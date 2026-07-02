@@ -8738,6 +8738,8 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
     }
     if should_use_behavioral_interview_answer_mode(payload) {
         system.push_str("\n\nBehavioral interview answer mode:\n");
+        system.push_str("- If the question asks for a self-introduction such as \"tell me about yourself\", give a complete first-person answer the user can say aloud, not a resume dump or notes. Use a present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role.\n");
+        system.push_str("- For self-introductions, aim for a 45-60 second answer in 2-3 tight paragraphs. Do not use bullets unless the user asks for notes. Do not start with \"You can say\" or a meta explanation.\n");
         system.push_str("- If the question asks for an interview story such as \"tell me about a time\", \"describe a situation\", \"worked under pressure\", conflict, leadership, ownership, ambiguity, failure, or deadline pressure, give a complete first-person answer the user can say aloud, not notes.\n");
         system.push_str("- Use attached resume, JD, prep docs, transcript, and screen context as source material. Prefer concrete names, tools, domains, constraints, and outcomes found in context.\n");
         system.push_str("- Shape the answer as STAR internally: situation, task, action, result. Do not label every sentence unless the user asks. Aim for a 45-90 second answer in 2-4 tight paragraphs, or 4-6 bullets only if structure helps.\n");
@@ -8845,6 +8847,13 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
 fn should_use_behavioral_interview_answer_mode(payload: &ProviderRequestPayload) -> bool {
     let question = payload.question.to_ascii_lowercase();
     let behavioral_signal = [
+        "tell me about yourself",
+        "tell me about myself",
+        "introduce yourself",
+        "walk me through your resume",
+        "walk me through your background",
+        "my background",
+        "my experience",
         "tell me about a time",
         "describe a time",
         "describe a situation",
@@ -14475,6 +14484,44 @@ mod tests {
         assert!(user.contains("Sai_Raghav_resume.pdf"));
         assert!(user.contains("NBCUniversal"));
         assert!(user.contains("Retool dashboard"));
+    }
+
+    #[test]
+    fn provider_messages_enable_self_intro_interview_mode_with_resume_context() {
+        let route = ProviderRoute::direct(ProviderSelector::openai("gpt-4.1-mini"));
+        let request = AnswerRequest::new("Tell me about yourself.", route).with_context(
+            AnswerContext::new(
+                AnswerContextKind::Document,
+                "Resume: 8+ years in BI, 4+ years enterprise BI engineering, Tableau, SQL, Redshift, Power BI, Python, Humana healthcare dashboards.",
+            )
+            .with_title("Sukruthi_Korukonda_BIE.docx")
+            .with_source("/tmp/Sukruthi_Korukonda_BIE.docx"),
+        );
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::openai("gpt-4.1-mini"),
+            Some("https://api.openai.com/v1/chat/completions".to_string()),
+            "fallback",
+            RouteBudget::realtime(),
+        );
+
+        let messages = provider_messages(&payload).expect("build provider messages");
+        let system = match &messages[0].content {
+            ChatMessageContent::Text(text) => text,
+            ChatMessageContent::Parts(_) => panic!("system message should be text"),
+        };
+        let user = match &messages[1].content {
+            ChatMessageContent::Text(text) => text,
+            ChatMessageContent::Parts(_) => panic!("user message should be text"),
+        };
+
+        assert!(system.contains("Behavioral interview answer mode"));
+        assert!(system.contains("self-introduction"));
+        assert!(system.contains("present-past-fit arc"));
+        assert!(system.contains("45-60 second answer"));
+        assert!(system.contains("Do not use bullets"));
+        assert!(user.contains("Sukruthi_Korukonda_BIE.docx"));
+        assert!(user.contains("Humana healthcare dashboards"));
     }
 
     #[test]

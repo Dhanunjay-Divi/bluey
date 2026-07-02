@@ -4334,3 +4334,39 @@ swift build -c debug --package-path native/macos/cue-overlay
 x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c
 git diff --check
 ```
+
+## Latest Round 306: Self-Intro Interview Voice
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-306-SELF-INTRO-INTERVIEW-VOICE.md`
+
+Round 306 fixed the answer-quality issue where `tell me about yourself` with an attached resume produced an accurate but too compressed resume paragraph:
+
+- Managed/server behavioral AnswerPlan now explicitly teaches self-introduction flow.
+- Local/direct daemon behavioral mode now triggers for self-intro prompts, not only STAR/story prompts.
+- Self-intro answers now prefer a first-person `present-past-fit` arc:
+  - current role and specialty,
+  - relevant past experience,
+  - strongest proof points,
+  - why the background fits the role.
+- Added regression tests for self-intro routing and prompt shaping.
+
+Verification:
+
+```bash
+cargo test -p cue-daemon provider_messages_enable_self_intro_interview_mode_with_resume_context --lib
+cargo test -p cue-daemon provider_messages_enable_behavioral_interview_mode_with_resume_context --lib
+cargo test --manifest-path server/Cargo.toml answer_plan_self_intro_is_behavioral_not_system_design --lib
+cargo fmt -p cue-daemon
+cargo fmt --manifest-path server/Cargo.toml
+git diff --check
+```

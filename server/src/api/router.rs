@@ -1098,7 +1098,8 @@ fn answer_plan_for_request(
     );
     let generic_screen_capture_prompt = looks_like_generic_screen_capture_prompt(&normalized);
     let docs = docs_requested
-        && (!generic_screen_capture_prompt || planning_context_has_document_signal(&normalized_context));
+        && (!generic_screen_capture_prompt
+            || planning_context_has_document_signal(&normalized_context));
     let meeting = contains_any(
         &normalized,
         &[
@@ -2062,7 +2063,7 @@ fn prompt_with_answer_plan(
             "Treat this as a follow-up to existing code when relevant. Preserve the existing artifact unless the user asks for a new one. Give the smallest useful delta, but include the actual updated code or snippet when the user asks for code. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
         }
         AnswerIntent::Behavioral => {
-            "Answer like a polished interview response: natural, first-person when appropriate, specific, and conversational. Never route resume/self-intro prompts into system design."
+            "Answer like a polished interview response: natural, first-person when appropriate, specific, and conversational. For self-introductions like \"tell me about yourself\", do not compress the resume into one facts paragraph. Use a speakable present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role. Aim for a 45-60 second answer in 2-3 tight paragraphs, not bullets, unless the user asks for notes. Do not invent metrics, employers, tools, or motivation beyond the supplied resume/JD/context. Never route resume/self-intro prompts into system design."
         }
         AnswerIntent::SystemDesign => {
             "Use clear sections for requirements, architecture, data flow, tradeoffs, scaling, and failure modes. Keep it practical and avoid overexplaining obvious basics."
@@ -2799,7 +2800,10 @@ fn sanitized_web_search_query(user_text: &str) -> Option<String> {
 fn extract_search_question(user_text: &str) -> String {
     let text = user_text.trim();
     if text.starts_with("Question:") {
-        return split_question_and_planning_context(text).0.trim().to_string();
+        return split_question_and_planning_context(text)
+            .0
+            .trim()
+            .to_string();
     }
     text.to_string()
 }
@@ -2809,7 +2813,10 @@ fn extract_planning_context(user_text: &str) -> String {
     if !text.starts_with("Question:") {
         return String::new();
     }
-    split_question_and_planning_context(text).1.trim().to_string()
+    split_question_and_planning_context(text)
+        .1
+        .trim()
+        .to_string()
 }
 
 fn split_question_and_planning_context(text: &str) -> (&str, &str) {
@@ -3457,17 +3464,17 @@ async fn complete_stream_inner(
             }
 
             let dispatch = routing::complete_stream_with_key(
-                    &selected_key.secret,
-                    route.provider,
-                    route.model,
-                    &provider_system,
-                    &provider_user,
-                    req.max_tokens,
-                    req.temperature,
-                    thinking,
-                    Some(est_in),
-                    &req.image_data_urls,
-                );
+                &selected_key.secret,
+                route.provider,
+                route.model,
+                &provider_system,
+                &provider_user,
+                req.max_tokens,
+                req.temperature,
+                thinking,
+                Some(est_in),
+                &req.image_data_urls,
+            );
 
             match tokio::time::timeout(stream_connect_deadline, dispatch).await {
                 Ok(Ok(streaming)) => {
@@ -6630,6 +6637,16 @@ mod tests {
         assert_eq!(plan.output, AnswerOutput::Compact);
         assert_eq!(plan.recommended_lane, "balanced");
         assert!(!plan.needs_web_search);
+
+        let (system, _user) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(system.contains("present-past-fit arc"));
+        assert!(system.contains("45-60 second answer"));
+        assert!(system.contains("do not compress the resume"));
     }
 
     #[test]
