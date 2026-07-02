@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 20:35 EDT
+Latest checkpoint: 2026-07-01 22:01 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,37 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-288-TAB-COMPLETE-CONTROL-COVERAGE.md`; the next canonical Bluey round doc should start at `ROUND-289-...`.
+- Latest completed Bluey round doc is `ROUND-289-TAB-ORDER-COMPOSER-TAB-FIX.md`; the next canonical Bluey round doc should start at `ROUND-290-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 289 is complete for Tab order and composer Tab behavior:
+  - fixed macOS header focus order so keyboard shortcuts is selected before theme, matching the visible header
+  - added a composer-level `Tab` fallback so the Ask text box does not insert tab whitespace
+  - anchored Tab navigation from Ask to the Ask input surface so Tab moves to the next control after Ask instead of restarting at History
+  - `Shift+Tab` from Ask moves to the previous control before Ask
+  - desktop workspace version bumped to `0.1.43`
+  - Windows parity note:
+    - this was macOS-specific `NSTextView` and Mac focus-order behavior
+    - Windows source was syntax-checked again
+  - local verification passed:
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `cargo check -p cue-daemon --quiet`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `git diff --check`
+  - macOS release verification passed:
+    - `https://bluey.sh/latest.json` reported `0.1.43`
+    - live `latest.json.sig` verified successfully against the release Ed25519 key
+    - live artifact SHA256:
+      `4a69b176f028c1abbf3b140bcbf4f9b0067cfd277e08aac5d311df8515b81b16`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.43/bluey-0.1.43-darwin-arm64.tar.gz`
+  - Round doc:
+    `docs/rounds/ROUND-289-TAB-ORDER-COMPOSER-TAB-FIX.md`
 - Round 288 is complete for full Tab control coverage:
   - macOS keyboard focus is now control-based instead of button-only
   - `Tab` / `Shift+Tab` can reach header controls, drawer controls, transcript clear, Ask input, attach, Tone, Opacity, Auto-send, Auto/model, Listen, Answer, and Screen

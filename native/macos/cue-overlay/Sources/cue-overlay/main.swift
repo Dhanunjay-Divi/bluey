@@ -774,6 +774,7 @@ private final class ComposerTextView: NSTextView {
         didSet { needsDisplay = true }
     }
     var onSubmit: (() -> Void)?
+    var onNavigateTab: ((Bool) -> Void)?
     var onMeasuredHeight: ((CGFloat) -> Void)?
     var onFocusChanged: ((Bool) -> Void)?
 
@@ -890,6 +891,15 @@ private final class ComposerTextView: NSTextView {
             return
         }
         let chars = event.charactersIgnoringModifiers ?? ""
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let isTab = event.keyCode == 48 || chars == "\t"
+        if isTab,
+           !flags.contains(.control),
+           !flags.contains(.option),
+           !flags.contains(.command) {
+            onNavigateTab?(flags.contains(.shift))
+            return
+        }
         let isReturn = event.keyCode == 36 || event.keyCode == 76 || chars == "\r" || chars == "\n"
         if isReturn {
             if event.modifierFlags.contains(.shift) {
@@ -5367,6 +5377,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             self?.applyOpacity(value)
         }
         composer.onSubmit = { [weak self] in self?.askClicked() }
+        composer.onNavigateTab = { [weak self] backward in
+            self?.cycleKeyboardControlFocus(backward: backward, currentOverride: self?.composerSurface)
+        }
         composer.onMeasuredHeight = { [weak self] height in self?.setComposerTextHeight(height) }
         composer.onFocusChanged = { [weak self] focused in
             (self?.composerSurface as? ComposerSurfaceView)?.setInputFocused(focused)
@@ -5934,7 +5947,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if isTab {
             guard !hasCommandLikeModifier else { return false }
             guard shouldHandleKeyboardControlNavigation else { return false }
-            cycleKeyboardControlFocus(backward: flags.contains(.shift))
+            cycleKeyboardControlFocus(
+                backward: flags.contains(.shift),
+                currentOverride: keyboardControlNavigationCurrentOverride())
             return true
         }
 
@@ -6005,14 +6020,23 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return true
     }
 
-    private func cycleKeyboardControlFocus(backward: Bool) {
+    private func keyboardControlNavigationCurrentOverride() -> NSView? {
+        guard keyboardFocusedControl == nil,
+              window?.firstResponder === composer
+        else {
+            return nil
+        }
+        return composerSurface
+    }
+
+    private func cycleKeyboardControlFocus(backward: Bool, currentOverride: NSView? = nil) {
         let controls = keyboardFocusableControls()
         guard !controls.isEmpty else {
             clearKeyboardControlFocus()
             return
         }
 
-        let currentIndex = keyboardFocusedControl.flatMap { current in
+        let currentIndex = (currentOverride ?? keyboardFocusedControl).flatMap { current in
             controls.firstIndex { $0 === current }
         }
         let nextIndex: Int
@@ -6080,10 +6104,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         var controls: [NSView] = [
             navButton,
             newSessionButton,
-            canvasToggleButton,
-            themeButton,
-            shortcutsButton,
             moveHandleButton,
+            canvasToggleButton,
+            shortcutsButton,
+            themeButton,
             fullSizeButton,
             interactionModeButton,
             hideButton,
