@@ -4241,3 +4241,36 @@ swift build -c debug --package-path native/macos/cue-overlay
 x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c
 git diff --check
 ```
+
+## Latest Round 303: Auto-send Stop Cancels
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-303-AUTOSEND-STOP-CANCELS.md`
+
+Round 303 fixed the live tester issue where Auto-send could answer late after the user clicked Listen Stop:
+
+- macOS no longer schedules auto-send from explicit Stop.
+- macOS schedules auto-send only after a final caption settles for 900ms while Listen is still active.
+- macOS Stop/paused/pill Stop cancels pending auto-send work and clears the auto-send buffer only.
+- macOS auto-send preference version bumped to reset old stop-triggered choices to off.
+- Windows default auto-send mode changed from system-stop to off.
+- Windows final captions schedule a 900ms settle timer while recording is active.
+- Windows Stop, transcript clear, and session switch cancel pending auto-send timers.
+- Both platforms now say captions settle; Stop cancels pending auto-send.
+
+Verification:
+
+```bash
+swift build -c debug --package-path native/macos/cue-overlay
+x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c
+git diff --check
+```

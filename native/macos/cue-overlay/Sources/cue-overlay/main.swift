@@ -275,7 +275,7 @@ private let supportedDropExtensions: Set<String> = [
 private let overlayLightThemeDefaultsKey = "bluey.overlay.lightTheme"
 private let overlayAutoSendStopModeDefaultsKey = "bluey.overlay.autoSendStopMode"
 private let overlayAutoSendStopModeVersionDefaultsKey = "bluey.overlay.autoSendStopModeVersion"
-private let overlayAutoSendStopModeCurrentVersion = 2
+private let overlayAutoSendStopModeCurrentVersion = 3
 
 private func blueyMaterialAlpha(_ base: CGFloat, opacity: CGFloat, floor: CGFloat = 0.02) -> CGFloat {
     min(1.0, max(floor, base * min(max(opacity, minimumOverlayBackgroundOpacity), 1.0)))
@@ -4601,18 +4601,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         var title: String {
             switch self {
             case .off: return "Don't auto-send"
-            case .mic: return "Auto-send when mic stops"
-            case .system: return "Auto-send when system stops"
-            case .micAndSystem: return "Auto-send when mic or system stops"
+            case .mic: return "Auto-send mic captions"
+            case .system: return "Auto-send system captions"
+            case .micAndSystem: return "Auto-send mic or system captions"
             }
         }
 
         var menuTitle: String {
             switch self {
             case .off: return "Don't auto-send"
-            case .mic: return "Auto-send when mic stops"
-            case .system: return "Auto-send when system stops"
-            case .micAndSystem: return "Auto-send when mic or system stops"
+            case .mic: return "Auto-send mic captions"
+            case .system: return "Auto-send system captions"
+            case .micAndSystem: return "Auto-send mic or system captions"
             }
         }
 
@@ -4623,13 +4623,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         var tooltip: String {
             switch self {
             case .off:
-                return "Stop only pauses listening"
+                return "Auto-send is off. Press Answer or Enter when ready."
             case .mic:
-                return "When Stop is clicked, send only if mic captions are ready"
+                return "Send after mic captions settle. Stop cancels pending auto-send."
             case .system:
-                return "When Stop is clicked, send only if system audio captions are ready"
+                return "Send after system captions settle. Stop cancels pending auto-send."
             case .micAndSystem:
-                return "When Stop is clicked, send if mic or system captions are ready"
+                return "Send after mic or system captions settle. Stop cancels pending auto-send."
             }
         }
 
@@ -8542,11 +8542,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         if recordingActive || recordingDesiredActive {
-            let shouldScheduleAutoSend = recordingActive
+            let shouldCancelAutoSend = recordingActive || recordingDesiredActive
             emitSimple("recording_stop_requested")
             recordingActive = false
             recordingDesiredActive = false
             recordingTransitionInFlight = true
+            if shouldCancelAutoSend {
+                cancelAutoSendAfterManualStop(origin: "composer")
+            }
             onListeningStateChanged?(.paused)
             recordingDesiredActive = false
             recordingTransitionInFlight = true
@@ -8556,9 +8559,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
             setTranscriptState("READY", active: false)
-            if shouldScheduleAutoSend {
-                scheduleAutoSendAfterExplicitStop()
-            }
         } else {
             prepareAutoSendListenCapture()
             emitSimple("recording_start_requested")
@@ -8653,6 +8653,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         autoSendTranscriptLinesBySource[source]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 
+    private func autoSendStopModeAllowsSource(_ source: String) -> Bool {
+        switch autoSendStopMode {
+        case .off:
+            return false
+        case .mic:
+            return source == "Mic"
+        case .system:
+            return source == "System"
+        case .micAndSystem:
+            return source == "Mic" || source == "System"
+        }
+    }
+
     private func hasTranscriptQuestionContext() -> Bool {
         transcriptSendQuestionForAnswer()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
@@ -8700,33 +8713,57 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return false
     }
 
-    private func scheduleAutoSendAfterExplicitStop() {
+    private func cancelAutoSendAfterManualStop(origin: String) {
+        let hadPending = autoSendAfterStopWorkItem != nil
+        let sourceCount = autoSendTranscriptLinesBySource.count
+        autoSendAfterStopWorkItem?.cancel()
+        autoSendAfterStopWorkItem = nil
+        autoSendListenCaptureActive = false
+        autoSendTranscriptLinesBySource.removeAll()
+        if hadPending || sourceCount > 0 {
+            emitLifecycle(
+                "autosend_cancelled",
+                detail: "origin=\(origin) mode=\(autoSendStopMode.rawValue) pending=\(hadPending) sources=\(sourceCount)"
+            )
+        }
+    }
+
+    private func scheduleAutoSendAfterCaptionSettle(source: String) {
         autoSendAfterStopWorkItem?.cancel()
         autoSendAfterStopWorkItem = nil
         guard autoSendStopMode.isEnabled else { return }
-        scheduleAutoSendAfterStopAttempt(mode: autoSendStopMode, attempt: 0)
-    }
-
-    private func scheduleAutoSendAfterStopAttempt(mode: AutoSendStopMode, attempt: Int) {
+        guard autoSendStopModeAllowsSource(source) else { return }
+        guard recordingActive, autoSendListenCaptureActive else { return }
+        guard hasAutoSendStopContext() else { return }
+        let mode = autoSendStopMode
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.autoSendAfterStopWorkItem = nil
             guard self.autoSendStopMode == mode else { return }
-            guard !self.recordingActive else { return }
+            guard self.recordingActive, self.autoSendListenCaptureActive else {
+                emitLifecycle(
+                    "autosend_answer_skipped",
+                    status: "manual_stop",
+                    detail: "mode=\(mode.rawValue) source=\(source)"
+                )
+                return
+            }
             guard self.hasAutoSendStopContext() else {
-                if attempt < 4 {
-                    self.scheduleAutoSendAfterStopAttempt(mode: mode, attempt: attempt + 1)
-                } else {
-                    self.autoSendListenCaptureActive = false
-                    self.autoSendTranscriptLinesBySource.removeAll()
-                }
+                emitLifecycle(
+                    "autosend_answer_skipped",
+                    status: "empty",
+                    detail: "mode=\(mode.rawValue) source=\(source)"
+                )
                 return
             }
             self.sendAutoStopAnswer(mode: mode)
         }
         autoSendAfterStopWorkItem = work
-        let delay = attempt == 0 ? 1.2 : 0.75
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        emitLifecycle(
+            "autosend_answer_scheduled",
+            detail: "mode=\(mode.rawValue) source=\(source) delay_ms=900 sources=\(autoSendTranscriptLinesBySource.count)"
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
     }
 
     private func sendAutoStopAnswer(mode: AutoSendStopMode) {
@@ -9505,6 +9542,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             recordingActive = false
             recordingDesiredActive = false
             recordingTransitionInFlight = false
+            cancelAutoSendAfterManualStop(origin: "state_paused")
             lastTranscriptStripSource = nil
             recordingButton.title = "Listen"
             setHeaderSubtitle()
@@ -9547,8 +9585,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
-    func scheduleAutoSendAfterExternalStop() {
-        scheduleAutoSendAfterExplicitStop()
+    func cancelAutoSendAfterExternalStop() {
+        cancelAutoSendAfterManualStop(origin: "pill")
     }
 
     private func updateAudioRouteBadge(_ text: String, accent: NSColor) {
@@ -11283,6 +11321,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
         rememberAutoSendTranscriptLine(source: key, body: cleanBody)
+        if final {
+            scheduleAutoSendAfterCaptionSettle(source: key)
+        }
         if final {
             latestLiveTranscriptLine = nil
             latestLiveTranscriptLinesBySource.removeValue(forKey: key)
@@ -13778,8 +13819,8 @@ private final class OverlayApp {
         expand()
         if currentRunState == .listening || currentRunState == .connecting {
             emitSimple("recording_stop_requested")
+            expandedView?.cancelAutoSendAfterExternalStop()
             setRunState(.paused)
-            expandedView?.scheduleAutoSendAfterExternalStop()
         } else {
             expandedView?.prepareAutoSendListenCapture()
             emitSimple("recording_start_requested")

@@ -77,7 +77,8 @@ static bool g_interactive_mode = true;
 static bool g_recording = false;
 static DWORD g_last_record_toggle_ms = 0;
 static DWORD g_record_restart_after_ms = 0;
-static int g_auto_send_mode = 2;
+static int g_auto_send_mode = 0;
+static bool g_auto_send_timer_armed = false;
 static bool g_light_theme = false;
 static double g_opacity = 0.92;
 static const int BLUEY_LIGHT_ACCENT_R = 0;
@@ -122,6 +123,8 @@ static wchar_t g_active_session_title[160] = L"";
 static WNDPROC g_ask_edit_proc = NULL;
 
 static void send_current_question(void);
+static void cancel_auto_send_timer(const char *origin);
+static void schedule_auto_send_after_caption_settled(void);
 static void show_full_overlay(bool emit_event);
 static void hide_overlay_completely(bool emit_event);
 static void update_paste_answer_button(void);
@@ -212,6 +215,7 @@ static void consume_sent_context_chips(void);
 #define ID_HOTKEY_ANSWER 2006
 #define ID_HOTKEY_HISTORY 2007
 #define ID_HOTKEY_FILES 2008
+#define ID_AUTOSEND_TIMER 3001
 #define BLUEY_GLOBAL_HOTKEY_MODS (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT)
 
 /* Stealth: hide overlay from screen recording, screenshots, and screen-share.
@@ -298,7 +302,7 @@ static void configure_tooltips(void) {
     add_control_tooltip(g_ask_edit, L"Type or paste a question for Bluey");
     add_control_tooltip(g_send_button, L"Send the question");
     add_control_tooltip(g_record_button, L"Start or stop listening");
-    add_control_tooltip(g_auto_send_combo, L"Choose which audio source should auto-send when listening stops.");
+    add_control_tooltip(g_auto_send_combo, L"Choose which audio source should auto-send after captions settle. Stop cancels pending auto-send.");
     add_control_tooltip(g_transcript_clear_button, L"Clear current captions from the next answer");
     add_control_tooltip(g_help_button, L"Show Bluey help");
     add_control_tooltip(g_session_button, L"Open conversation history");
@@ -706,6 +710,41 @@ static bool transcript_source_matches_auto_send_mode(void) {
 static bool has_auto_send_context(void) {
     if (g_auto_send_mode == 0) return false;
     return transcript_source_matches_auto_send_mode();
+}
+
+static void cancel_auto_send_timer(const char *origin) {
+    bool had_pending = g_auto_send_timer_armed;
+    if (g_hwnd) KillTimer(g_hwnd, ID_AUTOSEND_TIMER);
+    g_auto_send_timer_armed = false;
+    if (had_pending || has_auto_send_context()) {
+        char detail[192];
+        snprintf(
+            detail,
+            sizeof(detail),
+            "origin=%s mode=%d pending=%s transcript_context=%s",
+            origin ? origin : "unknown",
+            g_auto_send_mode,
+            had_pending ? "true" : "false",
+            has_transcript_context() ? "true" : "false"
+        );
+        emit_lifecycle_event("autosend_cancelled", "ok", detail);
+    }
+}
+
+static void schedule_auto_send_after_caption_settled(void) {
+    if (!g_hwnd || !g_recording || !has_auto_send_context()) return;
+    KillTimer(g_hwnd, ID_AUTOSEND_TIMER);
+    SetTimer(g_hwnd, ID_AUTOSEND_TIMER, 900, NULL);
+    g_auto_send_timer_armed = true;
+    char detail[160];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "mode=%d delay_ms=900 transcript_context=%s",
+        g_auto_send_mode,
+        has_transcript_context() ? "true" : "false"
+    );
+    emit_lifecycle_event("autosend_answer_scheduled", "ok", detail);
 }
 
 static void update_transcript_clear_button(void) {
@@ -1369,9 +1408,9 @@ static void create_controls(HWND hwnd) {
         WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
         0, 0, 220, 150, hwnd, (HMENU)ID_AUTO_SEND_BUTTON, GetModuleHandleW(NULL), NULL);
     SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Don't auto-send");
-    SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Auto-send when mic stops");
-    SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Auto-send when system stops");
-    SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Auto-send when mic or system stops");
+    SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Auto-send mic captions");
+    SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Auto-send system captions");
+    SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Auto-send mic or system captions");
     SendMessageW(g_auto_send_combo, CB_SETDROPPEDWIDTH, 280, 0);
     SendMessageW(g_auto_send_combo, CB_SETCURSEL, g_auto_send_mode, 0);
     g_transcript_clear_button = CreateWindowW(L"BUTTON", L"Clear", WS_CHILD | BS_OWNERDRAW,
@@ -1418,6 +1457,9 @@ static void consume_sent_context_chips(void) {
 }
 
 static void clear_local_transcript_context(void) {
+    if (g_auto_send_timer_armed) {
+        cancel_auto_send_timer("transcript_clear");
+    }
     char detail[160];
     snprintf(
         detail,
@@ -2001,8 +2043,12 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             g_transcript_partial[0] = L'\0';
             update_transcript_clear_button();
             update_paste_answer_button();
+            schedule_auto_send_after_caption_settled();
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "session_switched") == 0) {
+            if (g_auto_send_timer_armed) {
+                cancel_auto_send_timer("session_switched");
+            }
             safe_extract_json_to_wide(line, line_len, "title", g_session_banner, 256);
             if (wcslen(g_session_banner) == 0) wcscpy_s(g_session_banner, 256, L"New session");
             g_session_banner_tick = GetTickCount64();
@@ -2593,6 +2639,23 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
         break;
     }
+    case WM_TIMER:
+        if (wparam == ID_AUTOSEND_TIMER) {
+            KillTimer(hwnd, ID_AUTOSEND_TIMER);
+            g_auto_send_timer_armed = false;
+            if (g_recording && has_auto_send_context()) {
+                emit_lifecycle_event("autosend_answer_sent", "ok", "trigger=caption_settle platform=windows");
+                send_current_question();
+            } else {
+                emit_lifecycle_event(
+                    "autosend_answer_skipped",
+                    g_recording ? "empty" : "manual_stop",
+                    "trigger=caption_settle platform=windows"
+                );
+            }
+            return 0;
+        }
+        break;
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORSTATIC: {
         HDC hdc = (HDC)wparam;
@@ -2641,8 +2704,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             update_record_button();
             InvalidateRect(hwnd, NULL, TRUE);
             emit_simple_event(g_recording ? "recording_start_requested" : "recording_stop_requested");
-            if (was_recording && has_auto_send_context()) {
-                send_current_question();
+            if (was_recording) {
+                cancel_auto_send_timer("record_button");
             }
             return 0;
         }
