@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-02 00:44 EDT
+Latest checkpoint: 2026-07-02 01:27 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,39 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-294-SESSION-ID-STT-DIAGNOSTICS.md`; the next canonical Bluey round doc should start at `ROUND-295-...`.
+- Latest completed Bluey round doc is `ROUND-295-CLICKTHROUGH-MOVE-HANDLE-RELIABILITY.md`; the next canonical Bluey round doc should start at `ROUND-296-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 295 is complete and deployed for macOS click-through move-handle reliability:
+  - enlarged the blue click-through move handle from `34px` to `42px`
+  - enlarged the move-handle hit padding from `18px` to `26px`
+  - changed click-through hit-testing so the handle returns the actual `HeaderMoveButton`
+  - unified local button drag and global click-through monitor drag through the same panel drag methods
+  - kept a guarded global frame fallback if macOS keeps the drag sequence outside Bluey
+  - added `drag_started` / `drag_ended` lifecycle logs
+  - Windows parity note:
+    - no Windows source change needed; Windows already uses `HTCAPTION` for the click-through move handle
+  - local verification passed:
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `cargo check -p cue-core --quiet`
+    - `cargo check -p cue-daemon --quiet`
+    - `git diff --check`
+  - macOS release verification passed:
+    - `https://bluey.sh/latest.json` reported `0.1.49`
+    - live `latest.json.sig` verified successfully against the release Ed25519 key
+    - live artifact SHA256:
+      `247a300a6a91362bf99752638f41117841173ed9400c216f96179bdb7650a542`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+    - unpacked release reported `bluey 0.1.49` and `bluey-daemon 0.1.49`
+    - release artifact scan passed with no configured secrets/dev capture flags present
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.49/bluey-0.1.49-darwin-arm64.tar.gz`
+  - Round doc:
+    `docs/rounds/ROUND-295-CLICKTHROUGH-MOVE-HANDLE-RELIABILITY.md`
 - Round 294 is complete and deployed for session ids and STT diagnostics:
   - active meeting/session is created when Listen starts preparing, before any transcript arrives
   - overlay receives `set_active_session` with a stable short support code

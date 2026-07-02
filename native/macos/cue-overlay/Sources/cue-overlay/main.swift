@@ -4649,8 +4649,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let transcriptPreviewMemoryChars: Int = 1_400
         static let minTranscriptQuestionChars: Int = 8
         static let minTranscriptQuestionWords: Int = 2
-        static let clickThroughMoveHandleSize: CGFloat = 34
-        static let clickThroughMoveHandleHitPadding: CGFloat = 18
+        static let clickThroughMoveHandleSize: CGFloat = 42
+        static let clickThroughMoveHandleHitPadding: CGFloat = 26
     }
 
     let feed: FeedView
@@ -5793,7 +5793,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 return self
             }
             if isHeaderMoveHandleHit(at: point) {
-                return self
+                return moveHandleButton
             }
             blurComposerIfFocused()
             return nil
@@ -6948,21 +6948,31 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func beginManualWindowDrag(with _: NSEvent) {
+        beginManualWindowDrag(at: NSEvent.mouseLocation)
+    }
+
+    private func beginManualWindowDrag(at screenPoint: NSPoint) {
         guard let window else { return }
         manualWindowDragActive = true
-        manualWindowDragStartMouse = NSEvent.mouseLocation
+        manualWindowDragStartMouse = screenPoint
         manualWindowDragStartFrame = window.frame
         headerDragInProgress = true
         blurComposerIfFocused()
+        window.acceptsMouseMovedEvents = true
+        window.ignoresMouseEvents = false
         window.makeKey()
+        emitLifecycle("clickthrough_move_handle", status: "drag_started")
     }
 
     private func updateManualWindowDrag(with _: NSEvent) {
+        updateManualWindowDrag(to: NSEvent.mouseLocation)
+    }
+
+    private func updateManualWindowDrag(to screenPoint: NSPoint) {
         guard manualWindowDragActive, let window else { return }
-        let currentMouse = NSEvent.mouseLocation
         var frame = manualWindowDragStartFrame
-        frame.origin.x += currentMouse.x - manualWindowDragStartMouse.x
-        frame.origin.y += currentMouse.y - manualWindowDragStartMouse.y
+        frame.origin.x += screenPoint.x - manualWindowDragStartMouse.x
+        frame.origin.y += screenPoint.y - manualWindowDragStartMouse.y
         let visibleFrame = window.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
@@ -6977,12 +6987,29 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func endManualWindowDrag(with _: NSEvent) {
+        endManualWindowDrag()
+    }
+
+    private func endManualWindowDrag() {
         guard manualWindowDragActive else { return }
         manualWindowDragActive = false
         headerDragInProgress = false
         if let window {
             onWindowFrameChanged?(window.frame)
         }
+        emitLifecycle("clickthrough_move_handle", status: "drag_ended")
+    }
+
+    func beginClickThroughMoveHandleDrag(at screenPoint: NSPoint) {
+        beginManualWindowDrag(at: screenPoint)
+    }
+
+    func updateClickThroughMoveHandleDrag(to screenPoint: NSPoint) {
+        updateManualWindowDrag(to: screenPoint)
+    }
+
+    func endClickThroughMoveHandleDrag() {
+        endManualWindowDrag()
     }
 
     private func blurComposerIfFocused() {
@@ -12999,6 +13026,7 @@ private final class OverlayApp {
             expandedWindow.acceptsMouseMovedEvents = true
             expandedWindow.ignoresMouseEvents = false
             expandedWindow.makeKey()
+            expandedView.beginClickThroughMoveHandleDrag(at: point)
             emitLifecycle("clickthrough_move_handle", status: "armed")
 
         case .leftMouseDragged:
@@ -13016,12 +13044,21 @@ private final class OverlayApp {
             frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(
                 frame,
                 visibleFrame: visibleFrame)
-            expandedWindow.setFrame(frame, display: true, animate: false)
+            expandedView.updateClickThroughMoveHandleDrag(to: point)
+            let currentFrame = expandedWindow.frame
+            let frameChanged = abs(frame.origin.x - currentFrame.origin.x) > 0.5
+                || abs(frame.origin.y - currentFrame.origin.y) > 0.5
+                || abs(frame.size.width - currentFrame.size.width) > 0.5
+                || abs(frame.size.height - currentFrame.size.height) > 0.5
+            if frameChanged {
+                expandedWindow.setFrame(frame, display: true, animate: false)
+            }
             lastExpandedInteractiveMouseAt = CACurrentMediaTime()
             expandedWindow.ignoresMouseEvents = false
 
         case .leftMouseUp:
             if clickThroughHandleDragStartMouse != nil {
+                expandedView.endClickThroughMoveHandleDrag()
                 rememberExpandedFrame(expandedWindow.frame)
                 emitLifecycle("clickthrough_move_handle", status: "moved")
             }
