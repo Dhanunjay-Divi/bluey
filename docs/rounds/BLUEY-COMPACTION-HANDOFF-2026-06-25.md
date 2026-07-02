@@ -4210,3 +4210,34 @@ Start the fresh chat from the starter prompt above. In that chat:
    - Copy/paste/select works reliably.
    - Balance UI distinguishes reserved vs settled spend.
    - Add enough logs around auto-send, Listen stop, attachment send/clear, and canvas routing to prove failures without guessing.
+
+## Latest Round 302: Shortcut Guide And Click-through Move Handle
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-302-SHORTCUT-GUIDE-MOVE-HANDLE.md`
+
+Round 302 cleaned up stale keyboard shortcut affordances after plain single-letter local shortcuts were removed, and hardened the click-through move handle:
+
+- macOS shortcut guide button uses a help-style `?` icon instead of the keyboard icon.
+- macOS shortcut guide title/copy now says `Controls and shortcuts`.
+- macOS click-through handle drag now keeps the overlay mouse-active while the drag is in progress.
+- Windows shortcut guide button says `Shortcuts` instead of `Keys`.
+- Windows help/shortcut copy avoids stale `keyboard shortcuts` wording.
+- Windows click-through move handle visual target and hit slop were enlarged.
+
+Verification:
+
+```bash
+swift build -c debug --package-path native/macos/cue-overlay
+x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c
+git diff --check
+```

@@ -7940,7 +7940,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         autoSendModeMenu.toolTip = autoSendStopMode.tooltip
         canvasToggleButton.toolTip = "Open or collapse the canvas"
         themeButton.toolTip = lightThemeEnabled ? "Switch to dark theme" : "Switch to light theme"
-        shortcutsButton.toolTip = "Show keyboard shortcuts"
+        shortcutsButton.toolTip = "Show controls and shortcuts"
         moveHandleButton.toolTip = "Drag to move Bluey while click-through is on"
         balanceLabel.toolTip = "Remaining Bluey credits"
         fullSizeButton.toolTip = windowFullSize ? "Restore compact Bluey" : "Fill this screen"
@@ -8291,7 +8291,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func configureCloseConfirmForShortcutList() {
         clearKeyboardControlFocus()
-        closeConfirmTitle.stringValue = "Keyboard shortcuts"
+        closeConfirmTitle.stringValue = "Controls and shortcuts"
         closeConfirmPanelWidthConstraint?.constant = 470
         closeConfirmCancelLeadingConstraint?.isActive = false
         closeConfirmCancelCenterXConstraint?.isActive = true
@@ -8304,7 +8304,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmCancelButton.title = "Done"
         closeConfirmCancelButton.target = self
         closeConfirmCancelButton.action = #selector(cancelCloseConfirmClicked)
-        closeConfirmCancelButton.toolTip = "Close keyboard shortcuts"
+        closeConfirmCancelButton.toolTip = "Close controls and shortcuts"
         styleControlButton(closeConfirmCancelButton, symbol: "checkmark", accent: true)
 
         closeConfirmTurnOffButton.isHidden = true
@@ -10832,9 +10832,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func updateShortcutsButtonChrome() {
-        styleHeaderIconButton(shortcutsButton, symbol: "keyboard", fallback: "K")
+        styleHeaderIconButton(shortcutsButton, symbol: "questionmark.circle", fallback: "?")
         shortcutsButton.contentTintColor = lightThemeEnabled ? NSColor.black.withAlphaComponent(0.68) : BlueyTheme.cyan
-        shortcutsButton.toolTip = "Show keyboard shortcuts"
+        shortcutsButton.toolTip = "Show controls and shortcuts"
     }
 
     private func updateMoveHandleChrome() {
@@ -13629,6 +13629,11 @@ private final class OverlayApp {
         }
 
         expandedWindow.acceptsMouseMovedEvents = true
+        if clickThroughHandleDragStartMouse != nil {
+            expandedWindow.ignoresMouseEvents = false
+            lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+            return
+        }
         let point = NSEvent.mouseLocation
         let isMoveHandle = expandedView?.moveHandleContainsScreenPoint(point) ?? false
         let isInteractive = isMoveHandle || (expandedView?.isInteractiveAtScreenPoint(point) ?? true)

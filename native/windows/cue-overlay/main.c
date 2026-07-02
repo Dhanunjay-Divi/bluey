@@ -307,7 +307,7 @@ static void configure_tooltips(void) {
     add_control_tooltip(g_recap_button, L"Create a recap for this recording");
     add_control_tooltip(g_note_button, L"Set how Bluey should answer");
     add_control_tooltip(g_theme_button, L"Toggle light or dark theme");
-    add_control_tooltip(g_shortcuts_button, L"Show keyboard shortcuts");
+    add_control_tooltip(g_shortcuts_button, L"Show controls and shortcuts");
     add_control_tooltip(g_close_button, L"Turn Bluey off");
 }
 
@@ -1288,7 +1288,7 @@ static RECT clickthrough_move_handle_rect(RECT client) {
     int header_w = clamp_int((client.right * 84) / 100, 520, 780);
     if (header_w > client.right - 28) header_w = client.right - 28;
     int header_left = (client.right - header_w) / 2;
-    RECT handle = {header_left + 128, 14, header_left + 162, 48};
+    RECT handle = {header_left + 124, 10, header_left + 166, 52};
     return handle;
 }
 
@@ -1300,7 +1300,7 @@ static bool point_hits_clickthrough_move_handle(POINT point) {
     if (!ScreenToClient(g_hwnd, &local)) return false;
 
     RECT handle = clickthrough_move_handle_rect(rect);
-    InflateRect(&handle, 10, 10);
+    InflateRect(&handle, 18, 18);
     return PtInRect(&handle, local) != 0;
 }
 
@@ -1392,7 +1392,7 @@ static void create_controls(HWND hwnd) {
         0, 0, 60, 30, hwnd, (HMENU)ID_NOTE_BUTTON, GetModuleHandleW(NULL), NULL);
     g_theme_button = CreateWindowW(L"BUTTON", L"Theme", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 60, 30, hwnd, (HMENU)ID_THEME_BUTTON, GetModuleHandleW(NULL), NULL);
-    g_shortcuts_button = CreateWindowW(L"BUTTON", L"Keys", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+    g_shortcuts_button = CreateWindowW(L"BUTTON", L"Shortcuts", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 60, 30, hwnd, (HMENU)ID_SHORTCUTS_BUTTON, GetModuleHandleW(NULL), NULL);
     g_close_button = CreateWindowW(L"BUTTON", L"Quit", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 60, 30, hwnd, (HMENU)ID_CLOSE_BUTTON, GetModuleHandleW(NULL), NULL);
@@ -2657,7 +2657,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
         if (id == ID_HELP_BUTTON) {
             overlay_message_box(
-                L"Green dot: Bluey is connected.\nHelp: show this guide.\nKeys: show keyboard shortcuts.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide minimizes to the small button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nWhen click-through is off, blank Bluey space drags the window. When click-through is on, blank space clicks behind Bluey; drag the cyan move handle to reposition.",
+                L"Green dot: Bluey is connected.\nHelp: show this guide.\nShortcuts: show controls and shortcuts.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide minimizes to the small button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nWhen click-through is off, blank Bluey space drags the window. When click-through is on, blank space clicks behind Bluey; drag the cyan move handle to reposition.",
                 L"Bluey controls",
                 MB_OK | MB_ICONINFORMATION
             );
@@ -2691,7 +2691,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             );
             overlay_message_box(
                 shortcut_body,
-                L"Keyboard shortcuts",
+                L"Controls and shortcuts",
                 MB_OK | MB_ICONINFORMATION
             );
             emit_lifecycle_event("shortcuts_overlay_opened", "ok", "platform=windows");
