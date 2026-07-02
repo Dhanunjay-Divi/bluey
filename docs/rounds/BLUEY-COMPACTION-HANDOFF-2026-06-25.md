@@ -4408,3 +4408,39 @@ cargo fmt -p cue-daemon -p cue-core -p cue-llm
 cargo fmt --manifest-path server/Cargo.toml
 git diff --check
 ```
+
+## Latest Round 308: Humanized BI Interview Answers
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-308-HUMANIZED-BI-INTERVIEW-ANSWERS.md`
+
+Round 308 reviewed the shared ChatGPT BI interview-prep thread:
+
+- `https://chatgpt.com/share/6a4694e4-221c-83ea-a691-ca91fd2c869b`
+
+The useful pattern was: infer interviewer intent, give a ready-to-say first-person answer, anchor in supplied company/project/tool/metric context, and recover production-realistically when the interviewer challenges the story.
+
+Changes made:
+
+- Managed AnswerPlan now recognizes BI interview prompts such as dashboard-built-from-scratch, favorite SQL function, Tableau/backend lag, Dive Deep/focusing-on-the-right-problem, and interviewer pushback.
+- Managed behavioral prompt style now asks Bluey to infer the interviewer signal, produce speakable candidate answers, and include brief why-it-works or pushback recovery when useful.
+- Native/direct daemon behavioral mode now mirrors the same BI interview coaching instructions.
+- Self-intros remain 45-60 seconds; fuller interview stories can use 45-90 seconds.
+- Added regression tests for the shared-chat shapes.
+
+Verification:
+
+```bash
+cargo test --manifest-path server/Cargo.toml answer_plan -- --nocapture
+cargo test -p cue-daemon provider_messages_enable -- --nocapture
+cargo fmt --all
+```

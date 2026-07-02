@@ -8765,6 +8765,9 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
         system.push_str("- If the question asks for a self-introduction such as \"tell me about yourself\", give a complete first-person answer the user can say aloud, not a resume dump or notes. Use a present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role.\n");
         system.push_str("- For self-introductions, aim for a 45-60 second answer in 2-3 tight paragraphs. Do not use bullets unless the user asks for notes. Do not start with \"You can say\" or a meta explanation.\n");
         system.push_str("- If the question asks for an interview story such as \"tell me about a time\", \"describe a situation\", \"worked under pressure\", conflict, leadership, ownership, ambiguity, failure, or deadline pressure, give a complete first-person answer the user can say aloud, not notes.\n");
+        system.push_str("- For BI/data interview questions, infer what the interviewer is testing, such as Dive Deep, data quality, SQL/Tableau depth, ETL judgment, KPI logic, prioritization, or stakeholder communication. Make the answer prove that signal without sounding memorized.\n");
+        system.push_str("- Start with a ready-to-say answer anchored in the supplied company, project, tools, metrics, and constraints. If useful, add a short why-it-works or if-they-push-back recovery line.\n");
+        system.push_str("- If the interviewer challenges the story, do not blindly defend weak logic. Reframe it in a production-realistic way: upstream data arrival, ETL validation, reporting impact, KPI definitions, dashboard query behavior, or communication gaps.\n");
         system.push_str("- Use attached resume, JD, prep docs, transcript, and screen context as source material. Prefer concrete names, tools, domains, constraints, and outcomes found in context.\n");
         system.push_str("- Shape the answer as STAR internally: situation, task, action, result. Do not label every sentence unless the user asks. Aim for a 45-90 second answer in 2-4 tight paragraphs, or 4-6 bullets only if structure helps.\n");
         system.push_str("- If context does not contain a confirmed metric, use a defensible qualitative result instead of inventing numbers.\n");
@@ -8897,8 +8900,27 @@ fn should_use_behavioral_interview_answer_mode(payload: &ProviderRequestPayload)
         "ambiguity",
         "prioritize",
         "interview",
+        "interviewer",
         "behavioral",
+        "leadership principle",
+        "dive deep",
         "star answer",
+        "what should i say",
+        "how should i answer",
+        "how do i answer",
+        "can you talk about a dashboard",
+        "talk about a dashboard",
+        "dashboard that you built",
+        "built from scratch",
+        "what was the business problem",
+        "what metrics",
+        "what visual",
+        "favorite sql function",
+        "solve a problem that required in-depth thought",
+        "focusing on the right problem",
+        "how did you know that you were focusing",
+        "tableau filters",
+        "backend lag",
     ]
     .iter()
     .any(|signal| question.contains(signal));
@@ -8906,6 +8928,28 @@ fn should_use_behavioral_interview_answer_mode(payload: &ProviderRequestPayload)
     if !behavioral_signal {
         return false;
     }
+
+    let data_interview_signal = [
+        "business intelligence",
+        "bie",
+        "dashboard",
+        "tableau",
+        "power bi",
+        "sql",
+        "redshift",
+        "etl",
+        "pipeline",
+        "metric",
+        "kpi",
+        "data quality",
+        "data availability",
+        "reconciliation",
+        "row count",
+        "upstream",
+        "reporting",
+    ]
+    .iter()
+    .any(|signal| question.contains(signal));
 
     let has_candidate_context = payload.context.iter().any(|item| {
         let mut text = String::new();
@@ -8928,9 +8972,18 @@ fn should_use_behavioral_interview_answer_mode(payload: &ProviderRequestPayload)
             || lower.contains("interview")
             || lower.contains("experience")
             || lower.contains("project")
+            || lower.contains("business intelligence")
+            || lower.contains("tableau")
+            || lower.contains("sql")
+            || lower.contains("etl")
+            || lower.contains("dashboard")
     });
 
-    has_candidate_context || question.contains("interview") || question.contains("behavioral")
+    has_candidate_context
+        || data_interview_signal
+        || question.contains("interview")
+        || question.contains("interviewer")
+        || question.contains("behavioral")
 }
 
 fn provider_messages(payload: &ProviderRequestPayload) -> Result<Vec<ChatMessage>> {
@@ -14546,6 +14599,50 @@ mod tests {
         assert!(system.contains("Do not use bullets"));
         assert!(user.contains("Sukruthi_Korukonda_BIE.docx"));
         assert!(user.contains("Humana healthcare dashboards"));
+    }
+
+    #[test]
+    fn provider_messages_enable_bi_interview_coaching_mode() {
+        let route = ProviderRoute::direct(ProviderSelector::openai("gpt-4.1-mini"));
+        let request = AnswerRequest::new(
+            "Can you talk about a dashboard that you built from scratch, what was the business problem, metrics, and visual used?",
+            route,
+        )
+        .with_context(
+            AnswerContext::new(
+                AnswerContextKind::Document,
+                "Resume: Business Intelligence Engineer work at Humana and Vanguard using Tableau, SQL, Redshift, ETL validation, KPI reporting, and data quality reconciliation.",
+            )
+            .with_title("Sukruthi_Korukonda_BIE.docx")
+            .with_source("/tmp/Sukruthi_Korukonda_BIE.docx"),
+        );
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::openai("gpt-4.1-mini"),
+            Some("https://api.openai.com/v1/chat/completions".to_string()),
+            "fallback",
+            RouteBudget::realtime(),
+        );
+
+        let messages = provider_messages(&payload).expect("build provider messages");
+        let system = match &messages[0].content {
+            ChatMessageContent::Text(text) => text,
+            ChatMessageContent::Parts(_) => panic!("system message should be text"),
+        };
+        let user = match &messages[1].content {
+            ChatMessageContent::Text(text) => text,
+            ChatMessageContent::Parts(_) => panic!("user message should be text"),
+        };
+
+        assert!(system.contains("Behavioral interview answer mode"));
+        assert!(system.contains("BI/data interview questions"));
+        assert!(system.contains("interviewer is testing"));
+        assert!(system.contains("ready-to-say answer"));
+        assert!(system.contains("if-they-push-back"));
+        assert!(system.contains("production-realistic"));
+        assert!(user.contains("Sukruthi_Korukonda_BIE.docx"));
+        assert!(user.contains("Humana"));
+        assert!(user.contains("Vanguard"));
     }
 
     #[test]
