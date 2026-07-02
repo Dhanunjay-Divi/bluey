@@ -1657,6 +1657,8 @@ static int keyboard_focus_controls(HWND *controls, int max_controls) {
         g_shortcuts_button,
         g_close_button,
         g_transcript_clear_button,
+        g_ask_edit,
+        g_auto_send_combo,
         g_record_button,
         g_send_button,
     };
@@ -1701,11 +1703,18 @@ static bool focus_next_keyboard_control(bool backward) {
 
 static bool activate_focused_keyboard_control(void) {
     HWND focused = GetFocus();
-    if (!focused || focused == g_ask_edit) return false;
+    if (!focused) return false;
+    if (focused == g_ask_edit) {
+        return false;
+    }
     if (!is_keyboard_focusable_control(focused)) return false;
 
     int id = GetDlgCtrlID(focused);
     switch (id) {
+    case ID_AUTO_SEND_BUTTON:
+        SendMessageW(g_auto_send_combo, CB_SHOWDROPDOWN, TRUE, 0);
+        emit_lifecycle_event("keyboard_focus_activated", "ok", "control=auto_send platform=windows");
+        return true;
     case ID_SEND_BUTTON:
     case ID_RECORD_BUTTON:
     case ID_TRANSCRIPT_CLEAR_BUTTON:
@@ -2623,7 +2632,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 L"S Screen            I Click-through\n"
                 L"H History           F Files\n"
                 L"Enter Answer        Esc Close panel\n"
-                L"Tab Next button     Shift+Tab Previous button\n\n"
+                L"Tab Next control    Shift+Tab Previous control\n\n"
                 L"Global shortcuts work in both modes:\n"
                 L"Ctrl+Alt+B         Minimize to pill / restore\n"
                 L"Ctrl+Alt+T         Text input\n"
@@ -2636,7 +2645,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 L"Ask focused: type normally. Enter answers. Shift+Enter adds a new line.",
                 g_interactive_mode ? L"Click-through is off" : L"Click-through is on",
                 g_interactive_mode
-                    ? L"Blank Bluey space drags the window. Tab selects Bluey buttons; Enter opens the selected button."
+                    ? L"Blank Bluey space drags the window. Tab selects Bluey controls; Enter opens the selected control."
                     : L"Blank Bluey space clicks behind it. Drag the cyan move handle to move."
             );
             overlay_message_box(

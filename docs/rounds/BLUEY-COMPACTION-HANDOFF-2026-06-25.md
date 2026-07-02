@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 20:15 EDT
+Latest checkpoint: 2026-07-01 20:35 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,42 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-287-TAB-FOCUS-RING-VISIBILITY.md`; the next canonical Bluey round doc should start at `ROUND-288-...`.
+- Latest completed Bluey round doc is `ROUND-288-TAB-COMPLETE-CONTROL-COVERAGE.md`; the next canonical Bluey round doc should start at `ROUND-289-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 288 is complete for full Tab control coverage:
+  - macOS keyboard focus is now control-based instead of button-only
+  - `Tab` / `Shift+Tab` can reach header controls, drawer controls, transcript clear, Ask input, attach, Tone, Opacity, Auto-send, Auto/model, Listen, Answer, and Screen
+  - `Enter` / `Space` activates the selected control
+  - Ask input focuses the composer and then normal text editing takes priority
+  - menus open when selected
+  - opacity can be adjusted with arrow keys while selected
+  - modal/drawer control discovery ignores static labels so fake Tab stops are avoided
+  - shortcut guide copy now says controls instead of buttons
+  - Windows parity:
+    - Tab order includes Ask edit field and Auto-send combo box
+    - Enter/Space opens Auto-send when selected
+    - Windows shortcut guide copy says controls
+  - desktop workspace version bumped to `0.1.42`
+  - local verification passed:
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `cargo check -p cue-daemon --quiet`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `git diff --check`
+  - macOS release verification passed:
+    - `https://bluey.sh/latest.json` reported `0.1.42`
+    - live `latest.json.sig` verified successfully against the release Ed25519 key
+    - live artifact SHA256:
+      `44918f0d5adbcf8b92ad8541a96dcc1e7d3e374bfc22d7e650b385786f63f82f`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.42/bluey-0.1.42-darwin-arm64.tar.gz`
+  - Round doc:
+    `docs/rounds/ROUND-288-TAB-COMPLETE-CONTROL-COVERAGE.md`
 - Round 287 is complete for Tab focus ring visibility:
   - fixed the reason Tab focus was hard to see on macOS
   - root cause was the new focus ring sitting at z-position `3000` while header/composer chrome is reasserted around `4000+`

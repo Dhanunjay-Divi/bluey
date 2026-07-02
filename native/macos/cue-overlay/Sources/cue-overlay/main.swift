@@ -4778,7 +4778,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var dropHighlightActive = false
     private var lightThemeEnabled = UserDefaults.standard.bool(forKey: overlayLightThemeDefaultsKey)
     private let keyboardFocusRing = HeaderShieldView()
-    private weak var keyboardFocusedButton: NSButton?
+    private weak var keyboardFocusedControl: NSView?
 
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
@@ -5737,7 +5737,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseDown(with event: NSEvent) {
-        clearKeyboardButtonFocus()
+        clearKeyboardControlFocus()
         let localPoint = convert(event.locationInWindow, from: nil)
         if isKnowledgeBadgeHit(at: localPoint) {
             toggleSavedContextItems()
@@ -5933,33 +5933,59 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         if isTab {
             guard !hasCommandLikeModifier else { return false }
-            guard shouldHandleKeyboardButtonNavigation else { return false }
-            cycleKeyboardButtonFocus(backward: flags.contains(.shift))
+            guard shouldHandleKeyboardControlNavigation else { return false }
+            cycleKeyboardControlFocus(backward: flags.contains(.shift))
+            return true
+        }
+
+        if routeKeyboardOpacityAdjustment(event: event, hasCommandLikeModifier: hasCommandLikeModifier) {
             return true
         }
 
         if (isReturn || isSpace),
            !hasCommandLikeModifier,
-           let button = keyboardFocusedButton,
-           isKeyboardFocusable(button) {
-            button.performClick(nil)
-            emitLifecycle("keyboard_focus_activated", detail: "button=\(buttonIdentifier(button))")
+           let control = keyboardFocusedControl,
+           isKeyboardFocusable(control),
+           activateKeyboardFocusedControl(control) {
+            emitLifecycle("keyboard_focus_activated", detail: "control=\(controlIdentifier(control))")
             return true
         }
 
-        if keyboardFocusedButton != nil,
+        if keyboardFocusedControl != nil,
            !isReturn,
            !isSpace,
            !isTab,
            !hasCommandLikeModifier,
            event.keyCode != 53 {
-            clearKeyboardButtonFocus()
+            clearKeyboardControlFocus()
         }
 
         return false
     }
 
-    private var shouldHandleKeyboardButtonNavigation: Bool {
+    private func routeKeyboardOpacityAdjustment(event: NSEvent, hasCommandLikeModifier: Bool) -> Bool {
+        guard !hasCommandLikeModifier,
+              let control = keyboardFocusedControl,
+              isOpacityFocusControl(control),
+              isKeyboardFocusable(control)
+        else {
+            return false
+        }
+
+        let step = 0.02
+        switch event.keyCode {
+        case 123, 125:
+            applyOpacity(opacitySlider.doubleValue - step)
+        case 124, 126:
+            applyOpacity(opacitySlider.doubleValue + step)
+        default:
+            return false
+        }
+        emitLifecycle("keyboard_focus_adjusted", detail: "control=opacity value=\(Int((opacitySlider.doubleValue * 100.0).rounded()))")
+        return true
+    }
+
+    private var shouldHandleKeyboardControlNavigation: Bool {
         if !closeConfirmOverlay.isHidden || !answerStyleOverlay.isHidden {
             return true
         }
@@ -5979,52 +6005,52 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return true
     }
 
-    private func cycleKeyboardButtonFocus(backward: Bool) {
-        let buttons = keyboardFocusableButtons()
-        guard !buttons.isEmpty else {
-            clearKeyboardButtonFocus()
+    private func cycleKeyboardControlFocus(backward: Bool) {
+        let controls = keyboardFocusableControls()
+        guard !controls.isEmpty else {
+            clearKeyboardControlFocus()
             return
         }
 
-        let currentIndex = keyboardFocusedButton.flatMap { current in
-            buttons.firstIndex { $0 === current }
+        let currentIndex = keyboardFocusedControl.flatMap { current in
+            controls.firstIndex { $0 === current }
         }
         let nextIndex: Int
         if let currentIndex {
             nextIndex = backward
-                ? (currentIndex - 1 + buttons.count) % buttons.count
-                : (currentIndex + 1) % buttons.count
+                ? (currentIndex - 1 + controls.count) % controls.count
+                : (currentIndex + 1) % controls.count
         } else {
-            nextIndex = backward ? buttons.count - 1 : 0
+            nextIndex = backward ? controls.count - 1 : 0
         }
-        setKeyboardFocusedButton(buttons[nextIndex])
+        setKeyboardFocusedControl(controls[nextIndex])
     }
 
-    private func setKeyboardFocusedButton(_ button: NSButton?) {
-        guard keyboardFocusedButton !== button else {
+    private func setKeyboardFocusedControl(_ control: NSView?) {
+        guard keyboardFocusedControl !== control else {
             updateKeyboardFocusRingFrame()
             return
         }
-        keyboardFocusedButton = button
+        keyboardFocusedControl = control
         updateKeyboardFocusRingFrame()
-        if let button {
-            emitLifecycle("keyboard_focus_moved", detail: "button=\(buttonIdentifier(button))")
+        if let control {
+            emitLifecycle("keyboard_focus_moved", detail: "control=\(controlIdentifier(control))")
         }
     }
 
-    private func clearKeyboardButtonFocus() {
-        keyboardFocusedButton = nil
+    private func clearKeyboardControlFocus() {
+        keyboardFocusedControl = nil
         keyboardFocusRing.isHidden = true
     }
 
     private func updateKeyboardFocusRingFrame() {
-        guard let button = keyboardFocusedButton,
-              isKeyboardFocusable(button)
+        guard let control = keyboardFocusedControl,
+              isKeyboardFocusable(control)
         else {
             keyboardFocusRing.isHidden = true
             return
         }
-        let frame = button.convert(button.bounds, to: self)
+        let frame = control.convert(control.bounds, to: self)
             .insetBy(dx: -5, dy: -5)
         keyboardFocusRing.frame = frame
         keyboardFocusRing.layer?.cornerRadius = min(14, max(8, frame.height / 2))
@@ -6041,17 +6067,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         keyboardFocusRing.layer?.shadowColor = color.cgColor
     }
 
-    private func keyboardFocusableButtons() -> [NSButton] {
+    private func keyboardFocusableControls() -> [NSView] {
         if !closeConfirmOverlay.isHidden {
-            return buttonsInView(closeConfirmPanel)
+            return controlsInView(closeConfirmPanel)
                 .filter(isKeyboardFocusable)
         }
         if !answerStyleOverlay.isHidden {
-            return buttonsInView(answerStylePanel)
+            return controlsInView(answerStylePanel)
                 .filter(isKeyboardFocusable)
         }
 
-        var buttons: [NSButton] = [
+        var controls: [NSView] = [
             navButton,
             newSessionButton,
             canvasToggleButton,
@@ -6065,54 +6091,63 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         ]
 
         if !sessionDrawer.isHidden {
-            buttons.append(contentsOf: buttonsInView(sessionDrawer))
+            controls.append(contentsOf: controlsInView(sessionDrawer))
         }
 
-        buttons.append(contentsOf: [
+        controls.append(contentsOf: [
             transcriptClearButton,
+            composerSurface,
             attachButton,
             instructionsButton,
+            opacityControl,
+            autoSendModeMenu,
+            modelMenu,
             recordingButton,
             askButton,
             analyzeButton,
         ])
 
-        return dedupeButtons(buttons).filter(isKeyboardFocusable)
+        return dedupeControls(controls).filter(isKeyboardFocusable)
     }
 
-    private func buttonsInView(_ view: NSView) -> [NSButton] {
-        var result: [NSButton] = []
+    private func controlsInView(_ view: NSView) -> [NSView] {
+        var result: [NSView] = []
         for subview in view.subviews {
-            if let button = subview as? NSButton {
-                result.append(button)
+            if subview is NSButton || subview is NSPopUpButton {
+                result.append(subview)
+            } else if let textField = subview as? NSTextField,
+                      textField.isEditable || textField.isSelectable {
+                result.append(textField)
             }
-            result.append(contentsOf: buttonsInView(subview))
+            result.append(contentsOf: controlsInView(subview))
         }
         return result
     }
 
-    private func dedupeButtons(_ buttons: [NSButton]) -> [NSButton] {
+    private func dedupeControls(_ controls: [NSView]) -> [NSView] {
         var seen = Set<ObjectIdentifier>()
-        return buttons.filter { button in
-            let id = ObjectIdentifier(button)
+        return controls.filter { control in
+            let id = ObjectIdentifier(control)
             guard !seen.contains(id) else { return false }
             seen.insert(id)
             return true
         }
     }
 
-    private func isKeyboardFocusable(_ button: NSButton) -> Bool {
-        guard button.isEnabled,
-              !button.isHidden,
-              button.alphaValue > 0.01,
-              button.window != nil,
-              button.bounds.width > 4,
-              button.bounds.height > 4
+    private func isKeyboardFocusable(_ control: NSView) -> Bool {
+        if let nsControl = control as? NSControl, !nsControl.isEnabled {
+            return false
+        }
+        guard !control.isHidden,
+              control.alphaValue > 0.01,
+              control.window != nil,
+              control.bounds.width > 4,
+              control.bounds.height > 4
         else {
             return false
         }
 
-        var view: NSView? = button
+        var view: NSView? = control
         while let current = view {
             if current.isHidden || current.alphaValue <= 0.01 {
                 return false
@@ -6121,6 +6156,50 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             view = current.superview
         }
         return false
+    }
+
+    private func activateKeyboardFocusedControl(_ control: NSView) -> Bool {
+        if control === composerSurface || control === composerScroll || control === composer {
+            focusComposerForInput()
+            return true
+        }
+        if isOpacityFocusControl(control) {
+            window?.makeFirstResponder(opacityControl)
+            opacityControl.needsDisplay = true
+            return true
+        }
+        if let popup = control as? NSPopUpButton {
+            popup.performClick(nil)
+            return true
+        }
+        if let button = control as? NSButton {
+            button.performClick(nil)
+            return true
+        }
+        if let textField = control as? NSTextField {
+            window?.makeFirstResponder(textField)
+            return true
+        }
+        return false
+    }
+
+    private func isOpacityFocusControl(_ control: NSView) -> Bool {
+        control === opacityControl || control === opacitySlider
+    }
+
+    private func controlIdentifier(_ control: NSView) -> String {
+        if control === composerSurface || control === composerScroll || control === composer { return "ask_input" }
+        if control === opacityControl || control === opacitySlider { return "opacity" }
+        if control === autoSendModeMenu { return "auto_send" }
+        if control === modelMenu { return "model" }
+        if let button = control as? NSButton {
+            return buttonIdentifier(button)
+        }
+        if control === answerStyleBox { return "tone_text" }
+        if let textField = control as? NSTextField {
+            return textField.placeholderString ?? textField.stringValue
+        }
+        return String(describing: type(of: control))
     }
 
     private func buttonIdentifier(_ button: NSButton) -> String {
@@ -6402,7 +6481,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func focusComposerForInput() {
         guard !handleSignedOutGateAction(action: "text_input") else { return }
-        clearKeyboardButtonFocus()
+        clearKeyboardControlFocus()
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(composer)
@@ -7892,7 +7971,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func interactionModeClicked() {
         passThroughMode.toggle()
-        clearKeyboardButtonFocus()
+        clearKeyboardControlFocus()
         updateInteractionModeChrome()
         onInteractionModeChanged?()
     }
@@ -7988,7 +8067,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             color: titleColor)
         appendLine(passThroughMode
             ? "Blank Bluey space clicks behind it. Drag the blue move handle to move."
-            : "Blank Bluey space drags the window. Tab selects Bluey buttons; Enter opens the selected button.")
+            : "Blank Bluey space drags the window. Tab selects Bluey controls; Enter opens the selected control.")
         appendLine()
         appendLine("Inside Bluey when click-through is off and Ask is not focused:", font: noteFont, color: titleColor)
         appendLine()
@@ -7996,7 +8075,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         appendPair("S", "Screen", "I", "Click-through")
         appendPair("H", "History", "F", "Files")
         appendPair("Enter", "Answer", "Esc", "Close panel")
-        appendPair("Tab", "Next button", "Shift+Tab", "Previous button")
+        appendPair("Tab", "Next control", "Shift+Tab", "Previous control")
+        appendLine("Opacity selected: arrow keys adjust it.")
         appendLine()
         appendLine("Global shortcuts work in both modes:")
         globalShortcuts.forEach { appendShortcut($0.0, $0.1) }
@@ -8018,7 +8098,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func configureCloseConfirmForShortcutList() {
-        clearKeyboardButtonFocus()
+        clearKeyboardControlFocus()
         closeConfirmTitle.stringValue = "Keyboard shortcuts"
         closeConfirmPanelWidthConstraint?.constant = 470
         closeConfirmCancelLeadingConstraint?.isActive = false
