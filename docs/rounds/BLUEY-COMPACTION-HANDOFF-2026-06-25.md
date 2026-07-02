@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-02 02:08 EDT
+Latest checkpoint: 2026-07-02 02:49 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,44 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-296-KEYBOARD-THEME-TAB-ORDER-FINAL-PASS.md`; the next canonical Bluey round doc should start at `ROUND-297-...`.
+- Latest completed Bluey round doc is `ROUND-297-RELEASE-DISCIPLINE-RUNBOOKS.md`; the next canonical Bluey round doc should start at `ROUND-298-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 297 is complete for release discipline and ops runbooks:
+  - copied the Pinky deployment discipline into Bluey-owned docs and scripts
+  - updated `docs/RELEASE-RUNBOOK.md` with:
+    - deployment execution policy
+    - release id format `<version>-<commit12>`
+    - preprod readiness gate
+    - production promote gate
+    - post-production verification gate
+    - billing/credit/reload reconciliation gate
+    - provider/search cooldown and 429 proof gate
+  - added `scripts/bluey-release-live-verify.sh`
+    - verifies live `latest.json.sig`
+    - checks installer MIME types
+    - checks artifact SHA
+    - unpacks macOS release and checks binary versions
+    - fails on configured capture-visible dev markers in the shipped daemon
+  - updated `scripts/deploy-bluey-sh-manual.sh` to call the live verifier when a release public key or signing key is available
+  - added `docs/ops/DEPLOY-DISK-STORAGE-CHECK-RUNBOOK.md`
+  - added `docs/ops/DISPUTE-EVIDENCE-RUNBOOK.md`
+  - updated `docs/OPERATIONS-RUNBOOK.md` to reflect current production beta state instead of stale not-provisioned language
+  - updated `docs/PRODUCTION-DEPLOY-RUNBOOK.md` so manual API binary replacement is emergency-only and gated by storage, backup, billing, and reconciliation checks
+  - no desktop/server binaries changed and no production deploy was required
+  - verification passed:
+    - `BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.50`
+    - `bash -n scripts/bluey-release-live-verify.sh scripts/deploy-bluey-sh-manual.sh scripts/publish-bluey-release.sh scripts/release-hygiene-scan.sh`
+    - `scripts/release-hygiene-scan.sh docs/RELEASE-RUNBOOK.md docs/OPERATIONS-RUNBOOK.md docs/PRODUCTION-DEPLOY-RUNBOOK.md docs/ops scripts/bluey-release-live-verify.sh scripts/deploy-bluey-sh-manual.sh`
+  - remaining gates:
+    - add GitHub Actions production promotion workflow that promotes the already verified artifact instead of rebuilding
+    - add preprod artifact metadata and exact artifact promotion enforcement
+    - add server release bundle metadata for API deploys
+  - Round doc:
+    `docs/rounds/ROUND-297-RELEASE-DISCIPLINE-RUNBOOKS.md`
 - Round 296 is complete and deployed for Keyboard-before-Theme focus order and final pass:
   - inspected `IMG_3704.MOV` by extracting frames
   - confirmed the focus ring reached Theme before the Keyboard Shortcuts icon despite the icon being visually left of Theme

@@ -9,9 +9,95 @@ For the high-level lifecycle (environments, branches, promotion gates),
 read `docs/DELIVERY-LIFECYCLE.md` first. This doc is the concrete
 checklist.
 
-**Golden rule:** build the release artifact once, store it, deploy that
-same artifact to preprod, smoke preprod, then promote that exact stored
-artifact to prod. Never rebuild between preprod and prod.
+## Deployment Execution Policy
+
+Use this as the default rule when deciding how to build, test, and deploy:
+
+- Preprod may use local Mac and Windows machines plus direct SSH/local scripts
+  for fast iteration, smoke tests, and live validation.
+- Production should use GitHub Actions or another auditable signed promotion
+  path. Manual production deploys are allowed only for owner-approved emergency
+  hotfixes, and the exception must be recorded in the round doc.
+- Never publish an unsigned `latest.json`, an artifact without a checksum, or a
+  manifest whose version/SHA does not match the release artifact.
+- Build one immutable release id for operator tracking:
+  `<version>-<commit12>`.
+- Production must receive the exact artifact that passed preprod. Do not rebuild
+  separately for production.
+- Serialize production deploys with one active promotion at a time. GitHub
+  Actions should use workflow concurrency with `cancel-in-progress: false`.
+- For desktop releases, installers and client artifacts must pass:
+  `scripts/release-hygiene-scan.sh`,
+  `scripts/publish-bluey-release.sh` artifact scan,
+  live manifest signature verification, installer MIME checks, artifact SHA
+  checks, and unpacked binary version checks.
+- For server/API releases, production must pass cloud preflight, backup/restore
+  status, billing config, webhook config, and ledger/balance reconciliation
+  checks before deploy.
+
+**Golden rule:** build the release artifact once, store it, deploy that same
+artifact to preprod, smoke preprod, then promote that exact stored artifact to
+prod. Never rebuild between preprod and prod.
+
+---
+
+## Release Readiness Gate
+
+Treat this as the stop-the-line gate before every preprod deploy and every
+production promote.
+
+Required before preprod:
+
+- [ ] Intended commit is committed and pushed.
+- [ ] A numbered `docs/rounds/ROUND-NNN-*.md` exists for meaningful changes.
+- [ ] Release id is recorded as `<version>-<commit12>`.
+- [ ] `scripts/release-hygiene-scan.sh` passes.
+- [ ] Relevant platform checks pass:
+  - Rust checks/tests for touched crates.
+  - macOS Swift build or parse check for touched macOS overlay/helper code.
+  - Windows syntax/build check for touched Windows overlay/helper code.
+  - Server/API tests for routing, billing, web search, auth, export/delete, or
+    storage changes.
+- [ ] Release artifact is built with the production updater public key.
+- [ ] `scripts/publish-bluey-release.sh` artifact scan passes locally before
+  any publish.
+- [ ] No secrets, dev capture-visible flags, local-only auth bypass flags, or
+  plaintext provider keys are present in repo, docs, logs, or artifacts.
+- [ ] If the release touches sign-in, account deletion, credits, auto-reload,
+  usage billing, provider dispatch, web search, STT, embeddings, exports, or
+  object storage, record a second-pass safety review in the round doc.
+
+Required before production:
+
+- [ ] Production receives the exact preprod artifact. Do not rebuild.
+- [ ] Disk/storage check passed:
+  [`docs/ops/DEPLOY-DISK-STORAGE-CHECK-RUNBOOK.md`](./ops/DEPLOY-DISK-STORAGE-CHECK-RUNBOOK.md).
+- [ ] Production backup status is healthy, or an on-demand backup and restore
+  drill were completed immediately before promote.
+- [ ] `scripts/bluey-cloud-preflight.sh` passes against the production env.
+- [ ] Billing provider config is explicit and production webhook config is
+  correct for the target environment.
+- [ ] Billing changes have reconciliation proof: provider payment, local ledger,
+  balance, usage rows, entitlement, refund/dispute state, and auto-reload state
+  all agree for at least one test account.
+- [ ] Search/provider changes have quota/cooldown/fallback proof so a 429 or
+  provider loop cannot burn user credits or Bluey spend uncontrolled.
+- [ ] Active user/session risk is acceptable and documented.
+
+Required immediately after production:
+
+- [ ] `scripts/bluey-release-live-verify.sh <version>` passes with the release
+  public key or signing key available to the operator.
+- [ ] `https://bluey.sh/latest.json` reports the intended version.
+- [ ] `latest.json.sig` verifies against the release Ed25519 public key.
+- [ ] `/install.sh` returns `application/x-shellscript`.
+- [ ] `/install.ps1` returns `application/x-powershell`.
+- [ ] Live artifact SHA matches `SHA256SUMS.txt`.
+- [ ] Unpacked live binaries report the intended version.
+- [ ] Server health, billing health, and a signed-in desktop smoke pass for any
+  release touching auth, billing, routing, STT, or overlay behavior.
+- [ ] Monitor logs for the first 15 minutes and record any exception in the
+  round doc.
 
 ---
 
@@ -217,7 +303,26 @@ ssh <host> 'ls -la /var/www/bluey/releases/'
 `latest.json` should show the new version. The `latest` symlink should
 point at the new release dir (atomic swap done by `publish.sh`).
 
-For preprod → prod promotion (after preprod soak):
+Verify from the operator machine using the detached signature and live artifact:
+
+```bash
+BLUEY_RELEASE_PUBKEY_FILE=/secure/off-repo/bluey-release-ed25519.pub.pem \
+  scripts/bluey-release-live-verify.sh X.Y.Z
+```
+
+If only the signing key is available to the release operator, the verifier can
+derive the public key locally:
+
+```bash
+BLUEY_RELEASE_SIGNING_KEY_FILE=/secure/off-repo/bluey-release-ed25519.pem \
+  scripts/bluey-release-live-verify.sh X.Y.Z
+```
+
+This command verifies `latest.json.sig`, installer MIME types, live artifact
+SHA, unpacked binary versions for macOS, and absence of configured
+capture-visible dev markers in the shipped daemon.
+
+For preprod -> prod promotion (after preprod soak):
 
 ```bash
 BLUEY_RELEASE_SIGNING_KEY_FILE=/secure/off-repo/bluey-release-ed25519.pem \

@@ -3,7 +3,7 @@
 > **Secrets, server layout, smoke tests, daily ops.**
 > Mirrors Pinky's `OPERATIONS-RUNBOOK.md` shape but Bluey-only.
 >
-> Last updated: 2026-05-19.
+> Last updated: 2026-07-02.
 
 This is the ops playbook. If something is on fire, this is the doc to
 reach for.
@@ -14,12 +14,14 @@ reach for.
 
 | Layer | Status | Where |
 |---|---|---|
-| Layer 1 (local client) | shipping v0.1.0 | uno (dev), end-user laptops |
-| Layer 2 (distribution) | not provisioned | TBD, see `SERVER-REFERENCE.md` |
-| Layer 3 (product server) | not built | future, see `ARCHITECTURE.md` Section 5 |
+| Layer 1 (desktop client) | production beta, signed auto-update | end-user Macs; Windows parity where built |
+| Layer 2 (distribution) | live | `https://bluey.sh`, static installers, signed `latest.json`, versioned release artifacts |
+| Layer 3 (product/API server) | live production beta | `https://bluey.sh` API/admin/billing/auth paths on the Bluey API host |
+| Layer 4 (storage) | production beta | primary DB, hourly backups, optional private R2 object/release mirrors |
 
-When Layer 2/3 are stood up, fill in their details below + in
-`SERVER-REFERENCE.md`.
+Production deploys must follow [`docs/RELEASE-RUNBOOK.md`](./RELEASE-RUNBOOK.md).
+Do not manually patch production except for owner-approved emergency hotfixes,
+and record every exception in a numbered round doc.
 
 ---
 
@@ -47,6 +49,22 @@ Only the names of secrets appear in code or docs.
 ---
 
 ## 3. Smoke tests
+
+### Release artifact integrity
+
+Run after every desktop release publish:
+
+```bash
+BLUEY_RELEASE_PUBKEY_FILE=/secure/off-repo/bluey-release-ed25519.pub.pem \
+  scripts/bluey-release-live-verify.sh <version>
+```
+
+If only the signing key is available to the release operator:
+
+```bash
+BLUEY_RELEASE_SIGNING_KEY_FILE=/secure/off-repo/bluey-release-ed25519.pem \
+  scripts/bluey-release-live-verify.sh <version>
+```
 
 ### Client (run on uno or any test Mac)
 
@@ -118,15 +136,35 @@ cat ~/Library/Application\ Support/bluey/state.json
    `~/Library/Application Support/bluey/logs/`. The daemon emits
    `discover_overlay_bin` errors clearly.
 
-### Distribution server stuck (when one exists)
+### Distribution server stuck
 
 ```bash
 ssh <distribution-host>
-sudo systemctl status nginx          # Path C
-sudo systemctl status bluey-server   # Path A (Rust)
-sudo journalctl -u bluey-server --since "5 min ago" --no-pager
-# rollback by swapping the latest symlink (see DELIVERY-LIFECYCLE.md §5)
+curl -fsS https://bluey.sh/health
+curl -fsS https://bluey.sh/latest.json
+curl -fsSI https://bluey.sh/install.sh
+curl -fsSI https://bluey.sh/install.ps1
+sudo systemctl status caddy
+sudo journalctl -u caddy --since "15 min ago" --no-pager
 ```
+
+Do not edit `latest.json` by hand. Re-publish the last known good signed
+release or promote a verified stored artifact.
+
+### API server stuck
+
+```bash
+ssh <api-host>
+sudo systemctl status bluey-api.service
+sudo journalctl -u bluey-api.service --since "15 min ago" --no-pager
+curl -fsS https://bluey.sh/admin/health
+```
+
+Before restarts that may affect billing, run or confirm backup health. For disk
+or storage symptoms, use
+[`docs/ops/DEPLOY-DISK-STORAGE-CHECK-RUNBOOK.md`](./ops/DEPLOY-DISK-STORAGE-CHECK-RUNBOOK.md).
+For refund/dispute/account-delete billing symptoms, use
+[`docs/ops/DISPUTE-EVIDENCE-RUNBOOK.md`](./ops/DISPUTE-EVIDENCE-RUNBOOK.md).
 
 ---
 
@@ -139,6 +177,8 @@ sudo journalctl -u bluey-server --since "5 min ago" --no-pager
 | Pill appears but feed never opens on click | overlay process old, stale build | `bluey off`, rebuild, reinstall |
 | `Refused to spawn overlay` in logs | binary verification failed | check `BLUEY_OVERLAY_BIN` env, see `crates/cue-daemon/src/overlay.rs::verify_overlay_binary` |
 | Speculative dispatch never fires | env var disables it OR no providers configured | `BLUEY_SPECULATIVE_ROUTING=1` (default) + at least one provider key |
+| `curl https://bluey.sh/install.sh | bash` returns HTML | artifact path unreadable or Caddy fell through to SPA | run `scripts/bluey-release-live-verify.sh <version>`, fix file permissions, republish signed release |
+| Balance drops unexpectedly | stale UI balance, duplicated STT/listen rows, or billing settlement lag | inspect usage/ledger rows, session id, and use `docs/ops/DISPUTE-EVIDENCE-RUNBOOK.md` if this is a money-path complaint |
 
 ---
 
@@ -173,4 +213,6 @@ First build is slow (~3-5 min). Subsequent builds use the cargo cache.
 2. `DECISIONS.md` — historical decisions; the bug may be deliberate.
 3. `docs/rounds/PHASE-3-ROUND-N-PLAN.md` — current-round work in progress.
 4. `~/Library/Application Support/bluey/logs/` — daemon logs.
-5. `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md` — codex's last-known view.
+5. `docs/rounds/BLUEY-COMPACTION-HANDOFF-2026-06-25.md` — current long-running Codex handoff.
+6. `docs/ops/DEPLOY-DISK-STORAGE-CHECK-RUNBOOK.md` — deploy/storage incidents.
+7. `docs/ops/DISPUTE-EVIDENCE-RUNBOOK.md` — refunds, disputes, chargebacks, unexpected credit loss.

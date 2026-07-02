@@ -13,6 +13,7 @@ cd "$ROOT"
 PUBLISH_HOST="${PUBLISH_HOST:-root@165.227.77.152}"
 PUBLISH_PATH="${PUBLISH_PATH:-/var/www/bluey}"
 CURL_BIN="${CURL_BIN:-curl}"
+VERSION="${BLUEY_VERSION:-$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')}"
 
 if ! command -v "$CURL_BIN" >/dev/null 2>&1; then
     if [ -x /usr/bin/curl ]; then
@@ -60,5 +61,11 @@ for path in \
 do
     "$CURL_BIN" -fsS "https://bluey.sh${path}" >/dev/null
 done
+
+if [ -n "${BLUEY_RELEASE_PUBKEY_FILE:-}" ] || [ -n "${BLUEY_RELEASE_SIGNING_KEY_FILE:-}" ]; then
+    scripts/bluey-release-live-verify.sh "$VERSION"
+else
+    echo "[manual-deploy] warning: release signature verification skipped; set BLUEY_RELEASE_PUBKEY_FILE or BLUEY_RELEASE_SIGNING_KEY_FILE" >&2
+fi
 
 echo "[manual-deploy] done"

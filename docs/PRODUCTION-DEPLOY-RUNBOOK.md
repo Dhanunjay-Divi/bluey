@@ -286,6 +286,26 @@ Key metrics to alert on:
 
 ## 11. Rolling out a new server version
 
+Default rule: use a signed, auditable release/promotion path. Do not manually
+replace the production API binary for normal releases. Manual server binary
+replacement is an emergency hotfix path only and must be recorded in the round
+doc with the release id, operator, reason, backup proof, smoke output, and
+rollback target.
+
+Before any production server rollout:
+
+- Run [`docs/ops/DEPLOY-DISK-STORAGE-CHECK-RUNBOOK.md`](./ops/DEPLOY-DISK-STORAGE-CHECK-RUNBOOK.md).
+- Run `scripts/bluey-cloud-preflight.sh` against the production env files.
+- Confirm a fresh backup and restore drill if the change touches schema,
+  billing, credits, account delete/export, R2/object storage, or retention.
+- For billing or credit changes, prove provider payment, local ledger, balance,
+  user entitlement, refund/dispute state, and auto-reload state agree for a test
+  account.
+- For provider/search/STT/routing changes, prove cooldowns, 429 handling, and
+  usage charging cannot loop or double-bill.
+
+Emergency-only manual binary replacement:
+
 ```bash
 # Build the new binary on your build host.
 cd cue/server && cargo build --release
@@ -314,6 +334,11 @@ ssh root@<droplet> 'cp /var/backups/bluey-api/bin/bluey-server.previous /usr/loc
 ```
 
 The rollout command copies the old binary to `/var/backups/bluey-api/bin/bluey-server.previous` before replacing it. Keep that step before the `mv`; doing it from `ExecStartPre` would copy the newly deployed binary and make rollback useless.
+
+After the emergency rollout, run the production smoke and add the exception to a
+numbered round doc. If the same change needs to become normal production state,
+cut a signed release artifact from the same commit and promote it through the
+standard path.
 
 ## 12. Pre-launch sign-off checklist
 
@@ -355,7 +380,9 @@ RPO is 1 hour (cron interval). RTO is roughly the time to provision + restore = 
 - **Database replication.** Managed Postgres is the main production DB path;
   this runbook covers hourly logical backups, not cross-region replication or
   managed point-in-time-recovery policy.
-- **Auto-update server for the macOS app.** A separate distribution server (`R14.8` in `FUTURE-IMPLEMENTATIONS.md`) hosts the signed `.dmg` + `latest.json`.
+- **Ad hoc desktop update server changes.** The distribution path is live at
+  `https://bluey.sh`; changes to `latest.json`, installers, and release
+  artifacts must go through signed publish/promotion and live verification.
 - **Full web app polish on `bluey.sh`.** The same origin should host landing,
   install, link, reload, account, and docs pages. This repo includes the API
   and static landing starter; production page polish can stay in a separate
