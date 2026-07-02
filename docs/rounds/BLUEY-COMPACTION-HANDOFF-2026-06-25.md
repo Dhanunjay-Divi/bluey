@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 22:14 EDT
+Latest checkpoint: 2026-07-01 22:25 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,37 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-290-TONE-EDITOR-ENTER-READABILITY.md`; the next canonical Bluey round doc should start at `ROUND-291-...`.
+- Latest completed Bluey round doc is `ROUND-291-LOCAL-SHORTCUT-AUTOFOCUS-FIX.md`; the next canonical Bluey round doc should start at `ROUND-292-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 291 is complete for local shortcut autofocus:
+  - fixed the macOS key router fallback that focused Ask and inserted any printable key after shortcut handling
+  - Ask now receives typed characters only when it is already focused
+  - users can intentionally focus Ask by clicking it, pressing local `T`, or pressing global `Ctrl+Option+T`
+  - local shortcuts such as `L`, `S`, `I`, `H`, `F`, and `Enter` remain available when click-through is off and Ask is not focused
+  - desktop workspace version bumped to `0.1.45`
+  - Windows parity note:
+    - Windows already avoids this arbitrary printable-key autofocus behavior
+    - Windows source was syntax-checked again
+  - local verification passed:
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `cargo check -p cue-daemon --quiet`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `git diff --check`
+  - macOS release verification passed:
+    - `https://bluey.sh/latest.json` reported `0.1.45`
+    - live `latest.json.sig` verified successfully against the release Ed25519 key
+    - live artifact SHA256:
+      `9f3457203262d9aaa03afbb4b86569a6af32a3608424d76337a038d98cc18034`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.45/bluey-0.1.45-darwin-arm64.tar.gz`
+  - Round doc:
+    `docs/rounds/ROUND-291-LOCAL-SHORTCUT-AUTOFOCUS-FIX.md`
 - Round 290 is complete for Tone editor Enter/save and readability:
   - macOS Tone field now saves on `Enter`
   - handled both `insertNewline:` and `insertNewlineIgnoringFieldEditor:`

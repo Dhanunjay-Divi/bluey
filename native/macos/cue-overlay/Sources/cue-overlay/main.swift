@@ -5880,8 +5880,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return false
         }
         let composerAlreadyFocused = window?.firstResponder === composer
-        if !composerAlreadyFocused {
-            focusComposerForInput()
+        guard composerAlreadyFocused else {
+            return false
         }
         if flags.contains(.command) {
             switch key {
