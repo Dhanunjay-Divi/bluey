@@ -4608,3 +4608,9 @@ Deployment:
   `/var/backups/bluey-api/bin/bluey-server.previous-20260702T235807Z`
 - `bluey-api.service` active with `NRestarts=0`.
 - `https://bluey.sh/health` returned `status=ok`.
+- Published desktop release `0.1.53`.
+- Live artifact:
+  `https://bluey.sh/releases/v0.1.53/bluey-0.1.53-darwin-arm64.tar.gz`
+- Live artifact SHA256:
+  `e553d932d62bb1f18b8697c3f695865844a95683a00bbf9a7539acb5037bafb5`
+- Live verifier passed: signed `latest.json`, installer MIME types, artifact SHA, and unpacked binary version.

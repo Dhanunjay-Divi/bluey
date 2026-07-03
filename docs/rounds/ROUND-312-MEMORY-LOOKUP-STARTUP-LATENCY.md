@@ -89,6 +89,22 @@ Production server deploy:
 - `bluey-api.service` restarted active with `NRestarts=0`.
 - `https://bluey.sh/health` returned `status=ok`.
 
+Desktop release:
+
+- Bumped the public desktop release to `0.1.53`.
+- Built:
+  `dist/bluey-0.1.53-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `e553d932d62bb1f18b8697c3f695865844a95683a00bbf9a7539acb5037bafb5`
+- Published:
+  `https://bluey.sh/releases/v0.1.53/bluey-0.1.53-darwin-arm64.tar.gz`
+- Live `latest.json` reports version `0.1.53`.
+- Live verifier passed:
+  - `latest.json` signature verified
+  - installer MIME types are correct
+  - `darwin-arm64` artifact SHA verified
+  - unpacked binaries report `0.1.53`
+
 ## Follow-Up
 
 - Add a persisted failed-answer diagnostic row with request id, session id, sanitized error category, provider/lane, and timing, but no prompt/transcript text.
