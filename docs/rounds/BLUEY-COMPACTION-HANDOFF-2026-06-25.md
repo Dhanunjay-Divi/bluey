@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 17:42 EDT
+Latest checkpoint: 2026-07-03 18:09 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -36,7 +36,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
-- Round 325 is in progress for complete code canvas and line notes:
+- Round 325 is complete and deployed for complete code canvas and line notes:
   - traced the owner screenshot session `724C3B7E`; it was produced by older daemon build `0.1.59` and persisted a code artifact from only a histogram inner-loop fragment
   - hardened managed server coding prompt so code answers start with one short approach sentence, then complete fenced code with language tag
   - algorithm/interview coding answers now explicitly require full class/function signature, initialization, loop/body, return value, and sentinel/cleanup step
@@ -53,12 +53,24 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
     - `cargo fmt --check`
     - `cargo check -p cue-daemon`
     - `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
-  - pending before final close:
-    - package/deploy desktop `0.1.64`
-    - deploy production API server
-    - update `ROUND-325-COMPLETE-CODE-CANVAS-LINE-NOTES.md` and `RELEASE-v0.1.64.md` with live deployment facts
   - Round doc:
     `docs/rounds/ROUND-325-COMPLETE-CODE-CANVAS-LINE-NOTES.md`
+  - Release/deploy:
+    - desktop release `0.1.64` is live on `bluey.sh`
+    - live `latest.json.sig` verified successfully
+    - live installer MIME checks passed for `/install.sh` and `/install.ps1`
+    - live macOS artifact SHA verified:
+      `716486135eb6903495b786dfd9bd045a1704ebaf607f5cb20c2db09ea7d5dba6`
+    - unpacked macOS release reports `bluey 0.1.64` and `bluey-daemon 0.1.64`
+    - production API server built from commit `1c5536fc40eac36995832114176de2bf5a9f268b`
+    - installed `/usr/local/bin/bluey-server` SHA:
+      `6c878fef27d3c8574950c092975793c09db78f44a5b639517052ba6d641194c5`
+    - previous API binary backup:
+      `/var/backups/bluey-api/bin/bluey-server.previous-20260703T220614Z`
+    - `bluey-api.service` active with `NRestarts=0`
+    - public health returned `status=ok` and the expected commit
+    - recent API warning/error logs after restart had no entries
+    - local install updated to `0.1.64` and Bluey was restarted
 - Round 324 is complete and deployed for partial code stream recovery:
   - fixed request shape seen in Ref `54B786D8`, where a useful partial code answer ended with `answer_incomplete_reason="unclosed_code_fence"` and was replaced by a retry card
   - added repaired partial-answer recovery for managed and direct provider paths

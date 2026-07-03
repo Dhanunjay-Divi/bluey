@@ -48,16 +48,48 @@ cargo check --manifest-path server/Cargo.toml --bin bluey-server
 
 ## Deployment
 
-Pending:
+Completed:
 
-- Desktop release `0.1.64`
-- Production API server rebuild/restart
-- Live `latest.json` verification
-- Public API health verification
+- Desktop release `0.1.64` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.64/bluey-0.1.64-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `716486135eb6903495b786dfd9bd045a1704ebaf607f5cb20c2db09ea7d5dba6`
+- Artifact size:
+  `9190590` bytes
+- `latest.json` released at:
+  `2026-07-03T21:47:46.080957Z`
+- Public installer MIME checks passed for `/install.sh` and `/install.ps1`.
+- Live `latest.json.sig` verified successfully.
+- Unpacked Darwin arm64 release binaries report `0.1.64`.
+
+Production API server:
+
+- Deploy code commit:
+  `1c5536fc40eac36995832114176de2bf5a9f268b`
+- Build tree:
+  `/opt/bluey-build-codex-round325-code-artifact`
+- Installed binary:
+  `/usr/local/bin/bluey-server`
+- Binary SHA256:
+  `6c878fef27d3c8574950c092975793c09db78f44a5b639517052ba6d641194c5`
+- Previous binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260703T220614Z`
+- `bluey-api.service`: active
+- `NRestarts`: `0`
+- Public health reports:
+  `status=ok`, `commit=1c5536fc40eac36995832114176de2bf5a9f268b`
+- Recent warning/error logs after restart:
+  no entries
+
+Local install:
+
+- Public installer updated local binaries to `0.1.64`.
+- Local Bluey was restarted and `bluey status` returned a running daemon.
 
 ## Current State
 
-The code changes are ready for packaging/deploy. After deployment, retest a fresh algorithm prompt such as:
+The code changes are deployed. Retest a fresh algorithm prompt such as:
 
 ```text
 Given an array of integers heights representing histogram bars where width is 1, return the largest rectangle area.

@@ -33,4 +33,17 @@ cargo check --manifest-path server/Cargo.toml --bin bluey-server
 
 ## Deployment Status
 
-Pending final package and production deploy.
+Live on `https://bluey.sh/latest.json`.
+
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.64/bluey-0.1.64-darwin-arm64.tar.gz`
+- SHA256:
+  `716486135eb6903495b786dfd9bd045a1704ebaf607f5cb20c2db09ea7d5dba6`
+- Size:
+  `9190590` bytes
+- Release manifest signature verified.
+- `/install.sh` and `/install.ps1` MIME checks passed.
+- Production API server deployed from commit:
+  `1c5536fc40eac36995832114176de2bf5a9f268b`
+- Public health returned:
+  `status=ok`
