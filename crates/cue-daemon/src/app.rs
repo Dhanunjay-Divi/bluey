@@ -7103,7 +7103,12 @@ fn code_chat_body_for_artifact(body: &str, artifact: &CueCardArtifact) -> String
     let Some(code) = first_code_section_from_artifact(&artifact.body) else {
         return body.to_string();
     };
-    let mut visible = strip_canvas_pointer_lines(body).trim().to_string();
+    let body = if has_unclosed_code_fence(body) {
+        strip_unclosed_code_fence_tail(body)
+    } else {
+        body.to_string()
+    };
+    let mut visible = strip_canvas_pointer_lines(&body).trim().to_string();
     if visible.is_empty() || code_answer_is_pointer_only(&visible) {
         visible = "Here is the code:".to_string();
     }
@@ -7111,9 +7116,35 @@ fn code_chat_body_for_artifact(body: &str, artifact: &CueCardArtifact) -> String
     format!("{visible}\n\n```{language}\n{code}\n```")
 }
 
+fn strip_unclosed_code_fence_tail(body: &str) -> String {
+    let mut kept = Vec::new();
+    let mut in_fence = false;
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            if in_fence {
+                break;
+            }
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
+fn artifact_can_recover_incomplete_answer(artifact: &CueCardArtifact, reason: &str) -> bool {
+    matches!(artifact.artifact_type, CardArtifactType::Code) && reason == "unclosed_code_fence"
+}
+
 fn code_answer_is_pointer_only(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    lower.chars().count() < 220
+    let references_missing_context = lower.contains("already")
+        || lower.contains("above")
+        || lower.contains("earlier")
+        || lower.contains("same code")
+        || lower.contains("shown");
+    references_missing_context
+        && lower.chars().count() < 220
         && lower.contains("code")
         && !lower.contains("def ")
         && !lower.contains("class ")
@@ -7139,7 +7170,7 @@ fn first_code_section_from_artifact(body: &str) -> Option<String> {
         if in_code
             && matches!(
                 upper.as_str(),
-                "COMPLEXITY" | "TIME" | "SPACE" | "NOTES" | "EXPLANATION"
+                "COMPLEXITY" | "TIME" | "SPACE" | "LINE NOTES" | "NOTES" | "EXPLANATION"
             )
         {
             break;
@@ -7414,6 +7445,7 @@ fn normalize_code_canvas_body(body: &str) -> String {
                     | "COMPLEXITY"
                     | "TIME"
                     | "SPACE"
+                    | "LINE NOTES"
                     | "NOTES"
             ) {
                 section = match header.as_str() {
@@ -8326,14 +8358,47 @@ async fn call_bluey_managed_provider(
             return Err(anyhow!("managed provider stream returned no answer text"));
         }
         if let Some(reason) = incomplete_answer_reason(&answer) {
-            warn!(
-                provider = %provider.display_label(),
-                request_id = %request.metadata.request_id,
-                answer_chars = answer.chars().count(),
-                answer_incomplete_reason = reason,
-                "managed provider stream produced incomplete answer shape"
-            );
-            return Err(incomplete_answer_error(reason));
+            if let Some(artifact) = overlay_artifact
+                .as_ref()
+                .filter(|artifact| artifact_can_recover_incomplete_answer(artifact, reason))
+            {
+                let recovered_answer = visible_answer_body_for_artifact(&answer, Some(artifact));
+                warn!(
+                    provider = %provider.display_label(),
+                    request_id = %request.metadata.request_id,
+                    answer_chars = answer.chars().count(),
+                    recovered_answer_chars = recovered_answer.chars().count(),
+                    answer_incomplete_reason = reason,
+                    artifact_type = %artifact_type_label(artifact.artifact_type),
+                    "managed provider stream recovered incomplete visible answer from artifact"
+                );
+                if let Some(stream) = stream.as_mut() {
+                    stream
+                        .finish_with_cost_label_and_artifact(
+                            &recovered_answer,
+                            cost_label.clone(),
+                            overlay_artifact.clone(),
+                        )
+                        .await?;
+                }
+                return Ok(LiveProviderAnswer {
+                    provider: provider.clone(),
+                    answer: recovered_answer,
+                    artifact: overlay_artifact,
+                    token_usage,
+                    latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    sources,
+                });
+            } else {
+                warn!(
+                    provider = %provider.display_label(),
+                    request_id = %request.metadata.request_id,
+                    answer_chars = answer.chars().count(),
+                    answer_incomplete_reason = reason,
+                    "managed provider stream produced incomplete answer shape"
+                );
+                return Err(incomplete_answer_error(reason));
+            }
         }
         if !saw_finished {
             match recover_managed_stream_from_cached_answer(
@@ -8397,17 +8462,56 @@ async fn call_bluey_managed_provider(
     if answer.is_empty() {
         return Err(anyhow!("managed provider returned no answer text"));
     }
-    if let Some(reason) = incomplete_answer_reason(&answer) {
-        warn!(
-            provider = %provider.display_label(),
-            request_id = %request.metadata.request_id,
-            answer_chars = answer.chars().count(),
-            answer_incomplete_reason = reason,
-            "managed provider returned incomplete answer shape"
-        );
-        return Err(incomplete_answer_error(reason));
-    }
     let overlay_artifact = response.artifact.as_ref().and_then(llm_overlay_artifact);
+    if let Some(reason) = incomplete_answer_reason(&answer) {
+        if let Some(artifact) = overlay_artifact
+            .as_ref()
+            .filter(|artifact| artifact_can_recover_incomplete_answer(artifact, reason))
+        {
+            let recovered_answer = visible_answer_body_for_artifact(&answer, Some(artifact));
+            warn!(
+                provider = %provider.display_label(),
+                request_id = %request.metadata.request_id,
+                answer_chars = answer.chars().count(),
+                recovered_answer_chars = recovered_answer.chars().count(),
+                answer_incomplete_reason = reason,
+                artifact_type = %artifact_type_label(artifact.artifact_type),
+                "managed provider recovered incomplete visible answer from artifact"
+            );
+            if let Some(stream) = stream.as_mut() {
+                if !response.sources.is_empty() {
+                    stream
+                        .push_status(&format!("Found {} sources", response.sources.len()))
+                        .await?;
+                }
+                stream
+                    .finish_with_cost_label_and_artifact(
+                        &recovered_answer,
+                        response.cost_label.clone(),
+                        overlay_artifact.clone(),
+                    )
+                    .await?;
+            }
+            let token_usage = response.cost.as_ref().map(token_usage_from_llm_cost);
+            return Ok(LiveProviderAnswer {
+                provider: provider.clone(),
+                answer: recovered_answer,
+                artifact: overlay_artifact,
+                token_usage,
+                latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                sources: response.sources,
+            });
+        } else {
+            warn!(
+                provider = %provider.display_label(),
+                request_id = %request.metadata.request_id,
+                answer_chars = answer.chars().count(),
+                answer_incomplete_reason = reason,
+                "managed provider returned incomplete answer shape"
+            );
+            return Err(incomplete_answer_error(reason));
+        }
+    }
     if let Some(stream) = stream.as_mut() {
         if !response.sources.is_empty() {
             stream
@@ -16023,6 +16127,71 @@ mod tests {
         assert!(body.contains("```python"));
         assert!(body.contains("a, b = b, a"));
         assert!(body.contains("print('After:', a, b)"));
+    }
+
+    #[test]
+    fn code_artifact_recovers_chat_body_with_unclosed_streaming_fence() {
+        let artifact = CueCardArtifact {
+            artifact_type: CardArtifactType::Code,
+            title: "Code canvas".to_string(),
+            body: "CODE\n----\ndef fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        print(a)\n        a, b = b, a + b"
+                .to_string(),
+            confidence: 0.95,
+        };
+        let body = visible_answer_body_for_artifact(
+            "Here is the Python code:\n\n```python\ndef fib(n):",
+            Some(&artifact),
+        );
+
+        assert_eq!(incomplete_answer_reason(&body), None);
+        assert!(body.contains("Here is the Python code:"));
+        assert!(body.contains("```python"));
+        assert!(body.contains("a, b = b, a + b"));
+    }
+
+    #[test]
+    fn code_artifact_preview_keeps_line_notes_out_of_code_fence() {
+        let artifact = CueCardArtifact {
+            artifact_type: CardArtifactType::Code,
+            title: "Code canvas".to_string(),
+            body: "CODE\n----\ndef fib(n):\n    return n\n\nLINE NOTES\n----------\n1: demo note"
+                .to_string(),
+            confidence: 0.95,
+        };
+        let body = visible_answer_body_for_artifact("Here is the code:", Some(&artifact));
+
+        assert!(body.contains("```python\ndef fib(n):\n    return n\n```"));
+        assert!(!body.contains("1: demo note\n```"));
+        assert_eq!(incomplete_answer_reason(&body), None);
+    }
+
+    #[test]
+    fn only_code_artifacts_recover_unclosed_code_fence_errors() {
+        let code = CueCardArtifact {
+            artifact_type: CardArtifactType::Code,
+            title: "Code canvas".to_string(),
+            body: "CODE\n----\nprint('ok')".to_string(),
+            confidence: 0.95,
+        };
+        let design = CueCardArtifact {
+            artifact_type: CardArtifactType::SystemDesign,
+            title: "System design canvas".to_string(),
+            body: "System Design\n-------------\nAPI -> Queue".to_string(),
+            confidence: 0.88,
+        };
+
+        assert!(artifact_can_recover_incomplete_answer(
+            &code,
+            "unclosed_code_fence"
+        ));
+        assert!(!artifact_can_recover_incomplete_answer(
+            &design,
+            "unclosed_code_fence"
+        ));
+        assert!(!artifact_can_recover_incomplete_answer(
+            &code,
+            "dangling_heading"
+        ));
     }
 
     #[test]

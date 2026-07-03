@@ -4960,3 +4960,65 @@ Status at handoff update time:
   - installer MIME checks
   - Darwin arm64 artifact SHA verification
   - unpacked `bluey` and `bluey-daemon` version checks for `0.1.56`
+
+## Latest Round 320: Live QA Answer Matrix
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-320-LIVE-QA-ANSWER-MATRIX.md`
+
+Round 320 addresses the owner request to run broad live answer tests and fix what the tests reveal.
+
+What changed:
+
+- CLI `bluey ask` now defaults to managed `balanced` directly instead of the older broad route with a local deterministic fallback.
+- Daemon managed code answers can recover when the server returned a code artifact but the streamed visible prose has an unclosed Markdown code fence.
+- Code previews now treat `LINE NOTES` as metadata and keep it outside runnable code fences.
+
+Live QA:
+
+- Final fresh-session output directory: `/tmp/bluey-live-qa-round320-final-20260703T102110Z`
+- Session id: `b488f3a4-d0df-4d46-a6d1-5e0a0a0e50ac`
+- Cases covered: quick, coding, behavioral, writing, system design, missing docs, web-needed, missing screenshot, empty transcript, private guardrail.
+- Result: all cases returned successfully with no stderr.
+
+Verification:
+
+```bash
+cargo fmt
+cargo test -p cue-cli cli_ask_defaults_to_managed_balanced_without_local_fallback -- --nocapture
+cargo test -p cue-daemon code_artifact -- --nocapture
+cargo check -p cue-daemon --quiet
+cargo build -p cue-cli -p cue-daemon
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/deploy-bluey-sh-manual.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh
+```
+
+Status at handoff update time:
+
+- Desktop release `0.1.59` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 release artifact:
+  `https://bluey.sh/releases/v0.1.59/bluey-0.1.59-darwin-arm64.tar.gz`
+- Release artifact SHA256:
+  `dfcc71ffc35d5d5f981d941dee90ef9112c1ce5b1d0e9789924559d68feec3ac`
+- Deploy verification passed:
+  - release artifact dev-flag/secret scan
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.59`
+
+Remaining notes:
+
+- Normal CLI has no `attach` command; document upload should still be smoke-tested through overlay/drop-path or IPC.
+- Web-search planning/logging is present, but live search provider is not configured in this environment.
+- System design answers work but still need compact/canvas latency polish.

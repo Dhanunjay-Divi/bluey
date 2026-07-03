@@ -18,8 +18,8 @@ use cue_core::{
     load_account, load_settings, new_trace_id, save_settings, trace_id_from_env, AccountConfig,
     ActionItem, AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerRequest, AnswerResponse,
     AudioPipelineStatus, CardKind, CloudSyncStatus, ContextArtifact, CueCard, CueSettings,
-    MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, ProviderRoute, ProviderSelector,
-    Speaker, BLUEY_TRACE_ID_ENV,
+    MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, PrivacyFlags, ProviderRoute,
+    ProviderSelector, RouteBudget, RouteSelectionPolicy, Speaker, BLUEY_TRACE_ID_ENV,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -2733,13 +2733,20 @@ fn answer_request_from_args(question: String, args: &AskArgs) -> AnswerRequest {
         .as_deref()
         .or(args.model.as_deref().map(|_| "bluey_managed"))
         .map(|provider| ProviderRoute::direct(provider_selector(provider, args.model.as_deref())))
-        .unwrap_or_default();
+        .unwrap_or_else(default_cli_managed_route);
     let request = AnswerRequest::new(question, route);
     if args.stream {
         request.streaming()
     } else {
         request
     }
+}
+
+fn default_cli_managed_route() -> ProviderRoute {
+    ProviderRoute::direct(ProviderSelector::cue_managed("balanced"))
+        .with_budgets(RouteBudget::realtime())
+        .with_policy(RouteSelectionPolicy::Balanced)
+        .with_privacy(PrivacyFlags::managed_commercial())
 }
 
 fn provider_selector(provider: &str, model: Option<&str>) -> ProviderSelector {
@@ -3470,10 +3477,11 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bluey_on_boot_lines, bluey_on_boot_title, default_bluey_signin_url, device_login_url,
-        install_root_from_exe, login_account_provider, resolve_daemon_bin_from_roots,
-        resolve_login_api_url_from, BlueyOnAuthState,
+        answer_request_from_args, bluey_on_boot_lines, bluey_on_boot_title,
+        default_bluey_signin_url, device_login_url, install_root_from_exe, login_account_provider,
+        resolve_daemon_bin_from_roots, resolve_login_api_url_from, AskArgs, BlueyOnAuthState,
     };
+    use cue_core::AiProviderKind;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -3570,6 +3578,28 @@ mod tests {
                 Some("https://legacy-cue.example".to_string()),
             ),
             "https://cloud.bluey.sh"
+        );
+    }
+
+    #[test]
+    fn cli_ask_defaults_to_managed_balanced_without_local_fallback() {
+        let args = AskArgs {
+            provider: None,
+            model: None,
+            stream: true,
+            metadata: true,
+            question: vec!["write".into(), "code".into()],
+        };
+        let request = answer_request_from_args("write code".to_string(), &args);
+
+        assert_eq!(
+            request.route.primary.provider.provider_kind,
+            AiProviderKind::CueManaged
+        );
+        assert_eq!(request.route.primary.provider.model_or(""), "balanced");
+        assert!(
+            request.route.fallbacks.is_empty(),
+            "default CLI asks must not silently fall back to local context answers"
         );
     }
 
