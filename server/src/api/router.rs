@@ -2102,6 +2102,13 @@ fn looks_like_explanation_only_coding_question(normalized: &str) -> bool {
             "i want the code",
             "full code",
             "complete code",
+            "can you write",
+            "write ",
+            "code for",
+            "python code",
+            "java code",
+            "typescript code",
+            "javascript code",
             "implementation",
             "implement",
             "build",
@@ -7357,6 +7364,18 @@ mod tests {
     }
 
     #[test]
+    fn answer_plan_mixed_write_and_explain_keeps_code_artifact() {
+        let req = complete_request(
+            "Question:\nCan you write Fibonacci series? Then answer this follow-up: is there a way to reduce time complexity? New question: explain LRU cache.",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::CodingFollowUp);
+        assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+    }
+
+    #[test]
     fn answer_plan_eval_suite_covers_live_overlay_regressions() {
         let cases = [
             (
@@ -7373,6 +7392,14 @@ mod tests {
                 AnswerIntent::Coding,
                 AnswerOutput::CodeArtifact,
                 "balanced",
+                false,
+            ),
+            (
+                "fibonacci_mixed_write_explain",
+                "Question:\nCan you write Fibonacci series? Then answer this follow-up: is there a way to reduce time complexity? New question: explain LRU cache.",
+                AnswerIntent::CodingFollowUp,
+                AnswerOutput::CodeArtifact,
+                "deep",
                 false,
             ),
             (

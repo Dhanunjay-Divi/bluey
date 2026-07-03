@@ -4700,6 +4700,7 @@ What changed:
 - `response_artifact_for_output` makes sidebar/canvas artifact detection respect `AnswerPlan.output`.
 - Coding prompt now prefers from-scratch hashmap plus doubly linked list for LRU-style interview code.
 - Behavioral prompt now explicitly forbids invented metrics, tools, source systems, domains, latency windows, outcomes, and motivations.
+- A post-deploy live replay found one extra mixed-prompt bug: `write Fibonacci ... explain LRU` could suppress the code artifact because of the word `explain`. The explain-only guard now treats explicit `can you write` / `write` / `code for` / language-code requests as code-artifact prompts.
 
 Verification:
 
@@ -4709,9 +4710,11 @@ cargo test --manifest-path server/Cargo.toml answer_plan_ -- --nocapture
 cargo test --manifest-path server/Cargo.toml response_artifact -- --nocapture
 cargo test --manifest-path server/Cargo.toml --lib api::router::tests::answer_plan_eval_suite_covers_live_overlay_regressions -- --nocapture
 cargo build --manifest-path server/Cargo.toml
+git diff --check
 ```
 
 Status at handoff update time:
 
-- Local tests/build passed.
-- Server deploy and post-deploy live rerun are still pending.
+- Local tests/build passed after the mixed-prompt fix.
+- Initial server deploy to `ad2039433b17e7e5a7b3140471678f0b2af543fb` passed health and warning-log checks.
+- Final redeploy after the mixed-prompt fix is pending at this handoff edit.
