@@ -4767,4 +4767,11 @@ Status at handoff update time:
 - Initial deploy to commit `d66049e336ae0127d8065f8ba42215fc575621bb` passed health and warning-log checks.
 - Initial live smoke showed pictorial LRU returned `artifact_type=diagram`, but normal notification-system design incorrectly returned `artifact_type=code`.
 - Follow-up canvas-detail artifact fix is implemented and tested locally.
-- Final server redeploy and live re-smoke are pending.
+- Final server redeploy completed from commit `64ca5334e22cf0013e944f6ef87ce5eeaa0c9aa8`.
+- Installed binary SHA256:
+  `ec1d2d07a6405fae266457a446e8708296a48619f1092f6aaf44fb22671ef806`
+- Previous binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260703T071150Z`
+- `bluey-api.service` active with `NRestarts=0`.
+- `https://bluey.sh/health` reports commit `64ca5334e22cf0013e944f6ef87ce5eeaa0c9aa8`.
+- Final live smoke: notification-system design returned `artifact_type=system_design`; pictorial LRU returned `artifact_type=diagram` with Mermaid flowchart.

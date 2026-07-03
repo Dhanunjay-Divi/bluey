@@ -58,6 +58,25 @@ First live deploy smoke showed:
 
 The follow-up fix added `response_canvas_detail_artifact` so `AnswerOutput::CanvasDetail` no longer falls through to code detection first.
 
+## Deployment
+
+Final production deploy:
+
+- Commit: `64ca5334e22cf0013e944f6ef87ce5eeaa0c9aa8`
+- Build tree: `/opt/bluey-build-codex-round315-diagram/server`
+- Installed binary: `/usr/local/bin/bluey-server`
+- Binary SHA256: `ec1d2d07a6405fae266457a446e8708296a48619f1092f6aaf44fb22671ef806`
+- Previous binary backup: `/var/backups/bluey-api/bin/bluey-server.previous-20260703T071150Z`
+- `bluey-api.service`: active
+- `NRestarts`: `0`
+- Public health reports commit `64ca5334e22cf0013e944f6ef87ce5eeaa0c9aa8`
+- Recent warning logs: no entries.
+
+Final live smoke:
+
+- `Design a scalable notification system with queues...` returned `artifact_type=system_design`.
+- `Give a pictorial representation of an LRU cache data flow...` returned `artifact_type=diagram` with a Mermaid flowchart.
+
 ## Expected Behavior
 
 - `Design a scalable notification system` opens system-design canvas/detail.
