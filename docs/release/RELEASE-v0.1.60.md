@@ -42,3 +42,7 @@ This release hardens realtime STT for Deepgram managed live captions.
 - Live installer MIME checks passed.
 - Live manifest signature verified.
 - Production API relay was rebuilt and restarted active.
+- Production API health reports commit:
+  `757c0ba1beffce6ce4623d62c46ae123bd76827c`
+- Production API binary SHA256:
+  `f4dfc11050bfe8d80932035908357b429412c44272e30a1290371361798305b6`

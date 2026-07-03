@@ -71,9 +71,11 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
     - unpacked macOS release reports `bluey 0.1.60` and `bluey-daemon 0.1.60`
     - production API relay binary was built on the droplet and installed to `/usr/local/bin/bluey-server`
     - production API binary SHA:
-      `860b236c1e311357c3ecb025b8c5a1e4a67183ee7f3956920f8ebc0bc5ee8e0a`
+      `f4dfc11050bfe8d80932035908357b429412c44272e30a1290371361798305b6`
     - previous production API binary backup:
-      `/var/backups/bluey-api/bin/bluey-server.previous-20260703T170447Z`
+      `/var/backups/bluey-api/bin/bluey-server.previous-20260703T171630Z`
+    - production API public health commit:
+      `757c0ba1beffce6ce4623d62c46ae123bd76827c`
     - `bluey-api.service` restarted cleanly, `NRestarts=0`, and public health returned OK
     - recent production API warning/error logs after restart returned no entries
   - Remaining QA:
