@@ -218,6 +218,7 @@ static void consume_sent_context_chips(void);
 #define ID_HOTKEY_HISTORY 2007
 #define ID_HOTKEY_FILES 2008
 #define ID_AUTOSEND_TIMER 3001
+#define AUTOSEND_CAPTION_SETTLE_DELAY_MS 300
 #define BLUEY_GLOBAL_HOTKEY_MODS (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT)
 
 /* Stealth: hide overlay from screen recording, screenshots, and screen-share.
@@ -304,7 +305,7 @@ static void configure_tooltips(void) {
     add_control_tooltip(g_ask_edit, L"Type or paste a question for Bluey");
     add_control_tooltip(g_send_button, L"Send the question");
     add_control_tooltip(g_record_button, L"Start or stop listening");
-    add_control_tooltip(g_auto_send_combo, L"Choose which audio source should auto-send after captions settle. Stop cancels pending auto-send.");
+    add_control_tooltip(g_auto_send_combo, L"Choose which audio source should auto-send after captions pause briefly. Stop cancels pending auto-send.");
     add_control_tooltip(g_transcript_clear_button, L"Clear current captions from the next answer");
     add_control_tooltip(g_help_button, L"Show Bluey help");
     add_control_tooltip(g_session_button, L"Open conversation history");
@@ -753,14 +754,15 @@ static void cancel_auto_send_timer(const char *origin) {
 static void schedule_auto_send_after_caption_settled(void) {
     if (!g_hwnd || !g_recording || !has_auto_send_context()) return;
     KillTimer(g_hwnd, ID_AUTOSEND_TIMER);
-    SetTimer(g_hwnd, ID_AUTOSEND_TIMER, 900, NULL);
+    SetTimer(g_hwnd, ID_AUTOSEND_TIMER, AUTOSEND_CAPTION_SETTLE_DELAY_MS, NULL);
     g_auto_send_timer_armed = true;
     char detail[160];
     snprintf(
         detail,
         sizeof(detail),
-        "mode=%d delay_ms=900 transcript_context=%s",
+        "mode=%d delay_ms=%u transcript_context=%s",
         g_auto_send_mode,
+        AUTOSEND_CAPTION_SETTLE_DELAY_MS,
         has_transcript_context() ? "true" : "false"
     );
     emit_lifecycle_event("autosend_answer_scheduled", "ok", detail);

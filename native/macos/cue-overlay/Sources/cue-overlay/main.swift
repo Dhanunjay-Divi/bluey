@@ -4625,11 +4625,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             case .off:
                 return "Auto-send is off. Press Answer or Enter when ready."
             case .mic:
-                return "Send after mic captions settle. Stop cancels pending auto-send."
+                return "Send after mic captions pause briefly. Stop cancels pending auto-send."
             case .system:
-                return "Send after system captions settle. Stop cancels pending auto-send."
+                return "Send after system captions pause briefly. Stop cancels pending auto-send."
             case .micAndSystem:
-                return "Send after mic or system captions settle. Stop cancels pending auto-send."
+                return "Send after mic or system captions pause briefly. Stop cancels pending auto-send."
             }
         }
 
@@ -4649,6 +4649,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let transcriptPreviewMemoryChars: Int = 1_400
         static let minTranscriptQuestionChars: Int = 8
         static let minTranscriptQuestionWords: Int = 2
+        static let autoSendCaptionSettleDelayMs: Int = 300
+        static let autoSendCaptionSettleDelaySeconds: TimeInterval = 0.3
         static let clickThroughMoveHandleSize: CGFloat = 42
         static let clickThroughMoveHandleHitPadding: CGFloat = 26
     }
@@ -8761,9 +8763,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         autoSendAfterStopWorkItem = work
         emitLifecycle(
             "autosend_answer_scheduled",
-            detail: "mode=\(mode.rawValue) source=\(source) delay_ms=900 sources=\(autoSendTranscriptLinesBySource.count)"
+            detail: "mode=\(mode.rawValue) source=\(source) delay_ms=\(ChromeMetrics.autoSendCaptionSettleDelayMs) sources=\(autoSendTranscriptLinesBySource.count)"
         )
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + ChromeMetrics.autoSendCaptionSettleDelaySeconds,
+            execute: work
+        )
     }
 
     private func sendAutoStopAnswer(mode: AutoSendStopMode) {

@@ -4256,7 +4256,10 @@ Round doc:
 
 - `docs/rounds/ROUND-303-AUTOSEND-STOP-CANCELS.md`
 
-Round 303 fixed the live tester issue where Auto-send could answer late after the user clicked Listen Stop:
+Round 303 fixed the live tester issue where Auto-send could answer late after the user clicked Listen Stop.
+Note: Round 316 supersedes the original `900ms` settle delay with a `300ms` post-caption pause.
+
+Round 303 changes:
 
 - macOS no longer schedules auto-send from explicit Stop.
 - macOS schedules auto-send only after a final caption settles for 900ms while Listen is still active.
@@ -4775,3 +4778,44 @@ Status at handoff update time:
 - `bluey-api.service` active with `NRestarts=0`.
 - `https://bluey.sh/health` reports commit `64ca5334e22cf0013e944f6ef87ce5eeaa0c9aa8`.
 - Final live smoke: notification-system design returned `artifact_type=system_design`; pictorial LRU returned `artifact_type=diagram` with Mermaid flowchart.
+
+## Latest Round 316: Autosend Fast Caption Settle
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-316-AUTOSEND-FAST-CAPTION-SETTLE.md`
+
+Round 316 addresses the owner request: auto-send should fire quickly when voice stops, not wait almost another second and then appear to send only after Stop is clicked.
+
+What changed:
+
+- macOS overlay autosend post-caption settle delay changed from hard-coded `0.9s` to named constants:
+  - `autoSendCaptionSettleDelayMs = 300`
+  - `autoSendCaptionSettleDelaySeconds = 0.3`
+- Windows overlay autosend post-caption settle delay changed from `900ms` to `AUTOSEND_CAPTION_SETTLE_DELAY_MS = 300`.
+- macOS and Windows autosend scheduled logs now report the shared `300ms` delay.
+- Autosend tooltips now say captions "pause briefly" instead of "settle".
+
+Verification:
+
+```bash
+rg -n "delay_ms=900|ID_AUTOSEND_TIMER, 900|\\+ 0\\.9|captions settle" native/macos/cue-overlay/Sources/cue-overlay/main.swift native/windows/cue-overlay/main.c
+rg -n "autoSendCaptionSettleDelay|AUTOSEND_CAPTION_SETTLE_DELAY|autosend_answer_scheduled|pause briefly" native/macos/cue-overlay/Sources/cue-overlay/main.swift native/windows/cue-overlay/main.c
+swift build -c debug --package-path native/macos/cue-overlay
+git diff --check
+```
+
+Status at handoff update time:
+
+- Local source scan confirms no stale `900ms` overlay autosend settle remains.
+- macOS overlay debug build passed.
+- `git diff --check` passed.
+- Windows source parity is updated; Windows binary compile/release should be verified in the normal Windows release path.
