@@ -56,7 +56,24 @@ New regression coverage:
 
 ## Deployment
 
-Pending production API server deploy.
+Completed:
+
+- Production API server deployed from commit:
+  `784e7ee57c9a87b9cc964dc4050e8d4943cc04f2`
+- Build tree:
+  `/opt/bluey-build-codex-round327-resume-intro`
+- Installed binary:
+  `/usr/local/bin/bluey-server`
+- Binary SHA256:
+  `3329b457a10bcbe352df13d0aaf919cc4d887c96bf8cfc6ed4aa6ec61bf35383`
+- Previous binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260703T231206Z`
+- `bluey-api.service`: active
+- `NRestarts`: `0`
+- Public health reports:
+  `status=ok`, `commit=784e7ee57c9a87b9cc964dc4050e8d4943cc04f2`
+- Recent warning/error logs after restart:
+  no entries
 
 ## Remaining QA / Gates
 
@@ -72,4 +89,3 @@ Expected first answer:
 - first-person, role-specific, human
 - uses resume facts without inventing unsupported details
 - no need to ask again for a long answer
-

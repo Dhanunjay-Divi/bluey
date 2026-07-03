@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 19:03 EDT
+Latest checkpoint: 2026-07-03 19:14 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -36,7 +36,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
-- Round 327 is in progress for resume-introduction first-pass length:
+- Round 327 is complete and deployed for resume-introduction first-pass length:
   - owner showed `give me introduction based on the resume` returning a short compact answer first, then only producing a fuller intro after multiple follow-ups
   - root cause: behavioral/resume prompts still used `output=compact`, and generic compact overlay instructions competed with the interview prompt
   - added `AnswerOutput::InterviewAnswer`
@@ -47,12 +47,19 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
     - `cargo fmt --check`
     - `cargo test --manifest-path server/Cargo.toml answer_plan_ -- --nocapture`
     - `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
-  - pending before final close:
-    - commit/push Round 327 changes
-    - deploy production API server
-    - update `ROUND-327-RESUME-INTRO-FIRST-PASS-LENGTH.md` with deploy facts
   - Round doc:
     `docs/rounds/ROUND-327-RESUME-INTRO-FIRST-PASS-LENGTH.md`
+  - Release/deploy:
+    - production API server deployed from commit `784e7ee57c9a87b9cc964dc4050e8d4943cc04f2`
+    - build tree:
+      `/opt/bluey-build-codex-round327-resume-intro`
+    - installed `/usr/local/bin/bluey-server` SHA:
+      `3329b457a10bcbe352df13d0aaf919cc4d887c96bf8cfc6ed4aa6ec61bf35383`
+    - previous API binary backup:
+      `/var/backups/bluey-api/bin/bluey-server.previous-20260703T231206Z`
+    - `bluey-api.service` active with `NRestarts=0`
+    - public health returned `status=ok` and the expected commit
+    - recent API warning/error logs after restart had no entries
 - Round 326 is complete and deployed for the macOS PDF attachment picker:
   - owner reported the attachment picker seemed to allow DOC/DOCX but not PDF
   - confirmed `.pdf` is already allowed by the macOS overlay drag/drop extension list, daemon fallback picker, Windows picker filter, and daemon document conversion support
