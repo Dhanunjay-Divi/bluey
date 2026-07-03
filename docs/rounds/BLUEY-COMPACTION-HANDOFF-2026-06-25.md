@@ -4819,3 +4819,14 @@ Status at handoff update time:
 - macOS overlay debug build passed.
 - `git diff --check` passed.
 - Windows source parity is updated; Windows binary compile/release should be verified in the normal Windows release path.
+- Public desktop release `0.1.55` has been published to `https://bluey.sh/latest.json`.
+- Darwin arm64 release artifact:
+  `https://bluey.sh/releases/v0.1.55/bluey-0.1.55-darwin-arm64.tar.gz`
+- Release artifact SHA256:
+  `97086d226f9a9fe83f9597c2e387b6880cbfb9a054b09277ec29046806166aa6`
+- Deploy verification passed:
+  - release artifact dev-flag/secret scan
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.55`

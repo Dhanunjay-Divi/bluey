@@ -55,6 +55,38 @@ Result:
 - macOS overlay build passed.
 - `git diff --check` passed.
 
+Release verification:
+
+```bash
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" \
+  make package-darwin-arm64
+
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem \
+  PUBLISH_DO=1 \
+  PUBLISH_HOST=root@165.227.77.152 \
+  PUBLISH_PATH=/var/www/bluey \
+  scripts/deploy-bluey-sh-manual.sh
+```
+
+Result:
+
+- Release artifact dev-flag/secret scan passed.
+- `latest.json` signature verified.
+- `install.sh` content-type verified as `application/x-shellscript`.
+- `install.ps1` content-type verified as `application/x-powershell`.
+- Darwin arm64 artifact SHA verified.
+- Unpacked Darwin arm64 `bluey` and `bluey-daemon` binaries report `0.1.55`.
+
+## Deployment
+
+- Public release version: `0.1.55`
+- Live manifest: `https://bluey.sh/latest.json`
+- Download URL: `https://bluey.sh/releases/v0.1.55/bluey-0.1.55-darwin-arm64.tar.gz`
+- Local artifact: `dist/bluey-0.1.55-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `97086d226f9a9fe83f9597c2e387b6880cbfb9a054b09277ec29046806166aa6`
+- Live manifest reports the same SHA and size `9165571` bytes.
+
 ## Notes
 
 - This round intentionally keeps provider STT endpointing unchanged. The immediate delay found in the product path was the overlay's post-caption timer.
