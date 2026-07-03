@@ -4830,3 +4830,63 @@ Status at handoff update time:
   - installer MIME checks
   - Darwin arm64 artifact SHA verification
   - unpacked `bluey` and `bluey-daemon` version checks for `0.1.55`
+
+## Latest Round 317: Managed Stream Recovery and Sudoku Routing
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-317-MANAGED-STREAM-RECOVERY-SUDOKU-ROUTING.md`
+
+Round 317 addresses a production report where Bluey dropped before finishing a Python Sudoku answer.
+
+User-visible ref:
+
+- `CAED38EE`
+
+Trace result:
+
+- Full request id: `caed38ee-7895-4428-9ee2-f0423df25001`
+- Session ref: `550DD019`
+- Answer plan: `coding`
+- Output: `code_artifact`
+- Requested/effective lane: `balanced`
+- Provider/model: `zai` / `glm-5.2`
+- First token latency: `1484ms`
+- Total latency: `25370ms`
+- Output tokens: `712`
+- Server completed, billed, and cached the final response.
+- `request_idempotency.response_json` had a completed cached response of about `4475` bytes.
+
+What changed:
+
+- Daemon managed stream path now attempts cached-answer recovery when the stream errors after partial text.
+- Recovery uses the same request id, so completed server answers are retrieved from idempotency cache instead of generated/billed again.
+- On successful recovery, the overlay card is finalized with the recovered answer, cost label, artifact, and sources.
+- Added recovery diagnostics keyed by request id.
+- Server answer plan now treats algorithmic/solver code prompts such as `sudoku`, `backtracking`, `solver`, `algorithm`, `dfs`, `bfs`, etc. as deep code instead of simple balanced code.
+
+Verification:
+
+```bash
+cargo fmt --all
+cargo check -p cue-daemon
+cargo test -p cue-daemon stream -- --nocapture
+cargo test --manifest-path server/Cargo.toml answer_plan_ -- --nocapture
+cargo build --manifest-path server/Cargo.toml
+git diff --check
+```
+
+Status at handoff update time:
+
+- Local checks passed.
+- Desktop release version bumped to `0.1.56`.
+- Release note added at `docs/release/RELEASE-v0.1.56.md`.
+- Server and desktop deploy/release still need final publish verification if this handoff is read before deployment completes.

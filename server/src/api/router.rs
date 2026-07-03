@@ -2027,12 +2027,25 @@ fn looks_like_simple_coding_question(normalized: &str, short_question: bool) -> 
             "unit test",
             "test case",
             "optimize",
+            "algorithm",
+            "leetcode",
+            "solver",
+            "sudoku",
+            "backtracking",
+            "binary search",
+            "dfs",
+            "bfs",
             "concurrency",
             "thread",
             "async",
             "distributed",
             "graph",
+            "tree",
+            "heap",
+            "stack",
+            "queue",
             "dynamic programming",
+            "memoization",
             "doubly linked",
             "linked list",
         ],
@@ -7502,6 +7515,17 @@ mod tests {
         assert_eq!(plan.intent, AnswerIntent::Coding);
         assert_eq!(plan.output, AnswerOutput::CodeArtifact);
         assert_eq!(plan.recommended_lane, "balanced");
+    }
+
+    #[test]
+    fn answer_plan_algorithmic_solver_code_uses_deep_code_artifact() {
+        let req = complete_request("Question:\nGive me Python code which solves Sudoku.");
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Coding);
+        assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+        assert_eq!(plan.recommended_lane, "deep");
     }
 
     #[test]

@@ -8213,6 +8213,31 @@ async fn call_bluey_managed_provider(
                 Err(error) => {
                     let error = managed_llm_error(error);
                     let lower = format!("{error:#}").to_ascii_lowercase();
+                    if !answer.trim().is_empty() {
+                        match recover_managed_stream_from_cached_answer(
+                            &managed,
+                            &llm_request,
+                            &mut stream,
+                            &answer,
+                            provider,
+                            request.metadata.request_id,
+                            started_at,
+                            &error.to_string(),
+                        )
+                        .await
+                        {
+                            Ok(Some(recovered)) => return Ok(recovered),
+                            Ok(None) => {}
+                            Err(recovery_error) => {
+                                warn!(
+                                    provider = %provider.display_label(),
+                                    request_id = %request.metadata.request_id,
+                                    recovery_error = %recovery_error,
+                                    "managed provider stream cache recovery failed"
+                                );
+                            }
+                        }
+                    }
                     if !answer.trim().is_empty()
                         && is_missing_terminal_stream_metadata_error(&lower)
                         && incomplete_answer_reason(&answer).is_none()
@@ -8287,12 +8312,36 @@ async fn call_bluey_managed_provider(
             return Err(incomplete_answer_error(reason));
         }
         if !saw_finished {
-            warn!(
-                provider = %provider.display_label(),
-                request_id = %request.metadata.request_id,
-                answer_chars = answer.chars().count(),
-                "managed provider stream completed locally without final billing metadata; preserving complete-looking answer"
-            );
+            match recover_managed_stream_from_cached_answer(
+                &managed,
+                &llm_request,
+                &mut stream,
+                &answer,
+                provider,
+                request.metadata.request_id,
+                started_at,
+                "missing final billing metadata",
+            )
+            .await
+            {
+                Ok(Some(recovered)) => return Ok(recovered),
+                Ok(None) => {
+                    warn!(
+                        provider = %provider.display_label(),
+                        request_id = %request.metadata.request_id,
+                        answer_chars = answer.chars().count(),
+                        "managed provider stream completed locally without final billing metadata; preserving complete-looking answer"
+                    );
+                }
+                Err(recovery_error) => {
+                    warn!(
+                        provider = %provider.display_label(),
+                        request_id = %request.metadata.request_id,
+                        recovery_error = %recovery_error,
+                        "managed provider stream cache recovery failed after missing final metadata"
+                    );
+                }
+            }
         }
         if let Some(stream) = stream.as_mut() {
             stream
@@ -8359,6 +8408,103 @@ async fn call_bluey_managed_provider(
         latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         sources: response.sources,
     })
+}
+
+async fn recover_managed_stream_from_cached_answer(
+    managed: &BlueyManagedProvider,
+    llm_request: &LlmRequest,
+    stream: &mut Option<&mut OverlayAnswerStream>,
+    partial_answer: &str,
+    provider: &ProviderSelector,
+    request_id: uuid::Uuid,
+    started_at: Instant,
+    stream_failure: &str,
+) -> Result<Option<LiveProviderAnswer>> {
+    let partial_chars = partial_answer.trim().chars().count();
+    let response = match managed.complete(llm_request).await {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(
+                provider = %provider.display_label(),
+                request_id = %request_id,
+                partial_answer_chars = partial_chars,
+                stream_failure = %stream_failure,
+                recovery_error = %error,
+                "managed provider stream cached-answer recovery unavailable"
+            );
+            return Ok(None);
+        }
+    };
+    let answer = sanitize_answer_text(response.text.trim())
+        .trim()
+        .to_string();
+    if answer.is_empty() {
+        warn!(
+            provider = %provider.display_label(),
+            request_id = %request_id,
+            partial_answer_chars = partial_chars,
+            stream_failure = %stream_failure,
+            "managed provider stream cached-answer recovery returned empty answer"
+        );
+        return Ok(None);
+    }
+    if let Some(reason) = incomplete_answer_reason(&answer) {
+        warn!(
+            provider = %provider.display_label(),
+            request_id = %request_id,
+            partial_answer_chars = partial_chars,
+            recovered_answer_chars = answer.chars().count(),
+            answer_incomplete_reason = reason,
+            stream_failure = %stream_failure,
+            "managed provider stream cached-answer recovery returned incomplete answer"
+        );
+        return Ok(None);
+    }
+    let recovered_chars = answer.chars().count();
+    if recovered_chars < partial_chars {
+        warn!(
+            provider = %provider.display_label(),
+            request_id = %request_id,
+            partial_answer_chars = partial_chars,
+            recovered_answer_chars = recovered_chars,
+            stream_failure = %stream_failure,
+            "managed provider stream cached-answer recovery was shorter than partial stream"
+        );
+        return Ok(None);
+    }
+
+    let overlay_artifact = response.artifact.as_ref().and_then(llm_overlay_artifact);
+    if let Some(stream) = stream.as_mut() {
+        if !response.sources.is_empty() {
+            stream
+                .push_status(&format!("Found {} sources", response.sources.len()))
+                .await?;
+        }
+        stream
+            .finish_with_cost_label_and_artifact(
+                &answer,
+                response.cost_label.clone(),
+                overlay_artifact.clone(),
+            )
+            .await?;
+    }
+    info!(
+        provider = %provider.display_label(),
+        request_id = %request_id,
+        partial_answer_chars = partial_chars,
+        recovered_answer_chars = recovered_chars,
+        stream_failure = %stream_failure,
+        "managed provider stream recovered from cached final answer"
+    );
+    let token_usage = response.cost.as_ref().map(token_usage_from_llm_cost);
+    Ok(Some(LiveProviderAnswer {
+        provider: provider.clone(),
+        answer,
+        artifact: overlay_artifact,
+        token_usage,
+        latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        sources: response.sources,
+    }))
 }
 
 fn managed_lane_for_provider(
