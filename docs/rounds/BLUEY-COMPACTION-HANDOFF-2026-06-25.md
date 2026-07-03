@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 18:09 EDT
+Latest checkpoint: 2026-07-03 18:23 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,31 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest active Bluey round doc is `ROUND-325-COMPLETE-CODE-CANVAS-LINE-NOTES.md`; the next canonical Bluey round doc should start at `ROUND-326-...`.
+- Latest active Bluey round doc is `ROUND-326-PDF-ATTACH-PICKER-FILTER.md`; the next canonical Bluey round doc should start at `ROUND-327-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 326 is in progress for the macOS PDF attachment picker:
+  - owner reported the attachment picker seemed to allow DOC/DOCX but not PDF
+  - confirmed `.pdf` is already allowed by the macOS overlay drag/drop extension list, daemon fallback picker, Windows picker filter, and daemon document conversion support
+  - confirmed this Mac does not have `pdftotext`, but the bundled Bluey document converter successfully converted `/Users/uno/Downloads/Interview_Instructions.pdf` to markdown
+  - removed the native macOS `BlueyFilePicker.app` `allowedContentTypes` filter so Finder/UTI behavior cannot hide valid PDFs
+  - kept Bluey's explicit extension delegate validation, which still blocks unsupported file types
+  - Windows parity: Windows already includes `*.pdf` in the picker filter, so no Windows source change was needed
+  - workspace desktop version bumped to `0.1.65`
+  - verification passed:
+    - `native/macos/cue-picker/build.sh`
+    - `cargo test -p cue-daemon picker_context_filter_rejects_video_and_key_material -- --nocapture`
+    - `cargo check -p cue-daemon`
+    - `/Users/uno/.bluey/bin/bluey-doc-converter /Users/uno/Downloads/Interview_Instructions.pdf -o /tmp/bluey-pdf-test.md`
+  - pending before final close:
+    - package/deploy desktop `0.1.65`
+    - install locally and restart Bluey
+    - update `ROUND-326-PDF-ATTACH-PICKER-FILTER.md` and `RELEASE-v0.1.65.md` with live deployment facts
+  - Round doc:
+    `docs/rounds/ROUND-326-PDF-ATTACH-PICKER-FILTER.md`
 - Round 325 is complete and deployed for complete code canvas and line notes:
   - traced the owner screenshot session `724C3B7E`; it was produced by older daemon build `0.1.59` and persisted a code artifact from only a histogram inner-loop fragment
   - hardened managed server coding prompt so code answers start with one short approach sentence, then complete fenced code with language tag

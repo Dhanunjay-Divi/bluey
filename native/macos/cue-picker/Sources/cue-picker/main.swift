@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import UniformTypeIdentifiers
 
 private let allowedExtensions: Set<String> = [
     "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc",
@@ -76,14 +75,9 @@ private final class PickerAppDelegate: NSObject, NSApplicationDelegate {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
-        panel.allowsOtherFileTypes = false
+        panel.allowsOtherFileTypes = true
         panel.treatsFilePackagesAsDirectories = false
         panel.delegate = filterDelegate
-
-        let contentTypes = Array(Set(allowedExtensions.compactMap { UTType(filenameExtension: $0) }))
-        if !contentTypes.isEmpty {
-            panel.allowedContentTypes = contentTypes
-        }
 
         var paths: [String] = []
         if panel.runModal() == .OK {
