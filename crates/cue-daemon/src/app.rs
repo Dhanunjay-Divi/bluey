@@ -64,6 +64,7 @@ const LIVE_STT_AUDIBLE_RMS_DBFS: f64 = -58.0;
 const LIVE_STT_AUDIBLE_PEAK_DBFS: f64 = -34.0;
 const LIVE_STT_PREFACE_CHUNKS: usize = 8;
 const LIVE_STT_STARTUP_WARMUP_MS: u128 = 250;
+const LIVE_STT_FINALIZE_WAIT_MS: u64 = 850;
 const LIVE_STT_SILENCE_NOTICE_MS: u128 = 8_000;
 const PCM16_DBFS_FLOOR: f64 = -120.0;
 
@@ -3507,6 +3508,16 @@ fn live_stt_startup_warmup_ms() -> u128 {
     .min(LIVE_STT_SILENCE_NOTICE_MS)
 }
 
+fn live_stt_finalize_wait_ms() -> u64 {
+    env_first(&[
+        "BLUEY_LIVE_STT_FINALIZE_WAIT_MS",
+        "BLUEY_STT_FINALIZE_WAIT_MS",
+    ])
+    .and_then(|value| value.parse::<u64>().ok())
+    .unwrap_or(LIVE_STT_FINALIZE_WAIT_MS)
+    .clamp(100, 2_000)
+}
+
 async fn resolve_real_audio_sources(
     config: &AudioCaptureConfig,
     native_audio_helper: Option<&Path>,
@@ -4634,6 +4645,65 @@ async fn run_relay_audio_source(
         }
     }
 
+    let finalize_wait_ms = live_stt_finalize_wait_ms();
+    let _ = ws_tx
+        .send(WebSocketMessage::Text(
+            r#"{"type":"CloseStream"}"#.to_string(),
+        ))
+        .await;
+    let finalize_deadline = sleep(Duration::from_millis(finalize_wait_ms));
+    tokio::pin!(finalize_deadline);
+    let mut tail_frames = 0_u64;
+    loop {
+        tokio::select! {
+            _ = &mut finalize_deadline => break,
+            message = ws_rx.next() => {
+                match message {
+                    Some(Ok(WebSocketMessage::Text(payload))) => {
+                        tail_frames = tail_frames.saturating_add(1);
+                        emit_deepgram_relay_payload(
+                            &daemon,
+                            &session_id,
+                            source.source,
+                            sequence,
+                            &payload,
+                            Arc::clone(&last_transcript_at),
+                        ).await?;
+                    }
+                    Some(Ok(WebSocketMessage::Binary(payload))) => {
+                        if let Ok(payload) = std::str::from_utf8(&payload) {
+                            tail_frames = tail_frames.saturating_add(1);
+                            emit_deepgram_relay_payload(
+                                &daemon,
+                                &session_id,
+                                source.source,
+                                sequence,
+                                payload,
+                                Arc::clone(&last_transcript_at),
+                            ).await?;
+                        }
+                    }
+                    Some(Ok(WebSocketMessage::Close(_))) | None => break,
+                    Some(Ok(WebSocketMessage::Ping(_))) | Some(Ok(WebSocketMessage::Pong(_))) | Some(Ok(WebSocketMessage::Frame(_))) => {}
+                    Some(Err(error)) => {
+                        warn!(
+                            source = %source.source,
+                            stream_id = %source.stream_id,
+                            "live STT websocket tail finalize failed: {error}"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    info!(
+        source = %source.source,
+        stream_id = %source.stream_id,
+        tail_frames,
+        finalize_wait_ms,
+        "live STT relay tail finalize drained"
+    );
     let _ = ws_tx.send(WebSocketMessage::Close(None)).await;
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -15702,6 +15772,25 @@ mod tests {
 
         std::env::remove_var("BLUEY_LIVE_STT_STARTUP_WARMUP_MS");
         std::env::remove_var("BLUEY_STT_RELAY_STARTUP_WARMUP_MS");
+    }
+
+    #[test]
+    fn live_stt_finalize_wait_defaults_and_clamps() {
+        std::env::remove_var("BLUEY_LIVE_STT_FINALIZE_WAIT_MS");
+        std::env::remove_var("BLUEY_STT_FINALIZE_WAIT_MS");
+        assert_eq!(live_stt_finalize_wait_ms(), 850);
+
+        std::env::set_var("BLUEY_LIVE_STT_FINALIZE_WAIT_MS", "60");
+        assert_eq!(live_stt_finalize_wait_ms(), 100);
+
+        std::env::set_var("BLUEY_LIVE_STT_FINALIZE_WAIT_MS", "3000");
+        assert_eq!(live_stt_finalize_wait_ms(), 2_000);
+
+        std::env::set_var("BLUEY_LIVE_STT_FINALIZE_WAIT_MS", "700");
+        assert_eq!(live_stt_finalize_wait_ms(), 700);
+
+        std::env::remove_var("BLUEY_LIVE_STT_FINALIZE_WAIT_MS");
+        std::env::remove_var("BLUEY_STT_FINALIZE_WAIT_MS");
     }
 
     #[test]

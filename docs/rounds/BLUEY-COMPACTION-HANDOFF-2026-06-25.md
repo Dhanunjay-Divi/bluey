@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 05:33 EDT
+Latest checkpoint: 2026-07-03 12:46 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,62 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed and deployed Bluey round doc is `ROUND-319-TONE-TYPING-INDICATOR.md`; the next canonical Bluey round doc should start at `ROUND-320-...`.
+- Latest completed and deployed Bluey round doc is `ROUND-321-DEEPGRAM-REALTIME-STT-HARDENING.md`; the next canonical Bluey round doc should start at `ROUND-322-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 321 is complete and deployed for Deepgram realtime STT hardening:
+  - changed managed Deepgram realtime defaults to `endpointing=300`, `utterance_end_ms=1000`, `interim_results=true`, `vad_events=true`, `no_delay=true`, and default `language=en-US`
+  - kept `BLUEY_DEEPGRAM_LANGUAGE=auto|detect|none|off` to omit the default language for non-English or auto-detect testing
+  - added privacy-safe server relay frame timing/count telemetry:
+    - provider text frames
+    - transcript/partial/final/empty/control frames
+    - first provider frame ms
+    - first transcript ms
+    - first partial ms
+    - first final ms
+  - added desktop live STT tail finalization:
+    - sends Deepgram `CloseStream`
+    - drains provider frames for up to `850 ms`
+    - closes the relay after the tail drain
+  - bumped workspace desktop version to `0.1.60`
+  - verification passed so far:
+    - `cargo fmt --all`
+    - `cargo test --manifest-path server/Cargo.toml deepgram_url -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml deepgram_frame_inspection -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml stt::tests -- --nocapture`
+    - `cargo test -p cue-daemon live_stt_ -- --nocapture`
+    - `cargo test -p cue-daemon parse_frame -- --nocapture`
+    - `cargo check -p cue-daemon`
+    - `cargo check --manifest-path server/Cargo.toml`
+  - Round doc:
+    `docs/rounds/ROUND-321-DEEPGRAM-REALTIME-STT-HARDENING.md`
+  - Release/deploy:
+    - desktop release `0.1.60` is live on `bluey.sh`
+    - live `latest.json.sig` verified successfully by the deploy script
+    - live installer MIME checks passed for `/install.sh` and `/install.ps1`
+    - live macOS artifact SHA verified:
+      `16164a213784b2d02e7293e5980bde5f8d328f37b1313ae87da52932d7cdcf2f`
+    - unpacked macOS release reports `bluey 0.1.60` and `bluey-daemon 0.1.60`
+    - production API relay binary was built on the droplet and installed to `/usr/local/bin/bluey-server`
+    - production API binary SHA:
+      `860b236c1e311357c3ecb025b8c5a1e4a67183ee7f3956920f8ebc0bc5ee8e0a`
+    - previous production API binary backup:
+      `/var/backups/bluey-api/bin/bluey-server.previous-20260703T170447Z`
+    - `bluey-api.service` restarted cleanly, `NRestarts=0`, and public health returned OK
+    - recent production API warning/error logs after restart returned no entries
+  - Remaining QA:
+    - run a signed-in live Listen smoke and inspect first-provider/partial/final/tail timing logs
+- Round 320 is complete and deployed for live QA answer matrix:
+  - ran a broader local answer-quality smoke for coding, coding follow-up, behavioral, screen/code, system design, research/web-needed, missing context, and caption answer cases
+  - hardened recovery for provider failures so answer cards do not linger in a broken partial state
+  - documented the live QA matrix and remaining answer-quality gates
+  - desktop release `0.1.59` was deployed live on `bluey.sh`
+  - live release signature, installer MIME, macOS artifact SHA, and unpacked binary version checks passed
+  - Round doc:
+    `docs/rounds/ROUND-320-LIVE-QA-ANSWER-MATRIX.md`
 - Round 319 is complete and deployed for Tone typing/focus visibility:
   - added a dedicated blue typing indicator beside the macOS Tone input
   - Tone input now uses a brighter blue border and glow while focused

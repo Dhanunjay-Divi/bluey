@@ -39,8 +39,10 @@ const MAX_SESSION_SECONDS: i64 = 20 * 60;
 const PCM16_DBFS_FLOOR: f64 = -120.0;
 const LIVE_STT_AUDIBLE_RMS_DBFS: f64 = -58.0;
 const LIVE_STT_AUDIBLE_PEAK_DBFS: f64 = -34.0;
-const DEFAULT_DEEPGRAM_ENDPOINTING_MS: u32 = 200;
+const DEFAULT_DEEPGRAM_ENDPOINTING_MS: u32 = 300;
 const DEFAULT_DEEPGRAM_UTTERANCE_END_MS: u32 = 1_000;
+const DEFAULT_DEEPGRAM_LANGUAGE: &str = "en-US";
+const DEFAULT_DEEPGRAM_NO_DELAY: bool = true;
 
 #[derive(Debug, Deserialize)]
 pub struct SttSessionRequest {
@@ -404,6 +406,7 @@ async fn run_deepgram_relay(
     let mut forwarded_audio_chunks = 0_u64;
     let mut forwarded_audible_audio_chunks = 0_u64;
     let mut first_audible_after_ms: Option<u128> = None;
+    let mut provider_frame_stats = DeepgramRelayFrameStats::default();
 
     tokio::select! {
         _ = tokio::time::sleep(deadline) => {
@@ -478,7 +481,10 @@ async fn run_deepgram_relay(
             while let Some(message) = upstream_rx.next().await {
                 ensure_stt_account_active(&state, &session.account_id)?;
                 match message? {
-                    UpstreamMessage::Text(text) => client_tx.send(ClientMessage::Text(text)).await?,
+                    UpstreamMessage::Text(text) => {
+                        provider_frame_stats.observe(&session, started, &text);
+                        client_tx.send(ClientMessage::Text(text)).await?
+                    }
                     UpstreamMessage::Binary(bytes) => client_tx.send(ClientMessage::Binary(bytes)).await?,
                     UpstreamMessage::Ping(bytes) => client_tx.send(ClientMessage::Ping(bytes)).await?,
                     UpstreamMessage::Pong(bytes) => client_tx.send(ClientMessage::Pong(bytes)).await?,
@@ -535,6 +541,18 @@ async fn run_deepgram_relay(
         forwarded_audio_bytes,
         forwarded_audio_chunks,
         forwarded_audible_audio_chunks,
+        provider_text_frames = provider_frame_stats.text_frames,
+        provider_transcript_frames = provider_frame_stats.transcript_frames,
+        provider_partial_frames = provider_frame_stats.partial_frames,
+        provider_final_frames = provider_frame_stats.final_frames,
+        provider_empty_transcript_frames = provider_frame_stats.empty_transcript_frames,
+        provider_control_frames = provider_frame_stats.control_frames,
+        first_provider_frame_after_ms = provider_frame_stats.first_text_after_ms.unwrap_or(0),
+        first_provider_transcript_after_ms = provider_frame_stats
+            .first_transcript_after_ms
+            .unwrap_or(0),
+        first_provider_partial_after_ms = provider_frame_stats.first_partial_after_ms.unwrap_or(0),
+        first_provider_final_after_ms = provider_frame_stats.first_final_after_ms.unwrap_or(0),
         billable_elapsed_ms = billable_elapsed.as_millis() as u64,
         settle_reason = %settle_reason,
         "STT relay settlement prepared"
@@ -585,16 +603,22 @@ fn deepgram_realtime_url(session: &ClaimedSttSession) -> String {
         1_000,
         5_000,
     );
+    let no_delay = deepgram_realtime_env_bool("BLUEY_DEEPGRAM_NO_DELAY", DEFAULT_DEEPGRAM_NO_DELAY);
     let mut url = format!(
-        "{base}?model={}&encoding=linear16&sample_rate=16000&channels=1&punctuate=true&smart_format=true&interim_results=true&endpointing={endpointing_ms}&utterance_end_ms={utterance_end_ms}&vad_events=true",
+        "{base}?model={}&encoding=linear16&sample_rate=16000&channels=1&punctuate=true&smart_format=true&interim_results=true&endpointing={endpointing_ms}&utterance_end_ms={utterance_end_ms}&vad_events=true&no_delay={no_delay}",
         url_escape(&session.model),
     );
-    if let Ok(language) = std::env::var("BLUEY_DEEPGRAM_LANGUAGE") {
-        let language = language.trim();
-        if !language.is_empty() {
-            url.push_str("&language=");
-            url.push_str(&url_escape(language));
-        }
+    let language = std::env::var("BLUEY_DEEPGRAM_LANGUAGE")
+        .unwrap_or_else(|_| DEFAULT_DEEPGRAM_LANGUAGE.to_string());
+    let language = language.trim();
+    if !language.is_empty()
+        && !matches!(
+            language.to_ascii_lowercase().as_str(),
+            "auto" | "detect" | "none" | "off"
+        )
+    {
+        url.push_str("&language=");
+        url.push_str(&url_escape(language));
     }
     url
 }
@@ -605,6 +629,134 @@ fn deepgram_realtime_env_u32(name: &str, default: u32, min: u32, max: u32) -> u3
         .and_then(|value| value.trim().parse::<u32>().ok())
         .unwrap_or(default)
         .clamp(min, max)
+}
+
+fn deepgram_realtime_env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            matches!(value, "1")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(default)
+}
+
+#[derive(Debug, Default)]
+struct DeepgramRelayFrameStats {
+    text_frames: u64,
+    transcript_frames: u64,
+    partial_frames: u64,
+    final_frames: u64,
+    empty_transcript_frames: u64,
+    control_frames: u64,
+    first_text_after_ms: Option<u64>,
+    first_transcript_after_ms: Option<u64>,
+    first_partial_after_ms: Option<u64>,
+    first_final_after_ms: Option<u64>,
+}
+
+impl DeepgramRelayFrameStats {
+    fn observe(&mut self, session: &ClaimedSttSession, started: Instant, payload: &str) {
+        self.text_frames = self.text_frames.saturating_add(1);
+        let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.first_text_after_ms.get_or_insert(elapsed_ms);
+
+        let inspection = inspect_deepgram_relay_frame(payload);
+        if inspection.is_transcript_frame {
+            if inspection.transcript_chars == 0 {
+                self.empty_transcript_frames = self.empty_transcript_frames.saturating_add(1);
+            } else {
+                self.transcript_frames = self.transcript_frames.saturating_add(1);
+                self.first_transcript_after_ms.get_or_insert(elapsed_ms);
+                if inspection.is_final {
+                    self.final_frames = self.final_frames.saturating_add(1);
+                    self.first_final_after_ms.get_or_insert(elapsed_ms);
+                } else {
+                    self.partial_frames = self.partial_frames.saturating_add(1);
+                    self.first_partial_after_ms.get_or_insert(elapsed_ms);
+                }
+                if self.transcript_frames == 1
+                    || self.transcript_frames == 5
+                    || self.transcript_frames % 25 == 0
+                    || inspection.is_final
+                {
+                    tracing::info!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
+                        source = %session.source,
+                        provider = %session.provider,
+                        model = %session.model,
+                        frame_type = %inspection.frame_type,
+                        is_final = inspection.is_final,
+                        speech_final = inspection.speech_final,
+                        transcript_chars = inspection.transcript_chars,
+                        transcript_words = inspection.transcript_words,
+                        provider_elapsed_ms = elapsed_ms,
+                        provider_transcript_frames = self.transcript_frames,
+                        provider_partial_frames = self.partial_frames,
+                        provider_final_frames = self.final_frames,
+                        "STT relay provider transcript frame"
+                    );
+                }
+            }
+        } else {
+            self.control_frames = self.control_frames.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DeepgramRelayFrameInspection {
+    frame_type: String,
+    is_transcript_frame: bool,
+    is_final: bool,
+    speech_final: bool,
+    transcript_chars: usize,
+    transcript_words: usize,
+}
+
+fn inspect_deepgram_relay_frame(payload: &str) -> DeepgramRelayFrameInspection {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return DeepgramRelayFrameInspection {
+            frame_type: "invalid_json".to_string(),
+            ..DeepgramRelayFrameInspection::default()
+        };
+    };
+    let frame_type = value
+        .get("type")
+        .and_then(|ty| ty.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let is_transcript_frame = matches!(frame_type.as_str(), "Results" | "unknown")
+        && value
+            .get("channel")
+            .and_then(|channel| channel.as_object())
+            .is_some();
+    let transcript = value
+        .get("channel")
+        .and_then(|channel| channel.get("alternatives"))
+        .and_then(|alternatives| alternatives.as_array())
+        .and_then(|alternatives| alternatives.first())
+        .and_then(|alternative| alternative.get("transcript"))
+        .and_then(|transcript| transcript.as_str())
+        .unwrap_or("")
+        .trim();
+    DeepgramRelayFrameInspection {
+        frame_type,
+        is_transcript_frame,
+        is_final: value
+            .get("is_final")
+            .and_then(|is_final| is_final.as_bool())
+            .unwrap_or(false),
+        speech_final: value
+            .get("speech_final")
+            .and_then(|speech_final| speech_final.as_bool())
+            .unwrap_or(false),
+        transcript_chars: transcript.chars().count(),
+        transcript_words: transcript.split_whitespace().count(),
+    }
 }
 
 fn url_escape(value: &str) -> String {
@@ -743,6 +895,9 @@ fn finalize_relay_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static DEEPGRAM_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn random_token_is_url_safe_and_long() {
@@ -754,6 +909,9 @@ mod tests {
 
     #[test]
     fn deepgram_url_escapes_model() {
+        let _guard = DEEPGRAM_URL_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("BLUEY_DEEPGRAM_LANGUAGE");
+        std::env::remove_var("BLUEY_DEEPGRAM_NO_DELAY");
         let session = ClaimedSttSession {
             token: "token".into(),
             account_id: "acct".into(),
@@ -769,10 +927,52 @@ mod tests {
         let url = deepgram_realtime_url(&session);
         assert!(url.contains("model=nova%203%2Ftest"));
         assert!(url.contains("interim_results=true"));
-        assert!(url.contains("endpointing=200"));
+        assert!(url.contains("endpointing=300"));
         assert!(url.contains("utterance_end_ms=1000"));
         assert!(url.contains("vad_events=true"));
+        assert!(url.contains("no_delay=true"));
+        assert!(url.contains("language=en-US"));
         assert!(!url.contains("Token "));
+    }
+
+    #[test]
+    fn deepgram_url_can_omit_default_language() {
+        let _guard = DEEPGRAM_URL_ENV_LOCK.lock().unwrap();
+        std::env::set_var("BLUEY_DEEPGRAM_LANGUAGE", "auto");
+        let session = ClaimedSttSession {
+            token: "token".into(),
+            account_id: "acct".into(),
+            bluey_session_id: "sess".into(),
+            provider: "deepgram".into(),
+            model: "nova-3".into(),
+            source: "microphone".into(),
+            max_seconds: 60,
+            expires_at_ms: now_ms() + 60_000,
+            reserved_cents: 0,
+            reserved_trial_seconds: 0,
+        };
+        let url = deepgram_realtime_url(&session);
+        assert!(!url.contains("language="));
+        std::env::remove_var("BLUEY_DEEPGRAM_LANGUAGE");
+    }
+
+    #[test]
+    fn deepgram_frame_inspection_is_privacy_safe() {
+        let payload = r#"{
+          "type": "Results",
+          "is_final": false,
+          "speech_final": false,
+          "channel": {
+            "alternatives": [
+              {"transcript": "hello realtime captions"}
+            ]
+          }
+        }"#;
+        let inspected = inspect_deepgram_relay_frame(payload);
+        assert!(inspected.is_transcript_frame);
+        assert!(!inspected.is_final);
+        assert_eq!(inspected.transcript_chars, 23);
+        assert_eq!(inspected.transcript_words, 3);
     }
 
     #[test]
