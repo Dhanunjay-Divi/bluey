@@ -4664,3 +4664,54 @@ Deployment:
 - Live artifact SHA256:
   `bc81e08c501d1ab112dbd2850dcd44755bd292337aab3287aff1d991f56afe24`
 - Live verifier passed: signed `latest.json`, installer MIME types, artifact SHA, and unpacked binary version.
+
+## Latest Round 314: Live Answer Quality Smoke
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-314-LIVE-ANSWER-QUALITY-SMOKE.md`
+
+Round 314 addresses live answer-quality regressions found by replaying owner-style prompts against production `/router/complete`.
+
+Smoke prompts included:
+
+- BI/resume `Tell me about yourself`.
+- BI dashboard story and pushback around upstream refresh lag.
+- `Build me LRU cache in Python`.
+- LRU explanation follow-up.
+- Fibonacci topic reset into LRU.
+- Python swap without a third variable.
+- Secret Passage Ranch public lookup with `attached docs` wording.
+
+What changed:
+
+- Public lookup/research detection now wins over missing-context detection when the prompt is clearly asking about a public thing.
+- `current session/context/screen/transcript` no longer trips the external-web `current` heuristic.
+- Explanation-only coding prompts now produce compact answers instead of code artifacts/canvas replacements.
+- Explicit code/edit prompts still produce code artifacts.
+- `response_artifact_for_output` makes sidebar/canvas artifact detection respect `AnswerPlan.output`.
+- Coding prompt now prefers from-scratch hashmap plus doubly linked list for LRU-style interview code.
+- Behavioral prompt now explicitly forbids invented metrics, tools, source systems, domains, latency windows, outcomes, and motivations.
+
+Verification:
+
+```bash
+cargo fmt --all
+cargo test --manifest-path server/Cargo.toml answer_plan_ -- --nocapture
+cargo test --manifest-path server/Cargo.toml response_artifact -- --nocapture
+cargo test --manifest-path server/Cargo.toml --lib api::router::tests::answer_plan_eval_suite_covers_live_overlay_regressions -- --nocapture
+cargo build --manifest-path server/Cargo.toml
+```
+
+Status at handoff update time:
+
+- Local tests/build passed.
+- Server deploy and post-deploy live rerun are still pending.
