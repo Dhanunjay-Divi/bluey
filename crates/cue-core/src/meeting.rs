@@ -65,6 +65,21 @@ pub struct TranscriptSegment {
     /// (default)]` so transcripts persisted before this field deserialize.
     #[serde(default)]
     pub speaker_id: Option<i64>,
+    /// Audio position (seconds since capture start) for this segment, on the SAME
+    /// sample clock the diarizer uses (retention buffer's cumulative sample count
+    /// ÷ 16 kHz). This is what lets live diarization align a diarized speaker-time
+    /// segment to this transcript segment EXACTLY, rather than guessing via
+    /// wall-clock `created_at` (a different clock — the root cause of segments
+    /// staying unlabeled). `None` when diarization is off / no audio clock was
+    /// available. `#[serde(default)]` for back-compat with older transcripts.
+    #[serde(default)]
+    pub audio_start_secs: Option<f64>,
+    /// Estimated audio duration (seconds) of this segment's speech, so it forms an
+    /// interval `[audio_start_secs, +audio_dur_secs]` for max-total-overlap speaker
+    /// assignment (WhisperX-style) instead of a single-point test. `None` falls
+    /// back to a default span. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub audio_dur_secs: Option<f64>,
 }
 
 impl TranscriptSegment {
@@ -76,12 +91,26 @@ impl TranscriptSegment {
             created_at: clock::now_epoch_ms_string(),
             is_final,
             speaker_id: None,
+            audio_start_secs: None,
+            audio_dur_secs: None,
         }
     }
 
     /// Attach a diarized speaker id (builder-style).
     pub fn with_speaker_id(mut self, speaker_id: Option<i64>) -> Self {
         self.speaker_id = speaker_id;
+        self
+    }
+
+    /// Attach the audio-clock position (seconds since capture start), builder-style.
+    pub fn with_audio_start_secs(mut self, secs: Option<f64>) -> Self {
+        self.audio_start_secs = secs;
+        self
+    }
+
+    /// Attach the estimated audio duration (seconds), builder-style.
+    pub fn with_audio_dur_secs(mut self, secs: Option<f64>) -> Self {
+        self.audio_dur_secs = secs;
         self
     }
 

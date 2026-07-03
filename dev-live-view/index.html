@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bluey — Live Transcript · Diarization · Ledger</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #131824; --panel2: #0f1420; --line: #1f2637;
+    --text: #e6ebf5; --dim: #8b97ad; --accent: #5b8cff; --good: #35d29b;
+    --warn: #ffce5c; --quote: #6f7c95;
+    --sp1: #5b8cff; --sp2: #35d29b; --sp3: #ff8a5b; --sp4: #c98cff; --sp0: #8b97ad;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); }
+  header {
+    display: flex; align-items: center; gap: 14px; padding: 12px 18px;
+    border-bottom: 1px solid var(--line); background: var(--panel2);
+  }
+  header h1 { font-size: 15px; font-weight: 650; margin: 0; letter-spacing: .2px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #555; box-shadow: 0 0 0 3px rgba(255,255,255,.03); }
+  .dot.on { background: var(--good); box-shadow: 0 0 10px var(--good); }
+  .dot.off { background: #e5484d; }
+  #status { font-size: 12.5px; color: var(--dim); }
+  #wsurl { font-family: var(--mono); font-size: 11.5px; color: var(--dim); }
+  .spacer { flex: 1; }
+  button {
+    font: inherit; font-size: 12.5px; color: var(--text); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+
+  main { display: grid; grid-template-columns: 1.4fr 1fr; gap: 0; height: calc(100% - 52px); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; height: auto; } }
+
+  section { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); }
+  .col-title {
+    display: flex; align-items: center; gap: 8px; padding: 10px 16px;
+    font-size: 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--dim);
+    border-bottom: 1px solid var(--line); background: var(--panel2);
+  }
+  .count { margin-left: auto; font-family: var(--mono); color: var(--dim); font-size: 11.5px; }
+
+  /* Transcript */
+  #transcript { overflow-y: auto; padding: 12px 16px; flex: 1; }
+  .line { display: flex; gap: 10px; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,.03); animation: fade .25s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; } }
+  .tag {
+    flex: none; min-width: 78px; font-family: var(--mono); font-size: 11.5px; font-weight: 600;
+    padding-top: 1px;
+  }
+  .tag.sp1 { color: var(--sp1); } .tag.sp2 { color: var(--sp2); }
+  .tag.sp3 { color: var(--sp3); } .tag.sp4 { color: var(--sp4); } .tag.sp0 { color: var(--sp0); }
+  .txt { font-size: 14px; line-height: 1.5; }
+  .txt .partial { color: var(--dim); font-style: italic; }
+
+  /* Ledger */
+  #ledger-wrap { display: flex; flex-direction: column; min-height: 0; }
+  #ledger { overflow-y: auto; padding: 12px 16px; flex: 1; }
+  .lg-empty { color: var(--dim); font-size: 13px; padding: 20px 4px; }
+  .lg-group { margin-bottom: 18px; }
+  .lg-head { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--accent); margin-bottom: 8px; font-weight: 700; }
+  .lg-head.constraint { color: var(--warn); } .lg-head.owner { color: var(--sp3); }
+  .lg-item { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; margin-bottom: 8px; animation: fade .3s ease; }
+  .lg-text { font-size: 13.5px; line-height: 1.45; }
+  .lg-item.new { border-color: var(--good); box-shadow: 0 0 0 1px var(--good); }
+
+  /* Log */
+  #log-wrap { border-right: none; }
+  #log { overflow-y: auto; padding: 8px 12px; flex: 1; font-family: var(--mono); font-size: 11px; line-height: 1.55; color: var(--quote); }
+  .ev { white-space: pre-wrap; word-break: break-word; padding: 1px 0; }
+  .ev.t { color: #7f8db0; } .ev.l { color: var(--good); } .ev.sys { color: var(--dim); }
+
+  .hint { padding: 10px 16px; font-size: 11.5px; color: var(--dim); border-top: 1px solid var(--line); background: var(--panel2); font-family: var(--mono); }
+</style>
+</head>
+<body>
+<header>
+  <span id="dot" class="dot"></span>
+  <h1>Bluey Live View</h1>
+  <span id="status">connecting…</span>
+  <span class="spacer"></span>
+  <span id="wsurl"></span>
+  <button id="reconnect">reconnect</button>
+  <button id="clear">clear</button>
+</header>
+
+<main>
+  <section>
+    <div class="col-title">Transcript &amp; speakers <span class="count" id="tcount">0</span></div>
+    <div id="transcript"></div>
+    <div class="hint">Speaker labels come from diarization (event <code>.speaker</code>). Mic = You.</div>
+  </section>
+
+  <section id="ledger-wrap">
+    <div class="col-title">Verified decisions ledger <span class="count" id="lcount">0 items</span></div>
+    <div id="ledger"><div class="lg-empty">No ledger yet. It builds every N turns once <code>BLUEY_LEDGER=1</code> and a pass produces quote-verified items.</div></div>
+    <div class="hint">Every item survived the quote-verify harness — nothing here was fabricated.</div>
+  </section>
+
+  <section id="log-wrap" style="grid-column: 1 / -1; max-height: 200px; border-top: 1px solid var(--line);">
+    <div class="col-title">Raw event log <span class="count" id="ecount">0</span></div>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  const WS_URL = "ws://" + (location.hostname || "127.0.0.1") + ":8766";
+  const $ = (id) => document.getElementById(id);
+  const wsurlEl = $("wsurl"); wsurlEl.textContent = WS_URL;
+
+  const transcriptEl = $("transcript"), ledgerEl = $("ledger"), logEl = $("log");
+  const dot = $("dot"), statusEl = $("status");
+  let ws = null, evCount = 0, tCount = 0;
+  // Stitching state (mirrors the overlay): the line currently being appended to,
+  // and the timestamp of the last fragment (for the 2.5s pause rule).
+  let current = null, lastAtMs = 0;
+  // All committed transcript line elements, for in-place speaker-label upgrades.
+  let finalLines = [];
+
+  const speakerClass = (n) => (n == null ? "sp0" : "sp" + ((n % 4) + 1));
+  const speakerLabel = (ev) => {
+    if (ev.source === "microphone") return "You";
+    if (ev.speaker != null) return "Speaker " + ev.speaker;
+    if (ev.source === "system") return "They";
+    return ev.source || "—";
+  };
+
+  function log(cls, msg) {
+    evCount++; $("ecount").textContent = evCount;
+    const d = document.createElement("div");
+    d.className = "ev " + cls;
+    d.textContent = msg;
+    logEl.appendChild(d);
+    logEl.scrollTop = logEl.scrollHeight;
+    while (logEl.childElementCount > 400) logEl.removeChild(logEl.firstChild);
+  }
+
+  // Production-grade stitching (see docs/TRANSCRIPTION-PRODUCTION-PLAN.md P1).
+  // A new line starts on a real UTTERANCE BOUNDARY, not a fixed wall-clock pause:
+  //   1. SPEAKER CHANGE — diarized speaker (ev.speaker) or audio source differs.
+  //      [Deepgram/AssemblyAI: cut on speaker_changed]
+  //   2. AUDIO-TIME GAP — gap on the shared AUDIO clock (ev.audio_secs) exceeds
+  //      GAP_SECS. This is Deepgram's UtteranceEnd measured on word-time, immune
+  //      to network/model jitter (unlike a wall-clock pause).
+  //   3. FALLBACK — when no audio clock is present (injected text), fall back to a
+  //      wall-clock pause so behavior is still reasonable.
+  // Otherwise APPEND with raw concatenation so SentencePiece leading-space word
+  // boundaries survive ("Everybody"+" else" → "Everybody else"). Display is left-
+  // trimmed only.
+  const GAP_SECS = 1.0;          // audio-time word-gap that ends an utterance
+  const FALLBACK_PAUSE_MS = 2400; // only when no audio clock (AssemblyAI max_turn_silence)
+
+  function renderLine(line) {
+    line._inner.textContent = line._text.replace(/^\s+/, "") || "…";
+  }
+
+  function isBoundary(ev, now) {
+    if (!current) return true;
+    // 1. speaker / source change
+    const sameSpeaker =
+      current._speaker === ev.speaker && current._source === ev.source;
+    if (!sameSpeaker) return true;
+    // 2. audio-time gap (preferred, jitter-immune)
+    if (ev.audio_secs != null && current._audioEnd != null) {
+      return ev.audio_secs - current._audioEnd > GAP_SECS;
+    }
+    // 3. wall-clock fallback
+    return now - lastAtMs > FALLBACK_PAUSE_MS;
+  }
+
+  function addTranscript(ev) {
+    if (ev.is_final === false) return; // only finals broadcast today
+    const now = ev.ts_ms || Date.now();
+    const boundary = isBoundary(ev, now);
+    lastAtMs = now;
+
+    if (!boundary) {
+      current._text += ev.text || "";          // raw append (same utterance)
+      if (ev.audio_secs != null) current._audioEnd = ev.audio_secs + 0.6;
+      renderLine(current);
+    } else {
+      const line = document.createElement("div"); line.className = "line";
+      const tag = document.createElement("span");
+      tag.className = "tag " + speakerClass(ev.speaker);
+      tag.textContent = speakerLabel(ev);
+      const txt = document.createElement("span"); txt.className = "txt";
+      const inner = document.createElement("span");
+      txt.appendChild(inner);
+      line.appendChild(tag); line.appendChild(txt);
+      line._tag = tag; line._inner = inner;
+      line._source = ev.source; line._speaker = ev.speaker;
+      line._text = ev.text || "";
+      line._audioStart = ev.audio_secs != null ? ev.audio_secs : null;
+      line._audioEnd = ev.audio_secs != null ? ev.audio_secs + 0.6 : null;
+      renderLine(line);
+      transcriptEl.appendChild(line);
+      current = line; finalLines.push(line);
+      tCount++; $("tcount").textContent = tCount;
+    }
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  // A diarization speaker_update arrived: the daemon re-sends a segment's text
+  // once it has a real speaker id. Find the line whose accumulated text CONTAINS
+  // that fragment and upgrade its label to "Speaker N", with a flash.
+  function applySpeakerUpdate(ev) {
+    const frag = (ev.text || "").trim();
+    if (!frag) return false;
+    for (let i = finalLines.length - 1; i >= 0; i--) {
+      const line = finalLines[i];
+      if (line._text && line._text.includes(frag) && line._tag) {
+        line._speaker = ev.speaker;
+        line._tag.className = "tag " + speakerClass(ev.speaker);
+        line._tag.textContent = speakerLabel(ev);
+        line.style.transition = "background .4s"; line.style.background = "rgba(53,210,155,.12)";
+        setTimeout(() => { line.style.background = ""; }, 900);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Parse the rendered ledger block into groups for display.
+  function renderLedger(block) {
+    ledgerEl.innerHTML = "";
+    if (!block || !block.trim()) {
+      ledgerEl.innerHTML = '<div class="lg-empty">Ledger empty.</div>'; return;
+    }
+    let group = null, itemCount = 0;
+    const mkGroup = (name) => {
+      const g = document.createElement("div"); g.className = "lg-group";
+      const h = document.createElement("div");
+      h.className = "lg-head " + name.toLowerCase().replace(/s$/, "");
+      h.textContent = name; g.appendChild(h); ledgerEl.appendChild(g); return g;
+    };
+    for (const raw of block.split("\n")) {
+      const l = raw.trim();
+      if (!l) continue;
+      if (/^(Decisions|Constraints|Owners):$/.test(l)) { group = mkGroup(l.replace(":", "")); continue; }
+      if (l.startsWith("- ")) {
+        if (!group) group = mkGroup("Decisions");
+        const it = document.createElement("div"); it.className = "lg-item new";
+        const t = document.createElement("div"); t.className = "lg-text";
+        t.textContent = l.slice(2); it.appendChild(t); group.appendChild(it); itemCount++;
+        setTimeout(() => it.classList.remove("new"), 1500);
+      }
+    }
+    $("lcount").textContent = itemCount + (itemCount === 1 ? " item" : " items");
+  }
+
+  function onEvent(ev) {
+    if (ev.kind === "ledger") {
+      log("l", "LEDGER  " + (ev.ledger || "").replace(/\n/g, " ⏎ ").slice(0, 160));
+      renderLedger(ev.ledger || "");
+    } else if (ev.kind === "speaker_update") {
+      const ok = applySpeakerUpdate(ev);
+      log("sys", "DIARIZE → Speaker " + ev.speaker + " on: \"" +
+        (ev.text || "").trim().slice(0, 40) + "\"" + (ok ? "" : " (line not found)"));
+    } else {
+      log("t", (ev.is_final ? "FINAL " : "part  ") +
+        "[" + speakerLabel(ev) + "] " + (ev.text || "").trim());
+      addTranscript(ev);
+    }
+  }
+
+  function setConn(state) {
+    if (state === "open") { dot.className = "dot on"; statusEl.textContent = "connected · live"; }
+    else if (state === "closed") { dot.className = "dot off"; statusEl.textContent = "disconnected — is the daemon running?"; }
+    else { dot.className = "dot"; statusEl.textContent = "connecting…"; }
+  }
+
+  function connect() {
+    setConn("connecting");
+    try { ws = new WebSocket(WS_URL); }
+    catch (e) { setConn("closed"); log("sys", "WS construct failed: " + e); return; }
+    ws.onopen = () => { setConn("open"); log("sys", "connected to " + WS_URL); };
+    ws.onclose = () => { setConn("closed"); log("sys", "connection closed"); };
+    ws.onerror = () => { log("sys", "WS error"); };
+    ws.onmessage = (m) => {
+      let ev; try { ev = JSON.parse(m.data); } catch { log("sys", "bad JSON: " + m.data); return; }
+      onEvent(ev);
+    };
+  }
+
+  $("reconnect").onclick = () => { if (ws) try { ws.close(); } catch {} connect(); };
+  $("clear").onclick = () => {
+    transcriptEl.innerHTML = ""; logEl.innerHTML = "";
+    ledgerEl.innerHTML = '<div class="lg-empty">Cleared.</div>';
+    evCount = 0; tCount = 0; current = null; lastAtMs = 0; finalLines = [];
+    $("ecount").textContent = 0; $("tcount").textContent = 0; $("lcount").textContent = "0 items";
+  };
+
+  connect();
+})();
+</script>
+</body>
+</html>

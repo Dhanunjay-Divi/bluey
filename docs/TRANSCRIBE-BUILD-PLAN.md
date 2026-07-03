@@ -125,3 +125,151 @@ one ort linking mode per target).
 - ort execution providers (CoreML/DirectML/CPU availability): https://ort.pyke.io/perf/execution-providers
 - parakeet-rs (CoreML unstable, CPU faster than whisper-metal; 560ms streaming): https://github.com/altunenes/parakeet-rs
 - macOS: bare CLI can't appear in Screen Recording; .app bundle does; ad-hoc signing wipes grant on rebuild; CGRequestScreenCaptureAccess registers the app: https://developer.apple.com/documentation/screencapturekit/ , https://dgrlabs.co/blog/2026-04-25-capturing-system-audio-on-macos-in-2026.html
+
+## Word-Drop / Word-Scramble Bug — Root Cause & Fix (in-order serialized sink)
+
+> Diagnosed 2026-07-03 with real-time-streamed VoxConverse audio (raw STT engine
+> vs daemon layer). Documented so the regression is not reintroduced.
+
+### Symptom
+Live system-audio transcript scrambled word runs ("... when I think for me, ...")
+and silently dropped distinct finals under load — while STT had been seamless before.
+
+### Root cause (NOT the STT engine)
+The Nemotron/Parakeet engine is content-clean: real-time-paced and batch
+transcripts are **byte-identical** (verified via `realtime_emit` vs a batch pass,
+20 emits, IDENTICAL diff). The engine neither drops nor scrambles words.
+
+The bug was in the daemon. Commit `5f211b0` replaced the in-order `.await` sink
+(as in `8d6efbc:app.rs:1137`) with a **detached per-segment `tokio::spawn`**. On the
+multi-thread tokio runtime (`#[tokio::main]`, no flavor), those tasks run
+concurrently and, because the sink yields (`daemon.audio.lock().await`) BEFORE
+taking the meeting lock, a later segment could `push` before an earlier one:
+  - **Word-SCRAMBLE:** transcript committed out of model order.
+  - **Word-DROP (downstream):** the reordered tail poisoned
+    `is_near_duplicate_transcript` (walks the last 8 segments in an 8s window),
+    which then discarded legitimate distinct finals as duplicates.
+
+Separately, the engine is over real-time at the daemon's 20ms (320-sample) chunk
+cadence (RTF 1.29x, worst push 128ms) but comfortably real-time at 100ms
+(1600-sample) chunks (RTF 0.40x). Because `sys_rx` and the provider queue are
+unbounded end to end, this deficit causes **unbounded latency growth, not word
+loss** — a distinct problem from the scramble/drop.
+
+### Fix
+1. **In-order serialized sink (correctness — shipped).** One background consumer
+   task per capture owns an unbounded mpsc receiver and awaits
+   `add_audio_transcript_segment_allowing_session_start` for each segment in strict
+   FIFO order. The `select!` loop hands each Final off with a non-blocking
+   `seg_tx.send(...)`, so audio intake never blocks AND commit order == receipt
+   order. On loop break: `drop(seg_tx); sink_task.await;` flushes in order. This
+   preserves the `5f211b0` goal (sink I/O off the audio loop) while restoring the
+   `8d6efbc` ordering invariant the dedup logic depends on.
+2. **~100ms (1600-sample) chunk coalescing before `send_audio` (recommended,
+   throughput only).** Keeps the engine under real-time; does not affect content.
+   [Not yet applied — latency only, no word loss.]
+
+### Invariant — do NOT reintroduce the regression
+Transcript segments MUST be committed to `meeting.transcript` in the exact order
+they arrive from the provider. **Never spawn one detached task per segment for the
+sink** — that reorders commits on the multi-thread runtime and corrupts the dedup
+tail. Any off-loop sink must be a SINGLE ordered consumer.
+
+### Verification
+- Raw engine: `realtime_emit` (20ms real-time) vs batch → byte-identical (PASS).
+- Daemon: `STT_RECV_SEQ` labels each segment at arrival; the ordered consumer
+  commits in that order. Verified live-streamed msbyq (44 segments): arrival seq
+  `0..43` == commit seq `0..43`, monotonic, no gaps → no scramble, no drop.
+
+## Live STT Lag + Eaten Words — Root Cause & Fix (chunk coalescing + VAD)
+
+> Diagnosed 2026-07-03 by mapping the live path + web research + measuring RTF and
+> queue backlog on real-time-streamed VoxConverse audio. Two DISTINCT bugs.
+
+### Symptom
+Live transcript increasingly LAGGED behind speech, and quiet/onset words were EATEN
+(missing in the middle) — even with diarization OFF.
+
+### Cause 1 — LAG: 20ms feed → redundant mel recompute → RTF>1 → unbounded backlog
+The capture path frames 20ms/320-sample chunks and fed them 1:1 to the engine.
+parakeet-rs recomputes the mel spectrogram over its WHOLE internal buffer on EVERY
+`transcribe_chunk` call (nemotron.rs:628) — even the ~27/28 calls that early-return
+without running the encoder. At 20ms cadence that's ~50 full-window mel recomputes/
+sec → **RTF 1.29x** (over real-time). Every live queue is unbounded (sys_tx,
+audio_tx, seg_tx), so an RTF≥1 worker can't drop or backpressure — the `audio_rx`
+backlog grows **monotonically → ever-increasing lag**.
+
+**Fix: coalesce forwarded frames to ~100ms (1600 samples) before `send_audio`**
+(app.rs). Cuts mel recomputes ~5x → **RTF 0.25x measured**, backlog pinned at 0.
+The engine self-buffers to its 560ms encoder window regardless, so transcript
+content is UNCHANGED — verified byte-complete after coalescing. MEASURED on
+real-time-streamed aepyx (169s): chunk 20ms→100ms, RTF 1.29→0.25, backlog
+end=0/max=11 (was growing unbounded), transcript complete.
+
+### Cause 2 — EATEN WORDS: RMS VAD gate dropped quiet / onset speech
+The default build uses only the Send-safe `RmsGate`, which Drops chunks below 2%
+RMS after 500ms silence. Quiet speech / soft talkers / utterance onsets after a
+pause fell below the 2% floor and were dropped, clipping words.
+
+**Fix: lower default `rms_threshold_start` 0.02→0.01 and raise
+`silence_hangover_frames` 25→50 (1000ms)** (cue-core/src/vad.rs). Admits quiet
+speech, holds longer after speech so trailing words aren't cut. Env-tunable via
+`BLUEY_VAD_RMS_THRESHOLD` / `BLUEY_VAD_HANGOVER_MS`.
+
+### Diagnostics added (to prove it live)
+`STTPERF push` in the parakeet worker logs per-chunk `rtf` + `backlog` (climbing
+backlog + RTF≥1 = lag bug); `vad_dropped` counter in the audio loop (high count on
+talky audio = VAD eating speech).
+
+### Invariant
+Feed the STT engine ~100ms chunks, NOT 20ms — 20ms multiplies parakeet-rs's
+per-call mel recompute ~5x and pushes RTF over real-time. Coalescing is content-
+neutral (engine buffers to 560ms internally).
+
+## Bursty / Laggy Live Transcript — Root Cause & Fix (continuous uniform feed)
+
+> Diagnosed 2026-07-03. Text arrived in multi-second BURSTS (86 clumps, gaps up to
+> ~9s) despite the STT queue keeping up (backlog 0, RTF 0.26x) and 0 VAD drops —
+> i.e. the lag/eating was NOT queue backpressure. The user's instinct was right:
+> audio was being LOST/DISRUPTED in the gaps between sends.
+
+### Two mistakes we made (both in the daemon audio→engine feed, app.rs)
+1. **VAD-gated the engine feed.** The RMS VAD dropped "silence" frames BEFORE the
+   engine via `continue`. But Parakeet/Nemotron is CACHE-AWARE STREAMING and
+   assumes a CONTINUOUS audio timeline. Dropping frames punches HOLES in that
+   timeline → (a) any misjudged-quiet-speech is permanently lost, (b) the streaming
+   cache desyncs → output batches into multi-second bursts.
+2. **Fed VARIABLE-size chunks.** The coalescing sent ~100ms during speech but
+   short 20ms flushes on silence boundaries / timeouts. Irregular chunk sizes also
+   desync the streaming window, worsening the bursting.
+
+### The fix (both required)
+- **NO VAD gating on the system-audio engine feed.** Feed the model everything,
+  continuously. It handles silence itself. (VAD may still be used mic-side later,
+  but never to gate the streaming engine.)
+- **UNIFORM fixed-size chunks.** Buffer to EXACTLY `COALESCE_SAMPLES` (1600 = 100ms
+  @16k) and only ever `send_audio` that size, carrying the remainder. Every chunk
+  the engine sees is identical → the cache stays in sync.
+  MEASURED: bursts 86→9, max gap 9.0s→3.4s, median emit ~593ms (matches the model's
+  ~560ms window), RTF 0.26x, backlog flat. Remaining >3s gaps = genuine audio silence.
+
+### The full STT invariant set (do NOT reintroduce any of these regressions)
+1. **Feed a CONTINUOUS, UNIFORM stream** to the cache-aware streaming engine — no
+   VAD holes, no variable chunk sizes. Fixed ~100ms chunks including silence.
+2. **~100ms chunks, never 20ms.** 20ms multiplies parakeet-rs's per-call mel
+   recompute ~5x → RTF over real-time → unbounded backlog → growing lag.
+3. **Commit transcript segments IN RECEIPT ORDER** via a single ordered sink task —
+   never one detached `tokio::spawn` per segment (reorders on the multi-thread
+   runtime → scrambled/dropped words).
+4. **Never do disk I/O (`save_active`) under the `meeting` lock** — it blocks the
+   STT sink 50-200ms. Clone under the lock, save after releasing it.
+5. STT runs **CPU (ort), not CoreML** — CoreML is unstable for this model.
+
+### Diagnostic tooling left in place
+- `STTPERF push` (parakeet worker): per-chunk `rtf` + `backlog`. RTF≥1 + climbing
+  backlog = lag. `RUST_LOG=cue_daemon=debug` to see it.
+- Emit-cadence check: cluster committed segments by `created_at`; many bursts with
+  big gaps (with backlog 0 + 0 VAD drops) = streaming-cache desync, not queue lag.
+- WAV harness: `BLUEY_AUDIO_WAV_FILE=<16k mono wav>` drives the full live pipeline
+  at real-time cadence for reproducible measurement (crates/cue-transcribe examples
+  realtime_emit/chunk_timing for raw-engine A/B).

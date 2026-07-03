@@ -13,23 +13,28 @@
 
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::app::Daemon;
 
-/// Rolling window the live tier re-diarizes (seconds). 120s balances accuracy
-/// (enough speech per speaker to embed well) against per-window cost.
-pub const LIVE_WINDOW_SECS: usize = 120;
+/// Rolling window the live tier re-diarizes (seconds). 30s is the diart-style
+/// "local segmentation buffer": long enough for speakrs's VBx to separate ≤4
+/// speakers reliably, short enough that after 30s the window is genuinely ROLLING
+/// (fixed length) rather than growing-from-0 — which, combined with the persistent
+/// arrival-ordered speaker set in `LiveDiarizer`, is what keeps ids stable.
+pub const LIVE_WINDOW_SECS: usize = 30;
 
 /// How often the live tier re-diarizes, in seconds. Overridable via
-/// `BLUEY_DIARIZE_INTERVAL_SECS`. Default 30s → ~30s effective label latency,
-/// which is fine for AI context (labels firm up as the meeting proceeds).
+/// `BLUEY_DIARIZE_INTERVAL_SECS`. Default 15s → 30s window / 15s step: labels firm
+/// up reasonably fast, but the per-tick window CLONE (held under the retention
+/// mutex, contended with the 20 ms chunk push) happens half as often as at 10s,
+/// so STT stays smooth. Don't drop below ~15 without profiling the STT hot path.
 pub fn live_interval_secs() -> u64 {
     std::env::var("BLUEY_DIARIZE_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n| n >= 5)
-        .unwrap_or(30)
+        .unwrap_or(15)
 }
 
 /// Whether diarization is enabled at runtime. Off unless `BLUEY_DIARIZE=1` — the
@@ -56,14 +61,6 @@ pub(crate) struct LiveDiarizerHandle {
     window_tx: tokio::sync::mpsc::Sender<(Vec<f32>, f64)>,
     /// worker → daemon: labeled segments for the last processed window.
     result_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<cue_diarize::Segment>>,
-}
-
-impl LiveDiarizerHandle {
-    /// Non-blocking submit of a rolling window. Drops silently if the worker is
-    /// still processing the previous one (channel full) — best-effort.
-    fn try_submit(&self, window: Vec<f32>, start_secs: f64) {
-        let _ = self.window_tx.try_send((window, start_secs));
-    }
 }
 
 /// Spawn the live diarizer worker thread if diarization is enabled. The heavy
@@ -112,60 +109,174 @@ pub(crate) fn spawn_live_diarizer() -> Option<LiveDiarizerHandle> {
     })
 }
 
-/// One LIVE tick (called on the audio task): submit the current rolling window
-/// to the worker (non-blocking) and drain any ready results, stamping stable
-/// speaker ids onto overlapping transcript segments. Never blocks on inference.
-pub(crate) async fn live_tick(daemon: &Arc<Daemon>, handle: &mut LiveDiarizerHandle) {
-    // Submit the current window (cheap copy; non-blocking send).
-    let submit = {
-        let guard = daemon.audio_retention.lock().await;
-        match guard.as_ref() {
-            Some(r) if r.duration_secs() >= 3.0 => Some(r.rolling_window()),
-            _ => None,
-        }
-    };
-    if let Some((window, start)) = submit {
-        handle.try_submit(window, start);
+/// One LIVE tick (called on the audio task). CRITICAL: this must do essentially
+/// ZERO work on the audio task — the select! loop that calls it is the same one
+/// that reads `sys_rx`, so any lock wait, big clone, or disk I/O here stalls audio
+/// intake and EATS WORDS. So it only (1) drains ready diarizer results NON-blocking
+/// (`try_recv`) and hands the label+persist work to a DETACHED task, and (2) spawns
+/// a DETACHED task to grab the rolling window (which locks retention and clones
+/// ~1.9 MB) and submit it to the worker thread. The audio loop returns to
+/// `sys_rx.recv()` immediately.
+pub(crate) fn live_tick(daemon: &Arc<Daemon>, handle: &mut LiveDiarizerHandle) {
+    // 1) Drain completed results without blocking; label+persist off the audio task.
+    while let Ok(segments) = handle.result_rx.try_recv() {
+        let d = daemon.clone();
+        tokio::spawn(async move {
+            label_segments_by_overlap(&d, &segments).await;
+        });
     }
 
-    // Drain any completed results (from THIS or a prior tick) and apply labels.
-    while let Ok(segments) = handle.result_rx.try_recv() {
-        label_segments_by_overlap(daemon, &segments).await;
-    }
+    // 2) Grab + submit the window on a detached task (retention lock + big clone
+    //    must NOT run on the audio select! loop). `window_tx` is cloneable.
+    let d = daemon.clone();
+    let tx = handle.window_tx.clone();
+    tokio::spawn(async move {
+        let submit = {
+            let guard = d.audio_retention.lock().await;
+            match guard.as_ref() {
+                Some(r) if r.duration_secs() >= 3.0 => Some(r.rolling_window()),
+                _ => None,
+            }
+        };
+        if let Some((window, start)) = submit {
+            debug!(
+                samples = window.len(),
+                start_secs = start,
+                "diarize: live_tick submitting window"
+            );
+            let _ = tx.try_send((window, start));
+        }
+    });
 }
 
 /// Assign each diarized segment's speaker id to transcript segments whose time
-/// window overlaps it (system-side only). Updates the in-memory meeting; the
-/// live-transcript event consumers pick up the label on the next emit.
+/// window overlaps it (system-side only). Updates the in-memory meeting AND
+/// re-broadcasts each newly-labelled segment over the live-transcript WebSocket,
+/// so a view that already received the line (with `speaker=None`) can upgrade the
+/// label in place to the real "Speaker N".
 async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize::Segment]) {
-    let mut guard = daemon.meeting.lock().await;
-    let Some(meeting) = guard.as_mut() else {
-        return;
-    };
-    // Meeting start epoch ms → convert segment abs seconds to a comparable clock.
-    // Transcript segments carry `created_at` epoch-ms strings; we approximate
-    // overlap by matching each transcript segment to the diarized segment whose
-    // [start,end] contains its arrival time relative to meeting start.
-    let meeting_start_ms: i64 = meeting
-        .transcript
-        .first()
-        .and_then(|s| s.created_at.parse::<i64>().ok())
-        .unwrap_or(0);
-    for seg in meeting.transcript.iter_mut() {
-        // Only the far (system) side gets an individual id.
-        if seg.speaker.is_me() {
-            continue;
-        }
-        let Ok(ts_ms) = seg.created_at.parse::<i64>() else {
-            continue;
+    // Collect what changed while holding the meeting lock; broadcast after
+    // releasing it (broadcast::send is sync and non-blocking, but keep the
+    // lock scope tight).
+    let mut updates: Vec<(String, String, i64, u64)> = Vec::new();
+    let session_id;
+    // Snapshot to persist AFTER releasing the meeting lock. Saving under the lock
+    // is a ~50-200ms synchronous disk write that would block the STT sink from
+    // committing segments — i.e. "STT goes off while diarization runs". We stamp
+    // ids under the lock (cheap), clone once, release, then save off-lock.
+    let mut to_persist: Option<cue_core::meeting::MeetingRecord> = None;
+    {
+        let mut guard = daemon.meeting.lock().await;
+        let Some(meeting) = guard.as_mut() else {
+            return;
         };
-        let rel_secs = (ts_ms - meeting_start_ms) as f64 / 1000.0;
-        if let Some(d) = segments
-            .iter()
-            .find(|d| rel_secs >= d.start - 1.0 && rel_secs <= d.end + 1.0)
-        {
-            seg.speaker_id = Some(d.speaker);
+        session_id = meeting.id.to_string();
+        for seg in meeting.transcript.iter_mut() {
+            // Only the far (system) side gets an individual id (mic = the user).
+            if seg.speaker.is_me() {
+                continue;
+            }
+            if let Some(speaker) = assign_speaker(seg, segments) {
+                if seg.speaker_id != Some(speaker) {
+                    seg.speaker_id = Some(speaker);
+                    let ts_ms = seg.created_at.parse::<u64>().unwrap_or(0);
+                    updates.push((seg.text.clone(), seg.speaker.to_string(), speaker, ts_ms));
+                }
+            }
         }
+        if !updates.is_empty() {
+            to_persist = Some(meeting.clone());
+        }
+    } // meeting lock released HERE — before any disk I/O.
+
+    // Persist off-lock so the STT sink never waits on the diarizer's disk write.
+    if let Some(meeting) = to_persist {
+        if let Err(e) = daemon.store.save_active(&meeting) {
+            warn!("diarize: failed to persist live speaker labels: {e:#}");
+        }
+    }
+
+    for (text, source, speaker_id, ts_ms) in updates {
+        crate::app::broadcast_speaker_update(
+            daemon,
+            session_id.clone(),
+            source,
+            text,
+            speaker_id,
+            ts_ms,
+        );
+    }
+}
+
+/// Distance (seconds) from a point to a [start, end] range: 0 if inside, else
+/// the gap to the nearer edge. Used to pick the nearest diarized segment.
+fn dist_to_range(point: f64, start: f64, end: f64) -> f64 {
+    if point < start {
+        start - point
+    } else if point > end {
+        point - end
+    } else {
+        0.0
+    }
+}
+
+/// Default speech span (seconds) assumed for a transcript segment lacking a
+/// measured `audio_dur_secs` — roughly one Nemotron final's worth of audio.
+const DEFAULT_SEGMENT_DUR_SECS: f64 = 0.6;
+
+/// Cap (seconds) on the nearest-segment fallback: if the closest diarized turn is
+/// farther than this from the transcript segment, leave it unlabeled rather than
+/// inherit a distant speaker (WhisperX drops words with no overlap unless
+/// `fill_nearest`; this is the capped compromise).
+const NEAREST_FALLBACK_CAP_SECS: f64 = 2.0;
+
+/// Assign a diarized speaker to a transcript segment using WhisperX-style
+/// **max-total-overlap**: the segment forms an interval `[start, start+dur]` on
+/// the shared audio clock; for each diarized turn accumulate the overlap
+/// `max(0, min(ends) − max(starts))`, and pick the speaker with the most total
+/// overlap. If nothing overlaps, fall back to the nearest turn within
+/// [`NEAREST_FALLBACK_CAP_SECS`]; beyond that, return `None` (don't mislabel).
+fn assign_speaker(
+    seg: &cue_core::meeting::TranscriptSegment,
+    turns: &[cue_diarize::Segment],
+) -> Option<i64> {
+    let start = seg.audio_start_secs?;
+    let end = start + seg.audio_dur_secs.unwrap_or(DEFAULT_SEGMENT_DUR_SECS);
+
+    // Only consider turns the live tier actually labelled (skip the UNLABELED
+    // sentinel — an unmatched turn must never stamp -1 onto a transcript segment).
+    let labelled = || turns.iter().filter(|t| t.speaker >= 0);
+
+    // 1) Max-total-overlap.
+    let mut best: Option<(i64, f64)> = None;
+    let mut overlap_by_speaker: std::collections::HashMap<i64, f64> =
+        std::collections::HashMap::new();
+    for t in labelled() {
+        let ov = (t.end.min(end) - t.start.max(start)).max(0.0);
+        if ov > 0.0 {
+            *overlap_by_speaker.entry(t.speaker).or_insert(0.0) += ov;
+        }
+    }
+    for (&spk, &ov) in &overlap_by_speaker {
+        if best.map(|(_, b)| ov > b).unwrap_or(true) {
+            best = Some((spk, ov));
+        }
+    }
+    if let Some((spk, _)) = best {
+        return Some(spk);
+    }
+
+    // 2) Nearest-turn fallback, capped.
+    let point = start;
+    let nearest = labelled().min_by(|a, b| {
+        dist_to_range(point, a.start, a.end)
+            .partial_cmp(&dist_to_range(point, b.start, b.end))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+    if dist_to_range(point, nearest.start, nearest.end) <= NEAREST_FALLBACK_CAP_SECS {
+        Some(nearest.speaker)
+    } else {
+        None
     }
 }
 
@@ -227,27 +338,16 @@ pub(crate) async fn post_process_meeting(
     // transcript rewrite below.
     persist_diarization(&daemon, &session_id, &out).await;
 
-    // Rewrite far-side transcript speaker ids by time overlap, then re-archive.
-    let meeting_start_ms: i64 = meeting
-        .transcript
-        .first()
-        .and_then(|s| s.created_at.parse::<i64>().ok())
-        .unwrap_or(0);
+    // Rewrite far-side transcript speaker ids using the shared audio clock and the
+    // same max-total-overlap rule as the live tier (`assign_speaker`). The post
+    // pass is authoritative — it re-runs the diarizer over the full buffer.
     let mut labeled = 0usize;
     for seg in meeting.transcript.iter_mut() {
         if seg.speaker.is_me() {
             continue;
         }
-        let Ok(ts_ms) = seg.created_at.parse::<i64>() else {
-            continue;
-        };
-        let rel = (ts_ms - meeting_start_ms) as f64 / 1000.0;
-        if let Some(d) = out
-            .segments
-            .iter()
-            .find(|d| rel >= d.start - 1.0 && rel <= d.end + 1.0)
-        {
-            seg.speaker_id = Some(d.speaker);
+        if let Some(speaker) = assign_speaker(seg, &out.segments) {
+            seg.speaker_id = Some(speaker);
             labeled += 1;
         }
     }
@@ -322,4 +422,63 @@ async fn persist_diarization(
         utterances = n,
         "diarize: persisted embeddings to sessions.db"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cue_core::meeting::{Speaker, TranscriptSegment};
+    use cue_diarize::Segment;
+
+    fn seg(start: f64, dur: f64) -> TranscriptSegment {
+        TranscriptSegment::new(Speaker::System, "x", true)
+            .with_audio_start_secs(Some(start))
+            .with_audio_dur_secs(Some(dur))
+    }
+    fn turn(start: f64, end: f64, speaker: i64) -> Segment {
+        Segment {
+            start,
+            end,
+            speaker,
+        }
+    }
+
+    #[test]
+    fn max_overlap_picks_the_dominant_speaker() {
+        // Segment [10.0, 11.0]. Speaker 0 covers 10.0–10.2 (0.2s overlap),
+        // Speaker 1 covers 10.2–11.5 (0.8s overlap) → Speaker 1 wins.
+        let s = seg(10.0, 1.0);
+        let turns = [turn(9.0, 10.2, 0), turn(10.2, 11.5, 1)];
+        assert_eq!(assign_speaker(&s, &turns), Some(1));
+    }
+
+    #[test]
+    fn full_containment_assigns_that_speaker() {
+        let s = seg(5.0, 0.6);
+        let turns = [turn(4.0, 6.0, 2), turn(6.0, 8.0, 3)];
+        assert_eq!(assign_speaker(&s, &turns), Some(2));
+    }
+
+    #[test]
+    fn no_overlap_uses_nearest_within_cap() {
+        // Segment at 20.0; nearest turn ends at 19.5 (0.5s away < 2s cap).
+        let s = seg(20.0, 0.6);
+        let turns = [turn(10.0, 19.5, 7)];
+        assert_eq!(assign_speaker(&s, &turns), Some(7));
+    }
+
+    #[test]
+    fn far_beyond_cap_returns_none() {
+        // Nearest turn ends 5s before the segment → beyond the 2s cap → unlabeled.
+        let s = seg(30.0, 0.6);
+        let turns = [turn(10.0, 25.0, 4)];
+        assert_eq!(assign_speaker(&s, &turns), None);
+    }
+
+    #[test]
+    fn no_audio_clock_returns_none() {
+        let s = TranscriptSegment::new(Speaker::System, "x", true); // audio_start_secs = None
+        let turns = [turn(0.0, 10.0, 0)];
+        assert_eq!(assign_speaker(&s, &turns), None);
+    }
 }

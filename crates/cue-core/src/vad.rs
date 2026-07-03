@@ -94,7 +94,13 @@ impl Default for VadConfig {
     fn default() -> Self {
         Self {
             aggressiveness: VadAggressiveness::Aggressive,
-            rms_threshold_start: 0.02,
+            // 0.01 (1% full-scale), not 0.02: the higher floor gated out genuinely
+            // quiet speech / soft talkers / utterance onsets, clipping words. 1% is
+            // still well above room/fan noise. Env-tunable via BLUEY_VAD_RMS_THRESHOLD.
+            rms_threshold_start: 0.01,
+            // 25 frames = 500ms hangover: hold after speech so a trailing soft word
+            // isn't cut, but not so long it adds latency (the coalesce buffer now
+            // flushes on the silence boundary, so words don't wait for the pause).
             silence_hangover_frames: 25,
         }
     }
@@ -122,5 +128,6 @@ mod tests {
         let c = VadConfig::default();
         assert_eq!(c.aggressiveness, VadAggressiveness::Aggressive);
         assert_eq!(c.silence_hangover_frames, 25);
+        assert_eq!(c.rms_threshold_start, 0.01);
     }
 }

@@ -336,9 +336,9 @@ mod tests {
         // To ratchet the threshold up we need frames whose RMS is BELOW the Send
         // threshold (so they take the noise-floor branch) but non-trivial, so the
         // noise floor — and thus `noise_floor * 3` — climbs above the start. A
-        // constant-amplitude frame has RMS = amp/32768; pick amp so RMS ≈ 0.012
-        // (below the 0.02 start, but ×3 = 0.036 > start). amp = 0.012 * 32768 ≈ 393.
-        let below: i16 = 393;
+        // constant-amplitude frame has RMS = amp/32768; pick amp so RMS ≈ 0.006
+        // (below the 0.01 start, but ×3 = 0.018 > start). amp = 0.006 * 32768 ≈ 197.
+        let below: i16 = 197;
         let mid = chunk(vec![below; 320]);
         assert!(
             normalized_rms(&vec![below; 320]) < start,

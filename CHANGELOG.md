@@ -7,7 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Live STT lag + eaten/scrambled words (three distinct bugs, all diagnosed on
+  real-time-streamed VoxConverse audio — see `docs/TRANSCRIBE-BUILD-PLAN.md`):
+  - **Bursty/laggy transcript + lost audio** — the audio→engine feed VAD-gated
+    (dropped "silence" frames → holes in the timeline) and sent variable-size
+    chunks, desyncing Parakeet's cache-aware streaming (output batched into ~9s
+    bursts). Fixed: feed a CONTINUOUS, UNIFORM 100ms stream (no VAD gate, fixed
+    chunk size). Measured: bursts 86→9, max gap 9.0s→3.4s, steady ~593ms emit.
+  - **Growing lag** — 20ms chunks forced ~50 full-buffer mel recomputes/sec in
+    parakeet-rs (RTF 1.29×) → unbounded backlog. Fixed by the 100ms coalescing
+    above (RTF 0.25×, backlog flat at 0).
+  - **Scrambled/dropped words** — a detached `tokio::spawn` per segment committed
+    out of order on the multi-thread runtime, corrupting the dedup tail. Fixed
+    with a single ordered sink task (FIFO commit, non-blocking handoff).
+- Diarization no longer stalls STT: `label_segments_by_overlap` did a ~50-200ms
+  disk write (`save_active`) under the `meeting` lock, blocking the STT sink every
+  tick. Now stamps ids under the lock, saves off-lock → STT + diarization run truly
+  in parallel (verified: STT byte-complete with diarization firing every 5s).
+- Stable live speaker ids: `LiveDiarizer` mapped windows by centroid, but speakrs
+  per-run centroids aren't comparable across `diarize()` calls (~0 self-similarity)
+  → id churn. Now maps by TIME OVERLAP with the previous window (append-only,
+  arrival-ordered) → stable `{0}→{0,1}→{0,1,2}`, verified on VoxConverse.
+
 ### Added
+- Verified decisions ledger (master doc §5): every N transcript turns
+  (`BLUEY_LEDGER_INTERVAL_TURNS`, default 15) a **stateless, cheap-lane** LLM
+  pass extracts decisions / constraints / owners from the recent window. Reuses
+  the existing provider abstraction — **no bundled model, no new dependency** —
+  and forces the Instant/cheap lane (managed-instant → `gpt-4o-mini` → skips if
+  none configured) so the expensive answer model and the user's session are never
+  touched. Every extracted item is gated by an anti-hallucination harness in
+  `cue-core::ledger` (`parse_and_verify`): an item survives only if its `quote`
+  is a verbatim substring of the transcript, and a `speaker` is kept only if it
+  actually appears in the window. Verified items merge into a capped, deduped
+  `LedgerState` rendered as a pinned context block inserted ahead of everything
+  else on the answer path (survives context compaction). Off by default
+  (`BLUEY_LEDGER=1`); the keyword-heuristic ledger remains the zero-cost floor.
+  Fires on both the live-audio and `TranscriptAdd` IPC paths. See
+  `docs/LEDGER-PLAN.md`.
 - On-device English STT via Parakeet (Nemotron, `parakeet-rs`/ONNX): system-audio
   capture runs through the streaming `SttProvider` trait as the keyless local
   backstop (no cloud key / account required — nothing leaves the machine).

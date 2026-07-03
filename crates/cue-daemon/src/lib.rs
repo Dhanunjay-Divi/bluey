@@ -7,6 +7,8 @@ pub mod db;
 #[cfg(feature = "diarize")]
 pub mod diarize;
 pub mod export;
+// Decisions-ledger orchestration: stateless cheap-lane extraction every N turns.
+pub mod ledger;
 pub mod llm;
 pub mod overlay;
 pub mod secrets;

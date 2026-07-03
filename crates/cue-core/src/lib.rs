@@ -8,6 +8,7 @@ pub mod cloud;
 pub mod config;
 pub mod intelligence;
 pub mod ipc;
+pub mod ledger;
 pub mod logging;
 pub mod meeting;
 pub mod observability;
@@ -50,6 +51,9 @@ pub use intelligence::{
     SegmentAnalysis,
 };
 pub use ipc::{DaemonRequest, DaemonResponse};
+pub use ledger::{
+    parse_and_verify, LedgerItem, LedgerKind, LedgerState, DEFAULT_LEDGER_CAP, EXTRACTION_PROMPT,
+};
 pub use logging::{
     init_local_json_logging, local_log_dir, log_file_prefix, retain_recent_log_files, LocalLogGuard,
 };

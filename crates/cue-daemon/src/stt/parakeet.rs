@@ -116,7 +116,22 @@ fn run_worker(
         // `push` already returns `None` for empty/whitespace-only text, so we only
         // emit on `Some`. Measured RTF ~0.25 (250ms CPU per 1s of audio) with
         // diarization off, so the backlog stays at 0 and text streams in real time.
-        match engine.push(&chunk) {
+        //
+        // DIAGNOSTIC: per-chunk RTF + backlog depth. If RTF ≥ 1.0 the worker is
+        // over real-time and `backlog` climbs monotonically = the growing-lag bug.
+        // With coalescing to ~100ms chunks RTF drops well under 1 and backlog ~0.
+        let audio_secs = chunk.len() as f64 / 16_000.0;
+        let push_started = std::time::Instant::now();
+        let backlog = audio_rx.len();
+        let push_result = engine.push(&chunk);
+        let rtf = push_started.elapsed().as_secs_f64() / audio_secs.max(1e-9);
+        debug!(
+            rtf = format!("{rtf:.2}"),
+            audio_ms = (audio_secs * 1000.0) as u64,
+            backlog,
+            "STTPERF push"
+        );
+        match push_result {
             Ok(Some(tc)) => {
                 // parakeet-rs emits committed text per chunk; surface it as a
                 // Final for the streamed text the meeting transcript consumes.

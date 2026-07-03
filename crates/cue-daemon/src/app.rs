@@ -774,6 +774,108 @@ pub struct LiveTranscriptEvent {
     pub is_final: bool,
     pub speaker: Option<u8>,
     pub ts_ms: u64,
+    /// Kind of event: "transcript" (a spoken line) or "ledger" (the verified
+    /// decisions ledger was updated). Consumers branch on this field.
+    pub kind: String,
+    /// When `kind == "ledger"`, the freshly rendered ledger block; else `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<String>,
+    /// Audio-clock position (seconds since capture start) for a transcript line, on
+    /// the same clock the diarizer uses. Consumers use it for production stitching
+    /// (line breaks on audio-time GAP, not a wall-clock pause). `None` when no audio
+    /// clock is available (e.g. injected IPC text without live capture).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_secs: Option<f64>,
+}
+
+impl LiveTranscriptEvent {
+    /// A transcript-line event.
+    fn transcript(
+        session_id: String,
+        source: String,
+        text: String,
+        is_final: bool,
+        speaker: Option<u8>,
+        ts_ms: u64,
+        audio_secs: Option<f64>,
+    ) -> Self {
+        Self {
+            session_id,
+            source,
+            text,
+            is_final,
+            speaker,
+            ts_ms,
+            kind: "transcript".to_string(),
+            ledger: None,
+            audio_secs,
+        }
+    }
+
+    /// A ledger-update event carrying the freshly rendered ledger block.
+    fn ledger_update(session_id: String, block: String, ts_ms: u64) -> Self {
+        Self {
+            session_id,
+            source: "ledger".to_string(),
+            text: String::new(),
+            is_final: true,
+            speaker: None,
+            ts_ms,
+            kind: "ledger".to_string(),
+            ledger: Some(block),
+            audio_secs: None,
+        }
+    }
+
+    /// A speaker-update event: a previously-broadcast transcript line now has a
+    /// diarized speaker id. Consumers match on (session_id, ts_ms, text) and
+    /// upgrade the label in place (e.g. "They" → "Speaker 2"). Only emitted by the
+    /// diarization re-broadcast, so gated to that feature to avoid dead code.
+    #[cfg(feature = "diarize")]
+    fn speaker_update(
+        session_id: String,
+        source: String,
+        text: String,
+        speaker: Option<u8>,
+        ts_ms: u64,
+    ) -> Self {
+        Self {
+            session_id,
+            source,
+            text,
+            is_final: true,
+            speaker,
+            ts_ms,
+            kind: "speaker_update".to_string(),
+            ledger: None,
+            audio_secs: None,
+        }
+    }
+}
+
+/// Broadcast a diarization speaker-id update for an already-emitted transcript
+/// segment to dev-view WebSocket clients. Called by the live diarizer after it
+/// stamps `speaker_id` (the segment was first broadcast with `speaker=None`, so
+/// this is what lets the view show real per-speaker labels live). No-op if there
+/// are no subscribers.
+#[cfg(feature = "diarize")]
+pub(crate) fn broadcast_speaker_update(
+    daemon: &Daemon,
+    session_id: String,
+    source: String,
+    text: String,
+    speaker_id: i64,
+    ts_ms: u64,
+) {
+    let _ = daemon
+        .live_transcript_tx
+        .send(LiveTranscriptEvent::speaker_update(
+            session_id,
+            source,
+            text,
+            u8::try_from(speaker_id).ok(),
+            ts_ms,
+        ));
 }
 
 pub(crate) struct Daemon {
@@ -797,6 +899,10 @@ pub(crate) struct Daemon {
     /// back (Fix-button slice F3); see [`PendingFix`] and [`take_valid_pending_fix`].
     pending_fixes: Mutex<HashMap<uuid::Uuid, PendingFix>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
+    /// Running decisions ledger for the active meeting (see [`crate::ledger`]).
+    /// Populated by stateless cheap-lane extraction every N turns; rendered as a
+    /// pinned context block on the answer path. Reset when a new meeting starts.
+    ledger: Mutex<cue_core::LedgerState>,
     live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
     rag: Option<Arc<crate::db::rag::RagPipeline>>,
     rag_index_lock: Arc<Mutex<()>>,
@@ -830,6 +936,12 @@ pub(crate) struct Daemon {
     /// starts. Only present with the `diarize` feature.
     #[cfg(feature = "diarize")]
     pub(crate) audio_retention: Mutex<Option<crate::audio::retention::AudioRetention>>,
+    /// Lock-free cumulative captured-sample count (16 kHz), used to stamp each
+    /// transcript segment's `audio_start_secs` WITHOUT taking the retention mutex
+    /// on the hot STT path (that lock is contended by the 20 ms chunk push and the
+    /// diarizer's window clone — locking it per segment stalls STT / drops words).
+    #[cfg(feature = "diarize")]
+    pub(crate) audio_samples: AtomicU64,
 }
 
 struct OverlayProcess {
@@ -862,6 +974,19 @@ enum AudioRuntimeConfigResolution {
 const DEFAULT_AUDIO_IDLE_STOP_SECS: u64 = 5 * 60;
 const ANSWER_TRANSCRIPT_TURN_LIMIT: usize = 32;
 const ANSWER_TRANSCRIPT_CHAR_BUDGET: usize = 8_000;
+
+/// Streaming STT latency: how long after speech a Nemotron/Parakeet FINAL arrives
+/// (≈ one chunk + model lookahead, per project memory). Subtracted from the
+/// arrival-time audio-clock read so a transcript segment's `audio_start_secs`
+/// lands on the audio the words were actually spoken over, for diarization
+/// alignment. Only used on the diarize path.
+#[cfg(feature = "diarize")]
+const STT_LAG_SECS: f64 = 0.56;
+
+/// Monotonic receipt sequence for STT segments — labels each segment as it arrives
+/// from the provider so the ordered sink can be traced (and asserted) to commit in
+/// exactly this order. See the ORDERED SINK in `start_system_audio_capture_task`.
+static STT_RECV_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl OverlayProcess {
     fn send(&mut self, command: &OverlayCommand) -> Result<()> {
@@ -970,6 +1095,7 @@ pub async fn run() -> Result<()> {
         active_answer_card: Mutex::new(None),
         pending_fixes: Mutex::new(HashMap::new()),
         system_audio: Mutex::new(None),
+        ledger: Mutex::new(cue_core::LedgerState::default()),
         live_transcript_tx: broadcast::channel(64).0,
         rag: rag_pipeline,
         rag_index_lock: Arc::new(Mutex::new(())),
@@ -981,6 +1107,8 @@ pub async fn run() -> Result<()> {
         agent_cache: Mutex::new(None),
         #[cfg(feature = "diarize")]
         audio_retention: Mutex::new(None),
+        #[cfg(feature = "diarize")]
+        audio_samples: AtomicU64::new(0),
     });
 
     maybe_spawn_balance_polling(&daemon);
@@ -1091,7 +1219,20 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
     if let Some(prev) = slot.take() {
         prev.stop().await;
     }
-    match crate::audio::system_capture::SystemAudioCapture::start_with_mode(sys_tx, pick) {
+    // TEST HOOK (`BLUEY_AUDIO_WAV_FILE`): drive the FULL live pipeline from a 16 kHz
+    // mono WAV instead of the native ScreenCaptureKit helper — no mic, no TCC grant.
+    // Returns the same `SystemAudioCapture` handle, so everything downstream (the
+    // streaming STT task, retention, live diarization) is byte-for-byte identical.
+    let capture_result = match env::var("BLUEY_AUDIO_WAV_FILE")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
+        Some(path) => {
+            crate::audio::system_capture::SystemAudioCapture::start_from_wav(sys_tx, path)
+        }
+        None => crate::audio::system_capture::SystemAudioCapture::start_with_mode(sys_tx, pick),
+    };
+    match capture_result {
         Ok(handle) => {
             info!(
                 system_stt = stt_enabled,
@@ -1108,6 +1249,39 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
             let idle_timeout = audio_idle_stop_timeout();
             let daemon_sys = daemon.clone();
             tokio::spawn(async move {
+                // ── ORDERED TRANSCRIPT SINK ───────────────────────────────────
+                // Persist transcript segments strictly in RECEIPT ORDER on a
+                // SINGLE consumer task. The select! loop below hands each Final
+                // segment to this channel with a non-blocking `send` (unbounded →
+                // never blocks audio intake), and this one task awaits the sink
+                // for each segment in FIFO order.
+                //
+                // This restores the in-order commit invariant the dedup helpers
+                // (`is_near_duplicate_transcript` / `dedup_partial_on_final`)
+                // depend on — WITHOUT putting the sink's ~11 awaited I/O ops back
+                // on the audio loop. It replaces the per-segment detached
+                // `tokio::spawn` (commit 5f211b0), which on the multi-thread
+                // runtime committed segments OUT OF ORDER, scrambling words and
+                // making the dedup tail discard legitimate finals. Never spawn one
+                // task per segment for the sink again — see
+                // docs/TRANSCRIBE-BUILD-PLAN.md.
+                let (seg_tx, mut seg_rx) =
+                    mpsc::unbounded_channel::<(u64, cue_core::audio::SttSegmentMetadata)>();
+                let sink_daemon = daemon_sys.clone();
+                let sink_task = tokio::spawn(async move {
+                    while let Some((seq, segment)) = seg_rx.recv().await {
+                        if let Err(e) = add_audio_transcript_segment_allowing_session_start(
+                            &sink_daemon,
+                            &segment,
+                        )
+                        .await
+                        {
+                            warn!("system audio STT drain: forward failed: {e:#}");
+                        }
+                        trace!(seq, "transcript segment committed in order");
+                    }
+                });
+
                 let mut stt: Option<Box<dyn cue_core::stt::SttProvider>> = if stt_enabled {
                     match build_system_audio_stt_provider().await {
                         Ok(provider) => Some(provider),
@@ -1119,16 +1293,10 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                 } else {
                     None
                 };
-                let vad_config = crate::audio::vad::config_from_env();
-                let mut vad = if stt_enabled {
-                    // WebRTC VAD's native handle is not Send, so the
-                    // async system-audio task uses the Send-safe RMS gate
-                    // and relies on provider endpointing for the second
-                    // speech-boundary signal.
-                    Some(crate::audio::vad::RmsGate::new(&vad_config))
-                } else {
-                    None
-                };
+                // NOTE: no VAD gating on the system-audio engine feed. Dropping
+                // "silence" frames punches holes in the audio timeline that desync
+                // the cache-aware streaming model (bursty output + lost words); the
+                // model handles silence itself. See the coalescing block below.
 
                 // Idle auto-stop: if no transcript lands for `idle_timeout`,
                 // tear the capture down (saves CPU/battery + STT cost when a
@@ -1150,6 +1318,7 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                 diar_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 #[cfg(feature = "diarize")]
                 {
+                    daemon_sys.audio_samples.store(0, Ordering::Relaxed);
                     *daemon_sys.audio_retention.lock().await =
                         Some(crate::audio::retention::AudioRetention::new(
                             crate::diarize::LIVE_WINDOW_SECS,
@@ -1157,6 +1326,19 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                 }
                 #[cfg(feature = "diarize")]
                 let mut live_diarizer = crate::diarize::spawn_live_diarizer();
+
+                // CHUNK COALESCING (fixes growing STT lag). The capture path frames
+                // 20ms/320-sample chunks, but parakeet-rs recomputes the mel
+                // spectrogram over its WHOLE internal buffer on EVERY push
+                // (nemotron.rs), so a 20ms feed does ~50 full-window mel recomputes
+                // /sec → RTF ~1.29x → the unbounded worker backlog grows without
+                // bound → ever-increasing lag. Coalescing forwarded frames to
+                // ~100ms (1600 samples) cuts that ~5x → RTF ~0.40x, so the backlog
+                // stays ~0. The engine self-buffers to its 560ms encoder window
+                // regardless, so this changes ZERO transcript content — only CPU.
+                const COALESCE_SAMPLES: usize = 1600; // 100ms @ 16kHz mono
+                let mut coalesce_buf: Vec<i16> = Vec::with_capacity(COALESCE_SAMPLES);
+                let mut coalesce_started_at_ms: u64 = 0;
 
                 // Single-task select! loop: send audio AND drain events
                 // from the SAME provider instance.
@@ -1170,27 +1352,65 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                                         // Diarization: retain the FULL audio (pre-VAD, so
                                         // the diarizer sees everything). Best-effort.
                                         #[cfg(feature = "diarize")]
-                                        if let Some(r) =
-                                            daemon_sys.audio_retention.lock().await.as_mut()
                                         {
-                                            r.push(&crate::diarize::i16_to_f32(&chunk.samples));
-                                        }
-                                        if let Some(vad) = vad.as_mut() {
-                                            let action = vad.process(&chunk);
-                                            if !action.should_forward() {
-                                                trace!(
-                                                    vad_action = action.as_str(),
-                                                    "system audio VAD dropped silence frame"
-                                                );
-                                                continue;
-                                            }
-                                            trace!(
-                                                vad_action = action.as_str(),
-                                                "system audio VAD forwarded frame"
+                                            // Lock-free audio clock: advance BEFORE the retention
+                                            // lock so the STT read never waits on it.
+                                            daemon_sys.audio_samples.fetch_add(
+                                                chunk.samples.len() as u64,
+                                                Ordering::Relaxed,
                                             );
+                                            // TRY-lock, never await: if the live diarizer is
+                                            // mid-clone of the rolling window, DON'T block the
+                                            // audio loop waiting for the lock — that stalls
+                                            // `sys_rx.recv()` and eats words. Skipping the odd
+                                            // chunk barely affects diarization (the audio clock
+                                            // above still advances for STT alignment).
+                                            if let Ok(mut guard) =
+                                                daemon_sys.audio_retention.try_lock()
+                                            {
+                                                if let Some(r) = guard.as_mut() {
+                                                    r.push(&crate::diarize::i16_to_f32(
+                                                        &chunk.samples,
+                                                    ));
+                                                }
+                                            }
                                         }
-                                        if let Err(e) = provider.send_audio(&chunk).await {
-                                            warn!("system audio STT send failed: {e}");
+                                        // CONTINUOUS, UNIFORM feed to the cache-aware streaming
+                                        // model. Two rules, both essential for steady low-latency
+                                        // emit without lost words:
+                                        //   1. NO VAD gating before the engine. The VAD drops
+                                        //      "silence" frames — but that punches HOLES in the audio
+                                        //      timeline. Parakeet/Nemotron cache-aware streaming
+                                        //      assumes a CONTINUOUS stream; gaps desync its cache →
+                                        //      output batches into multi-second bursts AND any
+                                        //      misjudged-quiet-speech is lost. The model handles
+                                        //      silence itself, so feed it everything.
+                                        //   2. UNIFORM fixed-size chunks. Variable/short chunks also
+                                        //      desync the streaming window. Buffer to EXACTLY
+                                        //      COALESCE_SAMPLES and only ever send that size (carry
+                                        //      the remainder), so every chunk the engine sees is
+                                        //      identical — the stream stays regular and in-sync.
+                                        if coalesce_buf.is_empty() {
+                                            coalesce_started_at_ms = chunk.captured_at_ms;
+                                        }
+                                        coalesce_buf.extend_from_slice(&chunk.samples);
+                                        while coalesce_buf.len() >= COALESCE_SAMPLES {
+                                            let batch: Vec<i16> =
+                                                coalesce_buf.drain(..COALESCE_SAMPLES).collect();
+                                            let batched = cue_core::pcm::AudioChunk {
+                                                source: chunk.source,
+                                                sample_rate: chunk.sample_rate,
+                                                samples: batch,
+                                                captured_at_ms: coalesce_started_at_ms,
+                                            };
+                                            // Advance the batch timestamp by the emitted duration.
+                                            coalesce_started_at_ms = coalesce_started_at_ms
+                                                .saturating_add(
+                                                    (COALESCE_SAMPLES as u64) * 1000 / 16_000,
+                                                );
+                                            if let Err(e) = provider.send_audio(&batched).await {
+                                                warn!("system audio STT send failed: {e}");
+                                            }
                                         }
                                     }
                                     None => break,
@@ -1201,20 +1421,21 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                                     Some(Ok(event)) => {
                                         if let Some(segment) = transcript_event_to_stt_segment(&event) {
                                             last_transcript_at = Instant::now();
-                                            // Persist OFF this loop. The sink does ~11 awaited
-                                            // I/O ops (DB save + RAG index + trigger detect +
-                                            // overlay push); running it inline here STOPS this
-                                            // select! from pulling the next audio chunk off
-                                            // sys_rx, so audio backlogs and the model falls
-                                            // further behind every segment (compounding 8→24s
-                                            // lag). Each segment is independent + Finals arrive
-                                            // in order, so a detached task keeps audio flowing.
-                                            let d = daemon_sys.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(e) = add_audio_transcript_segment_allowing_session_start(&d, &segment).await {
-                                                    warn!("system audio STT drain: forward failed: {e:#}");
-                                                }
-                                            });
+                                            // Monotonic receipt sequence: the ordered sink commits
+                                            // strictly in this order (see the ORDERED SINK above).
+                                            let seq = STT_RECV_SEQ.fetch_add(1, Ordering::Relaxed);
+                                            // Hand off to the single ORDERED consumer (above).
+                                            // Non-blocking send into an unbounded channel: the
+                                            // select! loop keeps draining `sys_rx` (audio never
+                                            // stalls), and FIFO delivery guarantees commit order
+                                            // == receipt order, so the dedup tail stays consistent
+                                            // and nothing scrambles or drops. (Do NOT go back to a
+                                            // per-segment `tokio::spawn` — that reorders on the
+                                            // multi-thread runtime. See TRANSCRIBE-BUILD-PLAN.md.)
+                                            if seg_tx.send((seq, segment)).is_err() {
+                                                // Ordered consumer gone (capture tearing down).
+                                                break;
+                                            }
                                         }
                                     }
                                     Some(Err(e)) => {
@@ -1247,7 +1468,7 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                             _ = diar_tick_fire(&mut diar_tick) => {
                                 #[cfg(feature = "diarize")]
                                 if let Some(h) = live_diarizer.as_mut() {
-                                    crate::diarize::live_tick(&daemon_sys, h).await;
+                                    crate::diarize::live_tick(&daemon_sys, h);
                                 }
                             }
                         }
@@ -1263,8 +1484,23 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                 }
 
                 if let Some(ref mut provider) = stt {
+                    // Flush any sub-100ms coalesce remainder so the final partial
+                    // utterance still reaches the engine before close.
+                    if !coalesce_buf.is_empty() {
+                        let tail = cue_core::pcm::AudioChunk {
+                            source: cue_core::pcm::AudioSource::System,
+                            sample_rate: cue_core::pcm::SampleRate::SR_16K,
+                            samples: std::mem::take(&mut coalesce_buf),
+                            captured_at_ms: coalesce_started_at_ms,
+                        };
+                        let _ = provider.send_audio(&tail).await;
+                    }
                     let _ = provider.close().await;
                 }
+                // Close the ordered sink and drain any queued segments in order
+                // before this capture task exits (flush the last in-flight finals).
+                drop(seg_tx);
+                let _ = sink_task.await;
             });
             Ok(())
         }
@@ -1398,6 +1634,9 @@ async fn handle_request_inner(
                 meeting
             };
 
+            // Fresh meeting → fresh ledger (no cross-meeting bleed).
+            *daemon.ledger.lock().await = cue_core::LedgerState::default();
+
             update_state_from_meeting(daemon, Some(&meeting)).await?;
             let card = CueCard::new(
                 CardKind::System,
@@ -1426,6 +1665,8 @@ async fn handle_request_inner(
             let recap = generate_recap(&meeting);
             meeting.summary = Some(recap.summary.clone());
             let path = daemon.store.archive(&meeting)?;
+            // Meeting over → clear the ledger so a later ad-hoc meeting starts clean.
+            *daemon.ledger.lock().await = cue_core::LedgerState::default();
             update_state_from_meeting(daemon, None).await?;
             let card = CueCard::new(
                 CardKind::System,
@@ -1461,6 +1702,23 @@ async fn handle_request_inner(
             text,
             is_final,
         } => {
+            // Audio-clock position (same sample clock as the diarizer). The IPC /
+            // `bluey listen` path is the SECOND transcript path — it must stamp the
+            // clock too, or diarization skips every IPC segment (`audio_start_secs
+            // = None` → unlabeled forever). This is the headless-testable path, so
+            // without this fix live labeling always "looks broken". Read before the
+            // meeting lock to avoid nesting; STT lag doesn't apply here (external
+            // sources deliver finals promptly).
+            #[cfg(feature = "diarize")]
+            let audio_start_secs: Option<f64> = daemon
+                .audio_retention
+                .lock()
+                .await
+                .as_ref()
+                .map(|r| r.duration_secs());
+            #[cfg(not(feature = "diarize"))]
+            let audio_start_secs: Option<f64> = None;
+
             let Some((meeting_snapshot, cards, indexed_segment, committed_segment)) = ({
                 let mut meeting_guard = daemon.meeting.lock().await;
                 if meeting_guard.is_none() {
@@ -1472,7 +1730,8 @@ async fn handle_request_inner(
                 if is_near_duplicate_transcript(meeting, speaker, &text, is_final) {
                     None
                 } else {
-                    let segment = TranscriptSegment::new(speaker, text, is_final);
+                    let segment = TranscriptSegment::new(speaker, text, is_final)
+                        .with_audio_start_secs(audio_start_secs);
                     meeting.transcript.push(segment.clone());
 
                     let analysis = analyze_segment(&segment, meeting);
@@ -1495,6 +1754,31 @@ async fn handle_request_inner(
             }
 
             update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+            // Mirror the audio path: broadcast to dev-view WebSocket clients so
+            // `bluey listen` lines show up in the live HTML view, not just audio.
+            {
+                let source_label = match committed_segment.speaker {
+                    Speaker::System => "system",
+                    Speaker::User => "microphone",
+                    Speaker::Other => "other",
+                    Speaker::Unknown => "unknown",
+                };
+                let ts_ms = committed_segment.created_at.parse::<u64>().unwrap_or(0);
+                let _ = daemon
+                    .live_transcript_tx
+                    .send(LiveTranscriptEvent::transcript(
+                        meeting_snapshot.id.to_string(),
+                        source_label.to_string(),
+                        committed_segment.text.clone(),
+                        committed_segment.is_final,
+                        committed_segment
+                            .speaker_id
+                            .and_then(|id| u8::try_from(id).ok()),
+                        ts_ms,
+                        committed_segment.audio_start_secs,
+                    ));
+            }
+            maybe_fire_ledger(daemon, &meeting_snapshot);
             let has_cards = !cards.is_empty();
             for card in cards {
                 let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
@@ -5477,6 +5761,66 @@ async fn add_audio_transcript_segment_allowing_session_start(
     add_audio_transcript_segment_inner(daemon, segment, true).await
 }
 
+/// If the ledger feature is enabled and this transcript length hits an interval
+/// boundary, spawn a detached background pass. The pass builds a bounded,
+/// speaker-labelled window, runs a stateless cheap-lane extraction, verifies the
+/// output against the transcript, and merges surviving items into the daemon's
+/// ledger. The network call NEVER blocks the transcript path (fire-and-forget).
+fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
+    if !crate::ledger::enabled() {
+        return;
+    }
+    let len = meeting.transcript.len();
+    if !crate::ledger::should_fire(len) {
+        return;
+    }
+    let window = crate::ledger::build_window(&meeting.last_transcript_text_bounded(
+        crate::ledger::interval_turns(),
+        crate::ledger::WINDOW_MAX_CHARS,
+    ));
+    if window.trim().is_empty() {
+        return;
+    }
+    let daemon = Arc::clone(daemon);
+    tokio::spawn(async move {
+        match ledger_extract_once(&window).await {
+            Ok(Some(raw)) => {
+                let (added, block) = {
+                    let mut ledger = daemon.ledger.lock().await;
+                    let added = crate::ledger::ingest(&mut ledger, &raw, &window);
+                    (added, ledger.render())
+                };
+                if added > 0 {
+                    debug!("ledger: +{added} item(s) added");
+                    // Push the updated ledger to any dev-view WebSocket clients.
+                    if let Some(block) = block {
+                        let session_id = daemon
+                            .meeting
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(|m| m.id.to_string())
+                            .unwrap_or_default();
+                        let _ = daemon
+                            .live_transcript_tx
+                            .send(LiveTranscriptEvent::ledger_update(
+                                session_id,
+                                block,
+                                clock::now_epoch_ms_string().parse().unwrap_or(0),
+                            ));
+                    }
+                }
+            }
+            Ok(None) => {
+                debug!("ledger: no usable cheap provider configured; pass skipped");
+            }
+            Err(error) => {
+                warn!("ledger extraction pass failed: {error:#}");
+            }
+        }
+    });
+}
+
 async fn add_audio_transcript_segment_inner(
     daemon: &Arc<Daemon>,
     segment: &cue_core::audio::SttSegmentMetadata,
@@ -5506,6 +5850,27 @@ async fn add_audio_transcript_segment_inner(
         return Ok(());
     }
 
+    // Audio-clock position for this segment, on the SAME sample clock the diarizer
+    // uses (retention buffer ÷ 16 kHz). Captured before the meeting lock to avoid
+    // nested locking.
+    //
+    // Nemotron/Parakeet is a STREAMING model: a final arrives ~STT_LAG_SECS AFTER
+    // the audio that produced it. Reading the buffer length now therefore
+    // OVERSHOOTS the true speech position by that lag — enough to cross a speaker
+    // turn in fast back-and-forth. Subtract the calibrated lag so the transcript
+    // point lands on the audio the words were actually spoken over. (Production
+    // systems align on word-timestamps from the model; Parakeet's streaming path
+    // doesn't expose them, so we correct the arrival reading by a constant —
+    // WhisperX-style nearest-overlap in the matcher then tolerates the residual.)
+    #[cfg(feature = "diarize")]
+    let audio_start_secs: Option<f64> = {
+        // Lock-free read of the capture clock (no retention mutex on the hot path).
+        let secs = daemon.audio_samples.load(Ordering::Relaxed) as f64 / 16_000.0;
+        (secs > 0.0).then(|| (secs - STT_LAG_SECS).max(0.0))
+    };
+    #[cfg(not(feature = "diarize"))]
+    let audio_start_secs: Option<f64> = None;
+
     let (meeting_snapshot, committed_segment) = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
@@ -5520,7 +5885,8 @@ async fn add_audio_transcript_segment_inner(
         if segment.is_final {
             dedup_partial_on_final(meeting, speaker, text);
         }
-        let transcript_segment = TranscriptSegment::new(speaker, text_raw, segment.is_final);
+        let transcript_segment = TranscriptSegment::new(speaker, text_raw, segment.is_final)
+            .with_audio_start_secs(audio_start_secs);
         meeting.transcript.push(transcript_segment.clone());
         let analysis = analyze_segment(&transcript_segment, meeting);
         meeting.action_items.extend(analysis.action_items);
@@ -5530,6 +5896,7 @@ async fn add_audio_transcript_segment_inner(
     };
 
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    maybe_fire_ledger(daemon, &meeting_snapshot);
     let title = match speaker {
         Speaker::System => "System",
         Speaker::User => "Mic",
@@ -5560,16 +5927,21 @@ async fn add_audio_transcript_segment_inner(
         .last()
         .and_then(|s| s.created_at.parse::<u64>().ok())
         .unwrap_or(0);
-    let _ = daemon.live_transcript_tx.send(LiveTranscriptEvent {
-        session_id: meeting_snapshot.id.to_string(),
-        source: source_label.to_string(),
-        // Raw (untrimmed) so consumers can stitch fragments back into correctly
-        // spaced text — the leading space IS the word boundary (see text_raw above).
-        text: text_raw.to_string(),
-        is_final: segment.is_final,
-        speaker: None,
-        ts_ms,
-    });
+    let _ = daemon
+        .live_transcript_tx
+        .send(LiveTranscriptEvent::transcript(
+            meeting_snapshot.id.to_string(),
+            source_label.to_string(),
+            // Raw (untrimmed) so consumers can stitch fragments back into correctly
+            // spaced text — the leading space IS the word boundary (see text_raw above).
+            text_raw.to_string(),
+            segment.is_final,
+            committed_segment
+                .speaker_id
+                .and_then(|id| u8::try_from(id).ok()),
+            ts_ms,
+            committed_segment.audio_start_secs,
+        ));
 
     if segment.is_final {
         index_transcript_for_rag(daemon, meeting_snapshot.id.to_string(), text.to_string());
@@ -7392,6 +7764,91 @@ async fn call_chat_provider(
     })
 }
 
+/// Run one **stateless, cheap-lane** ledger extraction pass over `window` and
+/// return the model's raw text. Unlike the answer path this uses its OWN clean
+/// two-message request (the extraction system prompt is the only system prompt),
+/// never streams, never touches a session, and is capped to a small output.
+///
+/// Tries the cheap-provider candidates in order and uses the first one that is
+/// actually configured/usable; returns `Ok(None)` if none is (so the caller
+/// simply skips the pass — no error, no cost). `Local` is skipped because the
+/// local answer path is a deterministic heuristic, not a text generator.
+async fn ledger_extract_once(window: &str) -> Result<Option<String>> {
+    if window.trim().is_empty() {
+        return Ok(None);
+    }
+    for provider in crate::ledger::cheap_provider_candidates() {
+        if matches!(provider.provider_kind, AiProviderKind::Local) {
+            continue;
+        }
+        let config = provider_client_config(&provider);
+        if !config.can_attempt_live_request() || config.unavailable_message().is_some() {
+            continue;
+        }
+        let Some(endpoint) = config
+            .endpoint
+            .as_ref()
+            .filter(|endpoint| !endpoint.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(api_key) = provider_api_key(&config) else {
+            continue;
+        };
+
+        let model = provider
+            .model
+            .as_ref()
+            .map(|model| model.as_str().to_string())
+            .unwrap_or_else(|| default_model_for_provider(provider.provider_kind).to_string());
+        let request_body = ChatCompletionRequest {
+            model,
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: ChatMessageContent::Text(crate::ledger::system_prompt().to_string()),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: ChatMessageContent::Text(format!("Transcript:\n{window}")),
+                },
+            ],
+            stream: false,
+            max_tokens: crate::ledger::MAX_OUTPUT_TOKENS,
+        };
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("failed to build ledger HTTP client")?;
+        let response = client
+            .post(endpoint)
+            .bearer_auth(api_key)
+            .json(&request_body)
+            .send()
+            .await
+            .with_context(|| format!("ledger extraction call to {endpoint} failed"))?;
+        if !response.status().is_success() {
+            // Try the next candidate rather than failing the whole pass.
+            continue;
+        }
+        let body = response
+            .text()
+            .await
+            .context("failed to read ledger response")?;
+        let parsed: ChatCompletionResponse =
+            serde_json::from_str(&body).context("ledger response was not chat-completions JSON")?;
+        let text = parsed
+            .choices
+            .into_iter()
+            .find_map(|choice| choice.message.content)
+            .map(|content| content.trim().to_string())
+            .filter(|content| !content.is_empty());
+        return Ok(text);
+    }
+    Ok(None)
+}
+
 async fn read_streaming_chat_response(
     mut response: reqwest::Response,
     config: &ProviderClientConfig,
@@ -7995,6 +8452,21 @@ async fn answer_context_for_question(
     question: &str,
 ) -> Vec<AnswerContext> {
     let mut context = answer_context_from_meeting(meeting);
+
+    // LLM-verified decisions ledger (see `crate::ledger`): higher-fidelity than
+    // the keyword heuristic `decisions_ledger_block`, and every item is backed by
+    // a verbatim transcript quote. Insert it at the FRONT so it survives context
+    // compaction (which drops in insertion order) ahead of the transcript. Only
+    // present when the feature is enabled and a pass has produced verified items.
+    if let Some(block) = daemon.ledger.lock().await.render() {
+        context.insert(
+            0,
+            AnswerContext::new(AnswerContextKind::MeetingMemory, block)
+                .with_title("Verified decisions ledger")
+                .with_source("live meeting ledger (quote-verified)"),
+        );
+    }
+
     context.extend(retrieved_memory_contexts(daemon, meeting, question).await);
     context
 }

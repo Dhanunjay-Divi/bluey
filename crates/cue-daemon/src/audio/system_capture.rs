@@ -67,6 +67,81 @@ impl SystemAudioCapture {
             let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
         }
     }
+
+    /// TEST-ONLY: drive the pipeline from a 16 kHz mono WAV file instead of the
+    /// native capture helper. Frames the file into the same 20 ms `AudioChunk`s and
+    /// pushes them on a real-time cadence, so the whole downstream pipeline
+    /// (retention → STT → diarization) runs on deterministic, benchmarkable audio
+    /// with no OS permission. Used by `BLUEY_AUDIO_WAV_FILE`.
+    pub fn start_from_wav(
+        sender: UnboundedSender<AudioChunk>,
+        path: String,
+    ) -> std::io::Result<Self> {
+        let samples = read_wav_i16(&path)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            let mut base_ms: u64 = 0;
+            for frame in samples.chunks(CHUNK_SAMPLES) {
+                if stop_clone.load(Ordering::Acquire) {
+                    break;
+                }
+                tick.tick().await;
+                let chunk = AudioChunk {
+                    source: AudioSource::System,
+                    sample_rate: SampleRate::SR_16K,
+                    samples: frame.to_vec(),
+                    captured_at_ms: epoch_ms().saturating_add(base_ms),
+                };
+                base_ms = base_ms.saturating_add(20);
+                if sender.send(chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            stop,
+            task: Some(task),
+        })
+    }
+}
+
+/// Minimal 16-bit PCM WAV reader (finds the `data` chunk; assumes 16 kHz mono).
+fn read_wav_i16(path: &str) -> std::io::Result<Vec<i16>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a RIFF/WAV file",
+        ));
+    }
+    let mut pos = 12;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let sz = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let body = pos + 8;
+        if id == b"data" {
+            let end = (body + sz).min(bytes.len());
+            let mut out = Vec::with_capacity((end - body) / 2);
+            let mut i = body;
+            while i + 1 < end {
+                out.push(i16::from_le_bytes([bytes[i], bytes[i + 1]]));
+                i += 2;
+            }
+            return Ok(out);
+        }
+        pos = body + sz + (sz & 1);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "no data chunk in WAV",
+    ))
 }
 
 impl Drop for SystemAudioCapture {
