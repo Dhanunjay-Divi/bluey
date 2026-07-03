@@ -4749,6 +4749,7 @@ What changed:
 - Diagram/pictorial requests now win over generic `LRU`/`cache` coding signals unless the user explicitly asks for code.
 - System-design prompt now asks for `### Diagram` plus compact ASCII or Mermaid output when the user asks for pictorial/diagram output.
 - Mermaid/flowchart-shaped answers now become `artifact_type=diagram` before fenced-code detection can classify them as code.
+- Canvas-detail output now uses a non-code artifact path, so normal system-design answers do not become `artifact_type=code` just because they mention API/database/cache or include structured technical text.
 
 Verification:
 
@@ -4763,4 +4764,7 @@ git diff --check
 Status at handoff update time:
 
 - Local tests/build passed.
-- Server deploy and live diagram smoke are pending.
+- Initial deploy to commit `d66049e336ae0127d8065f8ba42215fc575621bb` passed health and warning-log checks.
+- Initial live smoke showed pictorial LRU returned `artifact_type=diagram`, but normal notification-system design incorrectly returned `artifact_type=code`.
+- Follow-up canvas-detail artifact fix is implemented and tested locally.
+- Final server redeploy and live re-smoke are pending.

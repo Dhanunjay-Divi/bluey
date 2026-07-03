@@ -5436,9 +5436,65 @@ struct ResponseArtifact {
 
 fn response_artifact_for_output(text: &str, output: AnswerOutput) -> Option<ResponseArtifact> {
     match output {
-        AnswerOutput::CodeArtifact | AnswerOutput::CanvasDetail => response_artifact(text),
+        AnswerOutput::CodeArtifact => response_artifact(text),
+        AnswerOutput::CanvasDetail => response_canvas_detail_artifact(text),
         AnswerOutput::Compact | AnswerOutput::SourceAnswer => None,
     }
+}
+
+fn response_canvas_detail_artifact(text: &str) -> Option<ResponseArtifact> {
+    let body = text.trim();
+    if body.is_empty() || looks_like_internal_disclosure_leak(body) {
+        return None;
+    }
+
+    let lower = body.to_lowercase();
+    if looks_like_diagram_artifact(body, &lower) {
+        return Some(ResponseArtifact {
+            artifact_type: "diagram",
+            body: format_structured_artifact(body, "Diagram"),
+            confidence: 0.88,
+        });
+    }
+    if looks_like_system_design_artifact(body, &lower) {
+        return Some(ResponseArtifact {
+            artifact_type: "system_design",
+            body: format_structured_artifact(body, "System Design"),
+            confidence: 0.88,
+        });
+    }
+    if lower.contains("screenshot")
+        || lower.contains("screen context")
+        || lower.contains("analyse screen")
+        || lower.contains("analyze screen")
+        || lower.contains("image shows")
+    {
+        return Some(ResponseArtifact {
+            artifact_type: "screen",
+            body: format_structured_artifact(body, "Screen Context"),
+            confidence: 0.86,
+        });
+    }
+    if lower.contains("attached document")
+        || lower.contains("pdf")
+        || lower.contains("resume")
+        || lower.contains("document context")
+    {
+        return Some(ResponseArtifact {
+            artifact_type: "document",
+            body: format_structured_artifact(body, "Document Context"),
+            confidence: 0.78,
+        });
+    }
+    if body.chars().count() > 700 && has_structured_shape(body) {
+        return Some(ResponseArtifact {
+            artifact_type: "structured",
+            body: format_structured_artifact(body, "Details"),
+            confidence: 0.70,
+        });
+    }
+
+    None
 }
 
 fn response_artifact(text: &str) -> Option<ResponseArtifact> {
@@ -7012,6 +7068,17 @@ mod tests {
 
         assert!(response_artifact(answer).is_some());
         assert!(response_artifact_for_output(answer, AnswerOutput::Compact).is_none());
+    }
+
+    #[test]
+    fn response_artifact_for_output_keeps_system_design_canvas_non_code() {
+        let answer = "## Requirements\nFunctional requirements include sending notifications over email, SMS, push, and webhook channels.\n\n## Architecture\nUse an API gateway, notification service, database, queue, worker pool, cache, and provider adapters. The queue absorbs throughput spikes and workers retry failed provider calls.\n\n## Data flow\nClient calls API, API writes request state to the database, publishes a message to the queue, and workers deliver notifications asynchronously.\n\n## Failure modes\nUse idempotency keys, dead-letter queues, provider circuit breakers, retry backoff, and observability for latency and throughput.";
+
+        let artifact =
+            response_artifact_for_output(answer, AnswerOutput::CanvasDetail).expect("artifact");
+
+        assert_eq!(artifact.artifact_type, "system_design");
+        assert_ne!(artifact.artifact_type, "code");
     }
 
     #[test]
