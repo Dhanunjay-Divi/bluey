@@ -95,3 +95,33 @@ New regression:
 - If the server completes a managed streamed answer but the daemon loses the final stream event, the overlay should recover the cached final answer and finish the card instead of leaving a broken response.
 - `Give me Python code which solves Sudoku` should use the deep code lane and return a code artifact.
 - The shareable ref id remains enough to trace request, session, provider, model, route, billing, and recovery logs without exposing user content in logs.
+
+## Deployment
+
+Server deploy:
+
+- Commit: `b366f668c6d82ff8e025f29ffa78ae0b29ab8509`
+- Build tree: `/opt/bluey-build-codex-round317-stream`
+- Installed binary: `/usr/local/bin/bluey-server`
+- Binary SHA256:
+  `84b1bafefb09ef431fca38e722493e333adb12ff645d13b106ad156eef822da7`
+- Previous binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260703T081905Z`
+- `bluey-api.service`: active
+- `NRestarts`: `0`
+- Public health reports commit `b366f668c6d82ff8e025f29ffa78ae0b29ab8509`
+- Recent warning logs: no entries.
+
+Desktop release:
+
+- Public release version: `0.1.56`
+- Live manifest: `https://bluey.sh/latest.json`
+- Download URL: `https://bluey.sh/releases/v0.1.56/bluey-0.1.56-darwin-arm64.tar.gz`
+- Local artifact: `dist/bluey-0.1.56-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `e01fd33db8706c049ddee511ee13d57058b34927574233c9119e21f5fdafe1b3`
+- Live manifest reports the same SHA and size `9170208` bytes.
+- Release artifact dev-flag/secret scan passed.
+- `latest.json` signature verified.
+- Installer MIME checks passed.
+- Unpacked Darwin arm64 `bluey` and `bluey-daemon` binaries report `0.1.56`.

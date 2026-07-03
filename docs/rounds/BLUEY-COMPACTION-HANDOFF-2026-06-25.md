@@ -4887,6 +4887,22 @@ git diff --check
 Status at handoff update time:
 
 - Local checks passed.
-- Desktop release version bumped to `0.1.56`.
-- Release note added at `docs/release/RELEASE-v0.1.56.md`.
-- Server and desktop deploy/release still need final publish verification if this handoff is read before deployment completes.
+- Server deployed from commit `b366f668c6d82ff8e025f29ffa78ae0b29ab8509`.
+- Installed server binary SHA256:
+  `84b1bafefb09ef431fca38e722493e333adb12ff645d13b106ad156eef822da7`
+- Previous server binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260703T081905Z`
+- `bluey-api.service` active with `NRestarts=0`.
+- Public health reports commit `b366f668c6d82ff8e025f29ffa78ae0b29ab8509`.
+- Recent warning logs: no entries.
+- Desktop release `0.1.56` published to `https://bluey.sh/latest.json`.
+- Darwin arm64 release artifact:
+  `https://bluey.sh/releases/v0.1.56/bluey-0.1.56-darwin-arm64.tar.gz`
+- Release artifact SHA256:
+  `e01fd33db8706c049ddee511ee13d57058b34927574233c9119e21f5fdafe1b3`
+- Deploy verification passed:
+  - release artifact dev-flag/secret scan
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.56`
