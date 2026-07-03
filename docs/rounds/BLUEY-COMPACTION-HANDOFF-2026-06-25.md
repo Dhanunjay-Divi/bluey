@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-02 04:18 EDT
+Latest checkpoint: 2026-07-03 04:50 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,35 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-301-FRESH-REVIEW-BILLING-GUARD-CLOSURE.md`; the next canonical Bluey round doc should start at `ROUND-302-...`.
+- Latest completed Bluey round doc is `ROUND-318-REALTIME-STT-ANSWER-LATENCY.md`; the next canonical Bluey round doc should start at `ROUND-319-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 318 is complete locally for realtime STT and answer latency:
+  - live managed STT relay now opens after audible audio or a 250 ms warm-up window, whichever comes first
+  - no-helper-bytes Listen toggles still avoid creating a cloud STT session
+  - server STT settlement now tracks audible chunks separately from raw forwarded bytes, so silent relay sessions settle as `no_audible_audio` with zero billable elapsed
+  - managed Deepgram realtime endpointing default changed from `300 ms` to `200 ms`; `utterance_end_ms` remains `1000 ms`
+  - chunked STT fallback default changed from `1000 ms` to `500 ms` when using the default audio config
+  - AnswerPlan AI fallback is now opt-in via `BLUEY_ANSWER_PLAN_AI_FALLBACK=1` instead of default-on
+  - cloud RAG retrieval budget default reduced from `300 ms` to `100 ms`
+  - memory lookup is now gated by a preliminary local AnswerPlan, so direct code, quick, screen, research, and missing-context requests skip memory before dispatch
+  - verification passed:
+    - `cargo fmt --all`
+    - `cargo test -p cue-daemon stt -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml answer_plan_ -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml deepgram -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml memory_lookup_is_explicit_or_followup_only -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml rag_retrieval_budget_default_and_override -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml pcm16_i16le_stats_are_privacy_safe_levels -- --nocapture`
+    - `cargo check -p cue-daemon`
+    - `cargo build --manifest-path server/Cargo.toml`
+    - `git diff --check`
+  - Round doc:
+    `docs/rounds/ROUND-318-REALTIME-STT-ANSWER-LATENCY.md`
+  - Deploy note: local code is tested but not marked deployed unless the release/deploy path is run after this handoff update.
 - Round 301 is complete for the fresh review of Codex-owned billing guard work:
   - reviewed Round 300 against the Pinky billing lesson goal with fresh eyes
   - found one remaining edge: an internal/test account with legacy Auto Reload enabled and a saved payment method could still reach the background Auto Reload worker

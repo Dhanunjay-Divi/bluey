@@ -63,6 +63,7 @@ const AUTO_CLOUD_SYNC_DEBOUNCE_SECS: u64 = 20;
 const LIVE_STT_AUDIBLE_RMS_DBFS: f64 = -58.0;
 const LIVE_STT_AUDIBLE_PEAK_DBFS: f64 = -34.0;
 const LIVE_STT_PREFACE_CHUNKS: usize = 8;
+const LIVE_STT_STARTUP_WARMUP_MS: u128 = 250;
 const LIVE_STT_SILENCE_NOTICE_MS: u128 = 8_000;
 const PCM16_DBFS_FLOOR: f64 = -120.0;
 
@@ -3479,7 +3480,13 @@ fn dev_direct_vision_enabled() -> bool {
 fn real_stt_chunk_duration_ms(configured: u32) -> u32 {
     env_first(&["BLUEY_STT_CHUNK_MS", "CUE_STT_CHUNK_MS"])
         .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or_else(|| configured.max(1_000))
+        .unwrap_or_else(|| {
+            if configured == cue_core::audio::DEFAULT_CHUNK_DURATION_MS {
+                500
+            } else {
+                configured
+            }
+        })
         .clamp(500, 15_000)
 }
 
@@ -3488,6 +3495,16 @@ fn managed_stt_relay_requested_seconds() -> i64 {
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(120)
         .clamp(30, 10 * 60)
+}
+
+fn live_stt_startup_warmup_ms() -> u128 {
+    env_first(&[
+        "BLUEY_LIVE_STT_STARTUP_WARMUP_MS",
+        "BLUEY_STT_RELAY_STARTUP_WARMUP_MS",
+    ])
+    .and_then(|value| value.parse::<u128>().ok())
+    .unwrap_or(LIVE_STT_STARTUP_WARMUP_MS)
+    .min(LIVE_STT_SILENCE_NOTICE_MS)
 }
 
 async fn resolve_real_audio_sources(
@@ -4323,8 +4340,9 @@ async fn run_relay_audio_source(
     let mut startup_bytes = 0_u64;
     let mut preface_chunks: VecDeque<Vec<u8>> = VecDeque::with_capacity(LIVE_STT_PREFACE_CHUNKS);
     let startup_started = Instant::now();
+    let startup_warmup_ms = live_stt_startup_warmup_ms();
     let mut silence_notice_sent = false;
-    let first_audible_stats = loop {
+    let (startup_ready_stats, startup_ready_reason) = loop {
         tokio::select! {
             changed = stop_rx.changed() => {
                 if changed.is_err() || *stop_rx.borrow() {
@@ -4370,7 +4388,10 @@ async fn run_relay_audio_source(
                 }
 
                 if stats.is_audible_for_stt() {
-                    break stats;
+                    break (stats, "audible");
+                }
+                if startup_started.elapsed().as_millis() >= startup_warmup_ms {
+                    break (stats, "warmup_elapsed");
                 }
 
                 if !silence_notice_sent
@@ -4419,8 +4440,11 @@ async fn run_relay_audio_source(
         reserved_max_seconds = stt_session.max_seconds,
         startup_chunks,
         startup_bytes,
-        first_audible_rms_dbfs = first_audible_stats.rms_dbfs,
-        first_audible_peak_dbfs = first_audible_stats.peak_dbfs,
+        startup_ready_reason,
+        startup_warmup_ms = startup_warmup_ms as u64,
+        startup_ready_rms_dbfs = startup_ready_stats.rms_dbfs,
+        startup_ready_peak_dbfs = startup_ready_stats.peak_dbfs,
+        startup_ready_audible = startup_ready_stats.is_audible_for_stt(),
         "live STT relay reservation created"
     );
     let access_token = cloud
@@ -15558,6 +15582,42 @@ mod tests {
 
         std::env::remove_var("BLUEY_MANAGED_STT_RELAY_SECONDS");
         std::env::remove_var("BLUEY_STT_RELAY_SECONDS");
+    }
+
+    #[test]
+    fn live_stt_startup_warmup_defaults_and_clamps() {
+        std::env::remove_var("BLUEY_LIVE_STT_STARTUP_WARMUP_MS");
+        std::env::remove_var("BLUEY_STT_RELAY_STARTUP_WARMUP_MS");
+        assert_eq!(live_stt_startup_warmup_ms(), 250);
+
+        std::env::set_var("BLUEY_LIVE_STT_STARTUP_WARMUP_MS", "75");
+        assert_eq!(live_stt_startup_warmup_ms(), 75);
+
+        std::env::set_var("BLUEY_LIVE_STT_STARTUP_WARMUP_MS", "90000");
+        assert_eq!(live_stt_startup_warmup_ms(), LIVE_STT_SILENCE_NOTICE_MS);
+
+        std::env::remove_var("BLUEY_LIVE_STT_STARTUP_WARMUP_MS");
+        std::env::remove_var("BLUEY_STT_RELAY_STARTUP_WARMUP_MS");
+    }
+
+    #[test]
+    fn real_stt_chunk_duration_defaults_to_fast_half_second_chunks() {
+        std::env::remove_var("BLUEY_STT_CHUNK_MS");
+        std::env::remove_var("CUE_STT_CHUNK_MS");
+        assert_eq!(
+            real_stt_chunk_duration_ms(cue_core::audio::DEFAULT_CHUNK_DURATION_MS),
+            500
+        );
+        assert_eq!(real_stt_chunk_duration_ms(1_400), 1_400);
+
+        std::env::set_var("BLUEY_STT_CHUNK_MS", "250");
+        assert_eq!(
+            real_stt_chunk_duration_ms(cue_core::audio::DEFAULT_CHUNK_DURATION_MS),
+            500
+        );
+
+        std::env::remove_var("BLUEY_STT_CHUNK_MS");
+        std::env::remove_var("CUE_STT_CHUNK_MS");
     }
 
     #[test]

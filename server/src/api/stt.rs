@@ -37,6 +37,10 @@ use crate::pricing;
 const DEFAULT_MAX_SECONDS: i64 = 10 * 60;
 const MAX_SESSION_SECONDS: i64 = 20 * 60;
 const PCM16_DBFS_FLOOR: f64 = -120.0;
+const LIVE_STT_AUDIBLE_RMS_DBFS: f64 = -58.0;
+const LIVE_STT_AUDIBLE_PEAK_DBFS: f64 = -34.0;
+const DEFAULT_DEEPGRAM_ENDPOINTING_MS: u32 = 200;
+const DEFAULT_DEEPGRAM_UTTERANCE_END_MS: u32 = 1_000;
 
 #[derive(Debug, Deserialize)]
 pub struct SttSessionRequest {
@@ -398,6 +402,8 @@ async fn run_deepgram_relay(
     let mut close_reason = "completed".to_string();
     let mut forwarded_audio_bytes = 0_u64;
     let mut forwarded_audio_chunks = 0_u64;
+    let mut forwarded_audible_audio_chunks = 0_u64;
+    let mut first_audible_after_ms: Option<u128> = None;
 
     tokio::select! {
         _ = tokio::time::sleep(deadline) => {
@@ -413,14 +419,23 @@ async fn run_deepgram_relay(
                         if !bytes.is_empty() {
                             forwarded_audio_bytes = forwarded_audio_bytes.saturating_add(bytes.len() as u64);
                             forwarded_audio_chunks = forwarded_audio_chunks.saturating_add(1);
+                            let stats = pcm16_i16le_stats(bytes.as_ref());
+                            if stats.is_audible_for_stt() {
+                                forwarded_audible_audio_chunks =
+                                    forwarded_audible_audio_chunks.saturating_add(1);
+                                if first_audible_after_ms.is_none() {
+                                    first_audible_after_ms = Some(started.elapsed().as_millis());
+                                }
+                            }
                             if forwarded_audio_chunks == 1 || forwarded_audio_chunks % 50 == 0 {
-                                let stats = pcm16_i16le_stats(bytes.as_ref());
                                 tracing::info!(
                                     account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
                                     source = %session.source,
                                     provider = %session.provider,
                                     model = %session.model,
                                     audio_chunks = forwarded_audio_chunks,
+                                    audible_audio_chunks = forwarded_audible_audio_chunks,
+                                    first_audible_after_ms = first_audible_after_ms.unwrap_or(0),
                                     audio_bytes = forwarded_audio_bytes,
                                     chunk_bytes = bytes.len(),
                                     samples = stats.samples,
@@ -496,21 +511,34 @@ async fn run_deepgram_relay(
             model = %session.model,
             forwarded_audio_bytes,
             forwarded_audio_chunks,
+            forwarded_audible_audio_chunks,
             "STT relay stopped because account was deleted; skipping billing settlement"
         );
         return Ok(());
     }
 
-    let billable_elapsed = if forwarded_audio_bytes == 0 {
+    let billable_elapsed = if forwarded_audible_audio_chunks == 0 {
         Duration::ZERO
     } else {
         started.elapsed()
     };
-    let settle_reason = if forwarded_audio_bytes == 0 {
-        format!("{close_reason}:no_audio")
+    let settle_reason = if forwarded_audible_audio_chunks == 0 {
+        format!("{close_reason}:no_audible_audio")
     } else {
         close_reason
     };
+    tracing::info!(
+        account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
+        source = %session.source,
+        provider = %session.provider,
+        model = %session.model,
+        forwarded_audio_bytes,
+        forwarded_audio_chunks,
+        forwarded_audible_audio_chunks,
+        billable_elapsed_ms = billable_elapsed.as_millis() as u64,
+        settle_reason = %settle_reason,
+        "STT relay settlement prepared"
+    );
     finalize_relay_session(
         &state,
         &session,
@@ -545,9 +573,21 @@ fn is_account_closed_error(error: &anyhow::Error) -> bool {
 fn deepgram_realtime_url(session: &ClaimedSttSession) -> String {
     let base = std::env::var("BLUEY_TEST_DEEPGRAM_WS_URL")
         .unwrap_or_else(|_| "wss://api.deepgram.com/v1/listen".to_string());
+    let endpointing_ms = deepgram_realtime_env_u32(
+        "BLUEY_DEEPGRAM_ENDPOINTING_MS",
+        DEFAULT_DEEPGRAM_ENDPOINTING_MS,
+        10,
+        1_000,
+    );
+    let utterance_end_ms = deepgram_realtime_env_u32(
+        "BLUEY_DEEPGRAM_UTTERANCE_END_MS",
+        DEFAULT_DEEPGRAM_UTTERANCE_END_MS,
+        1_000,
+        5_000,
+    );
     let mut url = format!(
-        "{base}?model={}&encoding=linear16&sample_rate=16000&channels=1&punctuate=true&smart_format=true&interim_results=true&endpointing=300&utterance_end_ms=1000&vad_events=true",
-        url_escape(&session.model)
+        "{base}?model={}&encoding=linear16&sample_rate=16000&channels=1&punctuate=true&smart_format=true&interim_results=true&endpointing={endpointing_ms}&utterance_end_ms={utterance_end_ms}&vad_events=true",
+        url_escape(&session.model),
     );
     if let Ok(language) = std::env::var("BLUEY_DEEPGRAM_LANGUAGE") {
         let language = language.trim();
@@ -557,6 +597,14 @@ fn deepgram_realtime_url(session: &ClaimedSttSession) -> String {
         }
     }
     url
+}
+
+fn deepgram_realtime_env_u32(name: &str, default: u32, min: u32, max: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 fn url_escape(value: &str) -> String {
@@ -577,6 +625,14 @@ struct Pcm16AudioStats {
     rms_dbfs: f64,
     peak_dbfs: f64,
     nonzero_percent: f64,
+}
+
+impl Pcm16AudioStats {
+    fn is_audible_for_stt(self) -> bool {
+        self.samples > 0
+            && (self.rms_dbfs >= LIVE_STT_AUDIBLE_RMS_DBFS
+                || self.peak_dbfs >= LIVE_STT_AUDIBLE_PEAK_DBFS)
+    }
 }
 
 fn pcm16_i16le_stats(raw: &[u8]) -> Pcm16AudioStats {
@@ -713,7 +769,7 @@ mod tests {
         let url = deepgram_realtime_url(&session);
         assert!(url.contains("model=nova%203%2Ftest"));
         assert!(url.contains("interim_results=true"));
-        assert!(url.contains("endpointing=300"));
+        assert!(url.contains("endpointing=200"));
         assert!(url.contains("utterance_end_ms=1000"));
         assert!(url.contains("vad_events=true"));
         assert!(!url.contains("Token "));
@@ -726,6 +782,7 @@ mod tests {
         assert_eq!(silent.samples, 320);
         assert_eq!(silent.rms_dbfs, PCM16_DBFS_FLOOR);
         assert_eq!(silent.peak_dbfs, PCM16_DBFS_FLOOR);
+        assert!(!silent.is_audible_for_stt());
 
         let mut audible = Vec::new();
         for _ in 0..320 {
@@ -735,6 +792,7 @@ mod tests {
         assert!(stats.rms_dbfs > -25.0);
         assert!(stats.peak_dbfs > -25.0);
         assert_eq!(stats.nonzero_percent, 100.0);
+        assert!(stats.is_audible_for_stt());
     }
 
     #[test]

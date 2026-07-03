@@ -641,7 +641,7 @@ fn stream_route_connect_deadline_for_lane(
 /// delay the first token by more than this. If the lexical/vector query
 /// over cloud_rag_chunks exceeds the budget the answer proceeds without
 /// retrieved context. Override with BLUEY_RAG_RETRIEVAL_BUDGET_MS.
-const DEFAULT_RAG_RETRIEVAL_BUDGET_MS: u64 = 300;
+const DEFAULT_RAG_RETRIEVAL_BUDGET_MS: u64 = 100;
 
 fn rag_retrieval_budget() -> std::time::Duration {
     let ms = std::env::var("BLUEY_RAG_RETRIEVAL_BUDGET_MS")
@@ -1393,12 +1393,23 @@ fn should_lookup_completion_memory(req: &CompleteRequest, requested_lane: &str) 
     false
 }
 
+fn answer_plan_allows_memory_lookup(plan: &AnswerPlan) -> bool {
+    !matches!(
+        plan.intent,
+        AnswerIntent::Quick
+            | AnswerIntent::Coding
+            | AnswerIntent::Screen
+            | AnswerIntent::Research
+            | AnswerIntent::MissingContext
+    )
+}
+
 fn answer_plan_routing_enabled() -> bool {
     !env_flag_is_false("BLUEY_ANSWER_PLAN_ROUTING")
 }
 
 fn answer_plan_ai_fallback_enabled() -> bool {
-    !env_flag_is_false("BLUEY_ANSWER_PLAN_AI_FALLBACK")
+    env_flag_is_true("BLUEY_ANSWER_PLAN_AI_FALLBACK")
 }
 
 const DEFAULT_ANSWER_PLAN_AI_CONFIDENCE_THRESHOLD: f32 = 0.70;
@@ -3739,7 +3750,9 @@ async fn complete_stream_inner(
         ));
     }
 
-    let should_lookup_memory = should_lookup_completion_memory(&req, &requested_effective_lane);
+    let preliminary_answer_plan = answer_plan_for_request(&req, &requested_effective_lane, &[]);
+    let should_lookup_memory = answer_plan_allows_memory_lookup(&preliminary_answer_plan)
+        && should_lookup_completion_memory(&req, &requested_effective_lane);
     let rag_matches = if should_lookup_memory {
         completion_rag_matches_budgeted(
             &state.pool,
@@ -4802,7 +4815,9 @@ async fn complete_inner(
         ));
     }
 
-    let should_lookup_memory = should_lookup_completion_memory(&req, &requested_effective_lane);
+    let preliminary_answer_plan = answer_plan_for_request(&req, &requested_effective_lane, &[]);
+    let should_lookup_memory = answer_plan_allows_memory_lookup(&preliminary_answer_plan)
+        && should_lookup_completion_memory(&req, &requested_effective_lane);
     let rag_matches = if should_lookup_memory {
         completion_rag_matches_budgeted(
             &state.pool,
@@ -7845,6 +7860,12 @@ mod tests {
         assert_eq!(ambiguous_plan.intent, AnswerIntent::General);
         assert_eq!(
             should_run_ai_answer_plan_classifier(&ambiguous, "balanced", &[], &ambiguous_plan),
+            None
+        );
+
+        std::env::set_var("BLUEY_ANSWER_PLAN_AI_FALLBACK", "1");
+        assert_eq!(
+            should_run_ai_answer_plan_classifier(&ambiguous, "balanced", &[], &ambiguous_plan),
             Some("low_confidence")
         );
 
@@ -7976,6 +7997,8 @@ mod tests {
     fn memory_lookup_is_explicit_or_followup_only() {
         let direct_code = complete_request("Question:\nWrite a Python LRU cache.");
         assert!(!should_lookup_completion_memory(&direct_code, "balanced"));
+        let direct_code_plan = answer_plan_for_request(&direct_code, "balanced", &[]);
+        assert!(!answer_plan_allows_memory_lookup(&direct_code_plan));
 
         let live_caption = complete_request(
             "Question:\nAnswer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.\n\nSession context:\nInterviewer: Tell me about yourself.\nMic: I am a data engineer.",
@@ -7984,10 +8007,14 @@ mod tests {
 
         let previous_code = complete_request("Question:\nCan you update the previous code?");
         assert!(should_lookup_completion_memory(&previous_code, "balanced"));
+        let previous_code_plan = answer_plan_for_request(&previous_code, "balanced", &[]);
+        assert!(answer_plan_allows_memory_lookup(&previous_code_plan));
 
         let explicit_memory =
             complete_request("Question:\nUse saved memory and tell me what was decided.");
         assert!(should_lookup_completion_memory(&explicit_memory, "balanced"));
+        let explicit_memory_plan = answer_plan_for_request(&explicit_memory, "balanced", &[]);
+        assert!(answer_plan_allows_memory_lookup(&explicit_memory_plan));
     }
 
     #[test]
