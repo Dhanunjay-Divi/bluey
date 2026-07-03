@@ -4570,6 +4570,9 @@ Round 312 investigated user-reported Bluey id `25594F6D`:
 - Local status mapped it to active meeting `25594f6d-4cc7-4315-b99b-017b567851ae`.
 - The active meeting had no transcript segments and no context items.
 - The active session file contained two successful managed answers but no persisted failed turn, so the exact provider failure could not be reconstructed from the short session id alone.
+- Production logs for the session showed completed managed-chat requests, not a server-side failed completion.
+- The memory lookup returned zero matches quickly; the slow-looking part was a misleading old UI status plus provider first-token latency.
+- One DeepSeek Pro route took `22612 ms` to first streamed token and `29188 ms` total, while the UI still displayed the stale memory/checking state.
 - Native overlay had been showing `Checking conversation context` for every non-screen managed stream before the server even selected a route, making provider failures look like memory failures.
 
 What changed:
@@ -4591,3 +4594,17 @@ cargo test -p cue-daemon answer_error_ref -- --nocapture
 cargo build -p cue-daemon --bin bluey-daemon
 cargo build --manifest-path server/Cargo.toml
 ```
+
+Deployment:
+
+- Local daemon hot-installed to `/Users/uno/.bluey/bin/bluey-daemon`.
+- Local installed daemon SHA256:
+  `1bd0731e59557b03a934da86b2dabd492e37ac0e544c3d07631888157fa0a14c`
+- Production server built from commit:
+  `e6baa4f1cf759cdb4886a387293852be6b12b149`
+- Production server SHA256:
+  `1ad3b4414d7afa54d8d2e41fd3149e801cc59fa0ad5be82caf68ba0561e15d4f`
+- Previous production server backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260702T235807Z`
+- `bluey-api.service` active with `NRestarts=0`.
+- `https://bluey.sh/health` returned `status=ok`.

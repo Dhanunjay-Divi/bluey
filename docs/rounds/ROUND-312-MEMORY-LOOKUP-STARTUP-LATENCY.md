@@ -23,6 +23,9 @@ Resolved local session id:
 - Local `bluey status` mapped `25594F6D` to the active meeting id.
 - `active-meeting.json` showed `transcript_segments: 0` and `context_items: 0`.
 - The active session contained two successful managed answers and no persisted failed turn.
+- Production logs for session `25594f6d-4cc7-4315-b99b-017b567851ae` did not show a server-side failed completion. They showed three completed managed-chat requests.
+- The saved-memory lookup in those prod logs returned `rag_match_count=0` quickly. The slow-feeling state was mostly because the old overlay kept showing the memory status while provider routing/first-token startup was still pending.
+- One DeepSeek Pro route took `22612 ms` to first streamed token and `29188 ms` total, which made the UI look stuck on the wrong status.
 - The native managed-provider path always pushed `Checking conversation context` for every non-screen streaming answer, even before the server selected a route.
 - The server also performed saved-context/RAG lookup for every normal request before planning/provider dispatch. This was budgeted, but still added delay and made the UI blame memory when the real failure could be provider capacity, auth, stream, billing, or another downstream issue.
 - Failed answer cards did not include a short request ref, so a screenshot/session id was not enough to locate the failed provider call later.
@@ -56,6 +59,35 @@ cargo test -p cue-daemon answer_error_ref -- --nocapture
 cargo build -p cue-daemon --bin bluey-daemon
 cargo build --manifest-path server/Cargo.toml
 ```
+
+## Deployment
+
+Local hot install:
+
+- Built `target/release/bluey-daemon`.
+- Backed up the installed daemon to:
+  `/Users/uno/.bluey/bin/bluey-daemon.backup-20260702194158`
+- Installed the rebuilt daemon to:
+  `/Users/uno/.bluey/bin/bluey-daemon`
+- Installed daemon SHA256:
+  `1bd0731e59557b03a934da86b2dabd492e37ac0e544c3d07631888157fa0a14c`
+- Restarted Bluey with `bluey off` then `bluey on`.
+
+Production server deploy:
+
+- Source archive from commit:
+  `e6baa4f1cf759cdb4886a387293852be6b12b149`
+- Build directory:
+  `/opt/bluey-build-codex-round312-memory`
+- Updated the droplet build toolchain to Rust/Cargo `1.96.1` because Cargo `1.75.0` could not parse a dependency with `edition2024` metadata.
+- Built:
+  `/opt/bluey-build-codex-round312-memory/server/target/release/bluey-server`
+- Installed production server SHA256:
+  `1ad3b4414d7afa54d8d2e41fd3149e801cc59fa0ad5be82caf68ba0561e15d4f`
+- Previous production binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260702T235807Z`
+- `bluey-api.service` restarted active with `NRestarts=0`.
+- `https://bluey.sh/health` returned `status=ok`.
 
 ## Follow-Up
 
