@@ -1126,7 +1126,10 @@ fn answer_plan_for_request(
         && (looks_like_coding_question(&normalized_context) || has_code_shape(&normalized_context));
     let context_system_design =
         has_planning_context && looks_like_system_design_question(&normalized_context);
-    let coding = looks_like_coding_question(&normalized)
+    let diagram_request = looks_like_diagram_request(&normalized);
+    let explicit_code_generation = looks_like_explicit_code_generation_request(&normalized);
+    let coding = ((!diagram_request || explicit_code_generation)
+        && looks_like_coding_question(&normalized))
         || (has_images && context_coding)
         || (generic_live_transcript_prompt && context_coding);
     let coding_followup = looks_like_coding_followup(&normalized, follow_up)
@@ -1141,7 +1144,8 @@ fn answer_plan_for_request(
             || looks_like_interview_answer_context(&normalized_context, ""));
     let behavioral = looks_like_behavioral_question(&normalized) || context_behavioral;
     let system_design = !behavioral
-        && (looks_like_system_design_question(&normalized)
+        && (diagram_request
+            || looks_like_system_design_question(&normalized)
             || (generic_live_transcript_prompt && context_system_design));
     let screen = has_images
         || contains_any(
@@ -1975,6 +1979,32 @@ fn looks_like_coding_question(normalized: &str) -> bool {
         || normalized.contains(".tsx")
 }
 
+fn looks_like_explicit_code_generation_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "code",
+            "write code",
+            "write a code",
+            "give me code",
+            "full code",
+            "complete code",
+            "implementation",
+            "implement",
+            "function",
+            "class",
+            "python",
+            "java",
+            "typescript",
+            "javascript",
+            "rust",
+            "c++",
+            "c#",
+            "golang",
+        ],
+    )
+}
+
 fn looks_like_simple_coding_question(normalized: &str, short_question: bool) -> bool {
     if contains_any(
         normalized,
@@ -2429,6 +2459,36 @@ fn looks_like_system_design_question(normalized: &str) -> bool {
     )
 }
 
+fn looks_like_diagram_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "diagram",
+            "flowchart",
+            "sequence diagram",
+            "architecture diagram",
+            "data flow",
+            "pictorial",
+            "visual representation",
+            "visualize",
+            "visualise",
+            "draw ",
+            "draw a",
+            "draw the",
+            "block diagram",
+            "box diagram",
+        ],
+    ) && !contains_any(
+        normalized,
+        &[
+            "screenshot",
+            "screen capture",
+            "image shows",
+            "attached image",
+        ],
+    )
+}
+
 fn looks_like_public_lookup_phrase(normalized: &str, word_count: usize) -> bool {
     (2..=8).contains(&word_count)
         && contains_any(
@@ -2482,7 +2542,7 @@ fn prompt_with_answer_plan(
             "Answer like a polished interview coach and candidate voice: natural, first-person when appropriate, specific, and conversational. Use the supplied resume, JD, documents, transcript, and screen context to infer the role and domain, such as SDE, data engineer, BI engineer, data scientist, DevOps, security, product, or another role. First infer what the interviewer is testing, such as Dive Deep, ownership, technical depth, data quality, system judgment, prioritization, stakeholder communication, or tradeoffs, then make the response prove that signal. For self-introductions like \"tell me about yourself\", do not compress the resume into one facts paragraph. Use a speakable present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role. For self-introductions, aim for a 45-60 second answer. For role/domain interview questions, give a ready-to-say answer anchored only in the supplied company, project, tools, metrics, constraints, and role expectations; when useful, include a brief why-it-works or if-they-push-back recovery line. Do not defend weak story logic blindly: reframe it in a production-realistic way, such as code ownership, incident debugging, architecture tradeoffs, upstream data, ETL validation, reporting impact, stakeholder communication, or KPI definition. For interview stories, aim for a 45-90 second answer in tight paragraphs, not generic bullets, unless the user asks for notes. Do not invent metrics, employers, tools, source systems, clinical/finance details, latency windows, outcomes, or motivation beyond the supplied resume/JD/context. If exact story detail is missing, say the framing safely with phrases like \"I would frame it as...\" or \"the signal I would emphasize is...\" instead of fabricating a result. Never route resume/self-intro or interview-coaching prompts into system design just because they mention architecture or systems."
         }
         AnswerIntent::SystemDesign => {
-            "Use clear sections for requirements, architecture, data flow, tradeoffs, scaling, and failure modes. Keep it practical and avoid overexplaining obvious basics."
+            "Use clear sections for requirements, architecture, data flow, tradeoffs, scaling, and failure modes. When the user asks for a diagram, pictorial representation, flowchart, sequence diagram, or visual explanation, start the canvas detail with `### Diagram` and include a compact ASCII box/arrow diagram or a fenced `mermaid` diagram with short labels. Keep it practical and avoid overexplaining obvious basics."
         }
         AnswerIntent::Screen => {
             "Use visible screen details first. Say when an important detail is not visible instead of inventing it."
@@ -5392,6 +5452,13 @@ fn response_artifact(text: &str) -> Option<ResponseArtifact> {
 
     let lower = body.to_lowercase();
     let code_blocks = extract_fenced_code_blocks(body);
+    if looks_like_diagram_artifact(body, &lower) {
+        return Some(ResponseArtifact {
+            artifact_type: "diagram",
+            body: format_structured_artifact(body, "Diagram"),
+            confidence: 0.88,
+        });
+    }
     if !code_blocks.is_empty() || has_code_shape(&lower) {
         return Some(ResponseArtifact {
             artifact_type: "code",
@@ -5438,6 +5505,25 @@ fn response_artifact(text: &str) -> Option<ResponseArtifact> {
     }
 
     None
+}
+
+fn looks_like_diagram_artifact(body: &str, lower: &str) -> bool {
+    lower.contains("```mermaid")
+        || lower.contains("flowchart td")
+        || lower.contains("flowchart lr")
+        || lower.contains("graph td")
+        || lower.contains("graph lr")
+        || lower.contains("sequencediagram")
+        || ((lower.contains("diagram")
+            || lower.contains("flowchart")
+            || lower.contains("pictorial representation")
+            || lower.contains("visual representation"))
+            && (body.contains("-->")
+                || body.contains("->")
+                || body.contains("+---")
+                || body.contains("|--")
+                || body.contains("[")
+                || body.contains("]")))
 }
 
 fn router_cost_label(cost_cents: i64, balance_cents_after: i64) -> String {
@@ -6902,6 +6988,18 @@ mod tests {
     }
 
     #[test]
+    fn response_artifact_detects_mermaid_diagram_before_code() {
+        let artifact = response_artifact(
+            "### Diagram\n```mermaid\nflowchart TD\n  Client --> API\n  API --> Queue\n  Queue --> Worker\n```\n",
+        )
+        .expect("diagram artifact");
+
+        assert_eq!(artifact.artifact_type, "diagram");
+        assert!(artifact.body.contains("Diagram"));
+        assert!(!artifact.body.contains("CODE\n----"));
+    }
+
+    #[test]
     fn response_artifact_does_not_route_self_intro_to_system_design() {
         let answer = "\"Tell me about myself? Sure. I'm Asvad, a Senior Software Engineer with a Master's in Computer and Information Science from UNT. I've been at Cognizant for about a year and a half building AI-first and agentic systems, things like LangGraph workflows, containerized deployments on Azure, and high-throughput APIs handling 50k+ daily transactions. Before that I was at FRONTSTEPS, where I worked across the full stack with C#, React, and Angular, and led some key modernization work on legacy systems.\n\nWhat drew me to this role at Onapsis is the intersection of platform engineering and cybersecurity. I've been working with Python, REST APIs, and distributed systems, and the focus on Threat Detection and Vulnerability Management is a domain I'm genuinely excited to grow in. I'm someone who moves fast, cares about clean architecture, and likes working close to both the research and product side.\"";
 
@@ -7587,6 +7685,29 @@ mod tests {
         assert_eq!(plan.intent, AnswerIntent::SystemDesign);
         assert_eq!(plan.output, AnswerOutput::CanvasDetail);
         assert_eq!(plan.recommended_lane, "deep");
+    }
+
+    #[test]
+    fn answer_plan_pictorial_design_opens_canvas_detail() {
+        let req = complete_request(
+            "Question:\nGive a pictorial representation of an LRU cache data flow.",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::SystemDesign);
+        assert_eq!(plan.output, AnswerOutput::CanvasDetail);
+        assert_eq!(plan.recommended_lane, "deep");
+
+        let (system, _user) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(system.contains("### Diagram"));
+        assert!(system.contains("pictorial representation"));
+        assert!(system.contains("mermaid"));
     }
 
     #[test]

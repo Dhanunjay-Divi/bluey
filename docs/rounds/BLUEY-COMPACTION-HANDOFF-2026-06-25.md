@@ -4726,3 +4726,41 @@ Status at handoff update time:
 - `https://bluey.sh/health` reports commit `309ee7f753c3677345f99bdd6881f36c250fc550`.
 - Final live replay covered self-intro, dashboard pushback, LRU code, LRU explanation follow-up, mixed Fibonacci/LRU, Python swap, and Secret Passage Ranch with missing-docs wording.
 - Final live replay outcome: behavioral answers stayed compact/no canvas, code prompts returned code artifacts, explanation-only LRU stayed no-artifact, and Secret Passage Ranch stated web search was unavailable instead of asking for unrelated docs.
+
+## Latest Round 315: Diagram Canvas Routing
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-315-DIAGRAM-CANVAS-ROUTING.md`
+
+Round 315 addresses the owner question: system-level design and pictorial representation should open canvas/detail output and show diagram-style content when asked.
+
+What changed:
+
+- Added a diagram-request detector for `diagram`, `flowchart`, `sequence diagram`, `architecture diagram`, `data flow`, `pictorial`, `visual representation`, `draw`, `block diagram`, and `box diagram`.
+- Diagram/pictorial requests now win over generic `LRU`/`cache` coding signals unless the user explicitly asks for code.
+- System-design prompt now asks for `### Diagram` plus compact ASCII or Mermaid output when the user asks for pictorial/diagram output.
+- Mermaid/flowchart-shaped answers now become `artifact_type=diagram` before fenced-code detection can classify them as code.
+
+Verification:
+
+```bash
+cargo fmt --all
+cargo test --manifest-path server/Cargo.toml answer_plan_ -- --nocapture
+cargo test --manifest-path server/Cargo.toml response_artifact -- --nocapture
+cargo build --manifest-path server/Cargo.toml
+git diff --check
+```
+
+Status at handoff update time:
+
+- Local tests/build passed.
+- Server deploy and live diagram smoke are pending.
