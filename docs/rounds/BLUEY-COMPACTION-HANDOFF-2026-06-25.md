@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 12:46 EDT
+Latest checkpoint: 2026-07-03 13:43 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,33 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed and deployed Bluey round doc is `ROUND-321-DEEPGRAM-REALTIME-STT-HARDENING.md`; the next canonical Bluey round doc should start at `ROUND-322-...`.
+- Latest active Bluey round doc is `ROUND-322-CANVAS-SPLIT-NO-AUTO-EXPAND.md`; the next canonical Bluey round doc should start at `ROUND-323-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 322 is complete and deployed for macOS canvas/window behavior:
+  - stopped normal canvas open/close from resizing the outer overlay window automatically
+  - added a draggable macOS canvas split divider between feed and canvas
+  - saved the canvas split fraction in `bluey.overlay.canvas.splitFraction.v1`
+  - made the cyan click-through move handle win hit testing before generic button/control routing
+  - checked Windows parity: Windows overlay does not currently expose the same macOS canvas split pane or canvas auto-expand path, so no Windows code change was applicable in this round
+  - bumped workspace desktop version to `0.1.61`
+  - verification passed so far:
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug bash native/macos/cue-overlay/build.sh`
+    - `cargo check -p cue-daemon`
+    - `BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64`
+    - `BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/deploy-bluey-sh-manual.sh`
+  - Round doc:
+    `docs/rounds/ROUND-322-CANVAS-SPLIT-NO-AUTO-EXPAND.md`
+  - Release/deploy:
+    - desktop release `0.1.61` is live on `bluey.sh`
+    - live `latest.json.sig` verified successfully by the deploy script
+    - live installer MIME checks passed for `/install.sh` and `/install.ps1`
+    - live macOS artifact SHA verified:
+      `51c2b45c4d98f64e19ef6c74d14f30268fccb086ce7c534f1e69bb6186df1c59`
+    - unpacked macOS release reports `bluey 0.1.61` and `bluey-daemon 0.1.61`
 - Round 321 is complete and deployed for Deepgram realtime STT hardening:
   - changed managed Deepgram realtime defaults to `endpointing=300`, `utterance_end_ms=1000`, `interim_results=true`, `vad_events=true`, `no_delay=true`, and default `language=en-US`
   - kept `BLUEY_DEEPGRAM_LANGUAGE=auto|detect|none|off` to omit the default language for non-English or auto-detect testing

@@ -276,6 +276,7 @@ private let overlayLightThemeDefaultsKey = "bluey.overlay.lightTheme"
 private let overlayAutoSendStopModeDefaultsKey = "bluey.overlay.autoSendStopMode"
 private let overlayAutoSendStopModeVersionDefaultsKey = "bluey.overlay.autoSendStopModeVersion"
 private let overlayAutoSendStopModeCurrentVersion = 3
+private let overlayCanvasSplitFractionDefaultsKey = "bluey.overlay.canvas.splitFraction.v1"
 
 private func blueyMaterialAlpha(_ base: CGFloat, opacity: CGFloat, floor: CGFloat = 0.02) -> CGFloat {
     min(1.0, max(floor, base * min(max(opacity, minimumOverlayBackgroundOpacity), 1.0)))
@@ -530,6 +531,12 @@ private enum ExpandedPanelMetrics {
     static let minCompactWidth: CGFloat = 760
     static let minResizeWidth: CGFloat = 620
     static let maxCanvasWidth: CGFloat = 1120
+    static let minCanvasPaneWidth: CGFloat = 360
+    static let minFeedPaneWidth: CGFloat = 260
+    static let canvasDividerWidth: CGFloat = 8
+    static let defaultCanvasSplitFraction: CGFloat = 0.42
+    static let minCanvasSplitFraction: CGFloat = 0.28
+    static let maxCanvasSplitFraction: CGFloat = 0.68
     static let maxFocusWidth: CGFloat = 1040
     static let focusHeight: CGFloat = 620
     static let height: CGFloat = 640
@@ -2003,6 +2010,73 @@ private final class HeaderMoveButton: NSButton {
         if let window {
             onMoved?(window.frame)
         }
+    }
+}
+
+private final class CanvasDividerView: NSView {
+    var onBeginDrag: ((NSEvent) -> Void)?
+    var onDrag: ((NSEvent) -> Void)?
+    var onEndDrag: ((NSEvent) -> Void)?
+    private var highlighted = false {
+        didSet {
+            needsDisplay = true
+        }
+    }
+
+    override var acceptsFirstResponder: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds.insetBy(dx: -4, dy: 0), cursor: .resizeLeftRight)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01, bounds.insetBy(dx: -6, dy: 0).contains(point) else {
+            return nil
+        }
+        return self
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        highlighted = true
+        NSCursor.resizeLeftRight.set()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        highlighted = false
+        NSCursor.arrow.set()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        highlighted = true
+        onBeginDrag?(event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        onDrag?(event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        highlighted = false
+        onEndDrag?(event)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.clear.setFill()
+        bounds.fill()
+        let railWidth: CGFloat = highlighted ? 3 : 2
+        let railHeight = max(28, bounds.height * 0.20)
+        let railRect = NSRect(
+            x: (bounds.width - railWidth) / 2,
+            y: (bounds.height - railHeight) / 2,
+            width: railWidth,
+            height: railHeight)
+        let color = highlighted
+            ? BlueyTheme.cyan.withAlphaComponent(0.90)
+            : BlueyTheme.cyan.withAlphaComponent(0.38)
+        color.setFill()
+        NSBezierPath(roundedRect: railRect, xRadius: railWidth / 2, yRadius: railWidth / 2).fill()
     }
 }
 
@@ -4658,6 +4732,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let feed: FeedView
     let workspace: NSView
     let canvasPane: CanvasPaneView
+    let canvasDivider: CanvasDividerView
     let toastView: NSView
     let toastTitleLabel: NSTextField
     let toastBodyLabel: NSTextField
@@ -4752,6 +4827,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var pendingDeleteSessionId: String?
     private var renameField: NSTextField?
     private var canvasWidthConstraint: NSLayoutConstraint?
+    private var canvasDividerWidthConstraint: NSLayoutConstraint?
     private var composerBarHeightConstraint: NSLayoutConstraint?
     private var composerTextHeightConstraint: NSLayoutConstraint?
     private var composerDocumentHeightConstraint: NSLayoutConstraint?
@@ -4802,6 +4878,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var canvasCardAssignments: [String: Int] = [:]
     private var canvasOpen = false
     private var canvasFullWindow = false
+    private var canvasSplitFraction = ExpandedPanelView.loadCanvasSplitFraction()
+    private var canvasDividerDragActive = false
     private var lastSessionToggleAt: TimeInterval = 0
     private var lastCanvasToggleAt: TimeInterval = 0
     private var suppressCanvasFullWindowUntil: TimeInterval = 0
@@ -4841,6 +4919,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
         workspace = NSView()
+        canvasDivider = CanvasDividerView(frame: .zero)
         canvasPane = CanvasPaneView(frame: .zero)
         toastView = NSView()
         toastTitleLabel = NSTextField(labelWithString: "")
@@ -5009,6 +5088,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             answerStyleSaveButton,
             workspace,
             feed,
+            canvasDivider,
             canvasPane,
             toastView,
             toastTitleLabel,
@@ -5071,6 +5151,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         brandStack.addArrangedSubview(statusLabel)
         addSubview(workspace)
         workspace.addSubview(feed)
+        workspace.addSubview(canvasDivider)
         workspace.addSubview(canvasPane)
         addSubview(toastView)
         toastView.addSubview(toastTitleLabel)
@@ -5154,7 +5235,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         toastView.layer?.zPosition = 70
 
         let canvasWidth = canvasPane.widthAnchor.constraint(equalToConstant: 0)
+        let canvasDividerWidth = canvasDivider.widthAnchor.constraint(equalToConstant: 0)
         canvasWidthConstraint = canvasWidth
+        canvasDividerWidthConstraint = canvasDividerWidth
         let composerTextHeight = composerSurface.heightAnchor.constraint(equalToConstant: ChromeMetrics.composerInputHeight)
         let composerDocumentHeight = composer.heightAnchor.constraint(equalToConstant: ChromeMetrics.composerInputHeight)
         let composerBarHeight = composerBar.heightAnchor.constraint(equalToConstant: ChromeMetrics.composerBaseHeight)
@@ -5188,8 +5271,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             feed.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
             feed.widthAnchor.constraint(greaterThanOrEqualToConstant: 260),
 
+            canvasDivider.topAnchor.constraint(equalTo: workspace.topAnchor),
+            canvasDivider.leadingAnchor.constraint(equalTo: feed.trailingAnchor),
+            canvasDivider.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
+            canvasDividerWidth,
+
             canvasPane.topAnchor.constraint(equalTo: workspace.topAnchor),
-            canvasPane.leadingAnchor.constraint(equalTo: feed.trailingAnchor, constant: 8),
+            canvasPane.leadingAnchor.constraint(equalTo: canvasDivider.trailingAnchor),
             canvasPane.trailingAnchor.constraint(equalTo: workspace.trailingAnchor),
             canvasPane.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
             canvasWidth,
@@ -5482,6 +5570,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionDrawer.isHidden = true
         answerStyleOverlay.isHidden = true
         canvasPane.isHidden = true
+        canvasDivider.isHidden = true
         canvasToggleButton.isHidden = true
         canvasPane.onCollapse = { [weak self] in self?.setCanvasOpen(false) }
         canvasPane.onToggleFullWindow = { [weak self] in self?.toggleCanvasFullWindow() }
@@ -5489,6 +5578,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasPane.onNext = { [weak self] in self?.showNextCanvas() }
         canvasPane.setFullWindow(false)
         canvasPane.setNavigation(index: 0, total: 0)
+        canvasDivider.onBeginDrag = { [weak self] event in
+            self?.beginCanvasDividerDrag(with: event)
+        }
+        canvasDivider.onDrag = { [weak self] event in
+            self?.updateCanvasDividerDrag(with: event)
+        }
+        canvasDivider.onEndDrag = { [weak self] event in
+            self?.endCanvasDividerDrag(with: event)
+        }
         styleHeaderIconButton(navButton, symbol: "sidebar.left", fallback: "[]")
         styleHeaderIconButton(drawerCloseButton, symbol: "xmark", fallback: "x")
         styleHeaderIconButton(canvasToggleButton, symbol: "sidebar.right", fallback: "|")
@@ -5789,6 +5887,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return self
         }
         if passThroughMode {
+            if isHeaderMoveHandleHit(at: point) {
+                return moveHandleButton
+            }
+            if isCanvasDividerHit(at: point) {
+                return canvasDivider
+            }
             if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
                 return hit
             }
@@ -5803,9 +5907,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
             if !resizeEdges(at: point).isEmpty {
                 return self
-            }
-            if isHeaderMoveHandleHit(at: point) {
-                return moveHandleButton
             }
             blurComposerIfFocused()
             return nil
@@ -5844,6 +5945,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
         }
         blurComposerIfFocused()
+        if isCanvasDividerHit(at: localPoint) {
+            beginCanvasDividerDrag(with: event)
+            return
+        }
         if passThroughMode {
             let edges = resizeEdges(at: localPoint)
             if !edges.isEmpty, let window {
@@ -5852,6 +5957,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
             if isHeaderMoveHandleHit(at: localPoint) {
                 beginManualWindowDrag(with: event)
+                return
+            }
+            if isCanvasDividerHit(at: localPoint) {
+                beginCanvasDividerDrag(with: event)
                 return
             }
             if hasInteractiveView(at: localPoint) {
@@ -5893,6 +6002,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
         guard shouldReceiveMouseEvents(atWindowPoint: windowPoint) else {
+            return
+        }
+        if isCanvasDividerHit(at: localPoint) {
+            clearResizeCursorIfNeeded()
+            NSCursor.resizeLeftRight.set()
             return
         }
         let edges = resizeEdges(at: localPoint)
@@ -6615,6 +6729,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if canvasDividerDragActive {
+            updateCanvasDividerDrag(with: event)
+            return
+        }
         if manualWindowDragActive {
             updateManualWindowDrag(with: event)
             return
@@ -6657,6 +6775,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if canvasDividerDragActive {
+            endCanvasDividerDrag(with: event)
+            return
+        }
         if manualWindowDragActive {
             endManualWindowDrag(with: event)
             return
@@ -6761,6 +6883,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         if isKnowledgeBadgeHit(at: localPoint) {
+            return true
+        }
+        if isCanvasDividerHit(at: localPoint) {
             return true
         }
         if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(localPoint) {
@@ -6941,6 +7066,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
+    private func isCanvasDividerHit(at localPoint: NSPoint) -> Bool {
+        guard canvasOpen,
+              !canvasDivider.isHidden,
+              canvasDivider.alphaValue > 0.01
+        else {
+            return false
+        }
+        return rectForView(canvasDivider).insetBy(dx: -8, dy: 0).contains(localPoint)
+    }
+
     var isSignedOutGateActive: Bool {
         signedOutGateActive
     }
@@ -7085,6 +7220,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 || view is NSPopUpButton
                 || view is NSSlider
                 || view is OpacityScrubberView
+                || view is CanvasDividerView
                 || view is ClickableHeaderBadge
             {
                 return true
@@ -7354,6 +7490,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         workspace.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         feed.setContentHuggingPriority(.defaultLow, for: .vertical)
         feed.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        canvasDivider.setContentHuggingPriority(.required, for: .horizontal)
+        canvasDivider.setContentCompressionResistancePriority(.required, for: .horizontal)
         canvasPane.setContentHuggingPriority(.defaultLow, for: .vertical)
         canvasPane.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
     }
@@ -7458,6 +7596,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         workspace.layer?.zPosition = 1
         feed.layer?.zPosition = 1
+        canvasDivider.layer?.zPosition = 2
         canvasPane.layer?.zPosition = 1
         sessionDrawer.layer?.zPosition = 3_900
         updateSessionDrawerGeometry(layoutWidth: layoutWidth, layoutHeight: layoutHeight)
@@ -7473,6 +7612,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         workspace.layer?.masksToBounds = true
         feed.layer?.masksToBounds = true
+        canvasDivider.layer?.masksToBounds = false
         canvasPane.layer?.masksToBounds = true
         transcriptStrip.layer?.masksToBounds = true
         attachmentStrip.layer?.masksToBounds = true
@@ -7487,6 +7627,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         brandStack.needsLayout = true
         brandStack.layoutSubtreeIfNeeded()
         feed.needsLayout = true
+        canvasDivider.needsDisplay = true
         canvasPane.needsLayout = true
         composerBar.needsLayout = true
         transcriptStrip.needsLayout = true
@@ -10888,15 +11029,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         canvasOpen = open
         canvasPane.isHidden = !open
+        canvasDivider.isHidden = !open
         updateCanvasWidth()
         canvasToggleButton.isHidden = canvases.isEmpty
         canvasToggleButton.contentTintColor = open ? themedAccentColor : themedDimTextColor
         canvasToggleButton.toolTip = open ? "Collapse canvas" : "Open canvas"
-        if open {
-            ensureRoomForCanvas()
-        } else {
-            restoreCompactWidth()
-        }
         if previousOpen != open {
             emitLifecycle("canvas_open_state", detail: "open=\(open) count=\(canvases.count) active=\(activeCanvasIndex ?? -1)")
         }
@@ -11067,11 +11204,69 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func updateCanvasWidth() {
         guard canvasOpen else {
             canvasWidthConstraint?.constant = 0
+            canvasDividerWidthConstraint?.constant = 0
             return
         }
-        let available = max(0, bounds.width)
-        let width = min(max(520, available * 0.42), 760)
-        canvasWidthConstraint?.constant = min(width, max(360, available - 420))
+        let available = max(0, workspace.bounds.width > 0 ? workspace.bounds.width : bounds.width)
+        let dividerWidth = min(ExpandedPanelMetrics.canvasDividerWidth, max(0, available))
+        let (minimum, maximum) = canvasWidthBounds(for: available, dividerWidth: dividerWidth)
+        let desired = clamp(available * canvasSplitFraction, minimum, maximum)
+        canvasDividerWidthConstraint?.constant = dividerWidth
+        canvasWidthConstraint?.constant = desired
+    }
+
+    private static func loadCanvasSplitFraction() -> CGFloat {
+        let stored = UserDefaults.standard.double(forKey: overlayCanvasSplitFractionDefaultsKey)
+        let value = stored > 0 ? CGFloat(stored) : ExpandedPanelMetrics.defaultCanvasSplitFraction
+        return min(
+            max(value, ExpandedPanelMetrics.minCanvasSplitFraction),
+            ExpandedPanelMetrics.maxCanvasSplitFraction)
+    }
+
+    private func canvasWidthBounds(for available: CGFloat, dividerWidth: CGFloat) -> (minimum: CGFloat, maximum: CGFloat) {
+        let maxByFeed = max(0, available - dividerWidth - ExpandedPanelMetrics.minFeedPaneWidth)
+        let minimum = min(ExpandedPanelMetrics.minCanvasPaneWidth, maxByFeed)
+        let maximum = max(minimum, min(ExpandedPanelMetrics.maxCanvasWidth, maxByFeed))
+        return (minimum, maximum)
+    }
+
+    private func beginCanvasDividerDrag(with _: NSEvent) {
+        guard canvasOpen else { return }
+        canvasDividerDragActive = true
+        blurComposerIfFocused()
+        window?.makeKey()
+        NSCursor.resizeLeftRight.set()
+        emitLifecycle("canvas_split_drag", status: "started")
+    }
+
+    private func updateCanvasDividerDrag(with event: NSEvent) {
+        guard canvasDividerDragActive, canvasOpen else { return }
+        let point = workspace.convert(event.locationInWindow, from: nil)
+        let available = max(1, workspace.bounds.width)
+        let dividerWidth = ExpandedPanelMetrics.canvasDividerWidth
+        let (minimum, maximum) = canvasWidthBounds(for: available, dividerWidth: dividerWidth)
+        let rawWidth = available - point.x - dividerWidth / 2
+        let width = clamp(rawWidth, minimum, maximum)
+        canvasSplitFraction = clamp(
+            width / available,
+            ExpandedPanelMetrics.minCanvasSplitFraction,
+            ExpandedPanelMetrics.maxCanvasSplitFraction)
+        canvasDividerWidthConstraint?.constant = dividerWidth
+        canvasWidthConstraint?.constant = width
+        layoutSubtreeIfNeeded()
+    }
+
+    private func endCanvasDividerDrag(with _: NSEvent) {
+        guard canvasDividerDragActive else { return }
+        canvasDividerDragActive = false
+        UserDefaults.standard.set(Double(canvasSplitFraction), forKey: overlayCanvasSplitFractionDefaultsKey)
+        NSCursor.arrow.set()
+        let splitFraction = String(format: "%.3f", Double(canvasSplitFraction))
+        emitLifecycle(
+            "canvas_split_drag",
+            status: "ended",
+            detail: "fraction=\(splitFraction)"
+        )
     }
 
     private func expandCanvasWindow() {
