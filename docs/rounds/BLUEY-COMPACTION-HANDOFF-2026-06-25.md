@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 13:43 EDT
+Latest checkpoint: 2026-07-03 16:52 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,35 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest active Bluey round doc is `ROUND-322-CANVAS-SPLIT-NO-AUTO-EXPAND.md`; the next canonical Bluey round doc should start at `ROUND-323-...`.
+- Latest active Bluey round doc is `ROUND-323-LIVE-STT-HELPER-DISCOVERY.md`; the next canonical Bluey round doc should start at `ROUND-324-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 323 is complete and deployed for live STT helper discovery:
+  - fixed daemon native audio helper discovery so symlink-launched installs can find helpers in `~/.bluey/bin`
+  - added macOS and Windows installed-bin helper discovery parity
+  - added public and legacy installer helper symlinks for audio/overlay/whisper/file-picker helpers
+  - added privacy-safe STT source/transport diagnostics
+  - fallback/chunked STT decisions now emit warning-level breadcrumbs for production `RUST_LOG=warn`
+  - bumped workspace desktop version to `0.1.62`
+  - verification passed:
+    - `cargo fmt --check`
+    - `cargo check -p cue-daemon`
+    - `bash -n scripts/install.sh && bash -n ops/install/install.sh`
+    - `BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64`
+    - local IPC audio smoke selected `bluey-managed:deepgram/nova-3 live` with native system and microphone devices
+    - `BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/deploy-bluey-sh-manual.sh`
+  - Round doc:
+    `docs/rounds/ROUND-323-LIVE-STT-HELPER-DISCOVERY.md`
+  - Release/deploy:
+    - desktop release `0.1.62` is live on `bluey.sh`
+    - live `latest.json.sig` verified successfully by the deploy script
+    - live installer MIME checks passed for `/install.sh` and `/install.ps1`
+    - live macOS artifact SHA verified:
+      `b05acbfc3a07a58436075cc30368b132add5a2b4b09f45044dcce7b481f88ab3`
+    - unpacked macOS release reports `bluey 0.1.62` and `bluey-daemon 0.1.62`
 - Round 322 is complete and deployed for macOS canvas/window behavior:
   - stopped normal canvas open/close from resizing the outer overlay window automatically
   - added a draggable macOS canvas split divider between feed and canvas

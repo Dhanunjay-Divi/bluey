@@ -82,6 +82,7 @@ ensure_user_path_entry() {
 link_cli_pair() {
     local dir="$1"
     local sudo_prefix="${2:-}"
+    local helper
 
     if [ -n "$sudo_prefix" ]; then
         $sudo_prefix mkdir -p "$dir"
@@ -89,12 +90,32 @@ link_cli_pair() {
         if [ -x "$DAEMON_SOURCE" ]; then
             $sudo_prefix ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
         fi
+        for helper in \
+            bluey-overlay-macos cue-overlay-macos \
+            bluey-audio-macos cue-audio-macos \
+            bluey-whisper-macos cue-whisper \
+            bluey-file-picker-macos cue-file-picker-macos
+        do
+            if [ -x "$INSTALL_ROOT/bin/$helper" ]; then
+                $sudo_prefix ln -sf "$INSTALL_ROOT/bin/$helper" "$dir/$helper"
+            fi
+        done
     else
         mkdir -p "$dir"
         ln -sf "$CLI_SOURCE" "$dir/bluey"
         if [ -x "$DAEMON_SOURCE" ]; then
             ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
         fi
+        for helper in \
+            bluey-overlay-macos cue-overlay-macos \
+            bluey-audio-macos cue-audio-macos \
+            bluey-whisper-macos cue-whisper \
+            bluey-file-picker-macos cue-file-picker-macos
+        do
+            if [ -x "$INSTALL_ROOT/bin/$helper" ]; then
+                ln -sf "$INSTALL_ROOT/bin/$helper" "$dir/$helper"
+            fi
+        done
     fi
 }
 

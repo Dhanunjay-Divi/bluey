@@ -3118,6 +3118,26 @@ async fn start_audio_capture(
         runtime.starting = false;
     }
     *daemon.audio.lock().await = status.clone();
+    let selected_stt_provider = status.stt_provider.as_deref().unwrap_or("unknown");
+    if selected_stt_provider.contains("chunked") {
+        warn!(
+            session_id = %session_id,
+            stt_provider = selected_stt_provider,
+            runtime_mode = ?status.runtime_mode,
+            source_count = status.devices.len(),
+            backend_ready = status.backend_ready,
+            "listen STT chunked fallback selected"
+        );
+    } else {
+        info!(
+            session_id = %session_id,
+            stt_provider = selected_stt_provider,
+            runtime_mode = ?status.runtime_mode,
+            source_count = status.devices.len(),
+            backend_ready = status.backend_ready,
+            "listen STT mode selected"
+        );
+    }
     let _ = record_active_session_listen_start(daemon, &session_id, status.stt_provider.as_deref())
         .await;
 
@@ -3224,6 +3244,46 @@ async fn build_real_audio_runtime_config(
     let supports_live_relay = sources
         .iter()
         .all(|source| matches!(source.ffmpeg_input, FfmpegAudioInput::NativeHelper { .. }));
+    let forced_chunked = env_truthy_any(&["BLUEY_STT_FORCE_CHUNKED", "BLUEY_MANAGED_STT_CHUNKED"]);
+    let source_summary = sources
+        .iter()
+        .map(|source| {
+            format!(
+                "{}:{}:{}",
+                source.source,
+                source.stream_id,
+                audio_input_transport_label(&source.ffmpeg_input)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let native_helper_path = native_audio_helper
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "none".to_string());
+    if forced_chunked || !supports_live_relay {
+        warn!(
+            source_count = sources.len(),
+            sources = %source_summary,
+            native_helper_found = native_audio_helper.is_some(),
+            native_helper_path = %native_helper_path,
+            ffmpeg_found = ffmpeg_path.is_some(),
+            supports_live_relay,
+            forced_chunked,
+            "listen STT fallback source resolution"
+        );
+    } else {
+        info!(
+            source_count = sources.len(),
+            sources = %source_summary,
+            native_helper_found = native_audio_helper.is_some(),
+            native_helper_path = %native_helper_path,
+            ffmpeg_found = ffmpeg_path.is_some(),
+            supports_live_relay,
+            forced_chunked,
+            "listen STT source resolution"
+        );
+    }
 
     let (stt_endpoint, stt_api_key, stt_model, stt_provider_label, stt_transport) = if let Some(
         explicit_stt_key,
@@ -3251,9 +3311,7 @@ async fn build_real_audio_runtime_config(
         match (account_token, account_api_url) {
             (Some(token), Some(api_url)) => {
                 let stt_model = env_first(&["BLUEY_STT_MODEL"]).unwrap_or_else(|| "nova-3".into());
-                if env_truthy_any(&["BLUEY_STT_FORCE_CHUNKED", "BLUEY_MANAGED_STT_CHUNKED"])
-                    || !supports_live_relay
-                {
+                if forced_chunked || !supports_live_relay {
                     (
                         format!("{}/router/transcribe", api_url.trim_end_matches('/')),
                         token,
@@ -3290,6 +3348,18 @@ async fn build_real_audio_runtime_config(
         chunk_duration_ms,
         sources,
     }))
+}
+
+fn audio_input_transport_label(input: &FfmpegAudioInput) -> &'static str {
+    match input {
+        FfmpegAudioInput::NativeHelper { .. } => "native-helper",
+        #[cfg(target_os = "macos")]
+        FfmpegAudioInput::MacAvFoundation { .. } => "mac-avfoundation",
+        #[cfg(target_os = "windows")]
+        FfmpegAudioInput::WindowsDshow { .. } => "windows-dshow",
+        #[cfg(target_os = "windows")]
+        FfmpegAudioInput::WindowsWasapiLoopback { .. } => "windows-wasapi-loopback",
+    }
 }
 
 fn failed_audio_status(config: AudioCaptureConfig, message: &str) -> AudioPipelineStatus {
@@ -3379,59 +3449,105 @@ fn find_ffmpeg() -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn find_native_audio_helper() -> Option<PathBuf> {
-    env_first(&["BLUEY_AUDIO_HELPER_BIN", "CUE_AUDIO_HELPER_BIN"])
-        .map(PathBuf::from)
-        .into_iter()
-        .chain(
-            env::current_exe()
-                .ok()
-                .and_then(|path| path.parent().map(Path::to_path_buf))
-                .into_iter()
-                .flat_map(|dir| {
-                    [
-                        dir.join("bluey-audio-macos"),
-                        dir.join("cue-audio-macos"),
-                        dir.join("../../native/macos/cue-audio/.build/bluey-audio-macos"),
-                        dir.join("../native/macos/cue-audio/.build/bluey-audio-macos"),
-                    ]
-                }),
-        )
-        .chain([
-            PathBuf::from("native/macos/cue-audio/.build/bluey-audio-macos"),
-            PathBuf::from("./bluey-audio-macos"),
-        ])
-        .find(|path| path.exists())
+    let mut candidates = Vec::new();
+    if let Some(path) = env_first(&["BLUEY_AUDIO_HELPER_BIN", "CUE_AUDIO_HELPER_BIN"]) {
+        candidates.push(PathBuf::from(path));
+    }
+
+    push_current_exe_helper_candidates(
+        &mut candidates,
+        &[
+            "bluey-audio-macos",
+            "cue-audio-macos",
+            "../../native/macos/cue-audio/.build/bluey-audio-macos",
+            "../native/macos/cue-audio/.build/bluey-audio-macos",
+        ],
+    );
+    push_installed_bluey_bin_helper_candidates(
+        &mut candidates,
+        &["bluey-audio-macos", "cue-audio-macos"],
+    );
+    candidates.extend([
+        PathBuf::from("native/macos/cue-audio/.build/bluey-audio-macos"),
+        PathBuf::from("./bluey-audio-macos"),
+        PathBuf::from("./cue-audio-macos"),
+    ]);
+
+    candidates.into_iter().find(|path| path.exists())
 }
 
 #[cfg(target_os = "windows")]
 fn find_native_audio_helper() -> Option<PathBuf> {
-    env_first(&["BLUEY_AUDIO_HELPER_BIN", "CUE_AUDIO_HELPER_BIN"])
-        .map(PathBuf::from)
-        .into_iter()
-        .chain(
-            env::current_exe()
-                .ok()
-                .and_then(|path| path.parent().map(Path::to_path_buf))
-                .into_iter()
-                .flat_map(|dir| {
-                    [
-                        dir.join("bluey-audio.exe"),
-                        dir.join("cue-audio.exe"),
-                        dir.join("../../native/windows/cue-audio/build/bluey-audio.exe"),
-                        dir.join("../native/windows/cue-audio/build/bluey-audio.exe"),
-                    ]
-                }),
-        )
-        .chain([
-            PathBuf::from("native/windows/cue-audio/build/bluey-audio.exe"),
-            PathBuf::from("./bluey-audio.exe"),
-        ])
-        .find(|path| path.exists())
+    let mut candidates = Vec::new();
+    if let Some(path) = env_first(&["BLUEY_AUDIO_HELPER_BIN", "CUE_AUDIO_HELPER_BIN"]) {
+        candidates.push(PathBuf::from(path));
+    }
+
+    push_current_exe_helper_candidates(
+        &mut candidates,
+        &[
+            "bluey-audio.exe",
+            "cue-audio.exe",
+            "../../native/windows/cue-audio/build/bluey-audio.exe",
+            "../native/windows/cue-audio/build/bluey-audio.exe",
+        ],
+    );
+    push_installed_bluey_bin_helper_candidates(
+        &mut candidates,
+        &["bluey-audio.exe", "cue-audio.exe"],
+    );
+    candidates.extend([
+        PathBuf::from("native/windows/cue-audio/build/bluey-audio.exe"),
+        PathBuf::from("./bluey-audio.exe"),
+        PathBuf::from("./cue-audio.exe"),
+    ]);
+
+    candidates.into_iter().find(|path| path.exists())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn find_native_audio_helper() -> Option<PathBuf> {
     None
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn push_current_exe_helper_candidates(candidates: &mut Vec<PathBuf>, helper_names: &[&str]) {
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    if let Some(parent) = exe.parent() {
+        push_helper_names(candidates, parent, helper_names);
+    }
+    if let Ok(real_exe) = std::fs::canonicalize(&exe) {
+        if let Some(parent) = real_exe.parent() {
+            push_helper_names(candidates, parent, helper_names);
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn push_installed_bluey_bin_helper_candidates(
+    candidates: &mut Vec<PathBuf>,
+    helper_names: &[&str],
+) {
+    for home_var in ["HOME", "USERPROFILE"] {
+        let Some(home) = env::var_os(home_var) else {
+            continue;
+        };
+        push_helper_names(
+            candidates,
+            PathBuf::from(home).join(".bluey/bin"),
+            helper_names,
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn push_helper_names(candidates: &mut Vec<PathBuf>, dir: impl AsRef<Path>, helper_names: &[&str]) {
+    let dir = dir.as_ref();
+    for name in helper_names {
+        candidates.push(dir.join(name));
+    }
 }
 
 fn env_first(names: &[&str]) -> Option<String> {

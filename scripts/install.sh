@@ -153,6 +153,16 @@ mv "$target_tmp" "$target"
 
 ln -sfn "$target/bin/bluey" "$bin_dir/bluey"
 ln -sfn "$target/bin/bluey-daemon" "$bin_dir/bluey-daemon"
+for helper in \
+  bluey-overlay-macos cue-overlay-macos \
+  bluey-audio-macos cue-audio-macos \
+  bluey-whisper-macos cue-whisper \
+  bluey-file-picker-macos cue-file-picker-macos
+do
+  if [[ -x "$target/bin/$helper" ]]; then
+    ln -sfn "$target/bin/$helper" "$bin_dir/$helper"
+  fi
+done
 
 if command -v xattr >/dev/null 2>&1; then
   xattr -dr com.apple.quarantine "$target" 2>/dev/null || true
