@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 18:37 EDT
+Latest checkpoint: 2026-07-03 19:03 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,29 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest active Bluey round doc is `ROUND-326-PDF-ATTACH-PICKER-FILTER.md`; the next canonical Bluey round doc should start at `ROUND-327-...`.
+- Latest active Bluey round doc is `ROUND-327-RESUME-INTRO-FIRST-PASS-LENGTH.md`; the next canonical Bluey round doc should start at `ROUND-328-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 327 is in progress for resume-introduction first-pass length:
+  - owner showed `give me introduction based on the resume` returning a short compact answer first, then only producing a fuller intro after multiple follow-ups
+  - root cause: behavioral/resume prompts still used `output=compact`, and generic compact overlay instructions competed with the interview prompt
+  - added `AnswerOutput::InterviewAnswer`
+  - behavioral interview prompts now default to `output=interview_answer`
+  - added detection for resume-intro phrasing such as `give me introduction based on the resume`
+  - added follow-up handling for `long answer`, `longer answer`, `more detail`, `expand`, and `elaborate`
+  - verification passed:
+    - `cargo fmt --check`
+    - `cargo test --manifest-path server/Cargo.toml answer_plan_ -- --nocapture`
+    - `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
+  - pending before final close:
+    - commit/push Round 327 changes
+    - deploy production API server
+    - update `ROUND-327-RESUME-INTRO-FIRST-PASS-LENGTH.md` with deploy facts
+  - Round doc:
+    `docs/rounds/ROUND-327-RESUME-INTRO-FIRST-PASS-LENGTH.md`
 - Round 326 is complete and deployed for the macOS PDF attachment picker:
   - owner reported the attachment picker seemed to allow DOC/DOCX but not PDF
   - confirmed `.pdf` is already allowed by the macOS overlay drag/drop extension list, daemon fallback picker, Windows picker filter, and daemon document conversion support
