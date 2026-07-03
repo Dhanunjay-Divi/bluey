@@ -4717,4 +4717,12 @@ Status at handoff update time:
 
 - Local tests/build passed after the mixed-prompt fix.
 - Initial server deploy to `ad2039433b17e7e5a7b3140471678f0b2af543fb` passed health and warning-log checks.
-- Final redeploy after the mixed-prompt fix is pending at this handoff edit.
+- Final server deploy completed from commit `309ee7f753c3677345f99bdd6881f36c250fc550`.
+- Installed binary SHA256:
+  `0a0973f1eed74cc7d141ab57ad3c005785134763c72fe369846c95ae3ad5966a`
+- Previous binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260703T021230Z`
+- `bluey-api.service` active with `NRestarts=0`.
+- `https://bluey.sh/health` reports commit `309ee7f753c3677345f99bdd6881f36c250fc550`.
+- Final live replay covered self-intro, dashboard pushback, LRU code, LRU explanation follow-up, mixed Fibonacci/LRU, Python swap, and Secret Passage Ranch with missing-docs wording.
+- Final live replay outcome: behavioral answers stayed compact/no canvas, code prompts returned code artifacts, explanation-only LRU stayed no-artifact, and Secret Passage Ranch stated web search was unavailable instead of asking for unrelated docs.

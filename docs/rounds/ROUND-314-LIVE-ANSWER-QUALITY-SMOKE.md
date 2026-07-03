@@ -61,25 +61,33 @@ cargo test --manifest-path server/Cargo.toml answer_plan_ -- --nocapture
 cargo test --manifest-path server/Cargo.toml response_artifact -- --nocapture
 cargo test --manifest-path server/Cargo.toml --lib api::router::tests::answer_plan_eval_suite_covers_live_overlay_regressions -- --nocapture
 cargo build --manifest-path server/Cargo.toml
+git diff --check
 ```
 
 All listed checks passed locally.
 
 ## Deployment Notes
 
-Post-deploy live replay after the first commit showed:
+Production deploy:
+
+- Commit: `309ee7f753c3677345f99bdd6881f36c250fc550`
+- Build tree: `/opt/bluey-build-codex-round314-quality/server`
+- Installed binary: `/usr/local/bin/bluey-server`
+- Binary SHA256: `0a0973f1eed74cc7d141ab57ad3c005785134763c72fe369846c95ae3ad5966a`
+- Previous binary backup: `/var/backups/bluey-api/bin/bluey-server.previous-20260703T021230Z`
+- `bluey-api.service`: active
+- `NRestarts`: `0`
+- Public health: `https://bluey.sh/health` reports commit `309ee7f753c3677345f99bdd6881f36c250fc550`
+- Recent warning logs: no entries after deploy and final smoke.
+
+Post-deploy live replay showed:
 
 - Self-intro stayed compact, no artifact, no invented risk words.
 - Dashboard pushback stayed compact, no artifact, and did not invent the earlier bad tools/metrics.
-- LRU code returned a first-principles code artifact with doubly linked list/hashmap signals and no `OrderedDict`.
+- LRU code returned a first-principles code artifact with doubly linked list/hashmap signals; it did not use `OrderedDict` as the primary implementation.
 - LRU explain-only follow-up returned no artifact, preserving the existing code canvas.
 - Secret Passage Ranch with `attached docs` wording entered the research path and stated web search was unavailable for the request instead of asking for unrelated documents.
-- Mixed Fibonacci/LRU prompt needed the follow-up fix above so it keeps code artifact output.
-
-Final expected behavior after redeploy:
-
-- Behavioral answer should stay grounded and should not open system-design canvas.
-- LRU build should stream a full code block/artifact from first principles.
-- LRU explain-only follow-up should remain a compact explanation and preserve the existing code artifact.
-- Secret Passage Ranch with `attached docs` wording should enter research/source-answer path; if provider search is unavailable, it must say web search was unavailable instead of asking for session documents.
 - Mixed code/explanation prompts should still produce a code artifact when they explicitly ask Bluey to write code.
+- Simple Python swap returned a code artifact.
+
+Note: one LRU live answer mentioned `OrderedDict` as an alternative after producing the real Node/hashmap/doubly-linked-list implementation. That is acceptable under the prompt; the primary implementation was not the shortcut.
