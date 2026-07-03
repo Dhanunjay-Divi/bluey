@@ -4692,6 +4692,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let answerStylePanel: NSView
     let answerStyleLabel: NSTextField
     let answerStyleBox: NSTextField
+    let answerStyleTypingIndicator: NSView
     let answerStyleSaveButton: NSButton
     let transcriptStrip: NSView
     let transcriptActivityDot: NSView
@@ -4875,6 +4876,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStylePanel = NSView()
         answerStyleLabel = NSTextField(labelWithString: "How Bluey should answer")
         answerStyleBox = ArrowCursorTextField()
+        answerStyleTypingIndicator = NSView()
         answerStyleSaveButton = NSButton(title: "Save", target: nil, action: nil)
         transcriptStrip = NSView()
         transcriptActivityDot = NSView()
@@ -5003,6 +5005,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             answerStylePanel,
             answerStyleLabel,
             answerStyleBox,
+            answerStyleTypingIndicator,
             answerStyleSaveButton,
             workspace,
             feed,
@@ -5130,6 +5133,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleOverlay.addSubview(answerStylePanel)
         answerStylePanel.addSubview(answerStyleLabel)
         answerStylePanel.addSubview(answerStyleBox)
+        answerStylePanel.addSubview(answerStyleTypingIndicator)
         answerStylePanel.addSubview(answerStyleSaveButton)
         addSubview(closeConfirmOverlay)
         closeConfirmOverlay.addSubview(closeConfirmPanel)
@@ -5257,6 +5261,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             answerStyleBox.leadingAnchor.constraint(equalTo: answerStylePanel.leadingAnchor, constant: 18),
             answerStyleBox.trailingAnchor.constraint(equalTo: answerStylePanel.trailingAnchor, constant: -18),
             answerStyleBox.heightAnchor.constraint(equalToConstant: 48),
+
+            answerStyleTypingIndicator.leadingAnchor.constraint(equalTo: answerStyleBox.leadingAnchor, constant: -9),
+            answerStyleTypingIndicator.centerYAnchor.constraint(equalTo: answerStyleBox.centerYAnchor),
+            answerStyleTypingIndicator.widthAnchor.constraint(equalToConstant: 4),
+            answerStyleTypingIndicator.heightAnchor.constraint(equalToConstant: 30),
 
             answerStyleSaveButton.topAnchor.constraint(equalTo: answerStyleBox.bottomAnchor, constant: 14),
             answerStyleSaveButton.leadingAnchor.constraint(equalTo: answerStylePanel.leadingAnchor, constant: 18),
@@ -5681,6 +5690,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             .withAlphaComponent(materialAlpha(0.97))
             .cgColor
         answerStyleLabel.textColor = lightThemeEnabled ? BlueyLightTheme.text : NSColor.white.withAlphaComponent(0.96)
+        refreshAnswerStyleInputChrome()
         composerBar.layer?.backgroundColor = themedComposerColor.cgColor
         composerBar.layer?.borderColor = (lightThemeEnabled
             ? BlueyLightTheme.accentBorder.withAlphaComponent(0.68)
@@ -6675,6 +6685,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         return false
+    }
+
+    func controlTextDidBeginEditing(_ obj: Notification) {
+        guard (obj.object as? NSControl) === answerStyleBox else { return }
+        setAnswerStyleInputFocused(true)
+        applyAccentInsertionPoint(to: answerStyleBox)
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard (obj.object as? NSControl) === answerStyleBox else { return }
+        setAnswerStyleInputFocused(false)
     }
 
     func isInteractiveAtScreenPoint(_ screenPoint: NSPoint) -> Bool {
@@ -7826,6 +7847,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleBox.layer?.borderWidth = 1
         answerStyleBox.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.24).cgColor
         answerStyleBox.layer?.masksToBounds = true
+        answerStyleTypingIndicator.wantsLayer = true
+        answerStyleTypingIndicator.layer?.cornerRadius = 2
+        answerStyleTypingIndicator.layer?.backgroundColor = BlueyTheme.cyan.cgColor
+        answerStyleTypingIndicator.layer?.shadowColor = BlueyTheme.cyan.cgColor
+        answerStyleTypingIndicator.layer?.shadowOpacity = 0
+        answerStyleTypingIndicator.layer?.shadowRadius = 8
+        answerStyleTypingIndicator.layer?.shadowOffset = .zero
+        answerStyleTypingIndicator.isHidden = true
     }
 
     private func configureComposer() {
@@ -8514,6 +8543,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func dismissAnswerStyleEditor(animated: Bool) {
         guard !answerStyleOverlay.isHidden else { return }
+        setAnswerStyleInputFocused(false)
         guard animated else {
             answerStyleOverlay.isHidden = true
             answerStyleOverlay.alphaValue = 1
@@ -9083,6 +9113,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateBackgroundControlsEnabledForModalState()
         window?.makeFirstResponder(answerStyleBox)
         applyAccentInsertionPoint(to: answerStyleBox)
+        setAnswerStyleInputFocused(true)
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.12
             answerStyleOverlay.animator().alphaValue = 1
@@ -9093,6 +9124,28 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if let editor = control.currentEditor() as? NSTextView {
             editor.insertionPointColor = themedAccentColor
         }
+    }
+
+    private func setAnswerStyleInputFocused(_ focused: Bool) {
+        refreshAnswerStyleInputChrome(focused: focused)
+    }
+
+    private func refreshAnswerStyleInputChrome(focused explicitFocus: Bool? = nil) {
+        let focused = explicitFocus ?? (answerStyleBox.currentEditor() != nil && !answerStyleOverlay.isHidden)
+        let accent = themedAccentBorderColor
+        let restingBorder = accent.withAlphaComponent(lightThemeEnabled ? 0.44 : 0.28)
+        let focusedBorder = accent.withAlphaComponent(lightThemeEnabled ? 0.98 : 0.92)
+        answerStyleBox.layer?.borderWidth = focused ? 2 : 1
+        answerStyleBox.layer?.borderColor = (focused ? focusedBorder : restingBorder).cgColor
+        answerStyleBox.layer?.shadowColor = accent.cgColor
+        answerStyleBox.layer?.shadowOpacity = focused ? (lightThemeEnabled ? 0.30 : 0.34) : 0
+        answerStyleBox.layer?.shadowRadius = focused ? 10 : 0
+        answerStyleBox.layer?.shadowOffset = .zero
+        answerStyleTypingIndicator.layer?.backgroundColor = accent.cgColor
+        answerStyleTypingIndicator.layer?.shadowColor = accent.cgColor
+        answerStyleTypingIndicator.layer?.shadowOpacity = focused ? 0.55 : 0
+        answerStyleTypingIndicator.alphaValue = focused ? 1.0 : 0.0
+        answerStyleTypingIndicator.isHidden = !focused
     }
 
     func focusComposerForQuestion() {
