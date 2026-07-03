@@ -4614,3 +4614,39 @@ Deployment:
 - Live artifact SHA256:
   `e553d932d62bb1f18b8697c3f695865844a95683a00bbf9a7539acb5037bafb5`
 - Live verifier passed: signed `latest.json`, installer MIME types, artifact SHA, and unpacked binary version.
+
+## Latest Round 313: Short ID Answer Diagnostics
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-313-SHORT-ID-ANSWER-DIAGNOSTICS.md`
+
+Round 313 addresses the owner question: screenshot short ids and uploaded logs were not enough to trace failed answers cleanly.
+
+What changed:
+
+- Server managed-answer logs now include `request_ref` and `session_ref` so a short id like `25594F6D` can be searched directly.
+- Server writes redacted `ops_audit_events` for `answer_failed` and `answer_slow_first_token`.
+- Admin support bundles now include `request_ref` on recent usage rows and `session_ref` on recent session rows.
+- Audit events exclude prompt/transcript/document/screenshot text and store operational metadata only: request/session ids and refs, trace id, lane, provider/model, timing, route index, retry/capacity status, and sanitized error preview.
+- Desktop answer failures now update synced session diagnostics with `answer_error` and the short ref, so failed overlay answers are not purely transient UI cards.
+
+Verification:
+
+```bash
+cargo fmt --all
+cargo test -p cue-core short_observability_ref -- --nocapture
+cargo test --manifest-path server/Cargo.toml short_observability_ref -- --nocapture
+cargo test -p cue-daemon answer_error_ref -- --nocapture
+cargo build --manifest-path server/Cargo.toml
+cargo build -p cue-daemon --bin bluey-daemon
+git diff --check
+```

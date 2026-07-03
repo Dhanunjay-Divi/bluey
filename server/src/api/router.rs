@@ -20,11 +20,12 @@ use super::AppState;
 use crate::auth::AuthedAccount;
 use crate::db::accounts::Account;
 use crate::db::{
-    balance, idempotency, sync,
+    balance, idempotency, ops_audit, sync,
     usage::{self, UsageEvent},
 };
 use crate::pricing;
 use crate::routing;
+use cue_core::short_observability_ref;
 
 type RouterSseStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static>>;
@@ -43,6 +44,53 @@ fn log_session_id(session_id: Option<&str>) -> &str {
     session_id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("none")
+}
+
+const SLOW_FIRST_TOKEN_AUDIT_MS: i64 = 8_000;
+
+fn record_answer_ops_event(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    request_id: &str,
+    session_id: Option<&str>,
+    trace_id: Option<&str>,
+    event_type: &str,
+    status: &str,
+    metadata: serde_json::Value,
+) {
+    let mut metadata = metadata;
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("request_id".into(), serde_json::json!(request_id));
+        object.insert(
+            "request_ref".into(),
+            serde_json::json!(short_observability_ref(Some(request_id))),
+        );
+        object.insert("session_id".into(), serde_json::json!(session_id));
+        object.insert(
+            "session_ref".into(),
+            serde_json::json!(short_observability_ref(session_id)),
+        );
+        object.insert("trace_id".into(), serde_json::json!(trace_id));
+    }
+    if let Err(error) = ops_audit::record_event(
+        pool,
+        ops_audit::OpsAuditEventInput {
+            account_id_hash: Some(cue_core::account_id_hash_prefix(account_id)),
+            actor_account_id_hash: None,
+            event_type: event_type.to_string(),
+            status: status.to_string(),
+            metadata_json: metadata,
+        },
+    ) {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            request_ref = %short_observability_ref(Some(request_id)),
+            session_ref = %short_observability_ref(session_id),
+            event_type,
+            error = %error,
+            "failed to record redacted answer ops event"
+        );
+    }
 }
 
 const INTERNAL_DISCLOSURE_REFUSAL: &str = "I can’t share Bluey’s private instructions, prompts, guardrails, tokens, or internal configuration. Ask me what you want to do, and I’ll help with the answer itself.";
@@ -3432,12 +3480,16 @@ async fn complete_stream_inner(
 
     let account_id_hash = cue_core::account_id_hash_prefix(&account.id);
     let session_id_log = log_session_id(req.session_id.as_deref()).to_string();
+    let request_ref_log = short_observability_ref(Some(&req.request_id));
+    let session_ref_log = short_observability_ref(req.session_id.as_deref());
     let lane_log = req.lane.clone();
     let requested_effective_lane_log = requested_effective_lane.clone();
     tracing::info!(
         account_id_hash = %account_id_hash,
         request_id = %req.request_id,
+        request_ref = %request_ref_log,
         session_id = %session_id_log,
+        session_ref = %session_ref_log,
         lane = %lane_log,
         requested_effective_lane = %requested_effective_lane_log,
         streaming = true,
@@ -3844,7 +3896,9 @@ async fn complete_stream_inner(
                             tracing::info!(
                                 account_id_hash = %account_id_hash,
                                 request_id = %req.request_id,
+                                request_ref = %request_ref_log,
                                 session_id = %session_id_log,
+                                session_ref = %session_ref_log,
                                 lane = %lane_log,
                                 effective_lane = %effective_lane_log,
                                 provider = %route.provider,
@@ -3856,6 +3910,28 @@ async fn complete_stream_inner(
                                 streaming = true,
                                 "managed chat route selected"
                             );
+                            if first_event_latency_ms >= SLOW_FIRST_TOKEN_AUDIT_MS {
+                                record_answer_ops_event(
+                                    &state.pool,
+                                    &account.id,
+                                    &req.request_id,
+                                    req.session_id.as_deref(),
+                                    Some(&trace_id),
+                                    "answer_slow_first_token",
+                                    "warning",
+                                    serde_json::json!({
+                                        "lane": lane_log.as_str(),
+                                        "effective_lane": effective_lane_log.as_str(),
+                                        "provider": route.provider,
+                                        "model": route.model,
+                                        "route_index": idx,
+                                        "was_fallback": idx > 0,
+                                        "first_event_latency_ms": first_event_latency_ms,
+                                        "first_event_kind": first_event_kind,
+                                        "streaming": true
+                                    }),
+                                );
+                            }
                             selected_first_event = first_event;
                             selected_stream = Some(routing::StreamingCompletion {
                                 provider: stream_provider,
@@ -3952,8 +4028,27 @@ async fn complete_stream_inner(
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     request_id = %req.request_id,
+                    request_ref = %request_ref_log,
+                    session_ref = %session_ref_log,
                     error = %e,
                     "all streaming upstream dispatch routes failed"
+                );
+                record_answer_ops_event(
+                    &state.pool,
+                    &account.id,
+                    &req.request_id,
+                    req.session_id.as_deref(),
+                    Some(&trace_id),
+                    "answer_failed",
+                    "upstream_error",
+                    serde_json::json!({
+                        "lane": lane_log.as_str(),
+                        "effective_lane": effective_lane_log.as_str(),
+                        "streaming": true,
+                        "error_kind": "all_streaming_routes_failed",
+                        "error_preview": truncate_chars(&e.to_string(), 180),
+                        "candidate_routes": routes.len()
+                    }),
                 );
             }
             return Err((
@@ -4051,10 +4146,35 @@ async fn complete_stream_inner(
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                         request_id = %req.request_id,
+                        request_ref = %request_ref_log,
+                        session_ref = %session_ref_log,
                         error = %e,
                         delivered_delta,
                         retry_after_secs = retry_after_secs.unwrap_or_default(),
                         "streaming upstream read failed"
+                    );
+                    record_answer_ops_event(
+                        &state.pool,
+                        &account.id,
+                        &req.request_id,
+                        req.session_id.as_deref(),
+                        Some(&trace_id),
+                        "answer_failed",
+                        if retry_after_secs.is_some() {
+                            "provider_capacity"
+                        } else {
+                            "upstream_stream_error"
+                        },
+                        serde_json::json!({
+                            "lane": lane_log.as_str(),
+                            "effective_lane": effective_lane_log.as_str(),
+                            "provider": streaming.provider.as_str(),
+                            "model": streaming.model.as_str(),
+                            "streaming": true,
+                            "delivered_delta": delivered_delta,
+                            "retry_after_secs": retry_after_secs,
+                            "error_preview": truncate_chars(&e.to_string(), 180)
+                        }),
                     );
                     let payload = if let Some(retry_after_secs) = retry_after_secs {
                         serde_json::json!({
@@ -4083,8 +4203,27 @@ async fn complete_stream_inner(
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %req.request_id,
+                request_ref = %request_ref_log,
+                session_ref = %session_ref_log,
                 delivered_delta,
                 "streaming provider ended without a terminal billing event"
+            );
+            record_answer_ops_event(
+                &state.pool,
+                &account.id,
+                &req.request_id,
+                req.session_id.as_deref(),
+                Some(&trace_id),
+                "answer_failed",
+                "upstream_stream_incomplete",
+                serde_json::json!({
+                    "lane": lane_log.as_str(),
+                    "effective_lane": effective_lane_log.as_str(),
+                    "provider": streaming.provider.as_str(),
+                    "model": streaming.model.as_str(),
+                    "streaming": true,
+                    "delivered_delta": delivered_delta
+                }),
             );
             yield Ok(Event::default().event("error").data(
                 serde_json::json!({
@@ -4209,8 +4348,10 @@ async fn complete_stream_inner(
             Ok(true) => tracing::info!(
                 account_id_hash = %account_id_hash,
                 request_id = %req.request_id,
+                request_ref = %request_ref_log,
                 trace_id = %trace_id,
                 session_id = %session_id_log,
+                session_ref = %session_ref_log,
                 provider = %streaming.provider,
                 model = %streaming.model,
                 cost_cents = llm_customer_cost,
@@ -4257,7 +4398,9 @@ async fn complete_stream_inner(
         tracing::info!(
             account_id_hash = %account_id_hash,
             request_id = %req.request_id,
+            request_ref = %request_ref_log,
             session_id = %session_id_log,
+            session_ref = %session_ref_log,
             lane = %lane_log,
             effective_lane = %effective_lane_log,
             provider = %streaming.provider,
@@ -4401,12 +4544,16 @@ async fn complete_inner(
 
     let account_id_hash = cue_core::account_id_hash_prefix(&account.id);
     let session_id_log = log_session_id(req.session_id.as_deref()).to_string();
+    let request_ref_log = short_observability_ref(Some(&req.request_id));
+    let session_ref_log = short_observability_ref(req.session_id.as_deref());
     let lane_log = req.lane.clone();
     let requested_effective_lane_log = requested_effective_lane.clone();
     tracing::info!(
         account_id_hash = %account_id_hash,
         request_id = %req.request_id,
+        request_ref = %request_ref_log,
         session_id = %session_id_log,
+        session_ref = %session_ref_log,
         lane = %lane_log,
         requested_effective_lane = %requested_effective_lane_log,
         streaming = false,
@@ -4766,7 +4913,9 @@ async fn complete_inner(
                     tracing::info!(
                         account_id_hash = %account_id_hash,
                         request_id = %req.request_id,
+                        request_ref = %request_ref_log,
                         session_id = %session_id_log,
+                        session_ref = %session_ref_log,
                         lane = %lane_log,
                         effective_lane = %effective_lane_log,
                         provider = %route.provider,
@@ -4845,8 +4994,27 @@ async fn complete_inner(
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     request_id = %req.request_id,
+                    request_ref = %request_ref_log,
+                    session_ref = %session_ref_log,
                     error = %e,
                     "all upstream dispatch routes failed"
+                );
+                record_answer_ops_event(
+                    &state.pool,
+                    &account.id,
+                    &req.request_id,
+                    req.session_id.as_deref(),
+                    Some(&trace_id),
+                    "answer_failed",
+                    "upstream_error",
+                    serde_json::json!({
+                        "lane": lane_log.as_str(),
+                        "effective_lane": effective_lane_log.as_str(),
+                        "streaming": false,
+                        "error_kind": "all_routes_failed",
+                        "error_preview": truncate_chars(&e.to_string(), 180),
+                        "candidate_routes": routes.len()
+                    }),
                 );
             }
             return Err((
@@ -4967,8 +5135,10 @@ async fn complete_inner(
         Ok(true) => tracing::info!(
             account_id_hash = %account_id_hash,
             request_id = %req.request_id,
+            request_ref = %request_ref_log,
             trace_id = %trace_id,
             session_id = %session_id_log,
+            session_ref = %session_ref_log,
             provider = %comp.provider,
             model = %comp.model,
             cost_cents = llm_customer_cost,
@@ -5026,7 +5196,9 @@ async fn complete_inner(
     tracing::info!(
         account_id_hash = %account_id_hash,
         request_id = %req.request_id,
+        request_ref = %request_ref_log,
         session_id = %session_id_log,
+        session_ref = %session_ref_log,
         lane = %lane_log,
         effective_lane = %effective_lane_log,
         provider = %comp.provider,
@@ -7453,6 +7625,20 @@ mod tests {
         let explicit_memory =
             complete_request("Question:\nUse saved memory and tell me what was decided.");
         assert!(should_lookup_completion_memory(&explicit_memory, "balanced"));
+    }
+
+    #[test]
+    fn short_observability_ref_matches_session_screenshot_codes() {
+        assert_eq!(
+            short_observability_ref(Some("25594f6d-4cc7-4315-b99b-017b567851ae")),
+            "25594F6D"
+        );
+        assert_eq!(
+            short_observability_ref(Some("74c0a385-e56a-4afd-bb90-5abb4941cebb")),
+            "74C0A385"
+        );
+        assert_eq!(short_observability_ref(None), "NONE");
+        assert_eq!(short_observability_ref(Some(" --- ")), "NONE");
     }
 
     #[test]

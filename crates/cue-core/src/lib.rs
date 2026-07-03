@@ -54,8 +54,8 @@ pub use meeting::{
 };
 pub use observability::{
     account_id_hash_prefix, new_request_id, new_trace_id, platform, sanitize_observability_id,
-    trace_id_from_env, ObserveFields, BLUEY_REQUEST_ID_HEADER, BLUEY_TRACE_ID_ENV,
-    BLUEY_TRACE_ID_HEADER,
+    short_observability_ref, trace_id_from_env, ObserveFields, BLUEY_REQUEST_ID_HEADER,
+    BLUEY_TRACE_ID_ENV, BLUEY_TRACE_ID_HEADER,
 };
 pub use overlay::{
     OverlayCommand, OverlayContextItem, OverlayEvent, OverlayPosition, OverlaySessionItem,

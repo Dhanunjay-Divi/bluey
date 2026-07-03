@@ -165,6 +165,26 @@ pub fn sanitize_observability_id(value: &str) -> Option<String> {
     }
 }
 
+/// Stable 8-character support reference for request/session ids.
+///
+/// This is intentionally not a secret. It is a human-friendly join key for
+/// screenshots, support bundles, redacted audit rows, and logs.
+pub fn short_observability_ref(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "NONE".to_string();
+    };
+    let short = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>();
+    if short.is_empty() {
+        "NONE".to_string()
+    } else {
+        short.to_ascii_uppercase()
+    }
+}
+
 /// SHA-256 of account id, first 12 hex chars. This is the support join key
 /// used by doctor/logs without placing raw account ids in local logs.
 pub fn account_id_hash_prefix(account_id: &str) -> String {
@@ -201,6 +221,20 @@ mod tests {
         assert_eq!(sanitize_observability_id("bad\nid"), None);
         assert_eq!(sanitize_observability_id(""), None);
         assert_eq!(sanitize_observability_id(&"x".repeat(129)), None);
+    }
+
+    #[test]
+    fn short_observability_ref_matches_session_screenshot_codes() {
+        assert_eq!(
+            short_observability_ref(Some("25594f6d-4cc7-4315-b99b-017b567851ae")),
+            "25594F6D"
+        );
+        assert_eq!(
+            short_observability_ref(Some("74c0a385-e56a-4afd-bb90-5abb4941cebb")),
+            "74C0A385"
+        );
+        assert_eq!(short_observability_ref(None), "NONE");
+        assert_eq!(short_observability_ref(Some(" --- ")), "NONE");
     }
 
     #[test]

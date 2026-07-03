@@ -6687,10 +6687,10 @@ async fn answer_with_provider_runtime(
         Ok(outcome) => outcome,
         Err(error) => {
             if is_answer_generation_current(daemon, generation_id) {
-                let error_message = answer_error_with_ref(
-                    &user_facing_answer_error(&error),
-                    request.metadata.request_id,
-                );
+                let user_message = user_facing_answer_error(&error);
+                let error_message =
+                    answer_error_with_ref(&user_message, request.metadata.request_id);
+                record_active_session_diagnostic(daemon, "answer_error", &error_message).await;
                 let _ = overlay_stream.finish(&error_message).await;
             }
             clear_active_answer_card(daemon, generation_id, answer_card_id).await;

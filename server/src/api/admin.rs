@@ -210,6 +210,7 @@ pub struct SupportCounts {
 #[derive(Serialize)]
 pub struct SupportUsageEvent {
     pub request_id: Option<String>,
+    pub request_ref: String,
     pub ts: Option<String>,
     pub kind: Option<String>,
     pub task_type: Option<String>,
@@ -224,6 +225,7 @@ pub struct SupportUsageEvent {
 
 #[derive(Serialize)]
 pub struct SupportSessionSummary {
+    pub session_ref: String,
     pub session_id_hash: String,
     pub status: Option<String>,
     pub created_at_ms: Option<i64>,
@@ -444,8 +446,10 @@ fn destination_kind(value: &str) -> String {
 }
 
 fn support_usage_event(value: &serde_json::Value) -> SupportUsageEvent {
+    let request_id = string_field(value, "request_id");
     SupportUsageEvent {
-        request_id: string_field(value, "request_id"),
+        request_ref: cue_core::short_observability_ref(request_id.as_deref()),
+        request_id,
         ts: string_field(value, "ts"),
         kind: string_field(value, "kind"),
         task_type: string_field(value, "task_type"),
@@ -460,8 +464,10 @@ fn support_usage_event(value: &serde_json::Value) -> SupportUsageEvent {
 }
 
 fn support_session_summary(value: &serde_json::Value) -> SupportSessionSummary {
+    let session_id = string_field(value, "session_id");
     SupportSessionSummary {
-        session_id_hash: string_field(value, "session_id")
+        session_ref: cue_core::short_observability_ref(session_id.as_deref()),
+        session_id_hash: session_id
             .map(|session_id| stable_hash(&session_id))
             .unwrap_or_default(),
         status: string_field(value, "status"),
