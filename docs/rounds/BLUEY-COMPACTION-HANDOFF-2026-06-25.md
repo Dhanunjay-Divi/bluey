@@ -30,13 +30,13 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-319-TONE-TYPING-INDICATOR.md`; the next canonical Bluey round doc should start at `ROUND-320-...`.
+- Latest completed and deployed Bluey round doc is `ROUND-319-TONE-TYPING-INDICATOR.md`; the next canonical Bluey round doc should start at `ROUND-320-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
-- Round 319 is complete locally for Tone typing/focus visibility:
+- Round 319 is complete and deployed for Tone typing/focus visibility:
   - added a dedicated blue typing indicator beside the macOS Tone input
   - Tone input now uses a brighter blue border and glow while focused
   - focus chrome refreshes on Tone open, click/edit begin, edit end, save, dismiss, and theme changes
@@ -50,7 +50,12 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
     - `cargo test -p cue-core overlay --lib`
   - Round doc:
     `docs/rounds/ROUND-319-TONE-TYPING-INDICATOR.md`
-  - Deploy note: local code is tested and ready for signed desktop packaging as `0.1.58`; not marked deployed until the release publish path runs.
+  - Release/deploy:
+    - desktop release `0.1.58` is live on `bluey.sh`
+    - live `latest.json.sig` verified successfully by the deploy script
+    - live installer MIME checks passed for `/install.sh` and `/install.ps1`
+    - live macOS artifact SHA verified
+    - unpacked macOS release reports `bluey 0.1.58` and `bluey-daemon 0.1.58`
 - Round 318 is complete and deployed for realtime STT and answer latency:
   - live managed STT relay now opens after audible audio or a 250 ms warm-up window, whichever comes first
   - no-helper-bytes Listen toggles still avoid creating a cloud STT session

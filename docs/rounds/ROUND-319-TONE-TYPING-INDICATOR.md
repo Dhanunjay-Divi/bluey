@@ -23,12 +23,17 @@ The owner reported that clicking the Tone editor should show a clear blue typing
 - `x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
 - `cargo check -p cue-daemon --quiet`
 - `cargo test -p cue-core overlay --lib`
+- `BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64`
+- `BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/deploy-bluey-sh-manual.sh`
 
 ## Current State
 
-The local code is tested and ready for desktop release packaging as `0.1.58`.
+- Desktop release `0.1.58` is live on `bluey.sh`.
+- Live `latest.json.sig` verified successfully.
+- Live installer MIME checks passed for `/install.sh` and `/install.ps1`.
+- Live macOS artifact SHA verified.
+- Unpacked macOS release reports `bluey 0.1.58` and `bluey-daemon 0.1.58`.
 
 ## Remaining QA/Gates
 
-- Publish the signed desktop artifact.
 - Smoke-test Tone in dark and white themes after update install.

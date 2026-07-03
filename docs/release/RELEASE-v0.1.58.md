@@ -16,3 +16,11 @@ Tone editor focus clarity.
 - `x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
 - `cargo check -p cue-daemon --quiet`
 - `cargo test -p cue-core overlay --lib`
+
+## Deployment
+
+- Desktop release `0.1.58` published to `bluey.sh`.
+- Live release signature verified.
+- Live installer MIME checks passed.
+- Live macOS artifact SHA verified.
+- Unpacked macOS release reports `bluey 0.1.58` and `bluey-daemon 0.1.58`.
