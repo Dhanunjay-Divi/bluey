@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 18:23 EDT
+Latest checkpoint: 2026-07-03 18:37 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -36,7 +36,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
-- Round 326 is in progress for the macOS PDF attachment picker:
+- Round 326 is complete and deployed for the macOS PDF attachment picker:
   - owner reported the attachment picker seemed to allow DOC/DOCX but not PDF
   - confirmed `.pdf` is already allowed by the macOS overlay drag/drop extension list, daemon fallback picker, Windows picker filter, and daemon document conversion support
   - confirmed this Mac does not have `pdftotext`, but the bundled Bluey document converter successfully converted `/Users/uno/Downloads/Interview_Instructions.pdf` to markdown
@@ -49,12 +49,16 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
     - `cargo test -p cue-daemon picker_context_filter_rejects_video_and_key_material -- --nocapture`
     - `cargo check -p cue-daemon`
     - `/Users/uno/.bluey/bin/bluey-doc-converter /Users/uno/Downloads/Interview_Instructions.pdf -o /tmp/bluey-pdf-test.md`
-  - pending before final close:
-    - package/deploy desktop `0.1.65`
-    - install locally and restart Bluey
-    - update `ROUND-326-PDF-ATTACH-PICKER-FILTER.md` and `RELEASE-v0.1.65.md` with live deployment facts
   - Round doc:
     `docs/rounds/ROUND-326-PDF-ATTACH-PICKER-FILTER.md`
+  - Release/deploy:
+    - desktop release `0.1.65` is live on `bluey.sh`
+    - live `latest.json.sig` verified successfully
+    - live installer MIME checks passed for `/install.sh` and `/install.ps1`
+    - live macOS artifact SHA verified:
+      `75191d76c86f8aa5e9632938cd17ae40e865dbdcec78c1bff44805c7ea60ff77`
+    - unpacked macOS release reports `bluey 0.1.65` and `bluey-daemon 0.1.65`
+    - local install updated to `0.1.65` and Bluey was restarted
 - Round 325 is complete and deployed for complete code canvas and line notes:
   - traced the owner screenshot session `724C3B7E`; it was produced by older daemon build `0.1.59` and persisted a code artifact from only a histogram inner-loop fragment
   - hardened managed server coding prompt so code answers start with one short approach sentence, then complete fenced code with language tag

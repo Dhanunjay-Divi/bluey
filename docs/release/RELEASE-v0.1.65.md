@@ -24,4 +24,26 @@ cargo check -p cue-daemon
 
 ## Deployment Status
 
-Pending final package and deploy.
+Live on `bluey.sh`.
+
+Live Darwin arm64 artifact:
+
+```text
+https://bluey.sh/releases/v0.1.65/bluey-0.1.65-darwin-arm64.tar.gz
+```
+
+SHA256:
+
+```text
+75191d76c86f8aa5e9632938cd17ae40e865dbdcec78c1bff44805c7ea60ff77
+```
+
+Live deployment checks passed:
+
+- `latest.json` signature verified.
+- `latest.json` reports `0.1.65`.
+- `/install.sh` serves `application/x-shellscript`.
+- `/install.ps1` serves `application/x-powershell`.
+- Darwin arm64 artifact SHA verified.
+- Unpacked `bluey` and `bluey-daemon` report `0.1.65`.
+- Local install from `https://bluey.sh/install.sh` completed and Bluey was restarted.

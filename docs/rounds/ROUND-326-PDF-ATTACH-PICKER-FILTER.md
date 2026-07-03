@@ -48,11 +48,35 @@ The converter smoke produced markdown from a real PDF. `pdftotext` is not instal
 
 ## Deployment
 
-Pending:
+Completed:
 
-- Package desktop release `0.1.65`
-- Publish `0.1.65` to `bluey.sh`
-- Install locally and restart Bluey
+- Packaged desktop release `0.1.65`.
+- Published `0.1.65` to `bluey.sh`.
+- Verified live signed release metadata and installer MIME types.
+- Verified the live Darwin arm64 artifact SHA.
+- Verified unpacked release binaries report `0.1.65`.
+- Installed locally from `https://bluey.sh/install.sh`.
+- Restarted Bluey locally.
+
+Live Darwin arm64 artifact:
+
+```text
+https://bluey.sh/releases/v0.1.65/bluey-0.1.65-darwin-arm64.tar.gz
+```
+
+SHA256:
+
+```text
+75191d76c86f8aa5e9632938cd17ae40e865dbdcec78c1bff44805c7ea60ff77
+```
+
+Local restart status after install:
+
+```text
+bluey 0.1.65
+bluey-daemon 0.1.65
+overlay_visible=true
+```
 
 ## Remaining QA / Gates
 
