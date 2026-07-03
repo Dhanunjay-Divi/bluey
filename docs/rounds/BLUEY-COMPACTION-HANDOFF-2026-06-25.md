@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 04:50 EDT
+Latest checkpoint: 2026-07-03 05:20 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,13 +30,13 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-318-REALTIME-STT-ANSWER-LATENCY.md`; the next canonical Bluey round doc should start at `ROUND-319-...`.
+- Latest completed and deployed Bluey round doc is `ROUND-318-REALTIME-STT-ANSWER-LATENCY.md`; the next canonical Bluey round doc should start at `ROUND-319-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
-- Round 318 is complete locally for realtime STT and answer latency:
+- Round 318 is complete and deployed for realtime STT and answer latency:
   - live managed STT relay now opens after audible audio or a 250 ms warm-up window, whichever comes first
   - no-helper-bytes Listen toggles still avoid creating a cloud STT session
   - server STT settlement now tracks audible chunks separately from raw forwarded bytes, so silent relay sessions settle as `no_audible_audio` with zero billable elapsed
@@ -58,7 +58,18 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
     - `git diff --check`
   - Round doc:
     `docs/rounds/ROUND-318-REALTIME-STT-ANSWER-LATENCY.md`
-  - Deploy note: local code is tested but not marked deployed unless the release/deploy path is run after this handoff update.
+  - Release/deploy:
+    - desktop release `0.1.57` is live on `bluey.sh`
+    - live `latest.json.sig` verified successfully by the deploy script
+    - live installer MIME checks passed for `/install.sh` and `/install.ps1`
+    - unpacked macOS release reports `bluey 0.1.57` and `bluey-daemon 0.1.57`
+    - production API was rebuilt and deployed on the droplet from commit `5d2f1f379a64059d7d3ec68abaeaf69f80ae0e26`
+    - production API health returned OK with commit `5d2f1f379a64059d7d3ec68abaeaf69f80ae0e26`
+    - production API binary SHA:
+      `d3568f41e947c49993cd1f50bb205c12908b88c543e5bd81e726ba7875dede2e`
+    - previous production API binary backup:
+      `/var/backups/bluey-api/bin/bluey-server.previous-20260703T091652Z`
+    - `bluey-api.service` restarted cleanly and recent warning logs were empty
 - Round 301 is complete for the fresh review of Codex-owned billing guard work:
   - reviewed Round 300 against the Pinky billing lesson goal with fresh eyes
   - found one remaining edge: an internal/test account with legacy Auto Reload enabled and a saved payment method could still reach the background Auto Reload worker

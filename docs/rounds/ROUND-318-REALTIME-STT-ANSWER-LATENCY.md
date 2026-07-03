@@ -35,10 +35,27 @@ The owner reported that live transcript text still did not feel realtime, answer
 - `cargo check -p cue-daemon`
 - `cargo build --manifest-path server/Cargo.toml`
 - `git diff --check`
+- `BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64`
+- `BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/deploy-bluey-sh-manual.sh`
+- Production API release build on droplet from commit `5d2f1f379a64059d7d3ec68abaeaf69f80ae0e26`
+- `curl -fsS https://bluey.sh/health`
 
 ## Current State
 
-The local code is tested. Production binaries/server still need the normal release/deploy path before owner live testing picks up this round.
+Released as desktop version `0.1.57` and deployed to the production API.
+
+- Live release metadata reports `0.1.57`.
+- Live release signature verified.
+- Live macOS artifact SHA verified by the deploy script.
+- Live installer MIME checks passed for `/install.sh` and `/install.ps1`.
+- Unpacked macOS binaries report `0.1.57`.
+- Production API health is OK and reports commit `5d2f1f379a64059d7d3ec68abaeaf69f80ae0e26`.
+- Production API binary SHA:
+  `d3568f41e947c49993cd1f50bb205c12908b88c543e5bd81e726ba7875dede2e`
+- Previous production API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260703T091652Z`
+- `bluey-api.service` restarted cleanly and was active after deployment.
+- Recent production API warning log check returned no entries.
 
 ## Remaining QA/Gates
 

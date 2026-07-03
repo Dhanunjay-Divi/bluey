@@ -23,3 +23,16 @@ Realtime STT and answer startup latency.
 - `cargo test --manifest-path server/Cargo.toml pcm16_i16le_stats_are_privacy_safe_levels -- --nocapture`
 - `cargo check -p cue-daemon`
 - `cargo build --manifest-path server/Cargo.toml`
+
+## Deployment
+
+- Desktop release `0.1.57` published to `bluey.sh`.
+- Live release signature verified.
+- Live installer MIME checks passed.
+- Unpacked macOS release reports `bluey 0.1.57` and `bluey-daemon 0.1.57`.
+- Production API deployed from commit `5d2f1f379a64059d7d3ec68abaeaf69f80ae0e26`.
+- Production API health returned OK for commit `5d2f1f379a64059d7d3ec68abaeaf69f80ae0e26`.
+- Production API binary SHA:
+  `d3568f41e947c49993cd1f50bb205c12908b88c543e5bd81e726ba7875dede2e`
+- Previous production API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260703T091652Z`
