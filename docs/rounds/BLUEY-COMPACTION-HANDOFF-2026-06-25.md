@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 16:52 EDT
+Latest checkpoint: 2026-07-03 17:17 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,37 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest active Bluey round doc is `ROUND-323-LIVE-STT-HELPER-DISCOVERY.md`; the next canonical Bluey round doc should start at `ROUND-324-...`.
+- Latest active Bluey round doc is `ROUND-324-PARTIAL-CODE-STREAM-RECOVERY.md`; the next canonical Bluey round doc should start at `ROUND-325-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 324 is complete and deployed for partial code stream recovery:
+  - fixed request shape seen in Ref `54B786D8`, where a useful partial code answer ended with `answer_incomplete_reason="unclosed_code_fence"` and was replaced by a retry card
+  - added repaired partial-answer recovery for managed and direct provider paths
+  - repaired code partials now close the open code fence, keep meaningful text/code, add a short partial-answer note, and preserve code canvas detection when possible
+  - tightened the coding prompt so first-time coding/build answers start with one short plain-English approach sentence before the first code fence
+  - tiny useless partials still fall back to retry behavior
+  - Windows parity: this is shared daemon/provider code, so macOS and Windows get the same answer recovery behavior
+  - bumped workspace desktop version to `0.1.63`
+  - verification passed:
+    - `cargo fmt --check`
+    - `cargo test -p cue-daemon incomplete_code_answer_repair -- --nocapture`
+    - `cargo test -p cue-daemon provider_messages_include_overlay_friendly_answer_shape -- --nocapture`
+    - `cargo check -p cue-daemon`
+    - `BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64`
+    - `BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/deploy-bluey-sh-manual.sh`
+    - `BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.63`
+  - Round doc:
+    `docs/rounds/ROUND-324-PARTIAL-CODE-STREAM-RECOVERY.md`
+  - Release/deploy:
+    - desktop release `0.1.63` is live on `bluey.sh`
+    - live `latest.json.sig` verified successfully
+    - live installer MIME checks passed for `/install.sh` and `/install.ps1`
+    - live macOS artifact SHA verified:
+      `36aee8d6c5934b9bf55c122fab90ea8ca4614b672bbe8982cdaace5e01371d93`
+    - unpacked macOS release reports `bluey 0.1.63` and `bluey-daemon 0.1.63`
 - Round 323 is complete and deployed for live STT helper discovery:
   - fixed daemon native audio helper discovery so symlink-launched installs can find helpers in `~/.bluey/bin`
   - added macOS and Windows installed-bin helper discovery parity

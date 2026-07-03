@@ -7322,6 +7322,51 @@ fn artifact_can_recover_incomplete_answer(artifact: &CueCardArtifact, reason: &s
     matches!(artifact.artifact_type, CardArtifactType::Code) && reason == "unclosed_code_fence"
 }
 
+const RECOVERED_PARTIAL_ANSWER_NOTE: &str =
+    "Connection dropped before Bluey finished. I kept this partial answer so you can continue or retry.";
+
+fn recover_incomplete_answer_from_text(
+    answer: &str,
+    reason: &str,
+) -> Option<(String, Option<CueCardArtifact>)> {
+    if reason != "unclosed_code_fence" {
+        return None;
+    }
+    let clean = sanitize_answer_text(answer).trim().to_string();
+    if clean.is_empty()
+        || clean == INTERNAL_DISCLOSURE_REFUSAL
+        || looks_like_internal_disclosure_leak(&clean)
+        || !has_unclosed_code_fence(&clean)
+    {
+        return None;
+    }
+
+    let mut repaired = clean;
+    if !repaired.ends_with('\n') {
+        repaired.push('\n');
+    }
+    repaired.push_str("```");
+
+    let code_chars = extract_fenced_code_blocks(&repaired)
+        .iter()
+        .map(|block| block.chars().count())
+        .sum::<usize>();
+    let prose_chars = strip_fenced_code(&repaired).trim().chars().count();
+    if code_chars < 80 && prose_chars < 80 {
+        return None;
+    }
+
+    repaired.push_str("\n\n");
+    repaired.push_str(RECOVERED_PARTIAL_ANSWER_NOTE);
+
+    if incomplete_answer_reason(&repaired).is_some() {
+        return None;
+    }
+
+    let artifact = answer_overlay_artifact(&repaired);
+    Some((repaired, artifact))
+}
+
 fn code_answer_is_pointer_only(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     let references_missing_context = lower.contains("already")
@@ -8576,6 +8621,36 @@ async fn call_bluey_managed_provider(
                     sources,
                 });
             } else {
+                if let Some((recovered_answer, recovered_artifact)) =
+                    recover_incomplete_answer_from_text(&answer, reason)
+                {
+                    warn!(
+                        provider = %provider.display_label(),
+                        request_id = %request.metadata.request_id,
+                        answer_chars = answer.chars().count(),
+                        recovered_answer_chars = recovered_answer.chars().count(),
+                        answer_incomplete_reason = reason,
+                        "managed provider stream preserved repaired partial answer"
+                    );
+                    if let Some(stream) = stream.as_mut() {
+                        stream
+                            .finish_with_cost_label_and_artifact(
+                                &recovered_answer,
+                                cost_label.clone(),
+                                recovered_artifact.clone(),
+                            )
+                            .await?;
+                    }
+                    return Ok(LiveProviderAnswer {
+                        provider: provider.clone(),
+                        answer: recovered_answer,
+                        artifact: recovered_artifact,
+                        token_usage,
+                        latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX))
+                            as u64,
+                        sources,
+                    });
+                }
                 warn!(
                     provider = %provider.display_label(),
                     request_id = %request.metadata.request_id,
@@ -8688,6 +8763,41 @@ async fn call_bluey_managed_provider(
                 sources: response.sources,
             });
         } else {
+            if let Some((recovered_answer, recovered_artifact)) =
+                recover_incomplete_answer_from_text(&answer, reason)
+            {
+                warn!(
+                    provider = %provider.display_label(),
+                    request_id = %request.metadata.request_id,
+                    answer_chars = answer.chars().count(),
+                    recovered_answer_chars = recovered_answer.chars().count(),
+                    answer_incomplete_reason = reason,
+                    "managed provider preserved repaired partial answer"
+                );
+                if let Some(stream) = stream.as_mut() {
+                    if !response.sources.is_empty() {
+                        stream
+                            .push_status(&format!("Found {} sources", response.sources.len()))
+                            .await?;
+                    }
+                    stream
+                        .finish_with_cost_label_and_artifact(
+                            &recovered_answer,
+                            response.cost_label.clone(),
+                            recovered_artifact.clone(),
+                        )
+                        .await?;
+                }
+                let token_usage = response.cost.as_ref().map(token_usage_from_llm_cost);
+                return Ok(LiveProviderAnswer {
+                    provider: provider.clone(),
+                    answer: recovered_answer,
+                    artifact: recovered_artifact,
+                    token_usage,
+                    latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    sources: response.sources,
+                });
+            }
             warn!(
                 provider = %provider.display_label(),
                 request_id = %request.metadata.request_id,
@@ -8936,6 +9046,34 @@ async fn call_chat_provider(
         .filter(|content| !content.is_empty())
         .context("provider returned no answer text")?;
     if let Some(reason) = incomplete_answer_reason(&answer) {
+        if let Some((recovered_answer, recovered_artifact)) =
+            recover_incomplete_answer_from_text(&answer, reason)
+        {
+            warn!(
+                provider = %config.provider.display_label(),
+                answer_chars = answer.chars().count(),
+                recovered_answer_chars = recovered_answer.chars().count(),
+                answer_incomplete_reason = reason,
+                "provider preserved repaired partial answer"
+            );
+            let token_usage = parsed.usage.map(|usage| {
+                let input = usage.prompt_tokens.unwrap_or_default();
+                let output = usage.completion_tokens.unwrap_or_default();
+                TokenUsage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    total_tokens: usage.total_tokens.unwrap_or(input.saturating_add(output)),
+                }
+            });
+            return Ok(LiveProviderAnswer {
+                provider: config.provider.clone(),
+                answer: recovered_answer,
+                artifact: recovered_artifact,
+                token_usage,
+                latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                sources: Vec::new(),
+            });
+        }
         warn!(
             provider = %config.provider.display_label(),
             answer_chars = answer.chars().count(),
@@ -9102,6 +9240,34 @@ async fn read_streaming_chat_response(
         ));
     }
     if let Some(reason) = incomplete_answer_reason(&answer) {
+        if let Some((recovered_answer, recovered_artifact)) =
+            recover_incomplete_answer_from_text(&answer, reason)
+        {
+            warn!(
+                provider = %config.provider.display_label(),
+                answer_chars = answer.chars().count(),
+                recovered_answer_chars = recovered_answer.chars().count(),
+                answer_incomplete_reason = reason,
+                "provider stream preserved repaired partial answer"
+            );
+            if let Some(stream) = stream.as_mut() {
+                stream
+                    .finish_with_cost_label_and_artifact(
+                        &recovered_answer,
+                        None,
+                        recovered_artifact.clone(),
+                    )
+                    .await?;
+            }
+            return Ok(LiveProviderAnswer {
+                provider: config.provider.clone(),
+                answer: recovered_answer,
+                artifact: recovered_artifact,
+                token_usage,
+                latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                sources: Vec::new(),
+            });
+        }
         warn!(
             provider = %config.provider.display_label(),
             answer_chars = answer.chars().count(),
@@ -9204,7 +9370,7 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
     system.push_str("\n\n");
     system.push_str(HUMAN_SPEAK_CONTRACT);
     system.push_str(
-        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- For quick \"what is\" / \"explain\" answers, do not default to bullets. A compact spoken answer is better than a polished reference note.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Do not use Markdown emphasis in chat prose. Avoid bold, italics, and inline backticks unless a fenced code block is actually needed.\n- Do not use Markdown tables in streamed chat. Use short bullets or plain lines instead, and reserve table-like detail for the workbench/canvas when it is truly useful.\n- Do not use em dashes in streamed chat, final answers, or artifact text.\n- Use the canvas split: chat is the explanation/talk track; the workbench is code, patch, architecture, data flow, APIs, tables, or deeper detail.\n- Do not write \"Code is in the canvas\", \"Architecture is in the canvas\", or similar pointer-only lines. Make the chat answer useful by itself.\n- If the user explicitly asks for code, a program, implementation, or says \"I want the code\" / \"write code in <language>\", the answer must include a complete fenced code block with a language tag. For small standalone tasks, include the full runnable snippet directly in chat, not only prose or a canvas artifact.\n- For first-time coding/build answers, keep the chat explanation short and put the complete code in fenced Markdown code blocks with a language tag so Bluey can place it in the canvas.\n- Treat repeated build/implement/write requests as requests to show or regenerate the implementation. Do not answer only with \"already above\" or \"already in the session\" unless the user explicitly asks whether it already exists.\n- For code follow-ups or requested changes, prefer in-place edits: name the file/function, show only the changed block, PATCH, or unified diff, and explain where it lands. Do not replace the whole implementation unless the user explicitly asks, the file is new/tiny, or a full replacement is materially safer than a patch.\n- For explanation-only coding questions or follow-ups, do not emit a new code fence by default. Use a teaching flow: Core idea, Data structures, Operation walkthrough, Invariant, Complexity, Edge cases.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions that ask for implementation or changes, use this shape after the talk track when useful: Approach, Patch, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For system design questions, keep chat to the recommendation, assumptions, and the key tradeoff. Put the full architecture workbench in sections: Architecture, Components, Data flow, APIs/contracts, Storage, Scaling, Tradeoffs, Failure modes, Observability, and Rollout / next steps when useful.\n- For system design follow-ups, answer the low-level explanation in chat unless the user asks to change the design. If they ask for a design change, update only the affected workbench section and call out what changed.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
+        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- For quick \"what is\" / \"explain\" answers, do not default to bullets. A compact spoken answer is better than a polished reference note.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Do not use Markdown emphasis in chat prose. Avoid bold, italics, and inline backticks unless a fenced code block is actually needed.\n- Do not use Markdown tables in streamed chat. Use short bullets or plain lines instead, and reserve table-like detail for the workbench/canvas when it is truly useful.\n- Do not use em dashes in streamed chat, final answers, or artifact text.\n- Use the canvas split: chat is the explanation/talk track; the workbench is code, patch, architecture, data flow, APIs, tables, or deeper detail.\n- Do not write \"Code is in the canvas\", \"Architecture is in the canvas\", or similar pointer-only lines. Make the chat answer useful by itself.\n- If the user explicitly asks for code, a program, implementation, or says \"I want the code\" / \"write code in <language>\", the answer must include a complete fenced code block with a language tag. For small standalone tasks, include the full runnable snippet directly in chat, not only prose or a canvas artifact.\n- For first-time coding/build answers, start with one short plain-English approach sentence before the first code fence, then put the complete code in fenced Markdown code blocks with a language tag so Bluey can place it in the canvas. Never start a streamed coding answer with a code fence.\n- Treat repeated build/implement/write requests as requests to show or regenerate the implementation. Do not answer only with \"already above\" or \"already in the session\" unless the user explicitly asks whether it already exists.\n- For code follow-ups or requested changes, prefer in-place edits: name the file/function, show only the changed block, PATCH, or unified diff, and explain where it lands. Do not replace the whole implementation unless the user explicitly asks, the file is new/tiny, or a full replacement is materially safer than a patch.\n- For explanation-only coding questions or follow-ups, do not emit a new code fence by default. Use a teaching flow: Core idea, Data structures, Operation walkthrough, Invariant, Complexity, Edge cases.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions that ask for implementation or changes, use this shape after the talk track when useful: Approach, Patch, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For system design questions, keep chat to the recommendation, assumptions, and the key tradeoff. Put the full architecture workbench in sections: Architecture, Components, Data flow, APIs/contracts, Storage, Scaling, Tradeoffs, Failure modes, Observability, and Rollout / next steps when useful.\n- For system design follow-ups, answer the low-level explanation in chat unless the user asks to change the design. If they ask for a design change, update only the affected workbench section and call out what changed.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
     );
     system.push_str(
         "\n- If a screenshot or attachment is insufficient, do not fill gaps from generic knowledge. State what is visible, what is missing, and ask for the next concrete evidence: failing output, current directory/tree, relevant file, expected result, or a fresh screenshot.",
@@ -15295,6 +15461,8 @@ mod tests {
         assert!(system.contains("complete code in fenced Markdown code blocks"));
         assert!(system.contains("I want the code"));
         assert!(system.contains("full runnable snippet directly in chat"));
+        assert!(system.contains("one short plain-English approach sentence"));
+        assert!(system.contains("Never start a streamed coding answer with a code fence"));
         assert!(system.contains("Do not use Markdown emphasis in chat prose"));
         assert!(system.contains("Do not use Markdown tables in streamed chat"));
         assert!(system.contains("teach the logic instead of dumping implementation notes"));
@@ -16269,6 +16437,32 @@ mod tests {
         );
 
         assert!(artifact.is_none());
+    }
+
+    #[test]
+    fn incomplete_code_answer_repair_closes_fence_and_preserves_canvas() {
+        let partial = "Use a hash map for lookup and a linked list for recency.\n\n```python\nclass Node:\n    def __init__(self, key=0, value=0):\n        self.key = key\n        self.value = value\n        self.prev = None\n        self.next = None\n\nclass LRUCache:\n    def __init__(self, capacity: int):\n        self.capacity = capacity";
+
+        let (repaired, artifact) =
+            recover_incomplete_answer_from_text(partial, "unclosed_code_fence")
+                .expect("repaired answer");
+
+        assert_eq!(incomplete_answer_reason(&repaired), None);
+        assert!(repaired.contains("```python"));
+        assert!(repaired.contains(RECOVERED_PARTIAL_ANSWER_NOTE));
+        assert_eq!(
+            artifact.as_ref().map(|artifact| artifact.artifact_type),
+            Some(CardArtifactType::Code)
+        );
+    }
+
+    #[test]
+    fn incomplete_code_answer_repair_ignores_tiny_stubs() {
+        assert!(
+            recover_incomplete_answer_from_text("```python\nclass", "unclosed_code_fence")
+                .is_none()
+        );
+        assert!(recover_incomplete_answer_from_text("### Next", "dangling_heading").is_none());
     }
 
     #[test]
