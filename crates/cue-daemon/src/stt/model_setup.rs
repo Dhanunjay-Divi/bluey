@@ -111,14 +111,36 @@ pub async fn ensure_parakeet_model(paths: &AppPaths) -> Result<ParakeetPaths> {
     Ok(parakeet_paths(model_dir))
 }
 
-/// Build [`ParakeetPaths`] from a ready model dir. Sortformer (diarization) is
-/// included when its model file is present beside the STT model.
+/// Build [`ParakeetPaths`] from a ready model dir.
+///
+/// Sortformer (speaker diarization) is **OFF by default** and opt-in via
+/// `BLUEY_STT_DIARIZE=1`. It is the slow, ~90%-of-compute part of the pipeline
+/// (measured: running `diarize_chunk` on every audio chunk pegs ~3 CPU cores and
+/// makes the STT worker fall behind real time, so the transcript backlog grows
+/// unboundedly — the multi-second-and-climbing lag). For the v1 system-audio path
+/// the speaker is always the SOURCE ("They"), so per-chunk diarization buys us
+/// nothing and costs us the whole latency budget. Leave it off unless a caller
+/// explicitly asks for speaker labels AND the model is present.
 fn parakeet_paths(model_dir: PathBuf) -> ParakeetPaths {
-    let sortformer = model_dir.join("diar_streaming_sortformer_4spk-v2.onnx");
-    let sortformer_model = sortformer.is_file().then_some(sortformer);
-    if sortformer_model.is_none() {
-        warn!("parakeet: sortformer diarization model not present; diarization disabled");
-    }
+    let diarize_requested = std::env::var("BLUEY_STT_DIARIZE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let sortformer_model = if diarize_requested {
+        let sortformer = model_dir.join("diar_streaming_sortformer_4spk-v2.onnx");
+        match sortformer.is_file() {
+            true => Some(sortformer),
+            false => {
+                warn!(
+                    "parakeet: BLUEY_STT_DIARIZE=1 but sortformer model not present; \
+                     diarization disabled"
+                );
+                None
+            }
+        }
+    } else {
+        // Default path: diarization disabled for latency (see doc comment).
+        None
+    };
     ParakeetPaths {
         nemotron_dir: model_dir,
         sortformer_model,

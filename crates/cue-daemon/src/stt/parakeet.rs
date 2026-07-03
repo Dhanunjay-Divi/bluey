@@ -1,15 +1,19 @@
 //! On-device Parakeet STT provider — English streaming transcription (+ optional
 //! on-demand Sortformer diarization) entirely on the user's machine, no network.
 //!
-//! `parakeet-rs` (NVIDIA Parakeet/Nemotron + Sortformer via ONNX Runtime) is a
-//! SYNCHRONOUS, in-process inference library: `Nemotron::transcribe_chunk` runs
-//! the model and returns the text. Our `SttProvider` trait, by contrast, is an
+//! ASR is delegated to the shared `cue-transcribe` crate ([`cue_transcribe::SttEngine`]),
+//! the single home for the Nemotron-wrapping inference code. The engine is a
+//! SYNCHRONOUS, in-process streaming model: `SttEngine::push` runs the model and
+//! returns any newly committed text. Our `SttProvider` trait, by contrast, is an
 //! async connection model (`send_audio` is a fast non-blocking write; results
 //! arrive separately via `next_event`). So this provider mirrors the proven
 //! `LocalWhisperProvider` bridge: audio is pushed over an mpsc channel into a
 //! dedicated blocking worker thread that runs inference, and the worker pushes
 //! `TranscriptEvent`s back over a second channel that `next_event` awaits. The
 //! CPU-heavy ONNX inference therefore never blocks the async runtime.
+//!
+//! Diarization is NOT part of `cue-transcribe` (it omits it deliberately); the
+//! on-demand Sortformer path below still uses `parakeet_rs::sortformer` directly.
 //!
 //! Gated behind the `parakeet-stt` cargo feature so the heavy ONNX dependency is
 //! opt-in and the default build is unaffected. See
@@ -20,7 +24,6 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use cue_core::pcm::{AudioChunk, AudioSource};
 use cue_core::stt::{ConnectionState, SttError, SttProvider, TranscriptEvent};
-use parakeet_rs::{Nemotron, NemotronMode};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
@@ -78,17 +81,11 @@ fn run_worker(
     mut audio_rx: mpsc::UnboundedReceiver<Vec<f32>>,
     event_tx: mpsc::UnboundedSender<Result<TranscriptEvent, SttError>>,
 ) {
-    // Load the English Nemotron model on this worker thread. `None` execution
-    // config = default backend (native ONNX Runtime / load-dynamic per target).
-    let mut nemotron = match Nemotron::from_pretrained(&paths.nemotron_dir, None) {
-        Ok(mut n) => {
-            // English-only is the model we ship (fastest, our use case).
-            if n.mode() != NemotronMode::EnglishOnly {
-                debug!("parakeet: model is not EnglishOnly mode ({:?})", n.mode());
-            }
-            n.reset();
-            n
-        }
+    // Load the streaming ASR engine on this worker thread. `cue-transcribe` owns
+    // the Nemotron-wrapping inference (CPU execution provider by default) and
+    // loads the model fresh, so the engine starts in a clean (reset) state.
+    let mut engine = match cue_transcribe::SttEngine::load(&paths.nemotron_dir) {
+        Ok(e) => e,
         Err(e) => {
             let _ = event_tx.send(Err(SttError::Provider(format!(
                 "failed to load Parakeet model from {}: {e}",
@@ -116,13 +113,16 @@ fn run_worker(
     // async task. The loop ends when the provider drops `audio_tx`.
     while let Some(chunk) = audio_rx.blocking_recv() {
         // STT: streaming, stateful — returns the incremental text for this chunk.
-        match nemotron.transcribe_chunk(&chunk) {
-            Ok(text) if !text.trim().is_empty() => {
+        // `push` already returns `None` for empty/whitespace-only text, so we only
+        // emit on `Some`. Measured RTF ~0.25 (250ms CPU per 1s of audio) with
+        // diarization off, so the backlog stays at 0 and text streams in real time.
+        match engine.push(&chunk) {
+            Ok(Some(tc)) => {
                 // parakeet-rs emits committed text per chunk; surface it as a
                 // Final for the streamed text the meeting transcript consumes.
                 if event_tx
                     .send(Ok(TranscriptEvent::Final {
-                        text,
+                        text: tc.text,
                         confidence: None,
                         source,
                         words: Vec::new(),
@@ -132,7 +132,7 @@ fn run_worker(
                     break; // consumer gone
                 }
             }
-            Ok(_) => {} // empty chunk, nothing to emit
+            Ok(None) => {} // empty chunk, nothing to emit
             Err(e) => {
                 error!("parakeet transcribe_chunk error: {e}");
                 let _ = event_tx.send(Err(SttError::Provider(format!(
@@ -143,6 +143,11 @@ fn run_worker(
         }
 
         // Diarization on-demand: when enabled, label the speaker for this chunk.
+        // OFF by default (`sortformer` is `None` unless `BLUEY_STT_DIARIZE=1`) —
+        // `diarize_chunk` is a second heavy ONNX model per chunk and, left on, it
+        // pegs the worker so the audio backlog grows unboundedly (the multi-second
+        // transcript lag). For system audio the speaker is always the source, so
+        // this stays off. See `model_setup::parakeet_paths`.
         #[cfg(feature = "parakeet-stt")]
         if let Some(diar) = sortformer.as_mut() {
             match diar.diarize_chunk(&chunk) {

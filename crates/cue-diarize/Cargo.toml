@@ -1,0 +1,24 @@
+[package]
+name = "cue-diarize"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "On-device speaker diarization (speakrs VBx+PLDA) with live centroid-inheritance and offline passes."
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+
+# speakrs = pyannote-parity VBx+PLDA diarization in pure Rust (~7.8% DER on
+# VoxConverse test, measured). Uses ort 2.0.0-rc.12 (matches cue-transcribe /
+# the daemon), permissive ONNX models (no HF gate), CoreML on Apple Silicon.
+#   - `online`        : model download via speakrs ModelManager (first-run).
+#   - `coreml`        : native CoreML backend (18× realtime on Apple Silicon).
+#   - `openblas-system`: link Homebrew arm64 OpenBLAS for the one PLDA eig
+#     (the default `openblas-static` tries to COMPILE OpenBLAS with gfortran,
+#     which fails targeting armv8.3-a on this toolchain).
+speakrs = { version = "0.4", default-features = false, features = [
+    "online",
+    "coreml",
+    "openblas-system",
+] }

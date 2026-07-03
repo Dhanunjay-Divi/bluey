@@ -2,6 +2,10 @@ pub mod app;
 pub mod audio;
 pub mod cloud;
 pub mod db;
+// Speaker-diarization orchestration (speakrs two-tier). Feature-gated so the
+// default build never links the diarization stack.
+#[cfg(feature = "diarize")]
+pub mod diarize;
 pub mod export;
 pub mod llm;
 pub mod overlay;

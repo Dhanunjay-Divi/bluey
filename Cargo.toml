@@ -18,6 +18,8 @@ members = [
     "crates/cue-router",
     "crates/cue-agent-bridge",
     "crates/cue-meeting-overlay",
+    "crates/cue-transcribe",
+    "crates/cue-diarize",
 ]
 default-members = [
     "crates/cue-cli",

@@ -1,0 +1,32 @@
+[package]
+name = "cue-transcribe"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Real-time on-device speech-to-text (Parakeet/Nemotron streaming), cross-platform."
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+
+# On-device streaming ASR. We take parakeet-rs's default features, which are
+# `["cpu", "ort-defaults"]` — CPU execution provider + the prebuilt ONNX Runtime
+# binaries (without ort-defaults, linking fails: "ort-sys was instructed not to
+# download prebuilt binaries"). CPU is the right default everywhere: parakeet-rs's
+# author reports CoreML is unstable for this model and CPU is faster than
+# Whisper-metal on Apple Silicon. CoreML/CUDA are opt-in features below, never
+# default. (See docs/TRANSCRIBE-BUILD-PLAN.md.)
+parakeet-rs = { version = "0.3" }
+# Same ort parakeet-rs uses (re-exported types for the SessionBuilder configure
+# hook that disables thread spinning). default-features off: parakeet-rs already
+# pulls the ONNX Runtime binaries, we only need the type names here.
+ort = { version = "=2.0.0-rc.12", default-features = false }
+
+[features]
+default = []
+# Opt-in hardware acceleration — only enable if MEASURED to help on a target.
+coreml = ["parakeet-rs/coreml"]
+cuda = ["parakeet-rs/cuda"]
+
+[dev-dependencies]
+hound = "3.5"

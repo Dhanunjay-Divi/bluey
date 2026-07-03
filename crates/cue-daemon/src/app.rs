@@ -776,11 +776,11 @@ pub struct LiveTranscriptEvent {
     pub ts_ms: u64,
 }
 
-struct Daemon {
-    paths: AppPaths,
-    store: MeetingStore,
+pub(crate) struct Daemon {
+    pub(crate) paths: AppPaths,
+    pub(crate) store: MeetingStore,
     state: Mutex<DaemonState>,
-    meeting: Mutex<Option<MeetingRecord>>,
+    pub(crate) meeting: Mutex<Option<MeetingRecord>>,
     overlay: Mutex<Option<OverlayProcess>>,
     overlay_enabled: bool,
     overlay_bin: Option<PathBuf>,
@@ -825,6 +825,11 @@ struct Daemon {
     /// Attach/detach reuse this and only flip the `attached` flag, so rapid
     /// "Use" clicks don't each trigger a fresh ~15s filesystem rediscovery.
     agent_cache: Mutex<Option<Vec<cue_core::agent_ui::AgentSummary>>>,
+    /// Retained meeting audio for speaker diarization (rolling window for the
+    /// live tier + full buffer for the post-meeting pass). `None` until capture
+    /// starts. Only present with the `diarize` feature.
+    #[cfg(feature = "diarize")]
+    pub(crate) audio_retention: Mutex<Option<crate::audio::retention::AudioRetention>>,
 }
 
 struct OverlayProcess {
@@ -974,6 +979,8 @@ pub async fn run() -> Result<()> {
             cue_core::overlay_ipc::OverlayUiState::Idle,
         )),
         agent_cache: Mutex::new(None),
+        #[cfg(feature = "diarize")]
+        audio_retention: Mutex::new(None),
     });
 
     maybe_spawn_balance_polling(&daemon);
@@ -1009,6 +1016,11 @@ pub async fn run() -> Result<()> {
     }
     write_state(&daemon).await?;
 
+    // Live-transcript WebSocket (dev/test surface): a plain browser page connects
+    // and receives every transcript segment as it lands, so we can SEE streaming +
+    // measure latency without the overlay. Read-only; gated to localhost.
+    spawn_live_transcript_ws(daemon.clone());
+
     let listener = TcpListener::bind(&args.addr)
         .await
         .with_context(|| format!("failed to bind Bluey daemon IPC at {}", args.addr))?;
@@ -1041,6 +1053,35 @@ pub async fn run() -> Result<()> {
 /// helper fails to start (e.g. missing helper binary or denied Screen
 /// Recording permission) so the caller can surface a setup card instead of
 /// silently sitting in "Connecting".
+/// Live-diarization tick interval. Mirrors `diarize::live_interval_secs()` when
+/// the feature is on; a harmless large default otherwise (the tick never fires
+/// without the feature — see `diar_tick_fire`).
+fn diar_live_interval_secs() -> u64 {
+    #[cfg(feature = "diarize")]
+    {
+        crate::diarize::live_interval_secs()
+    }
+    #[cfg(not(feature = "diarize"))]
+    {
+        3600
+    }
+}
+
+/// Await the diarization tick. With the feature on, this is `interval.tick()`;
+/// with it off, it never resolves, so the select! arm is inert. This lets the
+/// `diar_tick` select arm be unconditional (tokio::select! rejects `#[cfg]` arms).
+async fn diar_tick_fire(interval: &mut tokio::time::Interval) {
+    #[cfg(feature = "diarize")]
+    {
+        interval.tick().await;
+    }
+    #[cfg(not(feature = "diarize"))]
+    {
+        let _ = interval;
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Result<()> {
     let stt_enabled = crate::audio::system_capture::is_system_audio_stt_enabled();
     let (sys_tx, mut sys_rx) = mpsc::unbounded_channel();
@@ -1099,6 +1140,24 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                 let mut idle_tick = tokio::time::interval(Duration::from_secs(15));
                 idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+                // Speaker diarization (feature `diarize`): retain the meeting
+                // audio (rolling window for the live tier + full buffer for the
+                // post pass) and drive a periodic live re-diarize. `diar_tick` is
+                // ALWAYS defined (tokio::select! can't take a #[cfg] arm), but it
+                // only fires when the feature is on — see `diar_tick_fire`.
+                let mut diar_tick =
+                    tokio::time::interval(Duration::from_secs(diar_live_interval_secs()));
+                diar_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                #[cfg(feature = "diarize")]
+                {
+                    *daemon_sys.audio_retention.lock().await =
+                        Some(crate::audio::retention::AudioRetention::new(
+                            crate::diarize::LIVE_WINDOW_SECS,
+                        ));
+                }
+                #[cfg(feature = "diarize")]
+                let mut live_diarizer = crate::diarize::spawn_live_diarizer();
+
                 // Single-task select! loop: send audio AND drain events
                 // from the SAME provider instance.
                 loop {
@@ -1108,6 +1167,14 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                                 match chunk_opt {
                                     Some(chunk) => {
                                         debug!("[system audio chunk: {}ms]", chunk.duration_ms());
+                                        // Diarization: retain the FULL audio (pre-VAD, so
+                                        // the diarizer sees everything). Best-effort.
+                                        #[cfg(feature = "diarize")]
+                                        if let Some(r) =
+                                            daemon_sys.audio_retention.lock().await.as_mut()
+                                        {
+                                            r.push(&crate::diarize::i16_to_f32(&chunk.samples));
+                                        }
                                         if let Some(vad) = vad.as_mut() {
                                             let action = vad.process(&chunk);
                                             if !action.should_forward() {
@@ -1134,9 +1201,20 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                                     Some(Ok(event)) => {
                                         if let Some(segment) = transcript_event_to_stt_segment(&event) {
                                             last_transcript_at = Instant::now();
-                                            if let Err(e) = add_audio_transcript_segment_allowing_session_start(&daemon_sys, &segment).await {
-                                                warn!("system audio STT drain: forward failed: {e:#}");
-                                            }
+                                            // Persist OFF this loop. The sink does ~11 awaited
+                                            // I/O ops (DB save + RAG index + trigger detect +
+                                            // overlay push); running it inline here STOPS this
+                                            // select! from pulling the next audio chunk off
+                                            // sys_rx, so audio backlogs and the model falls
+                                            // further behind every segment (compounding 8→24s
+                                            // lag). Each segment is independent + Finals arrive
+                                            // in order, so a detached task keeps audio flowing.
+                                            let d = daemon_sys.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = add_audio_transcript_segment_allowing_session_start(&d, &segment).await {
+                                                    warn!("system audio STT drain: forward failed: {e:#}");
+                                                }
+                                            });
                                         }
                                     }
                                     Some(Err(e)) => {
@@ -1160,6 +1238,16 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                                     // Either this session was auto-stopped or it
                                     // is no longer current — stop draining.
                                     break;
+                                }
+                            }
+                            // LIVE diarization tick: re-diarize the rolling window
+                            // and stamp stable speaker ids onto recent segments.
+                            // (`diar_tick` never fires without the feature — see
+                            // its definition — so this arm is a no-op then.)
+                            _ = diar_tick_fire(&mut diar_tick) => {
+                                #[cfg(feature = "diarize")]
+                                if let Some(h) = live_diarizer.as_mut() {
+                                    crate::diarize::live_tick(&daemon_sys, h).await;
                                 }
                             }
                         }
@@ -1354,6 +1442,18 @@ async fn handle_request_inner(
             write_state(daemon).await?;
             // R10: Auto-recap via LLM (best-effort, fire-and-forget).
             spawn_auto_recap(daemon, &meeting);
+            // Diarization: authoritative post-pass over the retained full audio,
+            // then re-archive the meeting with resolved speaker ids. Fire-and-
+            // forget (speakrs is slow) so meeting-end stays snappy.
+            #[cfg(feature = "diarize")]
+            {
+                let d = daemon.clone();
+                let m = meeting.clone();
+                let sid = meeting.id.to_string();
+                tokio::spawn(async move {
+                    crate::diarize::post_process_meeting(d, m, sid).await;
+                });
+            }
             Ok(DaemonResponse::Recap { recap })
         }
         DaemonRequest::TranscriptAdd {
@@ -1914,6 +2014,67 @@ fn spawn_overlay_event_handler(
             }
         }
     });
+}
+
+/// Default address for the live-transcript WebSocket dev/test surface
+/// (override with `BLUEY_TRANSCRIPT_WS_ADDR`). A plain browser page connects and
+/// receives every `LiveTranscriptEvent` as JSON the moment it's produced — used
+/// to watch streaming + measure latency without the overlay.
+fn transcript_ws_addr() -> String {
+    std::env::var("BLUEY_TRANSCRIPT_WS_ADDR").unwrap_or_else(|_| "127.0.0.1:8766".to_string())
+}
+
+/// Spawn the read-only live-transcript WebSocket server. Each browser connection
+/// subscribes to the daemon's transcript broadcast and streams every segment.
+/// Localhost only; never fatal to daemon startup.
+fn spawn_live_transcript_ws(daemon: Arc<Daemon>) {
+    tokio::spawn(async move {
+        let addr = transcript_ws_addr();
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("live-transcript WS: failed to bind {addr}: {e}");
+                return;
+            }
+        };
+        info!("live-transcript WebSocket on ws://{addr} (dev view)");
+        loop {
+            match listener.accept().await {
+                Ok((stream, _peer)) => {
+                    let rx = daemon.live_transcript_tx.subscribe();
+                    tokio::spawn(async move {
+                        if let Err(e) = serve_transcript_ws(stream, rx).await {
+                            debug!("live-transcript WS client ended: {e}");
+                        }
+                    });
+                }
+                Err(e) => warn!("live-transcript WS accept error: {e}"),
+            }
+        }
+    });
+}
+
+/// One live-transcript WebSocket client: forward each broadcast event as JSON.
+async fn serve_transcript_ws(
+    stream: TcpStream,
+    mut rx: broadcast::Receiver<LiveTranscriptEvent>,
+) -> Result<()> {
+    use tokio_tungstenite::tungstenite::Message;
+    let ws = tokio_tungstenite::accept_async(stream).await?;
+    let (mut tx, _read) = ws.split();
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                let json = serde_json::to_string(&ev).unwrap_or_default();
+                if tx.send(Message::Text(json)).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        }
+    }
+    Ok(())
 }
 
 struct OverlayUiStateScope {
@@ -5332,7 +5493,15 @@ async fn add_audio_transcript_segment_inner(
         Some(AudioSourceKind::Microphone) => Speaker::User,
         None => Speaker::Unknown,
     };
-    let text = segment.text.trim();
+    // Keep the RAW text (with the model's own leading/trailing spaces) for
+    // storage + display: Nemotron/Parakeet encodes word boundaries as leading
+    // spaces (SentencePiece ▁→space), so trimming each chunk before we stitch
+    // them destroys exactly those boundaries and glues words together
+    // ("transcript"+"ion"→"transcription" is correct, but " this"→"this" loses
+    // the space between words). Only use a trimmed VIEW for the empty-check and
+    // dedup comparison, never for the text we persist or broadcast.
+    let text_raw = segment.text.as_str();
+    let text = text_raw.trim();
     if text.is_empty() {
         return Ok(());
     }
@@ -5351,7 +5520,7 @@ async fn add_audio_transcript_segment_inner(
         if segment.is_final {
             dedup_partial_on_final(meeting, speaker, text);
         }
-        let transcript_segment = TranscriptSegment::new(speaker, text, segment.is_final);
+        let transcript_segment = TranscriptSegment::new(speaker, text_raw, segment.is_final);
         meeting.transcript.push(transcript_segment.clone());
         let analysis = analyze_segment(&transcript_segment, meeting);
         meeting.action_items.extend(analysis.action_items);
@@ -5373,7 +5542,11 @@ async fn add_audio_transcript_segment_inner(
         .filter(|label| !label.trim().is_empty())
         .map(|label| format!("{label} STT"))
         .unwrap_or_else(|| "audio STT".to_string());
-    let card = CueCard::new(CardKind::Transcript, title, text).with_source(source);
+    // Send the RAW (untrimmed) text: the overlay app stitches successive
+    // transcript cards (`prev.text + line.text`), so the model's leading-space
+    // word boundaries must survive or words glue together ("This isa live test").
+    // Same reason the live-transcript WS below uses text_raw.
+    let card = CueCard::new(CardKind::Transcript, title, text_raw).with_source(source);
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
 
     // Broadcast live transcript event for dashboard consumption.
@@ -5390,7 +5563,9 @@ async fn add_audio_transcript_segment_inner(
     let _ = daemon.live_transcript_tx.send(LiveTranscriptEvent {
         session_id: meeting_snapshot.id.to_string(),
         source: source_label.to_string(),
-        text: text.to_string(),
+        // Raw (untrimmed) so consumers can stitch fragments back into correctly
+        // spaced text — the leading space IS the word boundary (see text_raw above).
+        text: text_raw.to_string(),
         is_final: segment.is_final,
         speaker: None,
         ts_ms,

@@ -1,5 +1,7 @@
 import AppKit
+import AudioToolbox
 import AVFoundation
+import CoreAudio
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
@@ -153,98 +155,316 @@ private final class PCM16Writer {
     }
 }
 
+/// System-audio capture via the Core Audio process-tap API (macOS 14.2+).
+///
+/// The ScreenCaptureKit audio path (`SCStream` with `capturesAudio`) delivers
+/// intermittent SILENT buffers on macOS 26.5 (Tahoe) on this machine, so we use
+/// the documented-reliable Core Audio tap path instead:
+///   1. `AudioHardwareCreateProcessTap` — a global stereo tap.
+///   2. An aggregate device whose tap list includes that tap, with the system
+///      default output as its main sub-device.
+///   3. An IOProc on the aggregate device reads the tap's Float32 buffers; we
+///      down-mix to mono and feed `PCM16Writer.writeMonoFloat` at the tap's
+///      real sample rate (read from `kAudioTapPropertyFormat`, NOT hardcoded).
+///
+/// Output on stdout is identical to the old path: 16 kHz mono i16 LE PCM.
 @available(macOS 13.0, *)
-private final class SystemAudioCapture: NSObject, SCStreamOutput {
+private final class SystemAudioCapture {
     private let duration: TimeInterval
     private let continuous: Bool
     private let appBundleId: String?
     private let writer = PCM16Writer()
-    private var stream: SCStream?
+
+    // Core Audio resources owned by this capture; torn down on cleanup.
+    private var tapID = AudioObjectID(kAudioObjectUnknown)
+    private var aggregateID = AudioObjectID(kAudioObjectUnknown)
+    private var procID: AudioDeviceIOProcID?
+    /// The tap's real stream sample rate (often 48 kHz), read from the tap.
+    private var tapSampleRate: Double = 48_000
 
     init(durationMs: Int, continuous: Bool, appBundleId: String?) {
         self.duration = TimeInterval(durationMs) / 1_000.0
         self.continuous = continuous
         self.appBundleId = appBundleId
-        super.init()
     }
 
     func run() async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first else {
-            throw NSError(domain: "BlueyAudio", code: 1, userInfo: [NSLocalizedDescriptionKey: "no display available for ScreenCaptureKit audio"])
-        }
-
-        // Per-app filter when a bundle id was chosen (via --pick): capture ONLY
-        // that app's audio (the call), not the whole display. Falls back to the
-        // whole display when no app is specified or the app isn't running.
-        let filter: SCContentFilter
-        if let bundleId = appBundleId,
-            let app = content.applications.first(where: { $0.bundleIdentifier == bundleId })
-        {
-            filter = SCContentFilter(
-                display: display,
-                including: [app],
-                exceptingWindows: []
+        guard #available(macOS 14.2, *) else {
+            throw NSError(
+                domain: "BlueyAudio",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "Core Audio process-tap capture requires macOS 14.2+"]
             )
-        } else {
-            if appBundleId != nil {
-                fputs("requested app not running; capturing whole-display audio\n", stderr)
-            }
-            filter = SCContentFilter(display: display, excludingWindows: [])
         }
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true
-        config.sampleRate = 48_000
-        config.channelCount = 1
-        config.width = 2
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-        config.queueDepth = 3
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: nil)
-        self.stream = stream
-        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "sh.bluey.audio.system", qos: .userInitiated))
-        try await stream.startCapture()
+        // The Core Audio tap captures all system output regardless of which app
+        // produced it; per-app scoping is only available via the --pick path.
+        if appBundleId != nil {
+            fputs("note: Core Audio tap captures whole-system audio; per-app scope ignored\n", stderr)
+        }
+
+        try setUpTap()
 
         if continuous {
-            // Run until killed
-            while true {
+            // Run until killed.
+            while !Task.isCancelled {
                 try await Task.sleep(nanoseconds: 1_000_000_000)
             }
         } else {
             try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
-            try await stream.stopCapture()
+            tearDown()
         }
     }
 
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio, sampleBuffer.isValid, sampleBuffer.numSamples > 0 else { return }
-        var audioBufferList = AudioBufferList()
-        var blockBuffer: CMBlockBuffer?
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: &audioBufferList,
-            bufferListSize: MemoryLayout<AudioBufferList>.size,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: UInt32(kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment),
-            blockBufferOut: &blockBuffer
+    // MARK: - Tap setup
+
+    @available(macOS 14.2, *)
+    private func setUpTap() throws {
+        // 1. Tap description: a private, unmuted, global stereo tap.
+        let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        tapDescription.uuid = UUID()
+        tapDescription.muteBehavior = .unmuted
+        tapDescription.isPrivate = true
+        tapDescription.name = "BlueyAudioTap"
+
+        // 2. Create the process tap.
+        var newTapID = AudioObjectID(kAudioObjectUnknown)
+        let tapErr = AudioHardwareCreateProcessTap(tapDescription, &newTapID)
+        guard tapErr == noErr, newTapID != AudioObjectID(kAudioObjectUnknown) else {
+            throw NSError(
+                domain: "BlueyAudio",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "AudioHardwareCreateProcessTap failed (OSStatus \(tapErr))"]
+            )
+        }
+        tapID = newTapID
+
+        // 3. Default output device UID — the aggregate needs a real output as its
+        //    main sub-device.
+        let outputUID: String
+        do {
+            outputUID = try defaultOutputDeviceUID()
+        } catch {
+            tearDown()
+            throw error
+        }
+
+        // 5. (done before building the IOProc) Tap stream format → real sample
+        //    rate + channel count.
+        if let format = try? tapStreamFormat(), format.mSampleRate > 0 {
+            tapSampleRate = format.mSampleRate
+        } else {
+            fputs("warning: could not read tap format; defaulting to 48 kHz\n", stderr)
+        }
+
+        // 4. Aggregate device whose tap list includes the tap.
+        let aggUID = UUID().uuidString
+        let desc: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "BlueyAudioAggregate",
+            kAudioAggregateDeviceUIDKey: aggUID,
+            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [
+                [kAudioSubDeviceUIDKey: outputUID]
+            ],
+            kAudioAggregateDeviceTapListKey: [
+                [
+                    kAudioSubTapUIDKey: tapDescription.uuid.uuidString,
+                    kAudioSubTapDriftCompensationKey: true,
+                ]
+            ],
+        ]
+        var newAggregateID = AudioObjectID(kAudioObjectUnknown)
+        let aggErr = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &newAggregateID)
+        guard aggErr == noErr, newAggregateID != AudioObjectID(kAudioObjectUnknown) else {
+            tearDown()
+            throw NSError(
+                domain: "BlueyAudio",
+                code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "AudioHardwareCreateAggregateDevice failed (OSStatus \(aggErr))"]
+            )
+        }
+        aggregateID = newAggregateID
+
+        // 6. IOProc on the aggregate device reading the tap buffers.
+        let queue = DispatchQueue(label: "sh.bluey.audio.tap", qos: .userInteractive)
+        let writer = self.writer
+        let sampleRate = self.tapSampleRate
+        var newProcID: AudioDeviceIOProcID?
+        let ioErr = AudioDeviceCreateIOProcIDWithBlock(&newProcID, aggregateID, queue) {
+            _, inInputData, _, _, _ in
+            SystemAudioCapture.handleInput(inInputData, writer: writer, sourceSampleRate: sampleRate)
+        }
+        guard ioErr == noErr, let createdProcID = newProcID else {
+            tearDown()
+            throw NSError(
+                domain: "BlueyAudio",
+                code: 13,
+                userInfo: [NSLocalizedDescriptionKey: "AudioDeviceCreateIOProcIDWithBlock failed (OSStatus \(ioErr))"]
+            )
+        }
+        procID = createdProcID
+
+        let startErr = AudioDeviceStart(aggregateID, createdProcID)
+        guard startErr == noErr else {
+            tearDown()
+            throw NSError(
+                domain: "BlueyAudio",
+                code: 14,
+                userInfo: [NSLocalizedDescriptionKey: "AudioDeviceStart failed (OSStatus \(startErr))"]
+            )
+        }
+    }
+
+    /// Walks the tap's input `AudioBufferList`, down-mixes Float32 samples to
+    /// mono, and feeds the resampling writer. Handles interleaved stereo,
+    /// non-interleaved (multi-buffer) stereo, and mono.
+    private static func handleInput(
+        _ inInputData: UnsafePointer<AudioBufferList>,
+        writer: PCM16Writer,
+        sourceSampleRate: Double
+    ) {
+        let bufferList = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer(mutating: inInputData)
         )
-        guard status == noErr else { return }
-        let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer)
-        guard
-            let streamDescription = formatDescription.flatMap({
-                CMAudioFormatDescriptionGetStreamBasicDescription($0)
-            })?.pointee
-        else { return }
-        writer.writePCM(
-            UnsafeMutableAudioBufferListPointer(&audioBufferList),
-            frameCount: sampleBuffer.numSamples,
-            format: streamDescription
+        guard bufferList.count > 0 else { return }
+
+        if bufferList.count > 1 {
+            // Non-interleaved: one buffer per channel. Average channel 0..N.
+            let firstChannels = max(Int(bufferList[0].mNumberChannels), 1)
+            let frameCount = Int(bufferList[0].mDataByteSize) / 4 / firstChannels
+            guard frameCount > 0 else { return }
+            var mono = [Float](repeating: 0, count: frameCount)
+            var channelsMixed = 0
+            for bufferIndex in 0..<bufferList.count {
+                guard let data = bufferList[bufferIndex].mData?.assumingMemoryBound(to: Float.self) else { continue }
+                let channels = max(Int(bufferList[bufferIndex].mNumberChannels), 1)
+                let frames = Int(bufferList[bufferIndex].mDataByteSize) / 4 / channels
+                let usable = min(frames, frameCount)
+                // Each non-interleaved buffer typically holds one channel.
+                for frame in 0..<usable {
+                    mono[frame] += data[frame]
+                }
+                channelsMixed += 1
+            }
+            guard channelsMixed > 0 else { return }
+            if channelsMixed > 1 {
+                let divisor = Float(channelsMixed)
+                for index in mono.indices { mono[index] /= divisor }
+            }
+            writer.writeMonoFloat(mono, sourceSampleRate: sourceSampleRate)
+        } else {
+            // Single buffer: mono or interleaved stereo/N-channel.
+            let buffer = bufferList[0]
+            guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { return }
+            let channels = max(Int(buffer.mNumberChannels), 1)
+            let frameCount = Int(buffer.mDataByteSize) / 4 / channels
+            guard frameCount > 0 else { return }
+            if channels == 1 {
+                let mono = Array(UnsafeBufferPointer(start: data, count: frameCount))
+                writer.writeMonoFloat(mono, sourceSampleRate: sourceSampleRate)
+            } else {
+                var mono = [Float](repeating: 0, count: frameCount)
+                let divisor = Float(channels)
+                for frame in 0..<frameCount {
+                    var sum: Float = 0
+                    for channel in 0..<channels {
+                        sum += data[frame * channels + channel]
+                    }
+                    mono[frame] = sum / divisor
+                }
+                writer.writeMonoFloat(mono, sourceSampleRate: sourceSampleRate)
+            }
+        }
+    }
+
+    // MARK: - Core Audio helpers
+
+    /// Returns the UID of the system default OUTPUT device.
+    private func defaultOutputDeviceUID() throws -> String {
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
         )
-        _ = blockBuffer
+        let devErr = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID
+        )
+        guard devErr == noErr, deviceID != AudioObjectID(kAudioObjectUnknown) else {
+            throw NSError(
+                domain: "BlueyAudio",
+                code: 15,
+                userInfo: [NSLocalizedDescriptionKey: "no default output device (OSStatus \(devErr))"]
+            )
+        }
+
+        var uidRef: CFString = "" as CFString
+        var uidSize = UInt32(MemoryLayout<CFString?>.size)
+        var uidAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let uidErr = withUnsafeMutablePointer(to: &uidRef) { ptr -> OSStatus in
+            AudioObjectGetPropertyData(deviceID, &uidAddr, 0, nil, &uidSize, ptr)
+        }
+        guard uidErr == noErr else {
+            throw NSError(
+                domain: "BlueyAudio",
+                code: 16,
+                userInfo: [NSLocalizedDescriptionKey: "could not read default output device UID (OSStatus \(uidErr))"]
+            )
+        }
+        return uidRef as String
+    }
+
+    /// Reads the tap's stream format (`kAudioTapPropertyFormat`).
+    @available(macOS 14.2, *)
+    private func tapStreamFormat() throws -> AudioStreamBasicDescription {
+        var format = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyFormat,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let err = AudioObjectGetPropertyData(tapID, &addr, 0, nil, &size, &format)
+        guard err == noErr else {
+            throw NSError(
+                domain: "BlueyAudio",
+                code: 17,
+                userInfo: [NSLocalizedDescriptionKey: "could not read tap format (OSStatus \(err))"]
+            )
+        }
+        return format
+    }
+
+    // MARK: - Cleanup
+
+    /// Best-effort teardown of all Core Audio resources, in reverse order.
+    private func tearDown() {
+        if aggregateID != AudioObjectID(kAudioObjectUnknown), let procID = procID {
+            AudioDeviceStop(aggregateID, procID)
+            AudioDeviceDestroyIOProcID(aggregateID, procID)
+        }
+        procID = nil
+        if aggregateID != AudioObjectID(kAudioObjectUnknown) {
+            AudioHardwareDestroyAggregateDevice(aggregateID)
+            aggregateID = AudioObjectID(kAudioObjectUnknown)
+        }
+        if tapID != AudioObjectID(kAudioObjectUnknown) {
+            if #available(macOS 14.2, *) {
+                AudioHardwareDestroyProcessTap(tapID)
+            }
+            tapID = AudioObjectID(kAudioObjectUnknown)
+        }
+    }
+
+    deinit {
+        tearDown()
     }
 }
 
@@ -408,6 +628,25 @@ private final class SourcePicker: NSObject, SCContentSharingPickerObserver, SCSt
 
 private func run() async -> Int32 {
     let args = parseArgs()
+
+    // Trigger the macOS Screen Recording permission flow up front. Without a
+    // grant, ScreenCaptureKit returns SILENT audio buffers (no error) and the
+    // binary never appears in System Settings → Screen Recording.
+    // CGRequestScreenCaptureAccess() registers the process with TCC (adding it to
+    // the list) and prompts on first use; CGPreflight reports current state so we
+    // fail LOUDLY instead of capturing silence.
+    if #available(macOS 11.0, *) {
+        if !CGPreflightScreenCaptureAccess() {
+            fputs("screen recording permission not granted — requesting…\n", stderr)
+            if !CGRequestScreenCaptureAccess() {
+                fputs(
+                    "ERROR: screen recording permission DENIED. Grant it in System Settings → Privacy & Security → Screen Recording, then relaunch.\n",
+                    stderr
+                )
+                return 3
+            }
+        }
+    }
 
     if args.mode == .pick {
         guard #available(macOS 14.0, *) else {

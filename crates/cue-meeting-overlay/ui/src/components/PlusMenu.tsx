@@ -70,6 +70,9 @@ export function PlusMenu({ onClose }: { onClose: () => void }) {
     >
       {/* Audio — the listen controls live here now (no separate tab) */}
       <MenuLabel>AUDIO</MenuLabel>
+      {/* One action: Listen / Stop. v1 captures SYSTEM audio (the other people
+          in the call — the question trigger). No "pick app" — clicking Listen
+          just works (whole-meeting audio). */}
       {active ? (
         <MenuItem
           icon={<StopIcon size={15} />}
@@ -77,21 +80,12 @@ export function PlusMenu({ onClose }: { onClose: () => void }) {
           onClick={act(() => client.stopListening())}
         />
       ) : (
-        // v1 streams SYSTEM audio only (the other people in the call — the
-        // question trigger). Mic streaming is a deliberate follow-up, so the
-        // copy promises only what we capture. No `microphone: true` here.
         <MenuItem
           icon={<SystemAudioIcon size={15} />}
-          label="Listen (system audio)"
+          label="Listen"
           onClick={act(() => client.startListening({ microphone: false, system: true }))}
         />
       )}
-      <MenuItem
-        icon={<SystemAudioIcon size={15} />}
-        label="Listen — pick app…"
-        hint="⌘⇧A"
-        onClick={act(() => client.pickSystemAudio())}
-      />
       {denied && (
         <MenuItem
           icon={<AlertIcon size={15} />}

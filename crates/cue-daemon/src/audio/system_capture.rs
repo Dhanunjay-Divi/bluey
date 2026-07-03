@@ -97,7 +97,14 @@ fn resolve_binary() -> std::io::Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn platform_binary_path() -> PathBuf {
-    // Look relative to the daemon binary first
+    // PREFER the .app bundle's inner binary. ScreenCaptureKit system-audio
+    // capture is TCC-gated, and a bare CLI binary can NEVER hold the Screen
+    // Recording grant (it doesn't appear in System Settings, so the user can't
+    // enable it, and capture returns silent buffers). The `BlueyAudio.app` bundle
+    // CAN be granted, and once granted its inner binary captures real audio. So
+    // we look for the bundle first, falling back to the bare binary only for old
+    // installs / dev builds without the bundle.
+    let app_inner = "BlueyAudio.app/Contents/MacOS/BlueyAudio";
     if let Ok(exe) = std::env::current_exe() {
         let mut dirs = Vec::new();
         if let Some(dir) = exe.parent() {
@@ -109,12 +116,21 @@ fn platform_binary_path() -> PathBuf {
             }
         }
         for dir in dirs {
-            for candidate in [dir.join("bluey-audio-macos"), dir.join("cue-audio-macos")] {
+            for candidate in [
+                dir.join(app_inner),
+                dir.join("bluey-audio-macos"),
+                dir.join("cue-audio-macos"),
+            ] {
                 if candidate.exists() {
                     return candidate;
                 }
             }
         }
+    }
+    // Dev fallback: the bundle built by native/macos/cue-audio/bundle-app.sh.
+    let dev_app = PathBuf::from(format!("native/macos/cue-audio/.build/{app_inner}"));
+    if dev_app.exists() {
+        return dev_app;
     }
     PathBuf::from("native/macos/cue-audio/.build/bluey-audio-macos")
 }

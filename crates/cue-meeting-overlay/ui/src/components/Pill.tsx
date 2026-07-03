@@ -46,12 +46,29 @@ export function Pill({
   const [flash, setFlash] = useState(false);
   const flashTimer = useRef<number | null>(null);
 
+  // Track source + last-arrival so we ACCUMULATE incremental ~560ms fragments
+  // into one flowing line (the model streams "It held on" then " the west"),
+  // resetting on speaker change or a >2.5s pause. Showing each lone fragment
+  // would look like "missing words".
+  const lineRef = useRef<{ source: string; text: string; at: number }>({
+    source: "",
+    text: "",
+    at: 0,
+  });
   useEffect(() => {
     const offState = client.onListeningState(setListen);
     const offLine = client.onTranscript((line) => {
-      const t = line.text.trim();
-      if (!t) return;
-      setLatest(t);
+      if (!line.text) return;
+      const now = Date.now();
+      const cur = lineRef.current;
+      const sameSpeaker = cur.source === line.source && cur.text !== "";
+      const paused = now - cur.at > 2500;
+      const text =
+        sameSpeaker && !paused ? cur.text + line.text : line.text;
+      lineRef.current = { source: line.source, text, at: now };
+      // Show the recent tail so the latest words stay visible in the small pill.
+      const trimmed = text.replace(/^\s+/, "");
+      setLatest(trimmed.length > 90 ? "…" + trimmed.slice(-90) : trimmed);
       setFlash(true);
       if (flashTimer.current) window.clearTimeout(flashTimer.current);
       flashTimer.current = window.setTimeout(() => setFlash(false), 700);

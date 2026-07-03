@@ -22,8 +22,13 @@ const DEFAULT_FRAME_MS: u32 = 20;
 /// 0.02 (~2% of full-scale) and slowly tracks the running noise floor so
 /// quieter environments still admit speech.
 pub struct RmsGate {
-    /// Adaptive threshold in normalized [0.0, 1.0] units.
+    /// Adaptive threshold in normalized [0.0, 1.0] units. Tracks the noise floor
+    /// up AND down, clamped to never fall below `threshold_floor`.
     threshold: f32,
+    /// Lower clamp for `threshold` — the configured start value. The threshold
+    /// can rise above this to reject loud noise, but never drops below it, so a
+    /// silent stream can't zero the gate out.
+    threshold_floor: f32,
     /// Running noise-floor estimate (EMA of RMS during non-speech frames).
     noise_floor: f32,
     /// EMA coefficient for the noise-floor update.
@@ -38,6 +43,7 @@ impl RmsGate {
     pub fn new(config: &VadConfig) -> Self {
         Self {
             threshold: config.rms_threshold_start,
+            threshold_floor: config.rms_threshold_start,
             noise_floor: 0.0,
             noise_alpha: 0.05,
             silence_hangover_limit: config.silence_hangover_frames,
@@ -54,15 +60,19 @@ impl RmsGate {
             self.silence_count = 0;
             FrameAction::Send
         } else {
-            // Below threshold — update noise floor (EMA) and maybe raise threshold.
+            // Below threshold — update noise floor (EMA) and re-track the
+            // threshold to it. CRITICAL: the threshold must follow the noise floor
+            // BOTH UP AND DOWN. An earlier version only ever RAISED the threshold
+            // (`if adaptive > threshold`), which is a one-way ratchet: a loud
+            // passage (music, applause) pushed it up, then quieter speech fell
+            // below the stuck-high threshold and was dropped as "silence"
+            // FOREVER — the transcript froze mid-sentence and never resumed even
+            // though audio kept playing. We instead set the threshold to
+            // `noise_floor * 3`, clamped to never drop below the configured start
+            // (so it can't zero out on a very quiet stream). This lets the gate
+            // relax again when the audio gets quieter.
             self.noise_floor = self.noise_floor * (1.0 - self.noise_alpha) + rms * self.noise_alpha;
-            // Keep threshold above noise floor by a fixed margin, not below the
-            // initial configured value. Prevents the gate from slowly zeroing
-            // out against very quiet mic streams.
-            let adaptive = (self.noise_floor * 3.0).max(0.01);
-            if adaptive > self.threshold {
-                self.threshold = adaptive;
-            }
+            self.threshold = (self.noise_floor * 3.0).max(self.threshold_floor);
 
             self.silence_count = self.silence_count.saturating_add(1);
             if self.silence_count <= self.silence_hangover_limit {
@@ -311,6 +321,64 @@ mod tests {
         // 4th consecutive silence frame exceeds hangover=3 → Drop
         assert_eq!(g.process(&quiet), FrameAction::Drop);
         assert_eq!(g.process(&quiet), FrameAction::Drop);
+    }
+
+    #[test]
+    fn rms_gate_threshold_recovers_after_loud_passage() {
+        // Regression: the gate used to RATCHET the threshold up only (a loud
+        // passage raised it, then quieter speech fell below the stuck-high
+        // threshold and was Dropped FOREVER — the transcript froze mid-sentence).
+        // The threshold must come back DOWN once the audio quiets, so speech is
+        // admitted again.
+        let mut g = RmsGate::new(&VadConfig::default());
+        let start = g.threshold();
+
+        // To ratchet the threshold up we need frames whose RMS is BELOW the Send
+        // threshold (so they take the noise-floor branch) but non-trivial, so the
+        // noise floor — and thus `noise_floor * 3` — climbs above the start. A
+        // constant-amplitude frame has RMS = amp/32768; pick amp so RMS ≈ 0.012
+        // (below the 0.02 start, but ×3 = 0.036 > start). amp = 0.012 * 32768 ≈ 393.
+        let below: i16 = 393;
+        let mid = chunk(vec![below; 320]);
+        assert!(
+            normalized_rms(&vec![below; 320]) < start,
+            "test frame must be below the Send threshold to exercise the ratchet"
+        );
+        for _ in 0..500 {
+            g.process(&mid);
+        }
+        assert!(
+            g.threshold() > start,
+            "threshold should have risen above start ({start}); got {}",
+            g.threshold()
+        );
+
+        // Now the audio goes quiet (near silence). The noise floor — and the
+        // threshold — must DECAY back toward the floor, not stay latched high.
+        let quiet = chunk(vec![0i16; 320]);
+        for _ in 0..500 {
+            g.process(&quiet);
+        }
+        let recovered = g.threshold();
+        assert!(
+            (recovered - start).abs() < 1e-4,
+            "threshold must recover to its floor ({start}), got {recovered}"
+        );
+
+        // And real speech is admitted again — no permanent freeze.
+        assert_eq!(g.process(&sine_chunk(30_000)), FrameAction::Send);
+    }
+
+    #[test]
+    fn rms_gate_threshold_never_drops_below_floor() {
+        // Even a fully-silent stream must not zero the gate out.
+        let mut g = RmsGate::new(&VadConfig::default());
+        let floor = g.threshold();
+        let quiet = chunk(vec![0i16; 320]);
+        for _ in 0..1000 {
+            g.process(&quiet);
+        }
+        assert!(g.threshold() >= floor - 1e-6);
     }
 
     #[test]

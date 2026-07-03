@@ -35,6 +35,24 @@ interface Turn {
 export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   const client = getClient();
   const [transcript, setTranscript] = useState<TranscriptLine | null>(null);
+  // Full scrollable transcript history: one entry per "line" (a speaker's
+  // continuous stretch until a speaker change or >2.5s pause). The ambient
+  // caption shows only the current tail; this backs the scrollable panel so the
+  // user can read everything said so far. Capped to a generous max so a very
+  // long meeting can't grow the DOM unbounded.
+  const [history, setHistory] = useState<TranscriptLine[]>([]);
+  const captionScrollRef = useRef<HTMLDivElement>(null);
+  const captionPinnedRef = useRef(true);
+  // Holds the FULL current-line text (the caption state is tail-capped, so we
+  // can't read the running total from it). Used to decide continue-vs-new-line
+  // and to feed the full history without re-deriving from the capped caption.
+  const transcriptRef = useRef<TranscriptLine | null>(null);
+  // Auto-scroll the transcript panel to the newest line, UNLESS the user has
+  // scrolled up to read earlier history (captionPinnedRef tracks that).
+  useEffect(() => {
+    const el = captionScrollRef.current;
+    if (el && captionPinnedRef.current) el.scrollTop = el.scrollHeight;
+  }, [history]);
   const [phase, setPhase] = useState<Phase>("idle");
   // The conversation feed — every asked question + its answer, in order.
   const [turns, setTurns] = useState<Turn[]>([]);
@@ -47,8 +65,56 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   const turnSeq = useRef(0);
   const feedEndRef = useRef<HTMLDivElement>(null);
 
+  // Parakeet streams INCREMENTAL ~560ms fragments ("It held on" then " the
+  // west"). ACCUMULATE same-speaker fragments into one flowing line — replacing
+  // would show only the latest fragment and drop the rest ("missing words").
+  // Start a fresh line on speaker change or a >2.5s pause. Concatenate RAW (the
+  // model encodes word boundaries in its own spaces; re-spacing splits words).
+  const lastAtRef = useRef(0);
   useEffect(
-    () => client.onTranscript((l) => l.final && setTranscript(l)),
+    () =>
+      client.onTranscript((l) => {
+        if (!l.final) return;
+        const now = Date.now();
+        const sameSpeaker = transcriptRef.current?.source === l.source;
+        const paused = now - lastAtRef.current > 2500;
+        const continues =
+          transcriptRef.current != null && sameSpeaker && !paused;
+        lastAtRef.current = now;
+
+        // Ambient caption: the NEWEST speech only (tail-capped so the 2-line
+        // clamp shows the current words, not the start; never grows unbounded).
+        setTranscript((prev) => {
+          const joined = continues ? prev!.text + l.text : l.text;
+          const CAP = 240;
+          let text = joined;
+          if (text.length > CAP) {
+            const tail = text.slice(-CAP);
+            const sp = tail.indexOf(" ");
+            text = sp > 0 ? tail.slice(sp + 1) : tail;
+          }
+          transcriptRef.current = { ...l, text: joined }; // ref holds FULL text
+          return { ...l, text };
+        });
+
+        // Full scrollable history: append to the current line, or start a new
+        // one. Kept in FULL (not tail-capped) so the user can scroll and read
+        // everything; bounded to MAX_LINES so the DOM stays sane on long runs.
+        setHistory((prev) => {
+          const MAX_LINES = 400;
+          let next: TranscriptLine[];
+          if (continues && prev.length > 0) {
+            const last = prev[prev.length - 1];
+            next = [
+              ...prev.slice(0, -1),
+              { ...last, text: last.text + l.text },
+            ];
+          } else {
+            next = [...prev, { ...l }];
+          }
+          return next.length > MAX_LINES ? next.slice(-MAX_LINES) : next;
+        });
+      }),
     [client],
   );
   // A daemon-detected for-me question (master doc §6) — the distinct signal that
@@ -254,15 +320,31 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
 
       {/* AMBIENT CAPTION (master doc §4/§12 — "felt, not read"): a single quiet
           live line proving Bluey hears you, pinned above the composer. NOT a
-          transcript wall. Hidden while answering (the answer owns the screen)
-          and while a detected question is being shown (that's the focus). */}
-      {transcript && phase === "idle" && !detectedQ && (
-        <div style={captionWrap} title={transcript.text}>
-          <span style={captionDot} />
-          <span style={captionWho}>
-            {transcript.source === "mic" ? "You" : "They"}
-          </span>
-          <span style={captionText}>{transcript.text}</span>
+          transcript wall. Kept visible even when a question is detected — the
+          live caption reassures the user that Bluey is still hearing them (a
+          detected question used to HIDE it, which looked like transcription had
+          stopped). Only hidden while answering (the answer owns the screen). */}
+      {history.length > 0 && phase === "idle" && (
+        <div
+          ref={captionScrollRef}
+          style={captionScroll}
+          onScroll={(e) => {
+            // Track whether the user is pinned to the bottom. If they scroll up
+            // to read history, we stop auto-scrolling so we don't yank them back.
+            const el = e.currentTarget;
+            captionPinnedRef.current =
+              el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+          }}
+        >
+          {history.map((line, i) => (
+            <div key={i} style={captionWrap}>
+              <span style={captionDot} />
+              <span style={captionWho}>
+                {line.source === "mic" ? "You" : "They"}
+              </span>
+              <span style={captionText}>{line.text.replace(/^\s+/, "")}</span>
+            </div>
+          ))}
         </div>
       )}
 
@@ -340,12 +422,20 @@ const heroDismiss = {
 } as const;
 
 // ---- The ambient caption (a single quiet live line — "felt, not read") ----
+// Scrollable transcript panel: bounded height, scrolls vertically so the full
+// history is readable. Border-top separates it from the feed above; the pinned
+// composer sits below it.
+const captionScroll = {
+  maxHeight: 108,
+  overflowY: "auto",
+  overflowX: "hidden",
+  borderTop: "1px solid var(--line)",
+} as const;
 const captionWrap = {
   display: "flex",
-  alignItems: "center",
+  alignItems: "flex-start",
   gap: 8,
-  padding: "7px 16px",
-  borderTop: "1px solid var(--line)",
+  padding: "5px 16px",
   minWidth: 0,
 } as const;
 const captionDot = {
@@ -366,9 +456,13 @@ const captionWho = {
 const captionText = {
   fontSize: 12,
   color: "var(--ink-3)",
-  whiteSpace: "nowrap",
-  overflow: "hidden",
-  textOverflow: "ellipsis",
+  // Inside the scrollable panel each line shows in FULL — wrap freely (the
+  // panel scrolls), and break any pathological unbroken run so nothing overflows
+  // horizontally.
+  whiteSpace: "pre-wrap",
+  overflowWrap: "anywhere",
+  wordBreak: "break-word",
+  lineHeight: 1.4,
   flex: 1,
   minWidth: 0,
 } as const;

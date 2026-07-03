@@ -58,6 +58,13 @@ pub struct TranscriptSegment {
     pub text: String,
     pub created_at: String,
     pub is_final: bool,
+    /// Diarized per-meeting speaker id (0-based), when speaker diarization is
+    /// active. ORTHOGONAL to the coarse `speaker` channel tag (mic-vs-system):
+    /// `speaker` says which side, `speaker_id` says which individual. `None`
+    /// when diarization is off or hasn't labeled this segment yet. `#[serde
+    /// (default)]` so transcripts persisted before this field deserialize.
+    #[serde(default)]
+    pub speaker_id: Option<i64>,
 }
 
 impl TranscriptSegment {
@@ -68,6 +75,28 @@ impl TranscriptSegment {
             text: text.into(),
             created_at: clock::now_epoch_ms_string(),
             is_final,
+            speaker_id: None,
+        }
+    }
+
+    /// Attach a diarized speaker id (builder-style).
+    pub fn with_speaker_id(mut self, speaker_id: Option<i64>) -> Self {
+        self.speaker_id = speaker_id;
+        self
+    }
+
+    /// Label for AI context / display. Prefers the diarized individual when
+    /// present ("You" stays "You" since the mic side is 100%-reliably the user;
+    /// the system side becomes "Speaker N" when diarization has resolved it),
+    /// else falls back to the coarse channel label.
+    pub fn context_label(&self) -> String {
+        match (self.speaker.is_me(), self.speaker_id) {
+            // The mic channel is always the user — keep the reliable "You".
+            (true, _) => self.speaker.display_label().to_string(),
+            // A resolved individual on the far side.
+            (false, Some(id)) => format!("Speaker {id}"),
+            // No diarization yet — coarse channel label ("They"/"Other"/…).
+            (false, None) => self.speaker.display_label().to_string(),
         }
     }
 }
@@ -322,7 +351,7 @@ impl MeetingRecord {
         let start = self.transcript.len().saturating_sub(count);
         self.transcript[start..]
             .iter()
-            .map(|segment| format!("{}: {}", segment.speaker.display_label(), segment.text))
+            .map(|segment| format!("{}: {}", segment.context_label(), segment.text))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -337,11 +366,7 @@ impl MeetingRecord {
         let mut used_chars = 0usize;
 
         for segment in self.transcript[start..].iter().rev() {
-            let line = format!(
-                "{}: {}",
-                segment.speaker.display_label(),
-                segment.text.trim()
-            );
+            let line = format!("{}: {}", segment.context_label(), segment.text.trim());
             if line.trim().is_empty() {
                 continue;
             }
