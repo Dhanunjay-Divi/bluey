@@ -273,3 +273,66 @@ neutral (engine buffers to 560ms internally).
 - WAV harness: `BLUEY_AUDIO_WAV_FILE=<16k mono wav>` drives the full live pipeline
   at real-time cadence for reproducible measurement (crates/cue-transcribe examples
   realtime_emit/chunk_timing for raw-engine A/B).
+
+## CORRECTION: the bursty emit is INTRINSIC to the model (not chunk sizing / VAD)
+
+> A follow-up diagnosis (real-time-streamed aepyx, fixed-20ms vs fixed-100ms vs
+> variable-coalesced feeds) OVERTURNED the "continuous uniform feed fixed the
+> bursting" conclusion above. Correcting it here so we don't chase chunk sizing.
+
+**Measured (227 emits each, stream-time emit gaps):**
+| feed | median | max |
+|---|---|---|
+| fixed 20ms | 0.560s | 3.36s |
+| fixed 100ms | 0.600s | 3.40s |
+| variable coalesced | 0.600s | 3.38s |
+
+**Byte-identical.** Chunk size / VAD gating / coalescing make ZERO difference to
+emit timing. The earlier "86→9 bursts" was run-to-run noise, not a fix.
+
+**Real root cause:** parakeet-rs `transcribe_chunk` only runs the encoder every
+56 mel frames (=560ms, `available_new_frames < CHUNK_SIZE` gate, nemotron.rs:637),
+AND the greedy streaming RNN-T decoder emits BLANK across several consecutive
+560ms windows while a word/phrase resolves, then commits a run of tokens at once.
+`push` returns `None` on empty text → no segment → then a burst. This is inherent
+to greedy streaming RNN-T decoding on this model; the big gaps are NOT silence
+(measured RMS in the gap windows ≈ non-silent).
+
+**What the earlier fixes DID legitimately fix (keep them):**
+- 100ms coalescing → RTF 1.29x→0.25x (real CPU/lag win, content-neutral).
+- Ordered single sink → in-order commits (real scramble/drop fix).
+- Off-lock save → STT ∥ diarization (real fix).
+These are correct. Only the "uniform feed removes bursting" claim was wrong.
+
+**To actually reduce perceived bursting (future, NOT chunk sizing):**
+1. Emit PARTIAL / word-level hypotheses, not just committed tokens.
+2. Client-side progressive reveal / smoothing of a burst's tokens.
+3. A shorter model streaming config than 56 frames (model-export change).
+The VAD gate is still worth removing for a DIFFERENT reason (silence frames drop
+audio → real inter-utterance gaps stretch wall-clock further), but it is NOT the
+source of the intrinsic burst.
+
+## Live diarization: multi-speaker passages lumped on one id — Fix (full-audio re-diarize)
+
+### Symptom
+Long stretches of multi-speaker dialogue were all labelled one speaker (e.g. 58
+consecutive segments = "Speaker 0"), even though several people were talking.
+
+### Root cause
+The live tier re-diarized only a 30s ROLLING window. A segment gets labelled at
+the tick when it's still in-window — but early on only ONE speaker has spoken, so
+it's labelled speaker 0. Once the rolling window scrolls past that segment, later
+ticks (which now see more speakers) can never re-label it — its
+`audio_start_secs` no longer overlaps the current window's turns. So early
+segments FREEZE at whatever id they got before other speakers appeared.
+
+### Fix
+The live tier now re-diarizes the FULL meeting audio (from t=0) each tick, not a
+30s rolling window (`live_tick` submits `retention.full()`, start=0). The whole
+timeline is always present, so `label_segments_by_overlap` (which overwrites every
+segment each tick) re-labels EARLY segments correctly as more speakers appear.
+The LiveDiarizer's time-overlap-to-previous id mapping still gives stable arrival-
+ordered ids. Runs on the diarizer's dedicated thread → the growing per-tick cost
+(speakrs over the whole meeting) never touches STT. MEASURED on aepyx (4-speaker,
+90s): distribution {0:75,1:26,2:3} → {0:34,1:49,2:22}; longest single-speaker run
+58→22 segments. The meeting-end post pass remains authoritative.

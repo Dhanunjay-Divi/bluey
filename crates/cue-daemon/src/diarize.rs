@@ -126,15 +126,23 @@ pub(crate) fn live_tick(daemon: &Arc<Daemon>, handle: &mut LiveDiarizerHandle) {
         });
     }
 
-    // 2) Grab + submit the window on a detached task (retention lock + big clone
-    //    must NOT run on the audio select! loop). `window_tx` is cloneable.
+    // 2) Grab + submit the FULL meeting audio (from t=0) on a detached task.
+    //    Re-diarizing the whole meeting each tick — not a 30s rolling window — is
+    //    what lets the live tier re-label EARLY segments correctly: with a rolling
+    //    window, a segment labelled when only one speaker had spoken freezes at
+    //    that id once the window scrolls past it (it can never see the later
+    //    speakers). The full buffer always contains every speaker, and
+    //    `label_segments_by_overlap` overwrites every segment each tick, so labels
+    //    converge to the whole-meeting picture. Runs on the diarizer's dedicated
+    //    thread, so the growing per-tick cost never touches STT. (retention lock +
+    //    clone must NOT run on the audio select! loop.)
     let d = daemon.clone();
     let tx = handle.window_tx.clone();
     tokio::spawn(async move {
         let submit = {
             let guard = d.audio_retention.lock().await;
             match guard.as_ref() {
-                Some(r) if r.duration_secs() >= 3.0 => Some(r.rolling_window()),
+                Some(r) if r.duration_secs() >= 3.0 => Some((r.full().to_vec(), 0.0_f64)),
                 _ => None,
             }
         };
@@ -142,7 +150,7 @@ pub(crate) fn live_tick(daemon: &Arc<Daemon>, handle: &mut LiveDiarizerHandle) {
             debug!(
                 samples = window.len(),
                 start_secs = start,
-                "diarize: live_tick submitting window"
+                "diarize: live_tick submitting FULL meeting audio"
             );
             let _ = tx.try_send((window, start));
         }
