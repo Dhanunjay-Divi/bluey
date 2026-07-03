@@ -53,5 +53,23 @@ git diff --check
 
 ## Current State
 
-- Code changes are implemented locally.
-- Production deploy and public desktop release still need to be completed for this round.
+- Code changes are committed and pushed on `codex/bluey-overlay-spacing-20260626`.
+- Production server is deployed from commit `5998379aea686d65db2570bdc2736defc2effd40`.
+- Server binary backup:
+  - `/var/backups/bluey-api/bin/bluey-server.previous-20260703005840`
+- Live server binary SHA256:
+  - `06919d0c285f1ee46c69cf0132d5f74684c41193bd0e43227837c09bfee1718c`
+- Public health check:
+  - `https://bluey.sh/health`
+  - reported commit `5998379aea686d65db2570bdc2736defc2effd40`
+- Public desktop release:
+  - `0.1.54`
+  - `https://bluey.sh/latest.json`
+- Live macOS artifact SHA256:
+  - `bc81e08c501d1ab112dbd2850dcd44755bd292337aab3287aff1d991f56afe24`
+- Live verifier passed:
+  - signed `latest.json`
+  - `install.sh` content type `application/x-shellscript`
+  - `install.ps1` content type `application/x-powershell`
+  - `darwin-arm64` artifact SHA
+  - unpacked binary version `0.1.54`

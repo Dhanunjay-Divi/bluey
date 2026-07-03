@@ -4650,3 +4650,17 @@ cargo build --manifest-path server/Cargo.toml
 cargo build -p cue-daemon --bin bluey-daemon
 git diff --check
 ```
+
+Deployment:
+
+- Commit: `5998379aea686d65db2570bdc2736defc2effd40`
+- Production server backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260703005840`
+- Production server SHA256:
+  `06919d0c285f1ee46c69cf0132d5f74684c41193bd0e43227837c09bfee1718c`
+- Public health:
+  `https://bluey.sh/health` reports commit `5998379aea686d65db2570bdc2736defc2effd40`
+- Public desktop release: `0.1.54`
+- Live artifact SHA256:
+  `bc81e08c501d1ab112dbd2850dcd44755bd292337aab3287aff1d991f56afe24`
+- Live verifier passed: signed `latest.json`, installer MIME types, artifact SHA, and unpacked binary version.
