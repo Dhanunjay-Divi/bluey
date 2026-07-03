@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 17:17 EDT
+Latest checkpoint: 2026-07-03 17:42 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,35 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest active Bluey round doc is `ROUND-324-PARTIAL-CODE-STREAM-RECOVERY.md`; the next canonical Bluey round doc should start at `ROUND-325-...`.
+- Latest active Bluey round doc is `ROUND-325-COMPLETE-CODE-CANVAS-LINE-NOTES.md`; the next canonical Bluey round doc should start at `ROUND-326-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 325 is in progress for complete code canvas and line notes:
+  - traced the owner screenshot session `724C3B7E`; it was produced by older daemon build `0.1.59` and persisted a code artifact from only a histogram inner-loop fragment
+  - hardened managed server coding prompt so code answers start with one short approach sentence, then complete fenced code with language tag
+  - algorithm/interview coding answers now explicitly require full class/function signature, initialization, loop/body, return value, and sentinel/cleanup step
+  - server response artifacts now require fenced code blocks before creating a code canvas, so loose inner-loop fragments no longer become official code artifacts
+  - daemon provider prompt and Code/General mode instructions now require `Line notes:` outside the code fence for non-trivial code
+  - Windows parity: this is shared server and daemon/provider code, so macOS and Windows receive the same answer-shaping contract
+  - workspace desktop version bumped to `0.1.64`
+  - verification passed:
+    - `cargo test -p cue-daemon provider_messages_include_overlay_friendly_answer_shape -- --nocapture`
+    - `cargo test -p cue-daemon mode_instructions -- --nocapture`
+    - `cargo test -p cue-daemon general_mode_keeps_code_shape_for_coding_questions -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml response_artifact -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml answer_plan_code_request_uses_deep_code_artifact -- --nocapture`
+    - `cargo fmt --check`
+    - `cargo check -p cue-daemon`
+    - `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
+  - pending before final close:
+    - package/deploy desktop `0.1.64`
+    - deploy production API server
+    - update `ROUND-325-COMPLETE-CODE-CANVAS-LINE-NOTES.md` and `RELEASE-v0.1.64.md` with live deployment facts
+  - Round doc:
+    `docs/rounds/ROUND-325-COMPLETE-CODE-CANVAS-LINE-NOTES.md`
 - Round 324 is complete and deployed for partial code stream recovery:
   - fixed request shape seen in Ref `54B786D8`, where a useful partial code answer ended with `answer_incomplete_reason="unclosed_code_fence"` and was replaced by a retry card
   - added repaired partial-answer recovery for managed and direct provider paths

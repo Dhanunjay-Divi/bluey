@@ -2557,10 +2557,10 @@ fn prompt_with_answer_plan(
             "Answer directly in 1-4 sentences. Do not open with setup unless it prevents confusion."
         }
         AnswerIntent::Coding => {
-            "If the user asks for code, start with complete working code in a fenced code block, then give a concise explanation of the key idea and complexity. For data-structure interview prompts such as LRU cache, implement from first principles with a hashmap plus doubly linked list unless the user explicitly asks for a library shortcut; mention library helpers only as alternatives after the real implementation. For non-trivial code, add a short `Line notes:` block outside the code fence using `1: ...` style notes for the important lines. Keep explanatory notes outside the code so copied code stays clean. Do not give only a summary."
+            "If the user asks for code, start with one short approach sentence, then give complete working code in a fenced code block with a language tag. For LeetCode/interview algorithm prompts, include the full class/function signature, initialization, loop/body, return value, and any sentinel/cleanup step; never provide only the inner loop or a pseudocode fragment. For data-structure interview prompts such as LRU cache, implement from first principles with a hashmap plus doubly linked list unless the user explicitly asks for a library shortcut; mention library helpers only as alternatives after the real implementation. For non-trivial code, add a short `Line notes:` block outside the code fence using `1: ...` or small `2-4: ...` notes for the important executable lines. Keep explanatory notes outside the code so copied code stays clean. Do not give only a summary."
         }
         AnswerIntent::CodingFollowUp => {
-            "Treat this as a follow-up to existing code when relevant. Preserve the existing artifact unless the user asks for a new one. Give the smallest useful delta, but include the actual updated code or snippet when the user asks for code. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
+            "Treat this as a follow-up to existing code when relevant. Preserve the existing artifact unless the user asks for a new one. Give the smallest useful delta, but include the actual updated code or snippet when the user asks for code. If the user asks to regenerate the full solution, include the complete fenced implementation, not only a middle fragment. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
         }
         AnswerIntent::Behavioral => {
             "Answer like a polished interview coach and candidate voice: natural, first-person when appropriate, specific, and conversational. Use the supplied resume, JD, documents, transcript, and screen context to infer the role and domain, such as SDE, data engineer, BI engineer, data scientist, DevOps, security, product, or another role. First infer what the interviewer is testing, such as Dive Deep, ownership, technical depth, data quality, system judgment, prioritization, stakeholder communication, or tradeoffs, then make the response prove that signal. For self-introductions like \"tell me about yourself\", do not compress the resume into one facts paragraph. Use a speakable present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role. For self-introductions, aim for a 45-60 second answer. For role/domain interview questions, give a ready-to-say answer anchored only in the supplied company, project, tools, metrics, constraints, and role expectations; when useful, include a brief why-it-works or if-they-push-back recovery line. Do not defend weak story logic blindly: reframe it in a production-realistic way, such as code ownership, incident debugging, architecture tradeoffs, upstream data, ETL validation, reporting impact, stakeholder communication, or KPI definition. For interview stories, aim for a 45-90 second answer in tight paragraphs, not generic bullets, unless the user asks for notes. Do not invent metrics, employers, tools, source systems, clinical/finance details, latency windows, outcomes, or motivation beyond the supplied resume/JD/context. If exact story detail is missing, say the framing safely with phrases like \"I would frame it as...\" or \"the signal I would emphasize is...\" instead of fabricating a result. Never route resume/self-intro or interview-coaching prompts into system design just because they mention architecture or systems."
@@ -5543,11 +5543,11 @@ fn response_artifact(text: &str) -> Option<ResponseArtifact> {
             confidence: 0.88,
         });
     }
-    if !code_blocks.is_empty() || has_code_shape(&lower) {
+    if !code_blocks.is_empty() {
         return Some(ResponseArtifact {
             artifact_type: "code",
             body: format_code_artifact(body, &code_blocks),
-            confidence: if code_blocks.is_empty() { 0.74 } else { 0.95 },
+            confidence: 0.95,
         });
     }
     if looks_like_system_design_artifact(body, &lower) {
@@ -7061,6 +7061,18 @@ mod tests {
     }
 
     #[test]
+    fn response_artifact_does_not_canvas_loose_code_fragment() {
+        let artifact = response_artifact(
+            "for i, h in enumerate(heights):\n    start = i\n    while stack and heights[stack[-1]] >= h:\n        idx = stack.pop()\n        width = i - (stack[-1] + 1 if stack else 0)\n        max_area = max(max_area, heights[idx] * width)\n        start = idx\n    stack.append(start)",
+        );
+
+        assert!(
+            artifact.is_none(),
+            "loose inner loops should not become code canvas artifacts"
+        );
+    }
+
+    #[test]
     fn response_artifact_detects_system_design() {
         let artifact = response_artifact(
             "For this system design, use an API gateway, database, cache, queue, and load balancer to reduce latency at scale.",
@@ -7519,6 +7531,9 @@ mod tests {
         );
         assert!(system.contains("hashmap plus doubly linked list"));
         assert!(system.contains("library shortcut"));
+        assert!(system.contains("full class/function signature"));
+        assert!(system.contains("never provide only the inner loop"));
+        assert!(system.contains("Line notes"));
     }
 
     #[test]
