@@ -50,6 +50,18 @@ private func displayTranscriptText(_ text: String) -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+private func scrollClipView(_ clipView: NSClipView, documentView: NSView?, deltaY: CGFloat) {
+    guard let documentView else { return }
+    clipView.layoutSubtreeIfNeeded()
+    documentView.layoutSubtreeIfNeeded()
+
+    let maxY = max(0, documentView.bounds.height - clipView.bounds.height)
+    var origin = clipView.bounds.origin
+    origin.y = min(max(origin.y + deltaY, 0), maxY)
+    clipView.scroll(to: origin)
+    clipView.enclosingScrollView?.reflectScrolledClipView(clipView)
+}
+
 private let privateInstructionRefusal = "I can’t share Bluey’s private instructions, prompts, guardrails, tokens, or internal configuration. Ask me what you want to do, and I’ll help with the answer itself."
 
 private func sanitizeOverlayOutput(kind: String, body: String) -> String {
@@ -2967,6 +2979,12 @@ private final class FeedView: NSView {
         updateScrollPinAfterUserInput()
     }
 
+    func scrollByKeyboard(direction: CGFloat) {
+        let step = max(120, scroll.contentView.bounds.height * 0.82)
+        scrollClipView(scroll.contentView, documentView: scroll.documentView, deltaY: direction * step)
+        updateScrollPinAfterUserInput()
+    }
+
     func latestCopyableCardText() -> String? {
         for card in cards.reversed() {
             let kind = normalizedCardKind(card.kind)
@@ -4529,6 +4547,11 @@ private final class CanvasPaneView: NSView {
         fullWindowButton.toolTip = value ? "Restore canvas size" : "Expand canvas"
     }
 
+    func scrollByKeyboard(direction: CGFloat) {
+        let step = max(120, scroll.contentView.bounds.height * 0.82)
+        scrollClipView(scroll.contentView, documentView: scroll.documentView, deltaY: direction * step)
+    }
+
     private func styleCanvasHeaderButton(_ button: NSButton, symbol: String, fallback: String) {
         button.title = ""
         button.isBordered = false
@@ -6028,6 +6051,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden else {
             return false
         }
+        if routeKeyboardContentScroll(event) {
+            return true
+        }
         if routeBlueyShortcut(event, source: "local") {
             return true
         }
@@ -6101,6 +6127,68 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         composer.keyDown(with: event)
         return true
+    }
+
+    private func routeKeyboardContentScroll(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.option),
+              !flags.contains(.command),
+              !flags.contains(.control),
+              !flags.contains(.shift),
+              !isTextEditingResponderActive
+        else {
+            return false
+        }
+
+        let direction: CGFloat
+        switch event.keyCode {
+        case 125, 121:
+            direction = 1
+        case 126, 116:
+            direction = -1
+        default:
+            return false
+        }
+
+        scrollVisibleContentByKeyboard(direction: direction)
+        emitLifecycle(
+            "keyboard_content_scroll",
+            detail: "direction=\(direction > 0 ? "down" : "up") target=\(keyboardScrollTargetIdentifier())")
+        return true
+    }
+
+    private func scrollVisibleContentByKeyboard(direction: CGFloat) {
+        guard let window else {
+            feed.scrollByKeyboard(direction: direction)
+            return
+        }
+        let localPoint = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+
+        if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(localPoint) {
+            let step = max(120, sessionScroll.contentView.bounds.height * 0.82)
+            scrollClipView(
+                sessionScroll.contentView,
+                documentView: sessionScroll.documentView,
+                deltaY: direction * step)
+            return
+        }
+        if canvasOpen, rectForView(canvasPane).contains(localPoint) {
+            canvasPane.scrollByKeyboard(direction: direction)
+            return
+        }
+        feed.scrollByKeyboard(direction: direction)
+    }
+
+    private func keyboardScrollTargetIdentifier() -> String {
+        guard let window else { return "feed" }
+        let localPoint = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(localPoint) {
+            return "history"
+        }
+        if canvasOpen, rectForView(canvasPane).contains(localPoint) {
+            return "canvas"
+        }
+        return "feed"
     }
 
     private func isComposerEditingKey(_ keyCode: UInt16) -> Bool {
@@ -8439,7 +8527,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         appendLine()
         appendPair("Enter", "Answer", "Esc", "Close panel")
         appendPair("Tab", "Next control", "Shift+Tab", "Previous control")
+        appendPair("Opt+Down", "Scroll down", "Opt+Up", "Scroll up")
         appendLine("Letters always type normally when Ask is focused.")
+        appendLine("Mouse wheel scrolls the answer, canvas, or history under the pointer.")
         appendLine("Opacity selected: arrow keys adjust it.")
         appendLine()
         appendLine("Global shortcuts work in both modes:")

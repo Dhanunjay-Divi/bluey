@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 00:51 EDT
+Latest checkpoint: 2026-07-04 09:00 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,45 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-328-CODING-ANSWER-SHAPE.md`; the next canonical Bluey round doc should start at `ROUND-329-...`.
+- Latest completed Bluey round doc is `ROUND-337-OVERLAY-CONTENT-SCROLLING.md`; the next canonical Bluey round doc should start at `ROUND-338-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 337 is complete and deployed for overlay content scrolling:
+  - owner asked how users can scroll when click-through is off and suggested `Option` plus up/down arrows
+  - confirmed the macOS overlay already forwards mouse-wheel events to feed/canvas/history/transcript/composer areas under the pointer
+  - added a shared macOS `scrollClipView` helper that clamps scroll offsets safely
+  - added keyboard scroll helpers for answer feed and right-side canvas
+  - added local macOS `Option+Down` / `Option+PageDown` and `Option+Up` / `Option+PageUp` scrolling
+  - keyboard scroll target is chosen by current mouse position: history drawer, canvas, or answer feed
+  - text editing remains safe: if Ask or another editor is active, `Option+Arrow` is left to the text editor
+  - updated shortcuts overlay with `Opt+Down`, `Opt+Up`, and mouse-wheel scroll copy
+  - workspace desktop version bumped to `0.1.76`
+  - verification passed:
+    - `cd native/macos/cue-overlay && swift build -c release`
+    - `cargo check -p cue-daemon -p cue-cli`
+    - `BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64`
+    - `BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh`
+    - `BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.76`
+    - `curl -fsSL https://bluey.sh/install.sh | bash`
+    - `/Users/uno/.bluey/bin/bluey --version`
+    - `/Users/uno/.bluey/bin/bluey-daemon --version`
+  - Release/deploy:
+    - desktop release `0.1.76` is live on `bluey.sh`
+    - live `latest.json.sig` verified successfully
+    - live installer MIME checks passed for `/install.sh` and `/install.ps1`
+    - live macOS artifact SHA verified:
+      `f95d32d983e41a4a3817e63217ae263d2a42d3c384b29d6db613b3cbe79dbf66`
+    - unpacked macOS release reports `bluey 0.1.76` and `bluey-daemon 0.1.76`
+    - public installer smoke installed `0.1.76` locally and both installed binaries report `0.1.76`
+    - non-interactive install could not prompt sudo and correctly fell back to `/Users/uno/.local/bin/bluey`
+  - Windows parity:
+    - Windows overlay has a separate C implementation and does not currently expose the same scrollable feed/canvas/history panes; no Windows code change was made in this round
+    - keep a Windows parity pass on the backlog once matching panes exist
+  - Round doc:
+    `docs/rounds/ROUND-337-OVERLAY-CONTENT-SCROLLING.md`
 - Round 328 is complete and deployed for coding answer shape:
   - owner showed a coding challenge answer with only a short approach sentence and a cramped code artifact
   - expected shape is approach explanation, readable complete code with useful comments, explanation, time/space complexity, and patch-style follow-ups
