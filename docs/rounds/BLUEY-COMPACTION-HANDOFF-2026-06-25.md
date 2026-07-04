@@ -5606,6 +5606,25 @@ Deployment status:
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no lines.
 
+## Latest Round 336: Web Speech STT Decision
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Round doc:
+
+- `docs/rounds/ROUND-336-WEB-SPEECH-STT-DECISION.md`
+
+Decision:
+
+- Do not replace production Deepgram/OpenAI/local STT with browser Web Speech.
+- Web Speech can be a browser-only preview/spike later, but it should not own native overlay captions, system-audio transcription, usage billing, transcript history, support refs, or provider fallback.
+
+Recommended STT path:
+
+- Keep production on managed provider streaming.
+- Unify remaining chunked mic/system paths onto the streaming chain.
+- Improve dynamic keyterms, confidence-aware transcript repair, and per-session support logs.
+
 Important production build note:
 
 - The droplet Rust toolchain was updated to `rustc 1.96.1` / `cargo 1.96.1` because the old `cargo 1.75.0` could not read the current lockfile / transitive 2024-edition crate metadata.
