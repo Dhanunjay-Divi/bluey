@@ -10284,16 +10284,23 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func setContextItems(_ items: [OverlayContextItem]) {
+        let attachPickerWasPending = attachPickerPending
+        let screenContextWasReady = screenContextReadyForAnswer
+        let answerWasStreaming = !answerStreamStats.isEmpty
         endAttachPickerHandoff()
         let previousIds = Set(contextItems.map(\.id))
         let currentIds = Set(items.map(\.id))
         let newlyAddedIds = currentIds.subtracting(previousIds)
         let mutationExpected = isExpectingContextMutationForPendingSend()
+        let shouldStageNewItemsForNextAnswer = mutationExpected
+            || attachPickerWasPending
+            || screenContextWasReady
+            || answerWasStreaming
         contextItems = items
         hasVisibleContextAttachments = !items.isEmpty
         pendingContextItemIds.formIntersection(currentIds)
         if !newlyAddedIds.isEmpty {
-            if mutationExpected {
+            if shouldStageNewItemsForNextAnswer {
                 pendingContextItemIds.formUnion(newlyAddedIds)
             }
             // New files are prepared for the next answer immediately. Show

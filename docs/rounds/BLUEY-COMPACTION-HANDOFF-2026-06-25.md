@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 18:55 EDT
+Latest checkpoint: 2026-07-04 19:35 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,7 +30,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-347-CLICKTHROUGH-SCROLL-ROUTING.md`; the next canonical Bluey round doc should start at `ROUND-348-...`.
+- Latest completed Bluey round doc is `ROUND-348-STREAMING-ATTACHMENT-EVENTS.md`; the next canonical Bluey round doc should start at `ROUND-349-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
@@ -5899,6 +5899,76 @@ Deployment status:
 - `https://bluey.sh/health` reports commit `210a4f7559ffd13fe263b3891d75b5e93c39c9f3`.
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
+
+## Latest Round 348: Streaming Attachment Events
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned runtime work:
+
+```bash
+codex/bluey-stream-attachments-20260704
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-348-STREAMING-ATTACHMENT-EVENTS.md`
+
+Trigger:
+
+- The owner reported that attaching screen context or documents does not work while Bluey is streaming an answer.
+
+Root cause:
+
+- The daemon overlay event loop processed events serially.
+- `AskRequested` awaited the full streamed answer, so `AttachRequested`, `AttachFilesRequested`, and `AnalyzeScreenRequested` were stuck behind the active answer.
+- The macOS overlay also only staged newly arrived context during a short mutation window, so context that arrived during a stream could look saved but not be pending for the next answer.
+
+What changed:
+
+- Overlay answer requests now run in a background task.
+- The daemon overlay event loop remains responsive while answers stream.
+- A daemon-side `overlay_answer_active` guard prevents accidental second answers during an active stream.
+- Trying to start a second overlay answer now shows an "Answer already running" warning, while files/screens can still be prepared.
+- macOS context updates stage newly added items for the next answer when attach/screen was armed or an answer is currently streaming.
+- Desktop workspace version bumped to `0.1.87`.
+
+Verification:
+
+```bash
+cargo fmt --check
+cargo check -p cue-cli -p cue-daemon
+swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift
+cd native/macos/cue-overlay && swift build -c release
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.87
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+/Users/uno/.bluey/bin/bluey on
+/Users/uno/.bluey/bin/bluey status
+```
+
+Deployment status:
+
+- Desktop release `0.1.87` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.87/bluey-0.1.87-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `ecd0c9eb00c3f40259d9a9ab9f351f4ae7b88e579b21dcd733656c8da0bcbb1e`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.87`
+- Public installer smoke installed `0.1.87` locally and both installed binaries report `0.1.87`.
+- `bluey on` started fresh daemon pid `4255`.
+
+Windows parity:
+
+- The daemon event-loop fix applies to both macOS and Windows.
+- The macOS staging change is Swift-only; Windows must preserve the same behavior in its overlay path: files/screens added during an active answer should be pending for the next answer, not hidden as saved-only context.
 
 ## Latest Round 347: Click-Through Scroll Routing
 

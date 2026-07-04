@@ -1335,6 +1335,7 @@ struct Daemon {
     auto_cloud_sync_debounce: Mutex<Option<tokio::task::JoinHandle<()>>>,
     balance_poll_shutdown: Mutex<Option<watch::Sender<bool>>>,
     balance_watch: crate::cloud::balance::BalanceWatch,
+    overlay_answer_active: Mutex<bool>,
     answer_generation: AtomicU64,
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
@@ -1501,6 +1502,7 @@ pub async fn run() -> Result<()> {
         auto_cloud_sync_debounce: Mutex::new(None),
         balance_poll_shutdown: Mutex::new(None),
         balance_watch,
+        overlay_answer_active: Mutex::new(false),
         answer_generation: AtomicU64::new(0),
         active_answer_card: Mutex::new(None),
         system_audio: Mutex::new(None),
@@ -2572,6 +2574,19 @@ fn overlay_lifecycle_detail_is_safe(stage: &str) -> bool {
     )
 }
 
+async fn try_begin_overlay_answer(daemon: &Arc<Daemon>) -> bool {
+    let mut active = daemon.overlay_answer_active.lock().await;
+    if *active {
+        return false;
+    }
+    *active = true;
+    true
+}
+
+async fn finish_overlay_answer(daemon: &Arc<Daemon>) {
+    *daemon.overlay_answer_active.lock().await = false;
+}
+
 async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Result<()> {
     match event {
         OverlayEvent::Ready {
@@ -2619,7 +2634,33 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         } => {
             let request =
                 answer_request_from_overlay(&question, provider, model, mode, visible_context_ids);
-            let _ = answer_with_provider_runtime(daemon, request, "overlay ask").await?;
+            if !try_begin_overlay_answer(daemon).await {
+                tracing::info!(
+                    request_id = %request.metadata.request_id,
+                    "overlay answer request ignored because another answer is still streaming"
+                );
+                push_system_card(
+                    daemon,
+                    CardKind::Warning,
+                    "Answer already running",
+                    "Bluey is still streaming the current answer. Attach files or capture the screen now; they will be ready for the next answer.",
+                )
+                .await;
+                return Ok(());
+            }
+            let daemon_for_answer = Arc::clone(daemon);
+            let request_id = request.metadata.request_id;
+            tokio::spawn(async move {
+                let result =
+                    answer_with_provider_runtime(&daemon_for_answer, request, "overlay ask").await;
+                if let Err(error) = result {
+                    warn!(
+                        request_id = %request_id,
+                        "background overlay answer failed: {error:#}"
+                    );
+                }
+                finish_overlay_answer(&daemon_for_answer).await;
+            });
         }
         OverlayEvent::AttachRequested => {
             // Drive Idle -> AttachOpen while the daemon-owned picker is open.
