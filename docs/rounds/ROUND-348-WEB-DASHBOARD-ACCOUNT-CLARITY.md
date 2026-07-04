@@ -17,15 +17,27 @@ The owner asked for a focused Bluey UI/web pass on the beginner dashboard, reloa
 
 - `npm --prefix crates/cue-dashboard/ui run build`
 - `node --check web/assets/bluey-site.js`
+- `cargo check -p cue-dashboard --quiet`
+- Static live deploy only:
+  - `rsync -av --delete ... web/ root@165.227.77.152:/var/www/bluey/`
+  - excluded `/install.sh`, `/install.ps1`, `/latest.json`, `/latest.json.sig`, `/releases/***`, and `/backups/***`
+- Live checks:
+  - `https://bluey.sh/` serves `bluey-site.css?v=2026070401`, `bluey-site.js?v=2026070401`, `Download Bluey`, and `Install, run, ask.`
+  - `https://bluey.sh/download` serves `Install Bluey`, the three install steps, and `macOS setup`
+  - `https://bluey.sh/account` serves `Try Bluey on desktop`, `Credits balance`, `Manual reload`, `Desktop and browser links`, and `Refresh saved sessions`
+  - `https://bluey.sh/install.sh` still returns `application/x-shellscript`
+  - `https://bluey.sh/install.ps1` still returns `application/x-powershell`
+  - `https://bluey.sh/latest.json` still returns release metadata
 
 ## Current State
 
 - Dashboard home is no longer an empty placeholder.
 - Reload errors now render in the signed-in account message area instead of the hidden auth message area.
 - The download page defaults to the macOS setup panel so new users see the install command without an extra click.
+- Static public web changes are live on `bluey.sh`.
 - No native overlay, audio, backend runtime, billing API, or cloud sync API files were changed.
 
 ## Remaining QA/Gates
 
-- Optional visual QA in a real browser against `web/index.html` routes and the packaged Tauri dashboard.
-- Deploy static web assets only after the owner is ready to publish the updated account and landing copy.
+- Owner visual QA in a real browser against live `bluey.sh` routes.
+- Packaged Tauri dashboard QA for the new dashboard Home screen.
