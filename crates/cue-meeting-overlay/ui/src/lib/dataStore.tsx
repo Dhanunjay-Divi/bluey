@@ -56,6 +56,13 @@ interface DataStoreValue {
    *  kind, so a newly-created thread surfaces without an app restart. Keeps the
    *  stale list on failure. */
   revalidateSessions: (kind: string) => void;
+  /** Pure getter: the cached selectable models for `kind`, or null when not yet
+   *  loaded (for a null kind, []). Element [0] is always "auto". Never fetches;
+   *  call {@link ensureModels} to load. Cached so the Composer's model picker
+   *  appears INSTANTLY on re-attach instead of after a per-mount CLI round-trip. */
+  modelsFor: (kind: string | null) => string[] | null;
+  /** Lazily fetch a kind's models once (no-op if loaded or in flight). */
+  ensureModels: (kind: string) => void;
   /** Attach an agent (optionally resuming a session / pinning a model). Resolves
    *  once the store has the fresh agent list applied; callers can `.then(...)`. */
   attach: (kind: string, sessionId?: string, model?: string) => Promise<void>;
@@ -79,12 +86,16 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [sessions, setSessions] = useState<Map<string, AgentSessionSummary[]>>(
     () => new Map(),
   );
+  // key = agent kind; value = that kind's selectable models ("auto" first). A
+  // missing key = never-fetched; a present key (even ["auto"]) = loaded.
+  const [models, setModels] = useState<Map<string, string[]>>(() => new Map());
 
   // In-flight guards — dedupe concurrent revalidations so background refreshes
   // can't stack duplicate requests for the same dataset.
   const agentsInflight = useRef(false);
   const meetingsInflight = useRef(false);
   const sessionsInflight = useRef<Set<string>>(new Set());
+  const modelsInflight = useRef<Set<string>>(new Set());
   // Guards the first-mount seed against React 19 StrictMode's double-invoke.
   const didSeed = useRef(false);
 
@@ -143,6 +154,23 @@ export function DataProvider({ children }: { children: ReactNode }) {
     [client],
   );
 
+  const revalidateModels = useCallback(
+    (kind: string) => {
+      if (modelsInflight.current.has(kind)) return;
+      modelsInflight.current.add(kind);
+      client
+        .models(kind)
+        .then((rows) => {
+          setModels((prev) => new Map(prev).set(kind, rows));
+          modelsInflight.current.delete(kind);
+        })
+        .catch(() => {
+          modelsInflight.current.delete(kind);
+        });
+    },
+    [client],
+  );
+
   // ---- first-mount seed (null → value): fetch agents + meetings once ----
   useEffect(() => {
     if (didSeed.current) return;
@@ -171,15 +199,36 @@ export function DataProvider({ children }: { children: ReactNode }) {
     [sessions, revalidateSessions],
   );
 
+  const modelsFor = useCallback(
+    (kind: string | null): string[] | null => {
+      if (!kind) return [];
+      return models.get(kind) ?? null;
+    },
+    [models],
+  );
+
+  const ensureModels = useCallback(
+    (kind: string) => {
+      if (models.has(kind) || modelsInflight.current.has(kind)) return;
+      revalidateModels(kind);
+    },
+    [models, revalidateModels],
+  );
+
   const attach = useCallback(
-    (kind: string, sessionId?: string, model?: string): Promise<void> =>
+    (kind: string, sessionId?: string, model?: string): Promise<void> => {
+      // PREFETCH the attached agent's models NOW (background) so the Composer's
+      // picker is already cached by the time the user lands on the Ask screen —
+      // no per-mount CLI round-trip delay. Fire-and-forget; ensureModels dedups.
+      revalidateModels(kind);
       // The daemon confirms by re-pushing the full agent list (caught by the
       // onAgents sub); we also apply the resolved value here to avoid a
       // first-paint lag. Idempotent with the push.
-      client.attach(kind, sessionId, model).then((a) => {
+      return client.attach(kind, sessionId, model).then((a) => {
         setAgents(a);
-      }),
-    [client],
+      });
+    },
+    [client, revalidateModels],
   );
 
   const detach = useCallback(
@@ -197,6 +246,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
     sessionsFor,
     ensureSessions,
     revalidateSessions,
+    modelsFor,
+    ensureModels,
     attach,
     detach,
     revalidateAgents,

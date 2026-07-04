@@ -56,9 +56,12 @@ export function HistoryTab({
 
       <div
         style={{
+          // Flex column that fills below the sub-toggle; the active lens
+          // (Meetings/Sessions) owns its OWN internal scroll (flex:1 +
+          // overflowY), so this wrapper must NOT also scroll — a nested
+          // scroll-in-scroll would strand the inner list at a short height.
           flex: 1,
           minHeight: 0,
-          overflowY: "auto",
           display: "flex",
           flexDirection: "column",
         }}

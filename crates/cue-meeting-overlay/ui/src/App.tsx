@@ -173,9 +173,13 @@ export function App() {
             scrolls internally (so the panel fills the window, no empty space). */}
           <div
             style={{
+              // Fills between header + footer; each tab's screen (AskScreen,
+              // HistoryTab, AgentsScreen) is flex:1 and owns its OWN internal
+              // scroll — so this frame must NOT scroll too (a double
+              // scroll-in-scroll stranded lists at a short height and left dead
+              // space at the bottom).
               flex: 1,
               minHeight: 0,
-              overflowY: "auto",
               display: "flex",
               flexDirection: "column",
             }}

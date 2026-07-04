@@ -43,7 +43,14 @@ export function HistoryScreen({
 
   return (
     <div
-      style={{ padding: "6px 12px 12px", maxHeight: 480, overflowY: "auto" }}
+      style={{
+        padding: "6px 12px 12px",
+        // Fill the parent + scroll internally (was maxHeight:480 → dead space
+        // below on taller windows).
+        flex: 1,
+        minHeight: 0,
+        overflowY: "auto",
+      }}
     >
       {Object.entries(groups).map(([project, rows]) => (
         <div key={project} style={{ marginBottom: 12 }}>

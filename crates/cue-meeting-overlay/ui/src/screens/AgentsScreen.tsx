@@ -69,7 +69,10 @@ export function AgentsScreen({
     <div
       style={{
         padding: "8px 12px 12px",
-        maxHeight: 480,
+        // Fill the flex-column parent (App's tab body) and scroll INTERNALLY —
+        // a hardcoded maxHeight left dead space below the list on taller windows.
+        flex: 1,
+        minHeight: 0,
         overflowY: "auto",
         display: "flex",
         flexDirection: "column",

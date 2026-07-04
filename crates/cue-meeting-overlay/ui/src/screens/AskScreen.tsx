@@ -4,6 +4,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { getClient } from "../lib";
+import { useDataStore } from "../lib/dataStore";
 import { useMeetingState } from "../lib/meetingState";
 import type {
   AgentSummary,
@@ -54,26 +55,20 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   // The attached agent's selectable models ("auto" is always element [0]) and
   // the current pick. Fetched when the agent changes; the Composer shows the
   // picker beside the speed pills only when there is more than one choice.
-  const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("auto");
   const agentKind = agent?.kind ?? null;
+  // Models come from the SHARED store (cached per kind + revalidated in the
+  // background), so the Composer's picker appears INSTANTLY on re-attach instead
+  // of after a per-mount CLI round-trip. `modelsFor` returns the cached list (or
+  // null until first load); `ensureModels` lazily loads a kind once.
+  const { modelsFor, ensureModels } = useDataStore();
+  const models = modelsFor(agentKind) ?? [];
   useEffect(() => {
-    let live = true;
-    // Reset to "auto" whenever the agent changes so a model picked for the
-    // previous agent never lingers as a stale value the new agent doesn't have.
+    // Reset the pick to "auto" whenever the agent changes so a model chosen for
+    // the previous agent never lingers as a stale value the new one lacks.
     setSelectedModel("auto");
-    if (!agentKind) {
-      setModels([]);
-      return;
-    }
-    client
-      .models(agentKind)
-      .then((m) => live && setModels(m))
-      .catch(() => live && setModels([]));
-    return () => {
-      live = false;
-    };
-  }, [client, agentKind]);
+    if (agentKind) ensureModels(agentKind);
+  }, [agentKind, ensureModels]);
   const askRef = useRef<{ cancel(): void } | null>(null);
   const feedEndRef = useRef<HTMLDivElement>(null);
 
