@@ -496,6 +496,39 @@ fn log_answer_completion_diagnostics(
     }
 }
 
+fn log_answer_failure_diagnostics(
+    request: &AnswerRequest,
+    meeting: &MeetingRecord,
+    source: &str,
+    visible_context_count: usize,
+    error: &anyhow::Error,
+) {
+    let context = answer_context_shape(&request.context);
+    warn!(
+        request_id = %request.metadata.request_id,
+        request_ref = %short_request_ref(request.metadata.request_id),
+        meeting_id = %meeting.id,
+        session_code = %meeting.session_code(),
+        source = %source,
+        route_primary = %request.route.primary.provider.display_label(),
+        route_fallbacks = request.route.fallbacks.len(),
+        streaming = request.metadata.stream,
+        visible_context_count,
+        pending_visible_context_ids = request.metadata.visible_context_ids.len(),
+        question_chars = request.question.chars().count(),
+        question_words = word_count(&request.question),
+        question_intent = question_intent_label(&request.question),
+        context_total = context.total,
+        context_screenshots = context.screenshots,
+        context_documents = context.documents,
+        context_transcripts = context.transcripts,
+        context_memory = context.memory,
+        context_other = context.other,
+        error = %format!("{error:#}"),
+        "answer request failed before completion"
+    );
+}
+
 fn is_provider_status_line(line: &str) -> bool {
     let trimmed = line.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -6953,6 +6986,13 @@ async fn answer_with_provider_runtime(
                 let user_message = user_facing_answer_error(&error);
                 let error_message =
                     answer_error_with_ref(&user_message, request.metadata.request_id);
+                log_answer_failure_diagnostics(
+                    &request,
+                    &meeting_snapshot,
+                    &source,
+                    visible_context.len(),
+                    &error,
+                );
                 record_active_session_diagnostic(daemon, "answer_error", &error_message).await;
                 let _ = overlay_stream.finish(&error_message).await;
             }
@@ -7170,9 +7210,12 @@ fn user_facing_answer_error(error: &anyhow::Error) -> String {
 }
 
 fn answer_error_with_ref(message: &str, request_id: uuid::Uuid) -> String {
+    format!("{message}\nRef: {}", short_request_ref(request_id))
+}
+
+fn short_request_ref(request_id: uuid::Uuid) -> String {
     let id = request_id.simple().to_string();
-    let short = id.get(..8).unwrap_or(&id).to_ascii_uppercase();
-    format!("{message}\nRef: {short}")
+    id.get(..8).unwrap_or(&id).to_ascii_uppercase()
 }
 
 fn is_incomplete_stream_error(lower_error: &str) -> bool {
@@ -11355,6 +11398,12 @@ fn answer_context_from_meeting(
         );
     }
 
+    if let Some(focused_code_context) =
+        question.and_then(|question| recent_coding_turn_context_for_follow_up(meeting, question))
+    {
+        context.push(focused_code_context);
+    }
+
     let conversation = meeting.last_conversation_text(10);
     if !conversation.trim().is_empty()
         && question.is_none_or(|question| {
@@ -11389,6 +11438,70 @@ fn answer_context_from_meeting(
     }
 
     context
+}
+
+fn recent_coding_turn_context_for_follow_up(
+    meeting: &MeetingRecord,
+    question: &str,
+) -> Option<AnswerContext> {
+    if !should_focus_recent_coding_turn_for_follow_up(question) {
+        return None;
+    }
+
+    let turn = meeting
+        .conversation
+        .iter()
+        .rev()
+        .find(|turn| conversation_turn_has_coding_context(turn))?;
+
+    let mut content = String::from(
+        "Recent coding turn selected for this immediate follow-up. Use this as the source of truth before asking for the problem again. If the user asks for Python, Java, full code, or the same solution, regenerate a complete implementation from the previous coding question.\n\nPrevious coding question:\n",
+    );
+    content.push_str(&compact_preserve_lines(&turn.question, 4_500));
+    if !turn.answer.trim().is_empty() {
+        content.push_str("\n\nPrevious Bluey answer:\n");
+        content.push_str(&compact_preserve_lines(&turn.answer, 2_000));
+    }
+    if let Some(artifact) = turn
+        .artifact
+        .as_ref()
+        .filter(|artifact| artifact.artifact_type == CardArtifactType::Code)
+        .filter(|artifact| !artifact.body.trim().is_empty())
+    {
+        content.push_str("\n\nPrevious code artifact:\n");
+        content.push_str(&compact_preserve_lines(&artifact.body, 6_000));
+    }
+
+    Some(
+        AnswerContext::new(AnswerContextKind::MeetingMemory, content)
+            .with_title("Recent coding prompt")
+            .with_source("active session coding follow-up"),
+    )
+}
+
+fn should_focus_recent_coding_turn_for_follow_up(question: &str) -> bool {
+    let trimmed = question.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let terms = topic_terms(trimmed);
+    looks_like_contextual_code_follow_up(trimmed, &terms)
+        || (has_recent_context_reference(trimmed)
+            && !looks_like_standalone_new_topic_request(trimmed, &terms))
+}
+
+fn conversation_turn_has_coding_context(turn: &ConversationTurn) -> bool {
+    turn.artifact
+        .as_ref()
+        .is_some_and(|artifact| artifact.artifact_type == CardArtifactType::Code)
+        || matches!(
+            question_intent_label(&turn.question),
+            "code_or_debug" | "code_explanation"
+        )
+        || answer_overlay_artifact(&turn.answer)
+            .as_ref()
+            .is_some_and(|artifact| artifact.artifact_type == CardArtifactType::Code)
 }
 
 fn should_include_recent_conversation_context(
@@ -15263,6 +15376,39 @@ mod tests {
             .find(|item| item.title.as_deref() == Some("Recent Bluey Q&A"))
             .expect("recent coding context");
         assert!(recent.content.contains("Alice can choose"));
+        let focused = context
+            .iter()
+            .find(|item| item.title.as_deref() == Some("Recent coding prompt"))
+            .expect("focused coding prompt");
+        assert!(focused.content.contains("Previous coding question"));
+        assert!(focused.content.contains("Return true if Alice can win"));
+        assert!(focused
+            .content
+            .contains("regenerate a complete implementation"));
+    }
+
+    #[test]
+    fn meeting_context_keeps_focused_code_prompt_for_same_java_follow_up() {
+        let mut meeting = MeetingRecord::new(Some("Coding practice".to_string()));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "You are given an array of positive integers nums. Alice and Bob are playing a game. Alice can choose either all single-digit numbers or all double-digit numbers. Return true if Alice can win this game, otherwise return false.",
+            "I would sum the numbers Alice could take in each choice, then compare either choice against Bob's remaining total.",
+            Some("overlay ask".to_string()),
+            Some("Bluey managed".to_string()),
+        ));
+
+        let context = answer_context_from_meeting(
+            &meeting,
+            &[],
+            Some("So can you give me Java code for the same?"),
+        );
+
+        let focused = context
+            .iter()
+            .find(|item| item.title.as_deref() == Some("Recent coding prompt"))
+            .expect("focused coding prompt");
+        assert!(focused.content.contains("Alice and Bob are playing a game"));
+        assert!(focused.content.contains("Previous Bluey answer"));
     }
 
     #[test]

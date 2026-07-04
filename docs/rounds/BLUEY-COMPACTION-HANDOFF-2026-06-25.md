@@ -5469,3 +5469,53 @@ Deployment status:
   - unpacked `bluey` and `bluey-daemon` version checks for `0.1.70`
 - Local machine installed from public `install.sh`; `/Users/uno/.bluey/bin/bluey` and `/Users/uno/.bluey/bin/bluey-daemon` both report `0.1.70`.
 - Local daemon restarted into fresh session `76fc0635-11ed-4481-bbe4-9dbd79bbd847`.
+
+## Latest Round 332: Code Follow-Up Quality Diagnostics
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-332-CODE-FOLLOWUP-QUALITY-DIAGNOSTICS.md`
+
+Trigger:
+
+- The owner showed old session `6CC7D7A4` where an Alice/Bob algorithm prompt got a short generic answer, then follow-ups like `Can you give me Python code?` and `So can you give me Java code for the same?` either asked for missing context or failed with refs such as `61B3DA69` and `B522EE81`.
+
+Production evidence:
+
+- Initial request `27CB318D` in session `6CC7D7A4` logged `answer_intent=general`, `answer_output=compact`, `context_chars=0`, and no artifact.
+- Follow-up request `77732480` logged `answer_intent=coding`, but only `context_chars=110`, so the provider did not have the full problem statement.
+- Screen resend request `9574DFDB` succeeded as coding with a code artifact, but had `input_tokens=10879` and `first_event_latency_ms=16119`.
+- Exact local refs such as `61B3DA69` and `B522EE81` were not findable in server logs, which confirmed the daemon needed stronger local failure diagnostics keyed by the same short ref shown to the user.
+
+What changed:
+
+- Server AnswerPlan now treats contextual code requests like `Can you give me Python code?`, `Can you give me Java code?`, `full code`, and `code for the same` as `coding_followup` when prior session context is coding-shaped.
+- Desktop daemon now injects a focused `Recent coding prompt` context block for immediate code follow-ups. It includes the full previous coding question, previous Bluey answer, and previous code artifact when present.
+- Desktop daemon now logs answer failures with request id, short ref, meeting id, session code, source, route, fallback count, context counts, question intent/word/char counts, and safe error chain.
+- Desktop workspace version bumped to `0.1.71`.
+
+Verification before deploy:
+
+```bash
+cargo check -p cue-daemon
+cargo test -p cue-daemon meeting_context_ --lib
+cargo test -p cue-daemon answer_error --lib
+cargo check --manifest-path server/Cargo.toml
+cargo test --manifest-path server/Cargo.toml answer_plan_ --lib
+```
+
+Deployment status:
+
+- Pending at handoff update time. Deploy server API and desktop `0.1.71`, then live-smoke:
+  - Alice/Bob prompt should route to coding/deep and produce approach/code/explanation/complexity.
+  - `Can you give me Python code?` should reuse the prior full problem without asking for the statement again.
+  - `So can you give me Java code for the same?` should reuse the prior problem.
+  - Any local failure ref should be findable in local daemon logs with `request_ref`.

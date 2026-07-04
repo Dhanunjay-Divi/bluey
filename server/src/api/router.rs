@@ -1149,6 +1149,9 @@ fn answer_plan_for_request(
         || (has_images && context_coding)
         || (generic_live_transcript_prompt && context_coding);
     let coding_followup = looks_like_coding_followup(&normalized, follow_up)
+        || (has_planning_context
+            && context_coding
+            && looks_like_contextual_code_generation_followup(&normalized))
         || (has_images && context_coding && follow_up);
     let simple_coding = coding && looks_like_simple_coding_question(&normalized, short_question);
     let context_behavioral = generic_live_transcript_prompt
@@ -1249,11 +1252,8 @@ fn answer_plan_for_request(
             || normalized.starts_with("tell me about ")
             || normalized.starts_with("can you tell me about ")
             || normalized.contains(" information about "));
-    let needs_web_search = !screen
-        && !coding
-        && !behavioral
-        && !system_design
-        && (explicit_web || about_unknown);
+    let needs_web_search =
+        !screen && !coding && !behavioral && !system_design && (explicit_web || about_unknown);
     let screen_without_image = screen && !has_images;
     let has_any_attached_evidence = has_images || has_planning_context || !rag_matches.is_empty();
     let missing_context = !needs_web_search
@@ -1271,8 +1271,8 @@ fn answer_plan_for_request(
                         "current session",
                     ],
                 )));
-    let explanation_only_coding = (coding || coding_followup)
-        && looks_like_explanation_only_coding_question(&normalized);
+    let explanation_only_coding =
+        (coding || coding_followup) && looks_like_explanation_only_coding_question(&normalized);
 
     let intent = if needs_web_search {
         AnswerIntent::Research
@@ -2584,10 +2584,10 @@ fn looks_like_interview_coaching_question(normalized: &str) -> bool {
             "source tables",
         ],
     );
-    let direct_code_or_design =
-        (looks_like_coding_question(normalized) || looks_like_system_design_question(normalized))
-            && !coaching_frame
-            && !story_prompt;
+    let direct_code_or_design = (looks_like_coding_question(normalized)
+        || looks_like_system_design_question(normalized))
+        && !coaching_frame
+        && !story_prompt;
 
     !direct_code_or_design && ((interview_frame && role_domain) || story_prompt)
 }
@@ -3150,6 +3150,32 @@ async fn completion_web_search_budgeted(
             }
         }
     }
+}
+
+fn looks_like_contextual_code_generation_followup(normalized: &str) -> bool {
+    if looks_like_algorithmic_challenge_prompt(normalized) {
+        return false;
+    }
+
+    contains_any(
+        normalized,
+        &[
+            "i want the code",
+            "give me code",
+            "give me python code",
+            "give me java code",
+            "can you give me code",
+            "can you give me python code",
+            "can you give me java code",
+            "python code",
+            "java code",
+            "full code",
+            "complete code",
+            "same code",
+            "code for the same",
+            "solution for the same",
+        ],
+    )
 }
 
 fn trial_web_searches_used_today(
@@ -7781,7 +7807,9 @@ mod tests {
         assert!(system.contains("company, project, tools, metrics, constraints"));
         assert!(system.contains("Do not invent metrics, employers, tools, source systems"));
         assert!(system.contains("If exact story detail is missing"));
-        assert!(system.contains("Role/domain interview questions") || system.contains("role/domain"));
+        assert!(
+            system.contains("Role/domain interview questions") || system.contains("role/domain")
+        );
         assert!(system.contains("RAG, MCP, or agent questions"));
         assert!(system.contains("retrieval, orchestration, grounding"));
         assert!(system.contains("infer the latest interviewer question"));
@@ -7793,14 +7821,17 @@ mod tests {
 
     #[test]
     fn answer_plan_interview_word_does_not_steal_direct_code_or_design() {
-        let code = complete_request("Question:\nWrite LRU cache code in Python for an SDE interview.");
+        let code =
+            complete_request("Question:\nWrite LRU cache code in Python for an SDE interview.");
         let code_plan = answer_plan_for_request(&code, "balanced", &[]);
 
         assert_eq!(code_plan.intent, AnswerIntent::Coding);
         assert_eq!(code_plan.output, AnswerOutput::CodeArtifact);
         assert!(code_plan.interview_context);
 
-        let design = complete_request("Question:\nDesign a scalable notification system for an SDE interview.");
+        let design = complete_request(
+            "Question:\nDesign a scalable notification system for an SDE interview.",
+        );
         let design_plan = answer_plan_for_request(&design, "balanced", &[]);
 
         assert_eq!(design_plan.intent, AnswerIntent::SystemDesign);
@@ -7876,6 +7907,32 @@ mod tests {
     #[test]
     fn answer_plan_python_followup_uses_code_followup() {
         let req = complete_request("Question:\nI want the code in Python.");
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::CodingFollowUp);
+        assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+        assert_eq!(plan.recommended_lane, "deep");
+    }
+
+    #[test]
+    fn answer_plan_python_request_with_prior_coding_context_is_followup() {
+        let req = complete_request(
+            "Question:\nCan you give me Python code?\n\nSession context:\n[Recent coding prompt from active session coding follow-up]\nPrevious coding question:\nYou are given an array of positive integers nums. Alice can choose either all single-digit numbers or all double-digit numbers from nums. Return true if Alice can win this game, otherwise return false.\n\nPrevious Bluey answer:\nI would sum the numbers Alice could take in each choice, then compare either choice against Bob's remaining total.",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::CodingFollowUp);
+        assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+        assert_eq!(plan.recommended_lane, "deep");
+    }
+
+    #[test]
+    fn answer_plan_java_request_for_same_prior_coding_context_is_followup() {
+        let req = complete_request(
+            "Question:\nSo can you give me Java code for the same?\n\nSession context:\n[Recent coding prompt from active session coding follow-up]\nPrevious coding question:\nYou are given an array of positive integers nums. Alice and Bob are playing a game. Alice can choose either all single-digit numbers or all double-digit numbers from nums. Return true if Alice can win this game, otherwise return false.",
+        );
 
         let plan = answer_plan_for_request(&req, "balanced", &[]);
 
@@ -8342,7 +8399,10 @@ mod tests {
 
         let explicit_memory =
             complete_request("Question:\nUse saved memory and tell me what was decided.");
-        assert!(should_lookup_completion_memory(&explicit_memory, "balanced"));
+        assert!(should_lookup_completion_memory(
+            &explicit_memory,
+            "balanced"
+        ));
         let explicit_memory_plan = answer_plan_for_request(&explicit_memory, "balanced", &[]);
         assert!(answer_plan_allows_memory_lookup(&explicit_memory_plan));
     }
