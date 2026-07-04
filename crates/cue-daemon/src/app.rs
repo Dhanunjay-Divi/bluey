@@ -932,6 +932,18 @@ pub(crate) struct Daemon {
     /// Attach/detach reuse this and only flip the `attached` flag, so rapid
     /// "Use" clicks don't each trigger a fresh ~15s filesystem rediscovery.
     agent_cache: Mutex<Option<Vec<cue_core::agent_ui::AgentSummary>>>,
+    /// True while a background full agent discovery is running, so overlapping
+    /// `AgentListRequested` events don't stack N concurrent ~15s rediscoveries.
+    /// Set true before spawning the bg refresh, cleared in the spawned task's
+    /// finally-path.
+    agent_refresh_inflight: std::sync::atomic::AtomicBool,
+    /// Monotonic generation counter bumped on every attach/detach cache flip
+    /// (`refresh_overlay_agents_attached_only`). A background full-discovery
+    /// tail captures this epoch at spawn time and only writes its result if the
+    /// epoch is unchanged when it finishes — otherwise a newer attach that
+    /// landed during the ~15s discovery window would be clobbered by the stale
+    /// `attached` snapshot the tail captured before the attach.
+    agent_cache_epoch: std::sync::atomic::AtomicU64,
     /// Retained meeting audio for speaker diarization (rolling window for the
     /// live tier + full buffer for the post-meeting pass). `None` until capture
     /// starts. Only present with the `diarize` feature.
@@ -1106,6 +1118,8 @@ pub async fn run() -> Result<()> {
             cue_core::overlay_ipc::OverlayUiState::Idle,
         )),
         agent_cache: Mutex::new(None),
+        agent_refresh_inflight: std::sync::atomic::AtomicBool::new(false),
+        agent_cache_epoch: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "diarize")]
         audio_retention: Mutex::new(None),
         #[cfg(feature = "diarize")]
@@ -2463,7 +2477,7 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             handle_remove_context_requested(daemon, id).await?;
         }
         OverlayEvent::AgentListRequested => {
-            refresh_overlay_agents(daemon).await;
+            refresh_overlay_agents_swr(daemon).await;
         }
         OverlayEvent::AgentAttachRequested {
             kind,
@@ -2790,6 +2804,55 @@ const AGENT_SESSION_LIST_CAP: usize = 40;
 /// than this many sessions reports exactly the cap.
 const AGENT_SESSION_COUNT_CAP: usize = 20;
 
+/// Stale-while-revalidate entry point for `AgentListRequested`. Serves the
+/// cached agent list INSTANTLY when present (the frontend's one-shot
+/// `listAgents()` resolves on this first `SetAgents`), then kicks a background
+/// full rediscovery whose later `SetAgents` push updates the list live. The
+/// first-ever call (no cache) pays the full two-phase discovery once.
+async fn refresh_overlay_agents_swr(daemon: &Arc<Daemon>) {
+    let cached = { daemon.agent_cache.lock().await.clone() };
+    let Some(mut agents) = cached else {
+        // First-ever call: no cache to serve. Pay the full two-phase discovery
+        // once (it writes the cache + pushes). Do NOT also spawn a bg refresh —
+        // that would double-run the slow discovery.
+        refresh_overlay_agents(daemon).await;
+        return;
+    };
+    // Cache hit: recompute the attached flag from live settings (attach state
+    // can have changed since the cache was written), serve instantly, then
+    // revalidate in the background.
+    let attached_label = load_settings(&daemon.paths)
+        .ok()
+        .and_then(|s| s.attached_agent);
+    for agent in &mut agents {
+        agent.attached = is_agent_kind_attached(&agent.kind, attached_label.as_deref());
+    }
+    *daemon.agent_cache.lock().await = Some(agents.clone());
+    let _ = send_overlay(daemon, OverlayCommand::SetAgents { agents }).await;
+    spawn_agent_bg_refresh(daemon);
+}
+
+/// Spawn a single background full agent rediscovery, guarded so overlapping
+/// `AgentListRequested` events (rapid tab-switches) don't stack N concurrent
+/// ~15s discoveries. `swap(true)` returns the PRIOR value: if it was already
+/// true, a refresh is in flight and this one is dropped.
+fn spawn_agent_bg_refresh(daemon: &Arc<Daemon>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if daemon.agent_refresh_inflight.swap(true, SeqCst) {
+        return;
+    }
+    let daemon = Arc::clone(daemon);
+    tokio::spawn(async move {
+        // `refresh_overlay_agents` catches its own panics and always returns (),
+        // so a straight-line clear after the await is sufficient — no
+        // catch_unwind needed. The flag clears after Phase-1 returns (Phase-2 is
+        // a spawned, idempotent tail; a second overlapping refresh in its window
+        // only recomputes the same data).
+        refresh_overlay_agents(&daemon).await;
+        daemon.agent_refresh_inflight.store(false, SeqCst);
+    });
+}
+
 /// Discover agents and push them to the overlay in TWO phases so the UI feels
 /// instant:
 ///   1. Fast first paint — discover installs + connectors (no session counts,
@@ -2800,9 +2863,18 @@ const AGENT_SESSION_COUNT_CAP: usize = 20;
 ///
 /// Fail-soft: any discovery/read error degrades to an empty list with a log.
 async fn refresh_overlay_agents(daemon: &Arc<Daemon>) {
+    use std::sync::atomic::Ordering::SeqCst;
+
     let settings = load_settings(&daemon.paths).unwrap_or_default();
     let attached = settings.attached_agent.clone();
     let allow_history = settings.allow_agent_session_history;
+
+    // Snapshot the cache generation. Every write below is discarded if an
+    // attach/detach flip (`refresh_overlay_agents_attached_only`) bumped the
+    // epoch after this discovery captured its `attached` snapshot — otherwise a
+    // newer attach that landed during the slow discovery would be overwritten by
+    // this stale list.
+    let epoch = daemon.agent_cache_epoch.load(SeqCst);
 
     // ---- Phase 1: instant paint (no counts) ----
     let started = Instant::now();
@@ -2821,8 +2893,10 @@ async fn refresh_overlay_agents(daemon: &Arc<Daemon>) {
         elapsed_ms = started.elapsed().as_millis() as u64,
         "agents: sending SetAgents (fast paint, counts pending)"
     );
-    *daemon.agent_cache.lock().await = Some(agents.clone());
-    let _ = send_overlay(daemon, OverlayCommand::SetAgents { agents }).await;
+    if daemon.agent_cache_epoch.load(SeqCst) == epoch {
+        *daemon.agent_cache.lock().await = Some(agents.clone());
+        let _ = send_overlay(daemon, OverlayCommand::SetAgents { agents }).await;
+    }
 
     // ---- Phase 2: fill session counts in the background ----
     if allow_history {
@@ -2837,14 +2911,17 @@ async fn refresh_overlay_agents(daemon: &Arc<Daemon>) {
             if counted.is_empty() {
                 return;
             }
+            // Discard if an attach/detach changed the attach state during the
+            // ~15s discovery window: this list carries the pre-attach `attached`
+            // snapshot and would visibly revert the badge + leave the cache wrong.
+            if daemon.agent_cache_epoch.load(SeqCst) != epoch {
+                return;
+            }
             info!(
                 count = counted.len(),
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "agents: sending SetAgents (counts filled)"
             );
-            // Only overwrite the cache if an attach/detach hasn't changed it in a
-            // way that matters; the attached flag is recomputed here from the same
-            // settings, so it's consistent. Re-send so the UI fills the counts.
             *daemon.agent_cache.lock().await = Some(counted.clone());
             let _ = send_overlay(&daemon, OverlayCommand::SetAgents { agents: counted }).await;
         });
@@ -2856,6 +2933,13 @@ async fn refresh_overlay_agents(daemon: &Arc<Daemon>) {
 /// "Use" clicks give instant feedback instead of stacking rediscoveries (the
 /// runaway-loop bug). Falls back to a full refresh only if nothing is cached.
 async fn refresh_overlay_agents_attached_only(daemon: &Arc<Daemon>) {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    // Bump the cache generation FIRST so any background full discovery already
+    // in flight (spawned before this attach/detach) discards its stale result
+    // instead of clobbering the fresh `attached` flag written below.
+    daemon.agent_cache_epoch.fetch_add(1, SeqCst);
+
     let attached_label = load_settings(&daemon.paths)
         .ok()
         .and_then(|s| s.attached_agent);
@@ -13315,6 +13399,49 @@ mod tests {
             "not_a_real_agent",
             Some("not_a_real_agent")
         ));
+    }
+
+    #[test]
+    fn agent_refresh_inflight_guard_drops_overlapping() {
+        // `spawn_agent_bg_refresh` uses `swap(true)` as the in-flight guard so
+        // rapid `AgentListRequested` events don't stack N concurrent ~15s
+        // rediscoveries. This asserts the primitive's contract the guard relies
+        // on: the first caller proceeds (prior value false), an overlapping
+        // second caller is dropped (prior value true), and after the spawned
+        // task clears the flag a later refresh proceeds again.
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let inflight = AtomicBool::new(false);
+        // First refresh: no refresh in flight → proceeds.
+        assert!(!inflight.swap(true, SeqCst));
+        // Overlapping refresh while the first is in flight → dropped.
+        assert!(inflight.swap(true, SeqCst));
+        // Spawned task's finally-path clears the flag.
+        inflight.store(false, SeqCst);
+        // A later refresh proceeds again.
+        assert!(!inflight.swap(true, SeqCst));
+    }
+
+    #[test]
+    fn agent_cache_epoch_guard_discards_stale_bg_refresh() {
+        // A background full discovery captures the epoch at spawn time and only
+        // writes its result if the epoch is unchanged when it finishes. This
+        // asserts that primitive's contract: an attach/detach flip that bumps the
+        // epoch mid-discovery makes the stale tail's guard fail (so it discards),
+        // while a discovery with no interleaving attach proceeds.
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let epoch = AtomicU64::new(0);
+
+        // Discovery A snapshots the epoch, then an attach/detach cache flip bumps
+        // it mid-flight. A's guard now fails → A discards its stale (pre-attach)
+        // result.
+        let snapshot_a = epoch.load(SeqCst);
+        epoch.fetch_add(1, SeqCst);
+        assert_ne!(epoch.load(SeqCst), snapshot_a);
+
+        // Discovery B snapshots after the attach; with no further flip its guard
+        // passes → B writes.
+        let snapshot_b = epoch.load(SeqCst);
+        assert_eq!(epoch.load(SeqCst), snapshot_b);
     }
 
     #[test]

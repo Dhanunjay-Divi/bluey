@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { MeetingProvider } from "./lib/meetingState";
+import { DataProvider } from "./lib/dataStore";
 import "./styles/aurora.css";
 
 const inTauri =
@@ -11,10 +12,15 @@ const inTauri =
 // MeetingProvider sits ABOVE <App/> so the meeting's session state (transcript,
 // history, Q&A, detected question) is never unmounted by collapse/onboarding/tab
 // switching — the meeting is the source of truth and this is its durable view.
+// DataProvider sits alongside it (SWR store for agents / meetings / sessions) so
+// discovery data is cached across tab switches and revalidated in the background
+// instead of being thrown away and refetched on every mount.
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <MeetingProvider>
-      <App />
+      <DataProvider>
+        <App />
+      </DataProvider>
     </MeetingProvider>
   </StrictMode>,
 );

@@ -1205,6 +1205,7 @@ mod tests {
                 preview: None,
                 is_active: true,
                 agent_session_id: None,
+                agent_kind: None,
             }],
         };
         let json = serde_json::to_string(&command).expect("serialize");
@@ -1215,6 +1216,7 @@ mod tests {
         assert!(!json.contains("ended_at"));
         assert!(!json.contains("preview"));
         assert!(!json.contains("agent_session_id"));
+        assert!(!json.contains("agent_kind"));
         let decoded: OverlayCommand = serde_json::from_str(&json).expect("decode");
         assert_eq!(serde_json::to_string(&decoded).expect("re-serialize"), json);
     }
@@ -1231,13 +1233,16 @@ mod tests {
             preview: Some("So the plan for the migration is".to_string()),
             is_active: false,
             agent_session_id: Some("sess-abc".to_string()),
+            agent_kind: Some("claude_code".to_string()),
         };
         let json = serde_json::to_string(&summary).expect("serialize");
         assert!(json.contains(r#""ended_at":"1718000900000""#));
         assert!(json.contains(r#""preview":"So the plan for the migration is""#));
         assert!(json.contains(r#""agent_session_id":"sess-abc""#));
+        assert!(json.contains(r#""agent_kind":"claude_code""#));
         let decoded: MeetingSummary = serde_json::from_str(&json).expect("decode");
         assert_eq!(decoded.agent_session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(decoded.agent_kind.as_deref(), Some("claude_code"));
     }
 
     #[test]

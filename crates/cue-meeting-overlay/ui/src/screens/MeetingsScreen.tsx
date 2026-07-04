@@ -9,6 +9,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { getClient } from "../lib";
+import { useDataStore } from "../lib/dataStore";
 import { createTranscriptGrouper } from "../lib/transcriptGrouping";
 import type {
   MeetingSummary,
@@ -33,20 +34,12 @@ export function MeetingsScreen({
    *  attached agent. The App wires this to attach(kind, sessionId) → Ask tab. */
   onResumeAgentThread: (kind: string | undefined, sessionId: string) => void;
 }) {
-  const [meetings, setMeetings] = useState<MeetingSummary[] | null>(null);
+  // Past meetings come from the shared SWR store — cached across tab switches and
+  // revalidated in the background (the History>Meetings lens triggers the
+  // revalidate on focus), so opening this screen shows data instantly with no
+  // throw-away refetch. null → first-load spinner; [] → empty.
+  const { meetings } = useDataStore();
   const [selected, setSelected] = useState<MeetingSummary | null>(null);
-
-  useEffect(() => {
-    let live = true;
-    setMeetings(null);
-    getClient()
-      .meetings()
-      .then((m) => live && setMeetings(m))
-      .catch(() => live && setMeetings([]));
-    return () => {
-      live = false;
-    };
-  }, []);
 
   if (selected) {
     return (

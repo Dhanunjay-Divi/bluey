@@ -36,6 +36,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-soft (missing/corrupt lines skipped), no fsync/rotation (optimization
   layer; a miss falls back to the store re-scrape).
 
+### Changed
+- **Seamless, no-redundant-load overlay (stale-while-revalidate).** Agent
+  discovery is ~14s (installs + connectors + session counts), and the overlay
+  re-ran it on every mount / tab switch, so agent selection lagged and every
+  screen threw away loaded data and refetched. Now:
+  - **Daemon serves the agent cache instantly.** `AgentListRequested` pushes the
+    cached agent list immediately (attached flag recomputed from live settings)
+    then refreshes in the background and pushes the update — the ~14s discovery no
+    longer blocks the paint. First-ever call (cold cache) still discovers once. A
+    cache-epoch guard prevents a background refresh from clobbering a just-attached
+    state, and an in-flight guard drops overlapping refreshes.
+  - **Frontend shared data store** (`DataProvider`, modeled on `MeetingProvider`):
+    agents, per-kind agent sessions, and meetings are held once and shared across
+    tabs — cached reads render instantly with no spinner, and revalidate in the
+    background. A single subscription to the daemon's pushed `set_agents` keeps it
+    live (attach/detach/refresh). No more per-screen mount refetch.
+- **History is one tab with a `[Meetings | Sessions]` sub-toggle** (was two
+  separate "Meetings"/"Agents" history tabs). Meetings = past meetings; Sessions =
+  the agent-session list. The "Agents" tab (attach/detach) stays its own tab.
+
 ### Added
 - **Meeting history — two distinct lenses.** The overlay now has a **Meetings**
   tab (your past meetings, newest-first, with transcript/turn counts + a preview)

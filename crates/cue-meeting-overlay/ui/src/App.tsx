@@ -2,11 +2,11 @@
 // tabs · close) over the active tab. First run shows onboarding; after that the
 // live Ask loop. One window, state-driven views (no router) — lean by design.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getClient } from "./lib";
 import { useDragHeader } from "./lib/useDragHeader";
 import { useCollapse } from "./lib/useCollapse";
-import type { AgentSummary } from "./lib/types";
+import { useDataStore } from "./lib/dataStore";
 import {
   Glass,
   Mark,
@@ -16,16 +16,17 @@ import {
 } from "./components/primitives";
 import { Pill } from "./components/Pill";
 import { AskScreen } from "./screens/AskScreen";
-import { MeetingsScreen } from "./screens/MeetingsScreen";
+import { HistoryTab } from "./screens/HistoryTab";
 import { AgentsScreen } from "./screens/AgentsScreen";
 import { Onboarding } from "./screens/Onboarding";
 
 // Audio controls live in the composer "+" menu now, not a separate tab.
-// "Meetings" is the MEETINGS lens (my past meetings + their transcript/Q&A);
-// the AGENT-SESSION lens (resume a Claude/Cursor thread) lives under "Agents".
-// Two clearly-named, distinct history surfaces.
-type Tab = "Ask" | "Meetings" | "Agents";
-const TABS: readonly Tab[] = ["Ask", "Meetings", "Agents"];
+// "History" holds TWO lenses under a sub-toggle: Meetings (my past meetings +
+// their transcript/Q&A) and Sessions (resume a Claude/Cursor agent thread).
+// "Agents" stays its own tab: attach/detach agents (+ its embedded past
+// sessions). Three top tabs, two lenses inside History.
+type Tab = "Ask" | "History" | "Agents";
+const TABS: readonly Tab[] = ["Ask", "History", "Agents"];
 
 export function App() {
   const client = getClient();
@@ -33,7 +34,9 @@ export function App() {
     () => !localStorage.getItem("bluey.onboarded"),
   );
   const [tab, setTab] = useState<Tab>("Ask");
-  const [agents, setAgents] = useState<AgentSummary[] | null>(null);
+  // Agents + attach/detach come from the shared SWR store (cached across tab
+  // switches, kept live by the daemon's set_agents push) — no per-mount refetch.
+  const { agents, attached, attach, detach } = useDataStore();
   const [connectors, setConnectors] = useState<string[]>([]);
   // Drag the frameless panel by its header (no titlebar to grab).
   const headerRef = useRef<HTMLDivElement>(null);
@@ -43,22 +46,6 @@ export function App() {
   const { collapsed, collapse, expand } = useCollapse();
   const pillRef = useRef<HTMLDivElement>(null);
   useDragHeader(pillRef);
-
-  useEffect(() => {
-    let live = true;
-    client
-      .listAgents()
-      .then((a) => live && setAgents(a))
-      .catch(() => live && setAgents([]));
-    return () => {
-      live = false;
-    };
-  }, [client]);
-
-  const attached = useMemo(
-    () => agents?.find((a) => a.attached) ?? null,
-    [agents],
-  );
 
   // Real connectors for the attached agent — the footer lists the actual ready
   // ones, never hardcoded brand names.
@@ -79,10 +66,6 @@ export function App() {
       live = false;
     };
   }, [client, attached]);
-
-  const attach = (kind: string, sessionId?: string, model?: string) =>
-    client.attach(kind, sessionId, model).then(setAgents);
-  const detach = () => client.detach().then(setAgents);
 
   return (
     // The panel is ALWAYS mounted — collapse hides it via display:none, it does
@@ -198,10 +181,11 @@ export function App() {
             }}
           >
             {tab === "Ask" && <AskScreen agent={attached} />}
-            {/* "Meetings" is the MEETINGS lens (my past meetings). The
-                AGENT-SESSION lens lives under the Agents tab. */}
-            {tab === "Meetings" && (
-              <MeetingsScreen
+            {/* "History" holds the MEETINGS + SESSIONS lenses under a sub-toggle
+                (the AGENT-SESSION lens also lives embedded in the Agents tab). */}
+            {tab === "History" && (
+              <HistoryTab
+                attachedKind={attached?.kind ?? null}
                 onResumeAgentThread={(kind, sid) => {
                   // Resume the thread on the agent the meeting ACTUALLY used
                   // (kind from the meeting link), not whatever is currently
@@ -211,6 +195,9 @@ export function App() {
                   if (!resumeKind) return; // no kind and nothing attached — no-op
                   void attach(resumeKind, sid).then(() => setTab("Ask"));
                 }}
+                onResumeSession={(kind, sid) =>
+                  void attach(kind, sid).then(() => setTab("Ask"))
+                }
               />
             )}
             {tab === "Agents" && (

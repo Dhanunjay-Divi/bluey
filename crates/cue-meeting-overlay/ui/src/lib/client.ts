@@ -28,6 +28,13 @@ export interface AskHandle {
 export interface MeetingClient {
   // ---- discovery / attach (the proven agent-bridge commands) ----
   listAgents(): Promise<AgentSummary[]>;
+  /** Subscribe to daemon-PUSHED agent lists (set_agents); returns an unsubscribe
+   *  fn. The daemon pushes set_agents not only as the reply to a one-shot
+   *  {@link listAgents} request but also from the background full-refresh (SWR)
+   *  and from attach/detach. This persistent subscription keeps a shared store
+   *  live where listAgents() cannot — it resolves on the first reply and detaches.
+   *  Single owner: subscribe ONCE, in the DataProvider. */
+  onAgents(cb: (agents: AgentSummary[]) => void): () => void;
   attach(
     kind: string,
     sessionId?: string,

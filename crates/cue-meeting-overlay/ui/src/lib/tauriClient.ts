@@ -509,6 +509,20 @@ export function createTauriClient(): MeetingClient {
       sendEvent({ type: "analyze_screen_requested" });
     },
 
+    onAgents(cb) {
+      // Persistent subscriber to daemon-PUSHED agent lists. Every set_agents line
+      // — the reply to a listAgents() request, the SWR background full-refresh, or
+      // an attach/detach flag-flip — fans out here so a shared store stays live.
+      // Pure subscribe: sends no event.
+      const handler = (cmd: OverlayCommand) => {
+        if (cmd.type !== "set_agents") return;
+        const c = cmd as Extract<OverlayCommand, { type: "set_agents" }>;
+        cb(c.agents.map(toAgentSummary));
+      };
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+
     onTranscript(cb) {
       // Transcript lines arrive as push_card with kind "transcript".
       const handler = (cmd: OverlayCommand) => {
