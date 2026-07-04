@@ -11455,11 +11455,11 @@ fn recent_coding_turn_context_for_follow_up(
         .find(|turn| conversation_turn_has_coding_context(turn))?;
 
     let mut content = String::from(
-        "Recent coding turn selected for this immediate follow-up. Use this as the source of truth before asking for the problem again. If the user asks for Python, Java, full code, or the same solution, regenerate a complete implementation from the previous coding question.\n\nPrevious coding question:\n",
+        "Recent coding context for this immediate follow-up.\n\nPrior coding question:\n",
     );
     content.push_str(&compact_preserve_lines(&turn.question, 4_500));
     if !turn.answer.trim().is_empty() {
-        content.push_str("\n\nPrevious Bluey answer:\n");
+        content.push_str("\n\nPrior answer summary:\n");
         content.push_str(&compact_preserve_lines(&turn.answer, 2_000));
     }
     if let Some(artifact) = turn
@@ -11468,14 +11468,14 @@ fn recent_coding_turn_context_for_follow_up(
         .filter(|artifact| artifact.artifact_type == CardArtifactType::Code)
         .filter(|artifact| !artifact.body.trim().is_empty())
     {
-        content.push_str("\n\nPrevious code artifact:\n");
+        content.push_str("\n\nPrior code artifact:\n");
         content.push_str(&compact_preserve_lines(&artifact.body, 6_000));
     }
 
     Some(
         AnswerContext::new(AnswerContextKind::MeetingMemory, content)
-            .with_title("Recent coding prompt")
-            .with_source("active session coding follow-up"),
+            .with_title("Recent coding context")
+            .with_source("active session coding context"),
     )
 }
 
@@ -15378,13 +15378,10 @@ mod tests {
         assert!(recent.content.contains("Alice can choose"));
         let focused = context
             .iter()
-            .find(|item| item.title.as_deref() == Some("Recent coding prompt"))
-            .expect("focused coding prompt");
-        assert!(focused.content.contains("Previous coding question"));
+            .find(|item| item.title.as_deref() == Some("Recent coding context"))
+            .expect("focused coding context");
+        assert!(focused.content.contains("Prior coding question"));
         assert!(focused.content.contains("Return true if Alice can win"));
-        assert!(focused
-            .content
-            .contains("regenerate a complete implementation"));
     }
 
     #[test]
@@ -15405,10 +15402,10 @@ mod tests {
 
         let focused = context
             .iter()
-            .find(|item| item.title.as_deref() == Some("Recent coding prompt"))
-            .expect("focused coding prompt");
+            .find(|item| item.title.as_deref() == Some("Recent coding context"))
+            .expect("focused coding context");
         assert!(focused.content.contains("Alice and Bob are playing a game"));
-        assert!(focused.content.contains("Previous Bluey answer"));
+        assert!(focused.content.contains("Prior answer summary"));
     }
 
     #[test]

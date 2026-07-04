@@ -5498,9 +5498,9 @@ Production evidence:
 What changed:
 
 - Server AnswerPlan now treats contextual code requests like `Can you give me Python code?`, `Can you give me Java code?`, `full code`, and `code for the same` as `coding_followup` when prior session context is coding-shaped.
-- Desktop daemon now injects a focused `Recent coding prompt` context block for immediate code follow-ups. It includes the full previous coding question, previous Bluey answer, and previous code artifact when present.
+- Desktop daemon now injects a focused `Recent coding context` block for immediate code follow-ups. It includes the full prior coding question, prior answer summary, and prior code artifact when present. The label/body avoid prompt-like wording so the server private-instruction guard does not false-positive on normal code follow-ups.
 - Desktop daemon now logs answer failures with request id, short ref, meeting id, session code, source, route, fallback count, context counts, question intent/word/char counts, and safe error chain.
-- Desktop workspace version bumped to `0.1.71`.
+- Desktop workspace version bumped to `0.1.72`.
 
 Verification before deploy:
 
@@ -5514,7 +5514,7 @@ cargo test --manifest-path server/Cargo.toml answer_plan_ --lib
 
 Deployment status:
 
-- Pending at handoff update time. Deploy server API and desktop `0.1.71`, then live-smoke:
+- Pending corrected release deploy. Deploy server API and desktop `0.1.72`, then live-smoke:
   - Alice/Bob prompt should route to coding/deep and produce approach/code/explanation/complexity.
   - `Can you give me Python code?` should reuse the prior full problem without asking for the statement again.
   - `So can you give me Java code for the same?` should reuse the prior problem.

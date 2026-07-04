@@ -7417,6 +7417,13 @@ mod tests {
     }
 
     #[test]
+    fn internal_disclosure_guard_allows_coding_followup_context() {
+        let user = "Question:\nSo can you give me Java code for the same?\n\nSession context:\n[Recent coding context from active session coding context]\nPrior coding question:\nYou are given an array of positive integers nums. Alice can choose either all single-digit numbers or all double-digit numbers from nums. Return true if Alice can win this game, otherwise return false.\n\nPrior answer summary:\nI would sum both choices and compare either choice against Bob's remaining total.";
+
+        assert!(!is_internal_disclosure_request(user));
+    }
+
+    #[test]
     fn response_artifact_ignores_internal_prompt_leak() {
         let leaked = "The prompts that define how I work are embedded in my system instructions. Question type detection, canvas and workbench split, style restrictions, and output shape are key rules.";
 
@@ -7918,7 +7925,7 @@ mod tests {
     #[test]
     fn answer_plan_python_request_with_prior_coding_context_is_followup() {
         let req = complete_request(
-            "Question:\nCan you give me Python code?\n\nSession context:\n[Recent coding prompt from active session coding follow-up]\nPrevious coding question:\nYou are given an array of positive integers nums. Alice can choose either all single-digit numbers or all double-digit numbers from nums. Return true if Alice can win this game, otherwise return false.\n\nPrevious Bluey answer:\nI would sum the numbers Alice could take in each choice, then compare either choice against Bob's remaining total.",
+            "Question:\nCan you give me Python code?\n\nSession context:\n[Recent coding context from active session coding context]\nPrior coding question:\nYou are given an array of positive integers nums. Alice can choose either all single-digit numbers or all double-digit numbers from nums. Return true if Alice can win this game, otherwise return false.\n\nPrior answer summary:\nI would sum the numbers Alice could take in each choice, then compare either choice against Bob's remaining total.",
         );
 
         let plan = answer_plan_for_request(&req, "balanced", &[]);
@@ -7931,7 +7938,7 @@ mod tests {
     #[test]
     fn answer_plan_java_request_for_same_prior_coding_context_is_followup() {
         let req = complete_request(
-            "Question:\nSo can you give me Java code for the same?\n\nSession context:\n[Recent coding prompt from active session coding follow-up]\nPrevious coding question:\nYou are given an array of positive integers nums. Alice and Bob are playing a game. Alice can choose either all single-digit numbers or all double-digit numbers from nums. Return true if Alice can win this game, otherwise return false.",
+            "Question:\nSo can you give me Java code for the same?\n\nSession context:\n[Recent coding context from active session coding context]\nPrior coding question:\nYou are given an array of positive integers nums. Alice and Bob are playing a game. Alice can choose either all single-digit numbers or all double-digit numbers from nums. Return true if Alice can win this game, otherwise return false.",
         );
 
         let plan = answer_plan_for_request(&req, "balanced", &[]);

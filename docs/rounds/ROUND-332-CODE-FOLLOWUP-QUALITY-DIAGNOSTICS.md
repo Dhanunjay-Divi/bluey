@@ -28,7 +28,7 @@ Live API logs for session `6CC7D7A4` showed:
 Two paths were not strong enough:
 
 1. Server AnswerPlan treated `Can you give me Python code?` as a fresh coding request even when prior coding session context existed, instead of a coding follow-up.
-2. Desktop context building relied on generic recent Q&A. If the prior answer was compact, the follow-up could inherit only a tiny summary instead of an explicit full prior coding prompt.
+2. Desktop context building relied on generic recent Q&A. If the prior answer was compact, the follow-up could inherit only a tiny summary instead of explicit prior coding context.
 
 ## Changes
 
@@ -46,11 +46,12 @@ Two paths were not strong enough:
 
 ### Desktop Daemon
 
-- Added a focused `Recent coding prompt` context block for immediate code follow-ups.
+- Added a focused `Recent coding context` block for immediate code follow-ups.
 - The block carries:
-  - full previous coding question
-  - previous Bluey answer
-  - previous code artifact body when available
+  - full prior coding question
+  - prior answer summary
+  - prior code artifact body when available
+- The context wording intentionally avoids prompt/instruction-like labels so server-side private-instruction guards do not false-positive on normal follow-ups like `give me Java code for the same`.
 - Added failure diagnostics for local answer refs:
   - request id and short ref
   - session id and session code
@@ -62,7 +63,7 @@ Two paths were not strong enough:
 
 ### Version
 
-- Bumped desktop release version to `0.1.71`.
+- Bumped desktop release version to `0.1.72`.
 
 ## Verification
 
@@ -85,4 +86,4 @@ Targeted coverage added:
 
 ## Notes
 
-This round fixes future continuity and traceability. It cannot rewrite already-saved compact turns in old sessions, but the next follow-up from a freshly updated `0.1.71` desktop will preserve the prior coding prompt explicitly.
+This round fixes future continuity and traceability. It cannot rewrite already-saved compact turns in old sessions, but the next follow-up from a freshly updated `0.1.72` desktop will preserve the prior coding context explicitly.
