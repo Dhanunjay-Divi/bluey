@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-03 19:14 EDT
+Latest checkpoint: 2026-07-04 00:34 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,38 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest active Bluey round doc is `ROUND-327-RESUME-INTRO-FIRST-PASS-LENGTH.md`; the next canonical Bluey round doc should start at `ROUND-328-...`.
+- Latest active Bluey round doc is `ROUND-328-CODING-ANSWER-SHAPE.md`; the next canonical Bluey round doc should start at `ROUND-329-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 328 is in progress for coding answer shape:
+  - owner showed a coding challenge answer with only a short approach sentence and a cramped code artifact
+  - expected shape is approach explanation, readable complete code with useful comments, explanation, time/space complexity, and patch-style follow-ups
+  - hardened managed server coding prompts to require `Approach`, `Code`, `Explanation`, `Complexity`, and `Edge cases`
+  - code blocks must keep each statement on its own line with correct indentation
+  - Python/LeetCode answers must include imports when type hints need them, or avoid those type hints
+  - non-trivial code should include concise inline comments for important decision lines
+  - code follow-ups preserve existing code and use changed blocks/patches unless full replacement is requested or safer
+  - applied the same contract to daemon fallback prompts and Code/General mode instructions
+  - expanded overlay inline-heading splitting for `Code`, `Changed block`, `Time Complexity`, `Space Complexity`, and `Line notes`
+  - workspace desktop version bumped to `0.1.66`
+  - verification passed:
+    - `cargo test --manifest-path server/Cargo.toml answer_plan_code_request_uses_deep_code_artifact -- --nocapture`
+    - `cargo test -p cue-daemon mode_instructions_specialize_default_answer_shapes -- --nocapture`
+    - `cargo test -p cue-daemon general_mode_keeps_code_shape_for_coding_questions -- --nocapture`
+    - `cargo test -p cue-daemon response_artifact_separates_code_line_notes -- --nocapture`
+    - `cargo check -p cue-daemon`
+    - `cargo fmt --check`
+    - `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
+  - pending before final close:
+    - commit/push Round 328 changes
+    - deploy production API server
+    - package/deploy desktop `0.1.66`
+    - install locally and restart Bluey
+  - Round doc:
+    `docs/rounds/ROUND-328-CODING-ANSWER-SHAPE.md`
 - Round 327 is complete and deployed for resume-introduction first-pass length:
   - owner showed `give me introduction based on the resume` returning a short compact answer first, then only producing a fuller intro after multiple follow-ups
   - root cause: behavioral/resume prompts still used `output=compact`, and generic compact overlay instructions competed with the interview prompt
