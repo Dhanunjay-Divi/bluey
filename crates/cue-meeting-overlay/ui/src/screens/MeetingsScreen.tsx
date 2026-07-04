@@ -25,6 +25,14 @@ interface ViewTurn {
   answer: string;
 }
 
+// Module-level cache of opened past-meeting VIEWS, keyed by meeting id. The
+// MeetingViewer unmounts when you go Back, so a component-local cache wouldn't
+// survive — this does, making RE-opening a meeting you already viewed instant
+// (no second openMeeting round-trip / "Opening…" spinner). A past meeting's
+// persisted snapshot is immutable, so the cache never goes stale within a
+// session. Bounded implicitly by the number of meetings you open per session.
+const openedMeetingCache = new Map<string, MeetingViewState>();
+
 export function MeetingsScreen({
   onResumeAgentThread,
   onContinue,
@@ -34,9 +42,13 @@ export function MeetingsScreen({
    *  links recorded before the kind was stored, where App falls back to the
    *  attached agent. The App wires this to attach(kind, sessionId) → Ask tab. */
   onResumeAgentThread: (kind: string | undefined, sessionId: string) => void;
-  /** Continue this past meeting in the Ask screen: make it the ACTIVE meeting.
-   *  App wires this to client.continueMeeting(id) → (unless blocked) Ask tab. */
-  onContinue: (id: string) => void;
+  /** Continue this past meeting in the Ask screen: make it the ACTIVE meeting AND
+   *  re-attach the agent thread it used (so continuing restores the FULL context —
+   *  transcript + Q&A + the agent conversation), in one action. Passed the whole
+   *  summary so App has the agent link (agentKind/agentSessionId). App wires this
+   *  to client.continueMeeting(id) + attach(kind, sessionId) → (unless blocked)
+   *  Ask tab. */
+  onContinue: (meeting: MeetingSummary) => void;
 }) {
   // Past meetings come from the shared SWR store — cached across tab switches and
   // revalidated in the background (the History>Meetings lens triggers the
@@ -108,18 +120,29 @@ function MeetingViewer({
   summary: MeetingSummary;
   onBack: () => void;
   onResumeAgentThread: (kind: string | undefined, sessionId: string) => void;
-  onContinue: (id: string) => void;
+  onContinue: (meeting: MeetingSummary) => void;
 }) {
   const [view, setView] = useState<MeetingViewState | null>(null);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let live = true;
-    setView(null);
     setFailed(false);
+    // Serve a previously-opened view INSTANTLY from the module cache (no spinner,
+    // no round-trip); only fetch on a cache miss. A past meeting's snapshot is
+    // immutable, so the cache is always correct within a session.
+    const cached = openedMeetingCache.get(summary.id);
+    if (cached) {
+      setView(cached);
+      return;
+    }
+    setView(null);
     getClient()
       .openMeeting(summary.id)
-      .then((v) => live && setView(v))
+      .then((v) => {
+        openedMeetingCache.set(summary.id, v);
+        if (live) setView(v);
+      })
       .catch(() => live && setFailed(true));
     return () => {
       live = false;
@@ -182,7 +205,7 @@ function MeetingViewer({
           ← Back
         </button>
         <span style={viewerTitle}>{summary.title || "Untitled meeting"}</span>
-        <button onClick={() => onContinue(summary.id)} style={continueBtn}>
+        <button onClick={() => onContinue(summary)} style={continueBtn}>
           Continue in Ask →
         </button>
         {summary.agentSessionId != null && (

@@ -14,6 +14,7 @@
 import { useEffect, useState } from "react";
 import { SegmentedTabs } from "../components/primitives";
 import { useDataStore } from "../lib/dataStore";
+import type { MeetingSummary } from "../lib/types";
 import { MeetingsScreen } from "./MeetingsScreen";
 import { HistoryScreen } from "./HistoryScreen";
 
@@ -34,7 +35,7 @@ export function HistoryTab({
   /** Resume a prior thread of an agent (from the Sessions lens). */
   onResumeSession: (kind: string, sessionId: string) => void;
   /** Continue a past meeting in the Ask screen (from the Meetings lens). */
-  onContinue: (id: string) => void;
+  onContinue: (meeting: MeetingSummary) => void;
 }) {
   const [lens, setLens] = useState<Lens>("Meetings");
 
@@ -96,7 +97,7 @@ function MeetingsLens({
   onContinue,
 }: {
   onResumeAgentThread: (kind: string | undefined, sessionId: string) => void;
-  onContinue: (id: string) => void;
+  onContinue: (meeting: MeetingSummary) => void;
 }) {
   const { revalidateMeetings } = useDataStore();
   useEffect(() => {

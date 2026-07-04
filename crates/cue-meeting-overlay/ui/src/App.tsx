@@ -202,14 +202,26 @@ export function App() {
                 onResumeSession={(kind, sid) =>
                   void attach(kind, sid).then(() => setTab("Ask"))
                 }
-                onContinue={(id) => {
-                  // Continue a past meeting into the ACTIVE slot. On success the
-                  // provider has already (or will shortly) reseed via
+                onContinue={(meeting) => {
+                  // Continue a past meeting into the ACTIVE slot AND re-attach the
+                  // agent thread it used — so continuing restores the FULL context
+                  // (transcript + Q&A via the reseed, AND the agent conversation),
+                  // not just the transcript. On success the provider reseeds via
                   // onMeetingReseed, so switching to Ask shows the continued
-                  // meeting. On blocked, stay on History — the daemon already
-                  // pushed the guidance Warning card (no extra UI needed).
-                  void client.continueMeeting(id).then((r) => {
+                  // meeting. On blocked (a live recording), stay on History — the
+                  // daemon already pushed the guidance Warning card.
+                  void client.continueMeeting(meeting.id).then((r) => {
                     if (r.blocked) return;
+                    // Re-attach the meeting's linked agent thread on the agent it
+                    // ACTUALLY used (kind from the link; fall back to the attached
+                    // agent for legacy links with no kind). No link → just show the
+                    // meeting content.
+                    if (meeting.agentSessionId) {
+                      const resumeKind = meeting.agentKind ?? attached?.kind;
+                      if (resumeKind) {
+                        void attach(resumeKind, meeting.agentSessionId);
+                      }
+                    }
                     setTab("Ask");
                   });
                 }}

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Continue now restores the FULL meeting context, not just the transcript.**
+  "Continue in Ask" re-seeded the transcript + Q&A but never re-attached the
+  meeting's linked agent thread — so the agent conversation was missing. It now
+  also re-attaches the meeting's agent session (on the agent kind the meeting
+  actually used, falling back to the attached agent for legacy links) in the same
+  action.
+- **Opening a past meeting is instant on re-open.** The read-only viewer re-fetched
+  `openMeeting` on every click (round-trip + "Opening…" spinner). Opened views are
+  now cached by id (a past meeting's snapshot is immutable), so re-opening one is
+  instant. (First open still fetches once; the daemon side was already fast —
+  ~32ms to read all meetings.)
+
 ### Added
 - **Continue a past meeting in the Ask screen.** Selecting a past meeting in
   History now offers "Continue in Ask →" — it makes that meeting the ACTIVE one,
