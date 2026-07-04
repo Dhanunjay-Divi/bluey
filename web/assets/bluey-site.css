@@ -631,7 +631,7 @@
       display: flex;
       align-items: center;
       justify-self: end;
-      gap: 1.5rem;
+      gap: 1.55rem;
     }
 
     #productSite .nav-links a,
@@ -658,6 +658,61 @@
     #productSite .nav-links .btn-nav:hover {
       background: #8ff5ff;
       color: #061114;
+    }
+
+    #productSite .theme-toggle {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      width: 58px;
+      height: 30px;
+      padding: 0 4px;
+      border: 1px solid rgba(99, 216, 255, .42);
+      border-radius: 999px;
+      background: rgba(99, 216, 255, .08);
+      box-shadow: inset 0 0 18px rgba(79, 141, 255, .12);
+      cursor: default;
+    }
+
+    #productSite .theme-toggle-knob {
+      position: relative;
+      display: inline-grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, #d7f7ff 0%, var(--bluey-accent) 45%, var(--bluey-accent-2) 100%);
+      box-shadow: 0 0 18px rgba(99, 216, 255, .52);
+    }
+
+    #productSite .theme-toggle-knob::before,
+    #productSite .theme-toggle-knob::after {
+      content: "";
+      position: absolute;
+      border-radius: 999px;
+      background: #061114;
+      opacity: .85;
+    }
+
+    #productSite .theme-toggle-knob::before {
+      width: 4px;
+      height: 4px;
+      box-shadow:
+        0 -7px 0 rgba(6, 17, 20, .82),
+        0 7px 0 rgba(6, 17, 20, .82),
+        7px 0 0 rgba(6, 17, 20, .82),
+        -7px 0 0 rgba(6, 17, 20, .82);
+    }
+
+    #productSite .theme-toggle-knob::after {
+      width: 3px;
+      height: 3px;
+      transform: rotate(45deg);
+      box-shadow:
+        5px 5px 0 rgba(6, 17, 20, .70),
+        -5px -5px 0 rgba(6, 17, 20, .70),
+        5px -5px 0 rgba(6, 17, 20, .70),
+        -5px 5px 0 rgba(6, 17, 20, .70);
     }
 
     #productSite [hidden],
@@ -745,7 +800,7 @@
       grid-template-columns: repeat(2, minmax(145px, 1fr));
       gap: .7rem;
       align-items: stretch;
-      max-width: 335px;
+      max-width: 392px;
       margin-top: 0;
     }
 
@@ -753,11 +808,11 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-height: 46px;
+      min-height: 56px;
       padding: .72rem 1.45rem;
       border-radius: 12px;
-      font-size: .93rem;
-      font-weight: 700;
+      font-size: .98rem;
+      font-weight: 800;
       text-decoration: none;
       letter-spacing: -.01em;
       transition: transform .2s, border-color .2s, background .2s, box-shadow .2s, color .2s;
@@ -793,8 +848,8 @@
     #productSite .join-bar {
       display: flex;
       gap: .5rem;
-      margin-top: 1.2rem;
-      max-width: 320px;
+      margin-top: 1.35rem;
+      max-width: 386px;
     }
 
     #productSite .join-bar input {
@@ -805,10 +860,10 @@
       border: 1px solid rgba(99, 216, 255, .30);
       color: #e0e0e0;
       border-radius: 8px;
-      padding: .6rem 1rem;
+      padding: .7rem 1rem;
       font-size: 1rem;
-      font-family: monospace;
-      letter-spacing: .15em;
+      font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+      letter-spacing: 0;
       text-transform: lowercase;
       outline: none;
       transition: border-color .3s, box-shadow .3s;
@@ -832,8 +887,9 @@
       color: var(--bluey-accent);
       border: 1px solid rgba(99, 216, 255, .30);
       border-radius: 8px;
-      padding: .6rem 1.2rem;
+      padding: .7rem 1.2rem;
       font-size: .9rem;
+      font-weight: 800;
       cursor: pointer;
       transition: all .2s;
     }
@@ -922,17 +978,17 @@
 
     #productSite .footer {
       width: auto;
-      padding: 1.2rem 2.5rem .7rem;
+      padding: 1.55rem 3rem .7rem;
       border-top: 1px solid #111;
       background: transparent;
     }
 
     #productSite .pricing {
       display: grid;
-      grid-template-columns: repeat(2, minmax(260px, 1fr));
-      gap: 1rem;
+      grid-template-columns: repeat(3, minmax(260px, 1fr));
+      gap: 2.5rem;
       align-items: stretch;
-      max-width: 860px;
+      max-width: none;
       margin: 0 auto;
     }
 
@@ -941,8 +997,8 @@
       align-items: flex-start;
       justify-content: space-between;
       gap: 1rem;
-      min-height: 98px;
-      padding: .78rem 1.15rem;
+      min-height: 78px;
+      padding: .9rem 1.45rem;
       border: 1px solid #1a1a1a;
       border-radius: 8px;
       color: #e0e0e0;
@@ -964,8 +1020,8 @@
     }
 
     #productSite .plan-name {
-      font-size: .9rem;
-      font-weight: 600;
+      font-size: 1rem;
+      font-weight: 800;
     }
 
     #productSite .plan-price {
@@ -994,7 +1050,7 @@
 
     #productSite .plan-detail {
       color: #555;
-      font-size: .75rem;
+      font-size: .78rem;
       line-height: 1.35;
     }
 

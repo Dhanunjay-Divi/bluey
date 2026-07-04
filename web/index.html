@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070401"
+    href="/assets/bluey-site.css?v=2026070402"
   >
   <script type="application/ld+json">
   {
@@ -698,6 +698,9 @@
         <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
       </a>
       <div class="nav-links">
+        <button class="theme-toggle" type="button" aria-label="Theme toggle preview" tabindex="-1">
+          <span class="theme-toggle-knob" aria-hidden="true"></span>
+        </button>
         <a href="/download">Download</a>
         <a class="btn-nav" href="/login" data-guest-only>Login</a>
         <a href="/account" data-auth-only hidden>Dashboard</a>
@@ -712,15 +715,15 @@
           <p class="hero-lede">Private AI chat for engineering meetings, code, docs, research, and screen work from your terminal.</p>
           <p class="hero-proof"><span>Install, run, ask.</span> Bluey keeps transcript, screen, files, code, docs, and saved session notes available without switching apps.</p>
           <div class="hero-actions">
-            <a class="btn btn-primary" href="/download">Download Bluey</a>
-            <a class="btn btn-ghost" href="/login">Sign in</a>
+            <a class="btn btn-primary" href="/download">Get Started</a>
+            <a class="btn btn-ghost" href="/login">Try Us</a>
           </div>
           <form class="join-bar" action="/login" method="get">
-            <input name="user_code" type="text" placeholder="Link code" autocomplete="one-time-code" spellcheck="false">
-            <button type="submit">Link</button>
+            <input name="user_code" type="text" placeholder="session code" autocomplete="one-time-code" spellcheck="false">
+            <button type="submit">Join</button>
           </form>
-          <div class="hero-note">native overlay &middot; AI models when needed &middot; prepaid credits for paid work</div>
-          <div class="hero-note">screen, transcript, files, and saved session notes only by choice</div>
+          <div class="hero-note">native overlay &middot; model routing &middot; prepaid credits &middot; saved sessions</div>
+          <div class="hero-note">screen, transcript, files, and session notes only by choice</div>
         </section>
 
         <aside class="product-preview terminal-preview" aria-label="Bluey terminal preview">
@@ -756,6 +759,13 @@
           </div>
           <div class="plan-price"><strong>$30</strong><span>credits</span></div>
         </a>
+        <a href="mailto:hello@bluey.sh" class="plan">
+          <div>
+            <div class="plan-name">Teams</div>
+            <div class="plan-detail">Concierge setup for shared engineering workflows, account support, and team rollout planning.</div>
+          </div>
+          <div class="plan-price"><strong>Contact</strong><span>team</span></div>
+        </a>
       </div>
       <p class="pricing-note">Teams are concierge for now.</p>
       <div class="footer-meta">
@@ -765,7 +775,7 @@
   </main>
 
   <script
-    src="/assets/bluey-site.js?v=2026070401"
+    src="/assets/bluey-site.js?v=2026070402"
   ></script>
 </body>
 </html>
