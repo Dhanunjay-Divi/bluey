@@ -2743,10 +2743,10 @@ fn prompt_with_answer_plan(
             "Answer directly in 1-4 sentences. Do not open with setup unless it prevents confusion."
         }
         AnswerIntent::Coding => {
-            "For first-time coding or algorithm answers, use this exact scan-friendly shape: `Approach`, then `Code`, then `Explanation`, then `Complexity`, then `Edge cases` when useful. Under Approach, give 2-4 clear bullets before the code. Under Code, give complete working code in a fenced code block with a language tag. Use the language implied by the prompt or screen; if none is specified for an interview algorithm prompt, use Python. For Python/LeetCode-style answers, include required imports or avoid type hints that need imports. Put each statement on its own line with correct indentation; never compress class, function, assignments, and return onto one wrapped line. Add concise inline comments for the important decision lines inside the code, but do not comment every trivial line. For LeetCode/interview algorithm prompts, include the full class/function signature, initialization, loop/body, return value, and any sentinel/cleanup step; never provide only the inner loop or a pseudocode fragment. For data-structure interview prompts such as LRU cache, implement from first principles with a hashmap plus doubly linked list unless the user explicitly asks for a library shortcut; mention library helpers only as alternatives after the real implementation. For non-trivial code, add a short `Line notes:` block outside the code fence using `1: ...` or small `2-4: ...` notes for the important executable lines. Keep explanatory notes outside the code so copied code stays clean. Always include Time Complexity and Space Complexity explicitly. Do not give only a summary."
+            "For first-time coding or algorithm answers, use this exact scan-friendly shape: `Approach`, then `Code`, then `Explanation`, then `Complexity`, then `Edge cases` when useful. Under Approach, give 2-4 clear bullets before the code. Under Code, give complete working code in a fenced code block with a language tag. Use the language implied by the prompt or screen; if none is specified for an interview algorithm prompt, use Python. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. For Python/LeetCode-style answers, include required imports or avoid type hints that need imports. Put each statement on its own line with correct indentation; never compress class, function, assignments, and return onto one wrapped line. Add concise inline comments for the important decision lines inside the code, but do not comment every trivial line. For LeetCode/interview algorithm prompts, include the full class/function signature, initialization, loop/body, return value, and any sentinel/cleanup step; never provide only the inner loop or a pseudocode fragment. For data-structure interview prompts such as LRU cache, implement from first principles with a hashmap plus doubly linked list unless the user explicitly asks for a library shortcut; mention library helpers only as alternatives after the real implementation. For non-trivial code, add a short `Line notes:` block outside the code fence using `1: ...` or small `2-4: ...` notes for the important executable lines. Keep explanatory notes outside the code so copied code stays clean. Always include Time Complexity and Space Complexity explicitly. Do not give only a summary."
         }
         AnswerIntent::CodingFollowUp => {
-            "Treat this as a follow-up to existing code when relevant. Preserve the existing artifact unless the user asks for a new one. For requested changes, use `Approach`, then `Patch` or `Changed block`, then `Explanation`, then `Complexity` if the complexity changes. Prefer the smallest safe in-place code change, changed block, or unified diff; do not replace the whole implementation unless the user asks for a full rewrite, the existing code is tiny, or a full replacement is materially safer. If the user asks to regenerate the full solution, include the complete fenced implementation, not only a middle fragment. Put each statement on its own line with correct indentation and add concise inline comments for important decision lines. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
+            "Treat this as a follow-up to existing code when relevant. Preserve the existing artifact unless the user asks for a new one. For requested changes, use `Approach`, then `Patch` or `Changed block`, then `Explanation`, then `Complexity` if the complexity changes. Prefer the smallest safe in-place code change, changed block, or unified diff; do not replace the whole implementation unless the user asks for a full rewrite, the existing code is tiny, or a full replacement is materially safer. If the user asks to regenerate the full solution or asks for the same code in another language, include the complete fenced implementation in that language with the full wrapper/signature, not only a middle fragment. Put each statement on its own line with correct indentation and add concise inline comments for important decision lines. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
         }
         AnswerIntent::Behavioral => {
             "Answer like a polished interview coach and candidate voice: natural, first-person when appropriate, specific, and conversational. Use the supplied resume, JD, documents, transcript, and screen context to infer the role and domain, such as SDE, data engineer, BI engineer, data scientist, DevOps, security, product, or another role. First infer what the interviewer is testing, such as Dive Deep, ownership, technical depth, data quality, system judgment, prioritization, stakeholder communication, or tradeoffs, then make the response prove that signal. For resume-based introductions, self-introductions, or prompts like \"tell me about yourself\", do not compress the resume into one facts paragraph and do not ask the user what kind of long answer they want when the resume/context is already supplied. Use a speakable present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role. For introductions, give the full ready-to-say answer on the first response and aim for a 45-60 second answer unless the user explicitly asks for a shorter version. For role/domain interview questions, give a ready-to-say answer anchored only in the supplied company, project, tools, metrics, constraints, and role expectations; when useful, include a brief why-it-works or if-they-push-back recovery line. Do not defend weak story logic blindly: reframe it in a production-realistic way, such as code ownership, incident debugging, architecture tradeoffs, upstream data, ETL validation, reporting impact, stakeholder communication, or KPI definition. For interview stories, aim for a 45-90 second answer in tight paragraphs, not generic bullets, unless the user asks for notes. Do not invent metrics, employers, tools, source systems, clinical/finance details, latency windows, outcomes, or motivation beyond the supplied resume/JD/context. If exact story detail is missing, say the framing safely with phrases like \"I would frame it as...\" or \"the signal I would emphasize is...\" instead of fabricating a result. Never route resume/self-intro or interview-coaching prompts into system design just because they mention architecture or systems."
@@ -5798,9 +5798,13 @@ fn response_canvas_detail_artifact(text: &str) -> Option<ResponseArtifact> {
         });
     }
     if !code_blocks.is_empty() {
+        let artifact_body = format_code_artifact(body, &code_blocks);
+        if !code_artifact_has_complete_code(&artifact_body) {
+            return None;
+        }
         return Some(ResponseArtifact {
             artifact_type: "code",
-            body: format_code_artifact(body, &code_blocks),
+            body: artifact_body,
             confidence: 0.94,
         });
     }
@@ -5864,9 +5868,13 @@ fn response_artifact(text: &str) -> Option<ResponseArtifact> {
         });
     }
     if !code_blocks.is_empty() {
+        let artifact_body = format_code_artifact(body, &code_blocks);
+        if !code_artifact_has_complete_code(&artifact_body) {
+            return None;
+        }
         return Some(ResponseArtifact {
             artifact_type: "code",
-            body: format_code_artifact(body, &code_blocks),
+            body: artifact_body,
             confidence: 0.95,
         });
     }
@@ -6218,6 +6226,210 @@ fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
     } else {
         sections.join("\n\n")
     }
+}
+
+fn code_artifact_has_complete_code(body: &str) -> bool {
+    let code = extract_code_section_from_canvas(body);
+    let code = code.trim();
+    if code.is_empty() {
+        return false;
+    }
+    if looks_like_patch_or_diff(code) {
+        return true;
+    }
+    if looks_like_control_flow_fragment_without_entrypoint(code) {
+        return false;
+    }
+    looks_like_real_code(code)
+}
+
+fn extract_code_section_from_canvas(body: &str) -> String {
+    let normalized = body.replace("\r\n", "\n");
+    let mut lines = Vec::new();
+    let mut in_code = false;
+    let mut saw_canvas_header = false;
+
+    for line in normalized.lines() {
+        let trimmed = line.trim();
+        let header = trimmed.to_ascii_uppercase();
+        if matches!(
+            header.as_str(),
+            "CODE" | "PATCH" | "DIFF" | "CHANGED BLOCK" | "CHANGED LINES"
+        ) {
+            in_code = true;
+            saw_canvas_header = true;
+            continue;
+        }
+        if matches!(
+            header.as_str(),
+            "LINE NOTES" | "COMPLEXITY" | "TIME" | "SPACE" | "NOTES" | "EXPLANATION" | "APPROACH"
+        ) {
+            if in_code {
+                break;
+            }
+            saw_canvas_header = true;
+            continue;
+        }
+        if trimmed.chars().all(|ch| ch == '-' || ch == '=') {
+            continue;
+        }
+        if in_code {
+            lines.push(line);
+        }
+    }
+
+    if saw_canvas_header {
+        lines.join("\n")
+    } else {
+        normalized
+    }
+}
+
+fn looks_like_real_code(code: &str) -> bool {
+    let lower = code.to_ascii_lowercase();
+    let syntax_signals = [
+        "def ",
+        "fn ",
+        "func ",
+        "function ",
+        "class ",
+        "struct ",
+        "enum ",
+        "return ",
+        "select ",
+        " from ",
+        " where ",
+        " group by",
+        " order by",
+        " join ",
+        "insert ",
+        "update ",
+        "delete ",
+        "#include",
+        "import ",
+        "let ",
+        "var ",
+        "const ",
+        "public ",
+        "private ",
+        "protected ",
+        "static ",
+        "=>",
+        "->",
+        "==",
+        "!=",
+        "<=",
+        ">=",
+        "+=",
+        "-=",
+        ".append(",
+        ".sort(",
+    ];
+    let has_signal = syntax_signals.iter().any(|signal| lower.contains(signal));
+    let has_punctuation = code.contains('{')
+        || code.contains('}')
+        || code.contains(';')
+        || code.contains('=')
+        || code.contains('(') && code.contains(')')
+        || code.contains('[') && code.contains(']');
+    let non_empty_lines = code
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .count();
+
+    has_signal || looks_like_code_assignment(code) || (non_empty_lines >= 2 && has_punctuation)
+}
+
+fn looks_like_code_assignment(code: &str) -> bool {
+    code.lines().map(str::trim).any(|line| {
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('#')
+            || line.starts_with("- ")
+            || line.contains("==")
+            || line.contains("!=")
+            || line.contains("<=")
+            || line.contains(">=")
+        {
+            return false;
+        }
+        line.contains('=')
+            && (line.contains(',')
+                || line.contains('+')
+                || line.contains('-')
+                || line.contains('*')
+                || line.contains('/')
+                || line.contains('.')
+                || line.contains('[')
+                || line.contains('('))
+    })
+}
+
+fn looks_like_patch_or_diff(code: &str) -> bool {
+    let trimmed = code.trim_start();
+    trimmed.starts_with("diff --git")
+        || trimmed.starts_with("@@")
+        || trimmed.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("+ ") || line.starts_with("- ") || line.starts_with("+\t") || line.starts_with("-\t")
+        })
+}
+
+fn looks_like_control_flow_fragment_without_entrypoint(code: &str) -> bool {
+    let lines = code
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("//")
+                && !line.starts_with('#')
+                && !line.starts_with("/*")
+                && !line.starts_with('*')
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = lines.first() else {
+        return false;
+    };
+    let lower_code = code.to_ascii_lowercase();
+    let lower_first = first.to_ascii_lowercase();
+    let has_entrypoint = [
+        "def ",
+        "class ",
+        "function ",
+        "fn ",
+        "func ",
+        "public ",
+        "private ",
+        "protected ",
+        "static ",
+        "int main",
+        "bool ",
+        "boolean ",
+        "void ",
+        "const ",
+        "let ",
+        "var ",
+        "=>",
+    ]
+    .iter()
+    .any(|signal| lower_code.contains(signal));
+    let starts_with_control_flow = [
+        "for ",
+        "for(",
+        "while ",
+        "while(",
+        "if ",
+        "if(",
+        "else",
+        "switch ",
+        "switch(",
+        "case ",
+    ]
+    .iter()
+    .any(|signal| lower_first.starts_with(signal));
+
+    starts_with_control_flow && !has_entrypoint
 }
 
 fn split_line_notes(notes: &str) -> (Option<String>, String) {
@@ -7508,6 +7720,30 @@ mod tests {
             artifact.is_none(),
             "loose inner loops should not become code canvas artifacts"
         );
+    }
+
+    #[test]
+    fn response_artifact_rejects_fenced_inner_loop_fragment() {
+        let artifact = response_artifact(
+            "Approach\nTrack net displacement.\n\n```cpp\nfor (char move : moves) {\n    if (move == 'U') {\n        y++;\n    } else if (move == 'D') {\n        y--;\n    } else if (move == 'L') {\n        x--;\n    } else if (move == 'R') {\n        x++;\n    }\n}\n```\n\nComplexity\nTime Complexity: O(N)",
+        );
+
+        assert!(
+            artifact.is_none(),
+            "fenced inner loops should not become code canvas artifacts"
+        );
+    }
+
+    #[test]
+    fn response_artifact_keeps_complete_robot_return_code() {
+        let artifact = response_artifact(
+            "Approach\nTrack net displacement.\n\n```cpp\nclass Solution {\npublic:\n    bool judgeCircle(string moves) {\n        int x = 0;\n        int y = 0;\n        for (char move : moves) {\n            if (move == 'U') y++;\n            else if (move == 'D') y--;\n            else if (move == 'L') x--;\n            else if (move == 'R') x++;\n        }\n        return x == 0 && y == 0;\n    }\n};\n```\n\nComplexity\nTime Complexity: O(N)",
+        )
+        .expect("complete code artifact");
+
+        assert_eq!(artifact.artifact_type, "code");
+        assert!(artifact.body.contains("class Solution"));
+        assert!(artifact.body.contains("judgeCircle"));
     }
 
     #[test]

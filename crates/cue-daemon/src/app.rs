@@ -8159,6 +8159,9 @@ fn code_canvas_has_real_code(body: &str) -> bool {
     if code.is_empty() {
         return false;
     }
+    if looks_like_control_flow_fragment_without_entrypoint(code) {
+        return false;
+    }
 
     let lower = code.to_ascii_lowercase();
     let non_empty_lines = code
@@ -8224,6 +8227,53 @@ fn code_canvas_has_real_code(body: &str) -> bool {
     has_signal
         || looks_like_code_assignment(code)
         || (non_empty_lines.len() >= 2 && has_punctuation)
+}
+
+fn looks_like_control_flow_fragment_without_entrypoint(code: &str) -> bool {
+    let lines = code
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with("//")
+                && !line.starts_with('#')
+                && !line.starts_with("/*")
+                && !line.starts_with('*')
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = lines.first() else {
+        return false;
+    };
+    let lower_code = code.to_ascii_lowercase();
+    let lower_first = first.to_ascii_lowercase();
+    let has_entrypoint = [
+        "def ",
+        "class ",
+        "function ",
+        "fn ",
+        "func ",
+        "public ",
+        "private ",
+        "protected ",
+        "static ",
+        "int main",
+        "bool ",
+        "boolean ",
+        "void ",
+        "const ",
+        "let ",
+        "var ",
+        "=>",
+    ]
+    .iter()
+    .any(|signal| lower_code.contains(signal));
+    let starts_with_control_flow = [
+        "for ", "for(", "while ", "while(", "if ", "if(", "else", "switch ", "switch(", "case ",
+    ]
+    .iter()
+    .any(|signal| lower_first.starts_with(signal));
+
+    starts_with_control_flow && !has_entrypoint
 }
 
 fn looks_like_code_assignment(code: &str) -> bool {
@@ -10896,7 +10946,7 @@ fn answer_request_from_overlay(
 fn mode_instructions(mode: &str) -> String {
     match mode.trim().to_ascii_lowercase().as_str() {
         "code" => {
-            "Answer in Code mode. For first-time implementation or algorithm requests, use Approach, Code, Explanation, Complexity, and Edge cases. For change requests, use Approach, Patch or Changed block, Explanation, and Complexity if it changed. If the user explicitly asks for code, a program, implementation, or says they want code in a language, include a complete fenced code block with a language tag; for small standalone tasks, include the full runnable snippet directly in chat. In code blocks, put each statement on its own line with correct indentation; never compress class, function, assignments, and return onto one wrapped line. For Python/LeetCode-style answers, include required imports or avoid type hints that need imports. For algorithm/interview prompts, include the full class/function signature, initialization, loop/body, return value, and sentinel or cleanup step; never show only the inner loop as the code artifact. Add concise inline comments for important decision lines inside non-trivial code, but do not comment every trivial line. Add `Line notes:` outside the code fence with numbered line or small-range explanations so the copied code stays clean. Always include Time Complexity and Space Complexity explicitly. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. Preserve the existing implementation by default: show the smallest safe changed block, PATCH, or unified diff, and name exactly where it belongs. Only provide a full replacement when the user asks for it, the file is new/tiny, or the surrounding code is too small for a safe patch. For explanation-only questions, skip Patch and teach the logic step by step: core idea, data structures, operation walkthrough, invariant, complexity, and edge cases. Keep commentary practical and avoid unrelated theory.".to_string()
+            "Answer in Code mode. For first-time implementation or algorithm requests, use Approach, Code, Explanation, Complexity, and Edge cases. For change requests, use Approach, Patch or Changed block, Explanation, and Complexity if it changed. If the user explicitly asks for code, a program, implementation, or says they want code in a language, include a complete fenced code block with a language tag; for small standalone tasks, include the full runnable snippet directly in chat. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. In code blocks, put each statement on its own line with correct indentation; never compress class, function, assignments, and return onto one wrapped line. For Python/LeetCode-style answers, include required imports or avoid type hints that need imports. For algorithm/interview prompts, include the full class/function signature, initialization, loop/body, return value, and sentinel or cleanup step; never show only the inner loop as the code artifact. Add concise inline comments for important decision lines inside non-trivial code, but do not comment every trivial line. Add `Line notes:` outside the code fence with numbered line or small-range explanations so the copied code stays clean. Always include Time Complexity and Space Complexity explicitly. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. Preserve the existing implementation by default: show the smallest safe changed block, PATCH, or unified diff, and name exactly where it belongs. Only provide a full replacement when the user asks for it, the file is new/tiny, or the surrounding code is too small for a safe patch. For explanation-only questions, skip Patch and teach the logic step by step: core idea, data structures, operation walkthrough, invariant, complexity, and edge cases. Keep commentary practical and avoid unrelated theory.".to_string()
         }
         "system design" | "system-design" | "design" => {
             "Answer in System Design mode. Keep chat to the short recommendation, assumptions, and key tradeoff. Put deeper workbench detail under `### Architecture`, `### Components`, `### Data flow`, `### APIs / contracts`, `### Storage`, `### Scaling`, `### Tradeoffs`, `### Failure modes`, `### Observability`, and `### Rollout / next steps` when useful. Prefer concrete services, storage choices, queues, cache boundaries, APIs, capacity assumptions, and failure modes. Use compact bullets and simple text diagrams when useful. For follow-ups, answer low-level explanation in chat unless the user asks to change the design; then update only the affected section unless a full redesign is requested.".to_string()
@@ -10908,7 +10958,7 @@ fn mode_instructions(mode: &str) -> String {
             "Answer in Writing mode. Produce polished copy first, then a short `### Notes` section explaining tone, edits, and optional variants. Keep the draft easy to reuse.".to_string()
         }
         _ => {
-            "Answer in General mode. Auto-detect the task type. Put the direct answer first, then concise context, reasoning, and next steps. If the question asks to explain code, an algorithm, or logic, teach it step by step in plain language and avoid a Patch section unless the user asks for code changes. If the question asks for implementation, debugging, APIs, config, terminal commands, or explicitly asks for code in a language, preserve existing code by default. For first-time code, use Approach, Code, Explanation, Complexity, and Edge cases. For follow-up changes, use Approach, Patch or Changed block, Explanation, and Complexity if it changed. Explicit code requests must include a complete fenced code block with a language tag; for small standalone tasks, include the full runnable snippet directly in chat. Code blocks must keep each statement on its own line with correct indentation, and non-trivial code should include concise inline comments on important decision lines. Algorithm/interview code answers must include the full class/function signature and return path, not only the inner loop, and should include `Line notes:` outside the code fence for non-trivial code. Always include Time Complexity and Space Complexity for algorithm/code answers. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. For follow-up code changes, prefer a small changed block, PATCH, or unified diff over full replacement. Keep it practical and easy to scan in a small overlay.".to_string()
+            "Answer in General mode. Auto-detect the task type. Put the direct answer first, then concise context, reasoning, and next steps. If the question asks to explain code, an algorithm, or logic, teach it step by step in plain language and avoid a Patch section unless the user asks for code changes. If the question asks for implementation, debugging, APIs, config, terminal commands, or explicitly asks for code in a language, preserve existing code by default. For first-time code, use Approach, Code, Explanation, Complexity, and Edge cases. For follow-up changes, use Approach, Patch or Changed block, Explanation, and Complexity if it changed. Explicit code requests must include a complete fenced code block with a language tag; for small standalone tasks, include the full runnable snippet directly in chat. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. Code blocks must keep each statement on its own line with correct indentation, and non-trivial code should include concise inline comments on important decision lines. Algorithm/interview code answers must include the full class/function signature and return path, not only the inner loop, and should include `Line notes:` outside the code fence for non-trivial code. Always include Time Complexity and Space Complexity for algorithm/code answers. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. For follow-up code changes, prefer a small changed block, PATCH, or unified diff over full replacement. Keep it practical and easy to scan in a small overlay.".to_string()
         }
     }
 }
@@ -17086,6 +17136,18 @@ mod tests {
         assert!(artifact.body.contains("Time Complexity: O(n)"));
         assert!(artifact.body.contains("NOTES\n-----"));
         assert!(artifact.body.contains("Use a hash map."));
+    }
+
+    #[test]
+    fn answer_overlay_artifact_rejects_fenced_inner_loop_fragment() {
+        let artifact = answer_overlay_artifact(
+            "Track net displacement.\n```cpp\nfor (char move : moves) {\n    if (move == 'U') {\n        y++;\n    } else if (move == 'D') {\n        y--;\n    } else if (move == 'L') {\n        x--;\n    } else if (move == 'R') {\n        x++;\n    }\n}\n```\nTime Complexity: O(n)",
+        );
+
+        assert!(
+            artifact.is_none(),
+            "fenced inner loops should not become code canvas artifacts"
+        );
     }
 
     #[test]

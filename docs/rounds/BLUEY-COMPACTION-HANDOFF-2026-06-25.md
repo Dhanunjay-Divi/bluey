@@ -5828,3 +5828,67 @@ Deployment status:
 - `https://bluey.sh/health` reports commit `e43fcec9ccc314ca217eef36df692b154a9e103e`.
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no lines.
+
+## Latest Round 339: Complete Code Artifact Guard
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-339-COMPLETE-CODE-ARTIFACT-GUARD.md`
+
+Trigger:
+
+- The owner showed a coding response where the code canvas contained only an inner C++ loop for a screen-derived algorithm answer.
+- A follow-up asking for the same code in Python risked preserving or regenerating an incomplete artifact instead of a full implementation.
+
+What changed:
+
+- Server artifact extraction now rejects top-level control-flow fragments that lack a wrapper/signature.
+- Shared daemon fallback artifact extraction applies the same guard.
+- Prompt instructions now explicitly require complete code when the user asks for the same code in another language.
+- Complete robot-return-to-origin style `class Solution` code remains accepted.
+- Patch/diff artifacts remain accepted for follow-up edits.
+- Desktop workspace version bumped to `0.1.78`.
+
+Verification so far:
+
+```bash
+cargo fmt --check
+cargo test --manifest-path server/Cargo.toml response_artifact_ --lib -- --nocapture
+cargo test --manifest-path server/Cargo.toml answer_plan_code_request_uses_deep_code_artifact --lib -- --nocapture
+cargo test --manifest-path server/Cargo.toml answer_plan_python --lib -- --nocapture
+cargo test --manifest-path server/Cargo.toml answer_plan_java --lib -- --nocapture
+cargo test --manifest-path server/Cargo.toml answer_plan_leetcode_statement_uses_deep_code_artifact --lib -- --nocapture
+cargo test -p cue-daemon answer_overlay_artifact_ -- --nocapture
+cargo test -p cue-daemon mode_instructions_specialize_default_answer_shapes -- --nocapture
+cargo check --manifest-path server/Cargo.toml --bin bluey-server
+cargo check -p cue-daemon -p cue-cli
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.78
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+```
+
+Deployment status:
+
+- Desktop release `0.1.78` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.78/bluey-0.1.78-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `3418bf8ae4f66fd3864fd6de2be08a461e985a98fab39ca85fda6440edf21aad`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.78`
+- Public installer smoke installed `0.1.78` locally and both installed binaries report `0.1.78`.
+- API deploy status: pending committed-source server rollout in the same round.
