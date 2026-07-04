@@ -13,6 +13,7 @@ import type {
   AgentSummary,
   AnswerChunk,
   AskOptions,
+  ContinueResult,
   ListeningState,
   MeetingState,
   MeetingSummary,
@@ -67,6 +68,19 @@ export interface MeetingClient {
    *  the daemon serves a pure read and sets `readOnly` true whenever a live or
    *  different active meeting would otherwise be clobbered. */
   openMeeting(id: string): Promise<MeetingViewState>;
+  /** Continue a past meeting: make it the ACTIVE meeting so the Ask screen
+   *  resumes in it. The daemon archives the current (idle) active meeting and
+   *  activates the target, then pushes the active-rehydrate set_meeting_state
+   *  that MeetingProvider reseeds from. BLOCKED (resolves { blocked:true }) when
+   *  a recording is live and the target differs — the live meeting is untouched
+   *  and a guidance card is shown. Resolves { ok:true } once activation is
+   *  confirmed. */
+  continueMeeting(id: string): Promise<ContinueResult>;
+  /** Subscribe to daemon-pushed ACTIVE meeting-state reseeds (meeting_id
+   *  absent) — emitted when a past meeting is continued into the active slot.
+   *  Returns an unsubscribe fn. Read-only VIEW replies (meeting_id present)
+   *  are NOT delivered here. */
+  onMeetingReseed(cb: (state: MeetingState) => void): () => void;
 
   // ---- the live loop ----
   /** Subscribe to live transcript lines; returns an unsubscribe fn. */

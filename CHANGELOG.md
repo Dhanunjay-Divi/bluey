@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Continue a past meeting in the Ask screen.** Selecting a past meeting in
+  History now offers "Continue in Ask →" — it makes that meeting the ACTIVE one,
+  so the Ask screen shows its transcript + Q&A and new questions continue within
+  it (was: past meetings could only be viewed read-only in the History tab, and
+  the Ask screen was stuck on the live meeting). SAFETY: a live recording is never
+  lost — the daemon detects an in-progress recording across BOTH audio paths
+  (`audio_runtime` REST/cloud AND `system_audio` the default keyless streaming)
+  and BLOCKS the switch with guidance ("stop listening first") when audio is
+  capturing and the target differs; only an idle active meeting is archived (ended
+  + recap + saved) before activating the selected one. The read-only viewer stays
+  as an additive alternative. Backed by a pure `continue_decision` function with a
+  machine-checked test proving a live recording can never enter the archive path.
+
 ### Fixed
 - **Overlay History/Agents screens left dead space at the bottom** and
   double-scrolled: the list roots hardcoded `maxHeight: 480` and App's tab body

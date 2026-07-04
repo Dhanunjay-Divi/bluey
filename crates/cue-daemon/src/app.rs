@@ -2512,6 +2512,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::MeetingOpenRequested { id } => {
             handle_meeting_open_requested(daemon, id).await;
         }
+        OverlayEvent::MeetingContinueRequested { id } => {
+            handle_meeting_continue_requested(daemon, id).await;
+        }
         OverlayEvent::ConnectorReauthRequested { kind, name } => {
             handle_connector_reauth_requested(daemon, &kind, &name).await;
         }
@@ -3564,6 +3567,24 @@ fn meeting_open_read_only(live: bool, active_id: Option<uuid::Uuid>) -> bool {
     live || active_id.is_some()
 }
 
+/// Is audio PHYSICALLY capturing right now? This is THE liveness signal that
+/// guards the "never lose a live recording" invariant, and it must observe BOTH
+/// capture paths because they store their handles in DIFFERENT slots:
+///
+/// - `audio_runtime.stop` — the REST/cloud capture path.
+/// - `system_audio` — the DEFAULT on-device system-audio streaming path (overlay
+///   Listen button, keyless `ListenStart`, `PickSystemAudioRequested`, auto-start).
+///
+/// `stop_audio_capture` tears down BOTH, so both are equally authoritative live
+/// signals. Reading only one under-detects an active recording on the primary
+/// keyless path — the exact miss that would let a live meeting be archived. Each
+/// slot is read under its own scoped guard, dropped before returning.
+async fn audio_is_live(daemon: &Arc<Daemon>) -> bool {
+    let runtime_live = { daemon.audio_runtime.lock().await.stop.is_some() };
+    let system_live = { daemon.system_audio.lock().await.is_some() };
+    runtime_live || system_live
+}
+
 /// Open (VIEW) one past meeting by id: reply with a read-only
 /// [`OverlayCommand::SetMeetingState`] snapshot carrying `meeting_id`.
 ///
@@ -3575,9 +3596,10 @@ fn meeting_open_read_only(live: bool, active_id: Option<uuid::Uuid>) -> bool {
 /// viewed meeting to active is descoped for v1, so read_only=false is still
 /// snapshot-only.)
 async fn handle_meeting_open_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) {
-    // (a) audio physically capturing, and (b) whether a meeting is active — both
-    // liveness facts. Take each lock, read, drop the guard before the next await.
-    let live = { daemon.audio_runtime.lock().await.stop.is_some() };
+    // (a) audio physically capturing (BOTH capture paths), and (b) whether a
+    // meeting is active — both liveness facts. Each lock is scoped inside the
+    // helper / expression and dropped before the next await.
+    let live = audio_is_live(daemon).await;
     let active_id = { daemon.meeting.lock().await.as_ref().map(|m| m.id) };
     let read_only = meeting_open_read_only(live, active_id);
 
@@ -3625,6 +3647,209 @@ async fn handle_meeting_open_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) {
                     conversation: Vec::new(),
                     meeting_id: Some(id.to_string()),
                     read_only: true,
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// The decision for a continue request, computed from the two liveness facts
+/// and the target id. Pure + total so the safety rule is directly testable.
+#[derive(Debug, PartialEq, Eq)]
+enum ContinueDecision {
+    Blocked,
+    ReseedActive,
+    Switch,
+}
+
+/// `live` = audio physically capturing; `active_id` = current active meeting id.
+/// Blocked ONLY when live AND switching to a DIFFERENT meeting (a live recording
+/// must never be archived/replaced). Same-meeting is always a no-mutation reseed
+/// (even while live). Otherwise a safe Switch.
+///
+/// Order matters: the same-target check comes FIRST so continuing the active
+/// meeting while live is `ReseedActive`, not `Blocked`.
+fn continue_decision(
+    live: bool,
+    active_id: Option<uuid::Uuid>,
+    target: uuid::Uuid,
+) -> ContinueDecision {
+    match active_id {
+        Some(a) if a == target => ContinueDecision::ReseedActive,
+        _ if live => ContinueDecision::Blocked,
+        _ => ContinueDecision::Switch,
+    }
+}
+
+/// CONTINUE (activate) a past meeting so the Ask screen resumes in it.
+///
+/// SAFETY (the #1 invariant — a live recording is NEVER lost): we read the two
+/// liveness facts (`live` = audio physically capturing, `active_id` = current
+/// active meeting) FIRST, then route through the pure [`continue_decision`]. The
+/// ONLY branch that archives/replaces `daemon.meeting` is `Switch`, and `Switch`
+/// is UNREACHABLE whenever `live && target != active_id` (that combination is
+/// `Blocked`, which performs ZERO mutation — no take, no archive, no ledger
+/// clear, no state write). Continuing the already-active meeting is
+/// `ReseedActive`, also zero-mutation, allowed even while live.
+///
+/// Every `daemon.meeting` / `daemon.audio_runtime` lock is scoped and the guard
+/// dropped before any `.await`, store call, or archive — no lock is held across
+/// an await.
+async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) {
+    // (1) audio physically capturing? Observes BOTH capture paths
+    // (`audio_runtime.stop` for REST/cloud, `system_audio` for the default
+    // on-device streaming path) so a keyless overlay recording is never
+    // mis-classified as idle. Scoped reads, guards dropped immediately.
+    let live = audio_is_live(daemon).await;
+    // (2) current active meeting id (if any). Scoped read, guard dropped.
+    let active_id = { daemon.meeting.lock().await.as_ref().map(|m| m.id) };
+
+    match continue_decision(live, active_id, id) {
+        ContinueDecision::Blocked => {
+            // A live recording is in progress and the user asked to switch to a
+            // DIFFERENT meeting. ZERO mutation: guide the user and resolve the
+            // request-promise as blocked (a past-VIEW-shaped reply the
+            // active-rehydrate picker can never mistake for a success reseed).
+            let card = CueCard::new(
+                CardKind::Warning,
+                "Meeting still recording",
+                "Stop listening before switching to another meeting.",
+            );
+            let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::SetMeetingState {
+                    transcript: Vec::new(),
+                    conversation: Vec::new(),
+                    meeting_id: Some(id.to_string()),
+                    read_only: true,
+                },
+            )
+            .await;
+        }
+        ContinueDecision::ReseedActive => {
+            // target == active: no switch. Re-emit the ACTIVE snapshot exactly
+            // like `handle_meeting_state_requested`. No archive.
+            let (transcript, conversation) = {
+                let guard = daemon.meeting.lock().await;
+                match guard.as_ref() {
+                    Some(meeting) => (
+                        meeting
+                            .transcript
+                            .iter()
+                            .filter(|segment| segment.is_final)
+                            .map(to_wire_line)
+                            .collect(),
+                        meeting.conversation.iter().map(to_wire_turn).collect(),
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                }
+            };
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::SetMeetingState {
+                    transcript,
+                    conversation,
+                    meeting_id: None,
+                    read_only: false,
+                },
+            )
+            .await;
+        }
+        ContinueDecision::Switch => {
+            // SAFE (not live, or no active meeting): archive the current active
+            // meeting (if any) then activate the target.
+            //
+            // (a) Archive — mirror the MeetingEnd handler. Scoped take clears the
+            // active slot; a failed archive only loses the recap file (acceptable
+            // vs. blocking the switch), so we log and continue.
+            let old = {
+                let mut guard = daemon.meeting.lock().await;
+                guard.take()
+            };
+            if let Some(mut meeting) = old {
+                meeting.ended_at = Some(clock::now_epoch_ms_string());
+                let recap = generate_recap(&meeting);
+                meeting.summary = Some(recap.summary.clone());
+                if let Err(error) = daemon.store.archive(&meeting) {
+                    warn!(meeting_id = %meeting.id, error = %error,
+                        "continue: failed to archive outgoing active meeting");
+                }
+                *daemon.ledger.lock().await = cue_core::LedgerState::default();
+            }
+
+            // (b) Load the target. A missing/failed target leaves state clean (the
+            // old meeting is already archived; we simply end with no active
+            // meeting). The reply's meeting_id:Some + read_only:true tells the UI
+            // it did NOT become active, so the frontend does not switch to Ask.
+            let record = match daemon.store.load_by_id(id) {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    warn!(meeting_id = %id, "continue: target meeting not found");
+                    let _ = send_overlay(
+                        daemon,
+                        OverlayCommand::SetMeetingState {
+                            transcript: Vec::new(),
+                            conversation: Vec::new(),
+                            meeting_id: Some(id.to_string()),
+                            read_only: true,
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    warn!(meeting_id = %id, error = %error,
+                        "continue: failed to load target meeting");
+                    let _ = send_overlay(
+                        daemon,
+                        OverlayCommand::SetMeetingState {
+                            transcript: Vec::new(),
+                            conversation: Vec::new(),
+                            meeting_id: Some(id.to_string()),
+                            read_only: true,
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            // (c) Activate the target. Scoped write, guard dropped.
+            {
+                let mut guard = daemon.meeting.lock().await;
+                *guard = Some(record.clone());
+            }
+            // Persist so a later restart rehydrates the now-active meeting
+            // (mirrors TranscriptAdd's save_active).
+            if let Err(error) = daemon.store.save_active(&record) {
+                warn!(meeting_id = %record.id, error = %error,
+                    "continue: failed to persist activated meeting");
+            }
+
+            // (d) Overlay state: InMeeting + counts + write_state.
+            if let Err(error) = update_state_from_meeting(daemon, Some(&record)).await {
+                warn!(meeting_id = %record.id, error = %error,
+                    "continue: failed to update overlay state for activated meeting");
+            }
+
+            // (e) The ACTIVE reseed — byte-identical to the active-rehydrate
+            // SetMeetingState so MeetingProvider reseeds the Ask screen.
+            let transcript = record
+                .transcript
+                .iter()
+                .filter(|segment| segment.is_final)
+                .map(to_wire_line)
+                .collect();
+            let conversation = record.conversation.iter().map(to_wire_turn).collect();
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::SetMeetingState {
+                    transcript,
+                    conversation,
+                    meeting_id: None,
+                    read_only: false,
                 },
             )
             .await;
@@ -13951,6 +14176,178 @@ mod tests {
         let (transcript, conversation) = snapshot_meeting(None);
         assert!(transcript.is_empty());
         assert!(conversation.is_empty());
+    }
+
+    #[test]
+    fn continue_when_live_and_different_target_is_blocked() {
+        // THE safety invariant, machine-checked: a live recording + a request to
+        // switch to a DIFFERENT meeting can NEVER reach the archive (Switch) path.
+        let active = uuid::Uuid::from_u128(1);
+        let target = uuid::Uuid::from_u128(2);
+        assert_eq!(
+            continue_decision(true, Some(active), target),
+            ContinueDecision::Blocked
+        );
+    }
+
+    #[test]
+    fn continue_when_live_and_same_target_reseeds_not_blocked() {
+        // Continuing the ALREADY-active meeting while live is a no-mutation
+        // reseed, never blocked (no switch happens).
+        let active = uuid::Uuid::from_u128(1);
+        assert_eq!(
+            continue_decision(true, Some(active), active),
+            ContinueDecision::ReseedActive
+        );
+    }
+
+    #[test]
+    fn continue_when_idle_switches() {
+        let active = uuid::Uuid::from_u128(1);
+        let target = uuid::Uuid::from_u128(2);
+        // Idle with a different active meeting → safe switch (archive + activate).
+        assert_eq!(
+            continue_decision(false, Some(active), target),
+            ContinueDecision::Switch
+        );
+        // Idle with no active meeting → safe switch (nothing to archive).
+        assert_eq!(
+            continue_decision(false, None, target),
+            ContinueDecision::Switch
+        );
+    }
+
+    #[test]
+    fn continue_same_active_is_reseed_when_idle() {
+        let active = uuid::Uuid::from_u128(1);
+        assert_eq!(
+            continue_decision(false, Some(active), active),
+            ContinueDecision::ReseedActive
+        );
+    }
+
+    #[test]
+    fn continue_switch_snapshot_maps_target_record() {
+        // The Switch branch reseeds the Ask screen from the freshly-activated
+        // target record using the SAME mappers as the active rehydrate. Assert the
+        // target maps to the final-filtered transcript + conversation the handler
+        // sends. (The archive-file + daemon.meeting mutation needs a full Daemon
+        // and is covered structurally by the decision test above — Blocked never
+        // reaches this Switch mapping.)
+        let mut target = MeetingRecord::new(Some("Continue".to_string()));
+        target
+            .transcript
+            .push(TranscriptSegment::new(Speaker::System, "partial", false));
+        target
+            .transcript
+            .push(TranscriptSegment::new(Speaker::System, "they spoke", true));
+        target
+            .transcript
+            .push(TranscriptSegment::new(Speaker::User, "you spoke", true));
+        target.push_conversation_turn(ConversationTurn::new(
+            "resume?",
+            "yes",
+            Some("overlay ask".to_string()),
+            Some("Bluey managed".to_string()),
+        ));
+
+        let (transcript, conversation) = snapshot_meeting(Some(&target));
+        assert_eq!(transcript.len(), 2, "non-final segment must be dropped");
+        assert_eq!(transcript[0].text, "they spoke");
+        assert_eq!(transcript[1].text, "you spoke");
+        assert_eq!(conversation.len(), 1);
+        assert_eq!(conversation[0].question, "resume?");
+    }
+
+    #[test]
+    fn continue_unknown_target_yields_empty_snapshot() {
+        // The graceful unknown-id reply carries empty vecs (mirrors the handler's
+        // Ok(None) / Err path that leaves state clean and does not switch to Ask).
+        let (transcript, conversation) = snapshot_meeting(None);
+        assert!(transcript.is_empty());
+        assert!(conversation.is_empty());
+    }
+
+    /// A scratch [`MeetingStore`] rooted in a unique temp dir, plus the temp base
+    /// (returned so the caller keeps it alive and can clean it up). Lets us drive
+    /// the exact store sequence the Switch branch performs without standing up a
+    /// full `Daemon`.
+    fn temp_store() -> (MeetingStore, std::path::PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("bluey-continue-switch-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+        paths.ensure().expect("ensure paths");
+        let store = MeetingStore::new(&paths).expect("build store");
+        (store, base)
+    }
+
+    #[test]
+    fn continue_switch_archives_outgoing_and_activates_target() {
+        // End-to-end proof of the Switch mutation contract against a REAL store
+        // (the piece the pure decision test cannot cover): the OUTGOING active
+        // meeting is archived (with ended_at + recap summary stamped, mirroring
+        // the handler) AND the TARGET becomes the active meeting.
+        let (store, base) = temp_store();
+
+        // The target lives in the archive (a past meeting the user picked).
+        let mut target = MeetingRecord::new(Some("Target".to_string()));
+        target
+            .transcript
+            .push(TranscriptSegment::new(Speaker::System, "resume me", true));
+        store.archive(&target).expect("seed target in archive");
+
+        // The outgoing active meeting is currently the active slot.
+        let mut outgoing = MeetingRecord::new(Some("Outgoing".to_string()));
+        outgoing.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            "still live content",
+            true,
+        ));
+        store.save_active(&outgoing).expect("seed active");
+
+        // Drive the Switch branch's store sequence exactly:
+        //   (a) stamp + archive the outgoing active meeting,
+        outgoing.ended_at = Some(clock::now_epoch_ms_string());
+        let recap = generate_recap(&outgoing);
+        outgoing.summary = Some(recap.summary.clone());
+        store.archive(&outgoing).expect("archive outgoing");
+        //   (b) load the target, then activate it.
+        let loaded = store
+            .load_by_id(target.id)
+            .expect("load target")
+            .expect("target present");
+        store.save_active(&loaded).expect("activate target");
+
+        // The TARGET is now the active meeting.
+        let active = store
+            .load_active()
+            .expect("read active")
+            .expect("active set");
+        assert_eq!(active.id, target.id, "target became active");
+
+        // The OUTGOING meeting is archived with ended_at + summary stamped and is
+        // no longer the active meeting.
+        let archived = store
+            .load_by_id(outgoing.id)
+            .expect("load outgoing")
+            .expect("outgoing archived");
+        assert_eq!(archived.id, outgoing.id);
+        assert!(archived.ended_at.is_some(), "outgoing stamped ended_at");
+        assert_eq!(
+            archived.summary,
+            Some(recap.summary),
+            "outgoing stamped recap summary"
+        );
+        assert_ne!(active.id, outgoing.id, "outgoing is no longer active");
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

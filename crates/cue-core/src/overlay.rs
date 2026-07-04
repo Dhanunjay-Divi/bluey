@@ -487,6 +487,14 @@ pub enum OverlayEvent {
     MeetingOpenRequested {
         id: uuid::Uuid,
     },
+    /// UI asked to CONTINUE (activate) a past meeting so the Ask screen resumes
+    /// in it. Unlike MeetingOpenRequested (pure read-only VIEW), this MUTATES the
+    /// active meeting — but only when SAFE. The daemon BLOCKS when audio is live
+    /// and the target differs from the active meeting (a live recording is never
+    /// lost). See the daemon handler for the safety-critical control flow.
+    MeetingContinueRequested {
+        id: uuid::Uuid,
+    },
     /// UI asked to re-authenticate one hosted-OAuth connector. For now this
     /// only logs and re-emits guidance; the real OAuth flow is future work.
     ConnectorReauthRequested {
@@ -1270,5 +1278,24 @@ mod tests {
         );
         let decoded: OverlayEvent = serde_json::from_str(&json).expect("decode");
         assert_eq!(serde_json::to_string(&decoded).expect("re-serialize"), json);
+    }
+
+    #[test]
+    fn meeting_continue_requested_round_trips() {
+        let id = uuid::Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
+        let event = OverlayEvent::MeetingContinueRequested { id };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(
+            json.contains("meeting_continue_requested"),
+            "tag present: {json}"
+        );
+        assert!(json.contains(&id.to_string()), "id present: {json}");
+        let decoded: OverlayEvent = serde_json::from_str(&json).expect("decode");
+        match decoded {
+            OverlayEvent::MeetingContinueRequested { id: decoded_id } => {
+                assert_eq!(decoded_id, id);
+            }
+            other => panic!("expected meeting_continue_requested, got {other:?}"),
+        }
     }
 }

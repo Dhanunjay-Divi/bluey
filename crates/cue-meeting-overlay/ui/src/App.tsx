@@ -202,6 +202,17 @@ export function App() {
                 onResumeSession={(kind, sid) =>
                   void attach(kind, sid).then(() => setTab("Ask"))
                 }
+                onContinue={(id) => {
+                  // Continue a past meeting into the ACTIVE slot. On success the
+                  // provider has already (or will shortly) reseed via
+                  // onMeetingReseed, so switching to Ask shows the continued
+                  // meeting. On blocked, stay on History — the daemon already
+                  // pushed the guidance Warning card (no extra UI needed).
+                  void client.continueMeeting(id).then((r) => {
+                    if (r.blocked) return;
+                    setTab("Ask");
+                  });
+                }}
               />
             )}
             {tab === "Agents" && (

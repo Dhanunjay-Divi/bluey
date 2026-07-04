@@ -116,6 +116,14 @@ export interface MeetingSummary {
   agentKind?: string;
 }
 
+/** Result of continuing a past meeting. `blocked` is true when a live
+ *  recording prevented the switch (the daemon kept recording and pushed a
+ *  guidance card); the caller must NOT switch to Ask in that case. */
+export interface ContinueResult {
+  ok: boolean;
+  blocked: boolean;
+}
+
 /** The read-only view of a PAST meeting opened from the MEETINGS lens: the same
  *  transcript + Q&A as a live {@link MeetingState}, plus the meeting id it
  *  belongs to and whether the daemon served it read-only (true whenever opening

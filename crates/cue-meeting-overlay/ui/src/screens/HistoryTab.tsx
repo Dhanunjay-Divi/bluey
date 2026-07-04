@@ -24,6 +24,7 @@ export function HistoryTab({
   attachedKind,
   onResumeAgentThread,
   onResumeSession,
+  onContinue,
 }: {
   /** The attached agent's kind, or null when nothing is attached — drives the
    *  Sessions lens (null → its "attach an agent" empty state). */
@@ -32,6 +33,8 @@ export function HistoryTab({
   onResumeAgentThread: (kind: string | undefined, sessionId: string) => void;
   /** Resume a prior thread of an agent (from the Sessions lens). */
   onResumeSession: (kind: string, sessionId: string) => void;
+  /** Continue a past meeting in the Ask screen (from the Meetings lens). */
+  onContinue: (id: string) => void;
 }) {
   const [lens, setLens] = useState<Lens>("Meetings");
 
@@ -67,7 +70,10 @@ export function HistoryTab({
         }}
       >
         {lens === "Meetings" && (
-          <MeetingsLens onResumeAgentThread={onResumeAgentThread} />
+          <MeetingsLens
+            onResumeAgentThread={onResumeAgentThread}
+            onContinue={onContinue}
+          />
         )}
         {lens === "Sessions" && (
           <HistoryScreen
@@ -87,12 +93,19 @@ export function HistoryTab({
 // without a visibilitychange listener. Cached meetings show instantly meanwhile.
 function MeetingsLens({
   onResumeAgentThread,
+  onContinue,
 }: {
   onResumeAgentThread: (kind: string | undefined, sessionId: string) => void;
+  onContinue: (id: string) => void;
 }) {
   const { revalidateMeetings } = useDataStore();
   useEffect(() => {
     revalidateMeetings();
   }, [revalidateMeetings]);
-  return <MeetingsScreen onResumeAgentThread={onResumeAgentThread} />;
+  return (
+    <MeetingsScreen
+      onResumeAgentThread={onResumeAgentThread}
+      onContinue={onContinue}
+    />
+  );
 }

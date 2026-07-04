@@ -33,6 +33,7 @@ import type {
   AgentSummary,
   AnswerChunk,
   AnswerStatusStep,
+  ContinueResult,
   ListeningState,
   MeetingConversationTurn,
   MeetingState,
@@ -421,6 +422,59 @@ export function createTauriClient(): MeetingClient {
           };
         },
       ),
+
+    // Continue a past meeting into the ACTIVE slot. The reply rides the SHARED
+    // set_meeting_state bus, so the picker discriminates:
+    //   • BLOCKED  → the dedicated guard reply: meeting_id === id && read_only
+    //     (a past-VIEW-shaped reply the daemon sends when a live recording
+    //     prevented the switch) → resolve { ok:false, blocked:true }.
+    //   • SUCCESS  → the active-rehydrate reseed: meeting_id absent → resolve
+    //     { ok:true }. That SAME broadcast ALSO reaches the persistent
+    //     onMeetingReseed handler (the bus fans out to every handler), so
+    //     resolving this one-shot request does NOT consume the provider reseed.
+    //   • anything else (a different open's meeting_id, or read_only false) →
+    //     undefined (not ours).
+    // CAUTION: the openMeeting picker also matches meeting_id === id; a blocked
+    // continue reply is meeting_id === id && read_only === true. Open vs Continue
+    // are separate user gestures never fired together for the same id, so no code
+    // guard is needed here.
+    continueMeeting: (id) =>
+      request<ContinueResult>(
+        { type: "meeting_continue_requested", id },
+        (cmd) => {
+          if (cmd.type !== "set_meeting_state") return undefined;
+          const c = cmd as Extract<
+            OverlayCommand,
+            { type: "set_meeting_state" }
+          >;
+          if (c.meeting_id === id && c.read_only === true) {
+            return { ok: false, blocked: true };
+          }
+          if (c.meeting_id == null) return { ok: true, blocked: false };
+          return undefined;
+        },
+      ),
+
+    onMeetingReseed(cb) {
+      // Persistent subscriber to daemon-PUSHED active reseeds — the
+      // meeting_id-absent set_meeting_state emitted when a past meeting is
+      // continued into the active slot. Unlike request()'s one-shot handler this
+      // stays registered. NOTE it also fires for the reply to meetingState()'s
+      // own request (same shape); that is harmless because the provider applies
+      // the same data idempotently and gates on `rehydrated` to skip the very
+      // first mount seed.
+      const handler = (cmd: OverlayCommand) => {
+        if (cmd.type !== "set_meeting_state") return;
+        const c = cmd as Extract<OverlayCommand, { type: "set_meeting_state" }>;
+        if (c.meeting_id != null) return;
+        cb({
+          transcript: c.transcript.map(toMeetingTranscriptLine),
+          conversation: c.conversation.map(toMeetingConversationTurn),
+        });
+      };
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
 
     setSessionHistoryConsent: (enabled) => {
       // First-class consent toggle: the daemon persists it the same way the IPC

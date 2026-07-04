@@ -40,7 +40,7 @@ import {
   PAUSE_MS,
   type TranscriptGrouper,
 } from "./transcriptGrouping";
-import type { AnswerStatusStep, TranscriptLine } from "./types";
+import type { AnswerStatusStep, MeetingState, TranscriptLine } from "./types";
 
 /** One Q&A exchange in the conversation feed: the question asked + the streamed
  *  answer + the live status steps for that turn. Past turns stay on screen so
@@ -134,6 +134,58 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
     setTranscript(caption);
   };
 
+  // ---- Continue-past-meeting reseed (single mutation path) ----
+  // A daemon-PUSHED active set_meeting_state (meeting_id absent) arrives when a
+  // past meeting is continued into the active slot. REPLACE the whole session
+  // with the target's snapshot — a fresh grouper (so the previous meeting's
+  // grouped lines + seen-id set are discarded), the transcript refolded through
+  // the SAME path the mount seed uses (paused=false), the Q&A feed rebuilt like
+  // the seed, and the detected question cleared (a new meeting carries none).
+  const reseed = (snap: MeetingState) => {
+    const grouper = createTranscriptGrouper();
+    grouperRef.current = grouper;
+    lastLiveAtRef.current = Date.now();
+
+    let folded: TranscriptLine[] = [];
+    let lastCaption: TranscriptLine | null = null;
+    for (const l of snap.transcript) {
+      const { history: next, caption } = grouper.foldSegment(
+        {
+          id: l.id,
+          source: l.source,
+          speaker: l.speaker,
+          text: l.text,
+          final: true,
+        },
+        false,
+      );
+      if (caption !== null) {
+        folded = next;
+        lastCaption = caption;
+      }
+    }
+    setHistory(folded);
+    setTranscript(lastCaption);
+
+    const seededTurns: Turn[] = snap.conversation.map((t, i) => ({
+      id: i + 1,
+      question: t.question,
+      answer: {
+        agentLabel: "Bluey",
+        text: t.answer,
+        sources: [],
+        tools: [],
+        done: true,
+        cost: undefined,
+      },
+      statusSteps: [],
+      statusDone: true,
+    }));
+    setTurns(seededTurns);
+    turnSeq.current = snap.conversation.length;
+    setDetectedQ(null);
+  };
+
   // ---- Fix B: seed once from the active meeting's persisted snapshot ----
   // Runs before live data matters. We fold each persisted segment through the
   // SAME grouping path the live stream uses (paused=false → group consecutive
@@ -220,6 +272,21 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
 
   // ---- detected for-me question (single owner) ----
   useEffect(() => client.onForMeQuestion((q) => setDetectedQ(q)), [client]);
+
+  // ---- continue-past-meeting reseed (single owner) ----
+  // Apply a daemon-pushed active reseed ONLY after the initial rehydrate seed
+  // has run, so the meetingState() reply that shares this bus shape (the mount
+  // seed) doesn't trigger a redundant second reseed. reseed closes over refs +
+  // stable setters, so it needn't be a dep.
+  useEffect(
+    () =>
+      client.onMeetingReseed((snap) => {
+        if (!rehydrated) return;
+        reseed(snap);
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [client, rehydrated],
+  );
 
   const value: MeetingStateValue = {
     transcript,

@@ -27,12 +27,16 @@ interface ViewTurn {
 
 export function MeetingsScreen({
   onResumeAgentThread,
+  onContinue,
 }: {
   /** Resume the agent thread this meeting chained (Decision 3). `kind` is the
    *  agent the meeting ACTUALLY used (from the link) — `undefined` for legacy
    *  links recorded before the kind was stored, where App falls back to the
    *  attached agent. The App wires this to attach(kind, sessionId) → Ask tab. */
   onResumeAgentThread: (kind: string | undefined, sessionId: string) => void;
+  /** Continue this past meeting in the Ask screen: make it the ACTIVE meeting.
+   *  App wires this to client.continueMeeting(id) → (unless blocked) Ask tab. */
+  onContinue: (id: string) => void;
 }) {
   // Past meetings come from the shared SWR store — cached across tab switches and
   // revalidated in the background (the History>Meetings lens triggers the
@@ -47,6 +51,7 @@ export function MeetingsScreen({
         summary={selected}
         onBack={() => setSelected(null)}
         onResumeAgentThread={onResumeAgentThread}
+        onContinue={onContinue}
       />
     );
   }
@@ -98,10 +103,12 @@ function MeetingViewer({
   summary,
   onBack,
   onResumeAgentThread,
+  onContinue,
 }: {
   summary: MeetingSummary;
   onBack: () => void;
   onResumeAgentThread: (kind: string | undefined, sessionId: string) => void;
+  onContinue: (id: string) => void;
 }) {
   const [view, setView] = useState<MeetingViewState | null>(null);
   const [failed, setFailed] = useState(false);
@@ -175,6 +182,9 @@ function MeetingViewer({
           ← Back
         </button>
         <span style={viewerTitle}>{summary.title || "Untitled meeting"}</span>
+        <button onClick={() => onContinue(summary.id)} style={continueBtn}>
+          Continue in Ask →
+        </button>
         {summary.agentSessionId != null && (
           <button
             onClick={() =>
@@ -354,6 +364,20 @@ const resumeBtn = {
   color: "#fff",
   background: "var(--tint)",
   border: "none",
+  borderRadius: "var(--r-pill)",
+  padding: "6px 12px",
+  cursor: "pointer",
+  flex: "none",
+} as const;
+// Secondary (outlined) variant next to the solid Resume button, so the two
+// actions are visually distinct: Continue reactivates the meeting, Resume
+// reattaches its agent thread.
+const continueBtn = {
+  fontSize: 11.5,
+  fontWeight: 600,
+  color: "var(--tint-ink)",
+  background: "var(--tint-wash)",
+  border: "1px solid var(--tint)",
   borderRadius: "var(--r-pill)",
   padding: "6px 12px",
   cursor: "pointer",
