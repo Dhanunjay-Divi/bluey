@@ -16,13 +16,16 @@ import {
 } from "./components/primitives";
 import { Pill } from "./components/Pill";
 import { AskScreen } from "./screens/AskScreen";
-import { HistoryScreen } from "./screens/HistoryScreen";
+import { MeetingsScreen } from "./screens/MeetingsScreen";
 import { AgentsScreen } from "./screens/AgentsScreen";
 import { Onboarding } from "./screens/Onboarding";
 
 // Audio controls live in the composer "+" menu now, not a separate tab.
-type Tab = "Ask" | "History" | "Agents";
-const TABS: readonly Tab[] = ["Ask", "History", "Agents"];
+// "Meetings" is the MEETINGS lens (my past meetings + their transcript/Q&A);
+// the AGENT-SESSION lens (resume a Claude/Cursor thread) lives under "Agents".
+// Two clearly-named, distinct history surfaces.
+type Tab = "Ask" | "Meetings" | "Agents";
+const TABS: readonly Tab[] = ["Ask", "Meetings", "Agents"];
 
 export function App() {
   const client = getClient();
@@ -195,13 +198,19 @@ export function App() {
             }}
           >
             {tab === "Ask" && <AskScreen agent={attached} />}
-            {tab === "History" && (
-              <HistoryScreen
-                kind={attached?.kind ?? null}
-                onResume={(sid) =>
-                  attached &&
-                  attach(attached.kind, sid).then(() => setTab("Ask"))
-                }
+            {/* "Meetings" is the MEETINGS lens (my past meetings). The
+                AGENT-SESSION lens lives under the Agents tab. */}
+            {tab === "Meetings" && (
+              <MeetingsScreen
+                onResumeAgentThread={(kind, sid) => {
+                  // Resume the thread on the agent the meeting ACTUALLY used
+                  // (kind from the meeting link), not whatever is currently
+                  // attached — a Claude id must not be resumed onto Cursor.
+                  // Legacy links have no kind → fall back to the attached agent.
+                  const resumeKind = kind ?? attached?.kind;
+                  if (!resumeKind) return; // no kind and nothing attached — no-op
+                  void attach(resumeKind, sid).then(() => setTab("Ask"));
+                }}
               />
             )}
             {tab === "Agents" && (
@@ -209,6 +218,9 @@ export function App() {
                 agents={agents}
                 onAttach={(k) => void attach(k)}
                 onDetach={() => void detach()}
+                onResumeSession={(kind, sid) =>
+                  attach(kind, sid).then(() => setTab("Ask"))
+                }
               />
             )}
           </div>

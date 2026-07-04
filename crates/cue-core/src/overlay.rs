@@ -9,6 +9,13 @@ fn default_true() -> bool {
     true
 }
 
+/// serde skip helper: omit a `bool` field from the wire when it is `false`.
+/// Used so `SetMeetingState.read_only` serializes identically to before the
+/// field existed for the active-rehydrate emitter (which sends `false`).
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// A fixed set of macOS System Settings privacy panes the overlay may ask the
 /// daemon to open. An enum (not a free URL) keeps the daemon's `open` call to a
 /// known allowlist.
@@ -127,6 +134,47 @@ pub struct MeetingConversationTurn {
     /// The grounding hint the turn was answered from, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+/// One row in the MEETINGS lens ("my past meetings"): a cheap summary of a
+/// persisted [`crate::meeting::MeetingRecord`], sent in answer to an
+/// [`OverlayEvent::MeetingsRequested`] via [`OverlayCommand::SetMeetings`]. The
+/// full transcript + Q&A is fetched lazily only when a row is opened (via
+/// [`OverlayEvent::MeetingOpenRequested`]), so this list stays light.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingSummary {
+    /// [`crate::meeting::MeetingRecord::id`] (a `Uuid`) rendered as a string.
+    pub id: String,
+    pub title: String,
+    /// Epoch-ms string, exactly as stored on the record.
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    /// `transcript.len()` — ALL segments, a cheap count for the list; the open
+    /// VIEW re-filters to finalized lines.
+    pub transcript_count: usize,
+    /// `conversation.len()` — the prior Q&A turn count.
+    pub turn_count: usize,
+    /// First non-empty transcript segment text, trimmed to <= 120 chars; `None`
+    /// when the meeting has no transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    /// `true` when this row is the currently-active (live) meeting.
+    #[serde(default)]
+    pub is_active: bool,
+    /// The agent session id this meeting was chained to, when any. Drives the
+    /// "resume agent thread" affordance in the viewer; the frontend derives
+    /// `hasAgentSession = agentSessionId != null`. `None` for meetings that were
+    /// never asked through an attached agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+    /// The agent KIND ("claude_code", "cursor", …) that owns
+    /// [`agent_session_id`]. The viewer resumes the thread on THIS agent, not
+    /// whatever is currently attached — resuming a Claude id onto an attached
+    /// Cursor would mis-target. `None` for legacy links recorded before the kind
+    /// was stored (the UI falls back to the attached agent for those).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
 }
 
 /// The lifecycle state of a tool-call step in the live answer status feed.
@@ -271,6 +319,27 @@ pub enum OverlayCommand {
     SetMeetingState {
         transcript: Vec<MeetingTranscriptLine>,
         conversation: Vec<MeetingConversationTurn>,
+        /// When this snapshot is a PAST-meeting VIEW (answering
+        /// [`OverlayEvent::MeetingOpenRequested`]), the opened meeting's id, so
+        /// the UI can match this reply to its open request and disambiguate it
+        /// from a live-rehydrate reply. `None` for the active-rehydrate emitter
+        /// (answering [`OverlayEvent::MeetingStateRequested`]) — with
+        /// `skip_serializing_if` that emitter's wire form is BYTE-IDENTICAL to
+        /// before this field existed (back-compat).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meeting_id: Option<String>,
+        /// `true` when the snapshot is read-only (viewing a past meeting while a
+        /// live one must not be clobbered). `false` (the default) for the active
+        /// rehydrate; skipped on the wire when `false` so that emitter's form is
+        /// byte-identical to before this field existed.
+        #[serde(default, skip_serializing_if = "is_false")]
+        read_only: bool,
+    },
+    /// The MEETINGS lens list ("my past meetings"), answering an
+    /// [`OverlayEvent::MeetingsRequested`]. Newest-first; empty-shell meetings
+    /// are filtered out by the daemon (same rule as History).
+    SetMeetings {
+        meetings: Vec<MeetingSummary>,
     },
     /// Push a review-gated Fix proposal for the user to approve or reject
     /// (Fix-button slice F3). The overlay renders the three sections plus the
@@ -401,6 +470,23 @@ pub enum OverlayEvent {
     /// replies with [`OverlayCommand::SetMeetingState`]. Empty vecs when there is
     /// no active meeting so the UI's request promise still resolves.
     MeetingStateRequested,
+    /// UI (the MEETINGS lens) asked for the list of past meetings. Read-only;
+    /// the daemon replies with [`OverlayCommand::SetMeetings`]. `offset`/`limit`
+    /// are reserved for paging (v1 ignores them and returns all) so the wire is
+    /// forward-compatible — mirrors [`OverlayEvent::AgentSessionsRequested`].
+    MeetingsRequested {
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        limit: usize,
+    },
+    /// UI asked to OPEN (view) one past meeting by id. Read-only: the daemon
+    /// replies with a [`OverlayCommand::SetMeetingState`] snapshot carrying
+    /// `meeting_id = Some(id)` and NEVER mutates the active meeting. See the
+    /// daemon handler for the live-vs-past read-only guard.
+    MeetingOpenRequested {
+        id: uuid::Uuid,
+    },
     /// UI asked to re-authenticate one hosted-OAuth connector. For now this
     /// only logs and re-emits guidance; the real OAuth flow is future work.
     ConnectorReauthRequested {
@@ -977,6 +1063,8 @@ mod tests {
                 answer: "ship it".to_string(),
                 source: Some("overlay ask".to_string()),
             }],
+            meeting_id: None,
+            read_only: false,
         };
         let json = serde_json::to_string(&command).expect("serialize set_meeting_state");
         assert!(json.contains(r#""type":"set_meeting_state""#));
@@ -1035,5 +1123,147 @@ mod tests {
             json,
             r#"{"type":"session_delete_requested","id":"00000000-0000-0000-0000-000000000000"}"#
         );
+    }
+
+    #[test]
+    fn set_meeting_state_active_rehydrate_wire_is_byte_identical() {
+        // The active-rehydrate emitter sets meeting_id: None + read_only: false.
+        // With skip_serializing_if + default, its JSON must be UNCHANGED from
+        // before the two fields existed — no `meeting_id`, no `read_only` keys.
+        // This is the back-compat invariant the live-rehydrate picker relies on.
+        let command = OverlayCommand::SetMeetingState {
+            transcript: vec![MeetingTranscriptLine {
+                id: "00000000-0000-0000-0000-000000000001".to_string(),
+                source: "system".to_string(),
+                speaker: None,
+                text: "hello".to_string(),
+                is_final: true,
+            }],
+            conversation: vec![],
+            meeting_id: None,
+            read_only: false,
+        };
+        let json = serde_json::to_string(&command).expect("serialize");
+        assert!(
+            !json.contains("meeting_id"),
+            "active rehydrate must omit meeting_id"
+        );
+        assert!(
+            !json.contains("read_only"),
+            "active rehydrate must omit read_only"
+        );
+        assert_eq!(
+            json,
+            r#"{"type":"set_meeting_state","transcript":[{"id":"00000000-0000-0000-0000-000000000001","source":"system","text":"hello","final":true}],"conversation":[]}"#
+        );
+    }
+
+    #[test]
+    fn set_meeting_state_past_view_carries_meeting_id_and_read_only() {
+        let command = OverlayCommand::SetMeetingState {
+            transcript: vec![],
+            conversation: vec![],
+            meeting_id: Some("00000000-0000-0000-0000-0000000000aa".to_string()),
+            read_only: true,
+        };
+        let json = serde_json::to_string(&command).expect("serialize");
+        assert!(json.contains(r#""meeting_id":"00000000-0000-0000-0000-0000000000aa""#));
+        assert!(json.contains(r#""read_only":true"#));
+        let decoded: OverlayCommand = serde_json::from_str(&json).expect("decode");
+        assert_eq!(serde_json::to_string(&decoded).expect("re-serialize"), json);
+    }
+
+    #[test]
+    fn legacy_set_meeting_state_decodes_without_new_fields() {
+        // An old daemon sends no meeting_id / read_only; the extended command
+        // must still decode, defaulting them (None / false).
+        let legacy = r#"{"type":"set_meeting_state","transcript":[],"conversation":[]}"#;
+        let decoded: OverlayCommand = serde_json::from_str(legacy).expect("decode legacy");
+        match decoded {
+            OverlayCommand::SetMeetingState {
+                meeting_id,
+                read_only,
+                ..
+            } => {
+                assert_eq!(meeting_id, None);
+                assert!(!read_only);
+            }
+            other => panic!("expected set_meeting_state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_meetings_roundtrips_and_skips_absent_optionals() {
+        let command = OverlayCommand::SetMeetings {
+            meetings: vec![MeetingSummary {
+                id: "00000000-0000-0000-0000-000000000001".to_string(),
+                title: "Standup".to_string(),
+                started_at: "1718000000000".to_string(),
+                ended_at: None,
+                transcript_count: 12,
+                turn_count: 3,
+                preview: None,
+                is_active: true,
+                agent_session_id: None,
+            }],
+        };
+        let json = serde_json::to_string(&command).expect("serialize");
+        assert!(json.contains(r#""type":"set_meetings""#));
+        assert!(json.contains(r#""transcript_count":12"#));
+        assert!(json.contains(r#""is_active":true"#));
+        // Absent optionals are omitted.
+        assert!(!json.contains("ended_at"));
+        assert!(!json.contains("preview"));
+        assert!(!json.contains("agent_session_id"));
+        let decoded: OverlayCommand = serde_json::from_str(&json).expect("decode");
+        assert_eq!(serde_json::to_string(&decoded).expect("re-serialize"), json);
+    }
+
+    #[test]
+    fn meeting_summary_carries_agent_session_and_preview_when_present() {
+        let summary = MeetingSummary {
+            id: "00000000-0000-0000-0000-000000000002".to_string(),
+            title: "Design review".to_string(),
+            started_at: "1718000000000".to_string(),
+            ended_at: Some("1718000900000".to_string()),
+            transcript_count: 40,
+            turn_count: 5,
+            preview: Some("So the plan for the migration is".to_string()),
+            is_active: false,
+            agent_session_id: Some("sess-abc".to_string()),
+        };
+        let json = serde_json::to_string(&summary).expect("serialize");
+        assert!(json.contains(r#""ended_at":"1718000900000""#));
+        assert!(json.contains(r#""preview":"So the plan for the migration is""#));
+        assert!(json.contains(r#""agent_session_id":"sess-abc""#));
+        let decoded: MeetingSummary = serde_json::from_str(&json).expect("decode");
+        assert_eq!(decoded.agent_session_id.as_deref(), Some("sess-abc"));
+    }
+
+    #[test]
+    fn meetings_requested_defaults_paging_when_absent() {
+        let legacy = r#"{"type":"meetings_requested"}"#;
+        let decoded: OverlayEvent = serde_json::from_str(legacy).expect("decode legacy");
+        match decoded {
+            OverlayEvent::MeetingsRequested { offset, limit } => {
+                assert_eq!(offset, 0);
+                assert_eq!(limit, 0);
+            }
+            other => panic!("expected meetings_requested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn meeting_open_requested_roundtrips() {
+        let event = OverlayEvent::MeetingOpenRequested {
+            id: uuid::Uuid::nil(),
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"meeting_open_requested","id":"00000000-0000-0000-0000-000000000000"}"#
+        );
+        let decoded: OverlayEvent = serde_json::from_str(&json).expect("decode");
+        assert_eq!(serde_json::to_string(&decoded).expect("re-serialize"), json);
     }
 }

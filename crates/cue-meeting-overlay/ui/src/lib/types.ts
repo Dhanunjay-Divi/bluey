@@ -86,6 +86,46 @@ export interface MeetingState {
   conversation: MeetingConversationTurn[];
 }
 
+/** One past meeting summarized for the MEETINGS lens (the "my past meetings"
+ *  list). Distinct from the AGENT-SESSION lens ({@link AgentSessionSummary}):
+ *  this is a meeting Bluey recorded, not a coding-agent thread. */
+export interface MeetingSummary {
+  /** MeetingRecord.id (Uuid) as string. */
+  id: string;
+  title: string;
+  /** epoch-ms string, as stored. */
+  startedAt: string;
+  /** epoch-ms string; absent while the meeting is still active. */
+  endedAt?: string;
+  /** meeting.transcript.len() — a cheap count for the row; the VIEW re-filters
+   *  to final segments only. */
+  transcriptCount: number;
+  /** meeting.conversation.len() — the number of Q&A turns. */
+  turnCount: number;
+  /** one line: the first non-empty transcript text, trimmed; absent if none. */
+  preview?: string;
+  /** true for the currently-active meeting (its id == the daemon's active id). */
+  isActive: boolean;
+  /** the agent session this meeting was chained to, when recorded — drives the
+   *  "Resume agent thread →" affordance. Absent when the meeting never chained a
+   *  thread; the frontend derives `hasAgentSession = agentSessionId != null`. */
+  agentSessionId?: string;
+  /** the agent KIND ("claude_code", "cursor", …) that owns `agentSessionId`.
+   *  Resume targets THIS agent, not whatever is currently attached. Absent for
+   *  links recorded before the kind was stored → fall back to the attached agent. */
+  agentKind?: string;
+}
+
+/** The read-only view of a PAST meeting opened from the MEETINGS lens: the same
+ *  transcript + Q&A as a live {@link MeetingState}, plus the meeting id it
+ *  belongs to and whether the daemon served it read-only (true whenever opening
+ *  it would clobber a live/active meeting). The viewer NEVER subscribes to the
+ *  live stream, so this snapshot is the whole of what it renders. */
+export interface MeetingViewState extends MeetingState {
+  meetingId: string;
+  readOnly: boolean;
+}
+
 /** The run state of a tool step in the live status feed (mirrors the agent's
  *  real ACP tool-call status — never fabricated). */
 export type AnswerStatusState = "pending" | "running" | "done" | "failed";

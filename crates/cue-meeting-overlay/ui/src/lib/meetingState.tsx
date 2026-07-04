@@ -35,6 +35,11 @@ import {
 } from "react";
 import { getClient } from ".";
 import type { AnswerState } from "../components/AnswerCard";
+import {
+  createTranscriptGrouper,
+  PAUSE_MS,
+  type TranscriptGrouper,
+} from "./transcriptGrouping";
 import type { AnswerStatusStep, TranscriptLine } from "./types";
 
 /** One Q&A exchange in the conversation feed: the question asked + the streamed
@@ -81,41 +86,6 @@ interface MeetingStateValue {
 
 const MeetingStateContext = createContext<MeetingStateValue | null>(null);
 
-// The ambient caption shows only the tail of the current line so the 2-line
-// clamp displays the newest words, not the start of a long stretch.
-const CAP = 240;
-// Full history is kept un-capped per line but bounded in line COUNT so a very
-// long meeting can't grow the DOM unbounded.
-const MAX_LINES = 400;
-// A speaker's line ends after this idle gap; the next LIVE fragment starts a new
-// one. (The seed has no per-segment timing, so it groups on speaker change only
-// — the daemon persists consecutive same-speaker fragments that ARE one line.)
-const PAUSE_MS = 2500;
-
-// One grouped transcript line, plus the set of segment ids folded into it. The
-// ids are the reconciliation key: a live/seed segment already listed here is a
-// duplicate and skipped, so the async seed and the live stream can interleave
-// without dropping or double-counting a line. The public `history` projects
-// these to plain `TranscriptLine`s (ids stripped) for rendering.
-interface GroupedLine extends TranscriptLine {
-  /** The daemon segment ids folded into this grouped line, in arrival order. */
-  ids: string[];
-}
-
-// Tail-cap a line for the ambient caption: keep only the last CAP chars, and
-// drop a leading partial word so the 2-line clamp shows clean, current words.
-function tailCap(text: string): string {
-  if (text.length <= CAP) return text;
-  const tail = text.slice(-CAP);
-  const sp = tail.indexOf(" ");
-  return sp > 0 ? tail.slice(sp + 1) : tail;
-}
-
-// Project the internal grouped lines to the public render shape (drop `ids`).
-function toHistory(lines: GroupedLine[]): TranscriptLine[] {
-  return lines.map(({ ids: _ids, ...line }) => line);
-}
-
 export function MeetingProvider({ children }: { children: ReactNode }) {
   const client = getClient();
 
@@ -125,13 +95,15 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
   const [detectedQ, setDetectedQ] = useState<DetectedQuestion | null>(null);
   const [rehydrated, setRehydrated] = useState(false);
 
-  // The authoritative grouped history, keyed by member segment ids. This ref is
-  // the single writer of the `history` state; both the seed and the live sub go
-  // through `foldSegment` below so seed↔live reconciliation is one code path.
-  const linesRef = useRef<GroupedLine[]>([]);
-  // Every segment id already folded into a line — the O(1) dedup guard that
-  // makes the async seed and live stream idempotent regardless of arrival order.
-  const seenIdsRef = useRef<Set<string>>(new Set());
+  // The authoritative grouped history, keyed by member segment ids. This grouper
+  // is the single writer of the `history` state; both the seed and the live sub
+  // go through its foldSegment so seed↔live reconciliation is one code path. It
+  // owns the grouped lines + the seen-id dedup set (the O(1) guard that makes the
+  // async seed and live stream idempotent regardless of arrival order).
+  const grouperRef = useRef<TranscriptGrouper | null>(null);
+  if (grouperRef.current === null) {
+    grouperRef.current = createTranscriptGrouper();
+  }
   // Wall-clock of the last LIVE fold, for the >PAUSE_MS new-line rule. The seed
   // doesn't touch this (it has no timing); it stays 0 until the first live line.
   const lastLiveAtRef = useRef(0);
@@ -149,38 +121,17 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
   // it makes the two paths idempotent). `paused` forces a new line on a live
   // gap; the seed passes `paused=false` so consecutive same-speaker persisted
   // fragments group into one flowing line (not the raw ~560ms fragments — the
-  // rehydrate-fidelity fix). A segment with no id (should not happen for finals)
-  // is treated as un-dedupable and always appended.
+  // rehydrate-fidelity fix). The pure grouping lives in transcriptGrouping.ts
+  // (shared verbatim with the read-only past-meeting viewer); this wrapper only
+  // pushes the result into React state. A duplicate segment yields caption:null
+  // and leaves state untouched.
   const foldSegment = (seg: TranscriptLine, paused: boolean) => {
-    if (seg.id && seenIdsRef.current.has(seg.id)) return;
-    if (seg.id) seenIdsRef.current.add(seg.id);
-
-    const lines = linesRef.current;
-    const last = lines.length > 0 ? lines[lines.length - 1] : null;
-    const continues = last != null && last.source === seg.source && !paused;
-
-    let next: GroupedLine[];
-    if (continues && last) {
-      // Extend the current line; RAW concat preserves the model's leading-space
-      // word boundaries (re-spacing would split words).
-      const merged: GroupedLine = {
-        ...last,
-        text: last.text + seg.text,
-        ids: seg.id ? [...last.ids, seg.id] : last.ids,
-      };
-      next = [...lines.slice(0, -1), merged];
-    } else {
-      next = [...lines, { ...seg, ids: seg.id ? [seg.id] : [] }];
-    }
-    if (next.length > MAX_LINES) {
-      next = next.slice(-MAX_LINES);
-    }
-    linesRef.current = next;
-    setHistory(toHistory(next));
-
-    // Ambient caption = the tail of the CURRENT (possibly just-extended) line.
-    const currentText = next[next.length - 1].text;
-    setTranscript({ ...seg, text: tailCap(currentText) });
+    const grouper = grouperRef.current;
+    if (!grouper) return;
+    const { history: next, caption } = grouper.foldSegment(seg, paused);
+    if (caption === null) return;
+    setHistory(next);
+    setTranscript(caption);
   };
 
   // ---- Fix B: seed once from the active meeting's persisted snapshot ----

@@ -40,9 +40,9 @@ use cue_core::{
     CardKind, CloudEndpointConfig, CloudEnvironment, CloudSyncState, CloudSyncStatus,
     ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn, CueCard,
     CueCardArtifact, CueSettings, DaemonState, MeetingConversationTurn, MeetingRecord,
-    MeetingState, MeetingTranscriptLine, MemoryHit, OverlayCommand, OverlayContextItem,
-    OverlayEvent, OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector,
-    ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
+    MeetingState, MeetingSummary, MeetingTranscriptLine, MemoryHit, OverlayCommand,
+    OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags, ProviderRoute,
+    ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
 };
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -2492,6 +2492,12 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::MeetingStateRequested => {
             handle_meeting_state_requested(daemon).await;
         }
+        OverlayEvent::MeetingsRequested { .. } => {
+            handle_meetings_requested(daemon).await;
+        }
+        OverlayEvent::MeetingOpenRequested { id } => {
+            handle_meeting_open_requested(daemon, id).await;
+        }
         OverlayEvent::ConnectorReauthRequested { kind, name } => {
             handle_connector_reauth_requested(daemon, &kind, &name).await;
         }
@@ -3236,6 +3242,40 @@ async fn set_attached_context_primed(daemon: &Arc<Daemon>, primed: bool) -> Resu
     save_settings(&daemon.paths, &settings)
 }
 
+/// Stamp the ACTIVE meeting with the agent thread (session id + KIND) it is
+/// chained to, so the Meetings lens can later resume THAT thread on the RIGHT
+/// agent. Called from BOTH chaining branches (new id and stable-id resume) so a
+/// resumed meeting is linked too; the in-meeting dedup guard avoids redundant
+/// saves. Best-effort — a failure only costs the resume affordance, never the
+/// answer; it holds the meeting lock only to mutate + save, then drops it.
+async fn stamp_meeting_agent_link(
+    daemon: &Arc<Daemon>,
+    kind: &AgentKind,
+    session_id: &str,
+    label: &str,
+) {
+    let kind_label = agent_model_label(kind);
+    let mut guard = daemon.meeting.lock().await;
+    let Some(meeting) = guard.as_mut() else {
+        return; // no active meeting to link
+    };
+    // Dedup: skip the save when both id and kind already match.
+    if meeting.agent_session_id.as_deref() == Some(session_id)
+        && meeting.agent_kind.as_deref() == Some(kind_label.as_str())
+    {
+        return;
+    }
+    meeting.agent_session_id = Some(session_id.to_string());
+    meeting.agent_kind = Some(kind_label);
+    if let Err(error) = daemon.store.save_active(meeting) {
+        warn!(
+            agent = %label,
+            error = %error,
+            "failed to stamp meeting with agent session id + kind"
+        );
+    }
+}
+
 /// Persist the session-history consent flag to the daemon's settings (the only
 /// writer over IPC — the UI's consent toggle routes here, not the dashboard's
 /// local SQLite, which never reaches the daemon).
@@ -3360,9 +3400,152 @@ async fn handle_meeting_state_requested(daemon: &Arc<Daemon>) {
         OverlayCommand::SetMeetingState {
             transcript,
             conversation,
+            // Active rehydrate: no meeting_id + not read-only, so the wire form
+            // stays byte-identical and the UI's live-rehydrate picker matches.
+            meeting_id: None,
+            read_only: false,
         },
     )
     .await;
+}
+
+/// Answer the MEETINGS lens ("my past meetings"): map every non-empty persisted
+/// meeting to a cheap [`MeetingSummary`] and push [`OverlayCommand::SetMeetings`].
+/// PURE READ — never writes `daemon.meeting`, never activates or archives.
+/// `all_meetings()` returns rows sorted by `started_at` DESCENDING (newest-first;
+/// the active meeting is included but is only first if its start time sorts
+/// highest — the UI keys off the `is_active` flag, not position). We preserve
+/// that order and filter empty shells with the same rule History uses.
+async fn handle_meetings_requested(daemon: &Arc<Daemon>) {
+    // Read the active meeting id, then drop the guard before any mapping/await.
+    let active_id = { daemon.meeting.lock().await.as_ref().map(|m| m.id) };
+
+    let records = match daemon.store.all_meetings() {
+        Ok(records) => records,
+        Err(error) => {
+            warn!(error = %error, "meetings list: failed to load meetings");
+            // Still resolve the UI's request promise with an empty list.
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::SetMeetings {
+                    meetings: Vec::new(),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    let meetings: Vec<MeetingSummary> = records
+        .into_iter()
+        .filter(|meeting| meeting.has_content())
+        .map(|meeting| to_meeting_summary(&meeting, active_id))
+        .collect();
+
+    info!(count = meetings.len(), "meetings list: sending SetMeetings");
+    let _ = send_overlay(daemon, OverlayCommand::SetMeetings { meetings }).await;
+}
+
+/// Map a persisted [`MeetingRecord`] to the cheap MEETINGS-lens summary row.
+/// `transcript_count` is ALL segments (the list is a count, not the view);
+/// `preview` is the first non-empty transcript text trimmed to <= 120 chars.
+fn to_meeting_summary(meeting: &MeetingRecord, active_id: Option<uuid::Uuid>) -> MeetingSummary {
+    let preview = meeting
+        .transcript
+        .iter()
+        .map(|segment| segment.text.trim())
+        .find(|text| !text.is_empty())
+        .map(|text| text.chars().take(120).collect::<String>());
+
+    MeetingSummary {
+        id: meeting.id.to_string(),
+        title: meeting.title.clone(),
+        started_at: meeting.started_at.clone(),
+        ended_at: meeting.ended_at.clone(),
+        transcript_count: meeting.transcript.len(),
+        turn_count: meeting.conversation.len(),
+        preview,
+        is_active: Some(meeting.id) == active_id,
+        agent_session_id: meeting.agent_session_id.clone(),
+        agent_kind: meeting.agent_kind.clone(),
+    }
+}
+
+/// The read-only rule for opening a past meeting: the snapshot is read-only if
+/// audio is physically capturing (`live`) OR any meeting is currently active
+/// (`active_id.is_some()`). This is the SAFETY GUARD — whenever there is
+/// anything to lose (a live/active meeting) the open is a pure read that cannot
+/// clobber it. Extracted so the rule is directly unit-testable.
+fn meeting_open_read_only(live: bool, active_id: Option<uuid::Uuid>) -> bool {
+    live || active_id.is_some()
+}
+
+/// Open (VIEW) one past meeting by id: reply with a read-only
+/// [`OverlayCommand::SetMeetingState`] snapshot carrying `meeting_id`.
+///
+/// SAFETY (the whole point): this handler is PURE READ. It NEVER writes
+/// `daemon.meeting`, NEVER `save_active`/`archive`, and NEVER calls the clobber
+/// path [`open_meeting_session`]. So opening a past meeting can never lose a
+/// live one. `read_only = live || active_id.is_some()`: if audio is capturing OR
+/// any meeting is currently active, the snapshot is read-only. (Promoting a
+/// viewed meeting to active is descoped for v1, so read_only=false is still
+/// snapshot-only.)
+async fn handle_meeting_open_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) {
+    // (a) audio physically capturing, and (b) whether a meeting is active — both
+    // liveness facts. Take each lock, read, drop the guard before the next await.
+    let live = { daemon.audio_runtime.lock().await.stop.is_some() };
+    let active_id = { daemon.meeting.lock().await.as_ref().map(|m| m.id) };
+    let read_only = meeting_open_read_only(live, active_id);
+
+    match daemon.store.load_by_id(id) {
+        Ok(Some(record)) => {
+            let transcript = record
+                .transcript
+                .iter()
+                .filter(|segment| segment.is_final)
+                .map(to_wire_line)
+                .collect();
+            let conversation = record.conversation.iter().map(to_wire_turn).collect();
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::SetMeetingState {
+                    transcript,
+                    conversation,
+                    meeting_id: Some(record.id.to_string()),
+                    read_only,
+                },
+            )
+            .await;
+        }
+        Ok(None) => {
+            // Meeting vanished (deleted between list and open): reply empty +
+            // read-only so the UI's open promise still resolves and never
+            // clobbers anything.
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::SetMeetingState {
+                    transcript: Vec::new(),
+                    conversation: Vec::new(),
+                    meeting_id: Some(id.to_string()),
+                    read_only: true,
+                },
+            )
+            .await;
+        }
+        Err(error) => {
+            warn!(meeting_id = %id, error = %error, "meeting open: failed to load meeting");
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::SetMeetingState {
+                    transcript: Vec::new(),
+                    conversation: Vec::new(),
+                    meeting_id: Some(id.to_string()),
+                    read_only: true,
+                },
+            )
+            .await;
+        }
+    }
 }
 
 /// The coarse capture channel (`"mic"` for the local user, `"system"` for the
@@ -7959,6 +8142,13 @@ async fn answer_with_agent(
                         warn!(agent = %label, error = %error, "failed to persist chained session id");
                     } else {
                         debug!(agent = %label, session = %new_id, "chained conversation: persisted new session id");
+
+                        // MEETING<->AGENT LINK: stamp the active meeting with the
+                        // agent thread (id + KIND) it's chained to, so opening
+                        // this meeting later can resume THAT thread on the RIGHT
+                        // agent. Best-effort. (Both branches stamp — see the
+                        // `else if` below — so a stable-id resume is linked too.)
+                        stamp_meeting_agent_link(&daemon, &kind, &new_id, &label).await;
                     }
 
                     // Mark the (now-chained) session as PRIMED: this turn just
@@ -8004,6 +8194,12 @@ async fn answer_with_agent(
                     if let Err(error) = set_attached_context_primed(&daemon, true).await {
                         warn!(agent = %label, error = %error, "failed to set context-primed marker");
                     }
+                    // Stamp the meeting<->agent link here TOO: a stable-id resume
+                    // (the id didn't advance) still means this meeting used that
+                    // thread, and this is the path the "resume a prior session via
+                    // the Agents lens" flow takes. Without this, a resumed meeting
+                    // would never record which thread to reopen.
+                    stamp_meeting_agent_link(&daemon, &kind, &new_id, &label).await;
                 }
             }
         }
@@ -12159,6 +12355,81 @@ fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meeting_open_is_read_only_whenever_a_live_or_active_meeting_exists() {
+        let other = uuid::Uuid::from_u128(1);
+        // Live audio capturing, no active meeting id known -> read-only.
+        assert!(meeting_open_read_only(true, None));
+        // Not live, but a meeting is active -> read-only (never clobber it).
+        assert!(meeting_open_read_only(false, Some(other)));
+        // Live AND active -> read-only.
+        assert!(meeting_open_read_only(true, Some(other)));
+        // Only when NOTHING is live and NO meeting is active is it non-read-only
+        // (still snapshot-only in v1; promotion to active is descoped).
+        assert!(!meeting_open_read_only(false, None));
+    }
+
+    #[test]
+    fn meeting_summary_reflects_counts_active_flag_and_agent_link() {
+        let active = uuid::Uuid::from_u128(7);
+        let mut meeting = MeetingRecord::new(Some("Sprint sync".to_string()));
+        meeting.id = active;
+        meeting
+            .transcript
+            .push(TranscriptSegment::new(Speaker::System, "   ", true));
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "First real spoken line here.",
+            true,
+        ));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "q",
+            "a",
+            Some("overlay ask".to_string()),
+            None,
+        ));
+        meeting.agent_session_id = Some("sess-42".to_string());
+
+        let summary = to_meeting_summary(&meeting, Some(active));
+        assert_eq!(summary.id, active.to_string());
+        assert_eq!(
+            summary.transcript_count, 2,
+            "counts ALL segments, not just non-empty"
+        );
+        assert_eq!(summary.turn_count, 1);
+        assert!(summary.is_active);
+        assert_eq!(summary.agent_session_id.as_deref(), Some("sess-42"));
+        // Preview skips the blank leading segment, uses the first non-empty one.
+        assert_eq!(
+            summary.preview.as_deref(),
+            Some("First real spoken line here.")
+        );
+    }
+
+    #[test]
+    fn meeting_summary_preview_trims_to_120_chars_and_none_when_no_transcript() {
+        let empty = MeetingRecord::new(Some("Empty".to_string()));
+        assert_eq!(to_meeting_summary(&empty, None).preview, None);
+
+        let mut long = MeetingRecord::new(Some("Long".to_string()));
+        long.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            "x".repeat(500),
+            true,
+        ));
+        let preview = to_meeting_summary(&long, None)
+            .preview
+            .expect("preview present");
+        assert_eq!(preview.chars().count(), 120);
+    }
+
+    #[test]
+    fn meeting_summary_not_active_when_id_differs() {
+        let meeting = MeetingRecord::new(Some("Past".to_string()));
+        let summary = to_meeting_summary(&meeting, Some(uuid::Uuid::from_u128(99)));
+        assert!(!summary.is_active);
+    }
 
     // ---- Pinned context survives compaction by being emitted first (#4/#5) ----
 

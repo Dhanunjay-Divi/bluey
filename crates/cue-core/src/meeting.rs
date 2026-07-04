@@ -341,6 +341,22 @@ pub struct MeetingRecord {
     #[serde(default)]
     pub answer_instructions: Option<String>,
     pub summary: Option<String>,
+    /// The agent session id this meeting was chained to, when the user asked
+    /// through an attached agent (Claude/Codex/…). Recorded so opening the
+    /// meeting later can offer to RESUME that agent thread, not just show old
+    /// text. `#[serde(default)]` keeps every legacy on-disk meeting decodable.
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
+    /// The agent KIND ("claude_code", "cursor", …) paired with
+    /// [`agent_session_id`]. Both are needed to resume the right thread: the
+    /// session id alone is meaningless without knowing which agent owns it, and
+    /// resuming it onto whatever agent happens to be attached would mis-target
+    /// (a Claude id attached under Cursor → a dead thread). `#[serde(default)]`
+    /// for legacy meetings (and meetings linked before this field existed —
+    /// their `agent_session_id` is present but kind is `None`, so the UI must
+    /// fall back to the attached agent for those).
+    #[serde(default)]
+    pub agent_kind: Option<String>,
 }
 
 impl MeetingRecord {
@@ -359,6 +375,8 @@ impl MeetingRecord {
             conversation: Vec::new(),
             answer_instructions: None,
             summary: None,
+            agent_session_id: None,
+            agent_kind: None,
         }
     }
 
@@ -563,5 +581,40 @@ mod tests {
         assert!(Speaker::User.is_me());
         assert!(!Speaker::System.is_me());
         assert!(!Speaker::Other.is_me());
+    }
+
+    #[test]
+    fn new_meeting_has_no_agent_session() {
+        let meeting = MeetingRecord::new(Some("Fresh".to_string()));
+        assert_eq!(meeting.agent_session_id, None);
+    }
+
+    #[test]
+    fn legacy_meeting_json_without_agent_session_decodes() {
+        // A meeting persisted before agent_session_id existed carries none of
+        // the field; #[serde(default)] must decode it to None rather than fail,
+        // so old on-disk meetings keep loading.
+        let legacy = r#"{
+            "id":"00000000-0000-0000-0000-000000000000",
+            "title":"Legacy",
+            "started_at":"1718000000000",
+            "ended_at":null,
+            "transcript":[],
+            "action_items":[],
+            "decisions":[],
+            "summary":null
+        }"#;
+        let meeting: MeetingRecord =
+            serde_json::from_str(legacy).expect("legacy meeting must decode");
+        assert_eq!(meeting.agent_session_id, None);
+    }
+
+    #[test]
+    fn meeting_with_agent_session_round_trips() {
+        let mut meeting = MeetingRecord::new(Some("Chained".to_string()));
+        meeting.agent_session_id = Some("sess-xyz".to_string());
+        let json = serde_json::to_string(&meeting).expect("serialize");
+        let decoded: MeetingRecord = serde_json::from_str(&json).expect("decode");
+        assert_eq!(decoded.agent_session_id.as_deref(), Some("sess-xyz"));
     }
 }

@@ -36,7 +36,9 @@ import type {
   ListeningState,
   MeetingConversationTurn,
   MeetingState,
+  MeetingSummary,
   MeetingTranscriptLine,
+  MeetingViewState,
   TranscriptLine,
 } from "./types";
 
@@ -88,6 +90,22 @@ interface WireMeetingConversationTurn {
   source?: string | null;
 }
 
+// One past meeting for the MEETINGS lens (the daemon's MeetingSummary serde
+// shape). agent_session_id is present only when the meeting chained an agent
+// thread; the UI derives hasAgentSession from its presence.
+interface WireMeetingSummary {
+  id: string;
+  title: string;
+  started_at: string;
+  ended_at?: string | null;
+  transcript_count: number;
+  turn_count: number;
+  preview?: string | null;
+  is_active: boolean;
+  agent_session_id?: string | null;
+  agent_kind?: string | null;
+}
+
 interface WireCueCard {
   id: string;
   kind: string; // CardKind, snake_case: answer | transcript | question | …
@@ -118,7 +136,13 @@ type OverlayCommand =
       type: "set_meeting_state";
       transcript: WireMeetingTranscriptLine[];
       conversation: WireMeetingConversationTurn[];
+      // Present only for a PAST-meeting VIEW reply (Decision 2). Absent on the
+      // active-rehydrate reply — the discriminator that keeps the two request()
+      // pickers on the shared bus from stealing each other's replies.
+      meeting_id?: string;
+      read_only?: boolean;
     }
+  | { type: "set_meetings"; meetings: WireMeetingSummary[] }
   | { type: "listening_state_changed"; state: string }
   | { type: "push_card"; card: WireCueCard }
   | {
@@ -194,6 +218,21 @@ function toMeetingConversationTurn(
     question: w.question,
     answer: w.answer,
     source: w.source ?? undefined,
+  };
+}
+
+function toMeetingSummary(w: WireMeetingSummary): MeetingSummary {
+  return {
+    id: w.id,
+    title: w.title,
+    startedAt: w.started_at,
+    endedAt: w.ended_at ?? undefined,
+    transcriptCount: w.transcript_count,
+    turnCount: w.turn_count,
+    preview: w.preview ?? undefined,
+    isActive: w.is_active,
+    agentSessionId: w.agent_session_id ?? undefined,
+    agentKind: w.agent_kind ?? undefined,
   };
 }
 
@@ -343,11 +382,45 @@ export function createTauriClient(): MeetingClient {
         // when no meeting is active (the daemon still replies).
         if (cmd.type !== "set_meeting_state") return undefined;
         const c = cmd as Extract<OverlayCommand, { type: "set_meeting_state" }>;
+        // CRITICAL: the active-rehydrate reply carries NO meeting_id; a
+        // PAST-meeting VIEW reply (openMeeting) carries one. Both share this bus,
+        // so reject any reply bearing a meeting_id — otherwise an openMeeting
+        // reply could resolve this rehydrate request and reseed the live view
+        // with a past meeting.
+        if (c.meeting_id != null) return undefined;
         return {
           transcript: c.transcript.map(toMeetingTranscriptLine),
           conversation: c.conversation.map(toMeetingConversationTurn),
         };
       }),
+
+    meetings: () =>
+      request<MeetingSummary[]>({ type: "meetings_requested" }, (cmd) => {
+        if (cmd.type !== "set_meetings") return undefined;
+        const c = cmd as Extract<OverlayCommand, { type: "set_meetings" }>;
+        return c.meetings.map(toMeetingSummary);
+      }),
+
+    openMeeting: (id) =>
+      request<MeetingViewState>(
+        { type: "meeting_open_requested", id },
+        (cmd) => {
+          if (cmd.type !== "set_meeting_state") return undefined;
+          const c = cmd as Extract<
+            OverlayCommand,
+            { type: "set_meeting_state" }
+          >;
+          // Discriminate MY reply from an active-rehydrate reply (meeting_id
+          // undefined) or a reply for a DIFFERENT open on the shared bus.
+          if (c.meeting_id !== id) return undefined;
+          return {
+            transcript: c.transcript.map(toMeetingTranscriptLine),
+            conversation: c.conversation.map(toMeetingConversationTurn),
+            meetingId: c.meeting_id,
+            readOnly: c.read_only ?? false,
+          };
+        },
+      ),
 
     setSessionHistoryConsent: (enabled) => {
       // First-class consent toggle: the daemon persists it the same way the IPC

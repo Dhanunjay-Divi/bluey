@@ -36,6 +36,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-soft (missing/corrupt lines skipped), no fsync/rotation (optimization
   layer; a miss falls back to the store re-scrape).
 
+### Added
+- **Meeting history — two distinct lenses.** The overlay now has a **Meetings**
+  tab (your past meetings, newest-first, with transcript/turn counts + a preview)
+  — open one to VIEW its full transcript + Q&A, so "continue an existing meeting"
+  shows its prior exchanges. Kept separate from the **Agents** tab's agent-session
+  list (resume a Claude/Cursor thread). Backed by new `meetings_requested`/
+  `set_meetings` and `meeting_open_requested` IPC over the store's existing
+  `all_meetings()`/`load_by_id()`. SAFETY: opening a past meeting is a PURE READ —
+  it never writes the active meeting, and the daemon marks the view read-only
+  whenever a live/active meeting exists, so viewing history can never clobber an
+  in-progress recording.
+- **Meeting ↔ agent-session link.** A meeting records the agent session id AND
+  kind it was chained to (`MeetingRecord.agent_session_id` + `agent_kind`, both
+  `#[serde(default)]` for legacy meetings), stamped on every answered turn
+  (including stable-id resumes). Opening a meeting offers "Resume agent thread →"
+  which reattaches THAT agent + session (not whatever is currently attached);
+  legacy links without a kind fall back to the attached agent.
+
 ### Fixed
 - **Overlay lost the whole session on collapse-to-pill** (and on a full restart):
   the panel was UNMOUNTED when collapsed (`if (collapsed) return <Pill/>`), which

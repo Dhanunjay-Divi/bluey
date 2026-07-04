@@ -15,6 +15,8 @@ import type {
   AskOptions,
   ListeningState,
   MeetingState,
+  MeetingSummary,
+  MeetingViewState,
   TranscriptLine,
 } from "./types";
 
@@ -46,6 +48,18 @@ export interface MeetingClient {
    *  or a full process restart never loses the transcript or prior exchanges.
    *  Resolves with empty arrays when no meeting is active. */
   meetingState(): Promise<MeetingState>;
+
+  // ---- the MEETINGS lens ("my past meetings") ----
+  /** List past meetings, newest-first, for the MEETINGS lens. Distinct from
+   *  {@link sessions} (the AGENT-SESSION lens): these are meetings Bluey
+   *  recorded, not coding-agent threads. Resolves with an empty list when the
+   *  store holds none. */
+  meetings(): Promise<MeetingSummary[]>;
+  /** Open a past meeting for READ-ONLY viewing: returns its persisted transcript
+   *  + Q&A snapshot. This NEVER activates the meeting or touches the live one —
+   *  the daemon serves a pure read and sets `readOnly` true whenever a live or
+   *  different active meeting would otherwise be clobbered. */
+  openMeeting(id: string): Promise<MeetingViewState>;
 
   // ---- the live loop ----
   /** Subscribe to live transcript lines; returns an unsubscribe fn. */
