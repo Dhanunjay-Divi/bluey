@@ -1820,6 +1820,10 @@ private final class OverlayWindow: NSWindow {
             break
         }
         super.sendEvent(event)
+        if event.type == .keyDown,
+           let panel = contentView as? ExpandedPanelView {
+            panel.refreshAnswerStyleEditorCaretForExternalEvent()
+        }
         if shouldApplyOverlayCursorAfterDispatch,
            let panel = contentView as? ExpandedPanelView {
             panel.applyOverlayCursorPolicy(atWindowPoint: event.locationInWindow)
@@ -4838,6 +4842,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let answerStyleLabel: NSTextField
     let answerStyleBox: NSTextField
     let answerStyleTypingIndicator: NSView
+    let answerStyleCaretIndicator: NSView
     let answerStyleSaveButton: NSButton
     let transcriptStrip: NSView
     let transcriptActivityDot: NSView
@@ -4903,6 +4908,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var composerDocumentHeightConstraint: NSLayoutConstraint?
     private var composerMeasuredHeight: CGFloat = ChromeMetrics.composerInputHeight
     private var attachmentStripHeightConstraint: NSLayoutConstraint?
+    private var answerStyleCaretBlinkTimer: Timer?
+    private var answerStyleCaretVisible = true
     private var sessionDrawerTopConstraint: NSLayoutConstraint?
     private var sessionDrawerLeadingConstraint: NSLayoutConstraint?
     private var sessionDrawerWidthConstraint: NSLayoutConstraint?
@@ -5026,6 +5033,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleLabel = NSTextField(labelWithString: "How Bluey should answer")
         answerStyleBox = ArrowCursorTextField()
         answerStyleTypingIndicator = NSView()
+        answerStyleCaretIndicator = NSView()
         answerStyleSaveButton = NSButton(title: "Save", target: nil, action: nil)
         transcriptStrip = NSView()
         transcriptActivityDot = NSView()
@@ -5155,6 +5163,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             answerStyleLabel,
             answerStyleBox,
             answerStyleTypingIndicator,
+            answerStyleCaretIndicator,
             answerStyleSaveButton,
             workspace,
             feed,
@@ -5285,6 +5294,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStylePanel.addSubview(answerStyleLabel)
         answerStylePanel.addSubview(answerStyleBox)
         answerStylePanel.addSubview(answerStyleTypingIndicator)
+        answerStylePanel.addSubview(answerStyleCaretIndicator)
         answerStylePanel.addSubview(answerStyleSaveButton)
         addSubview(closeConfirmOverlay)
         closeConfirmOverlay.addSubview(closeConfirmPanel)
@@ -5699,6 +5709,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         layoutTranscriptRailForCurrentText()
         updateKeyboardFocusRingFrame()
+        updateAnswerStyleCaretPosition()
     }
 
     override func resetCursorRects() {
@@ -6960,9 +6971,21 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         applyAnswerStyleEditorCursor()
     }
 
+    func controlTextDidChange(_ obj: Notification) {
+        guard (obj.object as? NSControl) === answerStyleBox else { return }
+        answerStyleCaretVisible = true
+        applyAccentInsertionPoint(to: answerStyleBox)
+        updateAnswerStyleCaretPosition()
+    }
+
     func controlTextDidEndEditing(_ obj: Notification) {
         guard (obj.object as? NSControl) === answerStyleBox else { return }
         setAnswerStyleInputFocused(false)
+    }
+
+    func refreshAnswerStyleEditorCaretForExternalEvent() {
+        guard !answerStyleOverlay.isHidden else { return }
+        applyAnswerStyleEditorCursor()
     }
 
     func isInteractiveAtScreenPoint(_ screenPoint: NSPoint) -> Bool {
@@ -8153,6 +8176,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleTypingIndicator.layer?.shadowRadius = 8
         answerStyleTypingIndicator.layer?.shadowOffset = .zero
         answerStyleTypingIndicator.isHidden = true
+        answerStyleCaretIndicator.wantsLayer = true
+        answerStyleCaretIndicator.layer?.cornerRadius = 1.5
+        answerStyleCaretIndicator.layer?.backgroundColor = BlueyTheme.cyan.cgColor
+        answerStyleCaretIndicator.layer?.shadowColor = BlueyTheme.cyan.cgColor
+        answerStyleCaretIndicator.layer?.shadowOpacity = 0.55
+        answerStyleCaretIndicator.layer?.shadowRadius = 6
+        answerStyleCaretIndicator.layer?.shadowOffset = .zero
+        answerStyleCaretIndicator.isHidden = true
     }
 
     private func configureComposer() {
@@ -9418,6 +9449,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         applyAccentInsertionPoint(to: answerStyleBox)
         applyAnswerStyleEditorCursor()
         setAnswerStyleInputFocused(true)
+        startAnswerStyleCaretBlink()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.12
             answerStyleOverlay.animator().alphaValue = 1
@@ -9426,7 +9458,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func applyAccentInsertionPoint(to control: NSControl) {
         if let editor = control.currentEditor() as? NSTextView {
-            editor.insertionPointColor = themedAccentColor
+            editor.insertionPointColor = control === answerStyleBox ? .clear : themedAccentColor
         }
         if control === answerStyleBox {
             applyAnswerStyleEditorCursor()
@@ -9435,16 +9467,24 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func applyAnswerStyleEditorCursor() {
         guard let editor = answerStyleBox.currentEditor() as? NSTextView else {
+            answerStyleCaretIndicator.isHidden = true
             NSCursor.arrow.set()
             return
         }
+        editor.insertionPointColor = .clear
         editor.discardCursorRects()
         editor.addCursorRect(editor.bounds, cursor: .arrow)
         window?.invalidateCursorRects(for: editor)
+        updateAnswerStyleCaretPosition()
         NSCursor.arrow.set()
     }
 
     private func setAnswerStyleInputFocused(_ focused: Bool) {
+        if focused {
+            startAnswerStyleCaretBlink()
+        } else {
+            stopAnswerStyleCaretBlink()
+        }
         refreshAnswerStyleInputChrome(focused: focused)
     }
 
@@ -9464,6 +9504,86 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleTypingIndicator.layer?.shadowOpacity = focused ? 0.55 : 0
         answerStyleTypingIndicator.alphaValue = focused ? 1.0 : 0.0
         answerStyleTypingIndicator.isHidden = !focused
+        answerStyleCaretIndicator.layer?.backgroundColor = accent.cgColor
+        answerStyleCaretIndicator.layer?.shadowColor = accent.cgColor
+        updateAnswerStyleCaretPosition()
+    }
+
+    private func startAnswerStyleCaretBlink() {
+        answerStyleCaretBlinkTimer?.invalidate()
+        answerStyleCaretVisible = true
+        updateAnswerStyleCaretPosition()
+        let timer = Timer(timeInterval: 0.55, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.answerStyleCaretVisible.toggle()
+            self.updateAnswerStyleCaretPosition()
+        }
+        answerStyleCaretBlinkTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopAnswerStyleCaretBlink() {
+        answerStyleCaretBlinkTimer?.invalidate()
+        answerStyleCaretBlinkTimer = nil
+        answerStyleCaretVisible = false
+        answerStyleCaretIndicator.isHidden = true
+    }
+
+    private func updateAnswerStyleCaretPosition() {
+        guard !answerStyleOverlay.isHidden,
+              let editor = answerStyleBox.currentEditor() as? NSTextView,
+              editor.selectedRange().length == 0
+        else {
+            answerStyleCaretIndicator.isHidden = true
+            return
+        }
+
+        editor.insertionPointColor = .clear
+        let boxRect = answerStyleBox.convert(answerStyleBox.bounds, to: answerStylePanel)
+        let location = min(editor.selectedRange().location, (editor.string as NSString).length)
+        let fallback = answerStyleCaretFallbackPoint(in: boxRect, location: location, text: editor.string)
+        let screenRect = editor.firstRect(
+            forCharacterRange: NSRange(location: location, length: 0),
+            actualRange: nil)
+        let rawPoint: NSPoint
+        if let window,
+           answerStyleCaretRectIsUsable(screenRect) {
+            rawPoint = answerStylePanel.convert(window.convertPoint(fromScreen: screenRect.origin), from: nil)
+        } else {
+            rawPoint = fallback
+        }
+
+        let caretWidth: CGFloat = 12
+        let caretHeight: CGFloat = 3
+        let x = min(max(rawPoint.x, boxRect.minX + 10), boxRect.maxX - caretWidth - 10)
+        let yCandidate = min(max(rawPoint.y + 1, boxRect.minY + 9), boxRect.maxY - 12)
+        let y = rawPoint == fallback ? fallback.y : yCandidate
+        answerStyleCaretIndicator.frame = NSRect(
+            x: x,
+            y: y,
+            width: caretWidth,
+            height: caretHeight)
+        answerStyleCaretIndicator.isHidden = !answerStyleCaretVisible
+    }
+
+    private func answerStyleCaretFallbackPoint(in boxRect: NSRect, location: Int, text: String) -> NSPoint {
+        let nsText = text as NSString
+        let clampedLocation = min(max(location, 0), nsText.length)
+        let prefix = nsText.substring(to: clampedLocation) as NSString
+        let font = answerStyleBox.font ?? NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        let textWidth = prefix.size(withAttributes: [.font: font]).width
+        let maxX = max(boxRect.minX + 10, boxRect.maxX - 24)
+        return NSPoint(
+            x: min(boxRect.minX + 10 + textWidth, maxX),
+            y: boxRect.minY + 13)
+    }
+
+    private func answerStyleCaretRectIsUsable(_ rect: NSRect) -> Bool {
+        rect.width.isFinite
+            && rect.height.isFinite
+            && rect.origin.x.isFinite
+            && rect.origin.y.isFinite
+            && !rect.isEmpty
     }
 
     func focusComposerForQuestion() {

@@ -5900,6 +5900,65 @@ Deployment status:
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
 
+## Latest Round 344: Tone Underscore Caret
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-344-TONE-UNDERSCORE-CARET.md`
+
+Trigger:
+
+- The owner showed the Tone editor and asked for the normal mouse pointer everywhere over the Tone input while still showing a Bluey-blue editing blinker.
+- The requested insertion indicator was an underscore/block style instead of the default vertical text caret.
+
+What changed:
+
+- Added a custom `answerStyleCaretIndicator` view inside the Tone panel.
+- The active Tone field editor now uses a transparent native insertion point while Bluey draws its own small Bluey-blue underscore caret.
+- The custom caret follows the AppKit insertion rect when available and falls back to a measured prefix-width position for empty/short text.
+- The caret blinks while Tone editing is active and hides on selection or when the editor closes.
+- The window event path re-applies the Tone caret and arrow cursor after key events so arrow/delete/selection movement stays stable.
+- Desktop workspace version bumped to `0.1.83`.
+
+Verification:
+
+```bash
+cargo fmt --check
+cargo check -p cue-cli -p cue-daemon
+cd native/macos/cue-overlay && swift build -c release
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.83
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+/Users/uno/.bluey/bin/bluey on
+/Users/uno/.bluey/bin/bluey status
+```
+
+Deployment status:
+
+- Desktop release `0.1.83` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.83/bluey-0.1.83-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `1753c3dc95416107889ff0ce0d553541406c17b2255d82cc005f16bbc92b8fe1`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.83`
+- Public installer smoke installed `0.1.83` locally and both installed binaries report `0.1.83`.
+- `bluey on` started fresh daemon pid `68363`.
+
 ## Latest Round 343: Screen Context Sent Chips Code Comments
 
 Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
