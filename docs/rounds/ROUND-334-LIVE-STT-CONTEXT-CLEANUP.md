@@ -86,4 +86,46 @@ cargo test -p cue-daemon live_stt_ -- --nocapture
 
 ## Deployment
 
-Pending packaging/deploy verification for `0.1.74`.
+Source commit:
+
+- `13dc58b3129f13eb49a335427a3e6e3f08ab6929`
+
+Desktop release:
+
+- Published desktop release `0.1.74` to `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.74/bluey-0.1.74-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `1a4c048033f00a81983f41b38ec5d856450b91ce18c6240c88c19ac76575d8e2`
+- Release artifact dev-flag/secret scan passed.
+- `latest.json` signature verified.
+- Installer MIME checks passed:
+  - `install.sh`: `application/x-shellscript`
+  - `install.ps1`: `application/x-powershell`
+- Unpacked release binaries report `0.1.74`.
+- Public installer smoke passed:
+  - `/Users/uno/.bluey/bin/bluey --version` -> `bluey 0.1.74`
+  - `/Users/uno/.bluey/bin/bluey-daemon --version` -> `bluey-daemon 0.1.74`
+- Note: the Codex noninteractive shell could not provide a sudo TTY, so installer smoke used the documented user-local fallback symlink at `/Users/uno/.local/bin/bluey`.
+
+Production API relay:
+
+- Built in:
+  `/opt/bluey-build-codex-round334-stt-cleanup`
+- Installed binary:
+  `/usr/local/bin/bluey-server`
+- Binary SHA256:
+  `54ee7410c4866524438781ac8702fc55b3d89d88a0720929c9e165f57cfd5172`
+- Previous binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260704T110948Z`
+- `bluey-api.service`: active
+- `NRestarts`: `0`
+- Public health returned:
+  `commit=13dc58b3129f13eb49a335427a3e6e3f08ab6929`
+- Recent production warning/error scan after restart returned no lines.
+
+## Next STT Work
+
+- Add a true horizontal live-caption partial stream so captions feel immediate instead of caption-strip-finalized.
+- Add dynamic per-session Deepgram keyterms from safe local context such as attached file names, screen OCR headings, and the current coding prompt.
+- Add a confidence-aware final transcript repair pass that can rewrite a completed utterance before answering while preserving the raw transcript for diagnostics if the user opts into support logs.

@@ -18,3 +18,8 @@ cargo test -p cue-daemon live_stt_cleanup -- --nocapture
 cargo test -p cue-daemon live_stt_ -- --nocapture
 ```
 
+## Deployment
+
+- Desktop release `0.1.74` published to `https://bluey.sh/latest.json`.
+- Server API deployed with source commit `13dc58b3129f13eb49a335427a3e6e3f08ab6929`.
+- Public release verification and installer smoke passed.

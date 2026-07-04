@@ -5655,4 +5655,31 @@ cargo test -p cue-daemon live_stt_ -- --nocapture
 
 Deployment status:
 
-- Pending packaging and production deployment for `0.1.74`.
+- Source commit:
+  `13dc58b3129f13eb49a335427a3e6e3f08ab6929`
+- Desktop release `0.1.74` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.74/bluey-0.1.74-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `1a4c048033f00a81983f41b38ec5d856450b91ce18c6240c88c19ac76575d8e2`
+- Release verification passed:
+  - release artifact dev-flag/secret scan
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.74`
+- Public installer smoke installed `0.1.74` locally and both installed binaries report `0.1.74`.
+- Production API server deployed from `/opt/bluey-build-codex-round334-stt-cleanup`.
+- Production binary SHA256:
+  `54ee7410c4866524438781ac8702fc55b3d89d88a0720929c9e165f57cfd5172`
+- Previous API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260704T110948Z`
+- `https://bluey.sh/health` reports commit `13dc58b3129f13eb49a335427a3e6e3f08ab6929`.
+- `bluey-api.service` is active with `NRestarts=0`.
+- Recent production warning/error scan after restart returned no lines.
+
+Remaining STT follow-up:
+
+- Add a true horizontal live-caption partial stream so captions feel immediate.
+- Add dynamic per-session keyterms from attached docs/screen/question context.
+- Add confidence-aware final transcript repair for low-confidence completed utterances.
