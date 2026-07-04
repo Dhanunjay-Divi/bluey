@@ -52,6 +52,11 @@ BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.p
 curl -fsSL https://bluey.sh/install.sh | bash
 /Users/uno/.bluey/bin/bluey --version
 /Users/uno/.bluey/bin/bluey-daemon --version
+rsync -az --delete --exclude='target' Cargo.toml Cargo.lock crates server infra root@165.227.77.152:/opt/bluey-build-codex-round340-code-fence-cleanup/
+ssh root@165.227.77.152 'cd /opt/bluey-build-codex-round340-code-fence-cleanup/server && BLUEY_GIT_COMMIT=e6860a2bf3eb3a12d16126d1857751f1c2769409 /root/.cargo/bin/cargo build --release --bin bluey-server'
+ssh root@165.227.77.152 'install -m 0755 /opt/bluey-build-codex-round340-code-fence-cleanup/server/target/release/bluey-server /usr/local/bin/bluey-server && systemctl restart bluey-api.service'
+curl -fsS https://bluey.sh/health
+ssh root@165.227.77.152 'journalctl -u bluey-api.service --since "5 min ago" -p warning --no-pager'
 ```
 
 ## Deployment
@@ -74,7 +79,21 @@ Release verification passed:
 - unpacked `bluey` and `bluey-daemon` version checks for `0.1.79`
 - public installer smoke installed `0.1.79` locally
 
-Production API rollout is pending the committed-source server build and restart.
+Production API server was built from the committed source at:
+
+`/opt/bluey-build-codex-round340-code-fence-cleanup`
+
+Production API deployment details:
+
+- Commit baked into health: `e6860a2bf3eb3a12d16126d1857751f1c2769409`
+- Production binary SHA256:
+  `f3a33f648af22a04d0f3bd70541bf55558b418712cf176a33eb2755baafb0f7c`
+- Previous API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260704T180742Z`
+- `bluey-api.service` status after restart: `active`
+- `bluey-api.service` `NRestarts`: `0`
+- `https://bluey.sh/health` reports commit `e6860a2bf3eb3a12d16126d1857751f1c2769409`
+- Recent production warning/error scan after restart returned no entries.
 
 ## Windows Parity
 

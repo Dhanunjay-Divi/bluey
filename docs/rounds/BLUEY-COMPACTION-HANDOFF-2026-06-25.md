@@ -5959,4 +5959,11 @@ Deployment status:
   - Darwin arm64 artifact SHA verification
   - unpacked `bluey` and `bluey-daemon` version checks for `0.1.79`
 - Public installer smoke installed `0.1.79` locally and both installed binaries report `0.1.79`.
-- API deploy status: pending committed-source server rollout in the same round.
+- Production API server deployed from `/opt/bluey-build-codex-round340-code-fence-cleanup`.
+- Production binary SHA256:
+  `f3a33f648af22a04d0f3bd70541bf55558b418712cf176a33eb2755baafb0f7c`
+- Previous API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260704T180742Z`
+- `https://bluey.sh/health` reports commit `e6860a2bf3eb3a12d16126d1857751f1c2769409`.
+- `bluey-api.service` is active with `NRestarts=0`.
+- Recent production warning/error scan after restart returned no entries.

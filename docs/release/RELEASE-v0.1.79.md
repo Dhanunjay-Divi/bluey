@@ -45,4 +45,11 @@ curl -fsSL https://bluey.sh/install.sh | bash
 
 ## API Deployment
 
-Pending committed-source production API rollout.
+- Production API server deployed from `/opt/bluey-build-codex-round340-code-fence-cleanup`.
+- Production API health reports commit `e6860a2bf3eb3a12d16126d1857751f1c2769409`.
+- Production binary SHA256:
+  `f3a33f648af22a04d0f3bd70541bf55558b418712cf176a33eb2755baafb0f7c`
+- Previous API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260704T180742Z`
+- `bluey-api.service` is active with `NRestarts=0`.
+- Recent production warning/error journal scan after restart returned no entries.
