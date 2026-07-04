@@ -14,6 +14,7 @@ import type {
   AnswerChunk,
   AskOptions,
   ListeningState,
+  MeetingState,
   TranscriptLine,
 } from "./types";
 
@@ -38,6 +39,13 @@ export interface MeetingClient {
   models(kind: string): Promise<string[]>;
   connectors(kind: string): Promise<AgentConnectorInfo[]>;
   setSessionHistoryConsent(enabled: boolean): Promise<void>;
+
+  /** Fetch the active meeting's transcript + Q&A once, to rehydrate on mount
+   *  (Fix B). The MEETING is the source of truth (the daemon persists it); the
+   *  overlay is a view that seeds itself from this snapshot so a collapse-remount
+   *  or a full process restart never loses the transcript or prior exchanges.
+   *  Resolves with empty arrays when no meeting is active. */
+  meetingState(): Promise<MeetingState>;
 
   // ---- the live loop ----
   /** Subscribe to live transcript lines; returns an unsubscribe fn. */

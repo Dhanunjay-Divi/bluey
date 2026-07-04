@@ -37,6 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layer; a miss falls back to the store re-scrape).
 
 ### Fixed
+- **Overlay lost the whole session on collapse-to-pill** (and on a full restart):
+  the panel was UNMOUNTED when collapsed (`if (collapsed) return <Pill/>`), which
+  destroyed the React state that owned the transcript, message history, and Q&A —
+  reopening showed a blank session even though the daemon still had everything.
+  The overlay is now a VIEW, not the owner: (A) the panel stays mounted and is
+  hidden via `display:none` on collapse, so state survives instantly; (B) session
+  state moved to a `MeetingProvider` above `<App/>` that, on mount, rehydrates from
+  the daemon via a new `meeting_state_requested`/`set_meeting_state` IPC (reads the
+  active `MeetingRecord`'s transcript + conversation) — so even a cold overlay
+  restart repaints the meeting so far. Snapshot and the live `onTranscript` stream
+  reconcile by STABLE per-segment id (the live push now carries the persisted
+  segment id + channel source via a shared `speaker_channel`, so seed↔live can't
+  duplicate or mislabel). Foundation for showing prior exchanges when a meeting
+  continues. (See `docs/work/DESIGN-CONTEXT-REDUNDANCY.md` sibling design notes.)
 - **Redundant per-turn context on a resumed session** (send-heavy-context-once):
   every ask re-sent the entire meeting package — pre-meeting brief, saved summary,
   back-history transcript, and Bluey's own prior Q&A (including internal

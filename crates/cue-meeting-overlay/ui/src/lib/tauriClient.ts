@@ -34,6 +34,9 @@ import type {
   AnswerChunk,
   AnswerStatusStep,
   ListeningState,
+  MeetingConversationTurn,
+  MeetingState,
+  MeetingTranscriptLine,
   TranscriptLine,
 } from "./types";
 
@@ -66,6 +69,25 @@ interface WireAgentConnectorInfo {
   ready: boolean;
 }
 
+// The active meeting's rehydration snapshot (Fix B). A minimal, stable wire
+// surface — the daemon deliberately does NOT expose TranscriptSegment /
+// ConversationTurn here (they carry diarization/audio-clock internals the UI
+// must not depend on). `final` is always true (only finalized segments persist).
+interface WireMeetingTranscriptLine {
+  id: string;
+  source: string;
+  speaker?: string | null;
+  text: string;
+  final: boolean;
+}
+
+interface WireMeetingConversationTurn {
+  id: string;
+  question: string;
+  answer: string;
+  source?: string | null;
+}
+
 interface WireCueCard {
   id: string;
   kind: string; // CardKind, snake_case: answer | transcript | question | …
@@ -92,6 +114,11 @@ type OverlayCommand =
       connectors: WireAgentConnectorInfo[];
     }
   | { type: "set_agent_models"; kind: string; models: string[] }
+  | {
+      type: "set_meeting_state";
+      transcript: WireMeetingTranscriptLine[];
+      conversation: WireMeetingConversationTurn[];
+    }
   | { type: "listening_state_changed"; state: string }
   | { type: "push_card"; card: WireCueCard }
   | {
@@ -145,6 +172,29 @@ function toAgentSessionSummary(
 
 function toAgentConnectorInfo(w: WireAgentConnectorInfo): AgentConnectorInfo {
   return { name: w.name, authTier: w.auth_tier, ready: w.ready };
+}
+
+function toMeetingTranscriptLine(
+  w: WireMeetingTranscriptLine,
+): MeetingTranscriptLine {
+  return {
+    id: w.id,
+    source: w.source,
+    speaker: w.speaker ?? undefined,
+    text: w.text,
+    final: w.final,
+  };
+}
+
+function toMeetingConversationTurn(
+  w: WireMeetingConversationTurn,
+): MeetingConversationTurn {
+  return {
+    id: w.id,
+    question: w.question,
+    answer: w.answer,
+    source: w.source ?? undefined,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +336,19 @@ export function createTauriClient(): MeetingClient {
         },
       ),
 
+    meetingState: () =>
+      request<MeetingState>({ type: "meeting_state_requested" }, (cmd) => {
+        // Exactly one active meeting, so no kind-guard is needed — the first
+        // set_meeting_state reply is ours. Empty arrays resolve the promise even
+        // when no meeting is active (the daemon still replies).
+        if (cmd.type !== "set_meeting_state") return undefined;
+        const c = cmd as Extract<OverlayCommand, { type: "set_meeting_state" }>;
+        return {
+          transcript: c.transcript.map(toMeetingTranscriptLine),
+          conversation: c.conversation.map(toMeetingConversationTurn),
+        };
+      }),
+
     setSessionHistoryConsent: (enabled) => {
       // First-class consent toggle: the daemon persists it the same way the IPC
       // SetAgentSessionHistory path does, then refreshes the agent list.
@@ -381,8 +444,13 @@ export function createTauriClient(): MeetingClient {
           .card;
         if (card.kind !== "transcript") return;
         const line: TranscriptLine = {
-          // The daemon tags transcript origin in `source` ("system" | "mic"…);
-          // fall back to "system" when absent.
+          // The daemon sets the live transcript card's id to the persisted
+          // segment's id, so the provider can reconcile this live line against
+          // the same segment already in its rehydration snapshot (id-upsert).
+          id: card.id,
+          // The daemon tags transcript origin in `source` ("system" | "mic") —
+          // the SAME channel the snapshot's MeetingTranscriptLine.source uses, so
+          // the seed/live seam agrees; fall back to "system" when absent.
           source: card.source ?? "system",
           speaker: card.title || undefined,
           text: card.body,

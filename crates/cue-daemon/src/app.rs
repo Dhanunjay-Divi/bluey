@@ -39,9 +39,10 @@ use cue_core::{
     AudioDeviceDescriptor, AudioDeviceRole, AudioPipelineStatus, AudioSourceKind, CardArtifactType,
     CardKind, CloudEndpointConfig, CloudEnvironment, CloudSyncState, CloudSyncStatus,
     ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn, CueCard,
-    CueCardArtifact, CueSettings, DaemonState, MeetingRecord, MeetingState, MemoryHit,
-    OverlayCommand, OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags,
-    ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
+    CueCardArtifact, CueSettings, DaemonState, MeetingConversationTurn, MeetingRecord,
+    MeetingState, MeetingTranscriptLine, MemoryHit, OverlayCommand, OverlayContextItem,
+    OverlayEvent, OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector,
+    ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
 };
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -2488,6 +2489,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::AgentModelsRequested { kind } => {
             handle_agent_models_requested(daemon, &kind).await;
         }
+        OverlayEvent::MeetingStateRequested => {
+            handle_meeting_state_requested(daemon).await;
+        }
         OverlayEvent::ConnectorReauthRequested { kind, name } => {
             handle_connector_reauth_requested(daemon, &kind, &name).await;
         }
@@ -3318,6 +3322,85 @@ async fn handle_agent_sessions_requested(
         },
     )
     .await;
+}
+
+/// Read-only rehydrate handler (Fix B): snapshot the active meeting's finalized
+/// transcript + prior Q&A and push it to the overlay as
+/// [`OverlayCommand::SetMeetingState`], so the UI can re-seed its in-memory view
+/// after a collapse-remount or a full process restart. When no meeting is
+/// active, both vecs are empty — but the command is STILL sent so the UI's
+/// request promise resolves (mirrors the consent-off empty `SetAgentSessions`
+/// path). The meeting `Mutex` is dropped before the send: never held across an
+/// `await`.
+async fn handle_meeting_state_requested(daemon: &Arc<Daemon>) {
+    let (transcript, conversation) = {
+        let guard = daemon.meeting.lock().await;
+        match guard.as_ref() {
+            Some(meeting) => (
+                meeting
+                    .transcript
+                    .iter()
+                    .filter(|segment| segment.is_final)
+                    .map(to_wire_line)
+                    .collect(),
+                meeting.conversation.iter().map(to_wire_turn).collect(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        }
+    };
+    let count = transcript.len();
+    let turns = conversation.len();
+    info!(
+        transcript_lines = count,
+        conversation_turns = turns,
+        "meeting state: sending SetMeetingState"
+    );
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetMeetingState {
+            transcript,
+            conversation,
+        },
+    )
+    .await;
+}
+
+/// The coarse capture channel (`"mic"` for the local user, `"system"` for the
+/// remote side) for a [`Speaker`]. This is the SINGLE source of the transcript
+/// `source` value shared by the rehydrate snapshot ([`to_wire_line`]) and the
+/// live push card, so both sides of the overlay's seed↔live seam agree — the
+/// overlay reconciles a live line against the seeded snapshot by segment id and
+/// renders the You/They caption from this channel, both of which break if the
+/// two paths ever diverge.
+fn speaker_channel(speaker: Speaker) -> &'static str {
+    match speaker {
+        Speaker::User => "mic",
+        _ => "system",
+    }
+}
+
+/// Map a persisted [`TranscriptSegment`] to the minimal rehydrate wire line. The
+/// capture channel is derived from the reliable [`Speaker`] tag (mic vs system),
+/// NOT the live display label. `speaker` stays `None` in v1 (the caption uses
+/// `source`); `is_final` is always `true` — only finalized segments reach here.
+fn to_wire_line(segment: &TranscriptSegment) -> MeetingTranscriptLine {
+    MeetingTranscriptLine {
+        id: segment.id.to_string(),
+        source: speaker_channel(segment.speaker).to_string(),
+        speaker: None,
+        text: segment.text.clone(),
+        is_final: true,
+    }
+}
+
+/// Map a persisted [`ConversationTurn`] to the minimal rehydrate wire turn.
+fn to_wire_turn(turn: &ConversationTurn) -> MeetingConversationTurn {
+    MeetingConversationTurn {
+        id: turn.id.to_string(),
+        question: turn.question.clone(),
+        answer: turn.answer.clone(),
+        source: turn.source.clone(),
+    }
 }
 
 /// Blocking core of [`handle_agent_sessions_requested`]: find the agent and
@@ -6142,17 +6225,25 @@ async fn add_audio_transcript_segment_inner(
         Speaker::Other => "Other",
         Speaker::Unknown => "Transcript",
     };
-    let source = segment
-        .speaker_label
-        .as_deref()
-        .filter(|label| !label.trim().is_empty())
-        .map(|label| format!("{label} STT"))
-        .unwrap_or_else(|| "audio STT".to_string());
+    // The live card carries the SAME coarse channel the rehydrate snapshot uses
+    // (`"mic"` / `"system"`) — NOT an "…​STT" display label. The overlay
+    // reconciles a live line against the seeded snapshot by segment `id`, and the
+    // channel is also what drives the You/They caption; a divergent label here
+    // broke both (the id-seam dedup and the mic label). Same mapping as the
+    // snapshot's [`to_wire_line`] via the shared [`speaker_channel`].
+    let source = speaker_channel(speaker);
     // Send the RAW (untrimmed) text: the overlay app stitches successive
     // transcript cards (`prev.text + line.text`), so the model's leading-space
     // word boundaries must survive or words glue together ("This isa live test").
     // Same reason the live-transcript WS below uses text_raw.
-    let card = CueCard::new(CardKind::Transcript, title, text_raw).with_source(source);
+    //
+    // Carry the persisted segment's id AS the card id so the overlay can dedup a
+    // live line against the same segment already in its rehydrated snapshot (the
+    // collapse-remount / restart seam) — an id-upsert, not a text heuristic. Only
+    // finals persist and reach the snapshot, so the id is meaningful there for
+    // finals; partials never enter the overlay history (dropped on `!final`).
+    let mut card = CueCard::new(CardKind::Transcript, title, text_raw).with_source(source);
+    card.id = committed_segment.id;
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
 
     // Broadcast live transcript event for dashboard consumption.
@@ -13392,5 +13483,100 @@ mod tests {
         let out = truncate_reason(&long);
         assert!(out.chars().count() <= 81, "capped to ~80 + ellipsis");
         assert!(out.ends_with('…'));
+    }
+
+    /// The rehydrate snapshot logic (Fix B): the same filter + map the handler
+    /// applies to `daemon.meeting` before sending `SetMeetingState`. Kept as a
+    /// helper so both the populated and empty cases exercise the real mappers
+    /// without standing up a full `Daemon`.
+    fn snapshot_meeting(
+        meeting: Option<&MeetingRecord>,
+    ) -> (Vec<MeetingTranscriptLine>, Vec<MeetingConversationTurn>) {
+        match meeting {
+            Some(meeting) => (
+                meeting
+                    .transcript
+                    .iter()
+                    .filter(|segment| segment.is_final)
+                    .map(to_wire_line)
+                    .collect(),
+                meeting.conversation.iter().map(to_wire_turn).collect(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        }
+    }
+
+    #[test]
+    fn handle_meeting_state_requested_emits_populated_snapshot() {
+        let mut meeting = MeetingRecord::new(Some("Rehydrate".to_string()));
+        // A non-final segment must be filtered out of the snapshot.
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            "partial fragment",
+            false,
+        ));
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            "they said hello",
+            true,
+        ));
+        meeting
+            .transcript
+            .push(TranscriptSegment::new(Speaker::User, "you replied", true));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "what next?",
+            "ship it",
+            Some("overlay ask".to_string()),
+            Some("Bluey managed".to_string()),
+        ));
+
+        let (transcript, conversation) = snapshot_meeting(Some(&meeting));
+
+        // Only the two FINAL segments survive, mapped to the reliable channel.
+        assert_eq!(transcript.len(), 2, "non-final segment must be dropped");
+        assert_eq!(transcript[0].source, "system");
+        assert_eq!(transcript[0].text, "they said hello");
+        assert!(transcript[0].is_final);
+        assert_eq!(transcript[1].source, "mic");
+        assert_eq!(transcript[1].text, "you replied");
+        // Ids are the segment uuids as strings and are non-empty.
+        assert!(!transcript[0].id.is_empty());
+
+        assert_eq!(conversation.len(), 1);
+        assert_eq!(conversation[0].question, "what next?");
+        assert_eq!(conversation[0].answer, "ship it");
+        assert_eq!(conversation[0].source.as_deref(), Some("overlay ask"));
+    }
+
+    #[test]
+    fn handle_meeting_state_requested_empty_when_no_meeting() {
+        let (transcript, conversation) = snapshot_meeting(None);
+        assert!(transcript.is_empty());
+        assert!(conversation.is_empty());
+    }
+
+    #[test]
+    fn speaker_channel_matches_snapshot_source_for_seed_live_seam() {
+        // The mic side is "mic", every other side is "system".
+        assert_eq!(speaker_channel(Speaker::User), "mic");
+        assert_eq!(speaker_channel(Speaker::System), "system");
+        assert_eq!(speaker_channel(Speaker::Other), "system");
+        assert_eq!(speaker_channel(Speaker::Unknown), "system");
+
+        // The live push card and the rehydrate snapshot MUST tag the same segment
+        // with the same channel, or the overlay can't reconcile a live line with
+        // its seeded copy by id (it would show a duplicate at the seam). Pin that
+        // the shared helper is exactly what `to_wire_line` emits.
+        for speaker in [
+            Speaker::User,
+            Speaker::System,
+            Speaker::Other,
+            Speaker::Unknown,
+        ] {
+            let segment = TranscriptSegment::new(speaker, "hello", true);
+            let wire = to_wire_line(&segment);
+            assert_eq!(wire.source, speaker_channel(speaker));
+            assert_eq!(wire.id, segment.id.to_string());
+        }
     }
 }

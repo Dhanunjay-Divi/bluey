@@ -84,6 +84,51 @@ pub struct OverlaySessionItem {
     pub pinned: bool,
 }
 
+/// One finalized spoken line in the active meeting's transcript, as sent to the
+/// overlay so it can rehydrate after a collapse-remount or a full process
+/// restart ([`OverlayCommand::SetMeetingState`]). This is a MINIMAL, stable wire
+/// surface — it deliberately does NOT carry the diarization / audio-clock
+/// internals of [`crate::meeting::TranscriptSegment`], which the UI must not
+/// depend on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingTranscriptLine {
+    /// The source segment's id (a `Uuid` rendered as a string). Stable across
+    /// the snapshot and the live push path, so the UI can dedup a snapshot line
+    /// against a live one.
+    pub id: String,
+    /// Coarse capture channel: `"mic"` (local user) or `"system"` (remote side).
+    /// Mapped from the segment's [`crate::meeting::Speaker`], the reliable
+    /// mic-vs-system signal — never the display label.
+    pub source: String,
+    /// A human speaker label when useful (e.g. a diarized individual), else
+    /// `None`. `v1` leaves this `None`; the caption uses `source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    /// The raw (untrimmed) spoken text of this segment.
+    pub text: String,
+    /// Always `true` — only finalized segments are persisted and emitted. Named
+    /// `is_final` on the Rust struct; the wire key is `"final"` to match the
+    /// UI's `TranscriptLine.final`.
+    #[serde(rename = "final")]
+    pub is_final: bool,
+}
+
+/// One prior Q&A exchange in the active meeting's conversation, as sent to the
+/// overlay for rehydration ([`OverlayCommand::SetMeetingState`]). A MINIMAL wire
+/// surface over [`crate::meeting::ConversationTurn`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingConversationTurn {
+    /// The source turn's id (a `Uuid` rendered as a string).
+    pub id: String,
+    /// The question the user asked.
+    pub question: String,
+    /// The answer Bluey produced.
+    pub answer: String,
+    /// The grounding hint the turn was answered from, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
 /// The lifecycle state of a tool-call step in the live answer status feed.
 /// Mirrors the agent's real ACP tool-call status — never fabricated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +263,15 @@ pub enum OverlayCommand {
         kind: String,
         models: Vec<String>,
     },
+    /// Snapshot of the active meeting for rehydration (Fix B). `transcript` is
+    /// the finalized spoken lines; `conversation` is the prior Q&A turns. Both
+    /// empty when no meeting is active (so the UI's request promise still
+    /// resolves). NOT a live stream — the UI seeds once on mount, then the live
+    /// push_card / update_card path carries deltas on top.
+    SetMeetingState {
+        transcript: Vec<MeetingTranscriptLine>,
+        conversation: Vec<MeetingConversationTurn>,
+    },
     /// Push a review-gated Fix proposal for the user to approve or reject
     /// (Fix-button slice F3). The overlay renders the three sections plus the
     /// optional diff and shows Approve/Reject. `proposal_id` is the id the
@@ -342,6 +396,11 @@ pub enum OverlayEvent {
     AgentModelsRequested {
         kind: String,
     },
+    /// UI asked for the active meeting's transcript + Q&A so it can rehydrate
+    /// after a collapse-remount or a full overlay restart. Read-only; the daemon
+    /// replies with [`OverlayCommand::SetMeetingState`]. Empty vecs when there is
+    /// no active meeting so the UI's request promise still resolves.
+    MeetingStateRequested,
     /// UI asked to re-authenticate one hosted-OAuth connector. For now this
     /// only logs and re-emits guidance; the real OAuth flow is future work.
     ConnectorReauthRequested {
@@ -891,6 +950,63 @@ mod tests {
         .expect("serialize");
         assert!(reject.contains(r#""type":"fix_approval_responded""#));
         assert!(reject.contains(r#""approved":false"#));
+    }
+
+    #[test]
+    fn set_meeting_state_roundtrips() {
+        let command = OverlayCommand::SetMeetingState {
+            transcript: vec![
+                MeetingTranscriptLine {
+                    id: "00000000-0000-0000-0000-000000000001".to_string(),
+                    source: "system".to_string(),
+                    speaker: None,
+                    text: "hello there".to_string(),
+                    is_final: true,
+                },
+                MeetingTranscriptLine {
+                    id: "00000000-0000-0000-0000-000000000002".to_string(),
+                    source: "mic".to_string(),
+                    speaker: None,
+                    text: "hi back".to_string(),
+                    is_final: true,
+                },
+            ],
+            conversation: vec![MeetingConversationTurn {
+                id: "00000000-0000-0000-0000-000000000003".to_string(),
+                question: "what next?".to_string(),
+                answer: "ship it".to_string(),
+                source: Some("overlay ask".to_string()),
+            }],
+        };
+        let json = serde_json::to_string(&command).expect("serialize set_meeting_state");
+        assert!(json.contains(r#""type":"set_meeting_state""#));
+        // `is_final` renders on the wire as `"final"` to match the UI shape.
+        assert!(json.contains(r#""final":true"#));
+        assert!(!json.contains("is_final"));
+        assert!(json.contains(r#""source":"system""#));
+        assert!(json.contains(r#""source":"mic""#));
+        let decoded: OverlayCommand =
+            serde_json::from_str(&json).expect("decode set_meeting_state");
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-serialize"),
+            json,
+            "SetMeetingState should round-trip"
+        );
+    }
+
+    #[test]
+    fn meeting_state_requested_decodes() {
+        let json = r#"{"type":"meeting_state_requested"}"#;
+        let decoded: OverlayEvent = serde_json::from_str(json).expect("decode");
+        match decoded {
+            OverlayEvent::MeetingStateRequested => {}
+            other => panic!("expected meeting_state_requested, got {other:?}"),
+        }
+        // Round-trips back to the same tag with no fields.
+        assert_eq!(
+            serde_json::to_string(&OverlayEvent::MeetingStateRequested).expect("serialize"),
+            json
+        );
     }
 
     #[test]

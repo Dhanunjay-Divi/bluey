@@ -67,8 +67,8 @@ pub use observability::{
     BLUEY_TRACE_ID_HEADER,
 };
 pub use overlay::{
-    AnswerStatusState, AnswerStatusStep, OverlayCommand, OverlayContextItem, OverlayEvent,
-    OverlayPosition, OverlaySessionItem,
+    AnswerStatusState, AnswerStatusStep, MeetingConversationTurn, MeetingTranscriptLine,
+    OverlayCommand, OverlayContextItem, OverlayEvent, OverlayPosition, OverlaySessionItem,
 };
 pub use prestage::{build_prestage_brief, PrestageInput};
 pub use state::{DaemonState, MeetingState};

@@ -81,148 +81,164 @@ export function App() {
     client.attach(kind, sessionId, model).then(setAgents);
   const detach = () => client.detach().then(setAgents);
 
-  // Collapsed: the ambient pill — live listening status + latest heard line +
-  // mic toggle, so the user rarely needs to expand mid-meeting. Click to expand.
-  if (collapsed) {
-    return (
-      <Pill
-        client={client}
-        attached={attached}
-        onExpand={() => void expand()}
-        dragRef={pillRef}
-      />
-    );
-  }
-
-  if (onboarding) {
-    return (
-      <Onboarding
-        agents={agents}
-        onAttach={(k) => void attach(k)}
-        onDone={() => {
-          localStorage.setItem("bluey.onboarded", "1");
-          setOnboarding(false);
-        }}
-      />
-    );
-  }
-
   return (
-    // The panel FILLS the window (pinned to all edges with a small margin for the
-    // soft shadow) — like the interview overlay — so there's no empty space
-    // around it. The middle tab content flexes + scrolls inside.
-    <div style={{ position: "fixed", inset: 7, display: "flex" }}>
-      <Glass
-        radius="var(--r-xl)"
+    // The panel is ALWAYS mounted — collapse hides it via display:none, it does
+    // NOT unmount it. Unmounting used to destroy AskScreen's state (the collapse
+    // bug); the session state now lives in MeetingProvider above <App/>, but we
+    // also keep the panel mounted so expanding is an instant repaint with no
+    // remount cost. The Pill (collapsed) and Onboarding (first run) render as
+    // siblings, never replacing the panel subtree.
+    <>
+      {/* Collapsed: the ambient pill — live listening status + latest heard line
+          + mic toggle, so the user rarely needs to expand mid-meeting. Click to
+          expand. */}
+      {collapsed && (
+        <Pill
+          client={client}
+          attached={attached}
+          onExpand={() => void expand()}
+          dragRef={pillRef}
+        />
+      )}
+
+      {/* First-run onboarding, rendered as a sibling and only while expanded. */}
+      {onboarding && !collapsed && (
+        <Onboarding
+          agents={agents}
+          onAttach={(k) => void attach(k)}
+          onDone={() => {
+            localStorage.setItem("bluey.onboarded", "1");
+            setOnboarding(false);
+          }}
+        />
+      )}
+
+      {/* The panel FILLS the window (pinned to all edges with a small margin for
+          the soft shadow) — like the interview overlay — so there's no empty
+          space around it. The middle tab content flexes + scrolls inside.
+          display:none (not visibility:hidden) when collapsed or onboarding so the
+          heavy transcript list skips layout/paint and captures no pointer events,
+          while AskScreen stays mounted. */}
+      <div
         style={{
-          flex: 1,
-          display: "flex",
-          flexDirection: "column",
-          minHeight: 0,
+          position: "fixed",
+          inset: 7,
+          display: collapsed || onboarding ? "none" : "flex",
         }}
       >
-        {/* header — drag region for the frameless panel (drag to move) */}
-        <div
-          ref={headerRef}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "13px 15px",
-            cursor: "grab",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
-            <span
-              style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
-            >
-              {attached ? <Waveform /> : <Mark />}
-              <span
-                style={{
-                  fontSize: 14,
-                  fontWeight: 600,
-                  letterSpacing: "-.01em",
-                }}
-              >
-                Bluey
-              </span>
-            </span>
-            <span style={{ fontSize: 12.5, color: "var(--ink-3)" }}>
-              ·{" "}
-              {attached ? (
-                <b style={{ color: "var(--tint-ink)", fontWeight: 540 }}>
-                  {attached.displayName}
-                </b>
-              ) : (
-                "managed"
-              )}
-            </span>
-          </div>
-          <SegmentedTabs tabs={TABS} value={tab} onChange={setTab} />
-          <button
-            aria-label="Collapse to pill"
-            title="Collapse to pill"
-            style={closeBtn}
-            onClick={() => void collapse()}
-          >
-            ×
-          </button>
-        </div>
-
-        {/* Middle: the active tab flexes to fill between header + footer and
-            scrolls internally (so the panel fills the window, no empty space). */}
-        <div
+        <Glass
+          radius="var(--r-xl)"
           style={{
             flex: 1,
-            minHeight: 0,
-            overflowY: "auto",
             display: "flex",
             flexDirection: "column",
+            minHeight: 0,
           }}
         >
-          {tab === "Ask" && <AskScreen agent={attached} />}
-          {tab === "History" && (
-            <HistoryScreen
-              kind={attached?.kind ?? null}
-              onResume={(sid) =>
-                attached && attach(attached.kind, sid).then(() => setTab("Ask"))
-              }
-            />
-          )}
-          {tab === "Agents" && (
-            <AgentsScreen
-              agents={agents}
-              onAttach={(k) => void attach(k)}
-              onDetach={() => void detach()}
-            />
-          )}
-        </div>
+          {/* header — drag region for the frameless panel (drag to move) */}
+          <div
+            ref={headerRef}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              padding: "13px 15px",
+              cursor: "grab",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+              <span
+                style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
+              >
+                {attached ? <Waveform /> : <Mark />}
+                <span
+                  style={{
+                    fontSize: 14,
+                    fontWeight: 600,
+                    letterSpacing: "-.01em",
+                  }}
+                >
+                  Bluey
+                </span>
+              </span>
+              <span style={{ fontSize: 12.5, color: "var(--ink-3)" }}>
+                ·{" "}
+                {attached ? (
+                  <b style={{ color: "var(--tint-ink)", fontWeight: 540 }}>
+                    {attached.displayName}
+                  </b>
+                ) : (
+                  "managed"
+                )}
+              </span>
+            </div>
+            <SegmentedTabs tabs={TABS} value={tab} onChange={setTab} />
+            <button
+              aria-label="Collapse to pill"
+              title="Collapse to pill"
+              style={closeBtn}
+              onClick={() => void collapse()}
+            >
+              ×
+            </button>
+          </div>
 
-        {/* footer */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "9px 16px",
-            borderTop: "1px solid var(--line)",
-          }}
-        >
-          <span style={ftr}>
-            {attached?.displayName ?? "Bluey"} ·{" "}
-            <span style={{ color: "var(--tint-ink)" }}>
-              runs on your machine
+          {/* Middle: the active tab flexes to fill between header + footer and
+            scrolls internally (so the panel fills the window, no empty space). */}
+          <div
+            style={{
+              flex: 1,
+              minHeight: 0,
+              overflowY: "auto",
+              display: "flex",
+              flexDirection: "column",
+            }}
+          >
+            {tab === "Ask" && <AskScreen agent={attached} />}
+            {tab === "History" && (
+              <HistoryScreen
+                kind={attached?.kind ?? null}
+                onResume={(sid) =>
+                  attached &&
+                  attach(attached.kind, sid).then(() => setTab("Ask"))
+                }
+              />
+            )}
+            {tab === "Agents" && (
+              <AgentsScreen
+                agents={agents}
+                onAttach={(k) => void attach(k)}
+                onDetach={() => void detach()}
+              />
+            )}
+          </div>
+
+          {/* footer */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              padding: "9px 16px",
+              borderTop: "1px solid var(--line)",
+            }}
+          >
+            <span style={ftr}>
+              {attached?.displayName ?? "Bluey"} ·{" "}
+              <span style={{ color: "var(--tint-ink)" }}>
+                runs on your machine
+              </span>
             </span>
-          </span>
-          <span style={ftr}>
-            {connectors.length > 0 ? connectors.join(" · ") : "no connectors"}
-          </span>
-          <span style={ftr}>⌘↵ ask · ⌥ hide</span>
-        </div>
+            <span style={ftr}>
+              {connectors.length > 0 ? connectors.join(" · ") : "no connectors"}
+            </span>
+            <span style={ftr}>⌘↵ ask · ⌥ hide</span>
+          </div>
 
-        <ResizeGrip />
-      </Glass>
-    </div>
+          <ResizeGrip />
+        </Glass>
+      </div>
+    </>
   );
 }
 

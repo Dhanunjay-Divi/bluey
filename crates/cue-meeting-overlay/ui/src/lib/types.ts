@@ -45,6 +45,11 @@ export type ListeningState =
 
 /** A normalized transcript line surfaced during a live meeting. */
 export interface TranscriptLine {
+  /** The daemon's stable per-segment id (a Uuid string), carried on the live
+   *  push path so a live line can be reconciled by id against the same segment
+   *  already present in the rehydration snapshot (Fix B seam). Absent only for
+   *  synthetic/partial lines that never reach history. */
+  id?: string;
   /** "system" | "mic" — who Bluey heard. */
   source: string;
   /** optional speaker label, when diarization provides one. */
@@ -52,6 +57,33 @@ export interface TranscriptLine {
   text: string;
   /** true once the line is finalized (not a partial). */
   final: boolean;
+}
+
+/** A persisted transcript line from the active meeting's rehydration snapshot
+ *  (Fix B). Same shape as a live {@link TranscriptLine} plus the daemon's stable
+ *  segment id — the dedup key when reconciling the seeded snapshot against the
+ *  live onTranscript stream. */
+export interface MeetingTranscriptLine extends TranscriptLine {
+  /** TranscriptSegment.id (Uuid) as string — the stable per-segment key. */
+  id: string;
+}
+
+/** A persisted Q&A turn from the active meeting's rehydration snapshot (Fix B). */
+export interface MeetingConversationTurn {
+  /** ConversationTurn.id (Uuid) as string. */
+  id: string;
+  question: string;
+  answer: string;
+  /** Grounding hint carried through from the daemon, when present. */
+  source?: string;
+}
+
+/** The active meeting's read-only snapshot, fetched once on mount to rehydrate
+ *  the overlay after a collapse-remount or a full process restart (Fix B). Both
+ *  arrays are empty when no meeting is active. */
+export interface MeetingState {
+  transcript: MeetingTranscriptLine[];
+  conversation: MeetingConversationTurn[];
 }
 
 /** The run state of a tool step in the live status feed (mirrors the agent's
