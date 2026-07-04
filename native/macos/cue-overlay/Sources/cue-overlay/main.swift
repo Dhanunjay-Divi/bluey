@@ -1206,6 +1206,8 @@ private final class ComposerSurfaceView: NSView {
     private var inputFocused = false
     private var restingBorderColor = NSColor.white.withAlphaComponent(0.105)
     private var focusedBorderColor = BlueyTheme.cyan.withAlphaComponent(0.62)
+    private var restingBackgroundColor = NSColor.white.withAlphaComponent(0.045)
+    private var focusedBackgroundColor = BlueyTheme.cyan.withAlphaComponent(0.10)
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -1225,18 +1227,31 @@ private final class ComposerSurfaceView: NSView {
         refreshFocusChrome()
     }
 
-    func updateBorderColors(resting: NSColor, focused: NSColor) {
+    func updateBorderColors(
+        resting: NSColor,
+        focused: NSColor,
+        restingBackground: NSColor? = nil,
+        focusedBackground: NSColor? = nil
+    ) {
         restingBorderColor = resting
         focusedBorderColor = focused
+        if let restingBackground {
+            restingBackgroundColor = restingBackground
+        }
+        if let focusedBackground {
+            focusedBackgroundColor = focusedBackground
+        }
         refreshFocusChrome()
     }
 
     private func refreshFocusChrome() {
         guard let layer else { return }
+        layer.borderWidth = inputFocused ? 2 : 1
         layer.borderColor = (inputFocused ? focusedBorderColor : restingBorderColor).cgColor
+        layer.backgroundColor = (inputFocused ? focusedBackgroundColor : restingBackgroundColor).cgColor
         layer.shadowColor = focusedBorderColor.cgColor
-        layer.shadowOpacity = inputFocused ? 0.18 : 0
-        layer.shadowRadius = inputFocused ? 10 : 0
+        layer.shadowOpacity = inputFocused ? 0.34 : 0
+        layer.shadowRadius = inputFocused ? 12 : 0
         layer.shadowOffset = .zero
     }
 }
@@ -5849,14 +5864,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             ? BlueyLightTheme.accentBorder.withAlphaComponent(0.68)
             : BlueyTheme.cyan.withAlphaComponent(0.22)).cgColor
         composerBar.layer?.shadowOpacity = lightThemeEnabled ? 0.10 : 0.18
-        composerSurface.layer?.backgroundColor = themedSurfaceColor.cgColor
         let composerSurfaceBorder = lightThemeEnabled
             ? BlueyLightTheme.border
             : NSColor.white.withAlphaComponent(materialAlpha(0.105))
+        let composerSurfaceFocusFill = themedAccentBorderColor.withAlphaComponent(lightThemeEnabled ? 0.20 : 0.11)
+        composerSurface.layer?.backgroundColor = themedSurfaceColor.cgColor
         composerSurface.layer?.borderColor = composerSurfaceBorder.cgColor
         (composerSurface as? ComposerSurfaceView)?.updateBorderColors(
             resting: composerSurfaceBorder,
-            focused: themedAccentBorderColor.withAlphaComponent(lightThemeEnabled ? 0.82 : 0.68))
+            focused: themedAccentBorderColor.withAlphaComponent(lightThemeEnabled ? 0.98 : 0.94),
+            restingBackground: themedSurfaceColor,
+            focusedBackground: composerSurfaceFocusFill)
         opacityControl.layer?.backgroundColor = NSColor.clear.cgColor
         opacityControl.layer?.borderColor = NSColor.clear.cgColor
         closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep
@@ -6062,6 +6080,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if isCanvasDividerHit(at: localPoint) {
             clearResizeCursorIfNeeded()
             NSCursor.resizeLeftRight.set()
+            return
+        }
+        if !answerStyleOverlay.isHidden,
+           rectForView(answerStylePanel).insetBy(dx: -8, dy: -8).contains(localPoint) {
+            clearResizeCursorIfNeeded()
+            applyAnswerStyleEditorCursor()
             return
         }
         let edges = resizeEdges(at: localPoint)
@@ -6933,6 +6957,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard (obj.object as? NSControl) === answerStyleBox else { return }
         setAnswerStyleInputFocused(true)
         applyAccentInsertionPoint(to: answerStyleBox)
+        applyAnswerStyleEditorCursor()
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
@@ -8148,7 +8173,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.105).cgColor
         (composerSurface as? ComposerSurfaceView)?.updateBorderColors(
             resting: NSColor.white.withAlphaComponent(0.105),
-            focused: BlueyTheme.cyan.withAlphaComponent(0.62))
+            focused: BlueyTheme.cyan.withAlphaComponent(0.96),
+            restingBackground: NSColor.white.withAlphaComponent(0.045),
+            focusedBackground: BlueyTheme.cyan.withAlphaComponent(0.105))
 
         composerScroll.drawsBackground = false
         composerScroll.borderType = .noBorder
@@ -9389,6 +9416,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateBackgroundControlsEnabledForModalState()
         window?.makeFirstResponder(answerStyleBox)
         applyAccentInsertionPoint(to: answerStyleBox)
+        applyAnswerStyleEditorCursor()
         setAnswerStyleInputFocused(true)
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.12
@@ -9400,6 +9428,20 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if let editor = control.currentEditor() as? NSTextView {
             editor.insertionPointColor = themedAccentColor
         }
+        if control === answerStyleBox {
+            applyAnswerStyleEditorCursor()
+        }
+    }
+
+    private func applyAnswerStyleEditorCursor() {
+        guard let editor = answerStyleBox.currentEditor() as? NSTextView else {
+            NSCursor.arrow.set()
+            return
+        }
+        editor.discardCursorRects()
+        editor.addCursorRect(editor.bounds, cursor: .arrow)
+        window?.invalidateCursorRects(for: editor)
+        NSCursor.arrow.set()
     }
 
     private func setAnswerStyleInputFocused(_ focused: Bool) {

@@ -5967,6 +5967,66 @@ Deployment status:
 - `bluey on` started fresh daemon pid `5303` at `Sat Jul 4 14:48:24 2026`.
 - Local daemon log tail now contains `version=0.1.80` entries after the restart.
 
+## Latest Round 342: Tone Cursor Input Focus
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-342-TONE-CURSOR-INPUT-FOCUS.md`
+
+Trigger:
+
+- The owner reported that Tone text still showed an I-beam cursor and the main Ask input needed a clearer blue selected-state border.
+
+What changed:
+
+- The macOS Tone panel now forces the shared AppKit field editor to use the arrow cursor, not only the visible `NSTextField`.
+- The Tone panel cursor policy now keeps the whole Tone panel in arrow-cursor mode.
+- The Ask input surface now uses a stronger focused Bluey-blue ring, subtle blue fill, and stronger focus shadow.
+- Initial composer setup and theme-refresh paths both use the stronger focused colors.
+- Desktop workspace version bumped to `0.1.81`.
+
+Windows parity note:
+
+- The current Windows C overlay does not have the same Tone editor UI surface, so there was no parallel Windows Tone cursor path to patch in this round.
+
+Verification:
+
+```bash
+cargo fmt --check
+cargo check -p cue-cli -p cue-daemon
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.81
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+/Users/uno/.bluey/bin/bluey on
+/Users/uno/.bluey/bin/bluey status
+```
+
+Deployment status:
+
+- Desktop release `0.1.81` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.81/bluey-0.1.81-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `37040ce65cfe236bcb5b5d3f0c8571151f1e800edc3deb92a223d761e3e65414`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.81`
+- Public installer smoke installed `0.1.81` locally and both installed binaries report `0.1.81`.
+- `bluey on` started fresh daemon pid `22487`.
+
 ## Latest Round 340: Code Fence Visible Canvas Cleanup
 
 Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
