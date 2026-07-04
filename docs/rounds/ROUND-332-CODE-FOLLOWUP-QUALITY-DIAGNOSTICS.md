@@ -122,6 +122,7 @@ The object uploads immediately before it succeeded, so this was most likely meta
 - Sanitize raw NUL bytes out of all Postgres sync text fields before binding.
 - Add table and record id context to each Postgres sync insert/update error.
 - Log the full safe error chain for `/sync` failures instead of only the top-level error.
+- Deployed the server-side sync hardening to production with commit `bddfe86379bff57dfb90714d1f2ad2261392d6c5`; `/health` reported that commit and recent logs showed no sync failure after restart.
 
 Additional verification:
 

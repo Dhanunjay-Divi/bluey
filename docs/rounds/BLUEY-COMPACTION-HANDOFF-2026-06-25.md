@@ -5535,6 +5535,7 @@ Post-deploy sync follow-up:
   `sync endpoint failed error=error serializing parameter 5`.
 - Live Postgres schema for `cloud_context_artifacts.title` was correct (`TEXT NOT NULL`), so the likely cause was a raw NUL byte in a text field from local artifact/session metadata.
 - Follow-up server patch sanitizes raw NUL bytes out of all Postgres sync text fields, adds table/record context around sync insert errors, and logs the full safe sync error chain.
+- Server-side sync hardening was deployed to production with commit `bddfe86379bff57dfb90714d1f2ad2261392d6c5`; `/health` reported that commit and recent logs showed no sync failure after restart.
 - Verification for that patch:
 
 ```bash
