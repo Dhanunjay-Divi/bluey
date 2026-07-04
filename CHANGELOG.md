@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Per-agent **model override** for the attached agent: a vendor model id
+  (e.g. `composer-2.5`, `gpt-5.1-codex`) carried on `CueSettings.attached_model`
+  and on the `AgentAttachRequested` overlay event, seeded onto the drive via the
+  registry row's `model_flag` (a no-op for flagless agents), pushed into
+  `tried_models` so the ModelBlocked resolver never re-proposes a blocked pick,
+  and cleared on detach. Preserved across conversation-chaining, dropped on the
+  BYOT re-attach round-trip (cloud rows have no model flag).
+- **Model flags** enabled for Cursor / Copilot / Antigravity (`--model`,
+  live-verified 2026-07-03); fallback model lists stay empty since vendor ids are
+  release/plan-dependent, so a flag stays inert until the user picks a model.
+- **Speed→effort** control: the overlay fast/balanced/deep picker now maps to
+  per-run reasoning-effort argv on agents with a live-verified effort flag —
+  Codex (`-c model_reasoning_effort=…`, live-verified). Prose speed instructions
+  remain for every agent (effort args are additive, never a replacement).
+  Copilot's `--effort` was live-refuted (the default `auto` model hard-errors on
+  it) so Copilot stays prose-only.
+- **Cursor native resume is now ledger-gated**: `cursor-agent --resume=<id>`
+  resumes only Bluey-minted CLI sessions from their original cwd (a wrong cwd or
+  unknown id silently mints an empty session), so Cursor resume by id requires
+  provenance from the new spawn-time session ledger; unproven ids degrade to
+  replay.
+- **Spawn-time agent-session ledger** (`agent-session-ledger.jsonl` under the
+  daemon data dir): records `{agent, session_id, cwd, spawned_at}` for
+  Bluey-minted CLI sessions so cwd-scoped resume never depends on store drift.
+  Resolved ledger-first (an undiscovered agent can still resolve its cwd),
+  fail-soft (missing/corrupt lines skipped), no fsync/rotation (optimization
+  layer; a miss falls back to the store re-scrape).
+
 ### Fixed
 - Live STT lag + eaten/scrambled words (three distinct bugs, all diagnosed on
   real-time-streamed VoxConverse audio — see `docs/TRANSCRIBE-BUILD-PLAN.md`):
