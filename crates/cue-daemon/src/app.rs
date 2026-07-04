@@ -7052,13 +7052,8 @@ async fn answer_with_provider_runtime(
         &request.metadata.visible_context_ids,
         &request.context,
     );
-    let visible_context =
+    let question_display_context =
         visible_question_context_for_ids(&meeting_snapshot, &question_attachment_ids);
-    let question_display_context = if visible_context.is_empty() {
-        question_card_context_from_answer_context(&request.context)
-    } else {
-        visible_context.clone()
-    };
     log_answer_request_diagnostics(&request, &source, question_display_context.len());
     let (visible_question_title, visible_question) =
         visible_question_for_source(&request.question, &source, &question_display_context);
@@ -7105,7 +7100,7 @@ async fn answer_with_provider_runtime(
                     &request,
                     &meeting_snapshot,
                     &source,
-                    visible_context.len(),
+                    question_display_context.len(),
                     &error,
                 );
                 record_active_session_diagnostic(daemon, "answer_error", &error_message).await;
@@ -7226,7 +7221,7 @@ async fn answer_with_provider_runtime(
         request_id = %request.metadata.request_id,
         meeting_id = %meeting_snapshot.id,
         provider = %outcome.provider.display_label(),
-        visible_context_count = visible_context.len(),
+        visible_context_count = question_display_context.len(),
         attachment_ids = question_attachment_ids.len(),
         persisted_answer_chars = persisted_shape.chars,
         persisted_answer_lines = persisted_shape.lines,
@@ -7284,6 +7279,12 @@ async fn answer_with_provider_runtime(
 fn user_facing_answer_error(error: &anyhow::Error) -> String {
     let raw = format!("{error:#}");
     let lower = raw.to_ascii_lowercase();
+    if lower.contains("internal_disclosure_blocked")
+        || lower.contains("private instructions")
+        || lower.contains("internal configuration")
+    {
+        return "That screen appears to include Bluey/private prompt content, so I blocked the request. Capture only the external problem area or ask from the existing answer, then try again.".to_string();
+    }
     if is_incomplete_stream_error(&lower) {
         return "Bluey's connection dropped before the answer finished. I did not save that partial answer. Please retry.".to_string();
     }
@@ -8617,78 +8618,20 @@ fn visible_question_context_for_ids(
 }
 
 fn question_attachment_ids_for_request(
-    meeting: &MeetingRecord,
+    _meeting: &MeetingRecord,
     visible_context_ids: &[uuid::Uuid],
-    answer_context: &[AnswerContext],
+    _answer_context: &[AnswerContext],
 ) -> Vec<uuid::Uuid> {
     if !visible_context_ids.is_empty() {
         return dedupe_attachment_ids(visible_context_ids.iter().copied());
     }
 
-    let mut ids = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for context in answer_context.iter().filter(|context| {
-        matches!(
-            context.kind,
-            AnswerContextKind::Document | AnswerContextKind::Screenshot
-        )
-    }) {
-        if let Some(artifact) = meeting
-            .context
-            .iter()
-            .find(|artifact| answer_context_matches_artifact(context, artifact))
-        {
-            if seen.insert(artifact.id) {
-                ids.push(artifact.id);
-            }
-        }
-    }
-    ids
+    Vec::new()
 }
 
 fn dedupe_attachment_ids(ids: impl IntoIterator<Item = uuid::Uuid>) -> Vec<uuid::Uuid> {
     let mut seen = std::collections::HashSet::new();
     ids.into_iter().filter(|id| seen.insert(*id)).collect()
-}
-
-fn answer_context_matches_artifact(context: &AnswerContext, artifact: &ContextArtifact) -> bool {
-    if answer_context_kind(artifact.kind) != context.kind {
-        return false;
-    }
-    if context
-        .source
-        .as_deref()
-        .is_some_and(|source| !source.trim().is_empty() && source == artifact.path)
-    {
-        return true;
-    }
-    context
-        .title
-        .as_deref()
-        .is_some_and(|title| !title.trim().is_empty() && title == artifact.title)
-}
-
-fn question_card_context_from_answer_context(context: &[AnswerContext]) -> Vec<AnswerContext> {
-    let mut seen = std::collections::HashSet::new();
-    context
-        .iter()
-        .filter(|item| {
-            matches!(
-                item.kind,
-                AnswerContextKind::Document | AnswerContextKind::Screenshot
-            )
-        })
-        .filter(|item| {
-            let key = format!(
-                "{:?}:{}:{}",
-                item.kind,
-                item.title.as_deref().unwrap_or_default(),
-                item.source.as_deref().unwrap_or_default()
-            );
-            seen.insert(key)
-        })
-        .cloned()
-        .collect()
 }
 
 fn clean_visible_question(question: &str) -> String {
@@ -11417,15 +11360,8 @@ fn recent_sent_attachment_context_for_follow_up(
             );
         }
 
-        let kind = if wants_visual_context
-            && matches!(artifact.kind, ContextKind::Image | ContextKind::Diagram)
-        {
-            AnswerContextKind::Screenshot
-        } else {
-            AnswerContextKind::MeetingMemory
-        };
         contexts.push(
-            AnswerContext::new(kind, content)
+            AnswerContext::new(AnswerContextKind::MeetingMemory, content)
                 .with_title(format!("Previous attachment: {}", artifact.title))
                 .with_source(artifact.path.clone()),
         );
@@ -11683,7 +11619,12 @@ fn relevant_current_attachment_context_for_question(
         .rev()
         .take(ANSWER_CONTEXT_ARTIFACT_LIMIT.min(3))
         .map(|(_, _, artifact)| {
-            let mut context = answer_context_from_artifact(artifact);
+            let mut context = if matches!(artifact.kind, ContextKind::Image | ContextKind::Diagram)
+            {
+                retained_image_memory_context_from_artifact(artifact)
+            } else {
+                answer_context_from_artifact(artifact)
+            };
             context.content = format!(
                 "Relevant current-session attachment selected for this question.\n{}",
                 context.content
@@ -12097,6 +12038,25 @@ fn is_strong_topic_anchor(term: &str) -> bool {
 }
 
 fn answer_context_from_artifact(artifact: &ContextArtifact) -> AnswerContext {
+    let content = answer_context_content_from_artifact(artifact);
+    AnswerContext::new(answer_context_kind(artifact.kind), content)
+        .with_title(artifact.title.clone())
+        .with_source(artifact.path.clone())
+}
+
+fn retained_image_memory_context_from_artifact(artifact: &ContextArtifact) -> AnswerContext {
+    AnswerContext::new(
+        AnswerContextKind::MeetingMemory,
+        format!(
+            "Retained image/screen summary. Do not treat this as a freshly attached screenshot; use it only as saved text memory unless the user attaches or captures the screen again.\n{}",
+            answer_context_content_from_artifact(artifact)
+        ),
+    )
+    .with_title(format!("Retained summary: {}", artifact.title))
+    .with_source(artifact.path.clone())
+}
+
+fn answer_context_content_from_artifact(artifact: &ContextArtifact) -> String {
     let mut content = format!("{} ({})", artifact.title, artifact.kind);
     if artifact.processing_status != ContextProcessingStatus::Ready {
         content.push_str(&format!("\nStatus: {}", artifact.processing_status));
@@ -12128,9 +12088,7 @@ fn answer_context_from_artifact(artifact: &ContextArtifact) -> AnswerContext {
             ANSWER_ATTACHMENT_PROMPT_PREVIEW_CHARS,
         ));
     }
-    AnswerContext::new(answer_context_kind(artifact.kind), content)
-        .with_title(artifact.title.clone())
-        .with_source(artifact.path.clone())
+    content
 }
 
 fn promote_request_to_vision_for_screen_context(paths: &AppPaths, request: &mut AnswerRequest) {
@@ -15808,6 +15766,42 @@ mod tests {
     }
 
     #[test]
+    fn relevant_current_image_context_uses_retained_memory_without_pending_ids() {
+        let screen = ContextArtifact::new(
+            ContextKind::Image,
+            "/tmp/bluey-screen.png",
+            "Screen context",
+            Some("Sent once with an Answer. Future answers use the saved summary.".to_string()),
+            Some(128),
+        )
+        .with_text_preview(
+            "One-shot image context. Prior answer included Go code for trapping rain water.",
+        )
+        .with_processing_status(ContextProcessingStatus::Ready);
+        let mut meeting = MeetingRecord::new(Some("Screen session".to_string()));
+        meeting.context.push(screen);
+
+        let context = relevant_current_attachment_context_for_question(
+            &meeting,
+            &[],
+            "can you give go code for this?",
+        );
+
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].kind, AnswerContextKind::MeetingMemory);
+        assert_eq!(
+            context[0].title.as_deref(),
+            Some("Retained summary: Screen context")
+        );
+        assert!(context[0]
+            .content
+            .contains("Do not treat this as a freshly attached screenshot"));
+        assert!(context[0]
+            .content
+            .contains("Go code for trapping rain water"));
+    }
+
+    #[test]
     fn relevant_current_attachment_context_ignores_unrelated_questions() {
         let saved_doc = ContextArtifact::new(
             ContextKind::Document,
@@ -15828,6 +15822,19 @@ mod tests {
         );
 
         assert!(context.is_empty());
+    }
+
+    #[test]
+    fn internal_disclosure_blocks_get_specific_user_message() {
+        let error = anyhow!(
+            "{}",
+            r#"provider error: server error: 400: {"reason":"internal_disclosure_blocked"}"#
+        );
+
+        let message = user_facing_answer_error(&error);
+
+        assert!(message.contains("private prompt content"));
+        assert!(message.contains("Capture only the external problem area"));
     }
 
     #[test]
@@ -15936,7 +15943,7 @@ mod tests {
         );
 
         assert_eq!(context.len(), 1);
-        assert_eq!(context[0].kind, AnswerContextKind::Screenshot);
+        assert_eq!(context[0].kind, AnswerContextKind::MeetingMemory);
         assert_eq!(
             context[0].title.as_deref(),
             Some("Previous attachment: Screen context")
@@ -15981,7 +15988,7 @@ mod tests {
         );
 
         assert_eq!(context.len(), 1);
-        assert_eq!(context[0].kind, AnswerContextKind::Screenshot);
+        assert_eq!(context[0].kind, AnswerContextKind::MeetingMemory);
         assert_eq!(
             context[0].title.as_deref(),
             Some("Previous attachment: Screen context")
@@ -16730,7 +16737,7 @@ mod tests {
     }
 
     #[test]
-    fn inferred_answer_context_produces_question_attachment_chips() {
+    fn inferred_answer_context_does_not_produce_question_attachment_chips() {
         let mut meeting = MeetingRecord::new(Some("Screen QA".to_string()));
         let screen = ContextArtifact::new(
             ContextKind::Image,
@@ -16752,16 +16759,13 @@ mod tests {
         ];
 
         let attachment_ids = question_attachment_ids_for_request(&meeting, &[], &answer_context);
-        assert_eq!(attachment_ids, vec![screen_id]);
+        assert!(attachment_ids.is_empty());
+        let explicit_attachment_ids =
+            question_attachment_ids_for_request(&meeting, &[screen_id], &answer_context);
+        assert_eq!(explicit_attachment_ids, vec![screen_id]);
 
-        let visible_context = visible_question_context_for_ids(&meeting, &attachment_ids);
-        let fallback_context = question_card_context_from_answer_context(&answer_context);
-        let display_context = if visible_context.is_empty() {
-            fallback_context
-        } else {
-            visible_context
-        };
-        let attachments = question_card_attachments(&display_context);
+        let visible_context = visible_question_context_for_ids(&meeting, &explicit_attachment_ids);
+        let attachments = question_card_attachments(&visible_context);
 
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].kind, "screen");

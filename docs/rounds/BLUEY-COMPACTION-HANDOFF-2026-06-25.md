@@ -5900,6 +5900,75 @@ Deployment status:
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
 
+## Latest Round 345: Explicit Screen Context Follow-Ups
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-345-EXPLICIT-SCREEN-CONTEXT-FOLLOWUPS.md`
+
+Trigger:
+
+- The owner showed a typed follow-up where `Screen context` was attached again even though the overlay had already sent the prior screen.
+- The answer failed with `Ref: B2D6A8AD`.
+- The visible session id was `A4331D2C`.
+
+Diagnosis:
+
+- The daemon log showed the overlay sent the follow-up with `context_ids=0`.
+- The daemon then inferred/reused saved screen context anyway and promoted the request to the managed vision lane.
+- The managed server rejected the stale screenshot request with `internal_disclosure_blocked` because the screenshot contained Bluey/private-instruction-looking UI.
+
+What changed:
+
+- Sent attachment chips and raw screen/image payloads are now explicit-only.
+- `question_attachment_ids_for_request` returns only overlay-provided `visible_context_ids`.
+- Previous screen/image follow-up context is retained as `MeetingMemory` text, not `Screenshot`.
+- Relevant current-session image matches without pending ids become retained text memory instead of vision uploads.
+- The user-facing error now explicitly explains private/internal-screen guard blocks.
+- Desktop workspace version bumped to `0.1.84`.
+
+Verification:
+
+```bash
+cargo fmt --check
+cargo check -p cue-daemon -p cue-cli
+cargo test -p cue-daemon follow_up_context --lib
+cargo test -p cue-daemon inferred_answer_context --lib
+cargo test -p cue-daemon relevant_current --lib
+cargo test -p cue-daemon internal_disclosure_blocks_get_specific_user_message --lib
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.84
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+/Users/uno/.bluey/bin/bluey on
+/Users/uno/.bluey/bin/bluey status
+```
+
+Deployment status:
+
+- Desktop release `0.1.84` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.84/bluey-0.1.84-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `a16c1009ef8f9b51ef75bf0216460bd4f8640cb883366495285f56171ab716a7`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.84`
+- Public installer smoke installed `0.1.84` locally and both installed binaries report `0.1.84`.
+- `bluey on` started fresh daemon pid `88374`.
+
 ## Latest Round 344: Tone Underscore Caret
 
 Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
