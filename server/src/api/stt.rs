@@ -43,7 +43,7 @@ const DEFAULT_DEEPGRAM_ENDPOINTING_MS: u32 = 200;
 const DEFAULT_DEEPGRAM_UTTERANCE_END_MS: u32 = 1_000;
 const DEFAULT_DEEPGRAM_LANGUAGE: &str = "en-US";
 const DEFAULT_DEEPGRAM_NO_DELAY: bool = true;
-const MAX_DEEPGRAM_KEYTERMS: usize = 50;
+const MAX_DEEPGRAM_KEYTERMS: usize = 64;
 const DEFAULT_DEEPGRAM_KEYTERMS: &[&str] = &[
     "LRU",
     "FIFO",
@@ -80,6 +80,21 @@ const DEFAULT_DEEPGRAM_KEYTERMS: &[&str] = &[
     "Claude",
     "Gemini",
     "Bluey",
+    "LeetCode",
+    "Fibonacci",
+    "Two Sum",
+    "given a set",
+    "set of two numbers",
+    "set of numbers",
+    "array of integers",
+    "single digit",
+    "double digit",
+    "hash map",
+    "linked list",
+    "binary search",
+    "sliding window",
+    "monotonic stack",
+    "dynamic programming",
 ];
 
 #[derive(Debug, Deserialize)]

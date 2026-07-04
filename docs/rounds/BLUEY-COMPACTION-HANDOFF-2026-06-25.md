@@ -5615,3 +5615,44 @@ Remaining STT follow-up:
 - Add the overlay live-caption UI pass so partial transcript text scrolls horizontally and feels immediate.
 - Add dynamic per-session keyterms from attached docs/resumes/session context without baking private words into binaries.
 - Add deterministic live STT latency smoke coverage.
+
+## Latest Round 334: Live STT Context Cleanup
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-334-LIVE-STT-CONTEXT-CLEANUP.md`
+
+Trigger:
+
+- The owner reported a live caption failure where `given a set of two numbers` was transcribed as `given acetone two numbers`.
+
+What changed:
+
+- Desktop daemon now runs a deterministic cleanup pass on partial/final live STT text before overlay display, transcript storage, and answer use.
+- The cleanup targets common coding/interview mishears such as `given acetone two numbers`, `lro cache`, `lru cash`, `leet code`, `fibinacci`, and `memo is asian`.
+- The cleanup is phrase-boundary aware so unrelated phrases such as `acetone bottle` are preserved.
+- Cleanup logs are metadata-only and do not include transcript text.
+- Server Deepgram built-in keyterms were expanded for common coding phrases and the cap was raised to `64`.
+- Desktop workspace version bumped to `0.1.74`.
+
+Verification so far:
+
+```bash
+cargo fmt -p cue-daemon
+cargo fmt --manifest-path server/Cargo.toml
+cargo test --manifest-path server/Cargo.toml stt::tests -- --nocapture
+cargo test -p cue-daemon live_stt_cleanup -- --nocapture
+cargo test -p cue-daemon live_stt_ -- --nocapture
+```
+
+Deployment status:
+
+- Pending packaging and production deployment for `0.1.74`.

@@ -1009,6 +1009,98 @@ pub fn normalize_transcript_text(text: &str) -> String {
         .to_lowercase()
 }
 
+fn clean_live_stt_text(text: &str) -> String {
+    let mut cleaned = text.to_string();
+    for (needle, replacement) in [
+        ("a given acetone two numbers", "a given set of two numbers"),
+        ("given acetone two numbers", "given a set of two numbers"),
+        ("given acetone numbers", "given a set of numbers"),
+        ("given acetone integers", "given a set of integers"),
+        ("given acetone strings", "given a set of strings"),
+        ("acetone two numbers", "a set of two numbers"),
+        ("acetone numbers", "a set of numbers"),
+        ("acetone integers", "a set of integers"),
+        ("acetone strings", "a set of strings"),
+        ("ell are you cache", "LRU cache"),
+        ("lro cache", "LRU cache"),
+        ("lru cash", "LRU cache"),
+        ("least recently used cash", "least recently used cache"),
+        ("leak code", "LeetCode"),
+        ("lead code", "LeetCode"),
+        ("leet code", "LeetCode"),
+        ("fibinacci", "Fibonacci"),
+        ("fibbonacci", "Fibonacci"),
+        ("memo is asian", "memoization"),
+        ("memoisation", "memoization"),
+        ("hashmap", "hash map"),
+    ] {
+        cleaned = replace_ascii_case_insensitive_phrase(&cleaned, needle, replacement);
+    }
+    cleaned
+}
+
+fn replace_ascii_case_insensitive_phrase(text: &str, needle: &str, replacement: &str) -> String {
+    if text.is_empty() || needle.is_empty() {
+        return text.to_string();
+    }
+    let lower = text.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = lower[cursor..].find(&needle) {
+        let start = cursor + relative_start;
+        let end = start + needle.len();
+        if is_ascii_phrase_boundary(&lower, start, end) {
+            output.push_str(&text[cursor..start]);
+            output.push_str(&match_ascii_replacement_case(
+                &text[start..end],
+                replacement,
+            ));
+            cursor = end;
+        } else {
+            let next = start
+                + lower[start..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(1);
+            output.push_str(&text[cursor..next]);
+            cursor = next;
+        }
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn is_ascii_phrase_boundary(text: &str, start: usize, end: usize) -> bool {
+    let before_ok = text[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+    let after_ok = text[end..]
+        .chars()
+        .next()
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+    before_ok && after_ok
+}
+
+fn match_ascii_replacement_case(matched: &str, replacement: &str) -> String {
+    let Some(first) = matched.chars().next() else {
+        return replacement.to_string();
+    };
+    if !first.is_ascii_uppercase() {
+        return replacement.to_string();
+    }
+    let mut chars = replacement.chars();
+    let Some(replacement_first) = chars.next() else {
+        return String::new();
+    };
+    let mut cased = String::with_capacity(replacement.len());
+    cased.push(replacement_first.to_ascii_uppercase());
+    cased.push_str(chars.as_str());
+    cased
+}
+
 fn compact_normalized_transcript_text(text: &str) -> String {
     normalize_transcript_text(text)
         .chars()
@@ -6538,7 +6630,9 @@ async fn add_audio_transcript_segment_inner(
         Some(AudioSourceKind::Microphone) => Speaker::User,
         None => Speaker::Unknown,
     };
-    let text = segment.text.trim();
+    let raw_text = segment.text.trim();
+    let cleaned_text = clean_live_stt_text(raw_text);
+    let text = cleaned_text.trim();
     if text.is_empty() {
         return Ok(false);
     }
@@ -6547,6 +6641,17 @@ async fn add_audio_transcript_segment_inner(
         Some(AudioSourceKind::Microphone) => "microphone",
         None => "unknown",
     };
+    if text != raw_text {
+        info!(
+            source = source_label,
+            is_final = segment.is_final,
+            raw_chars = raw_text.chars().count(),
+            raw_words = word_count(raw_text),
+            cleaned_chars = text.chars().count(),
+            cleaned_words = word_count(text),
+            "live STT transcript text normalized"
+        );
+    }
 
     if !segment.is_final {
         let _ = send_overlay(
@@ -17470,6 +17575,38 @@ mod tests {
             "we should cache a different answer.",
             true,
         ));
+    }
+
+    #[test]
+    fn live_stt_cleanup_repairs_coding_prompt_mishear() {
+        assert_eq!(
+            clean_live_stt_text("Mic: So let's take a given acetone two numbers."),
+            "Mic: So let's take a given set of two numbers."
+        );
+        assert_eq!(
+            clean_live_stt_text("Given acetone integers, return the sum."),
+            "Given a set of integers, return the sum."
+        );
+    }
+
+    #[test]
+    fn live_stt_cleanup_repairs_common_coding_terms() {
+        assert_eq!(
+            clean_live_stt_text("Can you explain lro cache?"),
+            "Can you explain LRU cache?"
+        );
+        assert_eq!(
+            clean_live_stt_text("Use memo is asian for fibinacci."),
+            "Use memoization for Fibonacci."
+        );
+    }
+
+    #[test]
+    fn live_stt_cleanup_avoids_unrelated_acetone_mentions() {
+        assert_eq!(
+            clean_live_stt_text("The acetone bottle is on the desk."),
+            "The acetone bottle is on the desk."
+        );
     }
 
     #[test]
