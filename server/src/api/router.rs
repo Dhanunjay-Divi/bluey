@@ -5831,12 +5831,28 @@ fn extract_fenced_code_blocks(text: &str) -> Vec<String> {
                     blocks.push(block);
                 }
                 current.clear();
+            } else if let Some(inline_code) = inline_code_after_malformed_opening_fence(line) {
+                if !inline_code.trim().is_empty() {
+                    current.push(inline_code.to_string());
+                }
             }
             in_fence = !in_fence;
             continue;
         }
         if in_fence {
-            current.push(line);
+            if let Some((before, _after)) = line.split_once("```") {
+                if !before.trim().is_empty() {
+                    current.push(before.to_string());
+                }
+                let block = current.join("\n").trim().to_string();
+                if !block.is_empty() {
+                    blocks.push(block);
+                }
+                current.clear();
+                in_fence = false;
+            } else {
+                current.push(line.to_string());
+            }
         }
     }
     blocks
@@ -5852,9 +5868,94 @@ fn strip_fenced_code(text: &str) -> String {
         }
         if !in_fence {
             lines.push(line);
+        } else if let Some((_before, after)) = line.split_once("```") {
+            in_fence = false;
+            if !after.trim().is_empty() {
+                lines.push(after.trim_start());
+            }
         }
     }
     lines.join("\n")
+}
+
+fn inline_code_after_malformed_opening_fence(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let tail = trimmed.strip_prefix("```")?.trim_start();
+    if tail.is_empty() || tail.starts_with('`') {
+        return None;
+    }
+
+    const LANGS: &[&str] = &[
+        "typescript",
+        "javascript",
+        "python",
+        "kotlin",
+        "csharp",
+        "swift",
+        "ruby",
+        "bash",
+        "shell",
+        "java",
+        "rust",
+        "json",
+        "yaml",
+        "html",
+        "css",
+        "cpp",
+        "php",
+        "sql",
+        "tsx",
+        "jsx",
+        "py",
+        "rs",
+        "kt",
+        "cs",
+        "go",
+        "sh",
+        "ts",
+        "js",
+        "c",
+    ];
+
+    for language in LANGS {
+        if let Some(rest) = tail.strip_prefix(language) {
+            let rest = rest.trim_start();
+            if looks_like_inline_code_after_fence(rest) {
+                return Some(rest);
+            }
+        }
+    }
+
+    None
+}
+
+fn looks_like_inline_code_after_fence(rest: &str) -> bool {
+    if rest.is_empty() {
+        return false;
+    }
+
+    [
+        "from ",
+        "import ",
+        "class ",
+        "def ",
+        "for ",
+        "while ",
+        "if ",
+        "return ",
+        "let ",
+        "const ",
+        "function ",
+        "public ",
+        "private ",
+        "package ",
+        "SELECT ",
+        "select ",
+        "{",
+        "[",
+    ]
+    .iter()
+    .any(|prefix| rest.starts_with(prefix))
 }
 
 fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
@@ -7139,6 +7240,23 @@ mod tests {
         assert!(artifact.body.contains("3: Swap both names"));
         assert!(artifact.body.contains("NOTES\n-----\nExplanation:"));
         assert!(!artifact.body.contains("Line notes:"));
+    }
+
+    #[test]
+    fn response_artifact_repairs_malformed_python_fence() {
+        let artifact = response_artifact(
+            "Approach\n- Sum both choices.\n\n```pythonfrom typing import List\nclass Solution:\n    def canAliceWin(self, nums: List[int]) -> bool:\n        total = sum(nums)\n        single_sum = sum(x for x in nums if x < 10)\n        double_sum = sum(x for x in nums if 10 <= x <= 99)\n        return single_sum > total - single_sum or double_sum > total - double_sum```\nLine notes:\n1: Import List for the LeetCode signature.\n4-6: Compare each Alice choice against Bob's remaining total.\nExplanation:\nAlice only has two legal choices.",
+        )
+        .expect("code artifact");
+
+        assert_eq!(artifact.artifact_type, "code");
+        assert!(artifact.body.contains("from typing import List"));
+        assert!(artifact.body.contains("double_sum = sum"));
+        assert!(!artifact.body.contains("```"));
+        assert!(artifact.body.contains("LINE NOTES\n----------"));
+        assert!(artifact.body.contains("4-6: Compare each Alice choice"));
+        assert!(artifact.body.contains("NOTES\n-----\nApproach"));
+        assert!(artifact.body.contains("Explanation:"));
     }
 
     #[test]

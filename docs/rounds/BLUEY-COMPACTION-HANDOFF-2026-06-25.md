@@ -5265,3 +5265,55 @@ Remaining notes:
 - Normal CLI has no `attach` command; document upload should still be smoke-tested through overlay/drop-path or IPC.
 - Web-search planning/logging is present, but live search provider is not configured in this environment.
 - System design answers work but still need compact/canvas latency polish.
+
+## Latest Round 329: Code Follow-Up Context Fence Repair
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-329-CODE-FOLLOWUP-CONTEXT-FENCE-REPAIR.md`
+
+Trigger:
+
+- The owner showed old session `6CC7D7A4` where a coding prompt got a short/malformed first answer, the follow-up `Can you give me Python code?` lost the previous problem statement, and the next follow-up failed with `Ref: 61B3DA69`.
+
+Root cause:
+
+- The visible session was on daemon `0.1.64`, before Round 328.
+- The daemon follow-up heuristic did not keep recent Q&A when the short follow-up only had generic code/language terms.
+- Both daemon and server artifact parsers were brittle around malformed streamed fences like ````pythonfrom typing import List` and inline closing fences.
+- Desktop-local artifact formatting did not preserve line notes/notes as canvas sections.
+
+What changed:
+
+- Short code regeneration follow-ups now retain prior Q&A when all topic terms are generic code/language terms.
+- Specific new code topics such as `Write Fibonacci code in Python` still skip stale Q&A.
+- Desktop and server code artifact parsers now recover malformed opening fences and strip inline closing fences.
+- Desktop code artifacts now preserve `LINE NOTES`, `COMPLEXITY`, and `NOTES` sections.
+- Workspace version bumped to `0.1.67`.
+
+Verification at handoff update time:
+
+```bash
+cargo fmt --check
+cargo test -p cue-daemon answer_overlay_artifact_repairs_malformed_python_fence -- --nocapture
+cargo test -p cue-daemon meeting_context_keeps_recent_qa_for_short_code_regeneration_follow_up -- --nocapture
+cargo test -p cue-daemon meeting_context_skips_recent_qa_for_specific_new_code_topic -- --nocapture
+cargo test -p cue-daemon answer_overlay_artifact_detects_fenced_code -- --nocapture
+cargo test -p bluey-server response_artifact_repairs_malformed_python_fence -- --nocapture
+cargo test -p bluey-server response_artifact_detects_code -- --nocapture
+cargo test -p bluey-server answer_plan_code_request_uses_deep_code_artifact -- --nocapture
+cargo check -p cue-daemon
+cargo check -p bluey-server
+```
+
+Deployment status at initial handoff update:
+
+- Not yet deployed. Package/publish desktop `0.1.67` and deploy the API parser fix next.

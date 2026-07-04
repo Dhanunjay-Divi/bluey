@@ -7588,12 +7588,28 @@ fn extract_fenced_code_blocks(text: &str) -> Vec<String> {
                     blocks.push(block);
                 }
                 current.clear();
+            } else if let Some(inline_code) = inline_code_after_malformed_opening_fence(line) {
+                if !inline_code.trim().is_empty() {
+                    current.push(inline_code.to_string());
+                }
             }
             in_fence = !in_fence;
             continue;
         }
         if in_fence {
-            current.push(line);
+            if let Some((before, _after)) = line.split_once("```") {
+                if !before.trim().is_empty() {
+                    current.push(before.to_string());
+                }
+                let block = current.join("\n").trim().to_string();
+                if !block.is_empty() {
+                    blocks.push(block);
+                }
+                current.clear();
+                in_fence = false;
+            } else {
+                current.push(line.to_string());
+            }
         }
     }
     blocks
@@ -7609,13 +7625,99 @@ fn strip_fenced_code(text: &str) -> String {
         }
         if !in_fence {
             lines.push(line);
+        } else if let Some((_before, after)) = line.split_once("```") {
+            in_fence = false;
+            if !after.trim().is_empty() {
+                lines.push(after.trim_start());
+            }
         }
     }
     lines.join("\n")
 }
 
+fn inline_code_after_malformed_opening_fence(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let tail = trimmed.strip_prefix("```")?.trim_start();
+    if tail.is_empty() || tail.starts_with('`') {
+        return None;
+    }
+
+    const LANGS: &[&str] = &[
+        "typescript",
+        "javascript",
+        "python",
+        "kotlin",
+        "csharp",
+        "swift",
+        "ruby",
+        "bash",
+        "shell",
+        "java",
+        "rust",
+        "json",
+        "yaml",
+        "html",
+        "css",
+        "cpp",
+        "php",
+        "sql",
+        "tsx",
+        "jsx",
+        "py",
+        "rs",
+        "kt",
+        "cs",
+        "go",
+        "sh",
+        "ts",
+        "js",
+        "c",
+    ];
+
+    for language in LANGS {
+        if let Some(rest) = tail.strip_prefix(language) {
+            let rest = rest.trim_start();
+            if looks_like_inline_code_after_fence(rest) {
+                return Some(rest);
+            }
+        }
+    }
+
+    None
+}
+
+fn looks_like_inline_code_after_fence(rest: &str) -> bool {
+    if rest.is_empty() {
+        return false;
+    }
+
+    [
+        "from ",
+        "import ",
+        "class ",
+        "def ",
+        "for ",
+        "while ",
+        "if ",
+        "return ",
+        "let ",
+        "const ",
+        "function ",
+        "public ",
+        "private ",
+        "package ",
+        "SELECT ",
+        "select ",
+        "{",
+        "[",
+    ]
+    .iter()
+    .any(|prefix| rest.starts_with(prefix))
+}
+
 fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
     let notes = strip_fenced_code(body).trim().to_string();
+    let (line_notes, remaining_notes) = split_line_notes(&notes);
     let mut sections = Vec::new();
     if !code_blocks.is_empty() {
         sections.push(format!(
@@ -7623,15 +7725,131 @@ fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
             code_blocks.join("\n\n// ---\n\n")
         ));
     }
-    let complexity = extract_complexity_lines(&notes);
+    if let Some(line_notes) = line_notes {
+        sections.push(format!("LINE NOTES\n----------\n{line_notes}"));
+    }
+    let complexity = extract_complexity_lines(&remaining_notes);
     if !complexity.is_empty() {
         sections.push(format!("COMPLEXITY\n----------\n{complexity}"));
+    }
+    let remaining_notes = strip_complexity_lines(&remaining_notes);
+    if !remaining_notes.is_empty() {
+        sections.push(format!("NOTES\n-----\n{remaining_notes}"));
     }
     if sections.is_empty() {
         body.to_string()
     } else {
         sections.join("\n\n")
     }
+}
+
+fn split_line_notes(notes: &str) -> (Option<String>, String) {
+    let clean = notes.trim();
+    if clean.is_empty() {
+        return (None, String::new());
+    }
+
+    let mut before = Vec::new();
+    let mut line_notes = Vec::new();
+    let mut after = Vec::new();
+    let mut in_line_notes = false;
+    let mut in_after = false;
+
+    for raw_line in clean.lines() {
+        let line = raw_line.trim_end();
+        if !in_line_notes && !in_after {
+            if let Some(rest) = line_notes_heading_remainder(line) {
+                in_line_notes = true;
+                if !rest.trim().is_empty() {
+                    line_notes.push(rest.trim().to_string());
+                }
+                continue;
+            }
+            before.push(line.to_string());
+            continue;
+        }
+
+        if in_line_notes && !in_after && looks_like_post_line_notes_heading(line) {
+            in_after = true;
+            after.push(line.to_string());
+            continue;
+        }
+
+        if in_after {
+            after.push(line.to_string());
+        } else {
+            line_notes.push(line.to_string());
+        }
+    }
+
+    let line_notes_text = trim_joined_lines(line_notes);
+    let mut remaining_parts = Vec::new();
+    let before_text = trim_joined_lines(before);
+    let after_text = trim_joined_lines(after);
+    if !before_text.is_empty() {
+        remaining_parts.push(before_text);
+    }
+    if !after_text.is_empty() {
+        remaining_parts.push(after_text);
+    }
+
+    (
+        (!line_notes_text.is_empty()).then_some(line_notes_text),
+        remaining_parts.join("\n\n"),
+    )
+}
+
+fn trim_joined_lines(lines: Vec<String>) -> String {
+    lines.join("\n").trim().to_string()
+}
+
+fn line_notes_heading_remainder(line: &str) -> Option<&str> {
+    let trimmed = trim_markdown_heading(line);
+    let lower = trimmed.to_ascii_lowercase();
+    for heading in [
+        "line notes",
+        "line-by-line notes",
+        "line by line notes",
+        "line annotations",
+        "visual line notes",
+    ] {
+        if lower == heading {
+            return Some("");
+        }
+        if let Some(rest) = lower.strip_prefix(&format!("{heading}:")) {
+            let offset = trimmed.len().saturating_sub(rest.len());
+            return Some(trimmed[offset..].trim_start());
+        }
+    }
+    None
+}
+
+fn looks_like_post_line_notes_heading(line: &str) -> bool {
+    let trimmed = trim_markdown_heading(line);
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.trim_end_matches(':').to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "notes"
+            | "explanation"
+            | "approach"
+            | "complexity"
+            | "time complexity"
+            | "space complexity"
+            | "edge cases"
+            | "walkthrough"
+            | "why this works"
+    )
+}
+
+fn trim_markdown_heading(line: &str) -> &str {
+    line.trim()
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches('*')
+        .trim()
 }
 
 fn normalize_canvas_artifact_body(artifact_type: CardArtifactType, body: &str) -> String {
@@ -7665,7 +7883,9 @@ fn normalize_code_canvas_body(body: &str) -> String {
         || upper.contains("CHANGED LINES\n====")
     {
         let mut code_lines = Vec::new();
+        let mut line_notes_lines = Vec::new();
         let mut complexity_lines = Vec::new();
+        let mut notes_lines = Vec::new();
         let mut section: Option<&str> = None;
         let mut code_header = "CODE";
         for line in normalized.lines() {
@@ -7694,6 +7914,7 @@ fn normalize_code_canvas_body(body: &str) -> String {
                         };
                         Some("code")
                     }
+                    "LINE NOTES" => Some("line_notes"),
                     "COMPLEXITY" | "TIME" | "SPACE" => Some("complexity"),
                     _ => Some("notes"),
                 };
@@ -7704,8 +7925,10 @@ fn normalize_code_canvas_body(body: &str) -> String {
             }
             match section {
                 Some("code") => code_lines.push(line),
+                Some("line_notes") => line_notes_lines.push(line),
                 Some("complexity") => complexity_lines.push(line),
                 Some("notes") if is_complexity_line(trimmed) => complexity_lines.push(line),
+                Some("notes") => notes_lines.push(line),
                 _ => {}
             }
         }
@@ -7714,9 +7937,17 @@ fn normalize_code_canvas_body(body: &str) -> String {
         if !code.is_empty() {
             sections.push(format!("{code_header}\n----\n{code}"));
         }
+        let line_notes = line_notes_lines.join("\n").trim().to_string();
+        if !line_notes.is_empty() {
+            sections.push(format!("LINE NOTES\n----------\n{line_notes}"));
+        }
         let complexity = complexity_lines.join("\n").trim().to_string();
         if !complexity.is_empty() {
             sections.push(format!("COMPLEXITY\n----------\n{complexity}"));
+        }
+        let notes = strip_complexity_lines(&notes_lines.join("\n"));
+        if !notes.is_empty() {
+            sections.push(format!("NOTES\n-----\n{notes}"));
         }
         if !sections.is_empty() {
             return sections.join("\n\n");
@@ -7853,7 +8084,7 @@ fn extract_code_section_from_canvas(body: &str) -> String {
         }
         if matches!(
             header.as_str(),
-            "COMPLEXITY" | "TIME" | "SPACE" | "NOTES" | "EXPLANATION" | "APPROACH"
+            "LINE NOTES" | "COMPLEXITY" | "TIME" | "SPACE" | "NOTES" | "EXPLANATION" | "APPROACH"
         ) {
             if in_code {
                 break;
@@ -7894,6 +8125,16 @@ fn is_complexity_line(line: &str) -> bool {
         || lower.starts_with("- space:")
         || lower.starts_with("time ")
         || lower.starts_with("space ")
+}
+
+fn strip_complexity_lines(text: &str) -> String {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|line| !is_complexity_line(line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 fn format_structured_artifact(body: &str, fallback_heading: &str) -> String {
@@ -11126,6 +11367,10 @@ fn should_include_recent_conversation_context(
     }
 
     let has_reference = has_recent_context_reference(trimmed);
+    if has_reference || looks_like_contextual_code_follow_up(trimmed, &question_terms) {
+        return true;
+    }
+
     let standalone_new_topic = looks_like_standalone_new_topic_request(trimmed, &question_terms);
     if standalone_new_topic && !has_reference {
         debug!(
@@ -11142,10 +11387,6 @@ fn should_include_recent_conversation_context(
         .filter(|term| conversation_terms.contains(*term))
         .count();
     if overlap >= 2 {
-        return true;
-    }
-
-    if has_reference {
         return true;
     }
 
@@ -11192,6 +11433,62 @@ fn has_recent_context_reference(question: &str) -> bool {
     ]
     .iter()
     .any(|signal| q.contains(signal))
+}
+
+fn looks_like_contextual_code_follow_up(
+    question: &str,
+    terms: &std::collections::BTreeSet<String>,
+) -> bool {
+    let q = question.trim().to_ascii_lowercase();
+    let code_request = [
+        "code",
+        "python code",
+        "java code",
+        "solution",
+        "implementation",
+        "function",
+        "class",
+        "write it",
+        "give me",
+        "can you give",
+    ]
+    .iter()
+    .any(|signal| q.contains(signal));
+    if !code_request {
+        return false;
+    }
+
+    terms
+        .iter()
+        .all(|term| is_generic_code_follow_up_term(term.as_str()))
+}
+
+fn is_generic_code_follow_up_term(term: &str) -> bool {
+    matches!(
+        term,
+        "python"
+            | "java"
+            | "rust"
+            | "golang"
+            | "go"
+            | "javascript"
+            | "typescript"
+            | "swift"
+            | "kotlin"
+            | "ruby"
+            | "php"
+            | "bash"
+            | "shell"
+            | "sql"
+            | "cpp"
+            | "csharp"
+            | "solution"
+            | "implementation"
+            | "function"
+            | "class"
+            | "snippet"
+            | "method"
+    )
 }
 
 fn looks_like_standalone_new_topic_request(
@@ -14901,6 +15198,44 @@ mod tests {
     }
 
     #[test]
+    fn meeting_context_keeps_recent_qa_for_short_code_regeneration_follow_up() {
+        let mut meeting = MeetingRecord::new(Some("Coding practice".to_string()));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "You are given an array of positive integers nums. Alice can choose all single-digit numbers or all double-digit numbers. Return true if Alice can win.",
+            "Sum Alice's single-digit choice and double-digit choice, then compare either choice against Bob's remaining total.",
+            Some("overlay ask".to_string()),
+            Some("Bluey managed".to_string()),
+        ));
+
+        let context =
+            answer_context_from_meeting(&meeting, &[], Some("Can you give me Python code?"));
+
+        let recent = context
+            .iter()
+            .find(|item| item.title.as_deref() == Some("Recent Bluey Q&A"))
+            .expect("recent coding context");
+        assert!(recent.content.contains("Alice can choose"));
+    }
+
+    #[test]
+    fn meeting_context_skips_recent_qa_for_specific_new_code_topic() {
+        let mut meeting = MeetingRecord::new(Some("Coding practice".to_string()));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "You are given an array of positive integers nums. Alice can choose all single-digit numbers or all double-digit numbers. Return true if Alice can win.",
+            "Sum Alice's single-digit choice and double-digit choice, then compare either choice against Bob's remaining total.",
+            Some("overlay ask".to_string()),
+            Some("Bluey managed".to_string()),
+        ));
+
+        let context =
+            answer_context_from_meeting(&meeting, &[], Some("Write Fibonacci code in Python."));
+
+        assert!(!context
+            .iter()
+            .any(|item| item.title.as_deref() == Some("Recent Bluey Q&A")));
+    }
+
+    #[test]
     fn answer_memory_lookup_is_explicit_or_followup_only() {
         assert!(!should_lookup_answer_memory(
             "Write a Python LRU cache.",
@@ -16447,7 +16782,27 @@ mod tests {
         assert!(artifact.body.contains("fn solve()"));
         assert!(artifact.body.contains("COMPLEXITY\n----------"));
         assert!(artifact.body.contains("Time Complexity: O(n)"));
-        assert!(!artifact.body.contains("NOTES\n-----"));
+        assert!(artifact.body.contains("NOTES\n-----"));
+        assert!(artifact.body.contains("Use a hash map."));
+    }
+
+    #[test]
+    fn answer_overlay_artifact_repairs_malformed_python_fence() {
+        let artifact = answer_overlay_artifact(
+            "Approach\n- Sum both choices.\n\n```pythonfrom typing import List\nclass Solution:\n    def canAliceWin(self, nums: List[int]) -> bool:\n        total = sum(nums)\n        single_sum = sum(x for x in nums if x < 10)\n        double_sum = sum(x for x in nums if 10 <= x <= 99)\n        return single_sum > total - single_sum or double_sum > total - double_sum```\nLine notes:\n1: Import List for the LeetCode signature.\n4-6: Compare each Alice choice against Bob's remaining total.\nExplanation:\nAlice only has two legal choices, so test both.\nTime Complexity: O(n)\nSpace Complexity: O(1)",
+        )
+        .expect("code artifact");
+
+        assert_eq!(artifact.artifact_type, CardArtifactType::Code);
+        assert!(artifact.body.contains("from typing import List"));
+        assert!(artifact.body.contains("double_sum = sum"));
+        assert!(!artifact.body.contains("```"));
+        assert!(artifact.body.contains("LINE NOTES\n----------"));
+        assert!(artifact.body.contains("4-6: Compare each Alice choice"));
+        assert!(artifact.body.contains("COMPLEXITY\n----------"));
+        assert!(artifact.body.contains("Time Complexity: O(n)"));
+        assert!(artifact.body.contains("NOTES\n-----"));
+        assert!(artifact.body.contains("Alice only has two legal choices"));
     }
 
     #[test]
