@@ -1004,8 +1004,19 @@ pub const REGISTRY: &[AgentEntry] = &[
         // `fallback_models` via `curated_models_for`.
         models_command: None,
         binary_candidates: &["codex"],
-        app_bundles: &[],
-        app_dirs_windows: &[],
+        // The Codex DESKTOP app (`/Applications/Codex.app`, macOS) — a SEPARATE
+        // install from the `codex` CLI and from ChatGPT.app. Listed so a
+        // Codex-app-only machine (app installed, CLI not on PATH) still surfaces
+        // Codex in discovery, like every other GUI agent's `.app`. NOTE: the app's
+        // `~/Library/Application Support/Codex` dir is an ELECTRON BROWSER PROFILE
+        // (ActorSafetyLists, Safe Browsing Cookies, GPUCache, …), NOT a session
+        // store — verified on-disk 2026-07 — so it is deliberately NOT a
+        // `data_dir_globs` entry. The app's readable threads live in `~/.codex`
+        // (already scanned below); its cloud/GUI conversations are encrypted +
+        // keychain-ACL-locked and intentionally unread (see the store comment
+        // above). So the `.app` adds DETECTION only, never a phantom session dir.
+        app_bundles: &["Codex.app"],
+        app_dirs_windows: &["Codex"],
         data_dir_globs: &[".codex"],
         app_data_windows: &[],
         // The CLI rollouts (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`,

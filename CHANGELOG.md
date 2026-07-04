@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Overlay History/Agents screens left dead space at the bottom** and
+  double-scrolled: the list roots hardcoded `maxHeight: 480` and App's tab body
+  scrolled on top of each screen's own scroll. The screens now `flex: 1` to fill
+  the tab body and scroll internally (single scroll), so the panel uses the full
+  window height.
+- **Model picker lagged on every agent switch**: AskScreen fetched the model list
+  in a per-mount effect with local state, so the picker stayed hidden until a
+  fresh daemon round-trip. Models now live in the shared SWR `DataStore` (cached
+  per kind, revalidated in the background) and are prefetched the moment an agent
+  is attached — so the picker appears instantly on re-attach.
+
+### Changed
+- **Codex desktop app is now detected** (`/Applications/Codex.app`), so a machine
+  with the Codex app but not the `codex` CLI still surfaces Codex. Its
+  `Application Support/Codex` dir is an Electron browser profile (not a session
+  store), so it is deliberately not scanned for sessions — the app's readable
+  threads already come from `~/.codex`.
+
 ### Added
 - Per-agent **model override** for the attached agent: a vendor model id
   (e.g. `composer-2.5`, `gpt-5.1-codex`) carried on `CueSettings.attached_model`
