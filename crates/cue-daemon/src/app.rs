@@ -49,6 +49,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, http::HeaderValue, Message as WebSocketMessage,
@@ -953,6 +954,14 @@ pub(crate) struct Daemon {
     /// back (Fix-button slice F3); see [`PendingFix`] and [`take_valid_pending_fix`].
     pending_fixes: Mutex<HashMap<uuid::Uuid, PendingFix>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
+    /// JoinHandle for the outer STT + ordered-sink task spawned per listening
+    /// session in [`start_system_audio_capture_task`]. `system_audio.stop()` only
+    /// joins the capture *supervisor* (it closes `sys_rx`); this task then flushes
+    /// the STT provider and drains any queued trailing finals into the still-active
+    /// meeting. [`stop_audio_capture`] MUST await this handle before an auto-end
+    /// archives the meeting, or those tail finals commit after the archive and
+    /// re-fragment into a fresh 1-line meeting. `None` when no session is running.
+    system_audio_task: Mutex<Option<JoinHandle<()>>>,
     /// Running decisions ledger for the active meeting (see [`crate::ledger`]).
     /// Populated by stateless cheap-lane extraction every N turns; rendered as a
     /// pinned context block on the answer path. Reset when a new meeting starts.
@@ -1161,6 +1170,7 @@ pub async fn run() -> Result<()> {
         active_answer_card: Mutex::new(None),
         pending_fixes: Mutex::new(HashMap::new()),
         system_audio: Mutex::new(None),
+        system_audio_task: Mutex::new(None),
         ledger: Mutex::new(cue_core::LedgerState::default()),
         live_transcript_tx: broadcast::channel(64).0,
         rag: rag_pipeline,
@@ -1286,6 +1296,12 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
     let mut slot = daemon.system_audio.lock().await;
     if let Some(prev) = slot.take() {
         prev.stop().await;
+        // Joining the supervisor above closed the prior session's `sys_rx`, so its
+        // outer STT/sink task will break and finish draining. Await it here so a
+        // restart never leaves the previous session's tail-drain racing this one.
+        if let Some(prev_task) = daemon.system_audio_task.lock().await.take() {
+            let _ = prev_task.await;
+        }
     }
     // TEST HOOK (`BLUEY_AUDIO_WAV_FILE`): drive the FULL live pipeline from a 16 kHz
     // mono WAV instead of the native ScreenCaptureKit helper — no mic, no TCC grant.
@@ -1342,7 +1358,7 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
 
             let idle_timeout = audio_idle_stop_timeout();
             let daemon_sys = daemon.clone();
-            tokio::spawn(async move {
+            let capture_task = tokio::spawn(async move {
                 // ── ORDERED TRANSCRIPT SINK ───────────────────────────────────
                 // Persist transcript segments strictly in RECEIPT ORDER on a
                 // SINGLE consumer task. The select! loop below hands each Final
@@ -1401,6 +1417,10 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                 let mut last_transcript_at = Instant::now();
                 let mut idle_tick = tokio::time::interval(Duration::from_secs(15));
                 idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Set when the idle arm decides to stop THIS session. The auto-end is
+                // deferred until after the loop breaks and the tail-drain completes,
+                // so the archive never races trailing finals (see finish_idle_auto_stop).
+                let mut idle_stop_pending = false;
 
                 // Speaker diarization (feature `diarize`): retain the meeting
                 // audio (rolling window for the live tier + full buffer for the
@@ -1542,7 +1562,7 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                                 }
                             }
                             _ = idle_tick.tick() => {
-                                if maybe_auto_stop_idle_audio(
+                                match idle_audio_should_stop(
                                     &daemon_sys,
                                     &session_id,
                                     last_transcript_at,
@@ -1550,9 +1570,18 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                                 )
                                 .await
                                 {
-                                    // Either this session was auto-stopped or it
-                                    // is no longer current — stop draining.
-                                    break;
+                                    IdleAudioDecision::Continue => {}
+                                    // Superseded by a newer session — just stop
+                                    // draining; that session owns teardown.
+                                    IdleAudioDecision::Superseded => break,
+                                    // Idle: break now so the loop exits and the
+                                    // tail-drain below runs to completion; the
+                                    // auto-end then happens AFTER the drain (never
+                                    // racing trailing finals — see finish_idle_auto_stop).
+                                    IdleAudioDecision::Stop => {
+                                        idle_stop_pending = true;
+                                        break;
+                                    }
                                 }
                             }
                             // LIVE diarization tick: re-diarize the rolling window
@@ -1595,7 +1624,21 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                 // before this capture task exits (flush the last in-flight finals).
                 drop(seg_tx);
                 let _ = sink_task.await;
+
+                // Idle auto-stop finalize: the drain above committed every trailing
+                // final into the still-active meeting, so archiving now can never
+                // race a late final into a fresh fragment. Only the idle path runs
+                // this — an external stop is finalized by its own caller after
+                // `stop_audio_capture` joins this task.
+                if idle_stop_pending {
+                    finish_idle_auto_stop(&daemon_sys, idle_timeout).await;
+                }
             });
+            // Publish the outer task handle so `stop_audio_capture` can await the
+            // full tail-drain (flush + ordered-sink) BEFORE an auto-end archives the
+            // meeting — otherwise trailing finals commit after the archive and
+            // re-fragment. Any prior handle was joined above at session start.
+            *daemon.system_audio_task.lock().await = Some(capture_task);
             Ok(())
         }
         Err(e) => {
@@ -5728,16 +5771,32 @@ fn pcm16_16k_duration_ms(byte_len: usize) -> u32 {
         .min(u32::MAX as u64)) as u32
 }
 
-async fn maybe_auto_stop_idle_audio(
+/// Outcome of the in-task idle check (see [`idle_audio_should_stop`]).
+enum IdleAudioDecision {
+    /// Not idle yet — keep draining.
+    Continue,
+    /// This session is no longer current (a newer capture superseded it) — stop
+    /// draining, but do NOT tear anything down (the newer session owns it).
+    Superseded,
+    /// Idle window elapsed for the current session — the caller should break and,
+    /// after the tail-drain, auto-end + emit the idle notice.
+    Stop,
+}
+
+/// Pure idle decision for the in-capture-task path. Does NOT tear down capture and
+/// does NOT self-join — the capture task calls this from inside its own select!
+/// loop, so calling the full [`stop_audio_capture`] here would await the task's own
+/// JoinHandle and deadlock. The caller breaks its loop (which finishes the
+/// tail-drain) and then calls [`finish_idle_auto_stop`].
+async fn idle_audio_should_stop(
     daemon: &Arc<Daemon>,
     session_id: &str,
     last_transcript_at: Instant,
     idle_timeout: Duration,
-) -> bool {
+) -> IdleAudioDecision {
     if last_transcript_at.elapsed() < idle_timeout {
-        return false;
+        return IdleAudioDecision::Continue;
     }
-
     let is_current_session = daemon
         .audio
         .lock()
@@ -5745,8 +5804,47 @@ async fn maybe_auto_stop_idle_audio(
         .session_id
         .as_deref()
         .is_some_and(|active| active == session_id);
-    if !is_current_session {
-        return true;
+    if is_current_session {
+        IdleAudioDecision::Stop
+    } else {
+        IdleAudioDecision::Superseded
+    }
+}
+
+/// Tear down capture + auto-end after an in-task idle stop. Called by the capture
+/// task AFTER its select! loop has broken and the tail-drain (STT flush + ordered
+/// sink) has fully completed, so the archive can never race trailing finals and the
+/// meeting is archived (never discarded). Runs `stop_audio_capture` for symmetry
+/// with the external stop path; the outer-task join inside it is a no-op here
+/// because this task already took its own handle before running (or it is None).
+async fn finish_idle_auto_stop(daemon: &Arc<Daemon>, idle_timeout: Duration) {
+    // We ARE the outer capture task, so drop our OWN handle from the slot before
+    // `stop_audio_capture` runs — otherwise its join-the-outer-task step would await
+    // this very task and deadlock. Dropping the JoinHandle only detaches it; we keep
+    // running to completion here.
+    let _self_handle = daemon.system_audio_task.lock().await.take();
+    let _status = stop_audio_capture(daemon).await;
+    match auto_end_active_meeting(daemon).await {
+        Ok(None) => debug!("idle auto-stop: no active meeting to auto-end"),
+        Ok(Some(_)) => {}
+        Err(error) => warn!(error = %error, "idle auto-stop: failed to archive meeting"),
+    }
+    emit_idle_auto_stop_notice(daemon, idle_timeout).await;
+}
+
+/// Idle auto-stop for the separate REST/cloud relay loops (`real_audio_loop` /
+/// `real_audio_relay_loop`). Those run in their OWN task (not the system-audio
+/// capture task), so calling the self-joining `stop_audio_capture` here is safe.
+async fn maybe_auto_stop_idle_audio(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+    last_transcript_at: Instant,
+    idle_timeout: Duration,
+) -> bool {
+    match idle_audio_should_stop(daemon, session_id, last_transcript_at, idle_timeout).await {
+        IdleAudioDecision::Continue => return false,
+        IdleAudioDecision::Superseded => return true,
+        IdleAudioDecision::Stop => {}
     }
 
     let _status = stop_audio_capture(daemon).await;
@@ -5759,6 +5857,13 @@ async fn maybe_auto_stop_idle_audio(
         Ok(Some(_)) => {}
         Err(error) => warn!(error = %error, "idle auto-stop: failed to archive meeting"),
     }
+    emit_idle_auto_stop_notice(daemon, idle_timeout).await;
+    true
+}
+
+/// Stamp the idle-stop note on the audio status and surface the "Recording
+/// auto-stopped" system card with the final balance. Shared by both idle paths.
+async fn emit_idle_auto_stop_notice(daemon: &Arc<Daemon>, idle_timeout: Duration) {
     {
         let mut audio = daemon.audio.lock().await;
         audio.note = Some(format!(
@@ -5785,7 +5890,6 @@ async fn maybe_auto_stop_idle_audio(
         ),
     )
     .await;
-    true
 }
 
 fn audio_idle_stop_timeout() -> Duration {
@@ -6686,6 +6790,18 @@ async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
         capture.stop().await;
     }
 
+    // Await the outer STT/sink task to completion. `capture.stop()` above joined
+    // only the capture *supervisor*, which closed `sys_rx`; the outer task then
+    // breaks its select! loop, flushes the STT provider, and drains any queued
+    // trailing finals into the STILL-ACTIVE meeting. We MUST join it here, before
+    // any caller runs `auto_end_active_meeting`: otherwise those tail finals commit
+    // after the archive, find no active meeting, and spawn a fresh never-ended
+    // 1-line fragment — the exact bug this lifecycle fix removes. The outer task is
+    // bounded (the provider flush + a finite queue drain), so this join is prompt.
+    if let Some(task) = daemon.system_audio_task.lock().await.take() {
+        let _ = task.await;
+    }
+
     let mut audio = daemon.audio.lock().await;
     let status = audio.clone().stopped();
     *audio = status.clone();
@@ -6766,6 +6882,18 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     });
 }
 
+/// Whether an audio transcript segment may CREATE a meeting when none is active.
+///
+/// Only while the audio session is still live: the session meeting is minted at
+/// listening-start, so during a live span the guard is already `Some` and this is
+/// moot; once capture has stopped (`audio_live == false`) a straggling final from
+/// the STT/sink tail-drain must be DROPPED, never re-create a fresh never-ended
+/// 1-line fragment (the fragmentation bug). Pure so the invariant is unit-testable
+/// without a full [`Daemon`].
+fn should_create_meeting_for_audio_segment(audio_live: bool) -> bool {
+    audio_live
+}
+
 async fn add_audio_transcript_segment_inner(
     daemon: &Arc<Daemon>,
     segment: &cue_core::audio::SttSegmentMetadata,
@@ -6819,6 +6947,17 @@ async fn add_audio_transcript_segment_inner(
     let (meeting_snapshot, committed_segment) = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
+            // No active meeting. NEVER re-create one from a stray audio final: the
+            // session meeting is minted at listening-start, and by the time capture
+            // has been torn down (auto-end already archived it) any straggling final
+            // from the drain must NOT spawn a fresh never-ended 1-line fragment — the
+            // exact bug this lifecycle fix removes. Only create when the audio session
+            // is still live (guards the theoretical case where a final beats the
+            // start-time create); otherwise drop the late segment.
+            if !should_create_meeting_for_audio_segment(audio_session_id.is_some()) {
+                debug!("dropping audio transcript segment: no active meeting and capture stopped");
+                return Ok(());
+            }
             *meeting_guard = Some(MeetingRecord::new(Some(generic_meeting_title())));
         }
 
@@ -10790,19 +10929,14 @@ async fn start_new_session(
     source: impl Into<String>,
 ) -> Result<MeetingRecord> {
     let source = source.into();
-    let archived_summary = {
-        let mut meeting_guard = daemon.meeting.lock().await;
-        if let Some(mut meeting) = meeting_guard.take() {
-            meeting.ended_at = Some(clock::now_epoch_ms_string());
-            let recap = generate_recap(&meeting);
-            meeting.summary = Some(recap.summary);
-            let title = meeting.title.clone();
-            let path = daemon.store.archive(&meeting)?;
-            Some(format!("{title} archived to {}.", path.display()))
-        } else {
-            None
-        }
-    };
+    // Archive the previous meeting through the SINGLE shared end path so it gets
+    // the same treatment as every other auto-end: recap-derived title upgrade,
+    // spawn_auto_recap, and — critically — the ledger reset. Archiving inline here
+    // (the old path) skipped the reset, so the prior meeting's LedgerState bled into
+    // the fresh meeting minted just below.
+    let archived_summary = auto_end_active_meeting(daemon)
+        .await?
+        .map(|meeting| format!("{} archived.", meeting.title));
 
     let meeting = {
         let mut meeting_guard = daemon.meeting.lock().await;
@@ -13066,10 +13200,12 @@ mod tests {
     fn changing_attached_session_resets_the_context_primed_marker() {
         // A primed session that gets a DIFFERENT session id (user re-attach) must
         // re-prime; a model-only re-attach (session preserved) must NOT.
-        let mut s = CueSettings::default();
-        s.attached_agent = Some("claude_code".to_string());
-        s.attached_session = Some("sess-1".to_string());
-        s.attached_context_primed = true;
+        let mut s = CueSettings {
+            attached_agent: Some("claude_code".to_string()),
+            attached_session: Some("sess-1".to_string()),
+            attached_context_primed: true,
+            ..CueSettings::default()
+        };
 
         // Model-only re-attach (no new session) preserves session AND primed.
         apply_attach_to_settings(
@@ -14608,10 +14744,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_auto_end_never_fires_while_audio_live() {
-        // The archive helper is only ever CALLED after stop_audio_capture; when
-        // invoked with no active meeting it is a benign no-op (Ok(None)), never a
-        // panic or a spurious archive. (Liveness is structurally guaranteed by the
-        // call sites; this pins the graceful no-active contract.)
+        // The archive helper is only ever CALLED after stop_audio_capture, which
+        // now JOINS the outer STT/sink task before returning — so every trailing
+        // final has been committed to the still-active meeting before the archive
+        // runs, and no late final can re-fragment afterward. When invoked with no
+        // active meeting the helper is a benign no-op (Ok(None)), never a panic or a
+        // spurious archive; this pins that graceful no-active contract.
         let (store, base) = temp_store();
         assert!(
             store.load_active().expect("read active").is_none(),
@@ -14668,6 +14806,22 @@ mod tests {
             "auto-end stamps the recap summary"
         );
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_late_audio_final_after_stop_never_creates_a_fragment() {
+        // The re-fragmentation guard: with no active meeting, an audio segment may
+        // create one ONLY while capture is still live. Once capture has stopped
+        // (the auto-end already archived the session meeting), a trailing final from
+        // the STT/sink tail-drain must NOT spawn a fresh never-ended 1-line meeting.
+        assert!(
+            should_create_meeting_for_audio_segment(true),
+            "a live session with no meeting yet may create the session meeting"
+        );
+        assert!(
+            !should_create_meeting_for_audio_segment(false),
+            "a trailing final after capture stopped must be dropped, not re-fragment"
+        );
     }
 
     #[test]

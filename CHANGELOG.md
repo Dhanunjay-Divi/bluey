@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Meeting lifecycle: no tail-final re-fragmentation after a meeting ends.**
+  Follow-up to the one-meeting-per-session fix: when listening stopped,
+  `stop_audio_capture` joined only the capture supervisor, not the detached
+  STT/sink task — so trailing finals still draining from the queue committed
+  *after* `auto_end_active_meeting` archived the meeting, found no active meeting,
+  and spawned a fresh never-ended 1-line fragment (the exact bug the lifecycle fix
+  set out to remove). Now `stop_audio_capture` awaits the outer STT/sink task
+  (bounded: provider flush + finite queue drain) before any caller auto-ends, so
+  the tail finals land in the still-active meeting first; the idle path takes its
+  own JoinHandle before that join to avoid a self-join deadlock. As defense in
+  depth, an audio segment can only *create* a meeting while capture is live — a
+  straggling final after capture stopped is dropped, never re-fragments.
+  `start_new_session` now also archives the previous meeting through the single
+  shared end path (was inline, which skipped the ledger reset and bled the prior
+  meeting's ledger into the new one).
 - **Meeting lifecycle: one meeting per listening session (no more "Ad hoc
   meeting" fragments).** History filled with junk because a too-eager create path
   minted a fresh meeting per transcript line and titled each from its first line.
