@@ -39,9 +39,9 @@ use cue_core::{
     AudioDeviceDescriptor, AudioDeviceRole, AudioPipelineStatus, AudioSourceKind, CardArtifactType,
     CardKind, CloudEndpointConfig, CloudEnvironment, CloudSyncState, CloudSyncStatus,
     ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn, CueCard,
-    CueCardArtifact, DaemonState, MeetingRecord, MeetingState, MemoryHit, OverlayCommand,
-    OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags, ProviderRoute,
-    ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
+    CueCardArtifact, CueSettings, DaemonState, MeetingRecord, MeetingState, MemoryHit,
+    OverlayCommand, OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags,
+    ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
 };
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -2083,7 +2083,11 @@ async fn handle_request_inner(
             let agents = discover_agent_summaries(daemon).await;
             Ok(DaemonResponse::Agents { agents })
         }
-        DaemonRequest::AgentAttach { kind, session_id } => {
+        DaemonRequest::AgentAttach {
+            kind,
+            session_id,
+            model,
+        } => {
             let Some(parsed) = parse_attached_agent(Some(&kind)) else {
                 return Ok(DaemonResponse::Error {
                     message: format!("\"{kind}\" is not a coding agent Bluey can attach"),
@@ -2107,12 +2111,19 @@ async fn handle_request_inner(
             }
             let label = agent_model_label(&parsed);
             let session = normalize_resume_session(session_id);
-            persist_attached_agent(daemon, Some(label), session).await?;
+            // A per-run model override, when the client (CLI `--model` or the
+            // overlay picker) supplied one. Blank normalizes to None (no
+            // override); it is applied later via the agent's `model_flag` and is
+            // a no-op for agents that have none.
+            let model = model
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty());
+            persist_attached_agent(daemon, Some(label), session, model).await?;
             let agents = discover_agent_summaries(daemon).await;
             Ok(DaemonResponse::Agents { agents })
         }
         DaemonRequest::AgentDetach => {
-            persist_attached_agent(daemon, None, None).await?;
+            persist_attached_agent(daemon, None, None, None).await?;
             Ok(DaemonResponse::Ok)
         }
         DaemonRequest::AgentSessions { kind } => {
@@ -2138,6 +2149,17 @@ async fn handle_request_inner(
                     Vec::new()
                 });
             Ok(DaemonResponse::AgentConnectors { connectors })
+        }
+        DaemonRequest::AgentModels { kind } => {
+            // Not consent-gated (public model list). Same resolver the overlay
+            // push path uses; sentinel-led + never empty on any failure.
+            let models = tokio::task::spawn_blocking(move || resolve_agent_models(&kind))
+                .await
+                .unwrap_or_else(|error| {
+                    debug!("agent model list task panicked: {error}");
+                    vec![cue_agent_bridge::model_resolve::MODEL_SENTINEL.to_string()]
+                });
+            Ok(DaemonResponse::AgentModels { models })
         }
         DaemonRequest::SetAgentSessionHistory { enabled } => {
             persist_session_history_consent(daemon, enabled).await?;
@@ -2442,8 +2464,12 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::AgentListRequested => {
             refresh_overlay_agents(daemon).await;
         }
-        OverlayEvent::AgentAttachRequested { kind, session_id } => {
-            handle_agent_attach(daemon, &kind, session_id.as_deref()).await;
+        OverlayEvent::AgentAttachRequested {
+            kind,
+            session_id,
+            model,
+        } => {
+            handle_agent_attach(daemon, &kind, session_id.as_deref(), model.as_deref()).await;
         }
         OverlayEvent::AgentDetachRequested => {
             handle_agent_detach(daemon).await;
@@ -2458,6 +2484,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::AgentConnectorsRequested { kind } => {
             handle_agent_connectors_requested(daemon, &kind).await;
+        }
+        OverlayEvent::AgentModelsRequested { kind } => {
+            handle_agent_models_requested(daemon, &kind).await;
         }
         OverlayEvent::ConnectorReauthRequested { kind, name } => {
             handle_connector_reauth_requested(daemon, &kind, &name).await;
@@ -2913,7 +2942,12 @@ fn count_agent_sessions(agent: &DiscoveredAgent) -> Option<usize> {
 /// ([`OverlayEvent::BillingDisclosureResponded`]) calls
 /// [`handle_billing_disclosure_response`], which records the vendor and
 /// re-runs the attach — this time skipping the gate.
-async fn handle_agent_attach(daemon: &Arc<Daemon>, kind: &str, session_id: Option<&str>) {
+async fn handle_agent_attach(
+    daemon: &Arc<Daemon>,
+    kind: &str,
+    session_id: Option<&str>,
+    model: Option<&str>,
+) {
     let Some(parsed) = parse_attached_agent(Some(kind)) else {
         debug!(kind, "ignored attach request for unknown agent kind");
         push_system_card(
@@ -2954,8 +2988,14 @@ async fn handle_agent_attach(daemon: &Arc<Daemon>, kind: &str, session_id: Optio
 
     let label = agent_model_label(&parsed);
     let session = normalize_resume_session(session_id.map(str::to_string));
+    // A blank model string is treated as "no override" so an empty picker value
+    // never becomes an argv token; mirror the resume-session normalization.
+    let model = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
 
-    if let Err(error) = persist_attached_agent(daemon, Some(label.clone()), session).await {
+    if let Err(error) = persist_attached_agent(daemon, Some(label.clone()), session, model).await {
         warn!("failed to persist attached agent: {error:#}");
         push_system_card(
             daemon,
@@ -3109,14 +3149,16 @@ async fn handle_billing_disclosure_response(
     );
 
     // Re-run the original attach. The gate now passes (vendor is in
-    // accepted_byot_vendors) and the agent is persisted normally.
-    handle_agent_attach(daemon, pending_kind, pending_session_id).await;
+    // accepted_byot_vendors) and the agent is persisted normally. Cloud BYOT
+    // rows have no model_flag, so carrying a pending model through the
+    // disclosure round-trip would be inert — pass None (contract D7).
+    handle_agent_attach(daemon, pending_kind, pending_session_id, None).await;
 }
 
 /// Detach the active agent: clear the agent and any resume session, persist,
 /// and re-emit the list.
 async fn handle_agent_detach(daemon: &Arc<Daemon>) {
-    if let Err(error) = persist_attached_agent(daemon, None, None).await {
+    if let Err(error) = persist_attached_agent(daemon, None, None, None).await {
         warn!("failed to detach agent: {error:#}");
         return;
     }
@@ -3124,20 +3166,49 @@ async fn handle_agent_detach(daemon: &Arc<Daemon>) {
     refresh_overlay_agents_attached_only(daemon).await;
 }
 
-/// Load settings, set `attached_agent` plus the session to resume, `touch()`,
-/// and persist via the shared settings writer. Centralizes the read-modify-write
-/// so both attach and detach share one code path. Detach passes `None` for both
-/// so the resume session never outlives the agent it belonged to.
+/// Load settings, set `attached_agent` plus the session to resume and the
+/// per-run model override, `touch()`, and persist via the shared settings
+/// writer. Centralizes the read-modify-write so both attach and detach share one
+/// code path. Detach passes `None` for all three so neither the resume session
+/// nor the model override outlives the agent it belonged to.
+///
+/// ATTACHED-SESSION PRESERVATION (model-picker hazard): a model-only re-attach
+/// flows `agent = Some(label), session = None, model = Some(...)`. Nulling
+/// `attached_session` there would WIPE an in-progress resumed session on every
+/// model change. So when an agent is being SET (`agent.is_some()`) and no
+/// `session` is supplied, the existing `attached_session` is PRESERVED; a new
+/// `session` still overwrites it. Detach (`agent = None`) always clears, so a
+/// detached agent never leaves a stale resume/model behind.
 async fn persist_attached_agent(
     daemon: &Arc<Daemon>,
     agent: Option<String>,
     session: Option<String>,
+    model: Option<String>,
 ) -> Result<()> {
     let mut settings = load_settings(&daemon.paths)?;
-    settings.attached_agent = agent;
-    settings.attached_session = session;
+    apply_attach_to_settings(&mut settings, agent, session, model);
     settings.touch();
     save_settings(&daemon.paths, &settings)
+}
+
+/// Pure settings mutation for [`persist_attached_agent`] (extracted so the
+/// attached-session preservation rule is unit-testable without a `Daemon`).
+/// Sets `attached_agent` and `attached_model` from the incoming values; for
+/// `attached_session`, preserves the existing value when an agent is being SET
+/// with no new session (the model-only re-attach case), and only overwrites it
+/// when a session is explicitly provided or when detaching (`agent = None`).
+fn apply_attach_to_settings(
+    settings: &mut CueSettings,
+    agent: Option<String>,
+    session: Option<String>,
+    model: Option<String>,
+) {
+    let attaching = agent.is_some();
+    settings.attached_agent = agent;
+    if session.is_some() || !attaching {
+        settings.attached_session = session;
+    }
+    settings.attached_model = model;
 }
 
 /// Persist the session-history consent flag to the daemon's settings (the only
@@ -3297,6 +3368,153 @@ fn list_agent_connectors(kind: &str) -> Vec<AgentConnectorInfo> {
             ready: auth_tier_ready(c.auth_tier),
         })
         .collect()
+}
+
+/// Wall-clock guard for the model-LIST CLI scrape. The command is read-only and
+/// non-quota (`cursor-agent models` / `agy models`), so a short bound is plenty;
+/// a hung CLI must never stall the picker. We do NOT wrap the CLI in a `timeout`
+/// binary (absent on macOS → exit 127) — the guard is enforced Rust-side.
+const AGENT_MODELS_SCRAPE_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Resolve one agent's available models and push them to the UI's model picker.
+///
+/// NOT consent-gated — a model list is public, unlike session history. The list
+/// is computed data-driven off the registry `models_command`:
+/// - a row WITH `models_command` (Cursor, Antigravity) is scraped by running
+///   `<binary> <models_command...>` in `spawn_blocking` (with a Rust-side
+///   wall-clock guard, NO `timeout` binary); on exit-0 + non-empty parse we use
+///   the live list, else the curated fallback;
+/// - a row WITHOUT `models_command` never spawns a CLI — it uses the curated
+///   list ([`cue_agent_bridge::model_resolve::list_agent_models`]).
+///
+/// The result always leads with the `"auto"` sentinel and is never empty, so a
+/// curated agent still gets its list (never an error line).
+async fn handle_agent_models_requested(daemon: &Arc<Daemon>, kind: &str) {
+    let kind_owned = kind.to_string();
+    let models = tokio::task::spawn_blocking(move || resolve_agent_models(&kind_owned))
+        .await
+        .unwrap_or_else(|error| {
+            warn!(kind, "agent model list task PANICKED: {error}");
+            // Never surface an empty list; the picker de-dups the sentinel.
+            vec![cue_agent_bridge::model_resolve::MODEL_SENTINEL.to_string()]
+        });
+
+    info!(
+        kind,
+        count = models.len(),
+        "agent models: sending SetAgentModels"
+    );
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetAgentModels {
+            kind: kind.to_string(),
+            models,
+        },
+    )
+    .await;
+}
+
+/// Blocking core of [`handle_agent_models_requested`]: resolve the agent kind,
+/// read its registry `models_command`, and either scrape the live model list or
+/// return the curated fallback. Pure of any daemon state; never panics.
+fn resolve_agent_models(kind: &str) -> Vec<String> {
+    use cue_agent_bridge::model_resolve::{
+        finalize_model_list, list_agent_models, parse_models_stdout,
+    };
+
+    let Some(agent_kind) = parse_attached_agent(Some(kind)) else {
+        // Unknown label → sentinel-only list (picker hidden). Mirror the curated
+        // wrapper's shape rather than an empty list.
+        return vec![cue_agent_bridge::model_resolve::MODEL_SENTINEL.to_string()];
+    };
+
+    let Some(tag) = cue_agent_bridge::registry::KindTag::from_agent_kind(&agent_kind) else {
+        return list_agent_models(&agent_kind);
+    };
+    let Some(entry) = cue_agent_bridge::registry::entry_for(tag) else {
+        return list_agent_models(&agent_kind);
+    };
+
+    // Curated (None-row) agents: never spawn a CLI on the model-list path.
+    let Some(models_args) = entry.models_command else {
+        return list_agent_models(&agent_kind);
+    };
+
+    // Enumerable row: run `<binary> <models_command...>`. The binary is the one
+    // the agent DRIVES with (drive_command[0]) — the same resolution the
+    // mcp-list path uses. Fail-soft to the curated list on any failure.
+    let Some(binary) = entry.drive_command.first().copied() else {
+        return list_agent_models(&agent_kind);
+    };
+
+    match scrape_models_cli(binary, models_args) {
+        Some(stdout) => {
+            let parsed = parse_models_stdout(&stdout);
+            if parsed.is_empty() {
+                warn!(
+                    kind,
+                    binary, "model scrape parsed no ids; using curated fallback"
+                );
+                list_agent_models(&agent_kind)
+            } else {
+                finalize_model_list(parsed)
+            }
+        }
+        None => {
+            warn!(kind, binary, "model scrape failed; using curated fallback");
+            list_agent_models(&agent_kind)
+        }
+    }
+}
+
+/// Run `<binary> <args...>` synchronously (already on a blocking thread) and
+/// return its stdout ONLY when it exits 0 within [`AGENT_MODELS_SCRAPE_TIMEOUT`].
+/// Any spawn error, non-zero exit, or timeout returns `None` so the caller uses
+/// the curated fallback. Read-only + non-quota by allowlist (the registry only
+/// sets `models_command` to the model-LIST subcommand). No `timeout` binary is
+/// used (absent on macOS); the wall-clock is enforced here by polling `try_wait`.
+fn scrape_models_cli(binary: &str, args: &[&'static str]) -> Option<String> {
+    let mut child = Command::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| warn!(binary, "failed to spawn model-list CLI: {e}"))
+        .ok()?;
+
+    let deadline = Instant::now() + AGENT_MODELS_SCRAPE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_string(&mut stdout);
+                }
+                return status.success().then_some(stdout);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Kill the hung child; discard whatever it printed.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    warn!(
+                        binary,
+                        "model-list CLI timed out after {}s",
+                        AGENT_MODELS_SCRAPE_TIMEOUT.as_secs()
+                    );
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                warn!(binary, "model-list CLI wait failed: {e}");
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
 }
 
 /// Re-auth one hosted-OAuth connector. Real OAuth is future work; for now this
@@ -6290,11 +6508,21 @@ async fn answer_with_provider_runtime(
     // all derived from it.
     let mut resume_session: Option<String> = None;
     let mut agent_source_label: Option<String> = None;
+    // The user's per-run model override for the attached agent (contract D1).
+    // Seeded into the CLI argv via the registry's `model_flag` down in
+    // `answer_with_agent`; a no-op for agents with no model flag.
+    let mut attached_model: Option<String> = None;
     if let Ok(settings) = load_settings(&daemon.paths) {
         if let Some(kind) = parse_attached_agent(settings.attached_agent.as_deref()) {
             let label = agent_model_label(&kind);
             request.route = ProviderRoute::direct(ProviderSelector::agent(label.clone()));
             resume_session = normalize_resume_session(settings.attached_session);
+            attached_model = settings
+                .attached_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string);
             agent_source_label = Some(label);
         }
     }
@@ -6378,6 +6606,7 @@ async fn answer_with_provider_runtime(
         &request,
         &answer_meeting,
         resume_session.as_deref(),
+        attached_model.as_deref(),
         Some(&mut overlay_stream),
     )
     .await
@@ -6820,6 +7049,7 @@ async fn resolve_answer_route(
     request: &AnswerRequest,
     meeting: &MeetingRecord,
     resume_session: Option<&str>,
+    attached_model: Option<&str>,
     mut stream: Option<&mut OverlayAnswerStream>,
 ) -> Result<AnswerRouteOutcome> {
     let mut attempts = Vec::new();
@@ -6903,6 +7133,7 @@ async fn resolve_answer_route(
                 &payload,
                 meeting,
                 resume_session,
+                attached_model,
                 stream_ref,
                 fallback_depth,
             )
@@ -7035,6 +7266,7 @@ async fn apply_continuation_tier(
     agent: &AgentKind,
     session_id: Option<&str>,
     via_acp: bool,
+    ledger_path: Option<std::path::PathBuf>,
 ) {
     let summarize_agent = agent.clone();
     cue_agent_bridge::continuation::apply_tier(
@@ -7043,6 +7275,7 @@ async fn apply_continuation_tier(
         session_id,
         via_acp,
         AGENT_SESSION_LIST_CAP,
+        ledger_path.as_deref(),
         move |prompt| {
             let agent = summarize_agent.clone();
             async move {
@@ -7072,6 +7305,11 @@ struct DriveOutcome {
     /// fix for "turn 2 forgets turn 1". Only meaningful for NativeResume/ACP
     /// tiers; ignored for Replay agents.
     session_id: Option<String>,
+    /// The EFFECTIVE cwd the drive ran in: `question.cwd` after
+    /// `apply_continuation_tier`, falling back to `std::env::current_dir()` (the
+    /// inherited cwd). Recorded in the spawn-time session ledger so a cwd-scoped
+    /// resume never depends on vendor-store drift.
+    cwd: Option<String>,
 }
 
 /// A failed single drive attempt. `reason` is a human phrase appended after
@@ -7117,9 +7355,19 @@ async fn drive_answer_attempt(
     payload: &ProviderRequestPayload,
     resume: Option<&str>,
     model_override: &[String],
+    effort_override: &[String],
     stream: &mut Option<&mut OverlayAnswerStream>,
 ) -> Result<DriveOutcome, DriveFailure> {
     let mut question = agent_question_from_payload(payload, resume);
+    // The spawn-time session ledger lives next to the other session stores in
+    // the daemon's data dir. Only available with an overlay stream (headless
+    // paths have no daemon handle → None → today's store-re-scrape behavior).
+    let ledger_path = stream.as_ref().map(|s| {
+        s.daemon
+            .paths
+            .data_dir
+            .join(cue_agent_bridge::sessions::ledger::AGENT_SESSION_LEDGER_FILE)
+    });
     // When a prior session is pinned, continue it per the agent's tier:
     // NativeResume → set resume id + the session's project as cwd (Claude's
     // resume is cwd-scoped); Replay → load + (if huge) compact the transcript
@@ -7133,8 +7381,19 @@ async fn drive_answer_attempt(
     // transcript as context instead of trusting `session/load`.
     let via_acp = acp_answer_enabled(kind);
     if !cue_agent_bridge::cloud::is_cloud_kind(kind) {
-        apply_continuation_tier(&mut question, kind, resume, via_acp).await;
+        apply_continuation_tier(&mut question, kind, resume, via_acp, ledger_path.clone()).await;
     }
+
+    // The EFFECTIVE cwd the drive will run in — captured AFTER the tier step set
+    // `question.cwd` (a NativeResume cwd-scoped resume) and BEFORE the Question
+    // is moved into the drive call. A `None` cwd means the child inherits the
+    // daemon's cwd, so record that inherited dir rather than `None`, otherwise a
+    // later cwd-scoped resume can't reconstruct where the session actually ran.
+    let effective_cwd = question.cwd.clone().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+    });
 
     // Cross-surface continuation bridge: an agent with NO CLI of its own (e.g.
     // VS Code Copilot, the extension) but a `continuation_via` sibling continues
@@ -7152,21 +7411,26 @@ async fn drive_answer_attempt(
         replay_context = question.context.is_some(),
         cwd_set = question.cwd.is_some(),
         model_override = model_override.len(),
+        effort_override = effort_override.len(),
         "driving attached agent for answer"
     );
     let kind = &drive_kind;
 
     // Pick the right driver in ONE place: the spine's `drive_with_overrides`
     // owns the cloud-vs-ACP-vs-CLI decision (data-driven by the registry row,
-    // never by name), threads the per-run model override into the local-CLI
-    // branch, and ignores it for cloud/ACP (which take no per-run model flag).
-    // Adding an agent is a registry row, not a new branch here. Cloud agents
-    // load credentials from the OS keychain and emit one audit line per HTTP
-    // call (vendor, endpoint, status — never the token).
+    // never by name), threads the per-run model + effort overrides into the
+    // local-CLI branch, and ignores them for cloud/ACP (which take no per-run
+    // model/effort flag). A non-empty override forces the CLI route (ACP has no
+    // model/effort parameter). Adding an agent is a registry row, not a new
+    // branch here. Cloud agents load credentials from the OS keychain and emit
+    // one audit line per HTTP call (vendor, endpoint, status — never the token).
     let answer_stream = match cue_agent_bridge::drive_with_overrides(
         kind.clone(),
         question,
-        model_override.to_vec(),
+        cue_agent_bridge::DriveOverrides {
+            model_args: model_override.to_vec(),
+            effort_args: effort_override.to_vec(),
+        },
     )
     .await
     {
@@ -7264,6 +7528,7 @@ async fn drive_answer_attempt(
         body,
         cost_usd,
         session_id: latest_session,
+        cwd: effective_cwd,
     })
 }
 
@@ -7279,6 +7544,33 @@ fn truncate_reason(message: &str) -> String {
     }
 }
 
+/// Seed the per-run model override for the attached agent from the user's
+/// picked model (contract D1). Returns `(model_override, tried_model)`:
+/// - `model_override` is `[flag, chosen]` when the registry row has a
+///   `model_flag` and `attached_model` is a non-blank vendor id; otherwise
+///   empty (a flagless agent, or no pick, is an honest no-op).
+/// - `tried_model` is `Some(chosen)` exactly when the override was seeded, so
+///   the caller can pre-fill `tried_models` and the ModelBlocked resolver never
+///   re-proposes the user's blocked pick.
+///
+/// Pure and data-driven (the flag comes from the registry, never named here) so
+/// it is unit-testable without a live drive.
+fn seed_model_override(
+    kind: &AgentKind,
+    attached_model: Option<&str>,
+) -> (Vec<String>, Option<String>) {
+    let Some(chosen) = attached_model.map(str::trim).filter(|m| !m.is_empty()) else {
+        return (Vec::new(), None);
+    };
+    match cue_agent_bridge::model_resolve::model_flag_for(kind) {
+        Some(flag) => (
+            vec![flag.to_string(), chosen.to_string()],
+            Some(chosen.to_string()),
+        ),
+        None => (Vec::new(), None),
+    }
+}
+
 /// Drive the attached coding agent and stream its answer through the overlay.
 ///
 /// Routing rule (PLAN §10): Bluey NEVER answers from the user's context with
@@ -7290,6 +7582,7 @@ async fn answer_with_agent(
     payload: &ProviderRequestPayload,
     _meeting: &MeetingRecord,
     resume_session: Option<&str>,
+    attached_model: Option<&str>,
     mut stream: Option<&mut OverlayAnswerStream>,
     fallback_depth: usize,
 ) -> Result<AgentRouteOutcome> {
@@ -7353,25 +7646,59 @@ async fn answer_with_agent(
     // The per-run model override appended to the next drive (empty = none) and
     // the models already tried-and-blocked in THIS answer, so the resolver
     // advances through the fallback list and then to BYOT — bounded, never a loop.
-    let mut model_override: Vec<String> = Vec::new();
+    //
+    // Seed the user's picked model (contract D1): if the registry row has a
+    // `model_flag`, prime `model_override = [flag, chosen]` AND record `chosen`
+    // in `tried_models` so the ModelBlocked resolver never re-proposes the
+    // user's blocked pick and advances straight to fallbacks/BYOT. This seed is
+    // overwritten by the resolver on a 400 (fallback UX preserved) and forces
+    // the CLI route in the bridge (ACP has no model parameter). A row with no
+    // model_flag is an honest no-op (logged, never an error).
+    let (mut model_override, seeded_model) = seed_model_override(&kind, attached_model);
     let mut tried_models: Vec<String> = Vec::new();
+    if let Some(seeded) = seeded_model {
+        tried_models.push(seeded);
+    } else if attached_model.is_some_and(|m| !m.trim().is_empty()) {
+        debug!(
+            agent = %label,
+            "attached model set but this agent has no model_flag — ignoring (no-op)"
+        );
+    }
+    // The per-run effort/reasoning-depth argv for this answer, mapped from the
+    // overlay speed tier via the registry (contract D2). Constant across retries;
+    // empty for "balanced"/unknown/flagless agents. Prose speed instructions
+    // (mode_instructions) still carry the same intent for every agent — these
+    // args are additive, never a replacement.
+    let effort_override: Vec<String> = payload
+        .speed
+        .as_deref()
+        .map(|s| cue_agent_bridge::registry::effort_args_for(&kind, s))
+        .unwrap_or_default();
     // Bounded same-agent retry for TRANSIENT backend faults (network reset,
     // empty-but-clean exit). The agent is the user's own — re-driving it is the
     // most USP-faithful recovery. Capped low so a live meeting never stalls.
     const MAX_TRANSIENT_RETRIES: u32 = 2;
     let mut transient_retries: u32 = 0;
-    let (body, cost_usd, session_id) = loop {
+    let (body, cost_usd, session_id, outcome_cwd) = loop {
         match drive_answer_attempt(
             &kind,
             &label,
             payload,
             attempt_resume,
             &model_override,
+            &effort_override,
             &mut stream,
         )
         .await
         {
-            Ok(outcome) => break (outcome.body, outcome.cost_usd, outcome.session_id),
+            Ok(outcome) => {
+                break (
+                    outcome.body,
+                    outcome.cost_usd,
+                    outcome.session_id,
+                    outcome.cwd,
+                )
+            }
             Err(failure) => {
                 // Recoverable resume failures (session too large OR not found)
                 // retry once without resume — a fresh session in the project dir
@@ -7507,16 +7834,43 @@ async fn answer_with_agent(
                 let still_attached =
                     parse_attached_agent(settings.attached_agent.as_deref()) == Some(kind.clone());
                 if still_attached && settings.attached_session.as_deref() != Some(new_id.as_str()) {
+                    // Preserve the user's model override across chaining so a
+                    // continued conversation keeps their picked model (D7).
                     if let Err(error) = persist_attached_agent(
                         &daemon,
                         settings.attached_agent.clone(),
                         Some(new_id.clone()),
+                        settings.attached_model.clone(),
                     )
                     .await
                     {
                         warn!(agent = %label, error = %error, "failed to persist chained session id");
                     } else {
                         debug!(agent = %label, session = %new_id, "chained conversation: persisted new session id");
+                    }
+
+                    // Record this newly-minted session in the spawn-time ledger
+                    // so a later cwd-scoped resume never depends on vendor-store
+                    // drift (contract D4). The changed-id gate above is the
+                    // write-side dedup. Best-effort: a failed append degrades to
+                    // the store re-scrape, never fails the answer.
+                    let ledger_path = daemon
+                        .paths
+                        .data_dir
+                        .join(cue_agent_bridge::sessions::ledger::AGENT_SESSION_LEDGER_FILE);
+                    let record = cue_agent_bridge::sessions::ledger::SessionLedgerRecord::new(
+                        kind.clone(),
+                        new_id.clone(),
+                        outcome_cwd.clone(),
+                    );
+                    if let Err(error) =
+                        cue_agent_bridge::sessions::ledger::append(&ledger_path, &record)
+                    {
+                        warn!(
+                            agent = %label,
+                            error = %error,
+                            "failed to append session ledger record (degrading to store re-scrape)"
+                        );
                     }
                 }
             }
@@ -8340,6 +8694,14 @@ fn answer_request_from_overlay(
 
     if let Some(mode) = mode.filter(|value| !value.trim().is_empty()) {
         request = request.with_instructions(mode_instructions(&mode));
+        // Carry the speed tier as DATA (not just prose) so the agent path can map
+        // it to per-run effort args. Only the speed dimensions of the picker set
+        // it; format modes ("code", "meeting", …) leave it None. Prose speed
+        // instructions above still apply to every agent regardless.
+        let normalized = mode.trim().to_ascii_lowercase();
+        if matches!(normalized.as_str(), "fast" | "balanced" | "deep") {
+            request.speed = Some(normalized);
+        }
     }
 
     request
@@ -10661,6 +11023,25 @@ fn discover_overlay_bin() -> Result<PathBuf> {
             // The MEETING overlay (cue-meeting-overlay) is the real product surface —
             // the Ask/answer feed + screen-share invisibility. Prefer it above the
             // older interview overlay (cue-overlay-tauri) and the legacy Swift one.
+            //
+            // Cargo puts artifacts under `target/<profile>/` for a native build but
+            // under `target/<triple>/<profile>/` when `--target` is passed — and on
+            // this project `--target aarch64-apple-darwin` is the REQUIRED build mode
+            // (the default rustup toolchain is x86_64 and its emulated binaries
+            // silently misbehave). So the triple-scoped dirs must be probed FIRST,
+            // else discovery falls through to a stale `target/release/` binary from
+            // an earlier native build and launches an overlay without the latest UI.
+            // Probe every apple-darwin triple's debug THEN release, then the plain
+            // (native) dirs, so the freshest matching build wins.
+            let triples = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
+            let overlay_names = ["cue-meeting-overlay", "cue-overlay-tauri"];
+            for triple in triples {
+                for profile in ["debug", "release"] {
+                    for name in overlay_names {
+                        candidates.push(cwd.join(format!("target/{triple}/{profile}/{name}")));
+                    }
+                }
+            }
             candidates.extend([
                 cwd.join("target/debug/cue-meeting-overlay"),
                 cwd.join("target/release/cue-meeting-overlay"),
@@ -11906,6 +12287,68 @@ mod tests {
     }
 
     #[test]
+    fn test_answer_request_from_overlay_sets_speed_only_for_speed_modes() {
+        // Speed dimensions of the picker set `speed` as data.
+        for mode in ["fast", "balanced", "deep"] {
+            let request = answer_request_from_overlay(
+                "Q",
+                Some("auto".to_string()),
+                None,
+                Some(mode.to_string()),
+            );
+            assert_eq!(
+                request.speed.as_deref(),
+                Some(mode),
+                "speed mode {mode} should set request.speed"
+            );
+        }
+
+        // Mixed-case/whitespace is normalized to the lowercase tier.
+        let request =
+            answer_request_from_overlay("Q", Some("auto".to_string()), None, Some(" DEEP ".into()));
+        assert_eq!(request.speed.as_deref(), Some("deep"));
+
+        // Format modes and no mode leave speed None.
+        for mode in [Some("code".to_string()), Some("meeting".to_string()), None] {
+            let request = answer_request_from_overlay("Q", Some("auto".to_string()), None, mode);
+            assert_eq!(request.speed, None);
+        }
+    }
+
+    #[test]
+    fn test_seed_model_override_flagless_agent_is_noop() {
+        // An agent with no registry model_flag (Other has no tag) yields no
+        // override and no tried-model entry, even with a model set.
+        let kind = AgentKind::Other("zed".to_string());
+        let (override_args, tried) = seed_model_override(&kind, Some("some-model"));
+        assert!(override_args.is_empty());
+        assert_eq!(tried, None);
+    }
+
+    #[test]
+    fn test_seed_model_override_codex_seeds_flag_and_tried_model() {
+        // Codex has model_flag `-m`; a picked model seeds [flag, model] and the
+        // tried-model entry so the block-resolver never re-proposes it.
+        let (override_args, tried) = seed_model_override(&AgentKind::Codex, Some("gpt-5.1-codex"));
+        assert_eq!(
+            override_args,
+            vec!["-m".to_string(), "gpt-5.1-codex".to_string()]
+        );
+        assert_eq!(tried.as_deref(), Some("gpt-5.1-codex"));
+    }
+
+    #[test]
+    fn test_seed_model_override_blank_or_absent_model_is_noop() {
+        // A blank/whitespace model, or none at all, is a no-op even for a
+        // flagged agent.
+        for model in [None, Some(""), Some("   ")] {
+            let (override_args, tried) = seed_model_override(&AgentKind::Codex, model);
+            assert!(override_args.is_empty(), "model {model:?} should not seed");
+            assert_eq!(tried, None);
+        }
+    }
+
+    #[test]
     fn overlay_auto_uses_managed_route_fallbacks() {
         let request = answer_request_from_overlay(
             "Solve this in Rust",
@@ -12421,6 +12864,74 @@ mod tests {
         assert_eq!(summary.capability, "read_only");
         assert_eq!(summary.session_count, None);
         assert!(!summary.attached);
+    }
+
+    #[test]
+    fn model_only_reattach_preserves_resumed_session() {
+        // The model-picker hazard: after attaching WITH a resume session, a
+        // model-only re-attach (session_id = None) must NOT wipe attached_session.
+        let mut settings = CueSettings::default();
+
+        // 1) Attach with a resumed session.
+        apply_attach_to_settings(
+            &mut settings,
+            Some("cursor".to_string()),
+            Some("s9".to_string()),
+            None,
+        );
+        assert_eq!(settings.attached_agent.as_deref(), Some("cursor"));
+        assert_eq!(settings.attached_session.as_deref(), Some("s9"));
+        assert_eq!(settings.attached_model, None);
+
+        // 2) Model-only re-attach (same kind, no session, a model): the resumed
+        //    session survives and the model override is recorded.
+        apply_attach_to_settings(
+            &mut settings,
+            Some("cursor".to_string()),
+            None,
+            Some("opus".to_string()),
+        );
+        assert_eq!(
+            settings.attached_session.as_deref(),
+            Some("s9"),
+            "model-only re-attach must preserve the resumed session"
+        );
+        assert_eq!(settings.attached_model.as_deref(), Some("opus"));
+
+        // 3) An explicit new session still overwrites.
+        apply_attach_to_settings(
+            &mut settings,
+            Some("cursor".to_string()),
+            Some("s10".to_string()),
+            None,
+        );
+        assert_eq!(settings.attached_session.as_deref(), Some("s10"));
+
+        // 4) Detach (agent = None) clears the session and model.
+        apply_attach_to_settings(&mut settings, None, None, None);
+        assert_eq!(settings.attached_agent, None);
+        assert_eq!(settings.attached_session, None);
+        assert_eq!(settings.attached_model, None);
+    }
+
+    #[test]
+    fn resolve_agent_models_returns_curated_for_unknown_and_curated_rows() {
+        // Unknown label → sentinel-only (picker hidden). Never empty.
+        assert_eq!(
+            resolve_agent_models("not_a_real_agent"),
+            vec!["auto".to_string()]
+        );
+        // A curated (None-row) agent never spawns a CLI: Claude yields its
+        // curated aliases behind the sentinel.
+        assert_eq!(
+            resolve_agent_models("claude_code"),
+            vec![
+                "auto".to_string(),
+                "opus".to_string(),
+                "sonnet".to_string(),
+                "haiku".to_string(),
+            ]
+        );
     }
 
     #[test]

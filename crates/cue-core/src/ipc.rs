@@ -93,11 +93,16 @@ pub enum DaemonRequest {
     /// connectors, sessions, attach state).
     AgentList,
     /// Attach `kind` as the active answer-routing agent. `session_id` optionally
-    /// pins a prior session to resume (validated in, persisted later).
+    /// pins a prior session to resume (validated in, persisted later). `model`
+    /// optionally pins a per-run model override (applied via the agent's
+    /// `model_flag`; a no-op for agents with none). Both default to `None`, so an
+    /// old client that omits them still attaches with no override — back-compat.
     AgentAttach {
         kind: String,
         #[serde(default)]
         session_id: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Clear the active agent; answers fall back to Bluey's normal providers.
     AgentDetach,
@@ -107,6 +112,12 @@ pub enum DaemonRequest {
     },
     /// List one agent's inherited MCP connectors (shape + readiness only).
     AgentConnectors {
+        kind: String,
+    },
+    /// List one agent's available models (for the model picker). Not consent-
+    /// gated — a model list is public. `models[0]` is always the `"auto"`
+    /// sentinel.
+    AgentModels {
         kind: String,
     },
     /// Set the **session-history consent** flag in the daemon's settings. Reading
@@ -195,6 +206,9 @@ pub enum DaemonResponse {
     AgentConnectors {
         connectors: Vec<AgentConnectorInfo>,
     },
+    AgentModels {
+        models: Vec<String>,
+    },
     Error {
         message: String,
     },
@@ -240,6 +254,7 @@ mod tests {
             DaemonRequest::AgentAttach {
                 kind: "claude_code".to_string(),
                 session_id: Some("abc".to_string()),
+                model: Some("composer-2.5".to_string()),
             },
             DaemonRequest::AgentDetach,
             DaemonRequest::AgentSessions {
@@ -247,6 +262,9 @@ mod tests {
             },
             DaemonRequest::AgentConnectors {
                 kind: "codex".to_string(),
+            },
+            DaemonRequest::AgentModels {
+                kind: "cursor".to_string(),
             },
         ];
         for request in cases {
@@ -265,9 +283,15 @@ mod tests {
         let json = r#"{"type":"agent_attach","kind":"claude_code"}"#;
         let decoded: DaemonRequest = serde_json::from_str(json).expect("decode");
         match decoded {
-            DaemonRequest::AgentAttach { kind, session_id } => {
+            DaemonRequest::AgentAttach {
+                kind,
+                session_id,
+                model,
+            } => {
                 assert_eq!(kind, "claude_code");
                 assert_eq!(session_id, None);
+                // Legacy payload without "model" must default to None (back-compat).
+                assert_eq!(model, None);
             }
             other => panic!("expected agent_attach, got {other:?}"),
         }
@@ -301,7 +325,10 @@ mod tests {
                 ready: true,
             }],
         };
-        for response in [agents, sessions, connectors] {
+        let models = DaemonResponse::AgentModels {
+            models: vec!["auto".to_string(), "composer-2.5".to_string()],
+        };
+        for response in [agents, sessions, connectors, models] {
             let json = serde_json::to_string(&response).expect("serialize response");
             let decoded: DaemonResponse = serde_json::from_str(&json).expect("decode response");
             assert_eq!(

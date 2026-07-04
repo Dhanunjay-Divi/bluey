@@ -885,7 +885,15 @@ pub async fn agent_attach(
     kind: String,
     session_id: Option<String>,
 ) -> Result<Vec<cue_core::AgentSummary>, String> {
-    match daemon_ipc(DaemonRequest::AgentAttach { kind, session_id }).await? {
+    // The dashboard attach surface carries no model picker yet; None = no
+    // per-run model override (the CLI/overlay surfaces supply one).
+    match daemon_ipc(DaemonRequest::AgentAttach {
+        kind,
+        session_id,
+        model: None,
+    })
+    .await?
+    {
         DaemonResponse::Agents { agents } => Ok(agents),
         DaemonResponse::Error { message } => Err(message),
         other => Err(format!("unexpected daemon response: {other:?}")),

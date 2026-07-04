@@ -437,11 +437,23 @@ enum AgentCommands {
         /// Pin a prior session to resume (validated; resume lands later).
         #[arg(long)]
         session: Option<String>,
+        /// Pin a per-run model override (a vendor model id, e.g. composer-2.5).
+        /// Applied via the agent's model flag; a no-op for agents with none.
+        /// List valid ids with `bluey agent models <kind>`.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Detach the active agent; answers use Bluey's normal providers.
     Detach,
     /// List a coding agent's prior sessions (needs session-history consent).
     Sessions {
+        /// Agent kind, e.g. claude_code, cursor, codex.
+        kind: String,
+    },
+    /// List a coding agent's selectable model ids (for `attach --model`).
+    /// Element [0] is always "auto" (no override). Live-scraped for Cursor,
+    /// curated for the rest; never consent-gated.
+    Models {
         /// Agent kind, e.g. claude_code, cursor, codex.
         kind: String,
     },
@@ -604,6 +616,11 @@ struct AskArgs {
     /// Model id to request for the selected provider route.
     #[arg(long)]
     model: Option<String>,
+    /// Answer speed tier: fast | balanced | deep. Maps to the agent's real
+    /// per-run effort flag where one exists (e.g. Codex reasoning effort) plus
+    /// depth-shaping prose; ignored by agents with no effort control.
+    #[arg(long)]
+    speed: Option<String>,
     /// Ask the daemon to include answer delta events in the IPC response.
     #[arg(long)]
     stream: bool,
@@ -2312,7 +2329,15 @@ fn answer_request_from_args(question: String, args: &AskArgs) -> AnswerRequest {
         .or(args.model.as_deref().map(|_| "bluey_managed"))
         .map(|provider| ProviderRoute::direct(provider_selector(provider, args.model.as_deref())))
         .unwrap_or_default();
-    let request = AnswerRequest::new(question, route);
+    let mut request = AnswerRequest::new(question, route);
+    // Carry the speed tier as DATA (the daemon maps it to the agent's effort
+    // flag + depth prose). Normalize blank to None so an empty flag is inert.
+    request.speed = args
+        .speed
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase);
     if args.stream {
         request.streaming()
     } else {
@@ -2351,16 +2376,24 @@ async fn agent_command(command: AgentCommands) -> Result<()> {
             print!("{}", render_agent_table(&agents));
             Ok(())
         }
-        AgentCommands::Attach { kind, session } => {
+        AgentCommands::Attach {
+            kind,
+            session,
+            model,
+        } => {
             let request_msg = DaemonRequest::AgentAttach {
                 kind: kind.clone(),
                 session_id: session.clone(),
+                model: model.clone(),
             };
             // A successful attach echoes the refreshed agent list back.
             let _ = agent_request_agents(request_msg).await?;
             println!("Attached {kind}.");
             if let Some(session) = session {
                 println!("Resuming session {session} on the next answer.");
+            }
+            if let Some(model) = model {
+                println!("Model override: {model} (applied on the next answer).");
             }
             println!("`bluey ask` will now route answers through {kind}.");
             Ok(())
@@ -2384,6 +2417,16 @@ async fn agent_command(command: AgentCommands) -> Result<()> {
             match agent_request(DaemonRequest::AgentConnectors { kind }).await? {
                 DaemonResponse::AgentConnectors { connectors } => {
                     print_agent_connectors(&connectors);
+                    Ok(())
+                }
+                DaemonResponse::Error { message } => bail!("daemon error: {message}"),
+                other => bail!("unexpected daemon response: {other:?}"),
+            }
+        }
+        AgentCommands::Models { kind } => {
+            match agent_request(DaemonRequest::AgentModels { kind }).await? {
+                DaemonResponse::AgentModels { models } => {
+                    print_agent_models(&models);
                     Ok(())
                 }
                 DaemonResponse::Error { message } => bail!("daemon error: {message}"),
@@ -2987,6 +3030,16 @@ fn print_agent_connectors(connectors: &[AgentConnectorInfo]) {
     }
 }
 
+fn print_agent_models(models: &[String]) {
+    if models.is_empty() {
+        println!("No models found.");
+        return;
+    }
+    for model in models {
+        println!("{model}");
+    }
+}
+
 fn print_response(response: DaemonResponse) -> Result<()> {
     match response {
         DaemonResponse::Ok => println!("ok"),
@@ -3011,6 +3064,7 @@ fn print_response(response: DaemonResponse) -> Result<()> {
         DaemonResponse::Agents { agents } => print!("{}", render_agent_table(&agents)),
         DaemonResponse::AgentSessions { sessions } => print_agent_sessions(&sessions),
         DaemonResponse::AgentConnectors { connectors } => print_agent_connectors(&connectors),
+        DaemonResponse::AgentModels { models } => print_agent_models(&models),
         DaemonResponse::Error { message } => {
             bail!("daemon error: {message}");
         }

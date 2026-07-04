@@ -210,6 +210,14 @@ pub enum OverlayCommand {
         kind: String,
         connectors: Vec<AgentConnectorInfo>,
     },
+    /// Push one agent's available models to the UI's model picker. `models[0]`
+    /// is always the `"auto"` sentinel (no override); the picker is hidden when
+    /// the list has <= 1 entry. `kind` is the snake_case agent label the UI
+    /// requested, echoed back so a reply for the wrong agent is dropped.
+    SetAgentModels {
+        kind: String,
+        models: Vec<String>,
+    },
     /// Push a review-gated Fix proposal for the user to approve or reject
     /// (Fix-button slice F3). The overlay renders the three sections plus the
     /// optional diff and shows Approve/Reject. `proposal_id` is the id the
@@ -298,11 +306,15 @@ pub enum OverlayEvent {
     },
     /// UI asked for the current discovered-agent list (agent-bridge Slice 5a).
     AgentListRequested,
-    /// UI attached an agent; `session_id` is an optional session to resume.
+    /// UI attached an agent; `session_id` is an optional session to resume and
+    /// `model` is an optional per-run vendor model id to apply via the registry
+    /// row's `model_flag` (a no-op for agents with no model flag).
     AgentAttachRequested {
         kind: String,
         #[serde(default)]
         session_id: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     /// UI detached the currently attached agent.
     AgentDetachRequested,
@@ -321,6 +333,13 @@ pub enum OverlayEvent {
     },
     /// UI asked for one agent's inherited MCP connectors.
     AgentConnectorsRequested {
+        kind: String,
+    },
+    /// UI asked for one agent's available models (for the model picker). Not
+    /// consent-gated — a model list is public, unlike session history. `kind` is
+    /// the snake_case agent label; the daemon replies with
+    /// [`OverlayCommand::SetAgentModels`].
+    AgentModelsRequested {
         kind: String,
     },
     /// UI asked to re-authenticate one hosted-OAuth connector. For now this
@@ -682,13 +701,43 @@ mod tests {
     }
 
     #[test]
+    fn set_agent_models_roundtrips() {
+        let command = OverlayCommand::SetAgentModels {
+            kind: "cursor".to_string(),
+            models: vec!["auto".to_string(), "composer-2.5".to_string()],
+        };
+        let json = serde_json::to_string(&command).expect("serialize");
+        assert!(json.contains(r#""type":"set_agent_models""#));
+        assert!(json.contains(r#""kind":"cursor""#));
+        assert!(json.contains(r#""models":["auto","composer-2.5"]"#));
+        let decoded: OverlayCommand = serde_json::from_str(&json).expect("decode");
+        assert_eq!(serde_json::to_string(&decoded).expect("re-serialize"), json);
+    }
+
+    #[test]
+    fn agent_models_requested_decodes_kind() {
+        let json = r#"{"type":"agent_models_requested","kind":"antigravity"}"#;
+        let decoded: OverlayEvent = serde_json::from_str(json).expect("decode");
+        match decoded {
+            OverlayEvent::AgentModelsRequested { kind } => assert_eq!(kind, "antigravity"),
+            other => panic!("expected agent_models_requested, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn agent_attach_event_deserializes_with_optional_session() {
+        // Old payload without session_id or model: both default to None.
         let json = r#"{"type":"agent_attach_requested","kind":"claude_code"}"#;
         let event: OverlayEvent = serde_json::from_str(json).expect("deserialize attach");
         match event {
-            OverlayEvent::AgentAttachRequested { kind, session_id } => {
+            OverlayEvent::AgentAttachRequested {
+                kind,
+                session_id,
+                model,
+            } => {
                 assert_eq!(kind, "claude_code");
                 assert_eq!(session_id, None);
+                assert_eq!(model, None);
             }
             other => panic!("expected agent_attach_requested, got {other:?}"),
         }
@@ -696,9 +745,34 @@ mod tests {
         let with_session = r#"{"type":"agent_attach_requested","kind":"cursor","session_id":"s9"}"#;
         let event: OverlayEvent = serde_json::from_str(with_session).expect("deserialize");
         match event {
-            OverlayEvent::AgentAttachRequested { kind, session_id } => {
+            OverlayEvent::AgentAttachRequested {
+                kind,
+                session_id,
+                model,
+            } => {
                 assert_eq!(kind, "cursor");
                 assert_eq!(session_id.as_deref(), Some("s9"));
+                assert_eq!(model, None);
+            }
+            other => panic!("expected agent_attach_requested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_attach_event_carries_optional_model() {
+        // A payload with an explicit model must carry it through.
+        let with_model =
+            r#"{"type":"agent_attach_requested","kind":"cursor","model":"composer-2.5"}"#;
+        let event: OverlayEvent = serde_json::from_str(with_model).expect("deserialize");
+        match event {
+            OverlayEvent::AgentAttachRequested {
+                kind,
+                session_id,
+                model,
+            } => {
+                assert_eq!(kind, "cursor");
+                assert_eq!(session_id, None);
+                assert_eq!(model.as_deref(), Some("composer-2.5"));
             }
             other => panic!("expected agent_attach_requested, got {other:?}"),
         }

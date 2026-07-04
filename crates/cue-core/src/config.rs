@@ -79,6 +79,12 @@ pub struct CueSettings {
     /// session. Cleared on detach.
     #[serde(default)]
     pub attached_session: Option<String>,
+    /// Agent bridge: per-run model override for the attached agent (a vendor
+    /// model id, e.g. "composer-2.5" / "gpt-5.1-codex"). Applied via the
+    /// registry row's `model_flag`; a no-op for agents with no model flag.
+    /// Cleared on detach.
+    #[serde(default)]
+    pub attached_model: Option<String>,
 
     /// Agent bridge: vendors for which the user has acknowledged the BYOT
     /// billing disclosure. Each entry is a lowercase `vendor_short` string
@@ -134,6 +140,7 @@ impl Default for CueSettings {
             allow_agent_session_history: false,
             attached_agent: None,
             attached_session: None,
+            attached_model: None,
             accepted_byot_vendors: Vec::new(),
             pinned_overlay_sessions: Vec::new(),
             my_names: Vec::new(),
@@ -224,6 +231,7 @@ mod tests {
         assert!(!settings.allow_agent_session_history);
         assert_eq!(settings.attached_agent, None);
         assert_eq!(settings.attached_session, None);
+        assert_eq!(settings.attached_model, None);
     }
 
     #[test]
@@ -232,6 +240,7 @@ mod tests {
             allow_agent_session_history: true,
             attached_agent: Some("claude_code".to_string()),
             attached_session: Some("sess-42".to_string()),
+            attached_model: Some("gpt-5.1-codex".to_string()),
             ..CueSettings::default()
         };
         let json = serde_json::to_string(&settings).expect("serialize");
@@ -239,6 +248,7 @@ mod tests {
         assert!(parsed.allow_agent_session_history);
         assert_eq!(parsed.attached_agent.as_deref(), Some("claude_code"));
         assert_eq!(parsed.attached_session.as_deref(), Some("sess-42"));
+        assert_eq!(parsed.attached_model.as_deref(), Some("gpt-5.1-codex"));
     }
 
     #[test]
@@ -261,5 +271,29 @@ mod tests {
         let settings: CueSettings = serde_json::from_str(legacy).expect("legacy config loads");
         assert_eq!(settings.attached_agent.as_deref(), Some("claude_code"));
         assert_eq!(settings.attached_session, None);
+    }
+
+    #[test]
+    fn legacy_settings_without_attached_model_still_load() {
+        // A config written after `attached_session` existed but before
+        // `attached_model` was added must still deserialize, defaulting the
+        // model to `None`.
+        let legacy = r#"{
+            "default_model": "Bluey Auto",
+            "default_mode": "General",
+            "answer_style": null,
+            "overlay_opacity": 0.9,
+            "audio_system_enabled": true,
+            "audio_microphone_enabled": true,
+            "cloud_sync_enabled": false,
+            "retention_days": 30,
+            "updated_at": "0",
+            "attached_agent": "claude_code",
+            "attached_session": "sess-42"
+        }"#;
+        let settings: CueSettings = serde_json::from_str(legacy).expect("legacy config loads");
+        assert_eq!(settings.attached_agent.as_deref(), Some("claude_code"));
+        assert_eq!(settings.attached_session.as_deref(), Some("sess-42"));
+        assert_eq!(settings.attached_model, None);
     }
 }

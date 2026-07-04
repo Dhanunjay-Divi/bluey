@@ -791,6 +791,12 @@ pub struct AnswerRequest {
     #[serde(default)]
     pub context: Vec<AnswerContext>,
     pub route: ProviderRoute,
+    /// The overlay speed tier ("fast" | "balanced" | "deep") carried as DATA so
+    /// the agent path can map it to per-run effort args via the registry. Prose
+    /// speed instructions still carry the same intent for flagless agents, so
+    /// this is additive, never a replacement. `None` when no speed picker set it.
+    #[serde(default)]
+    pub speed: Option<String>,
 }
 
 impl AnswerRequest {
@@ -806,6 +812,7 @@ impl AnswerRequest {
             instructions: None,
             context: Vec::new(),
             route,
+            speed: None,
         }
     }
 
@@ -925,6 +932,11 @@ pub struct ProviderRequestPayload {
     pub privacy: PrivacyFlags,
     pub latency_timeout_ms: u64,
     pub max_output_tokens: Option<u32>,
+    /// The overlay speed tier ("fast" | "balanced" | "deep"), copied from the
+    /// originating [`AnswerRequest::speed`]. The agent path maps it to per-run
+    /// effort args; `None` when no speed picker set it.
+    #[serde(default)]
+    pub speed: Option<String>,
 }
 
 impl ProviderRequestPayload {
@@ -949,6 +961,7 @@ impl ProviderRequestPayload {
             privacy: request.route.privacy,
             latency_timeout_ms: budget.latency.timeout_ms,
             max_output_tokens: budget.cost.max_output_tokens,
+            speed: request.speed.clone(),
         }
     }
 }
