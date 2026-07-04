@@ -50,6 +50,26 @@ private func displayTranscriptText(_ text: String) -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+private func stripDisplayLineNumberGutters(from text: String) -> String {
+    text.components(separatedBy: "\n")
+        .map { line in
+            line.replacingOccurrences(
+                of: #"^\s*\d+\s\|\s"#,
+                with: "",
+                options: .regularExpression)
+        }
+        .joined(separator: "\n")
+}
+
+private func displayLineNumberGutterLength(in rawLine: String) -> Int? {
+    let nsLine = rawLine as NSString
+    let range = nsLine.range(
+        of: #"^\s*\d+\s\|\s"#,
+        options: .regularExpression)
+    guard range.location == 0, range.length > 0 else { return nil }
+    return range.length
+}
+
 private func scrollClipView(_ clipView: NSClipView, documentView: NSView?, deltaY: CGFloat) {
     guard let documentView else { return }
     clipView.layoutSubtreeIfNeeded()
@@ -1162,8 +1182,30 @@ private final class ComposerTextView: NSTextView {
 }
 
 private final class ArrowCursorTextView: NSTextView {
+    var copySanitizer: ((String) -> String)?
+
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .arrow)
+    }
+
+    override func copy(_ sender: Any?) {
+        guard let copySanitizer else {
+            super.copy(sender)
+            return
+        }
+        let nsString = string as NSString
+        let selected = selectedRanges
+            .map { $0.rangeValue }
+            .filter { $0.length > 0 && NSMaxRange($0) <= nsString.length }
+            .map { nsString.substring(with: $0) }
+            .joined(separator: "\n")
+        let clean = copySanitizer(selected).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else {
+            super.copy(sender)
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(clean, forType: .string)
     }
 
     override func cursorUpdate(with event: NSEvent) {
@@ -4320,6 +4362,7 @@ private final class CanvasPaneView: NSView {
         textView.textContainer?.containerSize = NSSize(
             width: 1,
             height: CGFloat.greatestFiniteMagnitude)
+        textView.copySanitizer = { stripDisplayLineNumberGutters(from: $0) }
 
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
@@ -4409,9 +4452,72 @@ private final class CanvasPaneView: NSView {
             image.isTemplate = true
             iconView.image = image
         }
-        textView.textStorage?.setAttributedString(attributedCanvasText(artifact.content))
+        let displayText = displayCanvasText(for: artifact)
+        textView.textStorage?.setAttributedString(attributedCanvasText(displayText))
         updateTextWrapping()
         textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+    }
+
+    private func displayCanvasText(for artifact: CanvasArtifact) -> String {
+        guard artifact.kind == .code else { return artifact.content }
+        return codeCanvasWithDisplayLineNumbers(artifact.content)
+    }
+
+    private func codeCanvasWithDisplayLineNumbers(_ text: String) -> String {
+        var output: [String] = []
+        var inCode = false
+        var waitingForCodeDivider = false
+        var lineNumber = 1
+
+        for rawLine in text.components(separatedBy: "\n") {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            let header = trimmed.uppercased()
+            let isDivider = !trimmed.isEmpty && trimmed.allSatisfy { $0 == "-" || $0 == "=" }
+
+            if let role = canvasHeaderRole(header) {
+                if role == "code" {
+                    inCode = false
+                    waitingForCodeDivider = true
+                    lineNumber = 1
+                } else {
+                    stripTrailingDisplayOnlyBlankCodeLine(from: &output)
+                    inCode = false
+                    waitingForCodeDivider = false
+                }
+                output.append(rawLine)
+                continue
+            }
+
+            if waitingForCodeDivider {
+                if isDivider {
+                    output.append(rawLine)
+                    inCode = true
+                    waitingForCodeDivider = false
+                    continue
+                }
+                inCode = true
+                waitingForCodeDivider = false
+            }
+
+            if inCode {
+                output.append(String(format: "%3d | %@", lineNumber, rawLine))
+                lineNumber += 1
+            } else {
+                output.append(rawLine)
+            }
+        }
+
+        return output.joined(separator: "\n")
+    }
+
+    private func stripTrailingDisplayOnlyBlankCodeLine(from output: inout [String]) {
+        guard let last = output.last else { return }
+        let range = (last as NSString).range(
+            of: #"^\s*\d+\s\|\s*$"#,
+            options: .regularExpression)
+        if range.location == 0 && range.length == (last as NSString).length {
+            output[output.count - 1] = ""
+        }
     }
 
     private func attributedCanvasText(_ text: String) -> NSAttributedString {
@@ -4475,7 +4581,18 @@ private final class CanvasPaneView: NSView {
                         range: prefixRange)
                 }
             } else if currentSection == "code", range.length > 0 {
-                tintCodeComment(in: rawLine, lineRange: range, output: output)
+                let gutterLength = displayLineNumberGutterLength(in: rawLine) ?? 0
+                if gutterLength > 0 {
+                    output.addAttribute(
+                        .foregroundColor,
+                        value: BlueyTheme.textDim.withAlphaComponent(0.70),
+                        range: NSRange(location: range.location, length: min(gutterLength, range.length)))
+                }
+                let syntaxLine = stripDisplayLineNumberGutters(from: rawLine)
+                let syntaxRange = NSRange(
+                    location: range.location + gutterLength,
+                    length: max(0, range.length - gutterLength))
+                tintCodeComment(in: syntaxLine, lineRange: syntaxRange, output: output)
             } else if isDivider, range.length > 0 {
                 output.addAttribute(
                     .foregroundColor,

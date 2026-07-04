@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 09:35 EDT
+Latest checkpoint: 2026-07-04 18:27 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,7 +30,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-338-CANVAS-CLICKTHROUGH-HITTEST.md`; the next canonical Bluey round doc should start at `ROUND-339-...`.
+- Latest completed Bluey round doc is `ROUND-346-CODE-CANVAS-LINE-NUMBERS.md`; the next canonical Bluey round doc should start at `ROUND-347-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
@@ -5899,6 +5899,73 @@ Deployment status:
 - `https://bluey.sh/health` reports commit `210a4f7559ffd13fe263b3891d75b5e93c39c9f3`.
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
+
+## Latest Round 346: Code Canvas Line Numbers
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-346-CODE-CANVAS-LINE-NUMBERS.md`
+
+Trigger:
+
+- The owner pointed out that Bluey can mention line numbers and `Line notes`, but the code canvas did not visually show line numbers.
+- The owner also clarified that copied code must stay clean and must not include any visual line numbers.
+
+What changed:
+
+- macOS code canvas now shows display-only line numbers for the `CODE`, `PATCH`, `DIFF`, or changed-block section.
+- `LINE NOTES`, `COMPLEXITY`, and prose sections remain unnumbered.
+- The canvas copy button still copies the raw code section through the existing clean copy path.
+- Keyboard copy from selected canvas text strips visual line-number gutters before writing to the pasteboard.
+- Comment tinting still works after adding the display gutter.
+- Desktop workspace version bumped to `0.1.85`.
+
+Verification:
+
+```bash
+swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift
+cd native/macos/cue-overlay && swift build -c release
+cargo fmt --check
+cargo check -p cue-cli -p cue-daemon
+cargo test -p cue-daemon code_artifact_preview_keeps_line_notes_out_of_code_fence --lib
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.85
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+/Users/uno/.bluey/bin/bluey on
+/Users/uno/.bluey/bin/bluey status
+```
+
+Deployment status:
+
+- Desktop release `0.1.85` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.85/bluey-0.1.85-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `7f6c6ebd4740f0a20ab1019849c119e20f0b14fc64b5e7b795a87e90d6a9c15e`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.85`
+- Public installer smoke installed `0.1.85` locally and both installed binaries report `0.1.85`.
+- `bluey on` started fresh daemon pid `12534`.
+
+Windows parity:
+
+- The Windows C overlay does not yet render the same macOS right-side code canvas artifact pane.
+- No Windows code change was applicable in this round.
+- When Windows gets the matching code canvas UI, visible line-number gutters must be display-only and all copy paths must strip them before clipboard writes.
 
 ## Latest Round 345: Explicit Screen Context Follow-Ups
 
