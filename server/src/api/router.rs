@@ -1969,6 +1969,10 @@ fn record_answer_plan_classifier_usage(
 }
 
 fn looks_like_coding_question(normalized: &str) -> bool {
+    if looks_like_algorithmic_challenge_prompt(normalized) {
+        return true;
+    }
+
     contains_any(
         normalized,
         &[
@@ -2034,6 +2038,55 @@ fn looks_like_coding_question(normalized: &str) -> bool {
         || normalized.contains(".tsx")
 }
 
+fn looks_like_algorithmic_challenge_prompt(normalized: &str) -> bool {
+    let has_problem_intro = contains_any(
+        normalized,
+        &[
+            "you are given",
+            "given an array",
+            "given a string",
+            "given a list",
+            "given a matrix",
+            "given two",
+            "given n",
+            "given the root",
+        ],
+    );
+    let has_return_or_output = contains_any(
+        normalized,
+        &[
+            "return true",
+            "return false",
+            "return the",
+            "return a",
+            "return an",
+            "output",
+            "find the",
+            "determine if",
+            "calculate the",
+        ],
+    );
+    let has_data_signal = contains_any(
+        normalized,
+        &[
+            "array",
+            "integer",
+            "integers",
+            "nums",
+            "string",
+            "matrix",
+            "list",
+            "linked list",
+            "tree",
+            "graph",
+            "positive integers",
+        ],
+    );
+
+    (has_problem_intro && has_return_or_output && has_data_signal)
+        || (normalized.contains("return true if") && normalized.contains("otherwise return false"))
+}
+
 fn looks_like_explicit_code_generation_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -2061,6 +2114,10 @@ fn looks_like_explicit_code_generation_request(normalized: &str) -> bool {
 }
 
 fn looks_like_simple_coding_question(normalized: &str, short_question: bool) -> bool {
+    if looks_like_algorithmic_challenge_prompt(normalized) {
+        return false;
+    }
+
     if contains_any(
         normalized,
         &[
@@ -7795,6 +7852,19 @@ mod tests {
     #[test]
     fn answer_plan_algorithmic_solver_code_uses_deep_code_artifact() {
         let req = complete_request("Question:\nGive me Python code which solves Sudoku.");
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Coding);
+        assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+        assert_eq!(plan.recommended_lane, "deep");
+    }
+
+    #[test]
+    fn answer_plan_leetcode_statement_uses_deep_code_artifact() {
+        let req = complete_request(
+            "Question:\nYou are given an array of positive integers nums.\n\nAlice and Bob are playing a game. In the game, Alice can choose either all single-digit numbers or all double-digit numbers from nums, and the rest of the numbers are given to Bob. Alice wins if the sum of her numbers is strictly greater than the sum of Bob's numbers.\n\nReturn true if Alice can win this game, otherwise return false.",
+        );
 
         let plan = answer_plan_for_request(&req, "balanced", &[]);
 

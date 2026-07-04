@@ -308,21 +308,22 @@ fn answer_context_shape(context: &[AnswerContext]) -> AnswerContextShape {
 fn question_intent_label(question: &str) -> &'static str {
     let lower = question.to_ascii_lowercase();
     let compact = lower.replace(|ch: char| !ch.is_ascii_alphanumeric(), " ");
-    let has_code_signal = [
-        "code",
-        "build",
-        "implement",
-        "function",
-        "class",
-        "api",
-        "algorithm",
-        "cache",
-        "sql",
-        "bug",
-        "error",
-    ]
-    .iter()
-    .any(|signal| compact.contains(signal));
+    let has_code_signal = looks_like_algorithmic_challenge_question(&compact)
+        || [
+            "code",
+            "build",
+            "implement",
+            "function",
+            "class",
+            "api",
+            "algorithm",
+            "cache",
+            "sql",
+            "bug",
+            "error",
+        ]
+        .iter()
+        .any(|signal| compact.contains(signal));
     let has_explain_signal = [
         "explain",
         "logic",
@@ -350,6 +351,53 @@ fn question_intent_label(question: &str) -> &'static str {
     } else {
         "general"
     }
+}
+
+fn looks_like_algorithmic_challenge_question(compact_question: &str) -> bool {
+    let has_problem_intro = [
+        "you are given",
+        "given an array",
+        "given a string",
+        "given a list",
+        "given a matrix",
+        "given two",
+        "given n",
+        "given the root",
+    ]
+    .iter()
+    .any(|signal| compact_question.contains(signal));
+    let has_return_or_output = [
+        "return true",
+        "return false",
+        "return the",
+        "return a",
+        "return an",
+        "output",
+        "find the",
+        "determine if",
+        "calculate the",
+    ]
+    .iter()
+    .any(|signal| compact_question.contains(signal));
+    let has_data_signal = [
+        "array",
+        "integer",
+        "integers",
+        "nums",
+        "string",
+        "matrix",
+        "list",
+        "linked list",
+        "tree",
+        "graph",
+        "positive integers",
+    ]
+    .iter()
+    .any(|signal| compact_question.contains(signal));
+
+    (has_problem_intro && has_return_or_output && has_data_signal)
+        || (compact_question.contains("return true if")
+            && compact_question.contains("otherwise return false"))
 }
 
 fn artifact_type_label(artifact_type: CardArtifactType) -> &'static str {
@@ -16268,6 +16316,12 @@ mod tests {
         );
         assert_eq!(
             question_intent_label("Build me an LRU cache"),
+            "code_or_debug"
+        );
+        assert_eq!(
+            question_intent_label(
+                "You are given an array of positive integers nums. Return true if Alice can win this game, otherwise return false."
+            ),
             "code_or_debug"
         );
 

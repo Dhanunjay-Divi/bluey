@@ -5340,3 +5340,50 @@ Deployment status:
 Remaining:
 
 - Retest the Alice/Bob prompt and follow-up in a fresh session, not the old `0.1.64` session.
+
+## Latest Round 330: LeetCode Statement Routing
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-330-LEETCODE-STATEMENT-ROUTING.md`
+
+Trigger:
+
+- A fresh live CLI smoke on `0.1.67` showed the Alice/Bob problem statement still logged as `question_intent="general"` even though it was clearly a LeetCode-style coding challenge.
+- Root problem: the prompt said `You are given... Return true... otherwise return false`, but did not contain explicit words such as `code`, `implement`, `algorithm`, or `leetcode`.
+
+What changed:
+
+- Added a conservative algorithmic challenge detector for:
+  - `you are given...`
+  - `given an array/string/list/matrix...`
+  - `return true/false/the...`
+  - data-structure/problem words such as `array`, `integer`, `nums`, `matrix`, `tree`, or `graph`
+- Wired the detector into:
+  - daemon diagnostics
+  - shared local router heuristic
+  - managed server AnswerPlan
+- Bumped desktop workspace version to `0.1.68`.
+
+Verification at handoff update time:
+
+```bash
+cargo fmt --check
+cargo test -p cue-daemon answer_diagnostics_classify_question_and_text_shape_without_content -- --nocapture
+cargo test -p cue-router leetcode_statement_is_code_and_deep -- --nocapture
+(cd server && cargo test answer_plan_leetcode_statement_uses_deep_code_artifact -- --nocapture)
+cargo check -p cue-daemon
+(cd server && cargo check)
+```
+
+Deployment status at initial handoff update:
+
+- Not yet deployed. Package/publish desktop `0.1.68` and deploy the API classifier fix next.

@@ -170,8 +170,10 @@ impl TaskClassifier for HeuristicClassifier {
         let is_vision = vision_by_attachment || vision_signal_count > 0;
 
         // Score each non-vision task type by keyword hits.
-        let code_hits =
-            count_hits(&prompt_lower, CODE_KEYWORDS) + if has_code_fence { 2 } else { 0 };
+        let algorithmic_challenge = looks_like_algorithmic_challenge_prompt(&prompt_lower);
+        let code_hits = count_hits(&prompt_lower, CODE_KEYWORDS)
+            + if has_code_fence { 2 } else { 0 }
+            + if algorithmic_challenge { 3 } else { 0 };
         let design_hits = count_hits(&prompt_lower, DESIGN_KEYWORDS);
         let meeting_hits =
             count_hits(&prompt_lower, MEETING_KEYWORDS) + if input.has_transcript { 1 } else { 0 };
@@ -206,7 +208,7 @@ impl TaskClassifier for HeuristicClassifier {
         //   - otherwise Medium
         let difficulty = if length > 500
             || matches!(task_type, TaskType::SystemDesign)
-            || (matches!(task_type, TaskType::Code) && has_code_fence)
+            || (matches!(task_type, TaskType::Code) && (has_code_fence || algorithmic_challenge))
         {
             Difficulty::Hard
         } else if length < 60 && code_hits == 0 && design_hits == 0 {
@@ -277,6 +279,53 @@ fn count_hits(prompt_lower: &str, keywords: &[&str]) -> usize {
         .count()
 }
 
+fn looks_like_algorithmic_challenge_prompt(prompt_lower: &str) -> bool {
+    let has_problem_intro = [
+        "you are given",
+        "given an array",
+        "given a string",
+        "given a list",
+        "given a matrix",
+        "given two",
+        "given n",
+        "given the root",
+    ]
+    .iter()
+    .any(|signal| prompt_lower.contains(signal));
+    let has_return_or_output = [
+        "return true",
+        "return false",
+        "return the",
+        "return a",
+        "return an",
+        "output",
+        "find the",
+        "determine if",
+        "calculate the",
+    ]
+    .iter()
+    .any(|signal| prompt_lower.contains(signal));
+    let has_data_signal = [
+        "array",
+        "integer",
+        "integers",
+        "nums",
+        "string",
+        "matrix",
+        "list",
+        "linked list",
+        "tree",
+        "graph",
+        "positive integers",
+    ]
+    .iter()
+    .any(|signal| prompt_lower.contains(signal));
+
+    (has_problem_intro && has_return_or_output && has_data_signal)
+        || (prompt_lower.contains("return true if")
+            && prompt_lower.contains("otherwise return false"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +364,16 @@ mod tests {
     async fn code_with_fence_is_hard() {
         let c = HeuristicClassifier::new();
         let prompt = "Why does this Rust function panic?\n```rust\nfn foo() { let x: u8 = 300; }\n```\nstack trace shows overflow.";
+        let r = c.classify(&make_input(prompt)).await;
+        assert_eq!(r.task_type, TaskType::Code);
+        assert_eq!(r.difficulty, Difficulty::Hard);
+        assert_eq!(r.latency_lane, LatencyLane::Deep);
+    }
+
+    #[tokio::test]
+    async fn leetcode_statement_is_code_and_deep() {
+        let c = HeuristicClassifier::new();
+        let prompt = "You are given an array of positive integers nums. Alice and Bob are playing a game. Return true if Alice can win this game, otherwise return false.";
         let r = c.classify(&make_input(prompt)).await;
         assert_eq!(r.task_type, TaskType::Code);
         assert_eq!(r.difficulty, Difficulty::Hard);
