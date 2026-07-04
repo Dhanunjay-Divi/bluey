@@ -1872,11 +1872,19 @@ async fn ensure_daemon_quiet(no_overlay: bool) -> Result<()> {
 }
 
 async fn ensure_daemon_with_output(no_overlay: bool, quiet: bool) -> Result<()> {
+    let paths = AppPaths::discover()?;
     if request(DaemonRequest::Ping).await.is_ok() {
+        if restart_daemon_if_binary_changed(&paths, quiet).await? {
+            start(StartArgs {
+                foreground: false,
+                no_overlay,
+                quiet,
+            })
+            .await?;
+        }
         return Ok(());
     }
 
-    let paths = AppPaths::discover()?;
     cleanup_stale_daemon(&paths, quiet).await?;
 
     start(StartArgs {
@@ -2365,16 +2373,22 @@ fn parse_overlay_position(value: &str) -> Option<OverlayPosition> {
 }
 
 async fn start(args: StartArgs) -> Result<()> {
+    let paths = AppPaths::discover()?;
     if request(DaemonRequest::Ping).await.is_ok() {
+        if restart_daemon_if_binary_changed(&paths, args.quiet).await? {
+            return start_after_daemon_check(args).await;
+        }
         if !args.quiet {
             println!("Bluey daemon is already running.");
         }
         return Ok(());
     }
 
-    let paths = AppPaths::discover()?;
     cleanup_stale_daemon(&paths, args.quiet).await?;
+    start_after_daemon_check(args).await
+}
 
+async fn start_after_daemon_check(args: StartArgs) -> Result<()> {
     if args.foreground {
         let daemon_args = daemon_launch_args(&args);
         let mut command = Command::new(resolve_daemon_bin()?);
@@ -2405,6 +2419,56 @@ async fn start(args: StartArgs) -> Result<()> {
         println!("Bluey daemon started with pid {}.", child.id());
     }
     Ok(())
+}
+
+async fn restart_daemon_if_binary_changed(paths: &AppPaths, quiet: bool) -> Result<bool> {
+    let daemon_bin = match resolve_daemon_bin() {
+        Ok(path) => path,
+        Err(_) => return Ok(false),
+    };
+    let response = match request(DaemonRequest::Status).await {
+        Ok(response) => response,
+        Err(_) => return Ok(false),
+    };
+    let DaemonResponse::Status { state } = response else {
+        return Ok(false);
+    };
+    if !daemon_binary_is_newer_than_started_at(&daemon_bin, &state.started_at)? {
+        return Ok(false);
+    }
+
+    if !quiet {
+        eprintln!("Bluey updated on disk. Restarting the running daemon...");
+    }
+    let _ = request(DaemonRequest::Shutdown).await;
+    match wait_for_daemon_stopped(Duration::from_secs(10)).await {
+        Ok(()) => {}
+        Err(error) if !quiet => {
+            eprintln!("warning: graceful daemon restart timed out: {error:#}");
+        }
+        Err(_) => {}
+    }
+    let _ = cleanup_stale_daemon(paths, true).await;
+    Ok(true)
+}
+
+fn daemon_binary_is_newer_than_started_at(daemon_bin: &Path, started_at_ms: &str) -> Result<bool> {
+    let started_at = match epoch_millis_to_system_time(started_at_ms) {
+        Some(value) => value,
+        None => return Ok(false),
+    };
+    let modified = std::fs::metadata(daemon_bin)
+        .and_then(|metadata| metadata.modified())
+        .with_context(|| format!("failed to inspect {}", daemon_bin.display()))?;
+    let Ok(delta) = modified.duration_since(started_at) else {
+        return Ok(false);
+    };
+    Ok(delta > Duration::from_secs(2))
+}
+
+fn epoch_millis_to_system_time(value: &str) -> Option<SystemTime> {
+    let millis = value.parse::<u64>().ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_millis(millis))
 }
 
 async fn cleanup_stale_daemon(paths: &AppPaths, quiet: bool) -> Result<()> {
@@ -3485,6 +3549,9 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        time::{
+            Duration as StdDuration, SystemTime as StdSystemTime, UNIX_EPOCH as STD_UNIX_EPOCH,
+        },
     };
 
     #[test]
@@ -3677,6 +3744,46 @@ mod tests {
         assert_eq!(
             resolve_daemon_bin_from_roots(vec![PathBuf::from("/missing/bluey"), bluey]),
             Some(daemon)
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn daemon_binary_change_check_detects_newer_installed_binary() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-daemon-mtime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).expect("create temp dir");
+        let daemon = base.join("bluey-daemon");
+        fs::write(&daemon, b"daemon").expect("write daemon");
+
+        assert!(
+            super::daemon_binary_is_newer_than_started_at(&daemon, "0")
+                .expect("compare daemon mtime"),
+            "a binary modified after the daemon start time should require restart"
+        );
+
+        let future = StdSystemTime::now()
+            .checked_add(StdDuration::from_secs(3600))
+            .expect("future time")
+            .duration_since(STD_UNIX_EPOCH)
+            .expect("epoch")
+            .as_millis()
+            .to_string();
+        assert!(
+            !super::daemon_binary_is_newer_than_started_at(&daemon, &future)
+                .expect("compare future daemon mtime"),
+            "a daemon started after the binary mtime should not require restart"
+        );
+        assert!(
+            !super::daemon_binary_is_newer_than_started_at(&daemon, "not-a-time")
+                .expect("invalid started_at should be ignored")
         );
 
         let _ = fs::remove_dir_all(base);

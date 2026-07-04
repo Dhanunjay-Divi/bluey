@@ -72,7 +72,11 @@ private func sanitizeOverlayOutput(kind: String, body: String) -> String {
 }
 
 private func formatOverlayAnswerText(_ body: String) -> String {
-    stripPlainTextMarkdownDecoration(body)
+    removeLegacyInlineCodeBlob(stripPlainTextMarkdownDecoration(body))
+        .replacingOccurrences(
+            of: #"(Explanation|Complexity|Line notes|Time Complexity|Space Complexity)(?=[A-Z])"#,
+            with: "$1\n",
+            options: .regularExpression)
         .replacingOccurrences(
             of: #"(?<=[\:\.\!\?\*\)])\s*(-\s+[A-Z])"#,
             with: "\n$1",
@@ -82,6 +86,18 @@ private func formatOverlayAnswerText(_ body: String) -> String {
             with: ".\n\n$1",
             options: .regularExpression)
         .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+}
+
+private func removeLegacyInlineCodeBlob(_ text: String) -> String {
+    let pattern = #"(?s)\bCode(?:cpp|c\+\+|python|py|java|javascript|js|typescript|ts|go|rust|swift|csharp)?\s*(?:class|def|from|public|#include|import|func|function|vector|let|const|var).*?(?=\b(?:Explanation|Complexity|Line notes|Time Complexity|Space Complexity)\b)"#
+    let cleaned = text.replacingOccurrences(
+        of: pattern,
+        with: "Code is open in the canvas.\n",
+        options: .regularExpression)
+    return cleaned.replacingOccurrences(
+        of: #"\nCode is open in the canvas\.\nCode is open in the canvas\."#,
+        with: "\nCode is open in the canvas.",
+        options: .regularExpression)
 }
 
 private func stripPlainTextMarkdownDecoration(_ text: String) -> String {
@@ -2835,8 +2851,8 @@ private final class FeedView: NSView {
 
         stack.orientation = .vertical
         stack.alignment = .centerX
-        stack.spacing = 12
-        stack.edgeInsets = NSEdgeInsets(top: 28, left: 0, bottom: 16, right: 0)
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 12, left: 0, bottom: 10, right: 0)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         scroll.hasVerticalScroller = true
@@ -2845,7 +2861,7 @@ private final class FeedView: NSView {
         scroll.verticalScrollElasticity = .allowed
         scroll.borderType = .noBorder
         scroll.drawsBackground = false
-        scroll.contentInsets = NSEdgeInsets(top: 8, left: 0, bottom: 10, right: 0)
+        scroll.contentInsets = NSEdgeInsets(top: 4, left: 0, bottom: 6, right: 0)
         scroll.documentView = stack
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.wantsLayer = true
@@ -2868,7 +2884,6 @@ private final class FeedView: NSView {
             stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
             stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
             stack.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-            stack.bottomAnchor.constraint(greaterThanOrEqualTo: scroll.contentView.bottomAnchor),
             stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
         ])
     }
