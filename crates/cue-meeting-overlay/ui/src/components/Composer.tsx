@@ -4,6 +4,7 @@
 import { useState, type ReactNode } from "react";
 import type { AskMode, ListeningState } from "../lib/types";
 import { PlusMenu } from "./PlusMenu";
+import { ModelPicker } from "./ModelPicker";
 import { AlertIcon, MicIcon, SpinnerIcon, StopIcon } from "./icons";
 
 /** The three answer-speed presets, ordered fast → deep. `hint` is the title
@@ -27,6 +28,9 @@ export function Composer({
   listenState = "idle",
   mode,
   onModeChange,
+  models,
+  selectedModel,
+  onModelChange,
 }: {
   placeholder: string;
   contextLabel?: string;
@@ -39,6 +43,15 @@ export function Composer({
   mode?: AskMode;
   /** Called when the user picks a different speed preset. */
   onModeChange?: (mode: AskMode) => void;
+  /** Selectable models for the attached agent (element [0] is always "auto").
+   *  The picker sits on the speed row and is shown only when there is more than
+   *  one choice; omit / pass ≤1 entry to hide it (e.g. no agent attached, or an
+   *  agent whose CLI exposes no model list). */
+  models?: string[];
+  /** Currently selected model id ("auto" = no override). */
+  selectedModel?: string;
+  /** Called when the user picks a different model. */
+  onModelChange?: (model: string) => void;
 }) {
   const [text, setText] = useState("");
   const [plusOpen, setPlusOpen] = useState(false);
@@ -69,46 +82,64 @@ export function Composer({
           ✓ {contextLabel}
         </span>
       )}
-      {onModeChange && (
+      {(onModeChange || (onModelChange && (models?.length ?? 0) > 1)) && (
         <div
-          role="radiogroup"
-          aria-label="Answer speed"
           style={{
-            display: "inline-flex",
-            gap: 2,
+            display: "flex",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: 8,
             marginBottom: 10,
-            padding: 2,
-            background: "var(--glass-solid)",
-            border: "1px solid var(--line-2)",
-            borderRadius: "var(--r-pill)",
           }}
         >
-          {MODES.map((m) => {
-            const active = (mode ?? "balanced") === m.id;
-            return (
-              <button
-                key={m.id}
-                role="radio"
-                aria-checked={active}
-                title={m.hint}
-                onClick={() => onModeChange(m.id)}
-                style={{
-                  border: "none",
-                  cursor: "pointer",
-                  fontSize: 10.5,
-                  fontWeight: active ? 580 : 460,
-                  lineHeight: 1,
-                  padding: "5px 11px",
-                  borderRadius: "var(--r-pill)",
-                  background: active ? "var(--tint-wash)" : "transparent",
-                  color: active ? "var(--tint-ink)" : "var(--ink-3)",
-                  transition: "color .12s ease, background .12s ease",
-                }}
-              >
-                {m.label}
-              </button>
-            );
-          })}
+          {onModeChange && (
+            <div
+              role="radiogroup"
+              aria-label="Answer speed"
+              style={{
+                display: "inline-flex",
+                gap: 2,
+                padding: 2,
+                background: "var(--glass-solid)",
+                border: "1px solid var(--line-2)",
+                borderRadius: "var(--r-pill)",
+              }}
+            >
+              {MODES.map((m) => {
+                const active = (mode ?? "balanced") === m.id;
+                return (
+                  <button
+                    key={m.id}
+                    role="radio"
+                    aria-checked={active}
+                    title={m.hint}
+                    onClick={() => onModeChange(m.id)}
+                    style={{
+                      border: "none",
+                      cursor: "pointer",
+                      fontSize: 10.5,
+                      fontWeight: active ? 580 : 460,
+                      lineHeight: 1,
+                      padding: "5px 11px",
+                      borderRadius: "var(--r-pill)",
+                      background: active ? "var(--tint-wash)" : "transparent",
+                      color: active ? "var(--tint-ink)" : "var(--ink-3)",
+                      transition: "color .12s ease, background .12s ease",
+                    }}
+                  >
+                    {m.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {onModelChange && models && models.length > 1 && (
+            <ModelPicker
+              models={models}
+              value={selectedModel ?? "auto"}
+              onChange={onModelChange}
+            />
+          )}
         </div>
       )}
       <div
@@ -261,6 +292,14 @@ function micMeta(state: ListeningState): {
         title: "Audio couldn't start (setup needed) — click to retry",
         bg: "rgba(229,72,77,.12)",
         fg: "#e5484d",
+      };
+    case "permission_denied":
+      return {
+        glyph: <AlertIcon size={16} />,
+        label: "Grant Screen Recording — click to open Settings",
+        title: "Screen Recording permission needed — click to open Settings",
+        bg: "rgba(184,117,3,.14)",
+        fg: "#b87503",
       };
     case "paused":
     case "idle":

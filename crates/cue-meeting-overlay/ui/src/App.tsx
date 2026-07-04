@@ -77,8 +77,8 @@ export function App() {
     };
   }, [client, attached]);
 
-  const attach = (kind: string, sessionId?: string) =>
-    client.attach(kind, sessionId).then(setAgents);
+  const attach = (kind: string, sessionId?: string, model?: string) =>
+    client.attach(kind, sessionId, model).then(setAgents);
   const detach = () => client.detach().then(setAgents);
 
   // Collapsed: the ambient pill — live listening status + latest heard line +

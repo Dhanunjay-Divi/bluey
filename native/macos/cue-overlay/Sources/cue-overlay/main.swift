@@ -1096,9 +1096,12 @@ private func emitAgentListRequested() {
     emitEvent(["type": "agent_list_requested"])
 }
 
-private func emitAgentAttachRequested(kind: String, sessionId: String?) {
+private func emitAgentAttachRequested(
+    kind: String, sessionId: String?, model: String? = nil
+) {
     var p: [String: Any] = ["type": "agent_attach_requested", "kind": kind]
     if let sessionId, !sessionId.isEmpty { p["session_id"] = sessionId }
+    if let model, !model.isEmpty { p["model"] = model }
     emitEvent(p)
 }
 

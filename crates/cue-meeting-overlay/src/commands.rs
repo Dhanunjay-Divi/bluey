@@ -61,6 +61,12 @@ pub async fn agent_sessions(link: State<'_, DaemonLink>, kind: String) -> Result
 }
 
 #[tauri::command]
+pub async fn agent_models(link: State<'_, DaemonLink>, kind: String) -> Result<Value, String> {
+    let resp = request(&link.addr, json!({ "type": "agent_models", "kind": kind })).await?;
+    array_field(resp, "models")
+}
+
+#[tauri::command]
 pub async fn agent_connectors(link: State<'_, DaemonLink>, kind: String) -> Result<Value, String> {
     let resp = request(
         &link.addr,

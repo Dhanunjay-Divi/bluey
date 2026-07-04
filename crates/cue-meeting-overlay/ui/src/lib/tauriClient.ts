@@ -91,6 +91,7 @@ type OverlayCommand =
       kind: string;
       connectors: WireAgentConnectorInfo[];
     }
+  | { type: "set_agent_models"; kind: string; models: string[] }
   | { type: "listening_state_changed"; state: string }
   | { type: "push_card"; card: WireCueCard }
   | {
@@ -222,12 +223,13 @@ export function createTauriClient(): MeetingClient {
       ),
 
     // attach/detach both confirm by the daemon re-pushing the full agent list.
-    attach: (kind, sessionId) =>
+    attach: (kind, sessionId, model) =>
       request<AgentSummary[]>(
         {
           type: "agent_attach_requested",
           kind,
           ...(sessionId ? { session_id: sessionId } : {}),
+          ...(model ? { model } : {}),
         },
         (cmd) =>
           cmd.type === "set_agents"
@@ -260,6 +262,15 @@ export function createTauriClient(): MeetingClient {
           return c.sessions.map(toAgentSessionSummary);
         },
       ),
+
+    models: (kind) =>
+      request<string[]>({ type: "agent_models_requested", kind }, (cmd) => {
+        if (cmd.type !== "set_agent_models") return undefined;
+        const c = cmd as Extract<OverlayCommand, { type: "set_agent_models" }>;
+        // Guard against a reply for a different agent on the shared bus.
+        if (c.kind !== kind) return undefined;
+        return c.models;
+      }),
 
     connectors: (kind) =>
       request<AgentConnectorInfo[]>(
@@ -315,8 +326,12 @@ export function createTauriClient(): MeetingClient {
       // (recording_* = audio; capture_* = the screen "eye" — different feature.)
       sendEvent({
         type: "recording_start_requested",
-        ...(sources?.microphone !== undefined ? { enable_microphone: sources.microphone } : {}),
-        ...(sources?.system !== undefined ? { enable_system: sources.system } : {}),
+        ...(sources?.microphone !== undefined
+          ? { enable_microphone: sources.microphone }
+          : {}),
+        ...(sources?.system !== undefined
+          ? { enable_system: sources.system }
+          : {}),
       });
     },
 

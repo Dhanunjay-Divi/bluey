@@ -163,6 +163,7 @@ pub fn run() {
             commands::agent_attach,
             commands::agent_detach,
             commands::agent_sessions,
+            commands::agent_models,
             commands::agent_connectors,
             commands::set_agent_session_history,
             commands::meeting_ask,

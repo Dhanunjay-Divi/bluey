@@ -25,9 +25,17 @@ export interface AskHandle {
 export interface MeetingClient {
   // ---- discovery / attach (the proven agent-bridge commands) ----
   listAgents(): Promise<AgentSummary[]>;
-  attach(kind: string, sessionId?: string): Promise<AgentSummary[]>;
+  attach(
+    kind: string,
+    sessionId?: string,
+    model?: string,
+  ): Promise<AgentSummary[]>;
   detach(): Promise<AgentSummary[]>;
   sessions(kind: string): Promise<AgentSessionSummary[]>;
+  /** List the attached agent's selectable model ids (element [0] is always
+      "auto" = no override). Live-scraped for Cursor/Antigravity, curated for
+      the rest. */
+  models(kind: string): Promise<string[]>;
   connectors(kind: string): Promise<AgentConnectorInfo[]>;
   setSessionHistoryConsent(enabled: boolean): Promise<void>;
 
@@ -37,7 +45,9 @@ export interface MeetingClient {
   /** Subscribe to daemon-detected "for-me" questions (master doc §6) — the
    *  distinct signal that drives the Ask view's "They asked…" hero card.
    *  Returns an unsubscribe fn. */
-  onForMeQuestion(cb: (q: { text: string; title?: string }) => void): () => void;
+  onForMeQuestion(
+    cb: (q: { text: string; title?: string }) => void,
+  ): () => void;
   /**
    * Ask the attached agent a question; streams chunks (text / tool-fired /
    * source / done) to `onChunk`. The agent answer is SLOW by nature (driving a

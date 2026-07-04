@@ -61,6 +61,29 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   // The answer-speed preset, forwarded to the daemon as `mode`. Defaults to
   // "balanced" so an untouched composer behaves exactly as before.
   const [mode, setMode] = useState<AskMode>("balanced");
+  // The attached agent's selectable models ("auto" is always element [0]) and
+  // the current pick. Fetched when the agent changes; the Composer shows the
+  // picker beside the speed pills only when there is more than one choice.
+  const [models, setModels] = useState<string[]>([]);
+  const [selectedModel, setSelectedModel] = useState("auto");
+  const agentKind = agent?.kind ?? null;
+  useEffect(() => {
+    let live = true;
+    // Reset to "auto" whenever the agent changes so a model picked for the
+    // previous agent never lingers as a stale value the new agent doesn't have.
+    setSelectedModel("auto");
+    if (!agentKind) {
+      setModels([]);
+      return;
+    }
+    client
+      .models(agentKind)
+      .then((m) => live && setModels(m))
+      .catch(() => live && setModels([]));
+    return () => {
+      live = false;
+    };
+  }, [client, agentKind]);
   const askRef = useRef<{ cancel(): void } | null>(null);
   const turnSeq = useRef(0);
   const feedEndRef = useRef<HTMLDivElement>(null);
@@ -123,10 +146,7 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
     text: string;
     title?: string;
   } | null>(null);
-  useEffect(
-    () => client.onForMeQuestion((q) => setDetectedQ(q)),
-    [client],
-  );
+  useEffect(() => client.onForMeQuestion((q) => setDetectedQ(q)), [client]);
   useEffect(() => client.onListeningState(setListenState), [client]);
   // Keep the newest turn / streaming text in view as the feed grows.
   useEffect(() => {
@@ -354,12 +374,36 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
         onSubmit={runAsk}
         mode={mode}
         onModeChange={setMode}
+        models={models}
+        selectedModel={selectedModel}
+        onModelChange={(m) => {
+          setSelectedModel(m);
+          // Re-attach the SAME agent carrying the model override ("auto" clears
+          // it). Same mechanism the header attach uses; the daemon persists
+          // attached_model and applies it on the next answer.
+          if (agentKind) {
+            void client.attach(
+              agentKind,
+              undefined,
+              m === "auto" ? undefined : m,
+            );
+          }
+        }}
         onMic={() => {
           // Debounce: ignore clicks while a start is mid-flight (connecting),
           // so a non-responsive moment doesn't fire a burst of start events.
           if (listenState === "connecting") return;
+          // Permission denied → the mic click opens Settings (the recovery the
+          // old "+"-menu "Grant Screen Recording…" item used to offer).
+          if (listenState === "permission_denied") {
+            client.openPermissionSettings("screen_recording");
+            return;
+          }
           if (listenState === "listening") client.stopListening();
-          else client.startListening();
+          // v1 captures SYSTEM audio (the other people in the call — the
+          // question trigger), matching the intent of the old "+"-menu Listen
+          // item that this outside mic button replaces.
+          else client.startListening({ microphone: false, system: true });
         }}
         listenState={listenState}
       />

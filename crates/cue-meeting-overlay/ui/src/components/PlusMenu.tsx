@@ -1,28 +1,16 @@
 // The "+" context menu — opens from the composer's + button. Real daemon
-// actions only; nothing here is a stub. Holds BOTH the context actions (attach /
-// capture / screenshot) AND the audio controls (listen with mic/system, or pick
-// a specific app to capture) — so audio lives in the quick "+" dialog rather
-// than a separate tab.
+// actions only; nothing here is a stub. Holds the CONTEXT actions (attach /
+// capture / screenshot). The listen control lives OUTSIDE the menu now — as the
+// mic button directly on the composer row — so it is one click, not buried in a
+// dialog.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { getClient } from "../lib";
-import type { ListeningState } from "../lib/types";
-import {
-  AlertIcon,
-  AttachIcon,
-  GlobeIcon,
-  ScreenIcon,
-  StopIcon,
-  SystemAudioIcon,
-} from "./icons";
+import { AttachIcon, GlobeIcon, ScreenIcon } from "./icons";
 
 export function PlusMenu({ onClose }: { onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
   const client = getClient();
-  const [listen, setListen] = useState<ListeningState>("idle");
-
-  // Live listening state so the menu shows Start vs Stop + permission hints.
-  useEffect(() => client.onListeningState(setListen), [client]);
 
   // Dismiss on outside-click / Escape — standard popover behavior.
   useEffect(() => {
@@ -45,9 +33,6 @@ export function PlusMenu({ onClose }: { onClose: () => void }) {
     fn();
   };
 
-  const active = listen === "listening" || listen === "connecting";
-  const denied = listen === "permission_denied";
-
   return (
     <div
       ref={ref}
@@ -68,36 +53,7 @@ export function PlusMenu({ onClose }: { onClose: () => void }) {
         padding: "5px 0",
       }}
     >
-      {/* Audio — the listen controls live here now (no separate tab) */}
-      <MenuLabel>AUDIO</MenuLabel>
-      {/* One action: Listen / Stop. v1 captures SYSTEM audio (the other people
-          in the call — the question trigger). No "pick app" — clicking Listen
-          just works (whole-meeting audio). */}
-      {active ? (
-        <MenuItem
-          icon={<StopIcon size={15} />}
-          label="Stop listening"
-          onClick={act(() => client.stopListening())}
-        />
-      ) : (
-        <MenuItem
-          icon={<SystemAudioIcon size={15} />}
-          label="Listen"
-          onClick={act(() => client.startListening({ microphone: false, system: true }))}
-        />
-      )}
-      {denied && (
-        <MenuItem
-          icon={<AlertIcon size={15} />}
-          label="Grant Screen Recording…"
-          tone="warn"
-          onClick={act(() => client.openPermissionSettings("screen_recording"))}
-        />
-      )}
-
-      <Divider />
-
-      {/* Context — the original "+" actions */}
+      {/* Context — the "+" actions. Listen moved out to the composer's mic. */}
       <MenuLabel>CONTEXT</MenuLabel>
       <MenuItem
         icon={<AttachIcon size={15} />}
@@ -135,10 +91,6 @@ function MenuLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function Divider() {
-  return <div style={{ height: 1, background: "var(--line)", margin: "5px 0" }} />;
-}
-
 function MenuItem({
   icon,
   label,
@@ -170,7 +122,9 @@ function MenuItem({
         color,
         textAlign: "left",
       }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--tint-wash)")}
+      onMouseEnter={(e) =>
+        (e.currentTarget.style.background = "var(--tint-wash)")
+      }
       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
     >
       <span
@@ -187,7 +141,13 @@ function MenuItem({
       </span>
       <span style={{ flex: 1 }}>{label}</span>
       {hint && (
-        <span style={{ fontSize: 10, color: "var(--ink-4)", fontFamily: "var(--mono)" }}>
+        <span
+          style={{
+            fontSize: 10,
+            color: "var(--ink-4)",
+            fontFamily: "var(--mono)",
+          }}
+        >
           {hint}
         </span>
       )}
