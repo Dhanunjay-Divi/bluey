@@ -51,6 +51,8 @@ typedef struct Args {
 typedef struct Resampler {
     double ratio;
     double carry;
+    double window_sum;
+    unsigned int window_count;
 } Resampler;
 
 static Args parse_args(int argc, char **argv) {
@@ -161,11 +163,24 @@ static float read_channel_sample(const BYTE *sample, const WAVEFORMATEX *format,
 }
 
 static void write_resampled_i16(Resampler *resampler, float sample) {
-    resampler->carry += resampler->ratio;
-    while (resampler->carry >= 1.0) {
-        int16_t out = (int16_t)(sample * 32767.0f);
+    resampler->window_sum += (double)sample;
+    resampler->window_count += 1;
+    resampler->carry += 1.0;
+    const double samples_per_output = resampler->ratio > 0.0 ? (1.0 / resampler->ratio) : 1.0;
+    while (resampler->carry >= samples_per_output) {
+        double averaged = resampler->window_count > 0
+            ? resampler->window_sum / (double)resampler->window_count
+            : (double)sample;
+        if (averaged > 1.0) {
+            averaged = 1.0;
+        } else if (averaged < -1.0) {
+            averaged = -1.0;
+        }
+        int16_t out = (int16_t)(averaged * 32767.0);
         fwrite(&out, sizeof(int16_t), 1, stdout);
-        resampler->carry -= 1.0;
+        resampler->carry -= samples_per_output;
+        resampler->window_sum = 0.0;
+        resampler->window_count = 0;
     }
 }
 
@@ -268,6 +283,8 @@ int main(int argc, char **argv) {
     Resampler resampler;
     resampler.ratio = BLUEY_TARGET_SAMPLE_RATE / (double)mix_format->nSamplesPerSec;
     resampler.carry = 0.0;
+    resampler.window_sum = 0.0;
+    resampler.window_count = 0;
 
     hr = IAudioClient_Start(audio_client);
     if (FAILED(hr)) {

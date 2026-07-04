@@ -36,29 +36,44 @@ private func parseArgs() -> Args {
     return parsed
 }
 
-/// Writes 16 kHz mono i16 LE PCM to stdout from 48 kHz mono float input.
+/// Writes 16 kHz mono i16 LE PCM to stdout from mono float input.
 private final class PCM16Writer {
     private let handle = FileHandle.standardOutput
     private let lock = NSLock()
     private var carry: Double = 0.0
+    private var windowSum: Double = 0.0
+    private var windowCount: Int = 0
+    private var lastSourceSampleRate: Double = 0.0
 
     func writeMonoFloat(_ samples: [Float], sourceSampleRate: Double) {
         guard !samples.isEmpty, sourceSampleRate > 0 else { return }
         lock.lock()
+        defer { lock.unlock() }
+        if abs(sourceSampleRate - lastSourceSampleRate) > 0.1 {
+            carry = 0.0
+            windowSum = 0.0
+            windowCount = 0
+            lastSourceSampleRate = sourceSampleRate
+        }
         var output = Data()
-        output.reserveCapacity(samples.count * 2)
-        let ratio = 16_000.0 / sourceSampleRate
+        output.reserveCapacity(Int((Double(samples.count) * 16_000.0 / sourceSampleRate + 2.0) * 2.0))
+        let samplesPerOutput = max(sourceSampleRate / 16_000.0, 0.001)
         for sample in samples {
-            carry += ratio
-            while carry >= 1.0 {
-                let clamped = max(-1.0, min(1.0, sample.isFinite ? sample : 0.0))
-                var sample = Int16(clamped * 32767.0)
+            let clamped = max(-1.0, min(1.0, sample.isFinite ? sample : 0.0))
+            windowSum += Double(clamped)
+            windowCount += 1
+            carry += 1.0
+            while carry >= samplesPerOutput {
+                let averaged = windowCount > 0 ? windowSum / Double(windowCount) : Double(clamped)
+                let bounded = max(-1.0, min(1.0, averaged))
+                var sample = Int16(bounded * 32767.0)
                 withUnsafeBytes(of: &sample) { output.append(contentsOf: $0) }
-                carry -= 1.0
+                carry -= samplesPerOutput
+                windowSum = 0.0
+                windowCount = 0
             }
         }
         handle.write(output)
-        lock.unlock()
     }
 
     func write48kFloat(_ pointer: UnsafePointer<Float>, frameCount: Int) {

@@ -39,10 +39,48 @@ const MAX_SESSION_SECONDS: i64 = 20 * 60;
 const PCM16_DBFS_FLOOR: f64 = -120.0;
 const LIVE_STT_AUDIBLE_RMS_DBFS: f64 = -58.0;
 const LIVE_STT_AUDIBLE_PEAK_DBFS: f64 = -34.0;
-const DEFAULT_DEEPGRAM_ENDPOINTING_MS: u32 = 300;
+const DEFAULT_DEEPGRAM_ENDPOINTING_MS: u32 = 200;
 const DEFAULT_DEEPGRAM_UTTERANCE_END_MS: u32 = 1_000;
 const DEFAULT_DEEPGRAM_LANGUAGE: &str = "en-US";
 const DEFAULT_DEEPGRAM_NO_DELAY: bool = true;
+const MAX_DEEPGRAM_KEYTERMS: usize = 50;
+const DEFAULT_DEEPGRAM_KEYTERMS: &[&str] = &[
+    "LRU",
+    "FIFO",
+    "LIFO",
+    "API",
+    "REST API",
+    "GraphQL",
+    "gRPC",
+    "SQL",
+    "NoSQL",
+    "PostgreSQL",
+    "MySQL",
+    "Redis",
+    "Kafka",
+    "Kubernetes",
+    "Docker",
+    "Terraform",
+    "CI/CD",
+    "AWS",
+    "Azure",
+    "GCP",
+    "OAuth",
+    "JWT",
+    "Python",
+    "Java",
+    "JavaScript",
+    "TypeScript",
+    "C#",
+    "React",
+    "Angular",
+    "LangGraph",
+    "Deepgram",
+    "OpenAI",
+    "Claude",
+    "Gemini",
+    "Bluey",
+];
 
 #[derive(Debug, Deserialize)]
 pub struct SttSessionRequest {
@@ -604,6 +642,7 @@ fn deepgram_realtime_url(session: &ClaimedSttSession) -> String {
         5_000,
     );
     let no_delay = deepgram_realtime_env_bool("BLUEY_DEEPGRAM_NO_DELAY", DEFAULT_DEEPGRAM_NO_DELAY);
+    let keyterms = deepgram_realtime_keyterms();
     let mut url = format!(
         "{base}?model={}&encoding=linear16&sample_rate=16000&channels=1&punctuate=true&smart_format=true&interim_results=true&endpointing={endpointing_ms}&utterance_end_ms={utterance_end_ms}&vad_events=true&no_delay={no_delay}",
         url_escape(&session.model),
@@ -620,7 +659,50 @@ fn deepgram_realtime_url(session: &ClaimedSttSession) -> String {
         url.push_str("&language=");
         url.push_str(&url_escape(language));
     }
+    for keyterm in keyterms {
+        url.push_str("&keyterm=");
+        url.push_str(&url_escape(&keyterm));
+    }
     url
+}
+
+fn deepgram_realtime_keyterms() -> Vec<String> {
+    let include_defaults = deepgram_realtime_env_bool("BLUEY_DEEPGRAM_DEFAULT_KEYTERMS", true);
+    let mut keyterms = Vec::new();
+    if include_defaults {
+        for keyterm in DEFAULT_DEEPGRAM_KEYTERMS {
+            push_deepgram_keyterm(&mut keyterms, keyterm);
+        }
+    }
+    if let Ok(raw) = std::env::var("BLUEY_DEEPGRAM_KEYTERMS") {
+        let disabled = matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "none"
+        );
+        if !disabled {
+            for keyterm in raw.split([',', ';', '\n']) {
+                push_deepgram_keyterm(&mut keyterms, keyterm);
+            }
+        }
+    }
+    keyterms
+}
+
+fn push_deepgram_keyterm(keyterms: &mut Vec<String>, keyterm: &str) {
+    if keyterms.len() >= MAX_DEEPGRAM_KEYTERMS {
+        return;
+    }
+    let keyterm = keyterm.trim();
+    if keyterm.is_empty() {
+        return;
+    }
+    if keyterms
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(keyterm))
+    {
+        return;
+    }
+    keyterms.push(keyterm.to_string());
 }
 
 fn deepgram_realtime_env_u32(name: &str, default: u32, min: u32, max: u32) -> u32 {
@@ -912,6 +994,8 @@ mod tests {
         let _guard = DEEPGRAM_URL_ENV_LOCK.lock().unwrap();
         std::env::remove_var("BLUEY_DEEPGRAM_LANGUAGE");
         std::env::remove_var("BLUEY_DEEPGRAM_NO_DELAY");
+        std::env::remove_var("BLUEY_DEEPGRAM_DEFAULT_KEYTERMS");
+        std::env::remove_var("BLUEY_DEEPGRAM_KEYTERMS");
         let session = ClaimedSttSession {
             token: "token".into(),
             account_id: "acct".into(),
@@ -927,11 +1011,14 @@ mod tests {
         let url = deepgram_realtime_url(&session);
         assert!(url.contains("model=nova%203%2Ftest"));
         assert!(url.contains("interim_results=true"));
-        assert!(url.contains("endpointing=300"));
+        assert!(url.contains("endpointing=200"));
         assert!(url.contains("utterance_end_ms=1000"));
         assert!(url.contains("vad_events=true"));
         assert!(url.contains("no_delay=true"));
         assert!(url.contains("language=en-US"));
+        assert!(url.contains("keyterm=LRU"));
+        assert!(url.contains("keyterm=REST%20API"));
+        assert!(url.contains("keyterm=CI%2FCD"));
         assert!(!url.contains("Token "));
     }
 
@@ -939,6 +1026,8 @@ mod tests {
     fn deepgram_url_can_omit_default_language() {
         let _guard = DEEPGRAM_URL_ENV_LOCK.lock().unwrap();
         std::env::set_var("BLUEY_DEEPGRAM_LANGUAGE", "auto");
+        std::env::set_var("BLUEY_DEEPGRAM_DEFAULT_KEYTERMS", "0");
+        std::env::remove_var("BLUEY_DEEPGRAM_KEYTERMS");
         let session = ClaimedSttSession {
             token: "token".into(),
             account_id: "acct".into(),
@@ -953,7 +1042,38 @@ mod tests {
         };
         let url = deepgram_realtime_url(&session);
         assert!(!url.contains("language="));
+        assert!(!url.contains("keyterm="));
         std::env::remove_var("BLUEY_DEEPGRAM_LANGUAGE");
+        std::env::remove_var("BLUEY_DEEPGRAM_DEFAULT_KEYTERMS");
+    }
+
+    #[test]
+    fn deepgram_url_merges_custom_keyterms() {
+        let _guard = DEEPGRAM_URL_ENV_LOCK.lock().unwrap();
+        std::env::set_var("BLUEY_DEEPGRAM_DEFAULT_KEYTERMS", "0");
+        std::env::set_var(
+            "BLUEY_DEEPGRAM_KEYTERMS",
+            "Asvad;LRU\nSecret Passage Ranch,REST API",
+        );
+        let session = ClaimedSttSession {
+            token: "token".into(),
+            account_id: "acct".into(),
+            bluey_session_id: "sess".into(),
+            provider: "deepgram".into(),
+            model: "nova-3".into(),
+            source: "microphone".into(),
+            max_seconds: 60,
+            expires_at_ms: now_ms() + 60_000,
+            reserved_cents: 0,
+            reserved_trial_seconds: 0,
+        };
+        let url = deepgram_realtime_url(&session);
+        assert!(url.contains("keyterm=Asvad"));
+        assert!(url.contains("keyterm=LRU"));
+        assert!(url.contains("keyterm=Secret%20Passage%20Ranch"));
+        assert!(url.contains("keyterm=REST%20API"));
+        std::env::remove_var("BLUEY_DEEPGRAM_DEFAULT_KEYTERMS");
+        std::env::remove_var("BLUEY_DEEPGRAM_KEYTERMS");
     }
 
     #[test]

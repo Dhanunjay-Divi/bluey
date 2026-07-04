@@ -5544,3 +5544,45 @@ cargo test --manifest-path server/Cargo.toml sync_batch_round_trips_session_bund
 cargo test --manifest-path server/Cargo.toml answer_plan_ --lib
 cargo check --manifest-path server/Cargo.toml
 ```
+
+## Latest Round 333: Live STT Speed And Accuracy
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-333-LIVE-STT-SPEED-ACCURACY.md`
+
+Trigger:
+
+- The owner reported that live transcription was still not realtime enough, missed words, and badly mangled technical/coding phrases.
+
+What changed:
+
+- Server Deepgram realtime default endpointing changed from `300 ms` to `200 ms`.
+- Server Deepgram URL now includes built-in technical keyterms and supports deployment-configured `BLUEY_DEEPGRAM_KEYTERMS`.
+- macOS native audio helper now window-averages source samples when downsampling to 16 kHz PCM instead of sample-picking.
+- Windows native audio helper received the same window-averaging downsample behavior.
+- Desktop workspace version bumped to `0.1.73`.
+
+Verification so far:
+
+```bash
+cargo fmt --manifest-path server/Cargo.toml
+cargo test --manifest-path server/Cargo.toml stt::tests -- --nocapture
+bash native/macos/cue-audio/build.sh
+x86_64-w64-mingw32-gcc -Wall -Wextra -Werror -D_WIN32_WINNT=0x0601 native/windows/cue-audio/main.c -lole32 -luuid -o /tmp/bluey-audio.exe
+cargo test -p cue-daemon live_stt_ -- --nocapture
+```
+
+Remaining before final close:
+
+- Publish/deploy server and desktop release `0.1.73`.
+- Verify `latest.json` signature and live artifact.
+- Optionally run a short signed-in Listen smoke and inspect first partial/final timing logs.
