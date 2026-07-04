@@ -245,6 +245,11 @@ pub async fn apply_tier<F, Fut>(
                 question.resume = Some(session_id.to_string());
                 // NOTE: intentionally leave `question.context` unset — resume
                 // already carries the history; replaying it duplicates the turns.
+                // (The daemon may still attach MEETING context — brief/ledger/
+                // transcript that the vendor session does NOT hold — and decides
+                // per turn how much via the first-turn "primed" marker; that is a
+                // separate channel from the prior-agent history and is correct to
+                // send.)
             } else {
                 question.resume = None;
                 tracing::info!(
@@ -258,7 +263,10 @@ pub async fn apply_tier<F, Fut>(
         }
         ContinuationTier::NativeResume if cwd_usable => {
             // Non-ACP native resume: drive in the project dir, resume by id, let
-            // the vendor handle context compaction.
+            // the vendor handle context compaction. Any meeting context the daemon
+            // attached (brief/ledger/transcript the vendor session does NOT hold)
+            // is a separate channel and stays — the daemon decides per turn how
+            // much via the first-turn "primed" marker.
             question.cwd = project;
             question.resume = Some(session_id.to_string());
         }

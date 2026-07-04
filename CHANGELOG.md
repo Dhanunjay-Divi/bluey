@@ -37,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layer; a miss falls back to the store re-scrape).
 
 ### Fixed
+- **Redundant per-turn context on a resumed session** (send-heavy-context-once):
+  every ask re-sent the entire meeting package — pre-meeting brief, saved summary,
+  back-history transcript, and Bluey's own prior Q&A (including internal
+  scaffolding chatter) — even after the attached agent already had that history.
+  Now, after the first answered turn of an attached session (tracked by a new
+  `attached_context_primed` marker), later turns send only the always-pinned delta
+  (decisions ledger + recent transcript) plus the new question; the heavy blob is
+  sent ONCE. Research confirmed all six agent CLIs reload their own transcript on
+  resume, so re-sending it was pure duplication. The marker resets whenever the
+  attached session changes (re-attach / detach), so a new session re-primes; a
+  model-only re-attach preserves it. The mid-meeting-decision contract holds — new
+  pinned decisions still reach the agent every turn. (See
+  `docs/work/DESIGN-CONTEXT-REDUNDANCY.md`.)
 - **On-device STT silently absent from dev builds**: `scripts/run-local.sh` ran a
   plain `cargo build`, which omits the `cue-daemon/parakeet-stt` feature — so
   `bluey on` launched an STT-less daemon and `Listen` fell through to the cloud
