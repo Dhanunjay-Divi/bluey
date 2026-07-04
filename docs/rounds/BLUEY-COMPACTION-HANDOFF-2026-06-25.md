@@ -5900,6 +5900,82 @@ Deployment status:
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
 
+## Latest Round 343: Screen Context Sent Chips Code Comments
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-343-SCREEN-CONTEXT-SENT-CHIPS-CODE-COMMENTS.md`
+
+Trigger:
+
+- The owner showed a sent screen-context question where the question bubble did not show the `Screen context` chip even though the answer used the screen context.
+- The bottom attachment strip still showed `Screen context` after sending, but the intended behavior is to hide sent attachments there and keep them behind the header `Show file(s)` control.
+- The owner also asked why code answers did not include explanatory comments for the code blocks.
+
+What changed:
+
+- The daemon now derives question attachment ids from inferred document/screenshot `AnswerContext` when explicit overlay ids are missing.
+- Sent question cards now fall back to inferred document/screenshot answer context so context chips appear in the sent bubble.
+- Persisted conversation turns now store inferred attachment ids.
+- The macOS overlay now clears the bottom pending attachment strip after send, while keeping the header `Show N file(s)` control available.
+- Desktop and server coding prompts now require comments above major blocks and on important decision lines, plus `Line notes:` outside the code fence.
+- Desktop workspace version bumped to `0.1.82`.
+
+Verification:
+
+```bash
+cargo fmt --check
+cargo check -p cue-cli -p cue-daemon
+cargo check --manifest-path server/Cargo.toml --bin bluey-server
+cargo test -p cue-daemon inferred_answer_context_produces_question_attachment_chips -- --nocapture
+cargo test -p cue-daemon mode_instructions_specialize_default_answer_shapes -- --nocapture
+cargo test -p cue-daemon general_mode_keeps_code_shape_for_coding_questions -- --nocapture
+cargo test --manifest-path server/Cargo.toml answer_plan_prompt_explains_unavailable_web_search --lib -- --nocapture
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.82
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+/Users/uno/.bluey/bin/bluey on
+/Users/uno/.bluey/bin/bluey status
+rsync -az --delete --exclude='target' --exclude='.git' Cargo.toml Cargo.lock crates server infra root@165.227.77.152:/opt/bluey-build-codex-round343-screen-context-comments/
+ssh root@165.227.77.152 'cd /opt/bluey-build-codex-round343-screen-context-comments/server && BLUEY_GIT_COMMIT=2a0da7dbb4bc0e02cb29c1e7933195adb00a04f8 /root/.cargo/bin/cargo build --release --bin bluey-server'
+curl -fsS https://bluey.sh/health
+ssh root@165.227.77.152 'journalctl -u bluey-api.service --since "5 min ago" -p warning --no-pager'
+```
+
+Deployment status:
+
+- Desktop release `0.1.82` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.82/bluey-0.1.82-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `0dce9487c5376da7fb4839ccad1043c029559ac66aa4c1257dd5bc9dce124d0f`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.82`
+- Public installer smoke installed `0.1.82` locally and both installed binaries report `0.1.82`.
+- `bluey on` started fresh daemon pid `52242`.
+- Production API server deployed from `/opt/bluey-build-codex-round343-screen-context-comments`.
+- Production binary SHA256:
+  `c7c62ed2603e0ea71b2ab42b31a0c78b30876c7aae8c9b0cb4eee72365693672`
+- Previous API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260704T203443Z`
+- `https://bluey.sh/health` reports commit `2a0da7dbb4bc0e02cb29c1e7933195adb00a04f8`.
+- `bluey-api.service` is active with `NRestarts=0`.
+- Recent production warning/error scan after restart returned no entries.
+
 ## Latest Round 341: Stale Daemon Feed Gap Fix
 
 Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
