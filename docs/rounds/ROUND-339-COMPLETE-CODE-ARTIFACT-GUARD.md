@@ -77,6 +77,11 @@ BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.p
 curl -fsSL https://bluey.sh/install.sh | bash
 /Users/uno/.bluey/bin/bluey --version
 /Users/uno/.bluey/bin/bluey-daemon --version
+rsync -az --delete --exclude='target' Cargo.toml Cargo.lock crates server infra root@165.227.77.152:/opt/bluey-build-codex-round339-code-artifact/
+ssh root@165.227.77.152 'cd /opt/bluey-build-codex-round339-code-artifact/server && BLUEY_GIT_COMMIT=210a4f7559ffd13fe263b3891d75b5e93c39c9f3 /root/.cargo/bin/cargo build --release --bin bluey-server'
+ssh root@165.227.77.152 'install -m 0755 /opt/bluey-build-codex-round339-code-artifact/server/target/release/bluey-server /usr/local/bin/bluey-server && systemctl restart bluey-api.service'
+curl -fsS https://bluey.sh/health
+ssh root@165.227.77.152 'journalctl -u bluey-api.service --since "5 min ago" -p warning --no-pager'
 ```
 
 ## Release
@@ -101,7 +106,23 @@ Release verification passed:
 
 ## Deployment
 
-Desktop release is live. Production API deployment is tracked in the follow-up deployment note once the server binary is built from the committed source and restarted.
+Desktop release is live.
+
+Production API server was built from the committed source at:
+
+`/opt/bluey-build-codex-round339-code-artifact`
+
+Production API deployment details:
+
+- Commit baked into health: `210a4f7559ffd13fe263b3891d75b5e93c39c9f3`
+- Production binary SHA256:
+  `06a607833a7ea7f59b1bb0e283d334432fe8c7048a623c23dd8be45d4bbabb58`
+- Previous API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260704T144812Z`
+- `bluey-api.service` status after restart: `active`
+- `bluey-api.service` `NRestarts`: `0`
+- `https://bluey.sh/health` reports commit `210a4f7559ffd13fe263b3891d75b5e93c39c9f3`
+- Recent production warning/error scan after restart returned no entries.
 
 ## Windows Parity
 

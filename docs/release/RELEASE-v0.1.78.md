@@ -41,3 +41,14 @@ curl -fsSL https://bluey.sh/install.sh | bash
   - unpacked `bluey` and `bluey-daemon` version checks for `0.1.78`
 - Public installer smoke installed `0.1.78` locally and both installed binaries report `0.1.78`.
 - The non-interactive shell could not provide sudo credentials, so install correctly fell back to the user-local command symlink at `/Users/uno/.local/bin/bluey`.
+
+## API Deployment
+
+- Production API server deployed from `/opt/bluey-build-codex-round339-code-artifact`.
+- Production API health reports commit `210a4f7559ffd13fe263b3891d75b5e93c39c9f3`.
+- Production binary SHA256:
+  `06a607833a7ea7f59b1bb0e283d334432fe8c7048a623c23dd8be45d4bbabb58`
+- Previous API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260704T144812Z`
+- `bluey-api.service` is active with `NRestarts=0`.
+- Recent production warning/error journal scan after restart returned no entries.
