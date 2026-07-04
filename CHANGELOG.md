@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Meeting-only macOS build (`scripts/build-meeting.sh`).** A distinct build that
+  stages ONLY the meeting overlay (`cue-meeting-overlay`), never the legacy Swift
+  interview overlay (`bluey-overlay-macos` / `cue-overlay-macos`). The shared
+  `build-macos.sh` ships both, which let the daemon launch the WRONG UI (the
+  interview overlay) in place of the meeting overlay; with the interview overlay
+  simply absent from the distribution, that can no longer happen. Additive — it
+  changes no shared code and does not remove the interview overlay from the repo
+  (that is the other product's surface); it is purely a build that excludes it.
+  Pairs with `scripts/package-airdrop.sh` for the AirDrop tarball.
+
 ### Fixed
 - **Meeting lifecycle: no tail-final re-fragmentation after a meeting ends.**
   Follow-up to the one-meeting-per-session fix: when listening stopped,
