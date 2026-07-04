@@ -40,11 +40,11 @@ export function BalanceIndicator() {
 
   const label =
     status === "ready" && snapshot
-      ? snapshot.balance_label
+      ? `Credits ${snapshot.balance_label}`
       : status === "signed-out"
-        ? "Sign in"
+        ? "Sign in for credits"
         : status === "error"
-          ? "Balance --"
+          ? "Credits --"
           : "Checking";
 
   const balanceTone = snapshot
@@ -95,17 +95,17 @@ function toneForBalance(cents: number, lowBalanceWarning: boolean): "normal" | "
 function tooltip(snapshot: BalanceSnapshot | null, status: string): string {
   if (!snapshot) {
     return status === "signed-out"
-      ? "Bluey account is not signed in."
-      : "Balance unavailable.";
+      ? "Bluey account is not signed in. Sign in to use credits and saved-session sync."
+      : "Credits balance unavailable.";
   }
   const threshold = formatCents(snapshot.auto_topup_threshold_cents);
   const amount = formatCents(snapshot.auto_topup_amount_cents);
   const trialMinutes = Math.floor(snapshot.trial_seconds_remaining / 60);
   return [
-    `Balance: ${snapshot.balance_label}`,
+    `Credits balance: ${snapshot.balance_label}`,
     snapshot.auto_topup_enabled
-      ? `Auto top-up: ${amount} under ${threshold}`
-      : "Auto top-up: off",
+      ? `Auto Reload: adds ${amount} under ${threshold}`
+      : "Auto Reload: off",
     `Trial time: ${trialMinutes} min`,
   ].join("\n");
 }

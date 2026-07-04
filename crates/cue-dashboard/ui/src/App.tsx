@@ -6,6 +6,7 @@ import { DashboardLayout } from "./components/DashboardLayout";
 import { Chats } from "./pages/Chats";
 import { SessionDetail } from "./pages/SessionDetail";
 import { Placeholder } from "./pages/Placeholder";
+import { Home } from "./pages/Home";
 import { Search } from "./routes/Search";
 import { LiveTranscript } from "./routes/LiveTranscript";
 import { Responses } from "./routes/Responses";
@@ -112,7 +113,7 @@ function App() {
       <PermissionPoller />
       <Routes>
         <Route element={<DashboardLayout />}>
-          <Route index element={<Placeholder name="Home" />} />
+          <Route index element={<Home />} />
           <Route path="chats" element={<Chats />} />
           <Route path="session/:id" element={<SessionDetail />} />
           <Route path="prompts" element={<Placeholder name="Prompts" />} />

@@ -2,29 +2,19 @@ import { NavLink } from "react-router-dom";
 import {
   Home,
   MessageSquare,
-  FileText,
-  Keyboard,
   Settings,
   MessageCircle,
-  Camera,
-  Mic,
-  Code,
   Radio,
   Search,
 } from "lucide-react";
 
 const links = [
   { to: "/", icon: Home, label: "Home" },
-  { to: "/chats", icon: MessageSquare, label: "Chats" },
-  { to: "/prompts", icon: FileText, label: "Prompts" },
-  { to: "/shortcuts", icon: Keyboard, label: "Shortcuts" },
-  { to: "/settings", icon: Settings, label: "Settings" },
-  { to: "/responses", icon: MessageCircle, label: "Responses" },
-  { to: "/screenshot", icon: Camera, label: "Screenshot" },
-  { to: "/audio", icon: Mic, label: "Audio" },
+  { to: "/chats", icon: MessageSquare, label: "Sessions" },
   { to: "/live", icon: Radio, label: "Live" },
+  { to: "/responses", icon: MessageCircle, label: "Answers" },
   { to: "/search", icon: Search, label: "Search" },
-  { to: "/dev", icon: Code, label: "Dev Tools" },
+  { to: "/settings", icon: Settings, label: "Settings" },
 ];
 
 export function Sidebar() {
@@ -51,7 +41,7 @@ export function Sidebar() {
           </li>
         ))}
       </ul>
-      <div className="mt-auto px-2 text-xs text-zinc-600">⌘K command palette</div>
+      <div className="mt-auto px-2 text-xs leading-5 text-zinc-600">Cmd/Ctrl K command palette</div>
     </nav>
   );
 }

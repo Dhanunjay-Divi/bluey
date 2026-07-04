@@ -1,1 +1,81 @@
 @import "tailwindcss";
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+  }
+
+  body {
+    background: #f6f8fb;
+  }
+
+  .bg-zinc-950,
+  .bg-black\/30 {
+    background-color: #f6f8fb !important;
+  }
+
+  .bg-zinc-900,
+  .bg-zinc-900\/70,
+  .bg-zinc-900\/85,
+  .bg-zinc-950\/30,
+  .bg-zinc-950\/35,
+  .bg-zinc-950\/50 {
+    background-color: #ffffff !important;
+  }
+
+  .bg-zinc-800,
+  .hover\:bg-zinc-800:hover {
+    background-color: #eef3f7 !important;
+  }
+
+  .hover\:bg-zinc-900:hover {
+    background-color: #f8fbfd !important;
+  }
+
+  .border-zinc-800,
+  .border-zinc-700 {
+    border-color: #d7e1e8 !important;
+  }
+
+  .hover\:border-zinc-700:hover,
+  .hover\:border-zinc-600:hover,
+  .hover\:border-zinc-500:hover {
+    border-color: #aebdca !important;
+  }
+
+  .text-zinc-50,
+  .text-zinc-100,
+  .text-zinc-200 {
+    color: #10202a !important;
+  }
+
+  .text-zinc-300 {
+    color: #263a47 !important;
+  }
+
+  .text-zinc-400 {
+    color: #526471 !important;
+  }
+
+  .text-zinc-500,
+  .text-zinc-600 {
+    color: #6c7a86 !important;
+  }
+
+  .placeholder-zinc-600::placeholder,
+  .placeholder\:text-zinc-500::placeholder {
+    color: #87939e !important;
+  }
+
+  input,
+  textarea,
+  pre {
+    color: #10202a;
+  }
+
+  .shadow-black\/20,
+  .shadow-lg,
+  .shadow-2xl {
+    box-shadow: 0 18px 42px rgba(16, 32, 42, .10) !important;
+  }
+}

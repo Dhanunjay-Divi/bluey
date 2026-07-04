@@ -46,6 +46,9 @@ interface AccountMe {
   email: string;
   balance_cents: number;
   trial_seconds_remaining: number;
+  auto_topup_enabled: boolean;
+  auto_topup_threshold_cents: number;
+  auto_topup_amount_cents: number;
 }
 
 export function Settings() {
@@ -118,27 +121,37 @@ function AccountCard() {
 
   return (
     <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
-      <h3 className="font-semibold text-zinc-100">Account</h3>
+      <h3 className="font-semibold text-zinc-100">Account and credits</h3>
       {me ? (
-        <div className="space-y-1 text-sm">
+        <div className="space-y-3 text-sm">
           <div className="flex items-center gap-2 text-zinc-300">
             <Mail className="h-4 w-4 text-zinc-500" /> {me.email}
           </div>
-          <div className="text-zinc-400 text-xs">
-            Balance: <span className={`${balanceClass} font-medium tabular-nums`}>
-              ${(me.balance_cents / 100).toFixed(2)}
-            </span>
-            {me.trial_seconds_remaining > 0 && (
-              <span className="ml-2 text-emerald-400">
-                ({Math.round(me.trial_seconds_remaining / 60)} min trial left)
+          <div className="grid gap-2 rounded-lg border border-zinc-800 bg-zinc-950 p-3">
+            <div>
+              <span className="block text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+                Credits balance
               </span>
-            )}
+              <span className={`${balanceClass} mt-1 block text-2xl font-semibold tabular-nums`}>
+                ${(me.balance_cents / 100).toFixed(2)}
+              </span>
+            </div>
+            <p className="text-xs leading-5 text-zinc-500">
+              {me.trial_seconds_remaining > 0
+                ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes left. Credits are used after the trial when paid cloud work is needed.`
+                : "Paid cloud work pauses at $0 until you add credits."}
+            </p>
+            <p className="text-xs leading-5 text-zinc-500">
+              {me.auto_topup_enabled
+                ? `Auto Reload is on: adds $${(me.auto_topup_amount_cents / 100).toFixed(2)} below $${(me.auto_topup_threshold_cents / 100).toFixed(2)}.`
+                : "Auto Reload is off. Add credits manually from the web account page."}
+            </p>
           </div>
         </div>
       ) : loaded ? (
         <div className="space-y-2">
           <p className="text-sm text-zinc-400">
-            Sign in once in the browser. Bluey stores desktop tokens in your local account profile.
+            Sign in once in the browser for cloud answers, credits, and saved-session sync.
           </p>
           <button
             onClick={signIn}
@@ -155,7 +168,7 @@ function AccountCard() {
           onClick={openPortal}
           className="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-100"
         >
-          Manage billing <ExternalLink className="h-3 w-3" />
+          Manage credits <ExternalLink className="h-3 w-3" />
         </button>
         <button
           onClick={signOut}

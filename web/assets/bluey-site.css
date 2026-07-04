@@ -2443,6 +2443,50 @@
       padding: 0 2rem;
     }
 
+    #downloadApp .download-steps-strip {
+      width: min(700px, 100%);
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: .55rem;
+      margin: .65rem auto 1rem;
+      padding: 0 2rem;
+    }
+
+    #downloadApp .download-steps-strip span {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: .4rem;
+      min-height: 40px;
+      min-width: 0;
+      padding: .45rem .65rem;
+      border: 1px solid rgba(99, 216, 255, .18);
+      border-radius: 8px;
+      background: rgba(99, 216, 255, .055);
+      color: #aeb8be;
+      font-size: .76rem;
+      font-weight: 700;
+      text-align: center;
+    }
+
+    #downloadApp .download-steps-strip strong {
+      display: inline-grid;
+      place-items: center;
+      width: 1.2rem;
+      height: 1.2rem;
+      border-radius: 999px;
+      background: var(--bluey-accent);
+      color: #061114;
+      font-size: .68rem;
+      line-height: 1;
+      flex: 0 0 auto;
+    }
+
+    #downloadApp .download-steps-strip code {
+      color: #e8fbff;
+      font-size: .74rem;
+    }
+
     #downloadApp .download-card {
       min-height: auto;
       min-width: 0;
@@ -2933,6 +2977,7 @@
       }
 
       #downloadApp .download-hero,
+      #downloadApp .download-steps-strip,
       #downloadApp .platform-grid,
       #downloadApp .commands {
         padding-left: 1.5rem;
@@ -3002,6 +3047,7 @@
     }
 
     @media (max-width: 600px) {
+      #downloadApp .download-steps-strip,
       #downloadApp .cmd-grid,
       #downloadApp .platform-grid {
         grid-template-columns: 1fr;

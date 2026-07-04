@@ -220,7 +220,7 @@
         </a>
         <div class="rail-command">
           <code id="railCommandLabel">bluey on</code>
-          <span id="railCommandCopy">Start Bluey from Terminal. Sign in when you want AI models, credits, or saved sessions.</span>
+          <span id="railCommandCopy">Start Bluey from Terminal. Sign in for cloud answers, credits, and saved sessions.</span>
         </div>
         <div class="rail-list">
           <span>Dashboard</span>
@@ -263,14 +263,14 @@
 
       <main class="account-main">
         <section class="account-hero">
-          <h1>Try Bluey</h1>
-          <p>Start from Terminal, sign in when needed, and keep your work available from the overlay.</p>
+          <h1>Try Bluey on desktop</h1>
+          <p>Install once, run Bluey from Terminal, then sign in when you need cloud answers, credits, or saved sessions.</p>
         </section>
 
         <section class="account-grid">
           <aside class="account-card" id="accountAuthCard">
             <h2 id="accountAuthTitle">Sign in</h2>
-            <p id="accountAuthCopy">Use your Bluey account. If the desktop opened this page, confirm the link after signing in.</p>
+            <p id="accountAuthCopy">Use your Bluey account. If Terminal opened this page, sign in here, then connect the desktop link.</p>
             <div class="device-link-hint" id="deviceLinkHint" hidden></div>
             <form class="account-form" id="accountForm">
               <label>
@@ -302,11 +302,11 @@
 
           <section class="account-card account-preview-card" id="accountPreviewCard">
             <h2>What unlocks</h2>
-            <p>Credits power AI models, screen analysis, live speech, and saved session history.</p>
+            <p>Sign in adds the cloud pieces: credits, AI models, live speech, screen analysis, and saved session history.</p>
             <div class="preview-list">
               <div class="preview-item">
                 <div class="preview-icon">$</div>
-                <div><strong>Balance</strong><span>Track spend and reload in one place.</span></div>
+                <div><strong>Credits balance</strong><span>$30 reload adds $30 Bluey credits. No subscription is required.</span></div>
               </div>
               <div class="preview-item">
                 <div class="preview-icon">AI</div>
@@ -314,7 +314,7 @@
               </div>
               <div class="preview-item">
                 <div class="preview-icon">KB</div>
-                <div><strong>Saved sessions</strong><span>Keep useful session history attached to your account.</span></div>
+                <div><strong>Saved sessions</strong><span>Keep useful session history attached to your signed-in account.</span></div>
               </div>
             </div>
           </section>
@@ -344,7 +344,7 @@
             <div class="dashboard-head">
               <div>
                 <h2 id="accountEmailLabel">Bluey account</h2>
-                <p>Check your balance, add credits, and keep the desktop app connected.</p>
+                <p>See account state, credits, saved sessions, and desktop links in one place.</p>
               </div>
               <div class="dashboard-actions">
                 <span class="pill-muted" id="billingProviderLabel">No subscription</span>
@@ -355,12 +355,12 @@
 
             <div class="account-kpis">
               <div class="account-kpi balance-kpi">
-                <span>Current balance</span>
+                <span>Credits balance</span>
                 <strong id="balanceValue">$--</strong>
-                <em id="balanceHint">Refreshes after each paid answer.</em>
+                <em id="balanceHint">Credits are used for paid cloud work after any trial time.</em>
               </div>
               <div class="account-kpi">
-                <span>Last 7 days</span>
+                <span>Paid answers</span>
                 <strong id="usageValue">--</strong>
                 <em id="usageHint">Paid requests appear here.</em>
               </div>
@@ -375,23 +375,23 @@
               <div class="section-head">
                 <div>
                   <h3>Add credits</h3>
-                  <p>Credits are stored balance for paid Bluey work. Trial minutes are used first when available.</p>
+                  <p>Credits are prepaid balance. Trial time is used first when available, then credits pay for cloud work.</p>
                 </div>
               </div>
               <div class="billing-grid">
                 <div class="reload-card billing-primary-card">
                   <div>
                     <h3>Manual reload</h3>
-                    <p>Most people start with $30. It becomes $30 in Bluey credits after checkout succeeds.</p>
+                    <p>Most people start with $30. Checkout adds the same amount to your Bluey credits after payment succeeds.</p>
                     <div class="credit-equation" aria-label="$30 reload gives $30 Bluey credits">
                       <strong>$30 reload</strong>
                       <span>= $30 Bluey credits</span>
                     </div>
                     <ul class="reload-breakdown" aria-label="What credits cover">
-                      <li>Used for AI answers, speech transcription, screen analysis, and saved-session search.</li>
-                      <li>Each paid answer shows its cost and your remaining balance.</li>
-                      <li>Checkout opens in a new tab. Return here and press Refresh balance if it is still processing.</li>
-                      <li>Paid cloud work pauses at $0 unless you turn Auto Reload on.</li>
+                      <li>$30 reload gives $30 credits. $15 is the minimum reload.</li>
+                      <li>Credits cover AI answers, speech transcription, screen analysis, and saved-session search.</li>
+                      <li>Each paid answer shows its cost and remaining balance.</li>
+                      <li>Paid cloud work pauses at $0 unless Auto Reload is on.</li>
                     </ul>
                   </div>
                   <div class="manual-reload-panel" aria-label="Manual credit reload">
@@ -404,13 +404,13 @@
                     </label>
                     <button class="account-button primary" id="reloadButton" type="button">Add credits</button>
                   </div>
-                  <p class="manual-reload-rule" id="manualReloadRule">$30 recommended. $15 minimum. Checkout opens in a new tab; credits appear after payment succeeds.</p>
+                  <p class="manual-reload-rule" id="manualReloadRule">$30 recommended. $15 minimum. Checkout opens in a new tab; refresh here after payment succeeds.</p>
                 </div>
 
                 <div class="reload-card auto-reload-card" id="autoReloadCard">
                   <div>
                     <h3>Auto Reload (optional)</h3>
-                    <p id="autoReloadHint">Off by default. Keep it off if you want to add credits by hand.</p>
+                    <p id="autoReloadHint">Off by default. Turn it on only if you want Bluey to add credits automatically.</p>
                     <div class="auto-reload-fields" aria-label="Auto Reload rule">
                       <label>
                         <span>When below</span>
@@ -440,15 +440,15 @@
               </div>
             </section>
 
-            <section class="dashboard-section device-section" aria-label="Host login activity">
+            <section class="dashboard-section device-section" aria-label="Desktop and browser links">
               <div class="section-head">
                 <div>
-                  <h3>Host login activity</h3>
-                  <p>Places where you are signed in. Remove anything you do not recognize.</p>
+                  <h3>Desktop and browser links</h3>
+                  <p>Places where this account is signed in. Remove anything you do not recognize.</p>
                 </div>
               </div>
               <div class="device-summary-bar">
-                <span id="linkedDeviceCount">No host activity</span>
+                <span id="linkedDeviceCount">No linked devices</span>
                 <div class="account-actions-row">
                   <button class="account-button ghost compact" id="refreshDevicesButton" type="button">Refresh</button>
                   <button class="account-button danger compact" id="removeAllDevicesButton" type="button" disabled>Remove all</button>
@@ -475,9 +475,9 @@
               <div class="section-head">
                 <div>
                   <h3>Saved sessions</h3>
-                  <p>Saved snapshots from Bluey sync. Desktop sessions still live in the app.</p>
+                  <p>Cloud-synced session snapshots from signed-in desktops. Local-only sessions still live in the app.</p>
                 </div>
-                <button class="account-button ghost" id="refreshSessionsButton" type="button">Refresh sessions</button>
+                <button class="account-button ghost" id="refreshSessionsButton" type="button">Refresh saved sessions</button>
               </div>
               <div class="session-list" id="cloudSessionsList"></div>
               <div class="session-detail" id="cloudSessionDetail" hidden></div>
@@ -538,9 +538,15 @@
       </nav>
 
       <section class="download-hero">
-        <h1>Download</h1>
-        <p>Pick your platform</p>
+        <h1>Install Bluey</h1>
+        <p>Use macOS now. Install once, run <code>bluey on</code>, then sign in only when Bluey asks for cloud access.</p>
       </section>
+
+      <div class="download-steps-strip" aria-label="Bluey install flow">
+        <span><strong>1</strong> Install the command</span>
+        <span><strong>2</strong> Run <code>bluey on</code></span>
+        <span><strong>3</strong> Connect desktop if asked</span>
+      </div>
 
       <section class="platform-grid" aria-label="Bluey platform installers">
         <article class="download-card" data-platform-card="mac" role="button" tabindex="0" aria-label="Show macOS terminal install instructions" aria-controls="macInstallInstructions" aria-expanded="false">
@@ -556,7 +562,7 @@
             </div>
             <span class="availability">Ready</span>
           </div>
-          <p>Ready for Apple Silicon Macs. Install once, then sign in only when Bluey needs AI models or credits.</p>
+          <p>Ready for Apple Silicon Macs. The installer adds the <code>bluey</code> command and keeps updates signed.</p>
           <span class="download-card-action">Show terminal steps</span>
         </article>
 
@@ -597,7 +603,7 @@
 
       <section class="platform-instructions" id="macInstallInstructions" data-platform-instructions="mac" hidden>
         <h2>macOS setup</h2>
-        <p>Install once from Terminal, then start Bluey with one command.</p>
+        <p>Copy the install command, start Bluey, then keep the account page open if the desktop asks you to link.</p>
         <div class="instruction-steps">
           <div class="instruction-step">
             <span class="instruction-num">1</span>
@@ -612,7 +618,7 @@
           <div class="instruction-step">
             <span class="instruction-num">2</span>
             <div class="instruction-body">
-              <p>Then start Bluey:</p>
+              <p>Start the desktop app:</p>
               <div class="install-command">
                 <code>bluey on</code>
                 <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
@@ -620,7 +626,7 @@
             </div>
           </div>
         </div>
-        <div class="instruction-help">If Bluey needs you to sign in, it opens the account page for you.</div>
+        <div class="instruction-help">If Bluey needs sign-in, it opens this site with a link code. Sign in, press Connect desktop, then return to Bluey.</div>
       </section>
 
       <section class="platform-instructions" id="windowsInstallInstructions" data-platform-instructions="windows" hidden>
@@ -638,7 +644,7 @@
       </section>
 
       <div class="download-note">
-        <strong>After install:</strong> run <code>bluey on</code>. Bluey stays in the background and asks you to sign in only when needed.
+        <strong>After install:</strong> run <code>bluey on</code>. Bluey stays in the background, and the account link appears only when cloud access is needed.
       </div>
 
       <div class="viewer-note">
@@ -676,7 +682,7 @@
       </section>
 
       <div class="viewer-note">
-        <strong>Bluey is terminal-first.</strong> Install once, run <code>bluey on</code>, then ask from the overlay with your screen, transcript, files, and session notes.
+        <strong>Bluey is terminal-first.</strong> Install once, run <code>bluey on</code>, then ask from the overlay with your screen, transcript, files, and saved session notes.
       </div>
 
       <div class="page-footer-links">
@@ -703,18 +709,18 @@
       <div class="content">
         <section class="hero">
           <h1 aria-label="Bring context, stay present.">Bring context,<br><span class="accent">stay present.</span></h1>
-          <p class="hero-lede">Private AI chat for engineering meetings, code, docs, research, and screen work from your terminal. Ask from the work already on your machine.</p>
-          <p class="hero-proof"><span>One pill keeps the context together.</span> Ask with your transcript, screen, files, code, docs, and saved session notes without switching apps.</p>
+          <p class="hero-lede">Private AI chat for engineering meetings, code, docs, research, and screen work from your terminal.</p>
+          <p class="hero-proof"><span>Install, run, ask.</span> Bluey keeps transcript, screen, files, code, docs, and saved session notes available without switching apps.</p>
           <div class="hero-actions">
-            <a class="btn btn-primary" href="/download">Get Started</a>
-            <a class="btn btn-ghost" href="/login">Try Bluey</a>
+            <a class="btn btn-primary" href="/download">Download Bluey</a>
+            <a class="btn btn-ghost" href="/login">Sign in</a>
           </div>
           <form class="join-bar" action="/login" method="get">
             <input name="user_code" type="text" placeholder="Link code" autocomplete="one-time-code" spellcheck="false">
             <button type="submit">Link</button>
           </form>
-          <div class="hero-note">native overlay &middot; AI models when needed &middot; credits for paid work</div>
-          <div class="hero-note">screen, transcript, files, and saved session notes by choice</div>
+          <div class="hero-note">native overlay &middot; AI models when needed &middot; prepaid credits for paid work</div>
+          <div class="hero-note">screen, transcript, files, and saved session notes only by choice</div>
         </section>
 
         <aside class="product-preview terminal-preview" aria-label="Bluey terminal preview">
@@ -739,7 +745,7 @@
         <a href="/download" class="plan featured">
           <div>
             <div class="plan-name">Start free</div>
-            <div class="plan-detail">Download Bluey, run <code>bluey on</code>, and use the included trial before adding credits.</div>
+            <div class="plan-detail">Download Bluey, run <code>bluey on</code>, and use included trial time before adding credits.</div>
           </div>
           <div class="plan-price">Download</div>
         </a>

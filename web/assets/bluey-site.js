@@ -446,8 +446,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (title) title.textContent = accountAuthMode === 'signup' ? 'Create account' : 'Sign in';
       if (copy) {
         copy.textContent = accountAuthMode === 'signup'
-          ? 'Create a Bluey account, verify your email, then confirm the desktop link.'
-          : 'Use your Bluey account. If the desktop opened this page, confirm the link after signing in.';
+          ? 'Create a Bluey account, verify your email, then connect the desktop link if Terminal sent you here.'
+          : 'Use your Bluey account. If Terminal opened this page, sign in here, then connect the desktop link.';
       }
       if (terms) terms.hidden = accountAuthMode !== 'signup';
       if (primary) primary.textContent = accountAuthMode === 'signup' ? 'Send verification code' : 'Sign in';
@@ -470,11 +470,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (authed) {
         label.textContent = 'signed in';
         copy.textContent = email
-          ? `${email} is ready for credits, saved sessions, and cloud answers. Run bluey on to open the overlay.`
-          : 'Account ready for credits, saved sessions, and cloud answers. Run bluey on to open the overlay.';
+          ? `${email} is ready for cloud answers, credits, and saved sessions. Run bluey on to open the overlay.`
+          : 'Account ready for cloud answers, credits, and saved sessions. Run bluey on to open the overlay.';
       } else {
         label.textContent = 'bluey on';
-        copy.textContent = 'Start Bluey from Terminal. Sign in only when you need cloud answers, credits, or saved sessions.';
+        copy.textContent = 'Start Bluey from Terminal. Sign in for cloud answers, credits, and saved sessions.';
       }
     }
 
@@ -492,10 +492,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
       if (authed) {
         title.textContent = 'Bluey account';
-        copy.innerHTML = 'Check balance, add credits, view saved sessions, and manage your desktop connection. $30 becomes $30 Bluey credits; Auto Reload is optional.';
+        copy.innerHTML = 'Check account state, add credits, view saved sessions, and manage desktop links. $30 reload adds $30 Bluey credits. Auto Reload is optional.';
       } else {
-        title.textContent = 'Try Bluey';
-        copy.innerHTML = 'Start from Terminal, sign in when needed, and keep your work available from the overlay.';
+        title.textContent = 'Try Bluey on desktop';
+        copy.innerHTML = 'Install once, run Bluey from Terminal, then sign in when you need cloud answers, credits, or saved sessions.';
       }
     }
 
@@ -546,8 +546,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const codeEl = document.createElement('code');
         codeEl.textContent = code;
         body.append(codeEl, accountToken()
-          ? '. Click Connect desktop to finish Bluey login.'
-          : '. This code is already filled from your desktop app. Sign in or create an account here, then confirm the desktop link.');
+          ? '. Press Connect desktop to finish Bluey login.'
+          : '. This code came from your desktop app. Sign in or create an account here, then connect the desktop link.');
         el.append(title, body);
         if (accountToken()) {
           const button = document.createElement('button');
@@ -579,7 +579,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const storageKey = `bluey_device_approved_${code}`;
       if (sessionStorage.getItem(storageKey) === '1') return true;
       if (sessionStorage.getItem(`bluey_device_confirmed_${code}`) !== '1') {
-        accountMessage('Click Connect desktop to finish bluey login.');
+        accountMessage('Press Connect desktop to finish Bluey login.');
         return false;
       }
       accountMessage('Connecting this account to the desktop app...');
@@ -894,15 +894,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (me?.auto_topup_enabled) {
         hint.textContent = `On. Bluey adds ${amount} credits when your balance drops below ${threshold}.`;
       } else if (hasSavedMethod) {
-        hint.textContent = `Off. Turn on only if you want Bluey to add ${amount} credits below ${threshold}.`;
+        hint.textContent = `Off. Turn on only if you want Bluey to reload ${amount} below ${threshold}.`;
       } else if (shouldShowSquareSetup) {
         hint.textContent = 'Off by default. Save a card only if you want Bluey to reload automatically.';
       } else {
-        hint.textContent = me?.auto_topup_unavailable_reason || 'Add credits manually any time. Auto Reload is optional.';
+        hint.textContent = me?.auto_topup_unavailable_reason || 'Add credits manually any time. Auto Reload is optional and off by default.';
       }
 
       method.textContent = me?.saved_payment_method_label
-        ? `Saved card: ${me.saved_payment_method_label}`
+        ? `Saved card for Auto Reload: ${me.saved_payment_method_label}`
         : shouldShowSquareSetup
           ? 'No saved card yet'
           : '';
@@ -980,7 +980,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       renderAutoReload(me);
       accountMessage(enabled
-        ? `Auto Reload is on. Bluey will add ${money(settings.auto_topup_amount_cents)} when balance drops below ${money(settings.auto_topup_threshold_cents)}.`
+        ? `Auto Reload is on. Bluey will add ${money(settings.auto_topup_amount_cents)} credits when balance drops below ${money(settings.auto_topup_threshold_cents)}.`
         : 'Auto Reload is off. You can add credits manually whenever you need them.');
       return me;
     }
@@ -1054,8 +1054,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function deviceIconLabel(kind) {
       const value = String(kind || '').toLowerCase();
       if (value.includes('desktop') || value.includes('device')) return 'Bluey';
-      if (value.includes('browser')) return 'Host';
-      return 'Host';
+      if (value.includes('browser')) return 'Web';
+      return 'Link';
     }
 
     function deviceStatus(device) {
@@ -1074,10 +1074,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const removeAllButton = document.getElementById('removeAllDevicesButton');
       if (countLabel) {
         countLabel.textContent = devices.length === 0
-          ? 'No host activity'
+          ? 'No linked devices'
           : devices.length === 1
-          ? '1 active host session'
-          : `${devices.length} active host sessions`;
+          ? '1 linked device'
+          : `${devices.length} linked devices`;
       }
       if (removeAllButton) {
         removeAllButton.disabled = devices.length === 0;
@@ -1085,7 +1085,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!devices.length) {
         const empty = document.createElement('div');
         empty.className = 'session-empty';
-        empty.textContent = message || 'No host login activity yet. Sign in from Bluey desktop to add this machine.';
+        empty.textContent = message || 'No linked devices yet. Sign in from Bluey desktop to connect this machine.';
         list.append(empty);
         return;
       }
@@ -1150,7 +1150,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         method: 'DELETE',
       });
       renderLinkedDevices(devices);
-      accountMessage('Host access removed.');
+      accountMessage('Desktop and browser access removed.');
       return devices;
     }
 
@@ -1162,7 +1162,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!sessions.length) {
         const empty = document.createElement('div');
         empty.className = 'session-empty';
-        empty.textContent = 'No saved sessions yet. Keep Bluey on while signed in; sessions sync automatically, then refresh here.';
+        empty.textContent = 'No saved sessions yet. Keep Bluey on while signed in. Local sessions sync automatically when saved-session sync is enabled.';
         list.append(empty);
         return;
       }
@@ -1198,7 +1198,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         button.className = 'account-button ghost';
         button.type = 'button';
         button.dataset.sessionId = session.session_id || '';
-        button.textContent = 'View';
+        button.textContent = 'Open';
         row.append(body, copyId, button);
         list.append(row);
       }
@@ -1210,7 +1210,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       list.replaceChildren();
       const loading = document.createElement('div');
       loading.className = 'session-empty';
-      loading.textContent = 'Loading saved sessions...';
+      loading.textContent = 'Checking for saved sessions...';
       list.append(loading);
     }
 
@@ -1395,7 +1395,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       accountMessage('Loading account...');
       renderCloudSessionsLoading();
       const linkedDevicesPromise = loadLinkedDevices().catch((error) => {
-        renderLinkedDevices({ devices: [] }, `Could not load host activity: ${error.message}`);
+        renderLinkedDevices({ devices: [] }, `Could not load linked devices: ${error.message}`);
         return null;
       });
       const sessionsPromise = loadCloudSessions().then((sessions) => {
@@ -1439,7 +1439,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         void linkedDevicesPromise;
         void sessionsPromise;
         accountMessage(new URLSearchParams(location.search).get('reload') === 'success'
-          ? 'Credits added. If the balance still looks old, checkout is finishing; press Refresh balance in a moment.'
+          ? 'Checkout complete. If the balance still looks old, Square is finishing the credit event; press Refresh balance in a moment.'
           : '');
         try {
           const approved = await approvePendingDevice();
@@ -1457,10 +1457,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       try {
         amountCents = readManualReloadCents();
       } catch (error) {
-        accountMessage(error.message, true);
+        accountMessage(error.message);
         return;
       }
-      accountMessage(`Opening ${money(amountCents)} checkout...`);
+      accountMessage(`Opening checkout for ${money(amountCents)} Bluey credits...`);
       try {
         const checkout = await apiJson('/billing/checkout', {
           method: 'POST',
@@ -1564,9 +1564,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         saveSquareCard().catch((error) => accountMessage(error.message));
       });
       document.getElementById('refreshDevicesButton')?.addEventListener('click', () => {
-        renderLinkedDevices({ devices: [] }, 'Loading host activity...');
+        renderLinkedDevices({ devices: [] }, 'Loading linked devices...');
         loadLinkedDevices().catch((error) => {
-          renderLinkedDevices({ devices: [] }, `Could not load host activity: ${error.message}`);
+          renderLinkedDevices({ devices: [] }, `Could not load linked devices: ${error.message}`);
         });
       });
       document.getElementById('refreshAdminAbuseButton')?.addEventListener('click', () => {
@@ -1577,7 +1577,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('removeAllDevicesButton')?.addEventListener('click', () => {
         const button = document.getElementById('removeAllDevicesButton');
         if (!button || button.disabled) return;
-        if (!window.confirm('Remove all host access for this account?')) return;
+        if (!window.confirm('Remove all desktop and browser links for this account?')) return;
         const previous = button.textContent;
         button.disabled = true;
         button.textContent = 'Removing...';
@@ -1722,6 +1722,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           open();
         });
       });
+      if (isDownloadRoute && !document.querySelector('#downloadApp [data-platform-card].active')) {
+        selectDownloadPlatform('mac');
+      }
     }
 
     document.addEventListener('click', async (event) => {

@@ -93,12 +93,17 @@ export function Chats() {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-4">
-        <h2 className="text-xl font-semibold">Sessions</h2>
+        <div>
+          <h2 className="text-xl font-semibold">Saved sessions</h2>
+          <p className="mt-1 text-sm text-zinc-500">
+            Local sessions on this desktop. Sign in to sync them to your account.
+          </p>
+        </div>
         <button
           onClick={handleCreate}
           className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium hover:bg-blue-500"
         >
-          New Session
+          New session
         </button>
       </div>
 
@@ -127,7 +132,7 @@ export function Chats() {
       {filtered.length === 0 ? (
         <p className="text-zinc-500">
           {sessions.length === 0
-            ? "No sessions yet. Create one to get started."
+            ? "No sessions yet. Start one before a meeting, coding task, or research pass."
             : "No sessions match the current filter."}
         </p>
       ) : (
