@@ -1653,8 +1653,51 @@ static bool is_live_transcript_answer_prompt(const wchar_t *question) {
         && wcsstr(question, L"live captions from the current session transcript") != NULL;
 }
 
+static bool wide_contains_case_insensitive(const wchar_t *haystack, const wchar_t *needle) {
+    if (!haystack || !needle || needle[0] == L'\0') return false;
+    size_t needle_len = wcslen(needle);
+    for (const wchar_t *p = haystack; *p; p++) {
+        size_t i = 0;
+        while (i < needle_len && p[i] && towlower(p[i]) == towlower(needle[i])) {
+            i++;
+        }
+        if (i == needle_len) return true;
+    }
+    return false;
+}
+
+static bool context_chip_is_screen_context(const OverlayContextChip *chip) {
+    if (!chip) return false;
+    if (_wcsicmp(chip->kind, L"screen") == 0 || _wcsicmp(chip->kind, L"screenshot") == 0) {
+        return true;
+    }
+    return _wcsicmp(chip->kind, L"image") == 0
+        && wide_contains_case_insensitive(chip->title, L"screen");
+}
+
+static const wchar_t *fallback_question_for_context(void) {
+    bool has_screen_context = false;
+    bool has_file_context = false;
+    for (int i = 0; i < g_context_chip_count; i++) {
+        if (context_chip_is_screen_context(&g_context_chips[i])) {
+            has_screen_context = true;
+        } else {
+            has_file_context = true;
+        }
+    }
+    if (has_screen_context && has_file_context) {
+        return L"Answer using the attached screen context and files.";
+    }
+    if (has_screen_context) {
+        return L"Answer using the attached screen context.";
+    }
+    if (has_file_context) {
+        return L"Answer using the attached files.";
+    }
+    return L"Answer using the attached context.";
+}
+
 static void send_current_question(void) {
-    static const wchar_t *fallback = L"Answer the latest clear question from the current transcript, screen context, and attached files. If there is no clear question yet, summarize what Bluey needs next.";
     int length = GetWindowTextLengthW(g_ask_edit);
     bool used_fallback = length <= 0;
     wchar_t transcript_question[1024] = L"";
@@ -1672,7 +1715,7 @@ static void send_current_question(void) {
         SetFocus(g_ask_edit);
         return;
     }
-    const wchar_t *fallback_question = used_transcript_text ? transcript_question : fallback;
+    const wchar_t *fallback_question = used_transcript_text ? transcript_question : fallback_question_for_context();
     char detail[192];
     snprintf(
         detail,

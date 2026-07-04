@@ -5442,7 +5442,8 @@ What changed:
 - Screen-only fallback copy is now `Answer using the attached screen context.`
 - Screen plus actual files fallback copy is now `Answer using the attached screen context and files.`
 - File-only fallback copy is now `Answer using the attached files.`
-- Desktop workspace version bumped to `0.1.69`.
+- Windows native overlay source now uses the same pending-context fallback copy rule.
+- Desktop workspace version bumped to `0.1.70`.
 
 Verification at initial handoff update:
 
@@ -5450,8 +5451,21 @@ Verification at initial handoff update:
 bash native/macos/cue-overlay/build.sh
 cargo fmt --check
 cargo check -p cue-daemon
+x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c -ld2d1 -ldwrite -lole32 -lshell32 -lshlwapi -lcomdlg32
 ```
 
-Deployment status at initial handoff update:
+Deployment status:
 
-- Pending. Build/package/deploy desktop `0.1.69` next.
+- Desktop release `0.1.70` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 release artifact:
+  `https://bluey.sh/releases/v0.1.70/bluey-0.1.70-darwin-arm64.tar.gz`
+- Release artifact SHA256:
+  `0ade2e66e79e0a23b249d21de754cbdc5e83fd041d4d1267103220727dc25a6f`
+- Deploy verification passed:
+  - release artifact dev-flag/secret scan
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.70`
+- Local machine installed from public `install.sh`; `/Users/uno/.bluey/bin/bluey` and `/Users/uno/.bluey/bin/bluey-daemon` both report `0.1.70`.
+- Local daemon restarted into fresh session `76fc0635-11ed-4481-bbe4-9dbd79bbd847`.
