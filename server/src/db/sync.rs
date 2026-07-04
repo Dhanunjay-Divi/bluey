@@ -416,6 +416,9 @@ fn upsert_batch_postgres(
 
     for record in sessions {
         let metadata = serde_json::to_string(&record.metadata)?;
+        let title = db_text(&record.title);
+        let status = db_text(&record.status);
+        let answer_style = db_opt_text(&record.answer_style);
         tx.execute(
             "INSERT INTO cloud_sessions (
                 account_id, session_id, title, status, created_at_ms, updated_at_ms,
@@ -432,21 +435,25 @@ fn upsert_batch_postgres(
             &[
                 &account_id,
                 &record.session_id,
-                &record.title,
-                &record.status,
+                &title,
+                &status,
                 &record.created_at_ms,
                 &record.updated_at_ms,
                 &record.last_active_at_ms,
-                &record.answer_style,
+                &answer_style,
                 &metadata,
                 &record.deleted_at_ms,
             ],
-        )?;
+        )
+        .with_context(|| format!("upsert cloud_sessions session_id={}", record.session_id))?;
     }
 
     for record in transcript_segments {
         let metadata = serde_json::to_string(&record.metadata)?;
         let is_final = if record.is_final { 1_i32 } else { 0_i32 };
+        let speaker = db_text(&record.speaker);
+        let source = db_text(&record.source);
+        let text = db_text(&record.text);
         tx.execute(
             "INSERT INTO cloud_transcript_segments (
                 account_id, segment_id, session_id, speaker, source, text,
@@ -466,21 +473,37 @@ fn upsert_batch_postgres(
                 &account_id,
                 &record.segment_id,
                 &record.session_id,
-                &record.speaker,
-                &record.source,
-                &record.text,
+                &speaker,
+                &source,
+                &text,
                 &record.start_ms,
                 &record.end_ms,
                 &record.ts_ms,
                 &is_final,
                 &metadata,
             ],
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "upsert cloud_transcript_segments segment_id={} session_id={}",
+                record.segment_id, record.session_id
+            )
+        })?;
     }
 
     for record in cue_responses {
         let metadata = serde_json::to_string(&record.metadata)?;
         let artifact_confidence = record.artifact_confidence.map(|v| v as f64);
+        let kind = db_text(&record.kind);
+        let text = db_text(&record.text);
+        let source_text = db_opt_text(&record.source_text);
+        let provider = db_opt_text(&record.provider);
+        let model = db_opt_text(&record.model);
+        let lane = db_opt_text(&record.lane);
+        let task_type = db_opt_text(&record.task_type);
+        let cost_label = db_opt_text(&record.cost_label);
+        let artifact_type = db_opt_text(&record.artifact_type);
+        let artifact_body = db_opt_text(&record.artifact_body);
         tx.execute(
             "INSERT INTO cloud_cue_responses (
                 account_id, response_id, session_id, kind, text, source_text, ts_ms,
@@ -508,27 +531,39 @@ fn upsert_batch_postgres(
                 &account_id,
                 &record.response_id,
                 &record.session_id,
-                &record.kind,
-                &record.text,
-                &record.source_text,
+                &kind,
+                &text,
+                &source_text,
                 &record.ts_ms,
-                &record.provider,
-                &record.model,
-                &record.lane,
-                &record.task_type,
+                &provider,
+                &model,
+                &lane,
+                &task_type,
                 &record.cost_cents,
                 &record.balance_cents_after,
-                &record.cost_label,
-                &record.artifact_type,
-                &record.artifact_body,
+                &cost_label,
+                &artifact_type,
+                &artifact_body,
                 &artifact_confidence,
                 &metadata,
             ],
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "upsert cloud_cue_responses response_id={} session_id={}",
+                record.response_id, record.session_id
+            )
+        })?;
     }
 
     for record in context_artifacts {
         let metadata = serde_json::to_string(&record.metadata)?;
+        let kind = db_text(&record.kind);
+        let title = db_text(&record.title);
+        let note = db_opt_text(&record.note);
+        let source_uri = db_opt_text(&record.source_uri);
+        let content_hash = db_opt_text(&record.content_hash);
+        let text_preview = db_opt_text(&record.text_preview);
         tx.execute(
             "INSERT INTO cloud_context_artifacts (
                 account_id, artifact_id, session_id, kind, title, note, source_uri,
@@ -548,16 +583,22 @@ fn upsert_batch_postgres(
                 &account_id,
                 &record.artifact_id,
                 &record.session_id,
-                &record.kind,
-                &record.title,
-                &record.note,
-                &record.source_uri,
-                &record.content_hash,
-                &record.text_preview,
+                &kind,
+                &title,
+                &note,
+                &source_uri,
+                &content_hash,
+                &text_preview,
                 &record.created_at_ms,
                 &metadata,
             ],
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "upsert cloud_context_artifacts artifact_id={} session_id={}",
+                record.artifact_id, record.session_id
+            )
+        })?;
     }
 
     for record in rag_chunks {
@@ -568,6 +609,11 @@ fn upsert_batch_postgres(
             .map(serde_json::to_string)
             .transpose()?;
         let embedding_vector = record.embedding.as_deref().and_then(vector_literal_1536);
+        let source_kind = db_text(&record.source_kind);
+        let source_id = db_text(&record.source_id);
+        let text = db_text(&record.text);
+        let embedding_model = db_opt_text(&record.embedding_model);
+        let content_hash = db_opt_text(&record.content_hash);
         tx.execute(
             "INSERT INTO cloud_rag_chunks (
                 account_id, chunk_id, session_id, source_kind, source_id, chunk_index,
@@ -591,19 +637,25 @@ fn upsert_batch_postgres(
                 &account_id,
                 &record.chunk_id,
                 &record.session_id,
-                &record.source_kind,
-                &record.source_id,
+                &source_kind,
+                &source_id,
                 &record.chunk_index,
-                &record.text,
+                &text,
                 &embedding_json,
                 &embedding_vector,
-                &record.embedding_model,
+                &embedding_model,
                 &record.token_count,
-                &record.content_hash,
+                &content_hash,
                 &record.updated_at_ms,
                 &metadata,
             ],
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "upsert cloud_rag_chunks chunk_id={} source_id={}",
+                record.chunk_id, record.source_id
+            )
+        })?;
     }
 
     tx.commit().context("commit sync postgres tx")?;
@@ -1252,6 +1304,14 @@ fn vector_literal_1536(values: &[f32]) -> Option<String> {
     Some(format!("[{body}]"))
 }
 
+fn db_text(value: &str) -> String {
+    value.replace('\0', "")
+}
+
+fn db_opt_text(value: &Option<String>) -> Option<String> {
+    value.as_deref().map(db_text)
+}
+
 fn parse_json(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw).unwrap_or_else(|_| empty_json())
 }
@@ -1310,6 +1370,16 @@ fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
 mod tests {
     use super::*;
     use crate::db::{open_pool, run_migrations};
+
+    #[test]
+    fn db_text_removes_nul_bytes_before_postgres_bind() {
+        assert_eq!(db_text("Resume\0.pdf"), "Resume.pdf");
+        assert_eq!(
+            db_opt_text(&Some("screen\0context".to_string())),
+            Some("screencontext".to_string())
+        );
+        assert_eq!(db_opt_text(&None), None);
+    }
 
     #[test]
     fn sync_batch_round_trips_session_bundle_and_rag() {

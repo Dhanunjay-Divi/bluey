@@ -84,6 +84,54 @@ Targeted coverage added:
 - `answer_plan_python_request_with_prior_coding_context_is_followup`
 - `answer_plan_java_request_for_same_prior_coding_context_is_followup`
 
+## Deploy And Live Smoke
+
+Server and desktop deployment:
+
+- Server API deployed to production with commit `bb4aca3b10cdb66d40f7b3438939f956a6aabbd7`.
+- Desktop release `0.1.72` published to `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.72/bluey-0.1.72-darwin-arm64.tar.gz`
+- Publish verification passed:
+  - release artifact dev-flag/secret scan
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.72`
+- Local install from public `install.sh` verified `/Users/uno/.bluey/bin/bluey` and `/Users/uno/.bluey/bin/bluey-daemon` both report `0.1.72`.
+- Local daemon restarted into session `8491bd10-812a-4532-8426-add8ac023e36`.
+
+Live smoke:
+
+- Direct Alice/Bob coding prompt returned a complete coding answer with approach, code, explanation, complexity, and edge cases.
+- Request `e99d2770-b163-4609-ba9a-9709bac9d80c` for `So can you give me Java code for the same?` used neutral `Recent coding context` and returned a complete Java code artifact.
+- Server logs for `e99d2770-b163-4609-ba9a-9709bac9d80c` showed `answer_plan_source=rules`, `answer_intent=coding_followup`, `answer_output=code_artifact`, `effective_lane=deep`, route `deepseek-v4-pro`, `canvas_artifact_type=code`, and no internal disclosure guard block.
+
+During the first 0.1.71 smoke, the server's internal-disclosure guard falsely blocked a synthetic follow-up context because the desktop label used prompt-like wording. That was fixed before the final 0.1.72 deploy by renaming the block to neutral coding context.
+
+## Sync Follow-Up
+
+After deploy, production logged one `/sync/batch` warning:
+
+```text
+sync endpoint failed error=error serializing parameter 5
+```
+
+The object uploads immediately before it succeeded, so this was most likely metadata persistence, not file-byte upload. Live Postgres schema for `cloud_context_artifacts.title` is correctly `TEXT NOT NULL`; the likely cause is a raw NUL byte in a text field coming from local artifact/session metadata. Follow-up fix:
+
+- Sanitize raw NUL bytes out of all Postgres sync text fields before binding.
+- Add table and record id context to each Postgres sync insert/update error.
+- Log the full safe error chain for `/sync` failures instead of only the top-level error.
+
+Additional verification:
+
+```bash
+cargo test --manifest-path server/Cargo.toml db_text_removes_nul_bytes_before_postgres_bind --lib
+cargo test --manifest-path server/Cargo.toml sync_batch_round_trips_session_bundle_and_rag --lib
+cargo test --manifest-path server/Cargo.toml answer_plan_ --lib
+cargo check --manifest-path server/Cargo.toml
+```
+
 ## Notes
 
 This round fixes future continuity and traceability. It cannot rewrite already-saved compact turns in old sessions, but the next follow-up from a freshly updated `0.1.72` desktop will preserve the prior coding context explicitly.

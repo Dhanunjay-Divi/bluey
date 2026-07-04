@@ -5514,8 +5514,32 @@ cargo test --manifest-path server/Cargo.toml answer_plan_ --lib
 
 Deployment status:
 
-- Pending corrected release deploy. Deploy server API and desktop `0.1.72`, then live-smoke:
-  - Alice/Bob prompt should route to coding/deep and produce approach/code/explanation/complexity.
-  - `Can you give me Python code?` should reuse the prior full problem without asking for the statement again.
-  - `So can you give me Java code for the same?` should reuse the prior problem.
-  - Any local failure ref should be findable in local daemon logs with `request_ref`.
+- Server API deployed to production with commit `bb4aca3b10cdb66d40f7b3438939f956a6aabbd7`.
+- Desktop release `0.1.72` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 release artifact:
+  `https://bluey.sh/releases/v0.1.72/bluey-0.1.72-darwin-arm64.tar.gz`
+- Deploy verification passed:
+  - release artifact dev-flag/secret scan
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.72`
+- Local machine installed from public `install.sh`; `/Users/uno/.bluey/bin/bluey` and `/Users/uno/.bluey/bin/bluey-daemon` both report `0.1.72`.
+- Local daemon restarted into fresh session `8491bd10-812a-4532-8426-add8ac023e36`.
+- Live smoke request `e99d2770-b163-4609-ba9a-9709bac9d80c` for `So can you give me Java code for the same?` returned a complete Java code artifact from `answer_intent=coding_followup`, `answer_output=code_artifact`, `effective_lane=deep`, route `deepseek-v4-pro`.
+- The initial 0.1.71 smoke found a false-positive internal-disclosure guard block caused by prompt-like context wording. Final 0.1.72 uses neutral `Recent coding context` wording and passed the follow-up smoke.
+
+Post-deploy sync follow-up:
+
+- Production logged one `/sync/batch` warning after successful artifact object uploads:
+  `sync endpoint failed error=error serializing parameter 5`.
+- Live Postgres schema for `cloud_context_artifacts.title` was correct (`TEXT NOT NULL`), so the likely cause was a raw NUL byte in a text field from local artifact/session metadata.
+- Follow-up server patch sanitizes raw NUL bytes out of all Postgres sync text fields, adds table/record context around sync insert errors, and logs the full safe sync error chain.
+- Verification for that patch:
+
+```bash
+cargo test --manifest-path server/Cargo.toml db_text_removes_nul_bytes_before_postgres_bind --lib
+cargo test --manifest-path server/Cargo.toml sync_batch_round_trips_session_bundle_and_rag --lib
+cargo test --manifest-path server/Cargo.toml answer_plan_ --lib
+cargo check --manifest-path server/Cargo.toml
+```

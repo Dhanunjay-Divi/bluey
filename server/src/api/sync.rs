@@ -326,7 +326,12 @@ fn validate_object_id(artifact_id: &str) -> Result<(), (StatusCode, String)> {
 }
 
 fn internal(e: anyhow::Error) -> (StatusCode, String) {
-    tracing::warn!(error = %e, "sync endpoint failed");
+    let error_chain = e
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    tracing::warn!(error = %e, error_chain = %error_chain, "sync endpoint failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "sync failed".to_string())
 }
 
