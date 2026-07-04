@@ -5581,8 +5581,37 @@ x86_64-w64-mingw32-gcc -Wall -Wextra -Werror -D_WIN32_WINNT=0x0601 native/window
 cargo test -p cue-daemon live_stt_ -- --nocapture
 ```
 
-Remaining before final close:
+Deployment status:
 
-- Publish/deploy server and desktop release `0.1.73`.
-- Verify `latest.json` signature and live artifact.
-- Optionally run a short signed-in Listen smoke and inspect first partial/final timing logs.
+- Source commit:
+  `0b1d40c72c4484668c29254e5e7b3566c959b8b8`
+- Desktop release `0.1.73` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.73/bluey-0.1.73-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `ef01ad43308913dfffd5081f2780013ddfd2ea8df102f57b6487644e59c5d0ca`
+- Release verification passed:
+  - release artifact dev-flag/secret scan
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.73`
+- Public installer smoke installed `0.1.73` locally and both installed binaries report `0.1.73`.
+- Production API server deployed from `/opt/bluey-build-codex-round333-stt-speed`.
+- Production binary SHA256:
+  `906db8b0b16c8045b02290020f1489a03b2956273a92baab4d6ccd5a07f4cc2c`
+- Previous API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260704T102752Z`
+- `https://bluey.sh/health` reports commit `0b1d40c72c4484668c29254e5e7b3566c959b8b8`.
+- `bluey-api.service` is active with `NRestarts=0`.
+- Recent production warning/error scan after restart returned no lines.
+
+Important production build note:
+
+- The droplet Rust toolchain was updated to `rustc 1.96.1` / `cargo 1.96.1` because the old `cargo 1.75.0` could not read the current lockfile / transitive 2024-edition crate metadata.
+
+Remaining STT follow-up:
+
+- Add the overlay live-caption UI pass so partial transcript text scrolls horizontally and feels immediate.
+- Add dynamic per-session keyterms from attached docs/resumes/session context without baking private words into binaries.
+- Add deterministic live STT latency smoke coverage.

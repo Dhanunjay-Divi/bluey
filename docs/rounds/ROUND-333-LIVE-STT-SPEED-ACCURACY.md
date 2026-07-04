@@ -61,3 +61,48 @@ cargo test -p cue-daemon live_stt_ -- --nocapture
 
 Note: root `cargo fmt --manifest-path Cargo.toml` is not applicable because the workspace root has no direct targets; server formatting ran successfully.
 
+## Deployment
+
+Source commit:
+
+- `0b1d40c72c4484668c29254e5e7b3566c959b8b8`
+
+Desktop release:
+
+- Published desktop release `0.1.73` to `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.73/bluey-0.1.73-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `ef01ad43308913dfffd5081f2780013ddfd2ea8df102f57b6487644e59c5d0ca`
+- Release artifact dev-flag/secret scan passed.
+- `latest.json` signature verified.
+- Installer MIME checks passed:
+  - `install.sh`: `application/x-shellscript`
+  - `install.ps1`: `application/x-powershell`
+- Unpacked release binaries report `0.1.73`.
+- Public installer smoke passed:
+  - `/Users/uno/.bluey/bin/bluey --version` -> `bluey 0.1.73`
+  - `/Users/uno/.bluey/bin/bluey-daemon --version` -> `bluey-daemon 0.1.73`
+
+Production API relay:
+
+- Refreshed droplet Rust toolchain to `rustc 1.96.1` / `cargo 1.96.1` because the previous `cargo 1.75.0` could not read the current lockfile or 2024-edition transitive crate metadata.
+- Built in:
+  `/opt/bluey-build-codex-round333-stt-speed`
+- Installed binary:
+  `/usr/local/bin/bluey-server`
+- Binary SHA256:
+  `906db8b0b16c8045b02290020f1489a03b2956273a92baab4d6ccd5a07f4cc2c`
+- Previous binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260704T102752Z`
+- `bluey-api.service`: active
+- `NRestarts`: `0`
+- Public health returned:
+  `commit=0b1d40c72c4484668c29254e5e7b3566c959b8b8`
+- Recent production warning/error scan after restart returned no lines.
+
+## Next STT Work
+
+- Make the overlay live caption strip a true horizontal partial stream so interim captions feel immediate instead of final-caption delayed.
+- Add dynamic per-session keyterms from attached resumes/docs/question context without logging or storing private terms in release binaries.
+- Add a live STT latency smoke that speaks or replays deterministic audio and reports first-audio, first-partial, first-final, and transcript quality.
