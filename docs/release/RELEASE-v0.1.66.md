@@ -35,5 +35,21 @@ cargo check --manifest-path server/Cargo.toml --bin bluey-server
 
 ## Deployment Status
 
-Pending final package and deploy.
+Live.
 
+- Production API server deployed from commit:
+  `04ca504024dfcfa0cf3dd5ccc628807d2bc83a85`
+- API build tree:
+  `/opt/bluey-build-codex-round328-code-shape`
+- Installed API binary SHA:
+  `53e8ee7ced0371338b5f4298bc8aea55f7a67e76597c271f063d5a446d1ff967`
+- API health:
+  local and public `/health` returned `status=ok` with the expected commit
+- Desktop release:
+  `0.1.66` published to `bluey.sh`
+- macOS artifact SHA:
+  `36443359c5979d06055f0bec890b11d0add7afd7c2cd0db18041f06732c5ada3`
+- Release verification:
+  `latest.json` signature verified, installer MIME checks passed, live artifact SHA verified, unpacked binaries report `0.1.66`
+- Local install:
+  installed and restarted successfully on this Mac

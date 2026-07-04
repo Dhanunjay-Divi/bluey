@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 00:34 EDT
+Latest checkpoint: 2026-07-04 00:51 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,13 +30,13 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest active Bluey round doc is `ROUND-328-CODING-ANSWER-SHAPE.md`; the next canonical Bluey round doc should start at `ROUND-329-...`.
+- Latest completed Bluey round doc is `ROUND-328-CODING-ANSWER-SHAPE.md`; the next canonical Bluey round doc should start at `ROUND-329-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
-- Round 328 is in progress for coding answer shape:
+- Round 328 is complete and deployed for coding answer shape:
   - owner showed a coding challenge answer with only a short approach sentence and a cramped code artifact
   - expected shape is approach explanation, readable complete code with useful comments, explanation, time/space complexity, and patch-style follow-ups
   - hardened managed server coding prompts to require `Approach`, `Code`, `Explanation`, `Complexity`, and `Edge cases`
@@ -55,11 +55,25 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
     - `cargo check -p cue-daemon`
     - `cargo fmt --check`
     - `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
-  - pending before final close:
-    - commit/push Round 328 changes
-    - deploy production API server
-    - package/deploy desktop `0.1.66`
-    - install locally and restart Bluey
+  - Release/deploy:
+    - implementation commit:
+      `04ca504024dfcfa0cf3dd5ccc628807d2bc83a85`
+    - production API build tree:
+      `/opt/bluey-build-codex-round328-code-shape`
+    - previous API binary backup:
+      `/var/backups/bluey-api/bin/bluey-server.previous-20260704T044451Z`
+    - installed API binary SHA:
+      `53e8ee7ced0371338b5f4298bc8aea55f7a67e76597c271f063d5a446d1ff967`
+    - `bluey-api.service` active with `NRestarts=0`
+    - public health returned `status=ok` and expected commit
+    - recent API warning/error logs after restart had no entries
+    - desktop release `0.1.66` is live on `bluey.sh`
+    - live `latest.json.sig` verified successfully
+    - live installer MIME checks passed for `/install.sh` and `/install.ps1`
+    - live macOS artifact SHA verified:
+      `36443359c5979d06055f0bec890b11d0add7afd7c2cd0db18041f06732c5ada3`
+    - unpacked macOS release reports `bluey 0.1.66` and `bluey-daemon 0.1.66`
+    - local install updated to `0.1.66` and Bluey was restarted
   - Round doc:
     `docs/rounds/ROUND-328-CODING-ANSWER-SHAPE.md`
 - Round 327 is complete and deployed for resume-introduction first-pass length:
