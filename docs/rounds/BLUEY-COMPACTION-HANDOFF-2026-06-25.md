@@ -5413,3 +5413,45 @@ Live QA after deploy:
 - Server logs showed `answer_intent=coding`, `answer_output=code_artifact`, `effective_lane=deep`.
 - Gemini returned a 429; Bluey cooled that key and fell back to OpenAI `gpt-5.5`, proving fallback/cooldown behavior on this path.
 - Follow-up `Can you give me Python code?` request `bc90f545-7419-4477-ab66-ae454f3550cb` reused prior Alice/Bob context and returned full Python code.
+
+## Latest Round 331: Screen Context Prompt Copy
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-331-SCREEN-CONTEXT-PROMPT-COPY.md`
+
+Trigger:
+
+- The owner showed a screen-only ask whose visible question bubble said `Answer using the attached screen capture, documents, and current session context.`
+
+Root cause:
+
+- The macOS overlay treated the pending screen-context chip as a generic pending attachment, so it used the `screen + documents/session context` fallback text even when no files/documents were attached.
+
+What changed:
+
+- Added a pending non-screen context helper.
+- Screen-only fallback copy is now `Answer using the attached screen context.`
+- Screen plus actual files fallback copy is now `Answer using the attached screen context and files.`
+- File-only fallback copy is now `Answer using the attached files.`
+- Desktop workspace version bumped to `0.1.69`.
+
+Verification at initial handoff update:
+
+```bash
+bash native/macos/cue-overlay/build.sh
+cargo fmt --check
+cargo check -p cue-daemon
+```
+
+Deployment status at initial handoff update:
+
+- Pending. Build/package/deploy desktop `0.1.69` next.

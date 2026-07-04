@@ -9926,6 +9926,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             && item.title.localizedCaseInsensitiveContains("screen")
     }
 
+    private func pendingNonScreenContextItems() -> [OverlayContextItem] {
+        guard !pendingContextItemIds.isEmpty else {
+            return []
+        }
+        return contextItems.filter { item in
+            pendingContextItemIds.contains(item.id) && !isScreenContextItem(item)
+        }
+    }
+
     private func renderAttachmentStrip(_ items: [OverlayContextItem]) {
         for view in attachmentStack.arrangedSubviews {
             attachmentStack.removeArrangedSubview(view)
@@ -11923,15 +11932,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func fallbackQuestionForAttachedContext() -> String? {
-        let hasPendingAttachments = !pendingContextItemIds.isEmpty
+        let hasPendingAttachments = !pendingNonScreenContextItems().isEmpty
         if screenContextReadyForAnswer && hasPendingAttachments {
-            return "Answer using the attached screen capture, documents, and current session context."
+            return "Answer using the attached screen context and files."
         }
         if screenContextReadyForAnswer {
-            return "Analyse the attached screen capture and answer with the key details."
+            return "Answer using the attached screen context."
         }
         if hasPendingAttachments {
-            return "Answer using the attached documents and current session context."
+            return "Answer using the attached files."
         }
         return nil
     }
