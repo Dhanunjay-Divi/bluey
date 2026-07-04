@@ -43,7 +43,8 @@ pub use connectors::read_connectors;
 pub use discover::{discover_agents, discover_in_home, probe_sqlite_store};
 // Local-CLI drive (unchanged surface) — local agents call this directly.
 pub use drive::{
-    drive as drive_cli, is_transient_network_error, AnswerChunk, AnswerStream, Question, ToolStatus,
+    drive as drive_cli, is_transient_network_error, AnswerChunk, AnswerStream, DriveOverrides,
+    Question, ToolStatus,
 };
 pub use fix::{fix_apply_prompt, fix_proposal_prompt, parse_fix_proposal, FixProposal};
 pub use sessions::{list_with_health_check, reader_for, ReaderHealth, SessionReader};
@@ -89,36 +90,37 @@ pub async fn drive(agent: AgentKind, question: Question) -> anyhow::Result<Answe
     drive_cli(agent, question).await
 }
 
-/// Like [`drive`], but threads a per-run **model override** into the local-CLI
-/// branch (cloud and ACP agents don't take a per-run model flag, so the override
-/// is ignored for them — exactly as [`drive`] would route them).
+/// Like [`drive`], but threads per-run **model + effort overrides** into the
+/// local-CLI branch.
 ///
 /// This is the single dispatch entry point the daemon's answer ladder uses: it
 /// owns the cloud-vs-ACP-vs-CLI decision in ONE place (so adding an agent is a
-/// registry row, never a new dispatch branch in the daemon), while the override
-/// lets the model-block self-resolver re-drive a blocked CLI agent under a
-/// supported model ([`drive::DriveOptions::model_override`]). An empty override
-/// (the common case) is byte-identical to [`drive`].
+/// registry row, never a new dispatch branch in the daemon). The overrides let
+/// the daemon re-drive a CLI agent under a specific model (the model-block
+/// self-resolver) or reasoning effort (the overlay speed tier), applied via
+/// [`drive::DriveOptions::model_override`] / `effort_override`.
+///
+/// Routing rule (BINDING): the ACP branch is taken ONLY when
+/// `should_use_acp(&agent) && overrides.is_empty()`. ACP has no model/effort
+/// parameter, so a non-empty override FORCES the cloud-check-then-CLI path —
+/// an explicit user/resolver pick must never be a silent no-op on the ACP route,
+/// and this also makes the ModelBlocked retry deterministic (CLI directly)
+/// instead of ACP-then-fallback. When overrides are empty, behavior is
+/// byte-identical to [`drive`].
 pub async fn drive_with_overrides(
     agent: AgentKind,
     question: Question,
-    model_override: Vec<String>,
+    overrides: DriveOverrides,
 ) -> anyhow::Result<AnswerStream> {
-    if should_use_acp(&agent) {
-        // ACP ignores the per-run model override (it has no `--model` flag), but
-        // the CLI fallback must still honor it: a pre-first-output ACP failure
-        // re-drives the SAME agent+question over the CLI WITH the override, so the
-        // model-block self-resolver's re-drive is preserved end to end.
+    if should_use_acp(&agent) && overrides.is_empty() {
+        // Empty overrides: the ACP route is unchanged. Its CLI fallback also needs
+        // no overrides (empty by construction on this branch), so it can build a
+        // default DriveOptions.
         let cli_question = question.clone();
         let cli_agent = agent.clone();
-        let cli_override = model_override;
         let acp = acp::drive_acp(agent, question).await;
         return Ok(acp_with_cli_fallback(acp, move || {
-            let opts = drive::DriveOptions {
-                model_override: cli_override,
-                ..Default::default()
-            };
-            drive::drive_with_options(cli_agent, cli_question, opts)
+            drive::drive_with_options(cli_agent, cli_question, drive::DriveOptions::default())
         }));
     }
     if let Some(tag) = registry::KindTag::from_agent_kind(&agent) {
@@ -127,7 +129,8 @@ pub async fn drive_with_overrides(
         }
     }
     let opts = drive::DriveOptions {
-        model_override,
+        model_override: overrides.model_args,
+        effort_override: overrides.effort_args,
         ..Default::default()
     };
     drive::drive_with_options(agent, question, opts).await

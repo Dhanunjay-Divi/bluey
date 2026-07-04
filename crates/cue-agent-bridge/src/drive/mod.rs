@@ -25,6 +25,27 @@ pub mod cli;
 
 pub use cli::{drive, drive_with_mode, drive_with_options, DriveOptions};
 
+/// Per-run CLI overrides the daemon threads into a local-CLI drive. Exact argv
+/// tokens, data-driven off the registry (`model_flag` / `effort_args`) — the
+/// drive layer never names a model or a flag itself.
+#[derive(Debug, Clone, Default)]
+pub struct DriveOverrides {
+    /// e.g. `["--model", "composer-2.5"]` or `["-m", "gpt-5.1-codex"]`. Empty = none.
+    pub model_args: Vec<String>,
+    /// e.g. `["--effort", "high"]` or `["-c", "model_reasoning_effort=\"high\""]`.
+    /// Empty = none.
+    pub effort_args: Vec<String>,
+}
+
+impl DriveOverrides {
+    /// True when neither a model nor an effort override is set — the common case,
+    /// which routes byte-identically to today (ACP allowed, no forced CLI).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.model_args.is_empty() && self.effort_args.is_empty()
+    }
+}
+
 /// Character budget for the full replayed prompt (prior history + the question),
 /// the **safety net** against "prompt too long" when continuing a conversation.
 /// ~4 chars/token, so this ≈ 120K tokens — comfortably under the smallest modern

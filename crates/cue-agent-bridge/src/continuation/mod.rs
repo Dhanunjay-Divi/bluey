@@ -23,5 +23,6 @@ pub use compaction::{
 };
 pub use recoverable::is_resume_recoverable_error;
 pub use tier::{
-    apply_tier, continuation_bridge_kind, resolve_session, CONTINUATION_READ_MAX_TURNS,
+    apply_tier, continuation_bridge_kind, resolve_session, ResolvedSession,
+    CONTINUATION_READ_MAX_TURNS,
 };

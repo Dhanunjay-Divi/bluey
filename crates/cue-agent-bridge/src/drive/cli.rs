@@ -247,11 +247,16 @@ pub const COMMAND_MAP: &[DriveSpec] = &[
         // prints the plain-text answer.
         binary: "agy",
         oneshot_args: &["-p", "{prompt}"],
-        // Resume by conversation id: `agy --conversation <id> -p "<prompt>"`. The
-        // id Bluey reads from the Antigravity store IS the conversation UUID `agy
-        // --conversation` wants (verified: index/`conversations/<uuid>` share it),
-        // so no id translation is needed. Appended after the oneshot args; agy
-        // accepts the flag in any position.
+        // Resume by conversation id: `agy --conversation <id> -p "<prompt>"`.
+        // REFUTED live 2026-07-03: the claimed id equivalence holds ONLY for the
+        // antigravity-CLI store (~/.gemini/antigravity-cli). Every id Bluey lists
+        // comes from the DESKTOP store (~/.gemini/antigravity), and
+        // `agy --conversation <desktop-store-id>` fails with "Error: failed to send
+        // message: trajectory not found" (exit 1). This is why the Antigravity
+        // registry row keeps Replay — these resume_args are never exercised for a
+        // Bluey-listed id today. Kept as data for when the sessions layer learns the
+        // antigravity-cli store. Appended after the oneshot args; agy accepts the
+        // flag in any position.
         resume_args: &["--conversation", "{id}"],
         parser: OutputParser::PlainText,
     },
@@ -286,6 +291,13 @@ pub struct DriveOptions {
     /// data the resolver reads off the registry row (`model_flag` + a
     /// `fallback_models` entry); the drive layer never names a model itself.
     pub model_override: Vec<String>,
+    /// Per-run effort/reasoning-depth argv tokens (registry `effort_args` row),
+    /// appended immediately AFTER [`model_override`](DriveOptions::model_override).
+    /// Empty (the default) appends nothing, so existing callers are unchanged. The
+    /// tokens are data the daemon read off the registry row via
+    /// [`crate::registry::effort_args_for`]; the drive layer never names a flag or
+    /// a level itself.
+    pub effort_override: Vec<String>,
     /// Working directory to spawn the child in. Set from [`Question::cwd`] by
     /// [`drive_with_options`]. **Critical for cwd-scoped resume** (Claude resolves
     /// `--resume <id>` against `~/.claude/projects/<encoded-cwd>/`). `None` → the
@@ -300,6 +312,7 @@ impl Default for DriveOptions {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             mode: DriveMode::Answer,
             model_override: Vec::new(),
+            effort_override: Vec::new(),
             cwd: None,
         }
     }
@@ -584,6 +597,15 @@ pub async fn drive_with_options(
     // that take a model flag accept it in any position (VERIFIED LIVE for
     // Codex's `-m`). Empty by default, so non-fallback drives are byte-identical.
     for tok in &opts.model_override {
+        args.push(tok.clone());
+    }
+
+    // Append the per-run EFFORT override immediately after the model override
+    // (e.g. Copilot's `--effort high`, or Codex's `-c model_reasoning_effort=…`).
+    // Same posture as the model override: data the daemon read off the registry
+    // (`effort_args` for the overlay speed tier), never a flag/level named here.
+    // Empty by default, so non-speed drives are byte-identical.
+    for tok in &opts.effort_override {
         args.push(tok.clone());
     }
 

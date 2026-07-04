@@ -98,6 +98,20 @@ pub struct AgentEntry {
     /// which case [`fallback_models`](AgentEntry::fallback_models) is unused and
     /// the resolver goes straight to the BYOT proposal (or honest error).
     pub model_flag: Option<&'static str>,
+    /// Per-run reasoning-effort args by overlay speed tier. `None` = this CLI has
+    /// no live-verified per-run effort control (prose instructions only). Read by
+    /// [`effort_args_for`] and threaded into the drive as extra argv tokens right
+    /// after the model override; the prose speed instructions stay for every agent
+    /// (effort args are additive, never a replacement).
+    pub effort_args: Option<EffortArgs>,
+    /// When true, `NativeResume` by id is only safe for sessions Bluey ITSELF
+    /// minted via the CLI (recorded in the spawn-time session ledger). Ids listed
+    /// from the agent's GUI/IDE store are NOT proven resumable; `apply_tier`
+    /// degrades those to `Replay`. Live-verified for Cursor: a CLI-minted id +
+    /// the original cwd resumes, but a wrong-cwd or unknown id SILENTLY mints an
+    /// empty session (exit 0) — no error-based degrade can catch it, so provenance
+    /// must gate the resume.
+    pub resume_requires_ledger: bool,
     /// How to PROACTIVELY install this agent's CLI when it's missing (so a user
     /// with only the GUI app becomes drivable). `None` for agents with no known
     /// official CLI installer. Recipes are vetted, official sources only — never
@@ -147,6 +161,31 @@ pub struct AgentEntry {
     /// `mcp list` agents (claude/gemini/copilot), whose single command lists all
     /// servers at once.
     pub mcp_list_tools_per_server: bool,
+    /// The agent's OWN "list my available models" CLI invocation — the argv
+    /// AFTER the binary (e.g. `&["models"]`) — as DATA, so the model picker can
+    /// enumerate what the agent can run. Read-only and NON-quota: it prints the
+    /// account's model ids/labels; it never drives the model. Only the two
+    /// LIVE-enumerable CLIs carry it (Cursor `cursor-agent models`, Antigravity
+    /// `agy models`); every other row is `None` and falls back to a curated
+    /// list (see [`crate::model_resolve::curated_models_for`]). The binary is
+    /// [`drive_command`](AgentEntry::drive_command)`[0]`; this is the argv after
+    /// it. SECURITY: allowlisted to the model-LIST subcommand only — NEVER a
+    /// command that drives the model, changes config, or dumps secrets.
+    pub models_command: Option<&'static [&'static str]>,
+}
+
+/// Argv tokens per overlay speed tier ("balanced" always sends nothing = the CLI
+/// default). Data on the registry row, rendered by [`effort_args_for`] — the
+/// drive layer never names an effort flag or level itself. Only populated for
+/// CLIs whose per-run effort control is LIVE-VERIFIED (see the row comments);
+/// every other row leaves [`AgentEntry::effort_args`] `None` and relies on the
+/// prose speed instructions alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffortArgs {
+    /// Tokens for the "fast" tier (e.g. `["--effort", "low"]`).
+    pub fast: &'static [&'static str],
+    /// Tokens for the "deep" tier (e.g. `["--effort", "high"]`).
+    pub deep: &'static [&'static str],
 }
 
 /// How an agent's CLI login is made headless-friendly (device-code / printed
@@ -258,15 +297,20 @@ pub enum ContinuationTier {
     /// reaches the same sessions Bluey reads. Bluey passes the session id via the
     /// drive spec's `resume_args` and lets the VENDOR handle context compaction
     /// server-side (free, seamless-infinite). Claude (`--resume <id>`, cwd-scoped),
-    /// Codex (`codex resume <id>`), Copilot (`--resume=<id>`).
+    /// Codex (`codex resume <id>`), Copilot (`--resume=<id>`), Cursor
+    /// (`--resume=<id>`, cwd-scoped AND ledger-gated — only Bluey-minted CLI
+    /// sessions are proven resumable; see
+    /// [`AgentEntry::resume_requires_ledger`]).
     NativeResume,
     /// The agent's CLI has NO per-id resume that reaches Bluey's sessions, so
     /// Bluey continues by REPLAYING the transcript it already read as context
     /// (exactly what these apps do internally on a model switch — resend the
-    /// message list). Bluey caps/compacts the history to fit the window. Cursor
-    /// (no CLI resume), VS Code (no CLI), Gemini (`--resume` takes only
-    /// "latest"/index, not our id), Antigravity (sessions in its own store;
-    /// `agy --conversation` needed but not assumed installed → replay is robust).
+    /// message list). Bluey caps/compacts the history to fit the window. VS Code
+    /// (no CLI), Gemini (`--resume` takes only "latest"/index, not our id),
+    /// Antigravity (`agy --conversation` reaches ONLY the antigravity-cli store,
+    /// which is DISJOINT from the desktop store Bluey lists — every listable id
+    /// fails live with "trajectory not found", and agy parses as PlainText so no
+    /// id is captured for chaining → replay is the only robust path).
     Replay,
 }
 
@@ -409,6 +453,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         // list) but the safe-fallback values stay empty until proven.
         fallback_models: &[],
         model_flag: Some("--model"),
+        // Claude 2.0.42 has NO headless effort/thinking/reasoning flag (full
+        // --help inspected live 2026-07-03; the research doc's `claude --effort`
+        // claim is REFUTED). Prose speed instructions only.
+        effort_args: None,
+        resume_requires_ledger: false,
         // Claude's CLI login is `claude setup-token` (long-lived token; there is
         // no `claude login` subcommand). Interactive, no no-browser switch.
         login_command: Some(&["claude", "setup-token"]),
@@ -421,6 +470,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         // check. VERIFIED live. NEVER `mcp get` (leaks the server env / API key).
         mcp_list_command: Some(&["mcp", "list"]),
         mcp_list_tools_per_server: false,
+        // Model list via the curated CLAUDE_MODELS fallback (no CLI enum).
+        models_command: None,
         binary_candidates: &["claude"],
         app_bundles: &["Claude.app"],
         app_dirs_windows: &["Claude"],
@@ -463,6 +514,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         // Same `claude` engine as the CLI row — shares its (empty) fallback set.
         fallback_models: &[],
         model_flag: Some("--model"),
+        // Same `claude` engine as the CLI row — no headless effort flag.
+        effort_args: None,
+        resume_requires_ledger: false,
         // Driven through the same `claude` CLI, so it shares its login command.
         login_command: Some(&["claude", "setup-token"]),
         login_auth: LoginAuth::InteractiveOnly,
@@ -472,6 +526,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         // signal, so this row stays config-only (Level-1 fallback).
         mcp_list_command: None,
         mcp_list_tools_per_server: false,
+        // Model list via the curated CLAUDE_MODELS fallback (no CLI enum).
+        models_command: None,
         // No separate binary — driven through the same `claude` CLI.
         binary_candidates: &["claude"],
         app_bundles: &["Claude.app"],
@@ -501,6 +557,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         // Same `claude` engine as the CLI row — shares its (empty) fallback set.
         fallback_models: &[],
         model_flag: Some("--model"),
+        // Same `claude` engine as the CLI row — no headless effort flag.
+        effort_args: None,
+        resume_requires_ledger: false,
         // Same `claude` CLI engine → same login command.
         login_command: Some(&["claude", "setup-token"]),
         login_auth: LoginAuth::InteractiveOnly,
@@ -508,6 +567,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         // GUI-surface index row (see the App row); config-only fallback.
         mcp_list_command: None,
         mcp_list_tools_per_server: false,
+        // Model list via the curated CLAUDE_MODELS fallback (no CLI enum).
+        models_command: None,
         binary_candidates: &["claude"],
         app_bundles: &["Claude.app"],
         app_dirs_windows: &["Claude"],
@@ -532,7 +593,24 @@ pub const REGISTRY: &[AgentEntry] = &[
         kind_tag: KindTag::Cursor,
         // No account/plan model-block observed for Cursor; mechanism left inert.
         fallback_models: &[],
-        model_flag: None,
+        // LIVE-VERIFIED 2026-07-03: `cursor-agent --model composer-2.5` succeeded
+        // and the on-disk session blob recorded providerOptions.cursor.model
+        // Name="composer-2.5" (the JSON output does NOT echo the model). Valid ids
+        // come from `cursor-agent models` / --list-models; ids churn per release,
+        // so fallback_models stays empty ("auto" is the only stable value).
+        model_flag: Some("--model"),
+        // Cursor embeds effort INSIDE the --model bracket syntax
+        // (`--model 'id[effort=high,...]'`), so a speed control would couple to and
+        // overwrite the user's model choice — left prose-only in v1.
+        effort_args: None,
+        // `cursor-agent --resume=<id>` LIVE-VERIFIED 2026-07-03 (codeword PLUM
+        // recalled) but ONLY for CLI-minted ids run from the session's ORIGINAL
+        // cwd. The store is ~/.cursor/chats/<md5(cwd)>/<id>/ (meta.json carries the
+        // cwd); resuming from another cwd, or of an id not in that store, exits 0
+        // and SILENTLY mints an empty session — no error to catch. Hence the ledger
+        // gate below: only Bluey-minted CLI ids are proven resumable; GUI/vscdb ids
+        // stay Replay.
+        resume_requires_ledger: true,
         // `cursor-agent login` opens a browser; `NO_OPEN_BROWSER` prints the
         // device-code/URL instead (verified via `cursor-agent login --help`).
         login_command: Some(&["cursor-agent", "login"]),
@@ -548,6 +626,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         // this prefix per server (see `mcp_list_tools_per_server`). VERIFIED live.
         mcp_list_command: Some(&["mcp", "list-tools"]),
         mcp_list_tools_per_server: true,
+        // `cursor-agent models` lists ids like `composer-2.5 - Composer 2.5`
+        // (LIVE-enumerable). Read-only, non-quota model LIST — never drives.
+        models_command: Some(&["models"]),
         binary_candidates: &["cursor-agent", "cursor"],
         app_bundles: &["Cursor.app"],
         app_dirs_windows: &["cursor", "Cursor"],
@@ -564,7 +645,10 @@ pub const REGISTRY: &[AgentEntry] = &[
         // behavior for read-only MCP tools in `-p` mode is unconfirmed).
         mcp_allow_flag: None,
         mcp_allow_style: None,
-        continuation: ContinuationTier::Replay,
+        // NativeResume, LEDGER-GATED (resume_requires_ledger above): the CLI can
+        // `--resume=<id>` cwd-scoped, but only ids Bluey minted itself are proven
+        // resumable, so apply_tier degrades non-ledger ids back to Replay.
+        continuation: ContinuationTier::NativeResume,
         continuation_via: None,
         // NEVER `--plan`: Cursor's `--plan` flag is a known bug that writes
         // files. Propose = omit `--force` + rely on the prompt.
@@ -583,7 +667,16 @@ pub const REGISTRY: &[AgentEntry] = &[
         kind_tag: KindTag::Antigravity,
         // Drives through the `gemini` CLI; no model-block case observed.
         fallback_models: &[],
-        model_flag: None,
+        // LIVE-VERIFIED 2026-07-03: `agy --model "Gemini 3.5 Flash (Low)" -p` → OK
+        // and the CLI log shows the override propagated ("Propagating selected
+        // model override to backend: label=Gemini 3.5 Flash (Low)"). Values are the
+        // exact DISPLAY LABELS from `agy models` (spaces + parens, one argv entry);
+        // backend-fetched and drift-prone, so fallback_models stays empty; the flag
+        // is version-gated (agy ≥ 1.0.5).
+        model_flag: Some("--model"),
+        // `agy` has no effort flag (live --help); prose-only.
+        effort_args: None,
+        resume_requires_ledger: false,
         // Drives through the `gemini` CLI, which has no non-interactive login
         // subcommand (it authenticates on first run / via GEMINI_API_KEY).
         login_command: None,
@@ -596,6 +689,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         // reader — just without a live per-server health probe.
         mcp_list_command: None,
         mcp_list_tools_per_server: false,
+        // `agy models` lists DISPLAY LABELS like `Gemini 3.5 Flash (Low)`
+        // (LIVE-enumerable). Read-only, non-quota model LIST — never drives.
+        models_command: Some(&["models"]),
         // Sessions are read from Antigravity's plaintext conversation INDEX
         // (`agyhub_summaries_proto.pb`) — it lists ALL conversations with their
         // real titles + projects (the desktop UI lists from this same index).
@@ -631,6 +727,15 @@ pub const REGISTRY: &[AgentEntry] = &[
         // the answer path.)
         mcp_allow_flag: None,
         mcp_allow_style: None,
+        // Stays Replay (the NativeResume flip is DESCOPED — REFUTED live 2026-07-03):
+        // `agy --conversation <id>` only reaches conversations in the antigravity-CLI
+        // store (~/.gemini/antigravity-cli, SQLite index), which is DISJOINT from the
+        // desktop store (~/.gemini/antigravity, proto index) that Bluey's
+        // AntigravityIndex reader + data_dir_globs target. Every id Bluey can list
+        // today fails `agy --conversation <id>` with "trajectory not found" (exit 1),
+        // and agy parses as PlainText so no session id is ever captured for chaining.
+        // Flipping to NativeResume would turn working replay continuations into hard
+        // errors with zero chaining benefit.
         continuation: ContinuationTier::Replay,
         continuation_via: None,
         install: Some(InstallRecipe {
@@ -663,6 +768,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         // No CLI of its own to drive — read-only/replay surface.
         fallback_models: &[],
         model_flag: None,
+        // No CLI to drive → no effort control; stays Replay, never ledger-gated.
+        effort_args: None,
+        resume_requires_ledger: false,
         login_command: None,
         login_auth: LoginAuth::None,
         display_name: "Antigravity IDE",
@@ -672,6 +780,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         // per-server health probe.
         mcp_list_command: None,
         mcp_list_tools_per_server: false,
+        // No CLI to enumerate models; curated list is empty → picker hidden.
+        models_command: None,
         // No standalone IDE CLI on PATH and no `.app` bundle name we drive by;
         // discovery proves this row from the dotfile data dir below. (The
         // App-Support `Antigravity IDE` dir is intentionally skipped by the fork
@@ -714,7 +824,24 @@ pub const REGISTRY: &[AgentEntry] = &[
         kind_tag: KindTag::Copilot,
         // No account/plan model-block observed for the Copilot CLI.
         fallback_models: &[],
-        model_flag: None,
+        // LIVE-VERIFIED 2026-07-03: `copilot -p "reply with exactly OK" --model
+        // auto -s` → "OK", exit 0 (copilot 1.0.64, node 24). Only "auto" is
+        // help-documented; the model list is plan-dependent, so fallback_models
+        // stays empty.
+        model_flag: Some("--model"),
+        // Effort DESCOPED to None (prose-only) — REFUTED live 2026-07-03. The
+        // `--effort <level>` flag IS help-documented (choices none|low|medium|high
+        // |xhigh|max) and parses, BUT with the DEFAULT model ("auto", which the
+        // answer path always uses since there is no model picker) it hard-errors:
+        // `copilot -p "reply with exactly OK" --effort low` → `Error: Model "auto"
+        // does not support reasoning effort configuration (requested: "low")`,
+        // non-zero exit (copilot 1.0.64, node 24; same with/without -s). Sending
+        // effort args unconditionally would break EVERY Copilot fast/deep answer.
+        // Effort here is coupled to picking a reasoning-capable model (plan-gated,
+        // not enumerable), so it stays prose-only in v1 like Cursor. Revisit if a
+        // model picker lands and can guarantee a reasoning-capable model.
+        effort_args: None,
+        resume_requires_ledger: false,
         // The standalone `copilot` CLI has no `login` subcommand (verified via
         // `copilot --help`): it authenticates via `GH_TOKEN`/`GITHUB_TOKEN` or an
         // interactive in-REPL `/login`. No non-interactive CLI login to trigger.
@@ -734,6 +861,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         // when the active node is older. VERIFIED live under node 24.
         mcp_list_command: Some(&["mcp", "list"]),
         mcp_list_tools_per_server: false,
+        // Copilot's model list is not `--help`-enumerable; only "auto" is
+        // documented → curated fallback is ["auto"] and the picker is hidden.
+        models_command: None,
         binary_candidates: &["copilot"],
         app_bundles: &[],
         app_dirs_windows: &[],
@@ -776,6 +906,10 @@ pub const REGISTRY: &[AgentEntry] = &[
         // errors are 429 "no capacity", a transient class, not a plan block).
         fallback_models: &[],
         model_flag: Some("--model"),
+        // `gemini` has no effort flag (live --help); speed is model choice
+        // (-flash fast / -pro deep), so effort control is prose-only here.
+        effort_args: None,
+        resume_requires_ledger: false,
         // The `gemini` CLI has no `login`/`auth` subcommand (verified via
         // `gemini --help`): it authenticates interactively on first launch or
         // via `GEMINI_API_KEY`. Nothing non-interactive to trigger.
@@ -786,6 +920,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         // Server-level + connected health. VERIFIED live.
         mcp_list_command: Some(&["mcp", "list"]),
         mcp_list_tools_per_server: false,
+        // `gemini --help` exposes no model source → no scrape; curated list is
+        // empty so the picker is hidden.
+        models_command: None,
         binary_candidates: &["gemini"],
         app_bundles: &[],
         app_dirs_windows: &[],
@@ -838,6 +975,21 @@ pub const REGISTRY: &[AgentEntry] = &[
         // `-m, --model <MODEL>`). The `-c model="X"` config-override form also
         // works on both `exec` and `exec resume`; `-m` is the simplest pair.
         model_flag: Some("-m"),
+        // Per-run reasoning effort via the SAME `-c key=value` config-override
+        // mechanism answer_args already uses (`sandbox_mode`/`approval_policy`).
+        // LIVE-VERIFIED 2026-07-03: `codex exec --skip-git-repo-check -c
+        // 'model_reasoning_effort="low"' "reply with exactly OK"` — the codex
+        // 0.137.0 banner echoed `reasoning effort: low`, proving the key parsed and
+        // applied. (The run exited 1 only from the pre-existing ChatGPT-account
+        // model-block on gpt-5.1-codex-max — identical with the flag omitted — which
+        // is the account allowlist documented in fallback_models above, NOT an
+        // effort-key rejection.) Value tokens carry literal TOML quotes, matching
+        // the answer_args style. fast → low, deep → high; "balanced" sends nothing.
+        effort_args: Some(EffortArgs {
+            fast: &["-c", "model_reasoning_effort=\"low\""],
+            deep: &["-c", "model_reasoning_effort=\"high\""],
+        }),
+        resume_requires_ledger: false,
         // `codex login` opens a browser; `--device-auth` runs the headless
         // device-code flow instead (verified via `codex login --help`).
         login_command: Some(&["codex", "login"]),
@@ -848,6 +1000,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         // `None` rather than guessing a command that might drive the model.
         mcp_list_command: None,
         mcp_list_tools_per_server: false,
+        // No model-list subcommand; models come from the curated registry
+        // `fallback_models` via `curated_models_for`.
+        models_command: None,
         binary_candidates: &["codex"],
         app_bundles: &[],
         app_dirs_windows: &[],
@@ -920,6 +1075,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         // Aider is model-agnostic (BYO key already); no plan model-block class.
         fallback_models: &[],
         model_flag: Some("--model"),
+        // No live-verified per-run effort control for Aider; prose-only.
+        effort_args: None,
+        resume_requires_ledger: false,
         // Aider authenticates via provider env vars (OPENAI_API_KEY, etc.), not
         // a login subcommand. Nothing to trigger.
         login_command: None,
@@ -928,6 +1086,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         // No MCP-list CLI (Aider has no MCP surface here); config-only.
         mcp_list_command: None,
         mcp_list_tools_per_server: false,
+        // Not driven by the local model picker in v1; curated list is empty.
+        models_command: None,
         binary_candidates: &["aider"],
         app_bundles: &[],
         app_dirs_windows: &[],
@@ -953,6 +1113,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         // No headless CLI to drive, so no model flag / fallback applies.
         fallback_models: &[],
         model_flag: None,
+        // No headless CLI → no effort control; never ledger-gated.
+        effort_args: None,
+        resume_requires_ledger: false,
         // GUI-only auth (the IDE handles sign-in); no headless login CLI.
         login_command: None,
         login_auth: LoginAuth::None,
@@ -960,6 +1123,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         // No headless CLI to enumerate MCP; config-only fallback.
         mcp_list_command: None,
         mcp_list_tools_per_server: false,
+        // No headless CLI to enumerate models; curated list is empty.
+        models_command: None,
         binary_candidates: &["windsurf"],
         app_bundles: &["Windsurf.app"],
         app_dirs_windows: &["Windsurf"],
@@ -986,6 +1151,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         // No headless CLI to drive, so no model flag / fallback applies.
         fallback_models: &[],
         model_flag: None,
+        // No headless CLI → no effort control; never ledger-gated.
+        effort_args: None,
+        resume_requires_ledger: false,
         // GUI-only auth (the editor handles sign-in); no headless login CLI.
         login_command: None,
         login_auth: LoginAuth::None,
@@ -993,6 +1161,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         // No headless CLI to enumerate MCP; config-only fallback.
         mcp_list_command: None,
         mcp_list_tools_per_server: false,
+        // No headless CLI to enumerate models; curated list is empty.
+        models_command: None,
         binary_candidates: &["code"],
         app_bundles: &["Visual Studio Code.app"],
         app_dirs_windows: &["Microsoft VS Code"],
@@ -1030,6 +1200,29 @@ pub fn all_binary_candidates() -> impl Iterator<Item = (&'static AgentEntry, &'s
 /// stay total without an `unwrap`.
 pub fn entry_for(kind: KindTag) -> Option<&'static AgentEntry> {
     REGISTRY.iter().find(|e| e.kind_tag == kind)
+}
+
+/// Per-run effort argv for an agent + overlay speed tier ("fast"|"balanced"|
+/// "deep", case-insensitive, trimmed). Data-driven: reads the row's
+/// [`EffortArgs`] and maps "fast" → `fast`, "deep" → `deep`. "balanced" (the CLI
+/// default), any unknown tier, an agent with no registry row, or a row with no
+/// `effort_args` all return an empty `Vec` (nothing appended, prose-only). The
+/// drive layer never names a flag or a level — it only threads these tokens.
+#[must_use]
+pub fn effort_args_for(agent: &AgentKind, speed: &str) -> Vec<String> {
+    let Some(tag) = KindTag::from_agent_kind(agent) else {
+        return Vec::new();
+    };
+    let Some(effort) = entry_for(tag).and_then(|e| e.effort_args) else {
+        return Vec::new();
+    };
+    let tokens: &[&str] = match speed.trim().to_ascii_lowercase().as_str() {
+        "fast" => effort.fast,
+        "deep" => effort.deep,
+        // "balanced" (the CLI default) and any unknown tier send nothing.
+        _ => &[],
+    };
+    tokens.iter().map(|t| (*t).to_string()).collect()
 }
 
 /// Resolve the [`FixProfile`] for an agent's [`KindTag`], reading it straight
@@ -1430,5 +1623,97 @@ mod tests {
         assert_eq!(via_helper.propose_args, on_row.propose_args);
         assert_eq!(via_helper.apply_args, on_row.apply_args);
         assert_eq!(via_helper.apply_supported, on_row.apply_supported);
+    }
+
+    // ---- Model flag / effort / ledger-gated resume (agent speed control) ----
+
+    #[test]
+    fn test_cursor_row_is_ledger_gated_native_resume() {
+        // Cursor's `--resume=<id>` is cwd-scoped and silently mints an empty
+        // session for a wrong-cwd/unknown id (no error to catch), so its
+        // NativeResume tier MUST be gated on ledger provenance.
+        let cursor = row(KindTag::Cursor);
+        assert_eq!(cursor.continuation, ContinuationTier::NativeResume);
+        assert!(
+            cursor.resume_requires_ledger,
+            "Cursor NativeResume must be ledger-gated"
+        );
+    }
+
+    #[test]
+    fn test_model_flags_match_live_verified_clis() {
+        // Live-verified 2026-07-03: Cursor/Copilot/Antigravity all accept
+        // `--model`; Codex uses `-m`; Gemini `--model`. GUI-only / no-CLI rows
+        // carry no model flag.
+        assert_eq!(row(KindTag::Cursor).model_flag, Some("--model"));
+        assert_eq!(row(KindTag::Copilot).model_flag, Some("--model"));
+        assert_eq!(row(KindTag::Antigravity).model_flag, Some("--model"));
+        assert_eq!(row(KindTag::Codex).model_flag, Some("-m"));
+        assert_eq!(row(KindTag::Gemini).model_flag, Some("--model"));
+        assert_eq!(row(KindTag::AntigravityIde).model_flag, None);
+        assert_eq!(row(KindTag::Windsurf).model_flag, None);
+        assert_eq!(row(KindTag::VsCode).model_flag, None);
+    }
+
+    #[test]
+    fn test_effort_args_present_only_for_verified_clis() {
+        // Codex is the sole live-verified SAFE effort row: the `-c
+        // model_reasoning_effort=…` config-override, banner-echoed 2026-07-03.
+        let codex = row(KindTag::Codex).effort_args.expect("codex effort");
+        assert_eq!(codex.fast, &["-c", "model_reasoning_effort=\"low\""]);
+        assert_eq!(codex.deep, &["-c", "model_reasoning_effort=\"high\""]);
+        // Copilot's `--effort` hard-errors under the default "auto" model
+        // (live-refuted 2026-07-03), so it stays prose-only — no effort row.
+        // Claude/Gemini/Cursor/Antigravity have no per-run effort flag at all.
+        for kind in [
+            KindTag::ClaudeCode,
+            KindTag::ClaudeCodeApp,
+            KindTag::ClaudeCodeAgent,
+            KindTag::Copilot,
+            KindTag::Gemini,
+            KindTag::Cursor,
+            KindTag::Antigravity,
+        ] {
+            assert!(
+                row(kind).effort_args.is_none(),
+                "{kind:?} must have no effort_args (prose-only)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_effort_args_for_maps_fast_and_deep_and_defaults_balanced_empty() {
+        // Codex maps fast/deep to the verified config-override tokens.
+        assert_eq!(
+            effort_args_for(&AgentKind::Codex, "fast"),
+            vec![
+                "-c".to_string(),
+                "model_reasoning_effort=\"low\"".to_string()
+            ]
+        );
+        assert_eq!(
+            effort_args_for(&AgentKind::Codex, "deep"),
+            vec![
+                "-c".to_string(),
+                "model_reasoning_effort=\"high\"".to_string()
+            ]
+        );
+        // "balanced" and unknown tiers send nothing (the CLI default).
+        assert!(effort_args_for(&AgentKind::Codex, "balanced").is_empty());
+        assert!(effort_args_for(&AgentKind::Codex, "").is_empty());
+        assert!(effort_args_for(&AgentKind::Codex, "sideways").is_empty());
+        // Trimmed + case-insensitive.
+        assert_eq!(
+            effort_args_for(&AgentKind::Codex, "FAST "),
+            vec![
+                "-c".to_string(),
+                "model_reasoning_effort=\"low\"".to_string()
+            ]
+        );
+        // An agent with no effort row → empty even for a valid tier.
+        assert!(effort_args_for(&AgentKind::Gemini, "fast").is_empty());
+        // An un-tagged kind (no registry row) → empty.
+        assert!(effort_args_for(&AgentKind::Other("x".into()), "fast").is_empty());
+        assert!(effort_args_for(&AgentKind::Unknown, "deep").is_empty());
     }
 }

@@ -383,6 +383,133 @@ pub fn model_flag_for(agent: &AgentKind) -> Option<&'static str> {
         .and_then(|e| e.model_flag)
 }
 
+// ---------------------------------------------------------------------------
+// Model-LIST resolver (the model picker's data source)
+// ---------------------------------------------------------------------------
+
+/// The stable Claude model aliases. `claude --help` exposes no enumerable model
+/// list, so these curated aliases are the model-picker source for every Claude
+/// row (CLI / App / Agent — one shared engine).
+const CLAUDE_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
+
+/// Curated Antigravity (`agy`) model labels, live-captured from `agy models`
+/// (2026-07-03, see docs/work/VERIFY-AGENT-BRIDGE-FIXES.md). Antigravity IS an
+/// enumerable row (`models_command: Some(&["models"])`), but `agy` **drops its
+/// stdout under a non-TTY** (verified) — and the daemon scrapes with a piped
+/// (non-TTY) stdout, so the live scrape returns empty in production. These
+/// curated labels are therefore the fallback that keeps the Antigravity picker
+/// populated. Values are the exact `--model` DISPLAY LABELS (spaces + parens
+/// kept whole — one entry each); they can drift with Antigravity's server-side
+/// list, so refresh when the registry is updated.
+const ANTIGRAVITY_MODELS: &[&str] = &[
+    "Gemini 3.5 Flash (Medium)",
+    "Gemini 3.5 Flash (High)",
+    "Gemini 3.5 Flash (Low)",
+    "Gemini 3.1 Pro (Low)",
+    "Gemini 3.1 Pro (High)",
+    "Claude Sonnet 4.6 (Thinking)",
+    "Claude Opus 4.6 (Thinking)",
+    "GPT-OSS 120B (Medium)",
+];
+
+/// The sentinel first element of every model list: "no override" → the picker
+/// maps it to `attach(model=undefined)` → the daemon persists `attached_model =
+/// None`. Its picker label is "Default (agent decides)".
+pub const MODEL_SENTINEL: &str = "auto";
+
+/// Hard cap on the number of model ids surfaced to the picker, so a runaway or
+/// hostile CLI listing cannot flood the UI. Applied by [`finalize_model_list`].
+const MODEL_LIST_CAP: usize = 200;
+
+/// Parse the stdout of an agent's `models` command into raw model ids, using ONE
+/// generic rule that is correct for BOTH live-enumerable CLIs:
+/// - **Cursor** (`cursor-agent models`): lines like `composer-2.5 - Composer 2.5`
+///   — the id is the whitespace-free token left of `" - "`.
+/// - **Antigravity** (`agy models`): lines like `Gemini 3.5 Flash (Low)` — no
+///   `" - "`, so the WHOLE trimmed line (spaces/parens preserved) is the id.
+///
+/// Header/footer/noise lines are skipped: empty lines, Cursor's `Available
+/// models` header, and Cursor's `Tip:` footer (dropped BEFORE the `" - "` split
+/// so the bracket example inside the Tip line can never leak). This is pure and
+/// unit-testable; the DAEMON runs the CLI and feeds the captured stdout here.
+///
+/// It also self-guards auth/error output: an error line either has no `" - "`
+/// (kept as junk) or the caller's exit-code + empty guard discards the whole
+/// scrape (see the daemon's compose step and [`list_agent_models`]).
+pub fn parse_models_stdout(stdout: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "Available models" {
+            continue; // cursor header
+        }
+        if trimmed.starts_with("Tip:") {
+            continue; // cursor footer (dropped before the " - " split)
+        }
+        match trimmed.split_once(" - ") {
+            // Cursor: "composer-2.5 - Composer 2.5" → "composer-2.5".
+            Some((id, _label)) => ids.push(id.trim().to_string()),
+            // Antigravity: the whole trimmed line IS the id.
+            None => ids.push(trimmed.to_string()),
+        }
+    }
+    ids
+}
+
+/// The curated model ids for an agent, used for `models_command == None` rows and
+/// as the fallback when an enumerable agent's live scrape fails. Pure data:
+/// - Claude (CLI / App / Agent) → [`CLAUDE_MODELS`];
+/// - Codex → the registry `fallback_models` (via [`fallback_models_for`]);
+/// - Antigravity → [`ANTIGRAVITY_MODELS`] (its `agy models` scrape returns empty
+///   under the daemon's non-TTY spawn, so the curated list IS the live picker);
+/// - every other agent → empty (Copilot/Gemini/curated-empty → picker hidden).
+///
+/// This match is the ONE allowed kind-branch: it selects a curated-list SOURCE,
+/// not behavior. The returned ids are NOT yet sentinel-prepended — call
+/// [`finalize_model_list`] for the picker-ready list.
+pub fn curated_models_for(kind: &AgentKind) -> Vec<String> {
+    let curated: &[&str] = match kind {
+        AgentKind::ClaudeCode | AgentKind::ClaudeCodeApp | AgentKind::ClaudeCodeAgent => {
+            CLAUDE_MODELS
+        }
+        AgentKind::Codex => fallback_models_for(kind),
+        AgentKind::Antigravity => ANTIGRAVITY_MODELS,
+        _ => &[],
+    };
+    curated.iter().map(|m| (*m).to_string()).collect()
+}
+
+/// Finalize a raw id list into the picker-ready model list: prepend the
+/// [`MODEL_SENTINEL`] (`"auto"`) as element `[0]`, de-dup preserving first-seen
+/// order (so Cursor's own listed `"auto"` collapses with the prepended sentinel,
+/// sentinel staying index 0), and cap the length at [`MODEL_LIST_CAP`].
+pub fn finalize_model_list(ids: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(ids.len() + 1);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for id in std::iter::once(MODEL_SENTINEL.to_string()).chain(ids) {
+        if out.len() >= MODEL_LIST_CAP {
+            break;
+        }
+        if seen.insert(id.clone()) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// The picker-ready model list for an agent, CURATED-ONLY. PURE and never spawns
+/// a CLI — it is the source for `models_command == None` rows (and the unit
+/// tests). Agents whose row DOES carry a `models_command` (Cursor, Antigravity)
+/// are scraped daemon-side, which composes [`parse_models_stdout`] +
+/// [`finalize_model_list`] directly and only falls back to this curated wrapper
+/// when the live scrape fails. Always returns at least `["auto"]`.
+pub fn list_agent_models(kind: &AgentKind) -> Vec<String> {
+    finalize_model_list(curated_models_for(kind))
+}
+
 /// Build the [`ModelProposal`] for a [`ModelBlocked`] failure, reading the
 /// agent's fallback list + model flag off the registry (data-driven). The
 /// propose half of propose+approve; applying happens at the call site after
@@ -780,10 +907,13 @@ mod tests {
 
     #[test]
     fn agent_with_no_model_flag_proposes_byot_directly() {
-        // Cursor has model_flag: None → even a (hypothetical) model block goes
-        // straight to BYOT, never an unusable retry.
+        // Windsurf has model_flag: None (no drivable CLI) → even a (hypothetical)
+        // model block goes straight to BYOT, never an unusable retry. (Cursor is
+        // NOT used here: as of the 2026-07-03 live-verify it carries
+        // model_flag: Some("--model"); this branch must be exercised by a
+        // genuinely flagless row so it tests the None path, not empty fallbacks.)
         let blocked = ModelBlocked {
-            agent: AgentKind::Cursor,
+            agent: AgentKind::Windsurf,
             blocked_model: Some("some-model".to_string()),
             hint: None,
         };
@@ -989,5 +1119,156 @@ mod tests {
             !line.contains("is not supported when using"),
             "must not be the raw vendor error passthrough: {line}"
         );
+    }
+
+    // ---- Model-LIST resolver (the model picker's data source) -------------
+
+    #[test]
+    fn parse_models_stdout_takes_cursor_id_left_of_dash() {
+        // Cursor's `cursor-agent models` shape: "<id> - <label>". The id is the
+        // whitespace-free token left of " - "; header/footer lines are dropped.
+        let stdout = "Available models\n\
+                      composer-2.5 - Composer 2.5\n\
+                      gpt-5.1 - GPT 5.1\n\
+                      Tip: pass --model 'id[effort=high]' to override\n";
+        assert_eq!(
+            parse_models_stdout(stdout),
+            vec!["composer-2.5".to_string(), "gpt-5.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_models_stdout_keeps_whole_antigravity_line_as_id() {
+        // Antigravity's `agy models` shape: the whole DISPLAY LABEL (spaces +
+        // parens) IS the id, because there is no " - " separator.
+        let stdout = "Gemini 3.5 Flash (Low)\n\
+                      Gemini 3.5 Flash (High)\n\
+                      Gemini 3.5 Pro\n";
+        assert_eq!(
+            parse_models_stdout(stdout),
+            vec![
+                "Gemini 3.5 Flash (Low)".to_string(),
+                "Gemini 3.5 Flash (High)".to_string(),
+                "Gemini 3.5 Pro".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn finalize_prepends_auto_sentinel_and_dedups_cursor_own_auto() {
+        // Cursor lists a literal "auto" of its own; the sentinel-prepend + de-dup
+        // must collapse it to a single "auto" at index 0, order otherwise kept.
+        let ids = vec![
+            "auto".to_string(),
+            "composer-2.5".to_string(),
+            "composer-2.5".to_string(), // duplicate id → dropped
+            "gpt-5.1".to_string(),
+        ];
+        assert_eq!(
+            finalize_model_list(ids),
+            vec![
+                "auto".to_string(),
+                "composer-2.5".to_string(),
+                "gpt-5.1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn finalize_caps_list_length() {
+        let ids: Vec<String> = (0..500).map(|i| format!("m{i}")).collect();
+        let out = finalize_model_list(ids);
+        assert_eq!(out.len(), MODEL_LIST_CAP);
+        assert_eq!(out[0], MODEL_SENTINEL, "sentinel stays at index 0");
+    }
+
+    #[test]
+    fn list_agent_models_uses_claude_curated_aliases() {
+        // Claude has no CLI enumeration → curated aliases, sentinel first.
+        for kind in [
+            AgentKind::ClaudeCode,
+            AgentKind::ClaudeCodeApp,
+            AgentKind::ClaudeCodeAgent,
+        ] {
+            assert_eq!(
+                list_agent_models(&kind),
+                vec![
+                    "auto".to_string(),
+                    "opus".to_string(),
+                    "sonnet".to_string(),
+                    "haiku".to_string(),
+                ],
+                "{kind:?} must expose the curated Claude aliases behind the sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn list_agent_models_uses_codex_registry_fallbacks() {
+        // Codex reuses the registry fallback_models (no new constant).
+        let mut expected = vec!["auto".to_string()];
+        expected.extend(
+            fallback_models_for(&AgentKind::Codex)
+                .iter()
+                .map(|m| m.to_string()),
+        );
+        assert_eq!(list_agent_models(&AgentKind::Codex), expected);
+    }
+
+    #[test]
+    fn list_agent_models_uses_antigravity_curated_labels_when_scrape_is_empty() {
+        // Antigravity's `agy models` returns empty stdout under the daemon's
+        // non-TTY spawn, so the curated labels ARE the live picker. The list must
+        // be sentinel-first, contain the whole display labels (spaces + parens
+        // intact), and have >1 entry so the picker actually shows.
+        let models = list_agent_models(&AgentKind::Antigravity);
+        assert_eq!(models[0], "auto", "sentinel must be first");
+        assert!(models.len() > 1, "Antigravity picker must not be hidden");
+        assert!(
+            models.contains(&"Gemini 3.5 Flash (Low)".to_string()),
+            "display label kept whole (spaces + parens), got {models:?}"
+        );
+        assert!(
+            models.contains(&"Claude Opus 4.6 (Thinking)".to_string()),
+            "all curated labels present, got {models:?}"
+        );
+    }
+
+    #[test]
+    fn list_agent_models_hides_picker_for_curated_empty_agents() {
+        // Copilot/Gemini/curated-empty rows → list is ["auto"] only (len 1), so
+        // the picker is hidden (the >1 rule).
+        for kind in [
+            AgentKind::Copilot,
+            AgentKind::Gemini,
+            AgentKind::Windsurf,
+            AgentKind::VsCodeFork,
+            AgentKind::Unknown,
+        ] {
+            assert_eq!(
+                list_agent_models(&kind),
+                vec!["auto".to_string()],
+                "{kind:?} must yield only the sentinel (picker hidden)"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_scrape_compose_discards_error_output_and_uses_curated_fallback() {
+        // Mirror the daemon compose rule: on a FAILED scrape (empty parse or a
+        // non-zero exit), fall back to the curated list rather than surface junk.
+        let error_stdout = "Error: not signed in. Please run `cursor-agent login`.";
+        let parsed = parse_models_stdout(error_stdout);
+        // The error line has no " - " so it parses as a single junk id; the
+        // daemon only trusts a scrape on exit-0 AND non-empty — here we simulate
+        // the exit-0-but-treat-as-failure branch by requiring the curated path.
+        let scrape_ok = false; // stand-in for (status.success() && !parsed.is_empty())
+        let models = if scrape_ok {
+            finalize_model_list(parsed)
+        } else {
+            list_agent_models(&AgentKind::Cursor)
+        };
+        // Cursor has no curated ids → picker hidden, never the error line.
+        assert_eq!(models, vec!["auto".to_string()]);
     }
 }

@@ -129,6 +129,30 @@ codex exec -m gpt-5.5 -c model_reasoning_effort="high" "{prompt}"
 | **Copilot** | `copilot -p` | `--model` ✅ *(registry wrongly says None — FIX)* | `--effort=high` ✅ |
 | **Aider** | `aider --message` | `--model` ✅ | `--reasoning-effort` + `--thinking-tokens` ✅ |
 
+> **CORRECTION (live-verified 2026-07-03, during implementation on `agent/agent-bridge-fixes`).**
+> The effort column above was help/doc-derived. Live smokes on the installed CLIs
+> overturned two rows — only **Codex** effort was confirmed drivable:
+>
+> - **Claude `--effort` — REFUTED.** claude 2.0.42 `--help` has NO
+>   effort/thinking/reasoning flag headless (only `--model`/`--fallback-model`).
+>   Wiring `--effort` would fail every Claude drive with unknown-option. → Claude
+>   `effort_args: None` (prose-only). Revisit version-gated if a future CLI ships it.
+> - **Copilot `--effort` — REFUTED.** The flag parses, but under the default `auto`
+>   model (which the answer path always uses) it hard-errors: `Model "auto" does not
+>   support reasoning effort configuration`. Sending it would break every Copilot
+>   fast/deep answer. → Copilot `effort_args: None` (prose-only).
+> - **Codex `-c model_reasoning_effort` — CONFIRMED.** `codex exec -c
+>   'model_reasoning_effort="low"'` echoed `reasoning effort: low` in the banner (key
+>   applied); the exit-1 is the orthogonal ChatGPT-account model-block. → **the sole
+>   live-verified effort row.** Cursor effort stays coupled inside the `--model`
+>   bracket syntax (prose-only in v1); Gemini/Antigravity have none.
+>
+> Aider's effort flags were not live-smoked (no drivable-answer verification this
+> round) — treat as help-derived, not confirmed. See
+> [work/VERIFY-AGENT-BRIDGE-FIXES.md](work/VERIFY-AGENT-BRIDGE-FIXES.md) for the raw
+> smoke evidence and [work/IMPL-AGENT-BRIDGE-FIXES.md](work/IMPL-AGENT-BRIDGE-FIXES.md)
+> for what shipped.
+
 ### Empty drive / read-only (model NOT controllable — Bluey can't drive them)
 | Agent | Why |
 |---|---|

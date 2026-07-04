@@ -28,6 +28,7 @@ pub mod antigravity_ide;
 pub mod claude_app;
 pub mod json_files;
 pub mod jsonl;
+pub mod ledger;
 pub mod summaries;
 pub mod vscdb;
 
