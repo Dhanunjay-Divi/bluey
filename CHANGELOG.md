@@ -37,6 +37,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layer; a miss falls back to the store re-scrape).
 
 ### Fixed
+- **On-device STT silently absent from dev builds**: `scripts/run-local.sh` ran a
+  plain `cargo build`, which omits the `cue-daemon/parakeet-stt` feature — so
+  `bluey on` launched an STT-less daemon and `Listen` fell through to the cloud
+  "sign in for transcription" gate, producing zero transcript. Now builds with the
+  feature (matching the packaged installer, `scripts/build-macos.sh`).
+- **Diarization model now auto-downloads on demand**: the first-run fetch pulled
+  only the three STT files, so enabling `BLUEY_STT_DIARIZE=1` on a fresh install
+  warned "sortformer model not present" and silently ran without speaker labels.
+  The ~490MB Sortformer model is now fetched once, on first diarized run, from a
+  verified-public source (`cgus/diar_streaming_sortformer_4spk-v2.1-onnx`) —
+  overridable via `BLUEY_SORTFORMER_MODEL_URL`; a failed fetch degrades to
+  transcription-only rather than erroring STT bring-up. It stays out of the default
+  download so the 99% who don't enable speaker labels never pay the 490MB.
+- Overlay discovery probed `target/{debug,release}/` but `--target` builds land in
+  `target/<triple>/<profile>/`, so `bluey on` launched a stale overlay binary. Now
+  probes the apple-darwin triple dirs (debug-first) before the plain fallback.
 - Live STT lag + eaten/scrambled words (three distinct bugs, all diagnosed on
   real-time-streamed VoxConverse audio — see `docs/TRANSCRIBE-BUILD-PLAN.md`):
   - **Bursty/laggy transcript + lost audio** — the audio→engine feed VAD-gated
