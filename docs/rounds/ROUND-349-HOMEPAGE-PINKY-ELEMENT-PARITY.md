@@ -22,13 +22,21 @@ The owner compared the live Bluey homepage against Pinky's homepage and asked Bl
   - confirmed logo, theme toggle, Download/Login nav, paired CTAs, session-code row, terminal preview, and three bottom cards are visible
 - In-app browser mobile smoke:
   - confirmed the same elements remain usable at a phone-width viewport
+- Static live deploy only:
+  - `rsync -av --delete ... web/ root@165.227.77.152:/var/www/bluey/`
+  - excluded `/install.sh`, `/install.ps1`, `/latest.json`, `/latest.json.sig`, `/releases/***`, and `/backups/***`
+- Live checks:
+  - `https://bluey.sh/` serves `bluey-site.css?v=2026070402`, `bluey-site.js?v=2026070402`, `theme-toggle`, `Get Started`, `Try Us`, `session code`, `Join`, `Teams`, and `Contact`
+  - `https://bluey.sh/assets/bluey-site.css?v=2026070402` serves the theme-toggle styles and `repeat(3, minmax(260px, 1fr))`
+  - `https://bluey.sh/install.sh` still returns `application/x-shellscript`
+  - `https://bluey.sh/install.ps1` still returns `application/x-powershell`
+  - `https://bluey.sh/latest.json` still returns release metadata
 
 ## Current State
 
-- Static changes are local and ready to deploy to `bluey.sh`.
+- Static homepage changes are live on `bluey.sh`.
 - No native overlay, audio, backend runtime, billing API, dashboard app, or release artifact files were changed.
 
 ## Remaining QA/Gates
 
-- Deploy static `web/` assets with release-safe excludes.
 - Owner visual QA on the live homepage.
