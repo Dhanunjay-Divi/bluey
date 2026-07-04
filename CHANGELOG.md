@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Installer: "Apple could not verify" Gatekeeper popup on AirDropped/downloaded
+  builds.** `libopenblas.0.dylib` (the diarization dylib the daemon loads at
+  startup) ships read-only from Homebrew, and macOS `xattr -d` cannot remove the
+  `com.apple.quarantine` flag from a read-only file — so the strip silently failed
+  on exactly that dylib, leaving it quarantined and triggering the popup. install.sh
+  now `chmod -R u+w` the install upfront so quarantine can be stripped from every
+  file, verifies the strip took, adds `spctl --add` for the .app bundles, and prints
+  the exact `xattr -dr` fallback command if anything is left. Ad-hoc signing alone
+  does NOT satisfy Gatekeeper (no Apple Developer account here); removing quarantine
+  is the actual cure for the daemon-spawned subprocesses.
+
 ### Added
 - **Meeting-only macOS build (`scripts/build-meeting.sh`).** A distinct build that
   stages ONLY the meeting overlay (`cue-meeting-overlay`), never the legacy Swift

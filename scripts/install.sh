@@ -109,6 +109,14 @@ fi
 [[ -x "$extract_dir/bin/bluey-daemon" ]] || die "archive missing executable bin/bluey-daemon"
 
 cp -R "$extract_dir"/. "$target_tmp"/
+# Make the whole install user-writable upfront. Some staged files ship read-only
+# (e.g. libopenblas.0.dylib comes from Homebrew as r--r--r--), and a read-only
+# file cannot have its com.apple.quarantine xattr removed later — xattr -d fails
+# with "Permission denied", silently leaving quarantine on exactly the dylib the
+# diarize daemon loads at startup, which re-triggers the "Apple could not verify"
+# popup. Doing this here (freshly copied, definitely owned) guarantees the later
+# codesign + quarantine-strip can touch every file.
+chmod -R u+w "$target_tmp" 2>/dev/null || true
 chmod +x "$target_tmp/bin/bluey" "$target_tmp/bin/bluey-daemon"
 if [[ -f "$target_tmp/bin/bluey-overlay-macos" ]]; then chmod +x "$target_tmp/bin/bluey-overlay-macos"; fi
 if [[ -f "$target_tmp/bin/cue-overlay-macos" ]]; then chmod +x "$target_tmp/bin/cue-overlay-macos"; fi
@@ -128,31 +136,66 @@ mv "$target_tmp" "$target"
 ln -sfn "$target/bin/bluey" "$bin_dir/bluey"
 ln -sfn "$target/bin/bluey-daemon" "$bin_dir/bluey-daemon"
 
-if command -v xattr >/dev/null 2>&1; then
-  xattr -dr com.apple.quarantine "$target" 2>/dev/null || true
-fi
-
-# Ad-hoc re-sign so the binaries + .app bundles launch on a fresh Mac without a
-# right-click->Open dance. The build ships linker/ad-hoc signatures, but two
-# things invalidate them by the time they reach here: AirDrop/download adds a
-# quarantine flag (stripped above), and the diarize build rewrites the OpenBLAS
-# load command with install_name_tool, which breaks the daemon's signature. A
-# fresh "-s -" ad-hoc signature needs no Apple Developer account and re-seals
-# each Mach-O after those mutations. Best-effort: never fail the install over it
-# (a bad sign-attempt on one file must not block the whole setup).
+# ── Make macOS launch these binaries without an "Apple could not verify" popup ──
+#
+# The binaries are ad-hoc signed, NOT Apple-notarized (no Developer account). Two
+# things make macOS block them, and each needs its own cure:
+#   1. codesign --force --sign -  — re-seal each Mach-O. AirDrop/download plus the
+#      diarize install_name_tool rewrite invalidate the shipped signature; an
+#      unsigned/broken-signature binary is killed on launch. Ad-hoc needs no cert.
+#   2. xattr -dr com.apple.quarantine — REMOVE the quarantine flag. This is what
+#      actually silences the "cannot verify" popup: ad-hoc signing alone does NOT
+#      satisfy Gatekeeper (spctl still rejects it), so quarantine MUST be gone or
+#      the popup fires on first launch of a GUI .app (e.g. BlueyAudio.app).
+#   3. spctl --add — whitelist the .app bundles in Gatekeeper's own database, so
+#      even a GUI double-launch is approved. Best-effort (may need admin); the
+#      quarantine strip alone is enough for the daemon-SPAWNED subprocesses.
+#
+# ORDER MATTERS: sign FIRST, then strip quarantine LAST — codesign does not touch
+# the quarantine xattr, but doing the strip last guarantees nothing re-quarantines
+# a file after we cleared it. Best-effort throughout: never fail the install.
 if command -v codesign >/dev/null 2>&1; then
   # .app bundles first (deep, so their nested Mach-O + resources are sealed).
   while IFS= read -r app; do
     codesign --force --deep --sign - "$app" >/dev/null 2>&1 || true
   done < <(find "$target/bin" -maxdepth 1 -name '*.app' -type d 2>/dev/null)
-  # Then every bare Mach-O in bin/ (skip dirs, dylibs already sealed by --deep
-  # inside bundles are left alone; a top-level dylib like OpenBLAS is signed too).
+  # Then every bare Mach-O in bin/ (a top-level dylib like OpenBLAS is signed too).
   while IFS= read -r f; do
     case "$f" in *.app/*) continue ;; esac
     if file "$f" 2>/dev/null | grep -q 'Mach-O'; then
       codesign --force --sign - "$f" >/dev/null 2>&1 || true
     fi
   done < <(find "$target/bin" -maxdepth 1 -type f 2>/dev/null)
+fi
+
+# Whitelist the GUI .app bundles in Gatekeeper's assessment DB so a launch is
+# approved despite being non-notarized. Best-effort (needs admin; harmless if it
+# can't). The quarantine strip below is the primary cure for spawned subprocesses.
+if command -v spctl >/dev/null 2>&1; then
+  while IFS= read -r app; do
+    spctl --add --label "Bluey" "$app" >/dev/null 2>&1 || true
+  done < <(find "$target/bin" -maxdepth 1 -name '*.app' -type d 2>/dev/null)
+fi
+
+# Strip quarantine LAST, recursively, over the WHOLE install — this is the cure
+# that stops the "Apple could not verify" popup. Then VERIFY it actually took; if
+# anything is still quarantined, tell the user the one command that fixes it.
+if command -v xattr >/dev/null 2>&1; then
+  # CRITICAL: some staged files are read-only (e.g. libopenblas.0.dylib comes from
+  # Homebrew as r--r--r--). `xattr -d` on a non-writable file fails with
+  # "Permission denied", silently leaving quarantine on exactly the dylib the
+  # diarize daemon must load at startup — which re-triggers the popup. Make the
+  # tree user-writable first so the strip can touch every file.
+  chmod -R u+w "$target" >/dev/null 2>&1 || true
+  xattr -dr com.apple.quarantine "$target" 2>/dev/null || true
+  # Some macOS versions leave a stubborn flag on nested bundle contents; a second
+  # pass over every file closes that gap.
+  find "$target" -exec xattr -d com.apple.quarantine {} \; >/dev/null 2>&1 || true
+  if xattr -r "$target" 2>/dev/null | grep -q com.apple.quarantine; then
+    printf '\n  NOTE: macOS quarantine could not be fully cleared. If you see an\n' >&2
+    printf '  "Apple could not verify" popup, click Done, then run:\n' >&2
+    printf '    xattr -dr com.apple.quarantine %s\n\n' "$target" >&2
+  fi
 fi
 
 "$target/bin/bluey" --version >/dev/null
