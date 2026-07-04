@@ -6071,6 +6071,35 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         super.scrollWheel(with: event)
     }
 
+    func routeScrollWheelAtScreenPoint(_ screenPoint: NSPoint, event: NSEvent) -> Bool {
+        guard let window else { return false }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let localPoint = convert(windowPoint, from: nil)
+        guard bounds.contains(localPoint) else { return false }
+
+        if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(localPoint) {
+            sessionScroll.scrollWheel(with: event)
+            return true
+        }
+        if rectForView(transcriptScroll).contains(localPoint) {
+            transcriptScroll.scrollWheel(with: event)
+            return true
+        }
+        if rectForView(composerSurface).contains(localPoint) {
+            composerScroll.scrollWheel(with: event)
+            return true
+        }
+        if rectForView(feed).contains(localPoint) {
+            feed.forwardScrollWheel(event)
+            return true
+        }
+        if canvasOpen, rectForView(canvasPane).contains(localPoint) {
+            canvasPane.scrollWheel(with: event)
+            return true
+        }
+        return false
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !isHidden, alphaValue > 0.01, bounds.contains(point) else {
             return nil
@@ -8739,7 +8768,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             font: titleFont,
             color: titleColor)
         appendLine(passThroughMode
-            ? "Blank Bluey space clicks behind it. Drag the blue move handle to move."
+            ? "Blank Bluey space clicks behind it. Wheel/trackpad scrolls Bluey panes."
             : "Blank Bluey space drags the window. Tab selects Bluey controls; Enter opens the selected control.")
         appendLine()
         appendLine("Inside Bluey when click-through is off:", font: noteFont, color: titleColor)
@@ -8749,7 +8778,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         appendPair("Opt+Down", "Scroll down", "Opt+Up", "Scroll up")
         appendLine("Letters always type normally when Ask is focused.")
         appendLine("Mouse wheel scrolls the answer, canvas, or history under the pointer.")
-        appendLine("With click-through on, canvas body clicks behind Bluey; canvas buttons stay usable.")
+        appendLine("With click-through on, blank clicks pass through; Bluey feed, canvas, and history still scroll.")
         appendLine("Opacity selected: arrow keys adjust it.")
         appendLine()
         appendLine("Global shortcuts work in both modes:")
@@ -13869,7 +13898,7 @@ private final class OverlayApp {
     private func startGlobalMouseRouting() {
         guard globalMouseMonitor == nil else { return }
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp]
+            matching: [.mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp, .scrollWheel]
         ) { [weak self] event in
             DispatchQueue.main.async {
                 self?.handleGlobalMouseEventForClickThrough(event)
@@ -13900,6 +13929,12 @@ private final class OverlayApp {
         case .mouseMoved:
             if expandedWindow.frame.insetBy(dx: -12, dy: -12).contains(point) {
                 updateExpandedMousePolicy()
+            }
+
+        case .scrollWheel:
+            guard expandedWindow.frame.contains(point) else { return }
+            if expandedView.routeScrollWheelAtScreenPoint(point, event: event) {
+                expandedWindow.acceptsMouseMovedEvents = true
             }
 
         case .leftMouseDown:

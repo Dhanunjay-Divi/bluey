@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 18:27 EDT
+Latest checkpoint: 2026-07-04 18:55 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,7 +30,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-346-CODE-CANVAS-LINE-NUMBERS.md`; the next canonical Bluey round doc should start at `ROUND-347-...`.
+- Latest completed Bluey round doc is `ROUND-347-CLICKTHROUGH-SCROLL-ROUTING.md`; the next canonical Bluey round doc should start at `ROUND-348-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
@@ -5899,6 +5899,76 @@ Deployment status:
 - `https://bluey.sh/health` reports commit `210a4f7559ffd13fe263b3891d75b5e93c39c9f3`.
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
+
+## Latest Round 347: Click-Through Scroll Routing
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-347-CLICKTHROUGH-SCROLL-ROUTING.md`
+
+Trigger:
+
+- The owner reported that when click-through is on, scrolling inside the Bluey window still did not work.
+- Expected behavior: blank clicks pass through to the app behind Bluey, but wheel/trackpad scroll over Bluey panes should scroll Bluey.
+
+What changed:
+
+- Added macOS global scroll-wheel routing while click-through mode is active.
+- If the pointer is over the expanded Bluey window, scroll events are routed to the matching Bluey pane:
+  - history drawer
+  - live transcript preview
+  - composer area
+  - answer feed
+  - right-side canvas
+- Blank clicks/drags still pass through because only wheel events are routed.
+- Updated shortcuts/help copy to explain that blank clicks pass through while Bluey feed, canvas, and history still scroll.
+- Desktop workspace version bumped to `0.1.86`.
+
+Verification:
+
+```bash
+swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift
+cd native/macos/cue-overlay && swift build -c release
+cargo fmt --check
+cargo check -p cue-cli -p cue-daemon
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.86
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+/Users/uno/.bluey/bin/bluey on
+/Users/uno/.bluey/bin/bluey status
+```
+
+Deployment status:
+
+- Desktop release `0.1.86` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.86/bluey-0.1.86-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `f7232a5aa03ea5b8aae329194462f5aaf7f004da7ad994dfbc617fade7de488a`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.86`
+- Public installer smoke installed `0.1.86` locally and both installed binaries report `0.1.86`.
+- `bluey on` started fresh daemon pid `39283`.
+
+Windows parity:
+
+- This was a macOS AppKit event-routing change.
+- Windows has a separate native overlay path and did not share this exact global monitor behavior, so no Windows code change was made in this round.
+- Parity rule: in click-through mode, blank clicks should pass through while scroll-wheel input over Bluey's own scrollable panes should still scroll Bluey.
 
 ## Latest Round 346: Code Canvas Line Numbers
 
