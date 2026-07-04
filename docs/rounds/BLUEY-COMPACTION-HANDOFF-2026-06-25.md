@@ -5683,3 +5683,46 @@ Remaining STT follow-up:
 - Add a true horizontal live-caption partial stream so captions feel immediate.
 - Add dynamic per-session keyterms from attached docs/screen/question context.
 - Add confidence-aware final transcript repair for low-confidence completed utterances.
+
+## Latest Round 335: Code Canvas Stale Artifact Guard
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-335-CODE-CANVAS-STALE-ARTIFACT-GUARD.md`
+
+Trigger:
+
+- The owner reported that a latest code follow-up failed or returned no code, while the right-side canvas still showed code from the previous question.
+
+What changed:
+
+- macOS overlay now hides a stale active canvas when a newer answer has no artifact and looks like a failed/fresh code or screen-code answer.
+- Explanation-only code follow-ups still preserve the existing canvas.
+- Server code-artifact plans now get a larger output budget and must produce a real code artifact before the response can complete normally.
+- Server records a typed `answer_failed/code_artifact_missing` ops event with request/session refs and metadata-only hashes before billing.
+- Screen/canvas-detail answers that include fenced code are now extracted as `code` artifacts.
+- Desktop workspace version bumped to `0.1.75`.
+
+Verification so far:
+
+```bash
+cargo fmt --manifest-path server/Cargo.toml
+cargo test --manifest-path server/Cargo.toml response_artifact_for_output --lib -- --nocapture
+cargo test --manifest-path server/Cargo.toml code_artifact_plan_rejects_prose_only_answer --lib -- --nocapture
+cargo test --manifest-path server/Cargo.toml answer_plan_uses_screen_context_code_signals --lib -- --nocapture
+cargo check --manifest-path server/Cargo.toml
+cargo check -p cue-daemon -p cue-cli
+cd native/macos/cue-overlay && swift build -c release
+```
+
+Deployment status:
+
+- Deployment pending at handoff update time.

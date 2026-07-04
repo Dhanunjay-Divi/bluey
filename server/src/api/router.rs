@@ -47,6 +47,8 @@ fn log_session_id(session_id: Option<&str>) -> &str {
 }
 
 const SLOW_FIRST_TOKEN_AUDIT_MS: i64 = 8_000;
+const CODE_ARTIFACT_MIN_OUTPUT_TOKENS: u32 = 4_096;
+const CANVAS_DETAIL_MIN_OUTPUT_TOKENS: u32 = 3_072;
 
 fn record_answer_ops_event(
     pool: &crate::db::DbPool,
@@ -1484,6 +1486,57 @@ fn lane_for_answer_plan(requested_lane: &str, plan: &AnswerPlan, enabled: bool) 
         return "vision".to_string();
     }
     plan.recommended_lane.to_string()
+}
+
+fn max_tokens_for_answer_plan(requested: Option<u32>, output: AnswerOutput) -> Option<u32> {
+    match output {
+        AnswerOutput::CodeArtifact => Some(
+            requested
+                .unwrap_or(CODE_ARTIFACT_MIN_OUTPUT_TOKENS)
+                .max(CODE_ARTIFACT_MIN_OUTPUT_TOKENS),
+        ),
+        AnswerOutput::CanvasDetail => Some(
+            requested
+                .unwrap_or(CANVAS_DETAIL_MIN_OUTPUT_TOKENS)
+                .max(CANVAS_DETAIL_MIN_OUTPUT_TOKENS),
+        ),
+        _ => requested,
+    }
+}
+
+fn estimate_max_output_tokens_for_answer_plan(
+    requested: Option<u32>,
+    thinking: routing::ThinkingBudget,
+    output: AnswerOutput,
+) -> u32 {
+    let planned = max_tokens_for_answer_plan(requested, output);
+    match output {
+        AnswerOutput::CodeArtifact => routing::effective_max_output_tokens(planned, thinking)
+            .max(CODE_ARTIFACT_MIN_OUTPUT_TOKENS),
+        AnswerOutput::CanvasDetail => routing::effective_max_output_tokens(planned, thinking)
+            .max(CANVAS_DETAIL_MIN_OUTPUT_TOKENS),
+        _ => routing::effective_max_output_tokens(planned, thinking),
+    }
+}
+
+fn code_artifact_missing_for_plan(plan: &AnswerPlan, artifact: Option<&ResponseArtifact>) -> bool {
+    plan.output == AnswerOutput::CodeArtifact
+        && !matches!(
+            artifact.map(|artifact| artifact.artifact_type),
+            Some("code")
+        )
+}
+
+fn code_artifact_missing_error() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ApiError {
+            error: "Bluey expected code for this answer, but the provider returned only prose. Please retry.".into(),
+            reason: Some("code_artifact_missing".into()),
+            retry_after_secs: Some(1),
+            ..Default::default()
+        }),
+    )
 }
 
 async fn resolve_answer_plan_for_request(
@@ -4005,7 +4058,9 @@ async fn complete_stream_inner(
     let first_output_deadline = first_token_deadline_for_lane(&effective_lane, has_thinking_budget);
     let stream_connect_deadline =
         stream_route_connect_deadline_for_lane(&effective_lane, has_thinking_budget);
-    let effective_max_out = routing::effective_max_output_tokens(req.max_tokens, thinking);
+    let provider_max_tokens = max_tokens_for_answer_plan(req.max_tokens, answer_plan.output);
+    let effective_max_out =
+        estimate_max_output_tokens_for_answer_plan(req.max_tokens, thinking, answer_plan.output);
     let max_out = i64::from(effective_max_out);
     let est_in = req
         .estimated_input_tokens
@@ -4154,7 +4209,7 @@ async fn complete_stream_inner(
                 route.model,
                 &provider_system,
                 &provider_user,
-                req.max_tokens,
+                provider_max_tokens,
                 req.temperature,
                 thinking,
                 Some(est_in),
@@ -4566,6 +4621,55 @@ async fn complete_stream_inner(
             yield Ok(Event::default().event("error").data(payload.to_string()));
             return;
         }
+        let artifact = response_artifact_for_output(&text, answer_plan.output);
+        if code_artifact_missing_for_plan(&answer_plan, artifact.as_ref()) {
+            idempotency_guard.mark_failed_now();
+            tracing::warn!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                request_ref = %request_ref_log,
+                session_id = %session_id_log,
+                session_ref = %session_ref_log,
+                lane = %lane_log,
+                effective_lane = %effective_lane_log,
+                provider = %streaming.provider,
+                model = %streaming.model,
+                answer_intent = %answer_plan.intent.as_str(),
+                answer_output = %answer_plan.output.as_str(),
+                text_chars = text.chars().count(),
+                streaming = true,
+                "code artifact expected but missing before billing"
+            );
+            record_answer_ops_event(
+                &state.pool,
+                &account.id,
+                &req.request_id,
+                req.session_id.as_deref(),
+                Some(&trace_id),
+                "answer_failed",
+                "code_artifact_missing",
+                serde_json::json!({
+                    "lane": lane_log.as_str(),
+                    "effective_lane": effective_lane_log.as_str(),
+                    "provider": streaming.provider.as_str(),
+                    "model": streaming.model.as_str(),
+                    "streaming": true,
+                    "answer_intent": answer_plan.intent.as_str(),
+                    "answer_output": answer_plan.output.as_str(),
+                    "text_chars": text.chars().count(),
+                    "question_hash": request_diag.question_hash,
+                    "context_hash": request_diag.context_hash,
+                    "context_coding_signal": request_diag.context_coding_signal
+                }),
+            );
+            let payload = serde_json::json!({
+                "error": "Bluey expected code for this answer, but the provider returned only prose. Please retry.",
+                "reason": "code_artifact_missing",
+                "retry_after_secs": 1,
+            });
+            yield Ok(Event::default().event("error").data(payload.to_string()));
+            return;
+        }
         let elapsed_ms = started.elapsed().as_millis() as i64;
         let (llm_bluey_cost, llm_customer_cost) = pricing::compute_cost(
             &selected_route.pricing,
@@ -4711,7 +4815,6 @@ async fn complete_stream_inner(
             true,
         );
 
-        let artifact = response_artifact_for_output(&text, answer_plan.output);
         let artifact_type = artifact.as_ref().map(|artifact| artifact.artifact_type).unwrap_or("none");
         let artifact_confidence = artifact.as_ref().map(|artifact| artifact.confidence).unwrap_or(0.0);
         let web_search_skipped_reason = web_search.skipped_reason.unwrap_or("none");
@@ -5069,7 +5172,9 @@ async fn complete_inner(
         req.reasoning_effort.as_deref(),
         req.thinking_budget_tokens,
     );
-    let effective_max_out = routing::effective_max_output_tokens(req.max_tokens, thinking);
+    let provider_max_tokens = max_tokens_for_answer_plan(req.max_tokens, answer_plan.output);
+    let effective_max_out =
+        estimate_max_output_tokens_for_answer_plan(req.max_tokens, thinking, answer_plan.output);
     let max_out = i64::from(effective_max_out);
     let est_in = req.estimated_input_tokens.unwrap_or_else(|| {
         // Crude fallback: ~4 chars/token
@@ -5222,7 +5327,7 @@ async fn complete_inner(
                 route.model,
                 &provider_system,
                 &provider_user,
-                req.max_tokens,
+                provider_max_tokens,
                 req.temperature,
                 thinking,
                 Some(est_in),
@@ -5360,6 +5465,55 @@ async fn complete_inner(
             "managed chat stopped before billing because account is no longer active"
         );
         return Err(err);
+    }
+
+    let response_text = if looks_like_internal_disclosure_leak(&comp.text) {
+        INTERNAL_DISCLOSURE_REFUSAL.to_string()
+    } else {
+        comp.text.clone()
+    };
+    let artifact = response_artifact_for_output(&response_text, answer_plan.output);
+    if code_artifact_missing_for_plan(&answer_plan, artifact.as_ref()) {
+        let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+        tracing::warn!(
+            account_id_hash = %account_id_hash,
+            request_id = %req.request_id,
+            request_ref = %request_ref_log,
+            session_id = %session_id_log,
+            session_ref = %session_ref_log,
+            lane = %lane_log,
+            effective_lane = %effective_lane_log,
+            provider = %comp.provider,
+            model = %comp.model,
+            answer_intent = %answer_plan.intent.as_str(),
+            answer_output = %answer_plan.output.as_str(),
+            text_chars = response_text.chars().count(),
+            streaming = false,
+            "code artifact expected but missing before billing"
+        );
+        record_answer_ops_event(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+            req.session_id.as_deref(),
+            Some(&trace_id),
+            "answer_failed",
+            "code_artifact_missing",
+            serde_json::json!({
+                "lane": lane_log.as_str(),
+                "effective_lane": effective_lane_log.as_str(),
+                "provider": comp.provider.as_str(),
+                "model": comp.model.as_str(),
+                "streaming": false,
+                "answer_intent": answer_plan.intent.as_str(),
+                "answer_output": answer_plan.output.as_str(),
+                "text_chars": response_text.chars().count(),
+                "question_hash": request_diag.question_hash,
+                "context_hash": request_diag.context_hash,
+                "context_coding_signal": request_diag.context_coding_signal
+            }),
+        );
+        return Err(code_artifact_missing_error());
     }
 
     // 6. Compute actual cost from real token counts.
@@ -5500,12 +5654,6 @@ async fn complete_inner(
         false,
     );
 
-    let response_text = if looks_like_internal_disclosure_leak(&comp.text) {
-        INTERNAL_DISCLOSURE_REFUSAL.to_string()
-    } else {
-        comp.text
-    };
-    let artifact = response_artifact_for_output(&response_text, answer_plan.output);
     let artifact_type = artifact
         .as_ref()
         .map(|artifact| artifact.artifact_type)
@@ -5641,11 +5789,19 @@ fn response_canvas_detail_artifact(text: &str) -> Option<ResponseArtifact> {
     }
 
     let lower = body.to_lowercase();
+    let code_blocks = extract_fenced_code_blocks(body);
     if looks_like_diagram_artifact(body, &lower) {
         return Some(ResponseArtifact {
             artifact_type: "diagram",
             body: format_structured_artifact(body, "Diagram"),
             confidence: 0.88,
+        });
+    }
+    if !code_blocks.is_empty() {
+        return Some(ResponseArtifact {
+            artifact_type: "code",
+            body: format_code_artifact(body, &code_blocks),
+            confidence: 0.94,
         });
     }
     if looks_like_system_design_artifact(body, &lower) {
@@ -7401,6 +7557,33 @@ mod tests {
 
         assert_eq!(artifact.artifact_type, "system_design");
         assert_ne!(artifact.artifact_type, "code");
+    }
+
+    #[test]
+    fn response_artifact_for_output_keeps_code_from_canvas_detail() {
+        let answer = "Approach: sum both choices.\n```python\nclass Solution:\n    def canAliceWin(self, nums):\n        return True\n```\nTime Complexity: O(n)";
+        let artifact =
+            response_artifact_for_output(answer, AnswerOutput::CanvasDetail).expect("artifact");
+
+        assert_eq!(artifact.artifact_type, "code");
+        assert!(artifact.body.contains("CODE\n----"));
+        assert!(artifact.body.contains("def canAliceWin"));
+    }
+
+    #[test]
+    fn code_artifact_plan_rejects_prose_only_answer() {
+        let mut plan =
+            answer_plan_for_request(&complete_request("Write Python code."), "deep", &[]);
+        plan.output = AnswerOutput::CodeArtifact;
+        let prose = response_artifact_for_output(
+            "I would solve it with a hash map and a loop.",
+            plan.output,
+        );
+        let code =
+            response_artifact_for_output("```python\ndef solve():\n    return 1\n```", plan.output);
+
+        assert!(code_artifact_missing_for_plan(&plan, prose.as_ref()));
+        assert!(!code_artifact_missing_for_plan(&plan, code.as_ref()));
     }
 
     #[test]

@@ -10277,6 +10277,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func routeCanvasIfNeeded(_ card: RenderedCard) {
         let question = feed.nearestQuestionBody(beforeCardId: card.id)
         guard var artifact = makeCanvasArtifact(from: card) else {
+            if shouldHideStaleCanvasForAnswerWithoutArtifact(card: card, question: question) {
+                emitLifecycle(
+                    "canvas_hide_stale_without_artifact",
+                    detail: canvasLogDetail(card: card, question: question))
+                setCanvasOpen(false)
+                return
+            }
             if card.done, card.kind == "answer", canvasOpen, activeCanvasIndex != nil {
                 let shouldClose = shouldCloseCanvasForPlainAnswer(question: question)
                 emitLifecycle(
@@ -10308,6 +10315,102 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         } else if canvasOpen {
             renderActiveCanvas()
         }
+    }
+
+    private func shouldHideStaleCanvasForAnswerWithoutArtifact(
+        card: RenderedCard,
+        question: String?
+    ) -> Bool {
+        guard
+            card.kind == "answer",
+            card.artifact == nil,
+            canvasOpen,
+            let index = activeCanvasIndex,
+            canvases.indices.contains(index)
+        else {
+            return false
+        }
+
+        let body = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if answerBodyIndicatesCurrentAnswerFailure(body) {
+            return true
+        }
+
+        let lower = question?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        if !lower.isEmpty,
+           shouldPreserveCanvasForExplanatoryFollowup(
+            question: question,
+            artifactKind: canvases[index].kind)
+        {
+            return false
+        }
+        if questionLikelyRequestsFreshCanvas(lower) {
+            return true
+        }
+        return answerBodySuggestsFreshCodeCanvas(body.lowercased())
+    }
+
+    private func answerBodyIndicatesCurrentAnswerFailure(_ body: String) -> Bool {
+        let lower = body.lowercased()
+        return lower.contains("bluey could not complete that answer")
+            || lower.contains("connection dropped before bluey finished")
+            || lower.contains("did not save that partial answer")
+            || lower.contains("please retry")
+    }
+
+    private func questionLikelyRequestsFreshCanvas(_ lower: String) -> Bool {
+        guard !lower.isEmpty else { return false }
+        if looksLikeNewCanvasQuestion(lower) {
+            return true
+        }
+        let signals = [
+            "give me code",
+            "give me python",
+            "give me java",
+            "write code",
+            "python code",
+            "java code",
+            "javascript code",
+            "typescript code",
+            "c++ code",
+            "c# code",
+            "full code",
+            "complete code",
+            "solve this",
+            "solve it",
+            "implementation",
+            "implement this",
+            "leetcode",
+            "screen capture",
+            "attached screen",
+            "screenshot",
+        ]
+        if signals.contains(where: { lower.contains($0) }) {
+            return true
+        }
+        return lower.hasPrefix("code ")
+            || lower.hasPrefix("build ")
+            || lower.hasPrefix("implement ")
+            || lower.hasPrefix("solve ")
+    }
+
+    private func answerBodySuggestsFreshCodeCanvas(_ lower: String) -> Bool {
+        guard !lower.isEmpty else { return false }
+        let algorithmSignals = [
+            "i'd solve",
+            "i would solve",
+            "dynamic programming",
+            "monotonic stack",
+            "binary search",
+            "sliding window",
+            "hash map",
+            "linked list",
+            "time complexity",
+            "space complexity",
+        ]
+        return algorithmSignals.contains { lower.contains($0) }
     }
 
     private func canvasLogDetail(
