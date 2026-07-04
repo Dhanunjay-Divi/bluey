@@ -57,10 +57,49 @@ cargo check -p bluey-server
 
 ## Deployment
 
-Pending at initial doc write.
+Completed.
+
+- Commit: `b026fa7d15d15a7ee4d9059024e7f3366cdc3d55`
+- API host: `root@165.227.77.152`
+- API build directory: `/opt/bluey-build-codex-round329-code-fence`
+- API binary backup before replacement:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260704T054425Z`
+- API binary SHA256:
+  `571e4fce6cc5ef06806b7a4c633cab2bb7c149a51e9c5eff7da94b35467810c5`
+- API service after restart:
+  `ActiveState=active`, `SubState=running`, `MainPID=1104546`, `NRestarts=0`
+- Public health:
+  `https://bluey.sh/health` returned commit `b026fa7d15d15a7ee4d9059024e7f3366cdc3d55`.
+- Remote build note:
+  the droplet's default `/usr/bin/cargo` was too old for the current dependency graph, so the release build used `/root/.cargo/bin/cargo` / `rustc 1.96.1`.
+
+Desktop release:
+
+- Version: `0.1.67`
+- Public manifest: `https://bluey.sh/latest.json`
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.67/bluey-0.1.67-darwin-arm64.tar.gz`
+- Darwin arm64 SHA256:
+  `bea923de2af8c317513ddb04400be81fbada0bca02d1ecb83fd888fdee89351c`
+- Artifact size: `9185460` bytes
+- Publish verification passed:
+  - release artifact dev-flag/secret scan
+  - `latest.json` signature verification
+  - `install.sh` MIME check: `application/x-shellscript`
+  - `install.ps1` MIME check: `application/x-powershell`
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` report `0.1.67`
+- Local public install completed from `https://bluey.sh/install.sh`.
+- Local binaries:
+  - `/Users/uno/.bluey/bin/bluey --version` -> `bluey 0.1.67`
+  - `/Users/uno/.bluey/bin/bluey-daemon --version` -> `bluey-daemon 0.1.67`
+  - `/usr/local/bin/bluey` and `/Users/uno/.local/bin/bluey` both point at `/Users/uno/.bluey/bin/bluey`
+- Local daemon restart completed:
+  - pid `30961`
+  - fresh session `817ccef3-05a1-4f63-a6e2-58ab6914e39e`
+  - `overlay_visible=true`
+  - `overlay_capture_excluded=true` in normal production capture-excluded mode
 
 ## Remaining QA / Gates
 
-- Package and publish desktop `0.1.67`.
-- Deploy the managed API parser fix.
 - Retest the Alice/Bob prompt and follow-up in a fresh session, not the old `0.1.64` session.

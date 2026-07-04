@@ -5314,6 +5314,29 @@ cargo check -p cue-daemon
 cargo check -p bluey-server
 ```
 
-Deployment status at initial handoff update:
+Deployment status:
 
-- Not yet deployed. Package/publish desktop `0.1.67` and deploy the API parser fix next.
+- API deployed on `root@165.227.77.152`.
+- API commit on public health:
+  `b026fa7d15d15a7ee4d9059024e7f3366cdc3d55`
+- API binary SHA256:
+  `571e4fce6cc5ef06806b7a4c633cab2bb7c149a51e9c5eff7da94b35467810c5`
+- API service after restart:
+  `ActiveState=active`, `SubState=running`, `MainPID=1104546`, `NRestarts=0`
+- Desktop release `0.1.67` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 release artifact:
+  `https://bluey.sh/releases/v0.1.67/bluey-0.1.67-darwin-arm64.tar.gz`
+- Release artifact SHA256:
+  `bea923de2af8c317513ddb04400be81fbada0bca02d1ecb83fd888fdee89351c`
+- Deploy verification passed:
+  - release artifact dev-flag/secret scan
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.67`
+- Local machine installed from public `install.sh`; `/Users/uno/.bluey/bin/bluey` and `/Users/uno/.bluey/bin/bluey-daemon` both report `0.1.67`.
+- Local daemon restarted into fresh session `817ccef3-05a1-4f63-a6e2-58ab6914e39e`.
+
+Remaining:
+
+- Retest the Alice/Bob prompt and follow-up in a fresh session, not the old `0.1.64` session.
