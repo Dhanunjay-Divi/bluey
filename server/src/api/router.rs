@@ -4866,8 +4866,9 @@ async fn complete_stream_inner(
             "managed chat completed and billed"
         );
 
+        let response_text = visible_response_text_for_artifact(&text, artifact.as_ref());
         let response = CompleteResponse {
-            text,
+            text: response_text,
             provider: streaming.provider,
             model: streaming.model,
             input_tokens,
@@ -5711,8 +5712,9 @@ async fn complete_inner(
         "managed chat completed and billed"
     );
 
+    let visible_response_text = visible_response_text_for_artifact(&response_text, artifact.as_ref());
     let response = CompleteResponse {
-        text: response_text,
+        text: visible_response_text,
         provider: comp.provider,
         model: comp.model,
         input_tokens: comp.input_tokens,
@@ -5780,6 +5782,59 @@ fn response_artifact_for_output(text: &str, output: AnswerOutput) -> Option<Resp
         AnswerOutput::CanvasDetail => response_canvas_detail_artifact(text),
         AnswerOutput::Compact | AnswerOutput::SourceAnswer | AnswerOutput::InterviewAnswer => None,
     }
+}
+
+fn visible_response_text_for_artifact(text: &str, artifact: Option<&ResponseArtifact>) -> String {
+    let clean = text.trim();
+    let Some(artifact) = artifact else {
+        return clean.to_string();
+    };
+    if artifact.artifact_type != "code" {
+        return clean.to_string();
+    }
+
+    let visible = strip_fenced_code(clean);
+    let visible = strip_canvas_pointer_lines(&visible);
+    let visible = visible.trim();
+    if visible.is_empty() || code_answer_is_pointer_only(visible) {
+        return "I found the implementation shape and prepared the complete code artifact.".to_string();
+    }
+    visible.to_string()
+}
+
+fn strip_canvas_pointer_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let lower = line.trim().to_ascii_lowercase();
+            !(lower.contains("is in the canvas")
+                || lower.contains("in the canvas")
+                || lower.contains("code panel")
+                || lower.contains("right panel")
+                || lower.contains("workbench"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn code_answer_is_pointer_only(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let references_missing_context = lower.contains("already")
+        || lower.contains("above")
+        || lower.contains("earlier")
+        || lower.contains("same code")
+        || lower.contains("shown")
+        || lower.contains("prepared")
+        || lower.contains("complete code");
+    references_missing_context
+        && lower.chars().count() < 220
+        && lower.contains("code")
+        && !lower.contains("approach")
+        && !lower.contains("complexity")
+        && !lower.contains("def ")
+        && !lower.contains("class ")
+        && !lower.contains("return ")
+        && !lower.contains("for ")
+        && !lower.contains("while ")
 }
 
 fn response_canvas_detail_artifact(text: &str) -> Option<ResponseArtifact> {
@@ -6071,35 +6126,42 @@ fn extract_fenced_code_blocks(text: &str) -> Vec<String> {
     let mut current = Vec::new();
     let mut in_fence = false;
     for line in text.lines() {
-        if line.trim_start().starts_with("```") {
-            if in_fence {
-                let block = current.join("\n").trim().to_string();
-                if !block.is_empty() {
-                    blocks.push(block);
-                }
-                current.clear();
-            } else if let Some(inline_code) = inline_code_after_malformed_opening_fence(line) {
+        if !in_fence {
+            let Some((_before, after_fence)) = line.split_once("```") else {
+                continue;
+            };
+            if let Some(inline_code) = inline_code_after_fence_tail(after_fence) {
+                let (inline_code, closes_inline) =
+                    inline_code.split_once("```").unwrap_or((inline_code, ""));
                 if !inline_code.trim().is_empty() {
                     current.push(inline_code.to_string());
                 }
+                if !closes_inline.is_empty() || after_fence.matches("```").count() > 0 {
+                    let block = current.join("\n").trim().to_string();
+                    if !block.is_empty() {
+                        blocks.push(repair_code_block_layout(&block));
+                    }
+                    current.clear();
+                    in_fence = false;
+                    continue;
+                }
             }
-            in_fence = !in_fence;
+            in_fence = true;
             continue;
         }
-        if in_fence {
-            if let Some((before, _after)) = line.split_once("```") {
-                if !before.trim().is_empty() {
-                    current.push(before.to_string());
-                }
-                let block = current.join("\n").trim().to_string();
-                if !block.is_empty() {
-                    blocks.push(block);
-                }
-                current.clear();
-                in_fence = false;
-            } else {
-                current.push(line.to_string());
+
+        if let Some((before, _after)) = line.split_once("```") {
+            if !before.trim().is_empty() {
+                current.push(before.to_string());
             }
+            let block = current.join("\n").trim().to_string();
+            if !block.is_empty() {
+                blocks.push(repair_code_block_layout(&block));
+            }
+            current.clear();
+            in_fence = false;
+        } else {
+            current.push(line.to_string());
         }
     }
     blocks
@@ -6109,11 +6171,20 @@ fn strip_fenced_code(text: &str) -> String {
     let mut lines = Vec::new();
     let mut in_fence = false;
     for line in text.lines() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
         if !in_fence {
+            if let Some((before, after_fence)) = line.split_once("```") {
+                if !before.trim().is_empty() {
+                    lines.push(before.trim_end());
+                }
+                if let Some((_inside, after_close)) = after_fence.split_once("```") {
+                    if !after_close.trim().is_empty() {
+                        lines.push(after_close.trim_start());
+                    }
+                    continue;
+                }
+                in_fence = true;
+                continue;
+            }
             lines.push(line);
         } else if let Some((_before, after)) = line.split_once("```") {
             in_fence = false;
@@ -6122,12 +6193,11 @@ fn strip_fenced_code(text: &str) -> String {
             }
         }
     }
-    lines.join("\n")
+    remove_empty_code_headings(&lines.join("\n"))
 }
 
-fn inline_code_after_malformed_opening_fence(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    let tail = trimmed.strip_prefix("```")?.trim_start();
+fn inline_code_after_fence_tail(tail: &str) -> Option<&str> {
+    let tail = tail.trim_start();
     if tail.is_empty() || tail.starts_with('`') {
         return None;
     }
@@ -6174,6 +6244,78 @@ fn inline_code_after_malformed_opening_fence(line: &str) -> Option<&str> {
     }
 
     None
+}
+
+fn remove_empty_code_headings(text: &str) -> String {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = trim_markdown_heading(line).trim_end_matches(':');
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "code" | "implementation" | "solution code"
+        ) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n").trim().to_string()
+}
+
+fn repair_code_block_layout(code: &str) -> String {
+    let code = code.trim();
+    let non_empty_lines = code.lines().filter(|line| !line.trim().is_empty()).count();
+    if non_empty_lines > 3 || !(code.contains('{') || code.contains(';')) {
+        return code.to_string();
+    }
+
+    let mut out = String::with_capacity(code.len() + 32);
+    let mut paren_depth = 0usize;
+    for ch in code.chars() {
+        match ch {
+            '(' | '[' => {
+                paren_depth = paren_depth.saturating_add(1);
+                out.push(ch);
+            }
+            ')' | ']' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                out.push(ch);
+            }
+            '{' => {
+                trim_trailing_spaces(&mut out);
+                if !out.ends_with(' ') && !out.ends_with('\n') {
+                    out.push(' ');
+                }
+                out.push('{');
+                out.push('\n');
+            }
+            '}' => {
+                trim_trailing_spaces(&mut out);
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('}');
+                out.push('\n');
+            }
+            ';' if paren_depth == 0 => {
+                trim_trailing_spaces(&mut out);
+                out.push(';');
+                out.push('\n');
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    out.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn trim_trailing_spaces(out: &mut String) {
+    while out.ends_with(' ') || out.ends_with('\t') {
+        out.pop();
+    }
 }
 
 fn looks_like_inline_code_after_fence(rest: &str) -> bool {
@@ -7708,6 +7850,34 @@ mod tests {
         assert!(artifact.body.contains("4-6: Compare each Alice choice"));
         assert!(artifact.body.contains("NOTES\n-----\nApproach"));
         assert!(artifact.body.contains("Explanation:"));
+    }
+
+    #[test]
+    fn response_artifact_repairs_inline_heading_cpp_fence() {
+        let artifact = response_artifact(
+            "Approach\n- Track x and y.\nCode```cppclass Solution { public: bool judgeCircle(string moves) { int x = 0; int y = 0; for (char move : moves) { if (move == 'U') y++; else if (move == 'D') y--; else if (move == 'L') x--; else if (move == 'R') x++; } return x == 0 && y == 0; } };```\nExplanation\nReturn true only if both axes cancel.\nComplexity\nTime Complexity: O(N)\nSpace Complexity: O(1)",
+        )
+        .expect("code artifact");
+
+        assert_eq!(artifact.artifact_type, "code");
+        assert!(artifact.body.contains("class Solution"));
+        assert!(artifact.body.contains("bool judgeCircle"));
+        assert!(artifact.body.contains("return x == 0 && y == 0;"));
+        assert!(!artifact.body.contains("cppclass"));
+        assert!(!artifact.body.contains("```"));
+    }
+
+    #[test]
+    fn visible_response_text_strips_code_when_canvas_exists() {
+        let answer = "Approach\n- Track x and y.\n\n```cpp\nclass Solution {\npublic:\n    bool judgeCircle(string moves) {\n        return true;\n    }\n};\n```\n\nExplanation\nThe counters cancel opposing moves.\nComplexity\nTime Complexity: O(N)\nSpace Complexity: O(1)";
+        let artifact = response_artifact(answer).expect("code artifact");
+        let visible = visible_response_text_for_artifact(answer, Some(&artifact));
+
+        assert!(visible.contains("Approach"));
+        assert!(visible.contains("Explanation"));
+        assert!(visible.contains("Complexity"));
+        assert!(!visible.contains("class Solution"));
+        assert!(!visible.contains("```"));
     }
 
     #[test]

@@ -5899,3 +5899,64 @@ Deployment status:
 - `https://bluey.sh/health` reports commit `210a4f7559ffd13fe263b3891d75b5e93c39c9f3`.
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
+
+## Latest Round 340: Code Fence Visible Canvas Cleanup
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-340-CODE-FENCE-VISIBLE-CANVAS-CLEANUP.md`
+
+Trigger:
+
+- The owner showed a coding answer where the chat card rendered code as smashed prose, such as `Codecppclass...`, and the right-side code canvas looked chopped or awkward.
+
+What changed:
+
+- Server and daemon code-fence parsing now detects fences that appear after a heading on the same line.
+- Malformed language openings like `cppclass Solution` and `pythonfrom typing` are split into language plus code.
+- Same-line opening/closing fences are handled.
+- Compressed one-line C-like code blocks are lightly reflowed for code canvas readability.
+- When a code artifact exists, completed visible chat strips non-trivial code blocks and keeps approach/explanation/complexity prose.
+- Managed API final responses now return artifact-aware visible text so completed cards can replace rough streamed deltas with clean final text.
+- Desktop workspace version bumped to `0.1.79`.
+
+Verification so far:
+
+```bash
+cargo fmt --check
+cargo test --manifest-path server/Cargo.toml response_artifact_ --lib -- --nocapture
+cargo test --manifest-path server/Cargo.toml visible_response_text_strips_code_when_canvas_exists --lib -- --nocapture
+cargo test -p cue-daemon answer_overlay_artifact_ -- --nocapture
+cargo test -p cue-daemon visible_answer_body_strips_large_code_when_canvas_exists -- --nocapture
+cargo check --manifest-path server/Cargo.toml --bin bluey-server
+cargo check -p cue-daemon -p cue-cli
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.79
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+```
+
+Deployment status:
+
+- Desktop release `0.1.79` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.79/bluey-0.1.79-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `8eb3d665bd43b2c228bdf41be1ae9702a4cc1d129db979cc6fcc585c6b663fad`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.79`
+- Public installer smoke installed `0.1.79` locally and both installed binaries report `0.1.79`.
+- API deploy status: pending committed-source server rollout in the same round.

@@ -7483,21 +7483,20 @@ fn visible_answer_body_for_artifact(
 }
 
 fn code_chat_body_for_artifact(body: &str, artifact: &CueCardArtifact) -> String {
-    if !extract_fenced_code_blocks(body).is_empty() {
-        return body.to_string();
-    }
-
     let Some(code) = first_code_section_from_artifact(&artifact.body) else {
         return body.to_string();
     };
     let body = if has_unclosed_code_fence(body) {
         strip_unclosed_code_fence_tail(body)
     } else {
-        body.to_string()
+        strip_fenced_code(body)
     };
     let mut visible = strip_canvas_pointer_lines(&body).trim().to_string();
     if visible.is_empty() || code_answer_is_pointer_only(&visible) {
         visible = "Here is the code:".to_string();
+    }
+    if code.lines().count() > 8 || code.chars().count() > 600 {
+        return visible;
     }
     let language = infer_code_language(&code);
     format!("{visible}\n\n```{language}\n{code}\n```")
@@ -7777,35 +7776,42 @@ fn extract_fenced_code_blocks(text: &str) -> Vec<String> {
     let mut in_fence = false;
 
     for line in text.lines() {
-        if line.trim_start().starts_with("```") {
-            if in_fence {
-                let block = current.join("\n").trim().to_string();
-                if !block.is_empty() {
-                    blocks.push(block);
-                }
-                current.clear();
-            } else if let Some(inline_code) = inline_code_after_malformed_opening_fence(line) {
+        if !in_fence {
+            let Some((_before, after_fence)) = line.split_once("```") else {
+                continue;
+            };
+            if let Some(inline_code) = inline_code_after_fence_tail(after_fence) {
+                let (inline_code, closes_inline) =
+                    inline_code.split_once("```").unwrap_or((inline_code, ""));
                 if !inline_code.trim().is_empty() {
                     current.push(inline_code.to_string());
                 }
+                if !closes_inline.is_empty() || after_fence.matches("```").count() > 0 {
+                    let block = current.join("\n").trim().to_string();
+                    if !block.is_empty() {
+                        blocks.push(repair_code_block_layout(&block));
+                    }
+                    current.clear();
+                    in_fence = false;
+                    continue;
+                }
             }
-            in_fence = !in_fence;
+            in_fence = true;
             continue;
         }
-        if in_fence {
-            if let Some((before, _after)) = line.split_once("```") {
-                if !before.trim().is_empty() {
-                    current.push(before.to_string());
-                }
-                let block = current.join("\n").trim().to_string();
-                if !block.is_empty() {
-                    blocks.push(block);
-                }
-                current.clear();
-                in_fence = false;
-            } else {
-                current.push(line.to_string());
+
+        if let Some((before, _after)) = line.split_once("```") {
+            if !before.trim().is_empty() {
+                current.push(before.to_string());
             }
+            let block = current.join("\n").trim().to_string();
+            if !block.is_empty() {
+                blocks.push(repair_code_block_layout(&block));
+            }
+            current.clear();
+            in_fence = false;
+        } else {
+            current.push(line.to_string());
         }
     }
     blocks
@@ -7815,11 +7821,20 @@ fn strip_fenced_code(text: &str) -> String {
     let mut lines = Vec::new();
     let mut in_fence = false;
     for line in text.lines() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
         if !in_fence {
+            if let Some((before, after_fence)) = line.split_once("```") {
+                if !before.trim().is_empty() {
+                    lines.push(before.trim_end());
+                }
+                if let Some((_inside, after_close)) = after_fence.split_once("```") {
+                    if !after_close.trim().is_empty() {
+                        lines.push(after_close.trim_start());
+                    }
+                    continue;
+                }
+                in_fence = true;
+                continue;
+            }
             lines.push(line);
         } else if let Some((_before, after)) = line.split_once("```") {
             in_fence = false;
@@ -7828,12 +7843,11 @@ fn strip_fenced_code(text: &str) -> String {
             }
         }
     }
-    lines.join("\n")
+    remove_empty_code_headings(&lines.join("\n"))
 }
 
-fn inline_code_after_malformed_opening_fence(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    let tail = trimmed.strip_prefix("```")?.trim_start();
+fn inline_code_after_fence_tail(tail: &str) -> Option<&str> {
+    let tail = tail.trim_start();
     if tail.is_empty() || tail.starts_with('`') {
         return None;
     }
@@ -7880,6 +7894,78 @@ fn inline_code_after_malformed_opening_fence(line: &str) -> Option<&str> {
     }
 
     None
+}
+
+fn remove_empty_code_headings(text: &str) -> String {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = trim_markdown_heading(line).trim_end_matches(':');
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "code" | "implementation" | "solution code"
+        ) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n").trim().to_string()
+}
+
+fn repair_code_block_layout(code: &str) -> String {
+    let code = code.trim();
+    let non_empty_lines = code.lines().filter(|line| !line.trim().is_empty()).count();
+    if non_empty_lines > 3 || !(code.contains('{') || code.contains(';')) {
+        return code.to_string();
+    }
+
+    let mut out = String::with_capacity(code.len() + 32);
+    let mut paren_depth = 0usize;
+    for ch in code.chars() {
+        match ch {
+            '(' | '[' => {
+                paren_depth = paren_depth.saturating_add(1);
+                out.push(ch);
+            }
+            ')' | ']' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                out.push(ch);
+            }
+            '{' => {
+                trim_trailing_spaces(&mut out);
+                if !out.ends_with(' ') && !out.ends_with('\n') {
+                    out.push(' ');
+                }
+                out.push('{');
+                out.push('\n');
+            }
+            '}' => {
+                trim_trailing_spaces(&mut out);
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('}');
+                out.push('\n');
+            }
+            ';' if paren_depth == 0 => {
+                trim_trailing_spaces(&mut out);
+                out.push(';');
+                out.push('\n');
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    out.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn trim_trailing_spaces(out: &mut String) {
+    while out.ends_with(' ') || out.ends_with('\t') {
+        out.pop();
+    }
 }
 
 fn looks_like_inline_code_after_fence(rest: &str) -> bool {
@@ -17167,6 +17253,34 @@ mod tests {
         assert!(artifact.body.contains("Time Complexity: O(n)"));
         assert!(artifact.body.contains("NOTES\n-----"));
         assert!(artifact.body.contains("Alice only has two legal choices"));
+    }
+
+    #[test]
+    fn answer_overlay_artifact_repairs_inline_heading_cpp_fence() {
+        let artifact = answer_overlay_artifact(
+            "Approach\n- Track x and y.\nCode```cppclass Solution { public: bool judgeCircle(string moves) { int x = 0; int y = 0; for (char move : moves) { if (move == 'U') y++; else if (move == 'D') y--; else if (move == 'L') x--; else if (move == 'R') x++; } return x == 0 && y == 0; } };```\nExplanation\nReturn true only if both axes cancel.\nComplexity\nTime Complexity: O(N)\nSpace Complexity: O(1)",
+        )
+        .expect("code artifact");
+
+        assert_eq!(artifact.artifact_type, CardArtifactType::Code);
+        assert!(artifact.body.contains("class Solution"));
+        assert!(artifact.body.contains("bool judgeCircle"));
+        assert!(artifact.body.contains("return x == 0 && y == 0;"));
+        assert!(!artifact.body.contains("cppclass"));
+        assert!(!artifact.body.contains("```"));
+    }
+
+    #[test]
+    fn visible_answer_body_strips_large_code_when_canvas_exists() {
+        let answer = "Approach\n- Track x and y.\n\n```cpp\nclass Solution {\npublic:\n    bool judgeCircle(string moves) {\n        int x = 0;\n        int y = 0;\n        for (char move : moves) {\n            if (move == 'U') y++;\n            else if (move == 'D') y--;\n            else if (move == 'L') x--;\n            else if (move == 'R') x++;\n        }\n        return x == 0 && y == 0;\n    }\n};\n```\n\nExplanation\nThe counters cancel opposing moves.\nComplexity\nTime Complexity: O(N)\nSpace Complexity: O(1)";
+        let artifact = answer_overlay_artifact(answer).expect("code artifact");
+        let visible = visible_answer_body_for_artifact(answer, Some(&artifact));
+
+        assert!(visible.contains("Approach"));
+        assert!(visible.contains("Explanation"));
+        assert!(visible.contains("Complexity"));
+        assert!(!visible.contains("class Solution"));
+        assert!(!visible.contains("```"));
     }
 
     #[test]
