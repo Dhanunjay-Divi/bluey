@@ -7047,12 +7047,22 @@ async fn answer_with_provider_runtime(
     }
     promote_request_to_vision_for_screen_context(&daemon.paths, &mut request);
 
+    let question_attachment_ids = question_attachment_ids_for_request(
+        &meeting_snapshot,
+        &request.metadata.visible_context_ids,
+        &request.context,
+    );
     let visible_context =
-        visible_question_context_for_ids(&meeting_snapshot, &request.metadata.visible_context_ids);
-    log_answer_request_diagnostics(&request, &source, visible_context.len());
+        visible_question_context_for_ids(&meeting_snapshot, &question_attachment_ids);
+    let question_display_context = if visible_context.is_empty() {
+        question_card_context_from_answer_context(&request.context)
+    } else {
+        visible_context.clone()
+    };
+    log_answer_request_diagnostics(&request, &source, question_display_context.len());
     let (visible_question_title, visible_question) =
-        visible_question_for_source(&request.question, &source, &visible_context);
-    let question_attachments = question_card_attachments(&visible_context);
+        visible_question_for_source(&request.question, &source, &question_display_context);
+    let question_attachments = question_card_attachments(&question_display_context);
     let question_card = CueCard::new(
         CardKind::Question,
         visible_question_title.clone(),
@@ -7217,7 +7227,7 @@ async fn answer_with_provider_runtime(
         meeting_id = %meeting_snapshot.id,
         provider = %outcome.provider.display_label(),
         visible_context_count = visible_context.len(),
-        attachment_ids = request.metadata.visible_context_ids.len(),
+        attachment_ids = question_attachment_ids.len(),
         persisted_answer_chars = persisted_shape.chars,
         persisted_answer_lines = persisted_shape.lines,
         persisted_answer_closed_code_blocks = persisted_shape.closed_code_blocks,
@@ -7239,12 +7249,12 @@ async fn answer_with_provider_runtime(
                     Some(outcome.provider.display_label()),
                 )
                 .with_artifact(persisted_artifact.clone())
-                .with_attachment_ids(request.metadata.visible_context_ids.clone()),
+                .with_attachment_ids(question_attachment_ids.clone()),
             );
             let used_image_context = mark_visible_image_context_used_once(
                 &daemon.paths,
                 meeting,
-                &request.metadata.visible_context_ids,
+                &question_attachment_ids,
                 &visible_question,
                 &persisted_answer,
             );
@@ -8606,6 +8616,81 @@ fn visible_question_context_for_ids(
         .collect()
 }
 
+fn question_attachment_ids_for_request(
+    meeting: &MeetingRecord,
+    visible_context_ids: &[uuid::Uuid],
+    answer_context: &[AnswerContext],
+) -> Vec<uuid::Uuid> {
+    if !visible_context_ids.is_empty() {
+        return dedupe_attachment_ids(visible_context_ids.iter().copied());
+    }
+
+    let mut ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for context in answer_context.iter().filter(|context| {
+        matches!(
+            context.kind,
+            AnswerContextKind::Document | AnswerContextKind::Screenshot
+        )
+    }) {
+        if let Some(artifact) = meeting
+            .context
+            .iter()
+            .find(|artifact| answer_context_matches_artifact(context, artifact))
+        {
+            if seen.insert(artifact.id) {
+                ids.push(artifact.id);
+            }
+        }
+    }
+    ids
+}
+
+fn dedupe_attachment_ids(ids: impl IntoIterator<Item = uuid::Uuid>) -> Vec<uuid::Uuid> {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter().filter(|id| seen.insert(*id)).collect()
+}
+
+fn answer_context_matches_artifact(context: &AnswerContext, artifact: &ContextArtifact) -> bool {
+    if answer_context_kind(artifact.kind) != context.kind {
+        return false;
+    }
+    if context
+        .source
+        .as_deref()
+        .is_some_and(|source| !source.trim().is_empty() && source == artifact.path)
+    {
+        return true;
+    }
+    context
+        .title
+        .as_deref()
+        .is_some_and(|title| !title.trim().is_empty() && title == artifact.title)
+}
+
+fn question_card_context_from_answer_context(context: &[AnswerContext]) -> Vec<AnswerContext> {
+    let mut seen = std::collections::HashSet::new();
+    context
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.kind,
+                AnswerContextKind::Document | AnswerContextKind::Screenshot
+            )
+        })
+        .filter(|item| {
+            let key = format!(
+                "{:?}:{}:{}",
+                item.kind,
+                item.title.as_deref().unwrap_or_default(),
+                item.source.as_deref().unwrap_or_default()
+            );
+            seen.insert(key)
+        })
+        .cloned()
+        .collect()
+}
+
 fn clean_visible_question(question: &str) -> String {
     let mut cleaned_lines = Vec::new();
     for line in question.lines() {
@@ -9948,7 +10033,7 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
     system.push_str("\n\n");
     system.push_str(HUMAN_SPEAK_CONTRACT);
     system.push_str(
-        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- For quick \"what is\" / \"explain\" answers, do not default to bullets. A compact spoken answer is better than a polished reference note.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Do not use Markdown emphasis in chat prose. Avoid bold, italics, and inline backticks unless a fenced code block is actually needed.\n- Do not use Markdown tables in streamed chat. Use short bullets or plain lines instead, and reserve table-like detail for the workbench/canvas when it is truly useful.\n- Do not use em dashes in streamed chat, final answers, or artifact text.\n- Use the canvas split: chat is the explanation/talk track; the workbench is code, patch, architecture, data flow, APIs, tables, or deeper detail.\n- Do not write \"Code is in the canvas\", \"Architecture is in the canvas\", or similar pointer-only lines. Make the chat answer useful by itself.\n- If the user explicitly asks for code, a program, implementation, or says \"I want the code\" / \"write code in <language>\", the answer must include a complete fenced code block with a language tag. For small standalone tasks, include the full runnable snippet directly in chat, not only prose or a canvas artifact.\n- For first-time coding/build answers, use this shape: Approach, Code, Explanation, Complexity, and Edge cases. Approach should have 2-4 clear bullets before code. Never start a streamed coding answer with a code fence.\n- In code blocks, put each statement on its own line with correct indentation. Never compress class, function, assignments, and return onto one wrapped line.\n- For Python/LeetCode-style answers, include required imports or avoid type hints that need imports.\n- For algorithm/interview prompts, include the full class/function signature, initialization, loop/body, return value, and sentinel or cleanup step. Never put only an inner loop, helper body, or pseudocode fragment in the code fence.\n- Add concise inline comments for important decision lines inside non-trivial code, but do not comment every trivial line.\n- For non-trivial code, add a `Line notes:` block outside the code fence using `1: ...` or small `2-4: ...` ranges so Bluey can show explanatory notes without changing copied code.\n- Always include Time Complexity and Space Complexity explicitly for algorithm/code answers.\n- Treat repeated build/implement/write requests as requests to show or regenerate the implementation. Do not answer only with \"already above\" or \"already in the session\" unless the user explicitly asks whether it already exists.\n- For code follow-ups or requested changes, prefer in-place edits: name the file/function, show only the changed block, PATCH, or unified diff, and explain where it lands. Do not replace the whole implementation unless the user explicitly asks, the file is new/tiny, or a full replacement is materially safer than a patch.\n- For explanation-only coding questions or follow-ups, do not emit a new code fence by default. Use a teaching flow: Core idea, Data structures, Operation walkthrough, Invariant, Complexity, Edge cases.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions that ask for implementation or changes, use this shape after the talk track when useful: Approach, Code or Patch, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For system design questions, keep chat to the recommendation, assumptions, and the key tradeoff. Put the full architecture workbench in sections: Architecture, Components, Data flow, APIs/contracts, Storage, Scaling, Tradeoffs, Failure modes, Observability, and Rollout / next steps when useful.\n- For system design follow-ups, answer the low-level explanation in chat unless the user asks to change the design. If they ask for a design change, update only the affected workbench section and call out what changed.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
+        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- For quick \"what is\" / \"explain\" answers, do not default to bullets. A compact spoken answer is better than a polished reference note.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Do not use Markdown emphasis in chat prose. Avoid bold, italics, and inline backticks unless a fenced code block is actually needed.\n- Do not use Markdown tables in streamed chat. Use short bullets or plain lines instead, and reserve table-like detail for the workbench/canvas when it is truly useful.\n- Do not use em dashes in streamed chat, final answers, or artifact text.\n- Use the canvas split: chat is the explanation/talk track; the workbench is code, patch, architecture, data flow, APIs, tables, or deeper detail.\n- Do not write \"Code is in the canvas\", \"Architecture is in the canvas\", or similar pointer-only lines. Make the chat answer useful by itself.\n- If the user explicitly asks for code, a program, implementation, or says \"I want the code\" / \"write code in <language>\", the answer must include a complete fenced code block with a language tag. For small standalone tasks, include the full runnable snippet directly in chat, not only prose or a canvas artifact.\n- For first-time coding/build answers, use this shape: Approach, Code, Explanation, Complexity, and Edge cases. Approach should have 2-4 clear bullets before code. Never start a streamed coding answer with a code fence.\n- In code blocks, put each statement on its own line with correct indentation. Never compress class, function, assignments, and return onto one wrapped line.\n- For Python/LeetCode-style answers, include required imports or avoid type hints that need imports.\n- For algorithm/interview prompts, include the full class/function signature, initialization, loop/body, return value, and sentinel or cleanup step. Never put only an inner loop, helper body, or pseudocode fragment in the code fence.\n- Add concise comments inside non-trivial code: place a short comment above each major block and on the important decision lines that explain why that line or block exists. Do not comment every trivial assignment.\n- For non-trivial code, add a `Line notes:` block outside the code fence using `1: ...` or small `2-4: ...` ranges so Bluey can show explanatory notes without changing copied code.\n- Always include Time Complexity and Space Complexity explicitly for algorithm/code answers.\n- Treat repeated build/implement/write requests as requests to show or regenerate the implementation. Do not answer only with \"already above\" or \"already in the session\" unless the user explicitly asks whether it already exists.\n- For code follow-ups or requested changes, prefer in-place edits: name the file/function, show only the changed block, PATCH, or unified diff, and explain where it lands. Do not replace the whole implementation unless the user explicitly asks, the file is new/tiny, or a full replacement is materially safer than a patch.\n- For explanation-only coding questions or follow-ups, do not emit a new code fence by default. Use a teaching flow: Core idea, Data structures, Operation walkthrough, Invariant, Complexity, Edge cases.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions that ask for implementation or changes, use this shape after the talk track when useful: Approach, Code or Patch, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For system design questions, keep chat to the recommendation, assumptions, and the key tradeoff. Put the full architecture workbench in sections: Architecture, Components, Data flow, APIs/contracts, Storage, Scaling, Tradeoffs, Failure modes, Observability, and Rollout / next steps when useful.\n- For system design follow-ups, answer the low-level explanation in chat unless the user asks to change the design. If they ask for a design change, update only the affected workbench section and call out what changed.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
     );
     system.push_str(
         "\n- If a screenshot or attachment is insufficient, do not fill gaps from generic knowledge. State what is visible, what is missing, and ask for the next concrete evidence: failing output, current directory/tree, relevant file, expected result, or a fresh screenshot.",
@@ -11032,7 +11117,7 @@ fn answer_request_from_overlay(
 fn mode_instructions(mode: &str) -> String {
     match mode.trim().to_ascii_lowercase().as_str() {
         "code" => {
-            "Answer in Code mode. For first-time implementation or algorithm requests, use Approach, Code, Explanation, Complexity, and Edge cases. For change requests, use Approach, Patch or Changed block, Explanation, and Complexity if it changed. If the user explicitly asks for code, a program, implementation, or says they want code in a language, include a complete fenced code block with a language tag; for small standalone tasks, include the full runnable snippet directly in chat. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. In code blocks, put each statement on its own line with correct indentation; never compress class, function, assignments, and return onto one wrapped line. For Python/LeetCode-style answers, include required imports or avoid type hints that need imports. For algorithm/interview prompts, include the full class/function signature, initialization, loop/body, return value, and sentinel or cleanup step; never show only the inner loop as the code artifact. Add concise inline comments for important decision lines inside non-trivial code, but do not comment every trivial line. Add `Line notes:` outside the code fence with numbered line or small-range explanations so the copied code stays clean. Always include Time Complexity and Space Complexity explicitly. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. Preserve the existing implementation by default: show the smallest safe changed block, PATCH, or unified diff, and name exactly where it belongs. Only provide a full replacement when the user asks for it, the file is new/tiny, or the surrounding code is too small for a safe patch. For explanation-only questions, skip Patch and teach the logic step by step: core idea, data structures, operation walkthrough, invariant, complexity, and edge cases. Keep commentary practical and avoid unrelated theory.".to_string()
+            "Answer in Code mode. For first-time implementation or algorithm requests, use Approach, Code, Explanation, Complexity, and Edge cases. For change requests, use Approach, Patch or Changed block, Explanation, and Complexity if it changed. If the user explicitly asks for code, a program, implementation, or says they want code in a language, include a complete fenced code block with a language tag; for small standalone tasks, include the full runnable snippet directly in chat. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. In code blocks, put each statement on its own line with correct indentation; never compress class, function, assignments, and return onto one wrapped line. For Python/LeetCode-style answers, include required imports or avoid type hints that need imports. For algorithm/interview prompts, include the full class/function signature, initialization, loop/body, return value, and sentinel or cleanup step; never show only the inner loop as the code artifact. Add concise comments inside non-trivial code: place a short comment above each major block and on the important decision lines that explain why that line or block exists. Do not comment every trivial assignment. Add `Line notes:` outside the code fence with numbered line or small-range explanations so the copied code stays clean. Always include Time Complexity and Space Complexity explicitly. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. Preserve the existing implementation by default: show the smallest safe changed block, PATCH, or unified diff, and name exactly where it belongs. Only provide a full replacement when the user asks for it, the file is new/tiny, or the surrounding code is too small for a safe patch. For explanation-only questions, skip Patch and teach the logic step by step: core idea, data structures, operation walkthrough, invariant, complexity, and edge cases. Keep commentary practical and avoid unrelated theory.".to_string()
         }
         "system design" | "system-design" | "design" => {
             "Answer in System Design mode. Keep chat to the short recommendation, assumptions, and key tradeoff. Put deeper workbench detail under `### Architecture`, `### Components`, `### Data flow`, `### APIs / contracts`, `### Storage`, `### Scaling`, `### Tradeoffs`, `### Failure modes`, `### Observability`, and `### Rollout / next steps` when useful. Prefer concrete services, storage choices, queues, cache boundaries, APIs, capacity assumptions, and failure modes. Use compact bullets and simple text diagrams when useful. For follow-ups, answer low-level explanation in chat unless the user asks to change the design; then update only the affected section unless a full redesign is requested.".to_string()
@@ -11044,7 +11129,7 @@ fn mode_instructions(mode: &str) -> String {
             "Answer in Writing mode. Produce polished copy first, then a short `### Notes` section explaining tone, edits, and optional variants. Keep the draft easy to reuse.".to_string()
         }
         _ => {
-            "Answer in General mode. Auto-detect the task type. Put the direct answer first, then concise context, reasoning, and next steps. If the question asks to explain code, an algorithm, or logic, teach it step by step in plain language and avoid a Patch section unless the user asks for code changes. If the question asks for implementation, debugging, APIs, config, terminal commands, or explicitly asks for code in a language, preserve existing code by default. For first-time code, use Approach, Code, Explanation, Complexity, and Edge cases. For follow-up changes, use Approach, Patch or Changed block, Explanation, and Complexity if it changed. Explicit code requests must include a complete fenced code block with a language tag; for small standalone tasks, include the full runnable snippet directly in chat. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. Code blocks must keep each statement on its own line with correct indentation, and non-trivial code should include concise inline comments on important decision lines. Algorithm/interview code answers must include the full class/function signature and return path, not only the inner loop, and should include `Line notes:` outside the code fence for non-trivial code. Always include Time Complexity and Space Complexity for algorithm/code answers. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. For follow-up code changes, prefer a small changed block, PATCH, or unified diff over full replacement. Keep it practical and easy to scan in a small overlay.".to_string()
+            "Answer in General mode. Auto-detect the task type. Put the direct answer first, then concise context, reasoning, and next steps. If the question asks to explain code, an algorithm, or logic, teach it step by step in plain language and avoid a Patch section unless the user asks for code changes. If the question asks for implementation, debugging, APIs, config, terminal commands, or explicitly asks for code in a language, preserve existing code by default. For first-time code, use Approach, Code, Explanation, Complexity, and Edge cases. For follow-up changes, use Approach, Patch or Changed block, Explanation, and Complexity if it changed. Explicit code requests must include a complete fenced code block with a language tag; for small standalone tasks, include the full runnable snippet directly in chat. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. Code blocks must keep each statement on its own line with correct indentation, and non-trivial code should include concise comments above major blocks and on important decision lines. Algorithm/interview code answers must include the full class/function signature and return path, not only the inner loop, and should include `Line notes:` outside the code fence for non-trivial code. Always include Time Complexity and Space Complexity for algorithm/code answers. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. For follow-up code changes, prefer a small changed block, PATCH, or unified diff over full replacement. Keep it practical and easy to scan in a small overlay.".to_string()
         }
     }
 }
@@ -16645,6 +16730,49 @@ mod tests {
     }
 
     #[test]
+    fn inferred_answer_context_produces_question_attachment_chips() {
+        let mut meeting = MeetingRecord::new(Some("Screen QA".to_string()));
+        let screen = ContextArtifact::new(
+            ContextKind::Image,
+            "/tmp/bluey-screen.png",
+            "Screen context",
+            Some("Captured screenshot context for this answer.".to_string()),
+            Some(128),
+        )
+        .with_text_preview("LeetCode 37 Sudoku Solver")
+        .with_processing_status(ContextProcessingStatus::Ready);
+        let screen_id = screen.id;
+        meeting.context.push(screen);
+
+        let answer_context = vec![
+            AnswerContext::new(AnswerContextKind::MeetingMemory, "recent answer"),
+            AnswerContext::new(AnswerContextKind::Screenshot, "Relevant current-session attachment selected for this question.\nLeetCode 37 Sudoku Solver")
+                .with_title("Screen context")
+                .with_source("/tmp/bluey-screen.png"),
+        ];
+
+        let attachment_ids = question_attachment_ids_for_request(&meeting, &[], &answer_context);
+        assert_eq!(attachment_ids, vec![screen_id]);
+
+        let visible_context = visible_question_context_for_ids(&meeting, &attachment_ids);
+        let fallback_context = question_card_context_from_answer_context(&answer_context);
+        let display_context = if visible_context.is_empty() {
+            fallback_context
+        } else {
+            visible_context
+        };
+        let attachments = question_card_attachments(&display_context);
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].kind, "screen");
+        assert_eq!(attachments[0].title, "Screen context");
+        assert_eq!(
+            attachments[0].path.as_deref(),
+            Some("/tmp/bluey-screen.png")
+        );
+    }
+
+    #[test]
     fn mode_instructions_specialize_default_answer_shapes() {
         let code = mode_instructions("Code");
         let design = mode_instructions("System Design");
@@ -16662,7 +16790,8 @@ mod tests {
         assert!(code.contains("Line notes"));
         assert!(code.contains("Time Complexity and Space Complexity"));
         assert!(code.contains("correct indentation"));
-        assert!(code.contains("concise inline comments"));
+        assert!(code.contains("comments inside non-trivial code"));
+        assert!(code.contains("above each major block"));
         assert!(design.contains("### Architecture"));
         assert!(design.contains("### APIs / contracts"));
         assert!(design.contains("### Failure modes"));
@@ -16686,7 +16815,8 @@ mod tests {
         assert!(general.contains("Line notes"));
         assert!(general.contains("Approach, Code, Explanation, Complexity"));
         assert!(general.contains("correct indentation"));
-        assert!(general.contains("concise inline comments"));
+        assert!(general.contains("comments above major blocks"));
+        assert!(general.contains("important decision lines"));
         assert!(general.contains("Time Complexity and Space Complexity"));
         assert!(general.contains("small changed block"));
         assert!(general.contains("unified diff"));

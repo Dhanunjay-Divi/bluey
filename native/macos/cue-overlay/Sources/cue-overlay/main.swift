@@ -10151,7 +10151,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func consumeSentPendingContextAttachments() {
-        guard !pendingContextItemIds.isEmpty || showingSavedContextItems else { return }
         pendingContextItemIds.removeAll()
         showingSavedContextItems = false
         contextMutationExpectedUntil = nil
@@ -10159,11 +10158,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             setKnowledgeBadge(
                 savedContextBadgeTitle(for: contextItems.count, showing: showingSavedContextItems),
                 accent: BlueyTheme.green)
-            renderAttachmentStrip(itemsForVisibleAttachmentStrip())
+            renderAttachmentStrip([])
             refreshAttachmentStripLayout()
             return
         }
         renderAttachmentStrip([])
+        refreshAttachmentStripLayout()
     }
 
     func setSessions(_ sessions: [OverlaySessionItem]) {
