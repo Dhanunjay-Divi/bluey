@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Meeting lifecycle: one meeting per listening session (no more "Ad hoc
+  meeting" fragments).** History filled with junk because a too-eager create path
+  minted a fresh meeting per transcript line and titled each from its first line.
+  Now a single session meeting is created at listening-start (create-iff-none,
+  generic time-based "Meeting HH:MM" title) and every segment + Q&A coalesces into
+  it; it auto-ends (archives — never discards) on stop (`AudioStop` /
+  `RecordingStopRequested`), explicit `MeetingEnd`, and idle-silence, all through
+  one shared `auto_end_active_meeting` path that runs only AFTER audio capture has
+  stopped (so it can never archive a live recording). Titles are upgraded from the
+  recap ONLY at end, and a user rename that happens to start with "Meeting " is
+  preserved (strict "Meeting HH:MM" shape check, never a loose prefix match). The
+  History list is filtered by a stricter `meeting_is_substantive()` (2+ committed
+  units, a written summary, or attached context) so 1-line fragments and empty
+  active shells no longer appear. Also repaired a pre-existing compile break in the
+  `live_transcript_emit` integration test (drifted `LiveTranscriptEvent` fields).
 - **Continue now restores the FULL meeting context, not just the transcript.**
   "Continue in Ask" re-seeded the transcript + Q&A but never re-attached the
   meeting's linked agent thread — so the agent conversation was missing. It now

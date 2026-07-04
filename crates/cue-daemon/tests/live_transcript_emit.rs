@@ -14,6 +14,9 @@ fn live_transcript_event_serializes_correctly() {
         is_final: true,
         speaker: None,
         ts_ms: 1715792400000,
+        kind: "transcript".to_string(),
+        ledger: None,
+        audio_secs: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["session_id"], "abc-123");
@@ -39,6 +42,9 @@ async fn broadcast_channel_delivers_live_transcript_event() {
         is_final: false,
         speaker: None,
         ts_ms: 1000,
+        kind: "transcript".to_string(),
+        ledger: None,
+        audio_secs: None,
     };
 
     tx.send(event.clone()).unwrap();

@@ -394,6 +394,29 @@ impl MeetingRecord {
                 .is_some_and(|summary| !summary.trim().is_empty())
     }
 
+    /// A STRICTER bar than [`has_content`] for what belongs in the History list.
+    /// A meeting is "substantive" — worth showing to the user — iff it has real
+    /// conversational weight: at least two committed units (final transcript
+    /// segments + Q&A turns combined), OR a written summary, OR attached context.
+    /// This hides the 1-line / 0-turn fragments and empty active shells that a
+    /// too-eager create path used to spawn, without discarding anything already
+    /// archived.
+    pub fn meeting_is_substantive(&self) -> bool {
+        let final_transcript = self
+            .transcript
+            .iter()
+            .filter(|segment| segment.is_final)
+            .count();
+        if final_transcript + self.conversation.len() >= 2 {
+            return true;
+        }
+        !self.context.is_empty()
+            || self
+                .summary
+                .as_ref()
+                .is_some_and(|summary| !summary.trim().is_empty())
+    }
+
     pub fn last_transcript_text(&self, count: usize) -> String {
         let start = self.transcript.len().saturating_sub(count);
         self.transcript[start..]
@@ -518,6 +541,79 @@ pub struct MemoryHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_meeting_is_substantive_thresholds() {
+        // Empty shell → not substantive (the fragment/empty-active case).
+        let empty = MeetingRecord::new(Some("Meeting 10:00".to_string()));
+        assert!(!empty.meeting_is_substantive());
+
+        // A single final segment (1 unit) is below the >= 2 bar → not substantive.
+        let mut one_line = MeetingRecord::new(Some("Meeting 10:00".to_string()));
+        one_line
+            .transcript
+            .push(TranscriptSegment::new(Speaker::System, "hello", true));
+        assert!(!one_line.meeting_is_substantive());
+
+        // Non-final partials don't count toward the transcript weight.
+        let mut only_partials = MeetingRecord::new(Some("Meeting 10:00".to_string()));
+        only_partials.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            "partial one",
+            false,
+        ));
+        only_partials.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            "partial two",
+            false,
+        ));
+        assert!(
+            !only_partials.meeting_is_substantive(),
+            "partials must not count toward substance"
+        );
+
+        // Two final segments → substantive.
+        let mut two_finals = MeetingRecord::new(Some("Meeting 10:00".to_string()));
+        two_finals
+            .transcript
+            .push(TranscriptSegment::new(Speaker::System, "a", true));
+        two_finals
+            .transcript
+            .push(TranscriptSegment::new(Speaker::User, "b", true));
+        assert!(two_finals.meeting_is_substantive());
+
+        // One final segment + one Q&A turn (1 + 1 = 2 units) → substantive.
+        let mut mixed = MeetingRecord::new(Some("Meeting 10:00".to_string()));
+        mixed
+            .transcript
+            .push(TranscriptSegment::new(Speaker::System, "a", true));
+        mixed.push_conversation_turn(ConversationTurn::new(
+            "q",
+            "a",
+            Some("overlay ask".to_string()),
+            Some("Bluey managed".to_string()),
+        ));
+        assert!(mixed.meeting_is_substantive());
+
+        // A written summary alone → substantive (a whitespace-only summary is not).
+        let mut summarized = MeetingRecord::new(Some("Meeting 10:00".to_string()));
+        summarized.summary = Some("Recap text.".to_string());
+        assert!(summarized.meeting_is_substantive());
+        let mut blank_summary = MeetingRecord::new(Some("Meeting 10:00".to_string()));
+        blank_summary.summary = Some("   ".to_string());
+        assert!(!blank_summary.meeting_is_substantive());
+
+        // Attached context alone → substantive.
+        let mut with_context = MeetingRecord::new(Some("Meeting 10:00".to_string()));
+        with_context.context.push(ContextArtifact::new(
+            ContextKind::Text,
+            "pasted.txt",
+            "pasted spec",
+            Some("pasted spec text".to_string()),
+            None,
+        ));
+        assert!(with_context.meeting_is_substantive());
+    }
 
     #[test]
     fn recent_conversation_text_keeps_follow_up_context() {
