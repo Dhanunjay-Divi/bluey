@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 09:00 EDT
+Latest checkpoint: 2026-07-04 09:35 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,44 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-337-OVERLAY-CONTENT-SCROLLING.md`; the next canonical Bluey round doc should start at `ROUND-338-...`.
+- Latest completed Bluey round doc is `ROUND-338-CANVAS-CLICKTHROUGH-HITTEST.md`; the next canonical Bluey round doc should start at `ROUND-339-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 338 is complete and deployed for canvas click-through hit testing:
+  - owner reported canvas mode click-through was not working
+  - root cause: macOS overlay treated the entire open canvas pane as interactive when click-through was enabled
+  - generic interactive hit testing could also classify selectable canvas text as interactive, keeping the whole canvas mouse-active
+  - added `CanvasPaneView.passThroughInteractiveHit(at:)`
+  - in click-through mode, canvas now only keeps enabled header buttons and canvas scroller interactive
+  - canvas body, code/text area, and blank canvas background now click through to the app behind Bluey
+  - canvas divider and blue move handle remain interactive
+  - shortcuts copy now states: `With click-through on, canvas body clicks behind Bluey; canvas buttons stay usable.`
+  - workspace desktop version bumped to `0.1.77`
+  - verification passed:
+    - `cd native/macos/cue-overlay && swift build -c release`
+    - `cargo check -p cue-daemon -p cue-cli`
+    - `BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64`
+    - `BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh`
+    - `BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.77`
+    - `curl -fsSL https://bluey.sh/install.sh | bash`
+    - `/Users/uno/.bluey/bin/bluey --version`
+    - `/Users/uno/.bluey/bin/bluey-daemon --version`
+  - Release/deploy:
+    - desktop release `0.1.77` is live on `bluey.sh`
+    - live `latest.json.sig` verified successfully
+    - live installer MIME checks passed for `/install.sh` and `/install.ps1`
+    - live macOS artifact SHA verified:
+      `40013718b5a79394f166186274d1b12782aa52bc93a49465182a6a5ed5c4bca2`
+    - unpacked macOS release reports `bluey 0.1.77` and `bluey-daemon 0.1.77`
+    - public installer smoke installed `0.1.77` locally and both installed binaries report `0.1.77`
+    - non-interactive install could not prompt sudo and correctly fell back to `/Users/uno/.local/bin/bluey`
+  - Windows parity:
+    - issue and fix are in the macOS Swift overlay canvas; Windows C overlay does not share this exact canvas pane/hit-test path, so no Windows code change was made
+  - Round doc:
+    `docs/rounds/ROUND-338-CANVAS-CLICKTHROUGH-HITTEST.md`
 - Round 337 is complete and deployed for overlay content scrolling:
   - owner asked how users can scroll when click-through is off and suggested `Option` plus up/down arrows
   - confirmed the macOS overlay already forwards mouse-wheel events to feed/canvas/history/transcript/composer areas under the pointer

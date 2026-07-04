@@ -4552,6 +4552,23 @@ private final class CanvasPaneView: NSView {
         scrollClipView(scroll.contentView, documentView: scroll.documentView, deltaY: direction * step)
     }
 
+    func passThroughInteractiveHit(at point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01, bounds.contains(point) else { return nil }
+        guard let hit = super.hitTest(point) else { return nil }
+
+        var current: NSView? = hit
+        while let view = current {
+            if let button = view as? NSButton, button.isEnabled {
+                return hit
+            }
+            if view is NSScroller {
+                return hit
+            }
+            current = view.superview
+        }
+        return nil
+    }
+
     private func styleCanvasHeaderButton(_ button: NSButton, symbol: String, fallback: String) {
         button.title = ""
         button.isBordered = false
@@ -5916,6 +5933,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             if isCanvasDividerHit(at: point) {
                 return canvasDivider
             }
+            if canvasOpen, rectForView(canvasPane).contains(point) {
+                return canvasPassThroughHit(at: point)
+            }
             if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
                 return hit
             }
@@ -5924,9 +5944,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
             if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(point) {
                 return super.hitTest(point)
-            }
-            if canvasOpen, rectForView(canvasPane).contains(point) {
-                return super.hitTest(point) ?? canvasPane
             }
             if !resizeEdges(at: point).isEmpty {
                 return self
@@ -6982,7 +6999,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 : true
         }
         if canvasOpen, rectForView(canvasPane).contains(localPoint) {
-            return true
+            return canvasPassThroughHit(at: localPoint) != nil
         }
         if isHeaderMoveHandleHit(at: localPoint) {
             return true
@@ -7004,6 +7021,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return false
         }
         return isExplicitInteractiveHit(hit)
+    }
+
+    private func canvasPassThroughHit(at rootPoint: NSPoint) -> NSView? {
+        guard canvasOpen,
+              !canvasPane.isHidden,
+              canvasPane.alphaValue > 0.01,
+              rectForView(canvasPane).contains(rootPoint)
+        else {
+            return nil
+        }
+        let point = canvasPane.convert(rootPoint, from: self)
+        return canvasPane.passThroughInteractiveHit(at: point)
     }
 
     func manualButton(atWindowPoint point: NSPoint) -> NSButton? {
@@ -8530,6 +8559,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         appendPair("Opt+Down", "Scroll down", "Opt+Up", "Scroll up")
         appendLine("Letters always type normally when Ask is focused.")
         appendLine("Mouse wheel scrolls the answer, canvas, or history under the pointer.")
+        appendLine("With click-through on, canvas body clicks behind Bluey; canvas buttons stay usable.")
         appendLine("Opacity selected: arrow keys adjust it.")
         appendLine()
         appendLine("Global shortcuts work in both modes:")
