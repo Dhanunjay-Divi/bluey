@@ -110,8 +110,19 @@ fn internal_disclosure_error(user_text: &str) -> Option<(StatusCode, Json<ApiErr
     })
 }
 
+fn internal_disclosure_guard_text(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let Some(after_label) = trimmed.strip_prefix("Question:") else {
+        return trimmed;
+    };
+    let after_label = after_label
+        .trim_start_matches(|ch: char| ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n');
+    let end = after_label.find("\n\n").unwrap_or(after_label.len());
+    after_label[..end].trim()
+}
+
 fn is_internal_disclosure_request(text: &str) -> bool {
-    let normalized = normalize_guardrail_text(text);
+    let normalized = normalize_guardrail_text(internal_disclosure_guard_text(text));
     if normalized.is_empty() {
         return false;
     }

@@ -437,6 +437,21 @@ fn log_answer_request_diagnostics(
     );
 }
 
+fn initial_answer_progress_text(request: &AnswerRequest) -> &'static str {
+    let context = answer_context_shape(&request.context);
+    if context.screenshots > 0 {
+        "Reading screen context..."
+    } else if context.documents > 0 {
+        "Reading attached files..."
+    } else if context.transcripts > 0 {
+        "Reading live transcript..."
+    } else if context.memory > 0 {
+        "Checking saved context..."
+    } else {
+        "Preparing answer..."
+    }
+}
+
 fn log_answer_completion_diagnostics(
     request: &AnswerRequest,
     provider: &ProviderSelector,
@@ -539,8 +554,19 @@ fn internal_disclosure_refusal_for_question(question: &str) -> Option<&'static s
     is_internal_disclosure_request(question).then_some(INTERNAL_DISCLOSURE_REFUSAL)
 }
 
+fn internal_disclosure_guard_text(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let Some(after_label) = trimmed.strip_prefix("Question:") else {
+        return trimmed;
+    };
+    let after_label = after_label
+        .trim_start_matches(|ch: char| ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n');
+    let end = after_label.find("\n\n").unwrap_or(after_label.len());
+    after_label[..end].trim()
+}
+
 fn is_internal_disclosure_request(text: &str) -> bool {
-    let normalized = normalize_guardrail_text(text);
+    let normalized = normalize_guardrail_text(internal_disclosure_guard_text(text));
     if normalized.is_empty() {
         return false;
     }
@@ -7074,13 +7100,22 @@ async fn answer_with_provider_runtime(
     .await;
     write_state(daemon).await?;
 
-    let answer_card = CueCard::new(CardKind::Answer, "Bluey", "")
+    let initial_progress = initial_answer_progress_text(&request);
+    let answer_card = CueCard::new(CardKind::Answer, "Bluey", initial_progress)
         .with_source(format!("{} ({})", source, request.metadata.request_id));
     let answer_card_id = answer_card.id;
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card: answer_card }).await;
     register_active_answer_card(daemon, generation_id, answer_card_id).await;
     let mut overlay_stream =
         OverlayAnswerStream::new(Arc::clone(daemon), answer_card_id, generation_id);
+    overlay_stream.push_status(initial_progress).await?;
+    info!(
+        request_id = %request.metadata.request_id,
+        card_id = %answer_card_id,
+        generation_id,
+        progress = initial_progress,
+        "answer pipeline created visible progress card"
+    );
 
     let outcome = match resolve_answer_route(
         &daemon.paths,
@@ -7504,10 +7539,10 @@ fn code_chat_body_for_artifact(body: &str, artifact: &CueCardArtifact) -> String
     };
     let mut visible = strip_canvas_pointer_lines(&body).trim().to_string();
     if visible.is_empty() || code_answer_is_pointer_only(&visible) {
-        visible = "Here is the code:".to_string();
+        visible = "Complete code with comments:".to_string();
     }
-    if code.lines().count() > 8 || code.chars().count() > 600 {
-        return visible;
+    if code.lines().count() > 80 || code.chars().count() > 5_000 {
+        return format!("{visible}\n\nThe full code is open in the code panel.");
     }
     let language = infer_code_language(&code);
     format!("{visible}\n\n```{language}\n{code}\n```")
@@ -7526,7 +7561,7 @@ fn strip_unclosed_code_fence_tail(body: &str) -> String {
         }
         kept.push(line);
     }
-    kept.join("\n")
+    remove_empty_code_headings(&kept.join("\n"))
 }
 
 fn artifact_can_recover_incomplete_answer(artifact: &CueCardArtifact, reason: &str) -> bool {
@@ -7626,7 +7661,7 @@ fn first_code_section_from_artifact(body: &str) -> Option<String> {
     }
     let code = lines.join("\n").trim().to_string();
     if code_canvas_has_real_code(&code) {
-        Some(clamp_code_preview(&code, 40))
+        Some(clamp_code_preview(&code, 120))
     } else {
         None
     }
@@ -7652,6 +7687,12 @@ fn infer_code_language(code: &str) -> &'static str {
         "sql"
     } else if lower.contains("function ") || lower.contains("const ") || lower.contains("let ") {
         "javascript"
+    } else if lower.contains("#include")
+        || lower.contains("std::")
+        || lower.contains("public:")
+        || lower.contains("string ")
+    {
+        "cpp"
     } else if lower.contains("public static void main") {
         "java"
     } else {
@@ -9089,6 +9130,14 @@ async fn call_bluey_managed_provider(
                 stream.push_status("Reading screen context").await?;
             }
         }
+        info!(
+            provider = %provider.display_label(),
+            request_id = %request.metadata.request_id,
+            lane = ?lane,
+            max_tokens = llm_request.max_tokens,
+            image_count = llm_request.image_data_urls.len(),
+            "managed provider stream starting"
+        );
         let mut chunks = managed
             .complete_stream(&llm_request)
             .await
@@ -9200,13 +9249,18 @@ async fn call_bluey_managed_provider(
                 .filter(|artifact| artifact_can_recover_incomplete_answer(artifact, reason))
             {
                 let recovered_answer = visible_answer_body_for_artifact(&answer, Some(artifact));
+                let recovered_incomplete_reason =
+                    incomplete_answer_reason(&recovered_answer).unwrap_or("none");
                 warn!(
                     provider = %provider.display_label(),
                     request_id = %request.metadata.request_id,
                     answer_chars = answer.chars().count(),
                     recovered_answer_chars = recovered_answer.chars().count(),
+                    recovered_answer_lines = recovered_answer.lines().count(),
                     answer_incomplete_reason = reason,
+                    recovered_incomplete_reason,
                     artifact_type = %artifact_type_label(artifact.artifact_type),
+                    artifact_body_chars = artifact.body.chars().count(),
                     "managed provider stream recovered incomplete visible answer from artifact"
                 );
                 if let Some(stream) = stream.as_mut() {
@@ -9336,13 +9390,18 @@ async fn call_bluey_managed_provider(
             .filter(|artifact| artifact_can_recover_incomplete_answer(artifact, reason))
         {
             let recovered_answer = visible_answer_body_for_artifact(&answer, Some(artifact));
+            let recovered_incomplete_reason =
+                incomplete_answer_reason(&recovered_answer).unwrap_or("none");
             warn!(
                 provider = %provider.display_label(),
                 request_id = %request.metadata.request_id,
                 answer_chars = answer.chars().count(),
                 recovered_answer_chars = recovered_answer.chars().count(),
+                recovered_answer_lines = recovered_answer.lines().count(),
                 answer_incomplete_reason = reason,
+                recovered_incomplete_reason,
                 artifact_type = %artifact_type_label(artifact.artifact_type),
+                artifact_body_chars = artifact.body.chars().count(),
                 "managed provider recovered incomplete visible answer from artifact"
             );
             if let Some(stream) = stream.as_mut() {
@@ -10256,7 +10315,19 @@ fn should_use_behavioral_interview_answer_mode(payload: &ProviderRequestPayload)
         "system design",
     ]
     .iter()
-    .any(|signal| question.contains(signal));
+    .any(|signal| question.contains(signal))
+        || (question.contains("code")
+            && [
+                "write",
+                "give",
+                "show",
+                "provide",
+                "generate",
+                "convert",
+                "translate",
+            ]
+            .iter()
+            .any(|signal| question.contains(signal)));
     if direct_code_or_design_request && !coaching_story_signal {
         return false;
     }
@@ -17405,7 +17476,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_answer_body_strips_large_code_when_canvas_exists() {
+    fn visible_answer_body_includes_normal_code_when_canvas_exists() {
         let answer = "Approach\n- Track x and y.\n\n```cpp\nclass Solution {\npublic:\n    bool judgeCircle(string moves) {\n        int x = 0;\n        int y = 0;\n        for (char move : moves) {\n            if (move == 'U') y++;\n            else if (move == 'D') y--;\n            else if (move == 'L') x--;\n            else if (move == 'R') x++;\n        }\n        return x == 0 && y == 0;\n    }\n};\n```\n\nExplanation\nThe counters cancel opposing moves.\nComplexity\nTime Complexity: O(N)\nSpace Complexity: O(1)";
         let artifact = answer_overlay_artifact(answer).expect("code artifact");
         let visible = visible_answer_body_for_artifact(answer, Some(&artifact));
@@ -17413,8 +17484,31 @@ mod tests {
         assert!(visible.contains("Approach"));
         assert!(visible.contains("Explanation"));
         assert!(visible.contains("Complexity"));
-        assert!(!visible.contains("class Solution"));
-        assert!(!visible.contains("```"));
+        assert!(visible.contains("```cpp"));
+        assert!(visible.contains("class Solution"));
+        assert!(visible.contains("return x == 0 && y == 0;"));
+    }
+
+    #[test]
+    fn visible_answer_body_keeps_very_large_code_in_canvas() {
+        let code = (0..90)
+            .map(|index| format!("    // generated line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let artifact = CueCardArtifact {
+            artifact_type: CardArtifactType::Code,
+            title: "Code canvas".to_string(),
+            body: format!("CODE\n----\nclass Solution {{\n{code}\n}}"),
+            confidence: 0.95,
+        };
+        let visible = visible_answer_body_for_artifact(
+            "Approach\nThe full implementation is in the code panel.",
+            Some(&artifact),
+        );
+
+        assert!(visible.contains("Approach"));
+        assert!(visible.contains("full code is open in the code panel"));
+        assert!(!visible.contains("generated line 89"));
     }
 
     #[test]
@@ -17549,6 +17643,26 @@ mod tests {
         assert!(body.contains("```python\ndef fib(n):\n    return n\n```"));
         assert!(!body.contains("1: demo note\n```"));
         assert_eq!(incomplete_answer_reason(&body), None);
+    }
+
+    #[test]
+    fn code_artifact_recovery_removes_dangling_code_heading() {
+        let artifact = CueCardArtifact {
+            artifact_type: CardArtifactType::Code,
+            title: "Code canvas".to_string(),
+            body: "CODE\n----\npackage main\n\nfunc solve() int {\n    return 42\n}".to_string(),
+            confidence: 0.95,
+        };
+        let body = visible_answer_body_for_artifact(
+            "I would write the Go version with the same idea.\nCode\n```go\npackage main",
+            Some(&artifact),
+        );
+
+        assert_eq!(incomplete_answer_reason(&body), None);
+        assert!(body.contains("I would write the Go version"));
+        assert!(body.contains("```text"));
+        assert!(body.contains("func solve() int"));
+        assert!(!body.trim_end().ends_with("Code"));
     }
 
     #[test]
@@ -17708,6 +17822,13 @@ mod tests {
             internal_disclosure_refusal_for_question("help me write a system prompt for my app"),
             None
         );
+    }
+
+    #[test]
+    fn internal_disclosure_guard_ignores_session_context_for_coding_followups() {
+        let question = "Question:\nSo can you give me Java code for the same?\n\nSession context:\n[Recent coding context from active session coding context]\nPrior coding question:\nYou are given an array of positive integers nums. Alice can choose either all single-digit numbers or all double-digit numbers from nums. Return true if Alice can win this game, otherwise return false.\n\nPrior answer summary:\nI would sum both choices and compare either choice against Bob's remaining total.";
+
+        assert_eq!(internal_disclosure_refusal_for_question(question), None);
     }
 
     #[test]
