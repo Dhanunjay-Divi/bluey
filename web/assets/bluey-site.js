@@ -2128,7 +2128,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('accountDashboard').hidden = !authed;
       document.getElementById('accountRecoveryCard').hidden = true;
       document.getElementById('accountSignOut').hidden = true;
-      if (!authed) return;
+      if (!authed) {
+        setAdminDashboardAvailability(false);
+        return;
+      }
       const requestedSessionId = pendingSessionId();
       const refreshButton = document.getElementById('refreshAccountButton');
       if (refreshButton) refreshButton.disabled = true;
@@ -2203,9 +2206,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         renderUsage(usage);
         renderAutoReload(me);
         updateManualReloadDraftCopy();
+        const isAdmin = Boolean(me.is_admin);
+        setAdminDashboardAvailability(isAdmin);
         const adminSection = document.getElementById('adminAbuseSection');
-        if (adminSection) adminSection.hidden = !me.is_admin;
-        if (me.is_admin) {
+        if (adminSection) adminSection.hidden = !isAdmin;
+        if (isAdmin && normalizeDashboardTabName(window.location.hash) === 'admin') {
+          setDashboardTab('admin');
+        }
+        if (isAdmin) {
           loadAdminAbuse().catch((error) => {
             renderAdminAbuse({}, `Could not load trial abuse events: ${error.message}`);
           });
@@ -2257,7 +2265,27 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (tab === 'session-history' || tab === 'history' || tab === 'saved-sessions') return 'history';
       if (tab === 'summary' || tab === 'usage') return 'summary';
       if (tab === 'billing' || tab === 'reload' || tab === 'credits') return 'billing';
+      if (tab === 'admin' || tab === 'trial-protection' || tab === 'trial-abuse') return 'admin';
       return '';
+    }
+
+    function setAdminDashboardAvailability(enabled) {
+      const button = document.getElementById('dashboardTabAdminButton');
+      const panel = document.getElementById('dashboardTabAdmin');
+      if (button) {
+        button.hidden = !enabled;
+        if (!enabled) {
+          button.classList.remove('is-active');
+          button.setAttribute('aria-selected', 'false');
+        }
+      }
+      if (!enabled && panel) {
+        panel.hidden = true;
+        panel.classList.remove('is-active');
+      }
+      if (!enabled && normalizeDashboardTabName(window.location.hash) === 'admin') {
+        setDashboardTab('computers', true);
+      }
     }
 
     function setDashboardTab(tabName, updateHash = false) {

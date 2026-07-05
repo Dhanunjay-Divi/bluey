@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070423"
+    href="/assets/bluey-site.css?v=2026070424"
   >
   <script type="application/ld+json">
   {
@@ -477,6 +477,7 @@
               <button class="dashboard-tab" id="dashboardTabHistoryButton" type="button" role="tab" aria-selected="false" aria-controls="dashboardTabHistory" data-dashboard-tab="history">Session History</button>
               <button class="dashboard-tab" id="dashboardTabSummaryButton" type="button" role="tab" aria-selected="false" aria-controls="dashboardTabSummary" data-dashboard-tab="summary">Summary</button>
               <button class="dashboard-tab" id="dashboardTabBillingButton" type="button" role="tab" aria-selected="false" aria-controls="dashboardTabBilling" data-dashboard-tab="billing">Billing</button>
+              <button class="dashboard-tab" id="dashboardTabAdminButton" type="button" role="tab" aria-selected="false" aria-controls="dashboardTabAdmin" data-dashboard-tab="admin" hidden>Admin</button>
             </div>
 
             <section class="dashboard-tab-panel is-active" id="dashboardTabComputers" role="tabpanel" aria-labelledby="dashboardTabComputersButton" data-dashboard-panel="computers">
@@ -601,16 +602,18 @@
               </section>
             </section>
 
-            <section class="dashboard-section admin-abuse-section" id="adminAbuseSection" aria-label="Trial abuse" hidden>
-              <div class="section-head">
-                <div>
-                  <h3>Trial abuse</h3>
-                  <p>Recent trial grants, denials, and signup protection events.</p>
+            <section class="dashboard-tab-panel" id="dashboardTabAdmin" role="tabpanel" aria-labelledby="dashboardTabAdminButton" data-dashboard-panel="admin" hidden>
+              <section class="dashboard-section admin-abuse-section" id="adminAbuseSection" aria-label="Trial protection" hidden>
+                <div class="section-head">
+                  <div>
+                    <h3>Trial protection</h3>
+                    <p>Admin-only view of trial grants, denials, and signup protection events.</p>
+                  </div>
+                  <button class="account-button ghost compact" id="refreshAdminAbuseButton" type="button">Refresh</button>
                 </div>
-                <button class="account-button ghost compact" id="refreshAdminAbuseButton" type="button">Refresh</button>
-              </div>
-              <div class="abuse-summary-grid" id="adminAbuseSummary"></div>
-              <div class="abuse-event-list" id="adminAbuseEvents"></div>
+                <div class="abuse-summary-grid" id="adminAbuseSummary"></div>
+                <div class="abuse-event-list" id="adminAbuseEvents"></div>
+              </section>
             </section>
           </section>
         </section>
@@ -943,7 +946,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070423"
+    src="/assets/bluey-site.js?v=2026070424"
   ></script>
 </body>
 </html>
