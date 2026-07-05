@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070411"
+    href="/assets/bluey-site.css?v=2026070412"
   >
   <script type="application/ld+json">
   {
@@ -812,12 +812,12 @@
             <a class="btn btn-primary" href="/download">Get Started</a>
             <button class="btn btn-ghost" id="tryUsButton" type="button">Try Us</button>
           </div>
-          <form class="join-bar" id="productJoinForm" action="/login" method="get">
-            <input name="user_code" type="text" placeholder="session code" autocomplete="one-time-code" spellcheck="false">
-            <button type="submit">Join</button>
+          <form class="join-bar" id="productJoinForm" action="/login" method="get" aria-label="Connect a Bluey desktop code">
+            <input name="user_code" type="text" placeholder="connect code" autocomplete="one-time-code" spellcheck="false" aria-label="Bluey connect code">
+            <button type="submit">Connect</button>
           </form>
-          <div class="hero-note">native overlay &middot; model routing &middot; prepaid credits &middot; saved sessions</div>
-          <div class="hero-note">screen, transcript, files, and session notes only by choice</div>
+          <div class="connect-help">Have a code from Bluey desktop? Enter it here to connect this browser.</div>
+          <div class="hero-note">native overlay &middot; model routing &middot; prepaid credits &middot; saved sessions only by choice</div>
         </section>
 
         <aside class="product-preview terminal-preview" aria-label="Bluey terminal preview">
@@ -897,7 +897,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070411"
+    src="/assets/bluey-site.js?v=2026070412"
   ></script>
 </body>
 </html>

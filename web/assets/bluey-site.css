@@ -860,6 +860,10 @@
       background: #ebf9ff;
     }
 
+    html[data-bluey-theme="light"] #productSite .connect-help {
+      color: #5f7281;
+    }
+
     html[data-bluey-theme="light"] #productSite .hero-note,
     html[data-bluey-theme="light"] #productSite .plan-detail,
     html[data-bluey-theme="light"] #productSite .pricing-note,
@@ -1083,6 +1087,15 @@
       border-color: var(--bluey-accent);
       background: rgba(79, 141, 255, .17);
       color: #bff8ff;
+    }
+
+    #productSite .connect-help {
+      max-width: 386px;
+      margin-top: .45rem;
+      color: #777;
+      font-size: .73rem;
+      font-weight: 560;
+      line-height: 1.38;
     }
 
     #productSite .hero-note {
@@ -1470,6 +1483,11 @@
       #productSite .join-bar {
         max-width: 100%;
         justify-content: center;
+      }
+
+      #productSite .connect-help {
+        max-width: 100%;
+        text-align: center;
       }
 
       #productSite .product-preview {
