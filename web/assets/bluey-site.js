@@ -1627,10 +1627,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const toggle = document.getElementById('autoReloadToggle');
       const setup = document.getElementById('squareCardSetup');
       const saveButton = document.getElementById('saveSquareCardButton');
+      const saveAutoReloadButton = document.getElementById('saveAutoReloadButton');
       const changeCardButton = document.getElementById('changeSquareCardButton');
       const thresholdInput = document.getElementById('autoReloadThreshold');
       const amountInput = document.getElementById('autoReloadAmount');
-      const rule = document.getElementById('autoReloadRule');
       if (!card || !hint || !method || !toggle || !setup) return;
 
       let amountCents = Number(me?.auto_topup_amount_cents || AUTO_RELOAD_DEFAULT_AMOUNT_CENTS);
@@ -1650,7 +1650,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
       card.classList.toggle('is-on', Boolean(me?.auto_topup_enabled));
       toggle.checked = Boolean(me?.auto_topup_enabled);
-      toggle.disabled = !hasSavedMethod;
+      toggle.disabled = false;
       if (setup.dataset.open !== '1') {
         setup.hidden = true;
       }
@@ -1665,18 +1665,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       if (thresholdInput) thresholdInput.value = centsToDollars(thresholdCents);
       if (amountInput) amountInput.value = centsToDollars(amountCents);
-      if (rule) {
-        rule.textContent = `Below ${threshold}, add ${amount}.`;
-      }
 
       if (me?.auto_topup_enabled) {
-        hint.textContent = 'On';
+        hint.textContent = `On. Reloads ${amount} when below ${threshold}.`;
       } else if (hasSavedMethod) {
-        hint.textContent = 'Off';
+        hint.textContent = 'Off. Turn on and click Save to enable.';
       } else if (canSaveSquareCard) {
-        hint.textContent = 'Save a card in Billing to turn on.';
+        hint.textContent = 'Save a card in Billing before turning on.';
       } else {
         hint.textContent = me?.auto_topup_unavailable_reason || 'Unavailable';
+      }
+
+      if (saveAutoReloadButton) {
+        saveAutoReloadButton.disabled = !hasSavedMethod && !me?.auto_topup_enabled;
+        saveAutoReloadButton.textContent = 'Save';
       }
 
       method.textContent = me?.saved_payment_method_label
@@ -1684,6 +1686,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         : canSaveSquareCard
           ? 'No saved card.'
           : me?.auto_topup_unavailable_reason || 'Card saving unavailable.';
+      updateAutoReloadDraftCopy();
     }
 
     function readAutoReloadSettings() {
@@ -1712,12 +1715,24 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function updateAutoReloadDraftCopy() {
       const rule = document.getElementById('autoReloadRule');
+      const toggle = document.getElementById('autoReloadToggle');
+      const saveButton = document.getElementById('saveAutoReloadButton');
       if (!rule) return;
+      const enabled = Boolean(toggle?.checked);
+      const wasEnabled = Boolean(latestAccountForBilling?.auto_topup_enabled);
+      const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
+      if (!enabled) {
+        rule.textContent = wasEnabled ? 'Click Save to turn Auto Reload off.' : 'Auto Reload is off.';
+        if (saveButton) saveButton.disabled = !wasEnabled;
+        return;
+      }
       try {
         const settings = readAutoReloadSettings();
-        rule.textContent = `Below ${money(settings.auto_topup_threshold_cents)}, add ${money(settings.auto_topup_amount_cents)}.`;
+        rule.textContent = `When balance is below ${money(settings.auto_topup_threshold_cents)}, reload ${money(settings.auto_topup_amount_cents)}.`;
+        if (saveButton) saveButton.disabled = !hasSavedMethod;
       } catch (error) {
         rule.textContent = error.message;
+        if (saveButton) saveButton.disabled = true;
       }
     }
 
@@ -1759,12 +1774,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       const balanceCents = Number(me?.balance_cents || 0);
       if (balanceCents <= 0) {
-        return 'Balance is $0. Add credits to continue paid cloud work.';
+        return 'Add credits before paid cloud work.';
       }
       if (balanceCents < 500) {
-        return 'Low balance. Add credits to keep work running.';
+        return 'Low balance. Add credits when you need more.';
       }
-      return 'Balance ready for paid cloud work.';
+      return 'Ready for paid cloud work.';
     }
 
     async function updateAutoReload(enabled) {
@@ -1778,9 +1793,38 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       renderAutoReload(me);
       accountMessage(enabled
-        ? `Auto Reload is on. Bluey will add ${money(settings.auto_topup_amount_cents)} credits when balance drops below ${money(settings.auto_topup_threshold_cents)}.`
+        ? `Auto Reload is on. Bluey will reload ${money(settings.auto_topup_amount_cents)} when balance drops below ${money(settings.auto_topup_threshold_cents)}.`
         : 'Auto Reload is off. You can add credits manually whenever you need them.');
       return me;
+    }
+
+    async function saveAutoReloadSettings() {
+      const button = document.getElementById('saveAutoReloadButton');
+      const toggle = document.getElementById('autoReloadToggle');
+      const enabled = Boolean(toggle?.checked);
+      const wasEnabled = Boolean(latestAccountForBilling?.auto_topup_enabled);
+
+      if (!enabled && !wasEnabled) {
+        updateAutoReloadDraftCopy();
+        return;
+      }
+      if (enabled && !latestAccountForBilling?.auto_topup_available) {
+        throw new Error('Save a card in Billing before turning on Auto Reload.');
+      }
+
+      const previous = button?.textContent || 'Save';
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Saving...';
+      }
+      try {
+        await updateAutoReload(enabled);
+      } finally {
+        if (button) {
+          button.textContent = previous;
+        }
+        updateAutoReloadDraftCopy();
+      }
     }
 
     async function openSquareCardSetup() {
@@ -1844,8 +1888,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         });
         closeSquareCardSetup();
         renderAutoReload(me);
-        me = await updateAutoReload(true);
-        renderAutoReload(me);
+        accountMessage('Card saved. Turn on Auto Reload and click Save when you want it active.');
       } finally {
         if (button) {
           button.disabled = false;
@@ -2433,7 +2476,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const balanceReloadPanel = document.getElementById('balanceReloadPanel');
         const isTemporaryAccount = Boolean(me.is_temporary);
         const trialMinutes = trialMinutesRemaining(me);
-        if (balanceTitle) balanceTitle.textContent = isTemporaryAccount ? 'Trial time' : 'Balance';
+        if (balanceTitle) balanceTitle.textContent = isTemporaryAccount ? 'Trial time' : 'Remaining balance';
         if (balanceValue) {
           balanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
           balanceCard?.classList.toggle('balance-trial', isTemporaryAccount);
@@ -2678,38 +2721,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('overviewReloadButton')?.addEventListener('click', () => {
         startReload();
       });
-      document.getElementById('desktopBalanceHelpButton')?.addEventListener('click', () => {
-        focusDesktopConnectCard();
-      });
       document.getElementById('refreshAccountButton')?.addEventListener('click', () => {
         loadAccount().catch((error) => accountMessage(error.message));
       });
       document.getElementById('manualReloadAmount')?.addEventListener('input', () => {
         updateManualReloadDraftCopy();
       });
-      document.getElementById('autoReloadToggle')?.addEventListener('change', (event) => {
-        const enabled = Boolean(event.target.checked);
-        event.target.disabled = true;
-        updateAutoReload(enabled)
-          .catch((error) => {
-            accountMessage(error.message);
-            event.target.checked = !enabled;
-          })
-          .finally(() => {
-            loadAccount().catch((error) => accountMessage(error.message));
-          });
+      document.getElementById('autoReloadToggle')?.addEventListener('change', () => {
+        updateAutoReloadDraftCopy();
       });
       ['autoReloadThreshold', 'autoReloadAmount'].forEach((id) => {
-        document.getElementById(id)?.addEventListener('change', () => {
-          const toggle = document.getElementById('autoReloadToggle');
-          if (!toggle?.checked) {
-            updateAutoReloadDraftCopy();
-            return;
-          }
-          updateAutoReload(true)
-            .catch((error) => accountMessage(error.message))
-            .finally(() => loadAccount().catch((error) => accountMessage(error.message)));
+        document.getElementById(id)?.addEventListener('input', () => {
+          updateAutoReloadDraftCopy();
         });
+      });
+      document.getElementById('saveAutoReloadButton')?.addEventListener('click', () => {
+        saveAutoReloadSettings().catch((error) => accountMessage(error.message));
       });
       document.getElementById('saveSquareCardButton')?.addEventListener('click', () => {
         saveSquareCard().catch((error) => accountMessage(error.message));

@@ -429,9 +429,8 @@
               <div class="dashboard-overview-main">
                 <div class="dashboard-overview-title-row">
                   <div>
-                    <h2 id="balanceTitle">Balance</h2>
-                    <p id="balanceHint">Ready for cloud answers, speech, screen, and saved sessions.</p>
-                    <p class="balance-map-hint" id="desktopBalanceHint">Desktop using another account? <button type="button" id="desktopBalanceHelpButton">Move it here.</button></p>
+                    <h2 id="balanceTitle">Remaining balance</h2>
+                    <p id="balanceHint">Used for paid cloud work.</p>
                   </div>
                   <strong id="balanceValue">$--</strong>
                 </div>
@@ -455,12 +454,13 @@
                         <input id="autoReloadThreshold" type="number" min="1" max="50" step="1" value="5" inputmode="decimal" />
                       </label>
                       <label>
-                        <span>Add</span>
+                        <span>Reload</span>
                         <input id="autoReloadAmount" type="number" min="15" max="500" step="5" value="15" inputmode="decimal" />
                       </label>
                     </div>
-                    <p class="auto-reload-rule" id="autoReloadRule">Below $5.00, add $15.00.</p>
+                    <p class="auto-reload-rule" id="autoReloadRule">When balance is below $5.00, reload $15.00.</p>
                     <p class="auto-reload-hint" id="autoReloadHint">Off until a card is saved in Billing.</p>
+                    <button class="account-button ghost compact auto-reload-save" id="saveAutoReloadButton" type="button">Save</button>
                   </div>
                 </div>
               </div>

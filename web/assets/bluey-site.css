@@ -5977,19 +5977,6 @@
       padding: 0;
     }
 
-    #accountApp .compact-auto-reload:not(.is-on) .auto-reload-fields,
-    #accountApp .compact-auto-reload:not(.is-on) .auto-reload-rule {
-      display: none;
-    }
-
-    #accountApp .compact-auto-reload:not(.is-on) .auto-reload-head {
-      grid-column: 1 / -1;
-    }
-
-    #accountApp .compact-auto-reload:not(.is-on) .auto-reload-hint {
-      margin-top: .08rem;
-    }
-
     #accountApp .dashboard-tabs {
       gap: .18rem;
       margin-top: .55rem;
@@ -6459,29 +6446,6 @@
       line-height: 1.5;
     }
 
-    #accountApp .dashboard-overview-title-row .balance-map-hint {
-      margin-top: .18rem;
-      color: #5f6a71;
-      font-size: .68rem;
-      font-weight: 800;
-      line-height: 1.3;
-    }
-
-    #accountApp .dashboard-overview-title-row .balance-map-hint button {
-      appearance: none;
-      border: 0;
-      padding: 0;
-      background: transparent;
-      color: var(--bluey-accent);
-      font: inherit;
-      cursor: pointer;
-    }
-
-    #accountApp .dashboard-overview-title-row .balance-map-hint button:hover,
-    #accountApp .dashboard-overview-title-row .balance-map-hint button:focus-visible {
-      text-decoration: underline;
-    }
-
     #accountApp .dashboard-overview-title-row #balanceValue {
       color: #f2f2f2;
       font-size: 1.45rem;
@@ -6489,7 +6453,11 @@
     }
 
     #accountApp .dashboard-overview-actions {
-      display: none;
+      display: flex;
+      flex-wrap: wrap;
+      gap: .45rem;
+      align-items: center;
+      margin-top: .08rem;
     }
 
     #accountApp .dashboard-overview-side {
@@ -6546,6 +6514,16 @@
       color: #777;
       font-size: .7rem;
       line-height: 1.35;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-save {
+      grid-column: 1 / -1;
+      justify-self: start;
+      min-height: 30px;
+      margin-top: .1rem;
+      padding: .38rem .72rem;
+      border-radius: 8px;
+      font-size: .72rem;
     }
 
     #accountApp .dashboard-tabs {
@@ -6646,10 +6624,6 @@
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-rule,
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-hint {
       color: #5f7281;
-    }
-
-    html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row .balance-map-hint {
-      color: #7890a0;
     }
 
     html[data-bluey-theme="light"] #accountApp .dashboard-tab.is-active {
