@@ -130,6 +130,19 @@ if [[ -f "$target_tmp/bin/BlueyFilePicker.app/Contents/MacOS/bluey-file-picker-m
   chmod +x "$target_tmp/bin/BlueyFilePicker.app/Contents/MacOS/bluey-file-picker-macos"
 fi
 
+# Remove STALE flat-layout leftovers from an older install. An earlier Bluey put
+# binaries directly in "$install_root/bin" (unversioned), including the interview
+# overlay bluey-overlay-macos. When a new VERSIONED install ("$install_root/<ver>/
+# bin") lands beside it, the daemon's overlay discovery can still find that old
+# flat "$install_root/bin/bluey-overlay-macos" and fail:
+#   "overlay binary is outside install directory: binary=…/bluey/bin/bluey-overlay-macos"
+# It is never the current install (the current one lives under the versioned dir),
+# so removing the flat "$install_root/bin" here is safe and prevents the collision.
+if [[ -n "$install_root" && -d "$install_root/bin" && "$install_root/bin" != "$target/bin" ]]; then
+  # ${install_root:?} aborts rather than expanding to "/bin" if the var is ever empty.
+  rm -rf "${install_root:?}/bin"
+fi
+
 rm -rf "$target"
 mv "$target_tmp" "$target"
 
