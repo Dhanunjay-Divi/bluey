@@ -69,6 +69,10 @@ pub struct UsageWindow {
     pub mix: Vec<MixEntry>,
     pub tier_label: String,
     pub projected_days_remaining: f64,
+    #[serde(default)]
+    pub projection_label: String,
+    #[serde(default)]
+    pub projection_quality: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

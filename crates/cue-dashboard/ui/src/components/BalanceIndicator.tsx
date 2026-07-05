@@ -3,6 +3,7 @@ import { invoke } from "../lib/tauri";
 import { CreditCard } from "lucide-react";
 
 interface BalanceSnapshot {
+  account_email?: string | null;
   balance_cents: number;
   balance_label: string;
   trial_seconds_remaining: number;
@@ -102,12 +103,13 @@ function tooltip(snapshot: BalanceSnapshot | null, status: string): string {
   const amount = formatCents(snapshot.auto_topup_amount_cents);
   const trialMinutes = Math.floor(snapshot.trial_seconds_remaining / 60);
   return [
+    snapshot.account_email ? `Desktop account: ${snapshot.account_email}` : null,
     `Balance: ${snapshot.balance_label}`,
     snapshot.auto_topup_enabled
       ? `Auto top-up: ${amount} under ${threshold}`
       : "Auto top-up: off",
     `Trial time: ${trialMinutes} min`,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function formatCents(cents: number): string {

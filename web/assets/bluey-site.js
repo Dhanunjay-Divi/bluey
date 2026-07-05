@@ -763,9 +763,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('usageHint').textContent = `${money(usage.total_cents_spent)} spent in ${usage.period_days || 7} days.`;
       document.getElementById('tierValue').textContent = usage.tier_label || '--';
       const projectedDays = Math.round(usage.projected_days_remaining || 0);
-      document.getElementById('projectionHint').textContent = projectedDays > 0
-        ? `~${projectedDays} days at current rate.`
-        : 'Projection appears after usage.';
+      const projectionLabel = (usage.projection_label || '').trim();
+      document.getElementById('projectionHint').textContent = projectionLabel
+        || (projectedDays > 0
+          ? `~${projectedDays} days at recent pace.`
+          : 'Projection appears after usage.');
       const list = document.getElementById('usageList');
       const rows = usage.mix || [];
       list.replaceChildren();

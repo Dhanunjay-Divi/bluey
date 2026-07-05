@@ -2134,6 +2134,7 @@ async fn handle_request_inner(
                 daemon,
                 OverlayCommand::SetBalance {
                     label: "Sign in".to_string(),
+                    account_email: None,
                 },
             )
             .await;
@@ -2451,7 +2452,14 @@ async fn push_overlay_balance_snapshot(
         label.push_str(" low");
     }
     let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
-    let _ = send_overlay(daemon, OverlayCommand::SetBalance { label }).await;
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetBalance {
+            label,
+            account_email: snapshot.account_email.clone(),
+        },
+    )
+    .await;
 }
 
 async fn set_overlay_listening_state(daemon: &Arc<Daemon>, state: ListeningState) {
@@ -5316,12 +5324,14 @@ fn format_duration(duration: Duration) -> String {
 async fn refresh_overlay_balance(daemon: &Arc<Daemon>, trace_id: Option<&str>) -> Option<String> {
     let snapshot = fetch_current_balance_snapshot(trace_id).await?;
     let label = format_balance_cents(snapshot.balance_cents);
+    let account_email = snapshot.account_email.clone();
     daemon.balance_watch.publish(snapshot);
     let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
     let _ = send_overlay(
         daemon,
         OverlayCommand::SetBalance {
             label: label.clone(),
+            account_email,
         },
     )
     .await;
@@ -5895,6 +5905,7 @@ async fn fetch_current_balance_snapshot(
     .await
     {
         Ok(Ok(me)) => Some(crate::cloud::balance::BalanceSnapshot {
+            account_email: Some(me.email),
             balance_cents: me.balance_cents,
             trial_seconds_remaining: me.trial_seconds_remaining,
             auto_topup_enabled: me.auto_topup_enabled,

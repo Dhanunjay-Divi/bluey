@@ -16,6 +16,8 @@ use tokio::sync::watch;
 /// Snapshot emitted on every successful poll.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BalanceSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
     pub balance_cents: i64,
     pub trial_seconds_remaining: i64,
     pub auto_topup_enabled: bool,
@@ -169,6 +171,7 @@ async fn run_loop_inner(
 async fn poll_once(client: &cue_cloud_client::CloudClient) -> Result<BalanceSnapshot> {
     let me: cue_cloud_client::AccountMe = client.auth_get("/account/me").await?;
     let snap = BalanceSnapshot {
+        account_email: Some(me.email),
         balance_cents: me.balance_cents,
         trial_seconds_remaining: me.trial_seconds_remaining,
         auto_topup_enabled: me.auto_topup_enabled,
@@ -199,6 +202,7 @@ mod tests {
         assert!(rx.borrow().is_none());
 
         let snap = BalanceSnapshot {
+            account_email: Some("demo@bluey.sh".to_string()),
             balance_cents: 2500,
             trial_seconds_remaining: 0,
             auto_topup_enabled: true,
@@ -221,6 +225,7 @@ mod tests {
     fn low_balance_warning_only_when_positive_and_below_threshold() {
         // balance below threshold AND positive -> warning
         let s = BalanceSnapshot {
+            account_email: None,
             balance_cents: 100,
             trial_seconds_remaining: 0,
             auto_topup_enabled: true,

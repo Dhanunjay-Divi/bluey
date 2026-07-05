@@ -64,6 +64,8 @@ pub enum OverlayCommand {
     },
     SetBalance {
         label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_email: Option<String>,
     },
     SetAccountState {
         signed_in: bool,
@@ -203,6 +205,7 @@ mod tests {
     fn set_balance_serializes_as_overlay_command() {
         let json = serde_json::to_string(&OverlayCommand::SetBalance {
             label: "$12.34".to_string(),
+            account_email: None,
         })
         .expect("serialize overlay balance command");
 

@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 21:09 EDT
+Latest checkpoint: 2026-07-04 21:53 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,7 +30,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-351-CLICKTHROUGH-CONTENT-SCROLL-POLICY.md`; the next canonical Bluey round doc should start at `ROUND-352-...`.
+- Latest completed Bluey round doc is `ROUND-352-BALANCE-ACCOUNT-IDENTITY-RUNWAY.md`; the next canonical Bluey round doc should start at `ROUND-353-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
@@ -5981,6 +5981,63 @@ Deployment status:
   - unpacked `bluey` and `bluey-daemon` version checks for `0.1.90`
 - Public installer smoke installed `0.1.90` locally and both installed binaries report `0.1.90`.
 - Local daemon restarted successfully with pid `61294`.
+
+## Latest Round 352: Balance Account Identity And Runway
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Runtime worktree for this round:
+
+```bash
+/Users/uno/Downloads/cue-runtime-stream-attachments
+```
+
+Current branch:
+
+```bash
+codex/bluey-stream-attachments-20260704
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-352-BALANCE-ACCOUNT-IDENTITY-RUNWAY.md`
+
+Trigger:
+
+- The owner showed a web account page for `internal-admin-20260606023943@bluey.sh` with `$15.00`, while the desktop overlay showed `$8.25`.
+- The same page showed `~477 days at current rate`, which looked misleading.
+
+Root cause:
+
+- The desktop is linked to a different account: `codex-smoke-20260608183100@bluey.sh`.
+- The old account page displayed exact runway math from a very small recent usage sample.
+
+What changed:
+
+- `/account/usage` now returns `projection_label` and `projection_quality`.
+- Low-sample usage says `Light recent usage; estimate needs more activity.`
+- Long runway display is capped at `90+ days at recent pace`.
+- CLI and web account usage display prefer the server-provided projection label.
+- Desktop balance snapshots and overlay `set_balance` commands now carry optional account email metadata.
+- macOS overlay and desktop dashboard balance tooltips show the linked desktop account email.
+- The projection-label web/API changes were mirrored into `/Users/uno/Downloads/cue`, because that parallel web checkout matches the account page shown in the screenshot.
+
+Verification so far:
+
+```bash
+/Users/uno/.bluey/bin/bluey account
+/Users/uno/.bluey/bin/bluey credits
+cargo fmt --check
+swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift
+cargo check -p cue-core -p cue-cloud-client -p cue-daemon -p cue-cli -p cue-dashboard
+cargo check -p bluey-server
+cd /Users/uno/Downloads/cue && cargo fmt --check && cargo check -p cue-cloud-client -p cue-cli
+cd /Users/uno/Downloads/cue/server && cargo check -p bluey-server
+```
+
+Deployment status:
+
+- Not deployed yet in this round.
 
 ## Latest Round 350: macOS Click-Through Scroll Recursion
 

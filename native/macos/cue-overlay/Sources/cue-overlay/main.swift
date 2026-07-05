@@ -1448,7 +1448,7 @@ private enum OverlayCommand {
     case boot(title: String, lines: [String])
     case setOpacity(Double)
     case setPosition(String)
-    case setBalance(String)
+    case setBalance(String, String?)
     case setAccountState(signedIn: Bool)
     case setContextItems([OverlayContextItem])
     case setSessions([OverlaySessionItem])
@@ -1489,7 +1489,8 @@ private func parseCommand(_ line: String) -> OverlayCommand {
         return .setPosition(position)
     case "set_balance":
         let label = obj["label"] as? String ?? "Balance --"
-        return .setBalance(label)
+        let accountEmail = obj["account_email"] as? String
+        return .setBalance(label, accountEmail)
     case "set_account_state":
         return .setAccountState(signedIn: obj["signed_in"] as? Bool ?? false)
     case "set_context_items":
@@ -2426,7 +2427,7 @@ private final class PillView: NSView {
         // the expanded header so the launcher stays compact and scannable.
         setAccessibilityLabel(statusText)
     }
-    func setBalanceLabel(_ label: String) {
+    func setBalanceLabel(_ label: String, accountEmail: String? = nil) {
         let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
         balanceText = clean
         switch balanceVisualTone(for: clean) {
@@ -5083,6 +5084,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var knowledgeIndexTimer: Timer?
     private var knowledgeIndexSafetyWorkItem: DispatchWorkItem?
     private var knowledgeIndexFrame = 0
+    private var linkedAccountEmail: String = ""
     private var knowledgeBadgeContentVisible = false
     private var contextItems: [OverlayContextItem] = []
     private var pendingContextItemIds: Set<String> = []
@@ -8507,7 +8509,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         themeButton.toolTip = lightThemeEnabled ? "Switch to dark theme" : "Switch to light theme"
         shortcutsButton.toolTip = "Show controls and shortcuts"
         moveHandleButton.toolTip = "Drag to move Bluey while click-through is on"
-        balanceLabel.toolTip = "Remaining Bluey credits"
+        updateBalanceLabelTone()
         fullSizeButton.toolTip = windowFullSize ? "Restore compact Bluey" : "Fill this screen"
         interactionModeButton.toolTip = passThroughMode
             ? "Click-through on: controls click normally, the blue move handle drags Bluey, and blank space clicks the app behind it."
@@ -9840,9 +9842,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
-    func setBalanceLabel(_ label: String) {
+    func setBalanceLabel(_ label: String, accountEmail: String? = nil) {
         let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
         balanceLabel.stringValue = clean.isEmpty ? "Balance --" : clean
+        linkedAccountEmail = (accountEmail ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let tone = balanceVisualTone(for: balanceLabel.stringValue)
         if tone != .signedOut && tone != .unknown {
             showSignedInChromeReady()
@@ -9874,18 +9877,23 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func balanceLabelTooltip(for tone: BalanceVisualTone) -> String {
+        let base: String
         switch tone {
         case .critical:
-            return "Balance below $5. Add credits before paid cloud work pauses."
+            base = "Balance below $5. Add credits before paid cloud work pauses."
         case .low:
-            return "Low balance. Add credits soon."
+            base = "Low balance. Add credits soon."
         case .signedOut:
-            return "Sign in to use managed answers and balance."
+            base = "Sign in to use managed answers and balance."
         case .normal:
-            return "Remaining Bluey credits."
+            base = "Remaining Bluey credits."
         case .unknown:
-            return "Balance unavailable."
+            base = "Balance unavailable."
         }
+        guard !linkedAccountEmail.isEmpty else {
+            return base
+        }
+        return "Desktop account: \(linkedAccountEmail)\n\(base)"
     }
 
     private func setHeaderSubtitle(_ text: String = "") {
@@ -9929,6 +9937,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeBadge.layer?.borderColor = NSColor.clear.cgColor
         routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
         balanceLabel.stringValue = "Sign in"
+        linkedAccountEmail = ""
         updateBalanceLabelTone()
         setKnowledgeBadge("Docs locked", accent: BlueyTheme.textDim)
         composer.placeholder = url == nil ? "Sign in to use managed answers..." : "Sign in, then ask anything..."
@@ -14760,9 +14769,9 @@ private final class OverlayApp {
             expandedView?.applyOpacity(value)
         case .setPosition(let pos):
             applyPosition(pos)
-        case .setBalance(let label):
-            expandedView?.setBalanceLabel(label)
-            pillView?.setBalanceLabel(label)
+        case .setBalance(let label, let accountEmail):
+            expandedView?.setBalanceLabel(label, accountEmail: accountEmail)
+            pillView?.setBalanceLabel(label, accountEmail: accountEmail)
         case .setAccountState(let signedIn):
             if signedIn {
                 let shouldCollapseAfterUnlock = expandedView?.isSignedOutGateActive == true

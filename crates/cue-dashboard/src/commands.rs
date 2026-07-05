@@ -27,6 +27,7 @@ pub struct SessionSwitchedPayload {
 
 #[derive(Clone, Serialize)]
 pub struct BalanceSnapshotPayload {
+    pub account_email: Option<String>,
     pub balance_cents: i64,
     pub balance_label: String,
     pub trial_seconds_remaining: i64,
@@ -190,6 +191,7 @@ pub async fn get_balance_snapshot() -> Result<Option<BalanceSnapshotPayload>, St
         .await
         .map_err(|e| format!("balance lookup failed: {e}"))?;
     Ok(Some(BalanceSnapshotPayload {
+        account_email: Some(me.email),
         balance_cents: me.balance_cents,
         balance_label: format_cents(me.balance_cents),
         trial_seconds_remaining: me.trial_seconds_remaining,
