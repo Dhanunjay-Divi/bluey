@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070409"
+    href="/assets/bluey-site.css?v=2026070410"
   >
   <script type="application/ld+json">
   {
@@ -353,25 +353,39 @@
             </div>
           </section>
 
-          <section class="account-card" id="accountRecoveryCard" hidden>
+          <section class="account-card account-recovery-card" id="accountRecoveryCard" hidden>
+            <div class="auth-brand">
+              <img class="auth-logo" src="/assets/bluey-logo.svg" alt="">
+              <img class="auth-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
+            </div>
+            <div class="account-message" id="recoveryMessage"></div>
             <h2 id="recoveryTitle">Account help</h2>
             <p id="recoveryCopy">Recover or verify your Bluey account.</p>
             <form class="account-form" id="passwordResetStartForm" hidden>
               <label>
                 Email
-                <input id="resetEmail" type="email" autocomplete="email" placeholder="you@company.com">
+                <input id="resetEmail" type="email" autocomplete="email" placeholder="Email">
               </label>
               <button class="account-button primary" type="submit">Send reset link</button>
             </form>
             <form class="account-form" id="passwordResetConfirmForm" hidden>
-              <label>
+              <label class="password-label">
                 New password
-                <input id="resetPassword" type="password" autocomplete="new-password" placeholder="New password">
+                <span class="password-input">
+                  <input id="resetPassword" type="password" autocomplete="new-password" placeholder="New password">
+                  <button class="password-toggle" type="button" data-password-toggle="resetPassword" aria-label="Show new password"></button>
+                </span>
               </label>
-              <button class="account-button primary" type="submit">Set password</button>
+              <button class="account-button primary" type="submit">Reset password</button>
             </form>
-            <div class="account-message" id="recoveryMessage"></div>
-            <div class="account-note"><a href="/login">Return to sign in</a></div>
+            <div class="auth-switch">
+              <a class="auth-link-button" href="/login">Return to sign in</a>
+            </div>
+            <nav class="auth-card-links" aria-label="Recovery page links">
+              <a href="/">Home</a>
+              <a href="/download">Download</a>
+              <a href="/reload">Pricing</a>
+            </nav>
           </section>
 
           <section class="account-card dashboard-card" id="accountDashboard" hidden>
@@ -791,7 +805,7 @@
     <div class="main">
       <div class="content">
         <section class="hero">
-          <h1 aria-label="Bring context, stay present.">Bring context,<br><span class="accent">stay present.</span></h1>
+          <h1 aria-label="Stay present, stay unseen.">Stay present,<br><span class="accent">stay unseen.</span></h1>
           <p class="hero-lede">Private AI chat for engineering meetings, code, docs, research, and screen work from your terminal.</p>
           <p class="hero-proof"><span>Install, run, ask.</span> Bluey keeps transcript, screen, files, code, docs, and saved session notes available without switching apps.</p>
           <div class="hero-actions">
@@ -883,7 +897,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070409"
+    src="/assets/bluey-site.js?v=2026070410"
   ></script>
 </body>
 </html>

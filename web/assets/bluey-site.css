@@ -3811,6 +3811,16 @@
       display: block;
     }
 
+    #accountApp.is-guest #accountRecoveryCard > p {
+      display: block;
+      max-width: 20rem;
+      margin: -.6rem auto 1rem;
+      color: #8b8b8b;
+      text-align: center;
+      font-size: .8rem;
+      line-height: 1.48;
+    }
+
     #accountApp.is-guest .account-form {
       gap: .72rem;
     }
@@ -3932,6 +3942,15 @@
       font-weight: 760;
     }
 
+    #accountApp.is-guest #accountRecoveryCard .account-button {
+      width: 100%;
+      min-height: 44px;
+      border-radius: 9px;
+      font-size: .9rem;
+      font-weight: 760;
+      justify-content: center;
+    }
+
     #accountApp.is-guest .auth-switch {
       display: flex;
       align-items: center;
@@ -4021,7 +4040,8 @@
       font-weight: 720;
     }
 
-    #accountApp.is-guest #accountAuthMessage:not(:empty) {
+    #accountApp.is-guest #accountAuthMessage:not(:empty),
+    #accountApp.is-guest #recoveryMessage:not(:empty) {
       margin: 0 0 .8rem;
       padding: .62rem .72rem;
       border: 1px solid rgba(99, 216, 255, .28);
@@ -4032,13 +4052,15 @@
       font-size: .78rem;
     }
 
-    #accountApp.is-guest #accountAuthMessage[data-tone="error"]:not(:empty) {
+    #accountApp.is-guest #accountAuthMessage[data-tone="error"]:not(:empty),
+    #accountApp.is-guest #recoveryMessage[data-tone="error"]:not(:empty) {
       border-color: rgba(255, 96, 111, .38);
       background: rgba(90, 18, 24, .52);
       color: #ff8f98;
     }
 
-    #accountApp.is-guest #accountAuthMessage[data-tone="success"]:not(:empty) {
+    #accountApp.is-guest #accountAuthMessage[data-tone="success"]:not(:empty),
+    #accountApp.is-guest #recoveryMessage[data-tone="success"]:not(:empty) {
       border-color: rgba(115, 247, 186, .34);
       background: rgba(24, 91, 61, .30);
       color: #8dffc0;
@@ -4130,6 +4152,7 @@
     }
 
     html[data-bluey-theme="light"] #accountApp.is-guest #accountAuthCard > p,
+    html[data-bluey-theme="light"] #accountApp.is-guest #accountRecoveryCard > p,
     html[data-bluey-theme="light"] #accountApp .account-hero p,
     html[data-bluey-theme="light"] #accountApp .dashboard-head p,
     html[data-bluey-theme="light"] #accountApp .section-head p,
@@ -4175,6 +4198,27 @@
 
     html[data-bluey-theme="light"] #accountApp .auth-card-links a {
       color: #657888;
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-guest #accountAuthMessage:not(:empty),
+    html[data-bluey-theme="light"] #accountApp.is-guest #recoveryMessage:not(:empty) {
+      border-color: rgba(8, 124, 166, .22);
+      background: rgba(223, 247, 255, .78);
+      color: #075d82;
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-guest #accountAuthMessage[data-tone="error"]:not(:empty),
+    html[data-bluey-theme="light"] #accountApp.is-guest #recoveryMessage[data-tone="error"]:not(:empty) {
+      border-color: rgba(204, 54, 73, .24);
+      background: rgba(255, 232, 236, .84);
+      color: #a8273a;
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-guest #accountAuthMessage[data-tone="success"]:not(:empty),
+    html[data-bluey-theme="light"] #accountApp.is-guest #recoveryMessage[data-tone="success"]:not(:empty) {
+      border-color: rgba(34, 160, 95, .22);
+      background: rgba(223, 250, 236, .82);
+      color: #177545;
     }
 
     html[data-bluey-theme="light"] #accountApp .page-footer-links,

@@ -771,9 +771,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!enabled) otp.value = '';
     }
 
-    function recoveryMessage(text) {
+    function recoveryMessage(text, tone = '') {
       const el = document.getElementById('recoveryMessage');
-      if (el) el.textContent = text || '';
+      if (!el) return;
+      el.textContent = text || '';
+      el.dataset.tone = tone || '';
     }
 
     function renderDeviceLinkHint() {
@@ -1061,12 +1063,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function startPasswordReset(email) {
-      recoveryMessage('Sending reset email...');
+      recoveryMessage('Sending reset link...');
       await apiJson('/auth/password-reset/start', {
         method: 'POST',
         body: JSON.stringify({ email }),
       });
-      recoveryMessage('If the account exists, a reset link has been sent.');
+      recoveryMessage('If the account exists, a reset link was sent. Open it to choose a new password.', 'success');
     }
 
     async function confirmPasswordReset(token, newPassword) {
@@ -1075,7 +1077,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         method: 'POST',
         body: JSON.stringify({ token, new_password: newPassword }),
       });
-      recoveryMessage('Password updated. You can sign in now.');
+      recoveryMessage('Password reset. You can sign in now.', 'success');
     }
 
     function resetDeleteAccountDialog() {
@@ -2067,16 +2069,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('passwordResetStartForm').addEventListener('submit', (event) => {
         event.preventDefault();
         const email = document.getElementById('resetEmail').value.trim();
-        if (!email) return recoveryMessage('Email is required.');
-        startPasswordReset(email).catch((error) => recoveryMessage(error.message));
+        if (!email) return recoveryMessage('Email is required.', 'error');
+        startPasswordReset(email).catch((error) => recoveryMessage(error.message, 'error'));
       });
       document.getElementById('passwordResetConfirmForm').addEventListener('submit', (event) => {
         event.preventDefault();
         const token = new URLSearchParams(location.search).get('token') || '';
         const password = document.getElementById('resetPassword').value;
-        if (!token) return recoveryMessage('Reset token is missing.');
-        if (!password) return recoveryMessage('New password is required.');
-        confirmPasswordReset(token, password).catch((error) => recoveryMessage(error.message));
+        if (!token) return recoveryMessage('Open the reset link from your email to choose a new password.', 'error');
+        if (!password) return recoveryMessage('New password is required.', 'error');
+        confirmPasswordReset(token, password).catch((error) => recoveryMessage(error.message, 'error'));
       });
       loadAccount().catch((error) => {
         accountMessage(`Could not load account: ${error.message}`);
@@ -2095,20 +2097,24 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const params = new URLSearchParams(location.search);
       const token = params.get('token') || '';
       const isVerify = currentPath === '/verify-email';
-      document.getElementById('recoveryTitle').textContent = isVerify ? 'Verify email' : 'Reset password';
+      document.getElementById('recoveryTitle').textContent = isVerify
+        ? 'Verify email'
+        : token
+          ? 'New password'
+          : 'Reset password';
       document.getElementById('recoveryCopy').textContent = isVerify
         ? 'Bluey will verify this email token and return you to sign-in.'
         : token
-          ? 'Choose a new password for this Bluey account.'
-          : 'Enter your account email and Bluey will send a password reset link.';
+          ? 'Your reset link is ready. Choose a new password for this Bluey account.'
+          : 'Enter your account email. Bluey will send a secure password reset link.';
       document.getElementById('passwordResetStartForm').hidden = isVerify || Boolean(token);
       document.getElementById('passwordResetConfirmForm').hidden = isVerify || !token;
 
       if (isVerify) {
         if (!token) {
-          recoveryMessage('Verification token is missing.');
+          recoveryMessage('Verification token is missing.', 'error');
         } else {
-          confirmEmailVerification(token).catch((error) => recoveryMessage(error.message));
+          confirmEmailVerification(token).catch((error) => recoveryMessage(error.message, 'error'));
         }
       }
     }
