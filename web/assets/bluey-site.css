@@ -1536,6 +1536,38 @@
       letter-spacing: .04em;
     }
 
+    #accountApp .device-code-form {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: .75rem;
+      align-items: center;
+    }
+
+    #accountApp .device-code-form input {
+      min-width: 0;
+      padding: .8rem .9rem;
+      border: 1px solid rgba(148, 190, 204, .28);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, .06);
+      color: #fff;
+      font-size: .95rem;
+      font-weight: 800;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      outline: none;
+    }
+
+    #accountApp .device-code-form input:focus {
+      border-color: rgba(76, 200, 255, .82);
+      box-shadow: 0 0 0 3px rgba(76, 200, 255, .16);
+    }
+
+    #accountApp .device-code-status {
+      min-height: 1rem;
+      color: #9fb3bd;
+      font-size: .86rem;
+    }
+
     #accountApp .device-link-hint .account-button {
       width: fit-content;
       min-width: 180px;

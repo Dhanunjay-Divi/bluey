@@ -1608,7 +1608,9 @@ async fn browser_login(
 
     println!("Opening Bluey sign-in...");
     println!("Code: {}", flow.user_code);
-    println!("Approve this code only in the Bluey account you want this desktop to use.");
+    println!(
+        "Approve this code only if it matches your own Bluey desktop. It expires in 10 minutes."
+    );
     println!("{login_url}");
     let _ = open_browser(&login_url);
     println!("Waiting for browser approval...");
@@ -1730,8 +1732,19 @@ fn keyring_has_tokens_with_timeout(timeout: std::time::Duration) -> Result<Optio
 
 fn device_login_url(verification_uri: &str, user_code: &str) -> String {
     let base = verification_uri.trim_end_matches('/');
-    let separator = if base.contains('?') { '&' } else { '?' };
-    format!("{base}{separator}desktop=1&user_code={user_code}")
+    let mut params = Vec::new();
+    if !base.contains("desktop=") {
+        params.push("desktop=1".to_string());
+    }
+    if !base.contains("user_code=") && !base.contains("device_code=") {
+        params.push(format!("user_code={user_code}"));
+    }
+    if params.is_empty() {
+        base.to_string()
+    } else {
+        let separator = if base.contains('?') { '&' } else { '?' };
+        format!("{base}{separator}{}", params.join("&"))
+    }
 }
 
 fn load_local_meetings() -> Result<Vec<MeetingRecord>> {
@@ -3683,6 +3696,14 @@ mod tests {
         assert_eq!(
             device_login_url("https://bluey.sh/login?source=desktop", "ABCD-EFGH"),
             "https://bluey.sh/login?source=desktop&desktop=1&user_code=ABCD-EFGH"
+        );
+    }
+
+    #[test]
+    fn device_login_url_keeps_prefilled_server_code_once() {
+        assert_eq!(
+            device_login_url("https://bluey.sh/login?user_code=ABCD-EFGH", "ABCD-EFGH"),
+            "https://bluey.sh/login?user_code=ABCD-EFGH&desktop=1"
         );
     }
 

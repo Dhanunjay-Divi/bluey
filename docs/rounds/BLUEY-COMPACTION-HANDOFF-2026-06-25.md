@@ -1,9 +1,9 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 22:20 EDT
+Latest checkpoint: 2026-07-04 23:02 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
-Workspace: `/Users/uno/Downloads/cue`
+Workspace: `/Users/uno/Downloads/cue-runtime-stream-attachments`
 
 ## New Chat Starter
 
@@ -30,12 +30,22 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-352-BALANCE-ACCOUNT-IDENTITY-RUNWAY.md`; the next canonical Bluey round doc should start at `ROUND-353-...`.
+- Latest completed Bluey round doc is `ROUND-353-DEVICE-CODE-CONNECT-FLOW.md`; the next canonical Bluey round doc should start at `ROUND-354-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
-- Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 353 is in progress for explicit desktop device-code linking:
+  - `/auth/device/start` now returns `/login?user_code=XXXX-XXXX`
+  - CLI/daemon URL helpers avoid duplicate `user_code` query params
+  - `bluey on` and `bluey login` prompts warn users to approve only codes matching their own Bluey desktop
+  - web login/dashboard now shows a manual "Have a Bluey desktop code?" entry form and requires explicit `Connect desktop`
+  - targeted JS, CLI, and server device-flow tests passed
+  - desktop version bumped to `0.1.92`
+  - deployment still needs to be completed after commit/build/publish
+  - round doc: `docs/rounds/ROUND-353-DEVICE-CODE-CONNECT-FLOW.md`
+
+- Current Codex working branch for the latest saved work is `codex/bluey-stream-attachments-20260704`.
 - Round 338 is complete and deployed for canvas click-through hit testing:
   - owner reported canvas mode click-through was not working
   - root cause: macOS overlay treated the entire open canvas pane as interactive when click-through was enabled

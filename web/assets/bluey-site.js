@@ -528,7 +528,52 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.hidden = true;
         el.replaceChildren();
       }
-      if (!code) return;
+
+      const renderCodeEntry = (el) => {
+        el.hidden = false;
+        el.replaceChildren();
+        const title = document.createElement('strong');
+        title.textContent = 'Have a Bluey desktop code?';
+        const body = document.createElement('span');
+        body.textContent = accountToken()
+          ? 'Enter the code from Terminal or the Bluey window to connect this desktop to the account signed into this browser.'
+          : 'Enter the code from Terminal or the Bluey window, then sign in or create an account to confirm the desktop link.';
+        const form = document.createElement('form');
+        form.className = 'device-code-form';
+        form.noValidate = true;
+        const input = document.createElement('input');
+        input.name = 'user_code';
+        input.type = 'text';
+        input.placeholder = 'XXXX-XXXX';
+        input.autocomplete = 'one-time-code';
+        input.spellcheck = false;
+        input.inputMode = 'text';
+        const button = document.createElement('button');
+        button.type = 'submit';
+        button.className = 'account-button secondary compact';
+        button.textContent = 'Use code';
+        const status = document.createElement('span');
+        status.className = 'device-code-status';
+        form.addEventListener('submit', (event) => {
+          event.preventDefault();
+          const nextCode = normalizeDeviceCode(input.value);
+          if (!nextCode) {
+            status.textContent = 'Enter the code shown by Bluey desktop.';
+            input.focus();
+            return;
+          }
+          rememberPendingDeviceCode(nextCode);
+          status.textContent = '';
+          renderDeviceLinkHint();
+        });
+        form.append(input, button);
+        el.append(title, body, form, status);
+      };
+
+      if (!code) {
+        for (const el of targets) renderCodeEntry(el);
+        return;
+      }
 
       const renderInto = (el) => {
         el.hidden = false;
@@ -545,9 +590,17 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         body.append('Terminal is waiting on code ');
         const codeEl = document.createElement('code');
         codeEl.textContent = code;
-        body.append(codeEl, accountToken()
-          ? '. Click Connect desktop to finish Bluey login.'
-          : '. This code is already filled from your desktop app. Sign in or create an account here, then confirm the desktop link.');
+        if (accountToken()) {
+          body.append(
+            codeEl,
+            `. This connects the desktop showing that code to ${currentAccountEmail || 'the account signed into this browser'}. Only approve codes from your own Bluey desktop.`
+          );
+        } else {
+          body.append(
+            codeEl,
+            '. This code came from your desktop app. Sign in or create an account here, then confirm the desktop link before Bluey can use credits or cloud answers.'
+          );
+        }
         el.append(title, body);
         if (accountToken()) {
           const button = document.createElement('button');
@@ -579,7 +632,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const storageKey = `bluey_device_approved_${code}`;
       if (sessionStorage.getItem(storageKey) === '1') return true;
       if (sessionStorage.getItem(`bluey_device_confirmed_${code}`) !== '1') {
-        accountMessage('Click Connect desktop to finish bluey login.');
+        accountMessage('Click Connect desktop to finish Bluey login.');
         return false;
       }
       accountMessage('Connecting this account to the desktop app...');

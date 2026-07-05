@@ -694,10 +694,15 @@ pub async fn device_start(
         (chrono::Utc::now() + chrono::Duration::seconds(DEVICE_CODE_TTL_SECS)).to_rfc3339();
     device_codes::insert(&state.pool, &device_code, &user_code, &expires_at)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
+    let verification_uri = format!(
+        "{}/login?user_code={}",
+        state.config.public_url.trim_end_matches('/'),
+        user_code
+    );
     Ok(Json(DeviceStartResponse {
         device_code,
         user_code,
-        verification_uri: format!("{}/login", state.config.public_url),
+        verification_uri,
         expires_in: DEVICE_CODE_TTL_SECS,
         interval: DEVICE_POLL_INTERVAL_SECS,
     }))

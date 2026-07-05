@@ -6140,7 +6140,7 @@ async fn push_login_started_card(
         CardKind::System,
         title,
         format!(
-            "Open the browser, sign in, then click Connect desktop.\nCode: {user_code}\nBluey will finish automatically.\nlogin_url: {login_url}"
+            "Open the browser, sign in, then click Connect desktop.\nCode: {user_code}\nApprove only if this code matches your own Bluey window. The code expires in 10 minutes.\nlogin_url: {login_url}"
         ),
     )
     .await;
@@ -6152,7 +6152,9 @@ fn login_prompt_text(login_url: &str, user_code: &str, reopened: bool) -> String
     } else {
         "Opening Bluey sign-in in your browser."
     };
-    format!("{prefix}\nCode: {user_code}\nLogin: {login_url}")
+    format!(
+        "{prefix}\nCode: {user_code}\nApprove only if this code matches your own Bluey window. It expires in 10 minutes.\nLogin: {login_url}"
+    )
 }
 
 async fn run_background_cloud_login(
@@ -6262,8 +6264,19 @@ fn resolve_background_login_api_url(paths: &AppPaths) -> String {
 
 fn device_login_url(verification_uri: &str, user_code: &str) -> String {
     let base = verification_uri.trim_end_matches('/');
-    let separator = if base.contains('?') { '&' } else { '?' };
-    format!("{base}{separator}desktop=1&user_code={user_code}")
+    let mut params = Vec::new();
+    if !base.contains("desktop=") {
+        params.push("desktop=1".to_string());
+    }
+    if !base.contains("user_code=") && !base.contains("device_code=") {
+        params.push(format!("user_code={user_code}"));
+    }
+    if params.is_empty() {
+        base.to_string()
+    } else {
+        let separator = if base.contains('?') { '&' } else { '?' };
+        format!("{base}{separator}{}", params.join("&"))
+    }
 }
 
 fn open_browser_from_daemon(url: &str) -> Result<()> {
