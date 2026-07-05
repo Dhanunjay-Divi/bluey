@@ -2483,6 +2483,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return;
       }
       const requestedSessionId = pendingSessionId();
+      const requestedHashTab = normalizeDashboardTabName(window.location.hash);
+      const shouldOpenRequestedSession = Boolean(requestedSessionId)
+        && (!requestedHashTab || requestedHashTab === 'history');
       const refreshButton = document.getElementById('refreshAccountButton');
       if (refreshButton) refreshButton.disabled = true;
       accountMessage('Loading account...');
@@ -2492,7 +2495,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return null;
       });
       const sessionsPromise = loadCloudSessions().then(async (sessions) => {
-        if (requestedSessionId) {
+        if (shouldOpenRequestedSession) {
           setDashboardTab('history');
           try {
             await loadCloudSessionDetail(requestedSessionId);
@@ -2673,7 +2676,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       if (name === 'admin') maybeLoadAdminAbuse();
       if (updateHash && window.history?.replaceState) {
-        const nextUrl = `${window.location.pathname}${window.location.search}#${name}`;
+        const url = new URL(window.location.href);
+        if (name !== 'history') {
+          url.searchParams.delete('session');
+        }
+        url.hash = name;
+        const nextUrl = `${url.pathname}${url.search}${url.hash}`;
         window.history.replaceState(null, '', nextUrl);
       }
     }
@@ -2886,20 +2894,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('refreshSessionsButton').addEventListener('click', () => {
         setCloudSessionDetail('');
         loadCloudSessions().catch((error) => setCloudSessionDetail(`Could not load saved sessions: ${error.message}`));
-      });
-      document.getElementById('cloudSessionsList').addEventListener('click', (event) => {
-        const button = event.target.closest('button[data-session-id]');
-        if (!button) return;
-        const url = button.dataset.sessionOpen || accountSessionHref(button.dataset.sessionId);
-        const opened = window.open(url, '_blank');
-        if (opened) opened.opener = null;
-        if (!opened) {
-          setDashboardTab('history', true);
-          loadCloudSessionDetail(button.dataset.sessionId).catch((error) => {
-            setCloudSessionDetail(`Could not load saved session: ${error.message}`);
-          });
-          accountMessage('Popup blocked. Showing the saved session here instead.');
-        }
       });
       document.getElementById('passwordResetStartForm').addEventListener('submit', (event) => {
         event.preventDefault();
