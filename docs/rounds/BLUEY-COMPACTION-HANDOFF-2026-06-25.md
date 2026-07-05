@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 23:02 EDT
+Latest checkpoint: 2026-07-04 23:28 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue-runtime-stream-attachments`
 
@@ -35,14 +35,16 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 
 ## Current State
 
-- Round 353 is in progress for explicit desktop device-code linking:
+- Round 353 is complete and deployed for explicit desktop device-code linking:
   - `/auth/device/start` now returns `/login?user_code=XXXX-XXXX`
   - CLI/daemon URL helpers avoid duplicate `user_code` query params
   - `bluey on` and `bluey login` prompts warn users to approve only codes matching their own Bluey desktop
   - web login/dashboard now shows a manual "Have a Bluey desktop code?" entry form and requires explicit `Connect desktop`
   - targeted JS, CLI, and server device-flow tests passed
-  - desktop version bumped to `0.1.92`
-  - deployment still needs to be completed after commit/build/publish
+  - desktop release `0.1.92` is live and installer smoke installed it locally
+  - production API health reports commit `c2619f818dcf8cd081c4ff0a078448a6b36244b8`
+  - live `/auth/device/start` smoke confirmed `verification_uri` includes the generated `user_code`
+  - production warning scan after restart returned no entries
   - round doc: `docs/rounds/ROUND-353-DEVICE-CODE-CONNECT-FLOW.md`
 
 - Current Codex working branch for the latest saved work is `codex/bluey-stream-attachments-20260704`.

@@ -52,5 +52,29 @@ Results:
 
 ## Current State
 
-- Product code is changed locally and ready for release.
-- Deployment status will be updated after API/web/desktop publishing.
+- Deployed live in this round.
+- Desktop release `0.1.92` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.92/bluey-0.1.92-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `67a2d4c9081bb4cb19717ca31aadd113614102a1c10d7d6f73c55abbe15db935`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.92`
+- Production API health reports commit `c2619f818dcf8cd081c4ff0a078448a6b36244b8`.
+- Production binary SHA256:
+  `76490dbe730790fae7a2ac8077955a843937807471f3b4635531addb22779dfd`
+- Previous API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260705T032322Z`
+- Live `/auth/device/start` smoke confirmed:
+  - response includes a `user_code`
+  - `verification_uri` is `https://bluey.sh/login?...`
+  - `verification_uri` contains the same `user_code`
+  - code TTL is 600 seconds
+  - polling interval is 5 seconds
+- Live web JS already contains the manual desktop-code entry and explicit approval copy.
+- Recent production warning/error scan after restart returned no entries.
+- Public installer smoke installed `0.1.92` locally and both installed binaries report `0.1.92`.
+- Non-interactive install could not prompt sudo and correctly fell back to `/Users/uno/.local/bin/bluey`.
