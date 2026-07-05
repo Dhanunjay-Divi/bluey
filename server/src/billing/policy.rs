@@ -1,10 +1,10 @@
 use crate::db::accounts::Account;
 
 pub(crate) const INTERNAL_TEST_BILLING_BLOCK_MESSAGE: &str =
-    "Internal/test accounts cannot start paid checkout, save payment methods, or enable Auto Reload. Use an internal credit grant instead.";
+    "Temporary/internal/test accounts cannot start paid checkout, save payment methods, or enable Auto Reload. Create a regular account before adding credits.";
 
 pub(crate) fn is_internal_or_test_billing_account(account: &Account) -> bool {
-    account.is_admin || is_internal_or_test_billing_email(&account.email)
+    account.is_temporary || account.is_admin || is_internal_or_test_billing_email(&account.email)
 }
 
 fn is_internal_or_test_billing_email(email: &str) -> bool {
@@ -56,6 +56,8 @@ mod tests {
             email_verified_at: Some("2026-06-26T00:00:00Z".to_string()),
             balance_cents: 0,
             trial_seconds_remaining: 0,
+            is_temporary: false,
+            temporary_expires_at: None,
             auto_topup_enabled: false,
             auto_topup_threshold_cents: 1000,
             auto_topup_amount_cents: 3000,

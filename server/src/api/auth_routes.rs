@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     Extension, Json,
 };
 use hmac::{Hmac, Mac};
@@ -79,7 +79,48 @@ pub struct AuthAccountSummary {
     pub email: String,
     pub balance_cents: i64,
     pub trial_seconds_remaining: i64,
+    pub is_temporary: bool,
+    pub temporary_expires_at: Option<String>,
     pub is_admin: bool,
+}
+
+#[derive(Deserialize)]
+pub struct TrialStartRequest {
+    #[serde(default)]
+    pub turnstile_token: Option<String>,
+    #[serde(default)]
+    pub device_fingerprint: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct TrialStartResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: i64,
+    pub account: AuthAccountSummary,
+    pub password: String,
+    pub trial_seconds: i64,
+    pub temporary_expires_at: String,
+}
+
+#[derive(Deserialize)]
+pub struct TrialConvertStartRequest {
+    pub email: String,
+    pub password: String,
+    #[serde(default)]
+    pub terms_accepted: bool,
+}
+
+#[derive(Serialize)]
+pub struct TrialConvertStartResponse {
+    pub email: String,
+    pub expires_in_secs: i64,
+}
+
+#[derive(Deserialize)]
+pub struct TrialConvertConfirmRequest {
+    pub email: String,
+    pub otp: String,
 }
 
 #[derive(Serialize)]
@@ -121,6 +162,9 @@ fn allow_dev_auth_link_logs() -> bool {
 
 const SIGNUP_OTP_TTL_SECS: i64 = 10 * 60;
 const SIGNUP_OTP_MAX_ATTEMPTS: i64 = 5;
+const TEMPORARY_TRIAL_SECONDS: i64 = 15 * 60;
+const TEMPORARY_ACCOUNT_TTL_SECS: i64 = 24 * 60 * 60;
+const TEMPORARY_ACCOUNT_EMAIL_DOMAIN: &str = "try.bluey.sh";
 
 fn normalize_signup_email(email: &str) -> Result<String, (StatusCode, Json<ApiError>)> {
     let email = email.trim().to_lowercase();
@@ -145,6 +189,36 @@ fn random_signup_otp() -> String {
             return format!("{:06}", value % OTP_SPACE);
         }
     }
+}
+
+fn random_human_secret(len: usize) -> String {
+    use getrandom::getrandom;
+    const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut out = String::with_capacity(len);
+    while out.len() < len {
+        let mut bytes = [0u8; 24];
+        getrandom(&mut bytes).expect("OS random source");
+        for byte in bytes {
+            if out.len() == len {
+                break;
+            }
+            out.push(ALPHABET[(byte as usize) % ALPHABET.len()] as char);
+        }
+    }
+    out
+}
+
+fn temporary_trial_email() -> String {
+    format!(
+        "trial-{}@{}",
+        random_human_secret(12).to_ascii_lowercase(),
+        TEMPORARY_ACCOUNT_EMAIL_DOMAIN
+    )
+}
+
+fn is_temporary_trial_email(email: &str) -> bool {
+    let email = email.trim().to_ascii_lowercase();
+    email.starts_with("trial-") && email.ends_with(&format!("@{TEMPORARY_ACCOUNT_EMAIL_DOMAIN}"))
 }
 
 fn signup_otp_hash(jwt_secret: &str, email: &str, otp: &str) -> String {
@@ -209,6 +283,32 @@ fn request_device_fingerprint(headers: &HeaderMap, body_value: Option<&str>) -> 
         })
 }
 
+fn request_trial_identity(
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    device_fingerprint: Option<&str>,
+) -> trial_abuse::TrialAbuseSignals {
+    let device = request_device_fingerprint(headers, device_fingerprint);
+    let identity = device
+        .as_deref()
+        .map(|value| format!("try-us-device:{value}"))
+        .or_else(|| {
+            request_ip(headers, peer_ip).map(|ip| {
+                format!(
+                    "try-us-ip:{ip}:{}",
+                    request_user_agent(headers).unwrap_or_default()
+                )
+            })
+        })
+        .unwrap_or_else(|| format!("try-us-random:{}", uuid::Uuid::new_v4()));
+    trial_abuse::TrialAbuseSignals::from_raw(
+        &identity,
+        request_ip(headers, peer_ip).as_deref(),
+        device.as_deref(),
+        request_user_agent(headers).as_deref(),
+    )
+}
+
 fn signup_signals(
     email: &str,
     headers: &HeaderMap,
@@ -221,6 +321,20 @@ fn signup_signals(
         request_device_fingerprint(headers, device_fingerprint).as_deref(),
         request_user_agent(headers).as_deref(),
     )
+}
+
+fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn account_still_usable(account: &Account) -> bool {
+    !account.is_temporary_expired()
 }
 
 async fn verify_turnstile_if_needed(
@@ -329,6 +443,8 @@ fn auth_response(
             email: account.email.clone(),
             balance_cents: account.balance_cents,
             trial_seconds_remaining: account.trial_seconds_remaining,
+            is_temporary: account.is_temporary,
+            temporary_expires_at: account.temporary_expires_at.clone(),
             is_admin: account.is_admin,
         },
     })
@@ -342,6 +458,273 @@ pub async fn captcha_config(State(state): State<AppState>) -> Json<CaptchaConfig
         provider: site_key.as_ref().map(|_| "turnstile"),
         site_key,
     })
+}
+
+pub async fn trial_start(
+    State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(req): Json<TrialStartRequest>,
+) -> Result<(StatusCode, Json<TrialStartResponse>), (StatusCode, Json<ApiError>)> {
+    if let Some(token) = bearer_from_headers(&headers) {
+        if let Ok(claims) = auth::jwt::verify(&state.config.jwt_secret, &token) {
+            if claims.kind == "access" {
+                if let Ok(Some(account)) = Account::fetch_by_id(&state.pool, &claims.sub) {
+                    if account_still_usable(&account) {
+                        return Err(err(
+                            StatusCode::CONFLICT,
+                            "already signed in; use the current account or sign out first",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let peer_ip = connect_info.map(|ConnectInfo(addr)| addr.ip());
+    let signals = request_trial_identity(&headers, peer_ip, req.device_fingerprint.as_deref());
+    if let Err(error) =
+        verify_turnstile_if_needed(&state, &headers, peer_ip, req.turnstile_token.as_deref()).await
+    {
+        let _ = trial_abuse::record_event(
+            &state.pool,
+            None,
+            &signals,
+            "trial_turnstile_failed",
+            2,
+            Some("captcha_failed"),
+        );
+        return Err(error);
+    }
+
+    let decision =
+        trial_abuse::evaluate_trial_grant(&state.pool, state.config.trial_abuse, &signals)
+            .map_err(|e| {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("trial abuse: {e}"),
+                )
+            })?;
+    if !decision.allowed {
+        return Err(err(
+            StatusCode::TOO_MANY_REQUESTS,
+            decision.reason.as_deref().unwrap_or("trial limit reached"),
+        ));
+    }
+
+    let password = random_human_secret(18);
+    let password_hash = auth::password::hash_password(&password)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("password: {e}")))?;
+    let temporary_expires_at =
+        (chrono::Utc::now() + chrono::Duration::seconds(TEMPORARY_ACCOUNT_TTL_SECS)).to_rfc3339();
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut account_result = None;
+    for _ in 0..3 {
+        let email = temporary_trial_email();
+        match Account::create_temporary(
+            &state.pool,
+            &email,
+            &password_hash,
+            TEMPORARY_TRIAL_SECONDS,
+            &temporary_expires_at,
+        ) {
+            Ok(account) => {
+                account_result = Some(account);
+                break;
+            }
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<crate::db::accounts::AccountCreateError>(),
+                    Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
+                ) => {}
+            Err(error) => {
+                last_error = Some(error);
+                break;
+            }
+        }
+    }
+    let account = account_result.ok_or_else(|| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!(
+                "create trial: {}",
+                last_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "could not allocate temporary email".to_string())
+            ),
+        )
+    })?;
+
+    if let Err(error) =
+        trial_abuse::record_grant(&state.pool, &account.id, &signals, TEMPORARY_TRIAL_SECONDS)
+    {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            %error,
+            "failed to record temporary trial grant"
+        );
+    }
+
+    let auth = auth_response(&state, &account)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(TrialStartResponse {
+            access_token: auth.access_token,
+            refresh_token: auth.refresh_token,
+            expires_in: auth.expires_in,
+            account: auth.account,
+            password,
+            trial_seconds: TEMPORARY_TRIAL_SECONDS,
+            temporary_expires_at,
+        }),
+    ))
+}
+
+pub async fn trial_convert_start(
+    State(state): State<AppState>,
+    Extension(crate::auth::AuthedAccount(account)): Extension<crate::auth::AuthedAccount>,
+    Json(req): Json<TrialConvertStartRequest>,
+) -> Result<Json<TrialConvertStartResponse>, (StatusCode, Json<ApiError>)> {
+    if !account.is_temporary || account.is_temporary_expired() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "this account is already saved or the temporary trial expired",
+        ));
+    }
+    if !req.terms_accepted {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "accept Terms and Privacy to create an account",
+        ));
+    }
+    let email = normalize_signup_email(&req.email)?;
+    if is_temporary_trial_email(&email) {
+        return Err(err(StatusCode::BAD_REQUEST, "enter a real email address"));
+    }
+    if Account::fetch_by_email(&state.pool, &email)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
+        .is_some()
+    {
+        return Err(err(StatusCode::CONFLICT, "email already registered"));
+    }
+
+    let password_hash = auth::password::hash_password(&req.password)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    let otp = random_signup_otp();
+    let otp_hash = signup_otp_hash(&state.config.jwt_secret, &email, &otp);
+    let expires_at =
+        (chrono::Utc::now() + chrono::Duration::seconds(SIGNUP_OTP_TTL_SECS)).to_rfc3339();
+
+    signup_otps::upsert_for_account(
+        &state.pool,
+        &email,
+        &otp_hash,
+        &password_hash,
+        &expires_at,
+        &account.id,
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
+
+    match crate::mail::send_signup_otp(&state.config, &email, &otp, SIGNUP_OTP_TTL_SECS / 60).await
+    {
+        Ok(crate::mail::MailDelivery::Sent) => {}
+        Ok(crate::mail::MailDelivery::NotConfigured) if allow_dev_auth_link_logs() => {
+            tracing::info!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                email_hash = %cue_core::account_id_hash_prefix(&email),
+                signup_otp = %otp,
+                "trial conversion OTP generated but SMTP is unconfigured; dev logging enabled"
+            );
+        }
+        Ok(crate::mail::MailDelivery::NotConfigured) => {
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "email delivery unavailable",
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(account_id_hash = %cue_core::account_id_hash_prefix(&account.id), %error, "trial conversion OTP delivery failed");
+            return Err(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "email delivery failed",
+            ));
+        }
+    }
+
+    Ok(Json(TrialConvertStartResponse {
+        email,
+        expires_in_secs: SIGNUP_OTP_TTL_SECS,
+    }))
+}
+
+pub async fn trial_convert_confirm(
+    State(state): State<AppState>,
+    Extension(crate::auth::AuthedAccount(account)): Extension<crate::auth::AuthedAccount>,
+    Json(req): Json<TrialConvertConfirmRequest>,
+) -> Result<Json<AuthResponse>, (StatusCode, Json<ApiError>)> {
+    if !account.is_temporary || account.is_temporary_expired() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "this account is already saved or the temporary trial expired",
+        ));
+    }
+    let email = normalize_signup_email(&req.email)?;
+    let otp = req.otp.trim();
+    if otp.len() != 6 || !otp.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "verification code must be 6 digits",
+        ));
+    }
+    let signup_otp = signup_otps::fetch(&state.pool, &email)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "verification code not requested"))?;
+    if signup_otp.account_id.as_deref() != Some(account.id.as_str()) {
+        return Err(err(StatusCode::UNAUTHORIZED, "verification code mismatch"));
+    }
+    let exp: chrono::DateTime<chrono::Utc> = signup_otp
+        .expires_at
+        .parse()
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "bad expires_at"))?;
+    if exp < chrono::Utc::now() {
+        let _ = signup_otps::delete(&state.pool, &email);
+        return Err(err(StatusCode::GONE, "verification code expired"));
+    }
+    if signup_otp.attempts >= SIGNUP_OTP_MAX_ATTEMPTS {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many attempts"));
+    }
+    let submitted_hash = signup_otp_hash(&state.config.jwt_secret, &email, otp);
+    if !constant_time_eq(&submitted_hash, &signup_otp.otp_hash) {
+        let _ = signup_otps::increment_attempts(&state.pool, &email);
+        return Err(err(StatusCode::UNAUTHORIZED, "invalid verification code"));
+    }
+    if Account::fetch_by_email(&state.pool, &email)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
+        .is_some()
+    {
+        return Err(err(StatusCode::CONFLICT, "email already registered"));
+    }
+
+    let converted = Account::convert_temporary_to_registered(
+        &state.pool,
+        &account.id,
+        &email,
+        &signup_otp.password_hash,
+    )
+    .map_err(|e| {
+        if matches!(
+            e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
+            Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
+        ) {
+            return err(StatusCode::CONFLICT, "email already registered");
+        }
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
+    })?
+    .ok_or_else(|| err(StatusCode::CONFLICT, "trial account is no longer temporary"))?;
+
+    let _ = signup_otps::delete(&state.pool, &email);
+    Ok(Json(auth_response(&state, &converted)?))
 }
 
 pub async fn signup_start(
@@ -456,6 +839,12 @@ pub async fn signup_confirm(
     let signup_otp = signup_otps::fetch(&state.pool, &email)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "verification code not requested"))?;
+    if signup_otp.account_id.is_some() {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "verification code belongs to a temporary account conversion",
+        ));
+    }
 
     let exp: chrono::DateTime<chrono::Utc> = signup_otp
         .expires_at
@@ -566,6 +955,9 @@ pub async fn login(
                 "account vanished after auth",
             )
         })?;
+    if account.is_temporary_expired() {
+        return Err(err(StatusCode::UNAUTHORIZED, "temporary account expired"));
+    }
     if state.config.is_admin_email(&email) && !account.is_admin {
         Account::set_admin(&state.pool, &account.id, true)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
@@ -603,6 +995,9 @@ pub async fn refresh(
     let account = Account::fetch_by_id(&state.pool, &account_id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "account not found"))?;
+    if account.is_temporary_expired() {
+        return Err(err(StatusCode::UNAUTHORIZED, "temporary account expired"));
+    }
 
     // 3. Issue a new pair (the old token is already revoked atomically above).
     Ok(Json(auth_response(&state, &account)?))
@@ -747,6 +1142,9 @@ pub async fn device_poll(
     let account = Account::fetch_by_id(&state.pool, &account_id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
         .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "account not found"))?;
+    if account.is_temporary_expired() {
+        return Err(err(StatusCode::UNAUTHORIZED, "temporary account expired"));
+    }
     Ok(Json(auth_response(&state, &account)?))
 }
 
@@ -1051,6 +1449,9 @@ pub async fn link_exchange(
     let account = Account::fetch_by_id(&state.pool, &account_id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("fetch: {e}")))?
         .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "account vanished"))?;
+    if account.is_temporary_expired() {
+        return Err(err(StatusCode::UNAUTHORIZED, "temporary account expired"));
+    }
 
     Ok(Json(LinkExchangeResponse {
         access_token: access,
@@ -1060,6 +1461,8 @@ pub async fn link_exchange(
             email: account.email,
             balance_cents: account.balance_cents,
             trial_seconds_remaining: account.trial_seconds_remaining,
+            is_temporary: account.is_temporary,
+            temporary_expires_at: account.temporary_expires_at,
             is_admin: account.is_admin,
         },
     }))

@@ -34,6 +34,8 @@ pub struct Account {
     pub email_verified_at: Option<String>,
     pub balance_cents: i64,
     pub trial_seconds_remaining: i64,
+    pub is_temporary: bool,
+    pub temporary_expires_at: Option<String>,
     pub auto_topup_enabled: bool,
     pub auto_topup_threshold_cents: i64,
     pub auto_topup_amount_cents: i64,
@@ -79,6 +81,7 @@ pub struct BillingRiskAccountSummary {
 impl Account {
     const SELECT_FIELDS: &'static str = "id, email, email_verified_at,
                     balance_cents, trial_seconds_remaining,
+                    is_temporary, temporary_expires_at,
                     auto_topup_enabled, auto_topup_threshold_cents,
                     auto_topup_amount_cents, is_admin,
                     stripe_customer_id, stripe_payment_method_id,
@@ -94,45 +97,63 @@ impl Account {
             email_verified_at: r.get(2)?,
             balance_cents: r.get(3)?,
             trial_seconds_remaining: r.get(4)?,
-            auto_topup_enabled: r.get::<_, i64>(5)? == 1,
-            auto_topup_threshold_cents: r.get(6)?,
-            auto_topup_amount_cents: r.get(7)?,
-            is_admin: r.get::<_, i64>(8)? == 1,
-            stripe_customer_id: r.get(9)?,
-            stripe_payment_method_id: r.get(10)?,
-            square_customer_id: r.get(11)?,
-            square_card_id: r.get(12)?,
-            square_card_brand: r.get(13)?,
-            square_card_last4: r.get(14)?,
-            billing_restricted: r.get::<_, i64>(15)? == 1,
-            billing_restriction_reason: r.get(16)?,
-            billing_restricted_at: r.get(17)?,
+            is_temporary: r.get::<_, i64>(5)? == 1,
+            temporary_expires_at: r.get(6)?,
+            auto_topup_enabled: r.get::<_, i64>(7)? == 1,
+            auto_topup_threshold_cents: r.get(8)?,
+            auto_topup_amount_cents: r.get(9)?,
+            is_admin: r.get::<_, i64>(10)? == 1,
+            stripe_customer_id: r.get(11)?,
+            stripe_payment_method_id: r.get(12)?,
+            square_customer_id: r.get(13)?,
+            square_card_id: r.get(14)?,
+            square_card_brand: r.get(15)?,
+            square_card_last4: r.get(16)?,
+            billing_restricted: r.get::<_, i64>(17)? == 1,
+            billing_restriction_reason: r.get(18)?,
+            billing_restricted_at: r.get(19)?,
         })
     }
 
     fn from_pg_row(r: &PgRow) -> Result<Self> {
         let email_verified_at: Option<DateTime<Utc>> = r.try_get(2)?;
-        let billing_restricted_at: Option<DateTime<Utc>> = r.try_get(17)?;
+        let temporary_expires_at: Option<DateTime<Utc>> = r.try_get(6)?;
+        let billing_restricted_at: Option<DateTime<Utc>> = r.try_get(19)?;
         Ok(Self {
             id: r.try_get(0)?,
             email: r.try_get(1)?,
             email_verified_at: email_verified_at.map(|value| value.to_rfc3339()),
             balance_cents: r.try_get(3)?,
             trial_seconds_remaining: r.try_get(4)?,
-            auto_topup_enabled: r.try_get::<_, i32>(5)? != 0,
-            auto_topup_threshold_cents: r.try_get(6)?,
-            auto_topup_amount_cents: r.try_get(7)?,
-            is_admin: r.try_get::<_, i32>(8)? != 0,
-            stripe_customer_id: r.try_get(9)?,
-            stripe_payment_method_id: r.try_get(10)?,
-            square_customer_id: r.try_get(11)?,
-            square_card_id: r.try_get(12)?,
-            square_card_brand: r.try_get(13)?,
-            square_card_last4: r.try_get(14)?,
-            billing_restricted: r.try_get::<_, i32>(15)? != 0,
-            billing_restriction_reason: r.try_get(16)?,
+            is_temporary: r.try_get::<_, i32>(5)? != 0,
+            temporary_expires_at: temporary_expires_at.map(|value| value.to_rfc3339()),
+            auto_topup_enabled: r.try_get::<_, i32>(7)? != 0,
+            auto_topup_threshold_cents: r.try_get(8)?,
+            auto_topup_amount_cents: r.try_get(9)?,
+            is_admin: r.try_get::<_, i32>(10)? != 0,
+            stripe_customer_id: r.try_get(11)?,
+            stripe_payment_method_id: r.try_get(12)?,
+            square_customer_id: r.try_get(13)?,
+            square_card_id: r.try_get(14)?,
+            square_card_brand: r.try_get(15)?,
+            square_card_last4: r.try_get(16)?,
+            billing_restricted: r.try_get::<_, i32>(17)? != 0,
+            billing_restriction_reason: r.try_get(18)?,
             billing_restricted_at: billing_restricted_at.map(|value| value.to_rfc3339()),
         })
+    }
+
+    pub fn is_temporary_expired(&self) -> bool {
+        if !self.is_temporary {
+            return false;
+        }
+        let Some(expires_at) = self.temporary_expires_at.as_deref() else {
+            return true;
+        };
+        let Ok(expires_at) = expires_at.parse::<DateTime<Utc>>() else {
+            return true;
+        };
+        expires_at <= Utc::now()
     }
 
     pub fn fetch_by_id(pool: &DbPool, id: &str) -> Result<Option<Self>> {
@@ -261,6 +282,8 @@ impl Account {
                 email_verified_at: None,
                 balance_cents: 0,
                 trial_seconds_remaining: 600,
+                is_temporary: false,
+                temporary_expires_at: None,
                 auto_topup_enabled: false,
                 auto_topup_threshold_cents: 1000,
                 auto_topup_amount_cents: 3000,
@@ -275,6 +298,171 @@ impl Account {
                 billing_restriction_reason: None,
                 billing_restricted_at: None,
             })
+        })
+    }
+
+    pub fn create_temporary(
+        pool: &DbPool,
+        email: &str,
+        password_hash: &str,
+        trial_seconds_remaining: i64,
+        temporary_expires_at: &str,
+    ) -> Result<Self> {
+        crate::db::run_blocking_db(|| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let trial_seconds_remaining = trial_seconds_remaining.max(0);
+            match pool {
+                DbPool::Sqlite(_) => {
+                    let conn = pool.get()?;
+                    match conn.execute(
+                        "INSERT INTO accounts
+                        (id, email, password_hash, email_verified_at,
+                         trial_seconds_remaining, is_temporary, temporary_expires_at,
+                         auto_topup_enabled, auto_topup_threshold_cents, auto_topup_amount_cents)
+                     VALUES (?1, ?2, ?3, datetime('now'), ?4, 1, ?5, 0, ?6, ?7)",
+                        params![
+                            id,
+                            email,
+                            password_hash,
+                            trial_seconds_remaining,
+                            temporary_expires_at,
+                            DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS,
+                            DEFAULT_AUTO_TOPUP_AMOUNT_CENTS
+                        ],
+                    ) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            if let rusqlite::Error::SqliteFailure(ref ff, ref msg) = e {
+                                let is_unique = ff.code == rusqlite::ErrorCode::ConstraintViolation
+                                    && msg
+                                        .as_deref()
+                                        .map(|m| m.to_lowercase().contains("unique"))
+                                        .unwrap_or(false);
+                                if is_unique {
+                                    return Err(AccountCreateError::DuplicateEmail.into());
+                                }
+                            }
+                            return Err(AccountCreateError::Db(e).into());
+                        }
+                    }
+                }
+                DbPool::Postgres(_) => {
+                    let mut conn = pool.get_pg()?;
+                    let temporary_expires_at =
+                        chrono::DateTime::parse_from_rfc3339(temporary_expires_at)?
+                            .with_timezone(&Utc);
+                    if let Err(e) = conn.execute(
+                        "INSERT INTO accounts
+                        (id, email, password_hash, email_verified_at,
+                         trial_seconds_remaining, is_temporary, temporary_expires_at,
+                         auto_topup_enabled, auto_topup_threshold_cents, auto_topup_amount_cents)
+                     VALUES ($1, $2, $3, now(), $4, 1, $5, 0, $6, $7)",
+                        &[
+                            &id,
+                            &email,
+                            &password_hash,
+                            &trial_seconds_remaining,
+                            &temporary_expires_at,
+                            &DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS,
+                            &DEFAULT_AUTO_TOPUP_AMOUNT_CENTS,
+                        ],
+                    ) {
+                        if e.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+                            return Err(AccountCreateError::DuplicateEmail.into());
+                        }
+                        return Err(AccountCreateError::Postgres(e).into());
+                    }
+                }
+            }
+            Ok(Self {
+                id,
+                email: email.to_string(),
+                email_verified_at: Some(Utc::now().to_rfc3339()),
+                balance_cents: 0,
+                trial_seconds_remaining,
+                is_temporary: true,
+                temporary_expires_at: Some(temporary_expires_at.to_string()),
+                auto_topup_enabled: false,
+                auto_topup_threshold_cents: DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS,
+                auto_topup_amount_cents: DEFAULT_AUTO_TOPUP_AMOUNT_CENTS,
+                is_admin: false,
+                stripe_customer_id: None,
+                stripe_payment_method_id: None,
+                square_customer_id: None,
+                square_card_id: None,
+                square_card_brand: None,
+                square_card_last4: None,
+                billing_restricted: false,
+                billing_restriction_reason: None,
+                billing_restricted_at: None,
+            })
+        })
+    }
+
+    pub fn convert_temporary_to_registered(
+        pool: &DbPool,
+        id: &str,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<Option<Self>> {
+        crate::db::run_blocking_db(|| {
+            let changed = match pool {
+                DbPool::Sqlite(_) => {
+                    let conn = pool.get()?;
+                    match conn.execute(
+                        "UPDATE accounts
+                            SET email = ?2,
+                                password_hash = ?3,
+                                email_verified_at = datetime('now'),
+                                is_temporary = 0,
+                                temporary_expires_at = NULL
+                          WHERE id = ?1
+                            AND is_temporary = 1",
+                        params![id, email, password_hash],
+                    ) {
+                        Ok(changed) => changed,
+                        Err(e) => {
+                            if let rusqlite::Error::SqliteFailure(ref ff, ref msg) = e {
+                                let is_unique = ff.code == rusqlite::ErrorCode::ConstraintViolation
+                                    && msg
+                                        .as_deref()
+                                        .map(|m| m.to_lowercase().contains("unique"))
+                                        .unwrap_or(false);
+                                if is_unique {
+                                    return Err(AccountCreateError::DuplicateEmail.into());
+                                }
+                            }
+                            return Err(AccountCreateError::Db(e).into());
+                        }
+                    }
+                }
+                DbPool::Postgres(_) => {
+                    let mut conn = pool.get_pg()?;
+                    match conn.execute(
+                        "UPDATE accounts
+                            SET email = $2,
+                                password_hash = $3,
+                                email_verified_at = now(),
+                                is_temporary = 0,
+                                temporary_expires_at = NULL
+                          WHERE id = $1
+                            AND is_temporary = 1",
+                        &[&id, &email, &password_hash],
+                    ) {
+                        Ok(changed) => usize::try_from(changed).unwrap_or(usize::MAX),
+                        Err(e) => {
+                            if e.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+                                return Err(AccountCreateError::DuplicateEmail.into());
+                            }
+                            return Err(AccountCreateError::Postgres(e).into());
+                        }
+                    }
+                }
+            };
+            if changed == 0 {
+                return Ok(None);
+            }
+            Self::fetch_by_id(pool, id)
         })
     }
 
