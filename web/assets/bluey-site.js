@@ -172,23 +172,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return id;
     }
 
-    async function revokeBrowserSession() {
-      const previousRefreshToken = accountRefreshToken();
+    async function revokeBrowserSession(accessToken = accountToken(), refreshToken = accountRefreshToken()) {
+      if (!accessToken) return;
       try {
-        if (previousRefreshToken) {
-          await refreshAccountToken();
-        }
-      } catch {
-        // Sign-out should always clear the local browser, even if refresh is
-        // unavailable during a deploy or network blip.
-      }
-      const refreshToken = accountRefreshToken() || previousRefreshToken;
-      if (!accountToken() && !refreshToken) return;
-      try {
-        await apiJson('/auth/logout', {
+        await fetch('/auth/logout', {
           method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
           body: JSON.stringify({ refresh_token: refreshToken || null }),
-          skipAuthRefresh: true,
         });
       } catch {
         // Always let local sign-out complete. Stale or already-revoked server
@@ -197,11 +190,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function signOut() {
-      await revokeBrowserSession();
+      const accessToken = accountToken();
+      const refreshToken = accountRefreshToken();
       clearAccountToken();
       if (isAccountRoute) {
         loadAccount().catch((error) => accountMessage(error.message));
       }
+      await revokeBrowserSession(accessToken, refreshToken);
     }
 
     function syncAccountNav() {
@@ -260,6 +255,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         if (menu.dataset.profileMenuReady === '1') return;
         menu.dataset.profileMenuReady = '1';
         menu.addEventListener('click', (event) => {
+          const signOutButton = event.target.closest('[data-sign-out]');
+          if (signOutButton) {
+            event.preventDefault();
+            event.stopPropagation();
+            closeProfileMenu();
+            signOut().catch(() => {
+              clearAccountToken();
+            });
+            return;
+          }
           event.stopPropagation();
         });
       });
