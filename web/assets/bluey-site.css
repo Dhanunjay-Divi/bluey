@@ -814,13 +814,24 @@
       color: #e0e0e0;
     }
 
+    #productSite .account-profile-menu .danger {
+      color: #f87171;
+    }
+
+    #productSite .account-profile-menu .danger:hover {
+      background: #1a0a0a;
+      color: #ff8585;
+    }
+
     #productSite .account-profile-menu a:last-child,
     #productSite .account-profile-menu button:last-child {
       border-bottom: 0;
     }
 
     #productSite .theme-toggle,
-    #accountApp .theme-toggle {
+    #accountApp .theme-toggle,
+    #downloadApp .theme-toggle,
+    #policyApp .theme-toggle {
       appearance: none;
       -webkit-appearance: none;
       position: relative;
@@ -847,7 +858,9 @@
     }
 
     #productSite .theme-toggle:hover,
-    #accountApp .theme-toggle:hover {
+    #accountApp .theme-toggle:hover,
+    #downloadApp .theme-toggle:hover,
+    #policyApp .theme-toggle:hover {
       border-color: rgba(99, 216, 255, .68);
       box-shadow:
         inset 0 1px 0 rgba(255, 255, 255, .12),
@@ -857,13 +870,17 @@
     }
 
     #productSite .theme-toggle:focus-visible,
-    #accountApp .theme-toggle:focus-visible {
+    #accountApp .theme-toggle:focus-visible,
+    #downloadApp .theme-toggle:focus-visible,
+    #policyApp .theme-toggle:focus-visible {
       outline: 2px solid rgba(99, 216, 255, .62);
       outline-offset: 3px;
     }
 
     #productSite .theme-toggle-knob,
-    #accountApp .theme-toggle-knob {
+    #accountApp .theme-toggle-knob,
+    #downloadApp .theme-toggle-knob,
+    #policyApp .theme-toggle-knob {
       position: relative;
       display: inline-grid;
       place-items: center;
@@ -882,7 +899,9 @@
     }
 
     #productSite .theme-toggle-icon,
-    #accountApp .theme-toggle-icon {
+    #accountApp .theme-toggle-icon,
+    #downloadApp .theme-toggle-icon,
+    #policyApp .theme-toggle-icon {
       position: absolute;
       width: 13px;
       height: 13px;
@@ -893,13 +912,17 @@
     }
 
     #productSite .theme-toggle-sun,
-    #accountApp .theme-toggle-sun {
+    #accountApp .theme-toggle-sun,
+    #downloadApp .theme-toggle-sun,
+    #policyApp .theme-toggle-sun {
       opacity: 1;
       transform: scale(1) rotate(0deg);
     }
 
     #productSite .theme-toggle-moon,
-    #accountApp .theme-toggle-moon {
+    #accountApp .theme-toggle-moon,
+    #downloadApp .theme-toggle-moon,
+    #policyApp .theme-toggle-moon {
       opacity: 0;
       transform: scale(.72) rotate(-16deg);
     }
@@ -936,7 +959,9 @@
     }
 
     html[data-bluey-theme="light"] #productSite .theme-toggle,
-    html[data-bluey-theme="light"] #accountApp .theme-toggle {
+    html[data-bluey-theme="light"] #accountApp .theme-toggle,
+    html[data-bluey-theme="light"] #downloadApp .theme-toggle,
+    html[data-bluey-theme="light"] #policyApp .theme-toggle {
       justify-content: flex-start;
       border-color: rgba(48, 151, 210, .28);
       background:
@@ -950,7 +975,9 @@
     }
 
     html[data-bluey-theme="light"] #productSite .theme-toggle-knob,
-    html[data-bluey-theme="light"] #accountApp .theme-toggle-knob {
+    html[data-bluey-theme="light"] #accountApp .theme-toggle-knob,
+    html[data-bluey-theme="light"] #downloadApp .theme-toggle-knob,
+    html[data-bluey-theme="light"] #policyApp .theme-toggle-knob {
       background:
         radial-gradient(circle at 35% 25%, rgba(255, 255, 255, .55), transparent 32%),
         linear-gradient(145deg, #fff, #e6f8ff);
@@ -961,19 +988,25 @@
     }
 
     html[data-bluey-theme="light"] #productSite .theme-toggle-icon,
-    html[data-bluey-theme="light"] #accountApp .theme-toggle-icon {
+    html[data-bluey-theme="light"] #accountApp .theme-toggle-icon,
+    html[data-bluey-theme="light"] #downloadApp .theme-toggle-icon,
+    html[data-bluey-theme="light"] #policyApp .theme-toggle-icon {
       color: #172535;
       filter: drop-shadow(0 2px 5px rgba(0, 0, 0, .12));
     }
 
     html[data-bluey-theme="light"] #productSite .theme-toggle-sun,
-    html[data-bluey-theme="light"] #accountApp .theme-toggle-sun {
+    html[data-bluey-theme="light"] #accountApp .theme-toggle-sun,
+    html[data-bluey-theme="light"] #downloadApp .theme-toggle-sun,
+    html[data-bluey-theme="light"] #policyApp .theme-toggle-sun {
       opacity: 0;
       transform: scale(.72) rotate(22deg);
     }
 
     html[data-bluey-theme="light"] #productSite .theme-toggle-moon,
-    html[data-bluey-theme="light"] #accountApp .theme-toggle-moon {
+    html[data-bluey-theme="light"] #accountApp .theme-toggle-moon,
+    html[data-bluey-theme="light"] #downloadApp .theme-toggle-moon,
+    html[data-bluey-theme="light"] #policyApp .theme-toggle-moon {
       opacity: 1;
       transform: scale(1) rotate(0deg);
     }
@@ -1077,6 +1110,15 @@
     html[data-bluey-theme="light"] #productSite .account-profile-menu button:hover {
       background: #f1fbff;
       color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #productSite .account-profile-menu .danger {
+      color: #d93a4e;
+    }
+
+    html[data-bluey-theme="light"] #productSite .account-profile-menu .danger:hover {
+      background: #fff1f3;
+      color: #b42335;
     }
 
     html[data-bluey-theme="light"] #productSite .connect-help {
@@ -2098,6 +2140,17 @@
       color: #e0e0e0;
     }
 
+    #downloadApp .account-profile-menu .danger,
+    #policyApp .account-profile-menu .danger {
+      color: #f87171;
+    }
+
+    #downloadApp .account-profile-menu .danger:hover,
+    #policyApp .account-profile-menu .danger:hover {
+      background: #1a0a0a;
+      color: #ff8585;
+    }
+
     #downloadApp .account-profile-menu a:last-child,
     #downloadApp .account-profile-menu button:last-child,
     #policyApp .account-profile-menu a:last-child,
@@ -2126,6 +2179,12 @@
     #accountApp .account-button:hover,
     #downloadApp .copy-command:hover:not(:disabled) {
       border-color: var(--bluey-accent);
+      color: var(--bluey-accent);
+    }
+
+    #accountApp .account-button.copied,
+    #downloadApp .copy-command.copied {
+      border-color: rgba(99, 216, 255, .42);
       color: var(--bluey-accent);
     }
 
@@ -4479,7 +4538,7 @@
       gap: .72rem;
     }
 
-    #accountApp.is-guest .account-form label:not(.terms-check) {
+    #accountApp.is-guest .account-form label:not(.terms-check):not(.remember-check) {
       display: block;
       color: transparent;
       font-size: 0;
@@ -4583,6 +4642,28 @@
     #accountApp.is-guest .terms-check span {
       color: #858585;
       font-size: .68rem;
+    }
+
+    #accountApp.is-guest .remember-check {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      margin: -.1rem 0 0;
+      color: #858585;
+      font-size: .76rem;
+      font-weight: 580;
+      letter-spacing: 0;
+      line-height: 1.2;
+      text-transform: none;
+    }
+
+    #accountApp.is-guest .account-form .remember-check input {
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      padding: 0;
+      border-radius: 3px;
+      accent-color: var(--bluey-accent);
     }
 
     #accountApp.is-guest .auth-submit-row {
@@ -4890,6 +4971,10 @@
       color: #667887;
     }
 
+    html[data-bluey-theme="light"] #accountApp.is-guest .remember-check {
+      color: #667887;
+    }
+
     html[data-bluey-theme="light"] #accountApp .auth-link-button,
     html[data-bluey-theme="light"] #accountApp.is-guest .account-note a,
     html[data-bluey-theme="light"] #accountApp .auth-card-links a:hover {
@@ -4953,6 +5038,15 @@
       color: #087ca6;
     }
 
+    html[data-bluey-theme="light"] #accountApp .account-profile-menu .danger {
+      color: #d93a4e;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-profile-menu .danger:hover {
+      background: #fff1f3;
+      color: #b42335;
+    }
+
     html[data-bluey-theme="light"] #downloadApp .profile-button,
     html[data-bluey-theme="light"] #policyApp .profile-button {
       border-color: #d8e8f0;
@@ -5001,6 +5095,17 @@
     html[data-bluey-theme="light"] #policyApp .account-profile-menu button:hover {
       background: #f1fbff;
       color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .account-profile-menu .danger,
+    html[data-bluey-theme="light"] #policyApp .account-profile-menu .danger {
+      color: #d93a4e;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .account-profile-menu .danger:hover,
+    html[data-bluey-theme="light"] #policyApp .account-profile-menu .danger:hover {
+      background: #fff1f3;
+      color: #b42335;
     }
 
     html[data-bluey-theme="light"] #accountApp .account-modal-backdrop {

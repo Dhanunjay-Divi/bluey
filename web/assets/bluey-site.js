@@ -34,6 +34,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let squareCardSetupPromise = null;
     let refreshAccountTokenPromise = null;
     let currentAccountEmail = '';
+    let currentAccountIsAdmin = false;
+    let adminAbuseLoaded = false;
     let latestAccountForBilling = null;
     const AUTO_RELOAD_MIN_CENTS = 1500;
     const AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 1000;
@@ -51,6 +53,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let pendingTrialButton = null;
     const DEVICE_LINK_TTL_MS = 10 * 60 * 1000;
     const DEVICE_LINK_STORAGE_KEY = 'bluey_pending_device_code';
+    const ACCESS_TOKEN_KEY = 'bluey_access_token';
+    const REFRESH_TOKEN_KEY = 'bluey_refresh_token';
+    const AUTH_PERSISTENCE_KEY = 'bluey_auth_persistence';
 
     function money(cents) {
       return `$${(Number(cents || 0) / 100).toFixed(2)}`;
@@ -67,7 +72,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function accountToken() {
-      return localStorage.getItem('bluey_access_token') || '';
+      return localStorage.getItem(ACCESS_TOKEN_KEY) || sessionStorage.getItem(ACCESS_TOKEN_KEY) || '';
+    }
+
+    function accountRefreshToken() {
+      return localStorage.getItem(REFRESH_TOKEN_KEY) || sessionStorage.getItem(REFRESH_TOKEN_KEY) || '';
+    }
+
+    function accountTokenPersists() {
+      return localStorage.getItem(AUTH_PERSISTENCE_KEY) !== 'session' && !sessionStorage.getItem(ACCESS_TOKEN_KEY);
     }
 
     function normalizeDeviceCode(value) {
@@ -123,16 +136,26 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return String(id).trim().slice(0, 160);
     }
 
-    function setAccountToken(auth) {
-      localStorage.setItem('bluey_access_token', auth.access_token);
-      localStorage.setItem('bluey_refresh_token', auth.refresh_token || '');
+    function setAccountToken(auth, remember = accountTokenPersists()) {
+      const target = remember ? localStorage : sessionStorage;
+      const other = remember ? sessionStorage : localStorage;
+      other.removeItem(ACCESS_TOKEN_KEY);
+      other.removeItem(REFRESH_TOKEN_KEY);
+      target.setItem(ACCESS_TOKEN_KEY, auth.access_token);
+      target.setItem(REFRESH_TOKEN_KEY, auth.refresh_token || '');
+      localStorage.setItem(AUTH_PERSISTENCE_KEY, remember ? 'local' : 'session');
       syncAccountNav();
     }
 
     function clearAccountToken() {
-      localStorage.removeItem('bluey_access_token');
-      localStorage.removeItem('bluey_refresh_token');
+      localStorage.removeItem(ACCESS_TOKEN_KEY);
+      localStorage.removeItem(REFRESH_TOKEN_KEY);
+      localStorage.removeItem(AUTH_PERSISTENCE_KEY);
+      sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+      sessionStorage.removeItem(REFRESH_TOKEN_KEY);
       currentAccountEmail = '';
+      currentAccountIsAdmin = false;
+      adminAbuseLoaded = false;
       syncAccountNav();
     }
 
@@ -149,7 +172,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function revokeBrowserSession() {
-      const previousRefreshToken = localStorage.getItem('bluey_refresh_token') || '';
+      const previousRefreshToken = accountRefreshToken();
       try {
         if (previousRefreshToken) {
           await refreshAccountToken();
@@ -158,7 +181,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         // Sign-out should always clear the local browser, even if refresh is
         // unavailable during a deploy or network blip.
       }
-      const refreshToken = localStorage.getItem('bluey_refresh_token') || previousRefreshToken;
+      const refreshToken = accountRefreshToken() || previousRefreshToken;
       if (!accountToken() && !refreshToken) return;
       try {
         await apiJson('/auth/logout', {
@@ -459,7 +482,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     async function refreshAccountToken() {
       if (refreshAccountTokenPromise) return refreshAccountTokenPromise;
       refreshAccountTokenPromise = (async () => {
-        const refreshToken = localStorage.getItem('bluey_refresh_token') || '';
+        const refreshToken = accountRefreshToken();
         if (!refreshToken) return '';
         const response = await fetch('/auth/refresh', {
           method: 'POST',
@@ -476,7 +499,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           clearAccountToken();
           return '';
         }
-        setAccountToken(body);
+        setAccountToken(body, accountTokenPersists());
         return body.access_token;
       })();
       try {
@@ -869,6 +892,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const emailLabel = document.getElementById('accountEmailLabel');
       const passwordLabel = document.getElementById('accountPasswordLabel');
       const confirmLabel = document.getElementById('accountPasswordConfirmLabel');
+      const rememberLabel = document.getElementById('rememberMeLabel');
       const terms = document.getElementById('signupTermsLabel');
       const primary = document.getElementById('accountPrimaryButton');
       const create = document.getElementById('createAccountButton');
@@ -887,6 +911,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (emailLabel) emailLabel.hidden = false;
       if (passwordLabel) passwordLabel.hidden = false;
       if (confirmLabel) confirmLabel.hidden = accountAuthMode !== 'signup';
+      if (rememberLabel) rememberLabel.hidden = accountAuthMode !== 'login';
       if (terms) terms.hidden = accountAuthMode !== 'signup';
       if (primary) primary.textContent = accountAuthMode === 'signup' ? 'Send verification code' : 'Sign in';
       if (primary) primary.hidden = false;
@@ -952,6 +977,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const emailLabel = document.getElementById('accountEmailLabel');
       const passwordLabel = document.getElementById('accountPasswordLabel');
       const confirmLabel = document.getElementById('accountPasswordConfirmLabel');
+      const rememberLabel = document.getElementById('rememberMeLabel');
       const terms = document.getElementById('signupTermsLabel');
       const captcha = document.getElementById('signupCaptcha');
       const primary = document.getElementById('accountPrimaryButton');
@@ -971,6 +997,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (emailLabel) emailLabel.hidden = enabled;
       if (passwordLabel) passwordLabel.hidden = enabled;
       if (confirmLabel) confirmLabel.hidden = enabled || accountAuthMode !== 'signup';
+      if (rememberLabel) rememberLabel.hidden = enabled || accountAuthMode !== 'login';
       if (terms) terms.hidden = enabled || accountAuthMode !== 'signup';
       if (captcha) captcha.hidden = enabled || captcha.hidden;
       if (primary) primary.hidden = enabled;
@@ -991,10 +1018,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function renderDeviceLinkHint() {
       const code = pendingDeviceCode();
-      const targets = [
-        document.getElementById('deviceLinkHint'),
-        document.getElementById('dashboardDeviceLinkHint'),
-      ].filter(Boolean);
+      const authHint = document.getElementById('deviceLinkHint');
+      const dashboardHint = document.getElementById('dashboardDeviceLinkHint');
+      const targets = [authHint, dashboardHint].filter(Boolean);
       if (!targets.length) return;
       for (const el of targets) {
         el.hidden = true;
@@ -1043,7 +1069,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       };
 
       if (!code) {
-        for (const el of targets) renderCodeEntry(el);
+        if (accountToken() && dashboardHint) renderCodeEntry(dashboardHint);
         return;
       }
 
@@ -1095,7 +1121,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           el.append(button);
         }
       };
-      for (const el of targets) renderInto(el);
+      const visibleTargets = accountToken()
+        ? [dashboardHint].filter(Boolean)
+        : [authHint].filter(Boolean);
+      for (const el of visibleTargets) renderInto(el);
     }
 
     async function approvePendingDevice() {
@@ -1134,6 +1163,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     async function accountAuth(mode) {
       const email = document.getElementById('accountEmail').value.trim();
       const password = document.getElementById('accountPassword').value;
+      const remember = document.getElementById('rememberMe')?.checked !== false;
       if (!email || !password) {
         accountMessage('Email and password are required.', true, 'error');
         return;
@@ -1144,7 +1174,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         method: 'POST',
         body: JSON.stringify({ email, password }),
       });
-      setAccountToken(auth);
+      setAccountToken(auth, remember);
       accountMessage('', true);
       await loadAccount();
     }
@@ -1198,7 +1228,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         method: 'POST',
         body: JSON.stringify({ email, otp, device_fingerprint: browserTrialDeviceId() }),
       });
-      setAccountToken(auth);
+      setAccountToken(auth, document.getElementById('rememberMe')?.checked !== false);
       setSignupOtpMode(false);
       accountMessage('', true);
       await loadAccount();
@@ -1327,12 +1357,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function startPasswordReset(email) {
-      recoveryMessage('Sending reset link...');
+      recoveryMessage('Sending reset email...');
       await apiJson('/auth/password-reset/start', {
         method: 'POST',
         body: JSON.stringify({ email }),
       });
-      recoveryMessage('If the account exists, a reset link was sent. Open it to choose a new password.', 'success');
+      recoveryMessage('If the account exists, a reset email was sent. Open it to choose a new password.', 'success');
     }
 
     async function confirmPasswordReset(token, newPassword) {
@@ -2239,6 +2269,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return summary;
     }
 
+    function maybeLoadAdminAbuse() {
+      if (!currentAccountIsAdmin || adminAbuseLoaded) return;
+      adminAbuseLoaded = true;
+      loadAdminAbuse().catch((error) => {
+        adminAbuseLoaded = false;
+        renderAdminAbuse({}, `Could not load trial protection: ${error.message}`);
+      });
+    }
+
     async function loadAccount() {
       if (currentPath === '/verify-email' || currentPath === '/password-reset') {
         renderRecoveryRoute();
@@ -2252,6 +2291,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('accountDashboard').hidden = !authed;
       document.getElementById('accountRecoveryCard').hidden = true;
       if (!authed) {
+        currentAccountIsAdmin = false;
+        adminAbuseLoaded = false;
         setAdminDashboardAvailability(false);
         return;
       }
@@ -2339,22 +2380,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         renderAutoReload(me);
         updateManualReloadDraftCopy();
         const isAdmin = Boolean(me.is_admin);
+        currentAccountIsAdmin = isAdmin;
+        if (!isAdmin) adminAbuseLoaded = false;
         setAdminDashboardAvailability(isAdmin);
         const adminSection = document.getElementById('adminAbuseSection');
         if (adminSection) adminSection.hidden = !isAdmin;
         if (isAdmin && normalizeDashboardTabName(window.location.hash) === 'admin') {
           setDashboardTab('admin');
         }
-        if (isAdmin) {
-          loadAdminAbuse().catch((error) => {
-            renderAdminAbuse({}, `Could not load trial abuse events: ${error.message}`);
-          });
-        }
         void linkedDevicesPromise;
         void sessionsPromise;
         accountMessage(new URLSearchParams(location.search).get('reload') === 'success'
           ? 'Checkout complete. If the balance still looks old, Square is finishing the credit event; press Refresh balance in a moment.'
           : '');
+        openAccountActionFromHash();
         try {
           const approved = await approvePendingDevice();
           if (!approved) await openDesktopDeepLinkIfNeeded();
@@ -2420,6 +2459,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
+    function openAccountActionFromHash() {
+      if (!accountToken()) return false;
+      const action = String(window.location.hash || '').replace(/^#/, '').trim().toLowerCase();
+      if (action === 'password' || action === 'change-password') {
+        openChangePasswordDialog();
+        return true;
+      }
+      if (action === 'delete' || action === 'delete-account') {
+        openDeleteAccountDialog();
+        return true;
+      }
+      return false;
+    }
+
     function setDashboardTab(tabName, updateHash = false) {
       const name = normalizeDashboardTabName(tabName) || 'computers';
       document.querySelectorAll('[data-dashboard-tab]').forEach((button) => {
@@ -2432,6 +2485,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         panel.hidden = !active;
         panel.classList.toggle('is-active', active);
       });
+      if (name === 'admin') maybeLoadAdminAbuse();
       if (updateHash && window.history?.replaceState) {
         const nextUrl = `${window.location.pathname}${window.location.search}#${name}`;
         window.history.replaceState(null, '', nextUrl);
@@ -2450,7 +2504,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       window.addEventListener('hashchange', () => {
         const tab = normalizeDashboardTabName(window.location.hash);
-        if (tab) setDashboardTab(tab);
+        if (tab) {
+          setDashboardTab(tab);
+        } else {
+          openAccountActionFromHash();
+        }
       });
     }
 
@@ -2678,7 +2736,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         event.preventDefault();
         const token = new URLSearchParams(location.search).get('token') || '';
         const password = document.getElementById('resetPassword').value;
-        if (!token) return recoveryMessage('Open the reset link from your email to choose a new password.', 'error');
+        if (!token) return recoveryMessage('Open the reset email to choose a new password.', 'error');
         if (!password) return recoveryMessage('New password is required.', 'error');
         confirmPasswordReset(token, password).catch((error) => recoveryMessage(error.message, 'error'));
       });
@@ -2706,8 +2764,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('recoveryCopy').textContent = isVerify
         ? 'Bluey will verify this email token and return you to sign-in.'
         : token
-          ? 'Your reset link is ready. Choose a new password for this Bluey account.'
-          : 'Enter your account email. Bluey will send a secure password reset link.';
+          ? 'Your reset email is ready. Choose a new password for this Bluey account.'
+          : 'Enter your account email. Bluey will send a secure password reset email.';
       document.getElementById('passwordResetStartForm').hidden = isVerify || Boolean(token);
       document.getElementById('passwordResetConfirmForm').hidden = isVerify || !token;
 
@@ -2776,15 +2834,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!button) return;
       const text = button.dataset.copy || '';
       if (!text) return;
+      const old = button.textContent;
       try {
         await navigator.clipboard.writeText(text);
-        const old = button.textContent;
-        button.textContent = 'Copied';
+        button.textContent = 'Copied!';
+        button.classList.add('copied');
         setTimeout(() => {
           button.textContent = old;
+          button.classList.remove('copied');
         }, 1200);
       } catch {
         button.textContent = 'Copy failed';
+        setTimeout(() => {
+          button.textContent = old;
+        }, 1500);
       }
     });
 

@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070503"
+    href="/assets/bluey-site.css?v=2026070504"
   >
   <script type="application/ld+json">
   {
@@ -93,10 +93,21 @@
     <div class="policy-shell">
       <nav class="site-nav">
         <a class="brand" href="/">
-          <img src="/assets/bluey-logo.svg?v=2026070503" alt="">
-          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg?v=2026070503" alt="bluey">
+          <img src="/assets/bluey-logo.svg?v=2026070504" alt="">
+          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg?v=2026070504" alt="bluey">
         </a>
         <div class="navlinks">
+          <button class="theme-toggle" type="button" aria-label="Switch to light theme" aria-pressed="false">
+            <span class="theme-toggle-knob" aria-hidden="true">
+              <svg class="theme-toggle-icon theme-toggle-sun" viewBox="0 0 24 24" fill="none">
+                <circle cx="12" cy="12" r="4.3" fill="currentColor"></circle>
+                <path d="M12 2.8v2.5M12 18.7v2.5M4.2 4.2 6 6M18 18l1.8 1.8M2.8 12h2.5M18.7 12h2.5M4.2 19.8 6 18M18 6l1.8-1.8" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"></path>
+              </svg>
+              <svg class="theme-toggle-icon theme-toggle-moon" viewBox="0 0 24 24" fill="none">
+                <path d="M18.7 14.2A7.5 7.5 0 0 1 9.8 5.3a7.7 7.7 0 1 0 8.9 8.9Z" fill="currentColor"></path>
+              </svg>
+            </span>
+          </button>
           <a href="/download">Download</a>
           <a href="/docs/disguise">Controls</a>
           <a href="/privacy">Privacy</a>
@@ -117,6 +128,8 @@
             <div class="account-profile-menu" role="menu" data-account-profile-menu hidden>
               <div class="profile-email" data-profile-email-label>Bluey account</div>
               <a href="/account" role="menuitem">Dashboard</a>
+              <a href="/account#password" role="menuitem">Change Password</a>
+              <a class="danger" href="/account#delete" role="menuitem">Delete Account</a>
               <button type="button" role="menuitem" data-sign-out>Logout</button>
             </div>
           </div>
@@ -230,8 +243,8 @@
     <div class="account-shell">
       <aside class="account-rail" aria-label="Bluey account navigation">
         <a class="brand" href="/">
-          <img src="/assets/bluey-logo.svg?v=2026070503" alt="">
-          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg?v=2026070503" alt="bluey">
+          <img src="/assets/bluey-logo.svg?v=2026070504" alt="">
+          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg?v=2026070504" alt="bluey">
         </a>
         <div class="rail-command">
           <code id="railCommandLabel">bluey on</code>
@@ -250,8 +263,8 @@
 
       <header class="account-top">
         <a class="account-top-brand" href="/">
-          <img src="/assets/bluey-logo.svg?v=2026070503" alt="">
-          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg?v=2026070503" alt="bluey">
+          <img src="/assets/bluey-logo.svg?v=2026070504" alt="">
+          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg?v=2026070504" alt="bluey">
         </a>
         <div class="status-row">
           <span class="status-chip live">AI online</span>
@@ -300,8 +313,8 @@
         <section class="account-grid">
           <aside class="account-card" id="accountAuthCard">
             <div class="auth-brand">
-              <img class="auth-logo" src="/assets/bluey-logo.svg?v=2026070503" alt="">
-              <img class="auth-wordmark" src="/assets/bluey-wordmark.svg?v=2026070503" alt="bluey">
+              <img class="auth-logo" src="/assets/bluey-logo.svg?v=2026070504" alt="">
+              <img class="auth-wordmark" src="/assets/bluey-wordmark.svg?v=2026070504" alt="bluey">
             </div>
             <div class="account-message" id="accountAuthMessage"></div>
             <h2 id="accountAuthTitle">Welcome back</h2>
@@ -325,6 +338,10 @@
                   <input id="accountPasswordConfirm" type="password" autocomplete="new-password" placeholder="Confirm password">
                   <button class="password-toggle" type="button" data-password-toggle="accountPasswordConfirm" aria-label="Show confirm password"></button>
                 </span>
+              </label>
+              <label class="remember-check" id="rememberMeLabel">
+                <input type="checkbox" id="rememberMe" checked>
+                <span>Remember me</span>
               </label>
               <label id="signupOtpLabel" hidden>
                 Verification code
@@ -374,8 +391,8 @@
 
           <section class="account-card account-recovery-card" id="accountRecoveryCard" hidden>
             <div class="auth-brand">
-              <img class="auth-logo" src="/assets/bluey-logo.svg?v=2026070503" alt="">
-              <img class="auth-wordmark" src="/assets/bluey-wordmark.svg?v=2026070503" alt="bluey">
+              <img class="auth-logo" src="/assets/bluey-logo.svg?v=2026070504" alt="">
+              <img class="auth-wordmark" src="/assets/bluey-wordmark.svg?v=2026070504" alt="bluey">
             </div>
             <div class="account-message" id="recoveryMessage"></div>
             <h2 id="recoveryTitle">Account help</h2>
@@ -385,7 +402,7 @@
                 Email
                 <input id="resetEmail" type="email" autocomplete="email" placeholder="Email">
               </label>
-              <button class="account-button primary" type="submit">Send reset link</button>
+              <button class="account-button primary" type="submit">Send reset email</button>
             </form>
             <form class="account-form" id="passwordResetConfirmForm" hidden>
               <label class="password-label">
@@ -699,10 +716,21 @@
     <div class="download-shell">
       <nav class="site-nav">
         <a class="brand" href="/">
-          <img src="/assets/bluey-logo.svg?v=2026070503" alt="">
-          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg?v=2026070503" alt="bluey">
+          <img src="/assets/bluey-logo.svg?v=2026070504" alt="">
+          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg?v=2026070504" alt="bluey">
         </a>
         <div class="navlinks">
+          <button class="theme-toggle" type="button" aria-label="Switch to light theme" aria-pressed="false">
+            <span class="theme-toggle-knob" aria-hidden="true">
+              <svg class="theme-toggle-icon theme-toggle-sun" viewBox="0 0 24 24" fill="none">
+                <circle cx="12" cy="12" r="4.3" fill="currentColor"></circle>
+                <path d="M12 2.8v2.5M12 18.7v2.5M4.2 4.2 6 6M18 18l1.8 1.8M2.8 12h2.5M18.7 12h2.5M4.2 19.8 6 18M18 6l1.8-1.8" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"></path>
+              </svg>
+              <svg class="theme-toggle-icon theme-toggle-moon" viewBox="0 0 24 24" fill="none">
+                <path d="M18.7 14.2A7.5 7.5 0 0 1 9.8 5.3a7.7 7.7 0 1 0 8.9 8.9Z" fill="currentColor"></path>
+              </svg>
+            </span>
+          </button>
           <a class="nav-cta" href="/login" data-guest-only>Login</a>
           <a href="/account" data-auth-only hidden>Dashboard</a>
           <form class="nav-connect" action="/login" method="get" aria-label="Connect a Bluey desktop code" data-connect-code-form data-auth-only hidden>
@@ -719,6 +747,8 @@
             <div class="account-profile-menu" role="menu" data-account-profile-menu hidden>
               <div class="profile-email" data-profile-email-label>Bluey account</div>
               <a href="/account" role="menuitem">Dashboard</a>
+              <a href="/account#password" role="menuitem">Change Password</a>
+              <a class="danger" href="/account#delete" role="menuitem">Delete Account</a>
               <button type="button" role="menuitem" data-sign-out>Logout</button>
             </div>
           </div>
@@ -849,8 +879,8 @@
   <main class="page" id="productSite">
     <nav class="nav">
       <a class="logo" href="/">
-        <img src="/assets/bluey-logo.svg?v=2026070503" alt="">
-        <img class="brand-wordmark" src="/assets/bluey-wordmark.svg?v=2026070503" alt="bluey">
+        <img src="/assets/bluey-logo.svg?v=2026070504" alt="">
+        <img class="brand-wordmark" src="/assets/bluey-wordmark.svg?v=2026070504" alt="bluey">
       </a>
       <div class="nav-links">
         <button class="theme-toggle" type="button" aria-label="Switch to light theme" aria-pressed="false">
@@ -876,6 +906,8 @@
           <div class="account-profile-menu" role="menu" data-account-profile-menu hidden>
             <div class="profile-email" data-profile-email-label>Bluey account</div>
             <a href="/account" role="menuitem">Dashboard</a>
+            <a href="/account#password" role="menuitem">Change Password</a>
+            <a class="danger" href="/account#delete" role="menuitem">Delete Account</a>
             <button type="button" role="menuitem" data-sign-out>Logout</button>
           </div>
         </div>
@@ -898,7 +930,7 @@
             <input name="user_code" type="text" placeholder="connect code" autocomplete="one-time-code" spellcheck="false" aria-label="Bluey connect code">
             <button type="submit">Connect</button>
           </form>
-          <div class="connect-help">Have a Bluey desktop code? Enter it to connect this browser.</div>
+          <div class="connect-help">Have a Bluey desktop code? Enter it to connect your account.</div>
           <div class="connect-status" id="productConnectStatus" aria-live="polite"></div>
           <div class="hero-note">native overlay · model routing · prepaid credits · sessions save only by choice</div>
         </section>
@@ -982,7 +1014,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070503"
+    src="/assets/bluey-site.js?v=2026070504"
   ></script>
 </body>
 </html>
