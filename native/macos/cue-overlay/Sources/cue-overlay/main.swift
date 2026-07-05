@@ -2912,8 +2912,11 @@ private final class FeedView: NSView {
 
         stack.orientation = .vertical
         stack.alignment = .centerX
+        stack.distribution = .fill
         stack.spacing = 8
         stack.edgeInsets = NSEdgeInsets(top: 12, left: 0, bottom: 10, right: 0)
+        stack.setContentHuggingPriority(.required, for: .vertical)
+        stack.setContentCompressionResistancePriority(.required, for: .vertical)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         scroll.hasVerticalScroller = true

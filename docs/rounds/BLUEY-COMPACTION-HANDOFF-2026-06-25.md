@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 19:35 EDT
+Latest checkpoint: 2026-07-04 20:05 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,7 +30,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-348-STREAMING-ATTACHMENT-EVENTS.md`; the next canonical Bluey round doc should start at `ROUND-349-...`.
+- Latest completed Bluey round doc is `ROUND-349-FOLLOWUP-VISION-FALLBACK-FEED-GAP.md`; the next canonical Bluey round doc should start at `ROUND-350-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
@@ -5899,6 +5899,82 @@ Deployment status:
 - `https://bluey.sh/health` reports commit `210a4f7559ffd13fe263b3891d75b5e93c39c9f3`.
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
+
+## Latest Round 349: Follow-up Vision Fallback and Feed Gap
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned runtime work:
+
+```bash
+codex/bluey-stream-attachments-20260704
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-349-FOLLOWUP-VISION-FALLBACK-FEED-GAP.md`
+
+Trigger:
+
+- The owner showed Bluey session `AD0A09E8` where a code follow-up, `can u give me go code for that?`, failed with ref `FFAC5F2B`.
+- The same screenshot showed a large blank vertical gap between the prior answer and the next question.
+
+Root cause:
+
+- The failing ref was from daemon `0.1.82`, but the pattern still needed hardening.
+- A screenshot-backed first answer used `bluey_managed/vision`.
+- Follow-up/code requests could still be promoted back to managed vision when screenshot context was present.
+- Managed vision returned HTTP `400`, and Bluey surfaced the generic failure instead of retrying from retained screen text and recent Q&A.
+- The macOS feed stack did not explicitly use compact vertical distribution, so AppKit could spread arranged chat rows across the viewport.
+
+What changed:
+
+- Added daemon fallback from managed vision `400` to saved text context:
+  - screenshot context is downgraded to meeting memory for the retry
+  - code/debug follow-ups retry on managed `deep`
+  - other requests retry on managed `balanced`
+  - fallback attempts log `managed vision request rejected; retrying with saved text context`
+- Added a daemon regression test for the exact code-follow-up shape.
+- Set the macOS feed stack to `.fill` and gave it vertical hugging/compression resistance to keep chat spacing compact.
+- Desktop workspace version bumped to `0.1.88`.
+
+Verification so far:
+
+```bash
+cargo fmt --check
+cargo test -p cue-daemon managed_vision_bad_request_falls_back_to_text_deep_for_code_follow_up -- --nocapture
+cargo check -p cue-cli -p cue-daemon
+swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift
+cd native/macos/cue-overlay && swift build -c release
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.88
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+/Users/uno/.bluey/bin/bluey on
+/Users/uno/.bluey/bin/bluey status
+```
+
+Deployment status:
+
+- Desktop release `0.1.88` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.88/bluey-0.1.88-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `42acefb183d8c0a762679caba7aac375ed25ad29051e5027e17281630aceaa3c`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.88`
+- Public installer smoke installed `0.1.88` locally and both installed binaries report `0.1.88`.
+- `bluey on` started fresh daemon pid `88803`.
+
+Windows parity:
+
+- The follow-up fallback is daemon-side and applies to macOS and Windows.
+- The feed-gap fix is macOS Swift overlay-specific; Windows should keep compact chat feed row layout in its own overlay path.
 
 ## Latest Round 348: Streaming Attachment Events
 

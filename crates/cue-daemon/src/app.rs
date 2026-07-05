@@ -9040,6 +9040,83 @@ async fn resolve_answer_route(
                             .failed(message.clone()),
                     );
                     failures.push(message);
+                    if let Some(fallback_request) =
+                        managed_vision_text_fallback_request(request, &step.provider, &error)
+                    {
+                        let fallback_provider = fallback_request.route.primary.provider.clone();
+                        let fallback_depth = fallback_depth + 1;
+                        info!(
+                            request_id = %request.metadata.request_id,
+                            failed_provider = %step.provider.display_label(),
+                            fallback_provider = %fallback_provider.display_label(),
+                            question_intent = question_intent_label(&request.question),
+                            "managed vision request rejected; retrying with saved text context"
+                        );
+                        let fallback_config = provider_client_config(&fallback_provider);
+                        let fallback_budget = fallback_request
+                            .route
+                            .primary
+                            .budget_override
+                            .unwrap_or(fallback_request.route.budgets);
+                        let fallback_payload = ProviderRequestPayload::from_request(
+                            &fallback_request,
+                            fallback_provider.clone(),
+                            fallback_config.endpoint.clone(),
+                            default_model_for_provider(fallback_provider.provider_kind),
+                            fallback_budget,
+                        );
+                        if let Some(stream) = stream.as_mut() {
+                            stream.push_status("Using saved screen context").await?;
+                        }
+                        let stream_ref = stream.as_mut().map(|stream| &mut **stream);
+                        match call_bluey_managed_provider(
+                            paths,
+                            &fallback_request,
+                            &fallback_provider,
+                            &fallback_payload,
+                            stream_ref,
+                        )
+                        .await
+                        {
+                            Ok(answer) => {
+                                attempts.push(
+                                    RouteAttemptMetadata::started(
+                                        answer.provider.clone(),
+                                        fallback_depth,
+                                    )
+                                    .succeeded(answer.latency_ms),
+                                );
+                                let safety = SafetyOutcome::pass().with_notice(format!(
+                                    "managed Bluey route used after vision text fallback: {}",
+                                    answer.provider.display_label()
+                                ));
+                                return Ok(AnswerRouteOutcome {
+                                    provider: answer.provider,
+                                    answer: answer.answer,
+                                    artifact: answer.artifact,
+                                    attempts,
+                                    latency_ms: answer.latency_ms,
+                                    token_usage: answer.token_usage,
+                                    safety,
+                                    sources: answer.sources,
+                                });
+                            }
+                            Err(fallback_error) => {
+                                let fallback_message = format!(
+                                    "{} text fallback request failed: {fallback_error:#}",
+                                    fallback_provider.display_label()
+                                );
+                                attempts.push(
+                                    RouteAttemptMetadata::started(
+                                        fallback_provider,
+                                        fallback_depth,
+                                    )
+                                    .failed(fallback_message.clone()),
+                                );
+                                failures.push(fallback_message);
+                            }
+                        }
+                    }
                     continue;
                 }
             }
@@ -9095,6 +9172,57 @@ async fn resolve_answer_route(
         request.metadata.request_id,
         failures.join("; ")
     ))
+}
+
+fn managed_vision_text_fallback_request(
+    request: &AnswerRequest,
+    provider: &ProviderSelector,
+    error: &anyhow::Error,
+) -> Option<AnswerRequest> {
+    if !matches!(provider.provider_kind, AiProviderKind::CueManaged) {
+        return None;
+    }
+    if provider.model_or("") != "vision" {
+        return None;
+    }
+    let raw_error = format!("{error:#}");
+    let lower_error = raw_error.to_ascii_lowercase();
+    let bad_request = lower_error.contains("server error: 400")
+        || lower_error.contains("server error 400")
+        || lower_error.contains("bad request");
+    if !bad_request {
+        return None;
+    }
+    if !request
+        .context
+        .iter()
+        .any(|context| context.kind == AnswerContextKind::Screenshot)
+    {
+        return None;
+    }
+
+    let lane = match question_intent_label(&request.question) {
+        "code_or_debug" | "code_explanation" => "deep",
+        _ => "balanced",
+    };
+    let mut fallback = request.clone();
+    fallback.route = managed_provider_route(lane);
+    fallback.metadata.required_capabilities = vec![cue_core::AiCapability::Chat];
+    fallback.context = fallback
+        .context
+        .into_iter()
+        .map(|mut context| {
+            if context.kind == AnswerContextKind::Screenshot {
+                context.kind = AnswerContextKind::MeetingMemory;
+                context.content = format!(
+                    "Saved screen context text fallback. The image route rejected this request, so use this retained screen text, prior Q&A, and any code artifact in context. Do not ask for the same screenshot again unless required details are missing.\n{}",
+                    context.content
+                );
+            }
+            context
+        })
+        .collect();
+    Some(fallback)
 }
 
 async fn call_bluey_managed_provider(
@@ -17219,6 +17347,56 @@ mod tests {
             AiProviderKind::CueManaged
         );
         assert_eq!(deep.route.primary.provider.model_or(""), "deep");
+    }
+
+    #[test]
+    fn managed_vision_bad_request_falls_back_to_text_deep_for_code_follow_up() {
+        let mut request = AnswerRequest::new(
+            "can u give me go code for that?",
+            managed_provider_route("vision"),
+        )
+        .streaming()
+        .with_context(
+            AnswerContext::new(
+                AnswerContextKind::Screenshot,
+                "Screen context preview: wildcard matching problem statement.",
+            )
+            .with_title("Screen context")
+            .with_source("/tmp/bluey-screen.png"),
+        )
+        .with_context(AnswerContext::new(
+            AnswerContextKind::MeetingMemory,
+            "Recent coding context for this immediate follow-up.",
+        ));
+        request.metadata = request
+            .metadata
+            .require(cue_core::AiCapability::Vision)
+            .with_visible_context_ids(vec![uuid::Uuid::new_v4()]);
+
+        let fallback = managed_vision_text_fallback_request(
+            &request,
+            &ProviderSelector::cue_managed("vision"),
+            &anyhow!("provider error: server error: 400"),
+        )
+        .expect("fallback request");
+
+        assert_eq!(fallback.route.primary.provider.model_or(""), "deep");
+        assert_eq!(
+            fallback.metadata.required_capabilities,
+            vec![cue_core::AiCapability::Chat]
+        );
+        assert!(!fallback.route.privacy.allow_image_upload);
+        assert!(!fallback
+            .context
+            .iter()
+            .any(|context| context.kind == AnswerContextKind::Screenshot));
+        assert!(fallback.context.iter().any(|context| {
+            context.kind == AnswerContextKind::MeetingMemory
+                && context
+                    .content
+                    .contains("Saved screen context text fallback")
+                && context.content.contains("wildcard matching")
+        }));
     }
 
     #[test]
