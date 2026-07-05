@@ -881,8 +881,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (title) title.textContent = accountAuthMode === 'signup' ? 'Create account' : 'Welcome back';
       if (copy) {
         copy.textContent = accountAuthMode === 'signup'
-          ? 'Create a Bluey account, verify your email, then connect the desktop link if Terminal sent you here.'
-          : 'Sign in to manage credits, saved sessions, and desktop links.';
+          ? 'Create an account, verify email, then connect the desktop if asked.'
+          : 'Sign in to manage balance, sessions, and linked computers.';
       }
       if (emailLabel) emailLabel.hidden = false;
       if (passwordLabel) passwordLabel.hidden = false;
@@ -912,11 +912,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (authed) {
         label.textContent = 'signed in';
         copy.textContent = email
-          ? `${email} is ready for cloud answers, credits, and saved sessions. Run bluey on to open the overlay.`
-          : 'Account ready for cloud answers, credits, and saved sessions. Run bluey on to open the overlay.';
+          ? `${email} is ready. Run bluey on to open the overlay.`
+          : 'Account ready. Run bluey on to open the overlay.';
       } else {
         label.textContent = 'bluey on';
-        copy.textContent = 'Start Bluey from Terminal. Sign in for cloud answers, credits, and saved sessions.';
+        copy.textContent = 'Start Bluey from Terminal. Sign in only when needed.';
       }
     }
 
@@ -934,10 +934,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
       if (authed) {
         title.textContent = 'Bluey account';
-        copy.innerHTML = 'Check account state, add credits, view saved sessions, and manage desktop links. $30 reload adds $30 Bluey credits. Auto Reload is optional.';
+        copy.innerHTML = 'Manage balance, sessions, and linked computers.';
       } else {
         title.textContent = 'Try Bluey on desktop';
-        copy.innerHTML = 'Install once, run Bluey from Terminal, then sign in when you need cloud answers, credits, or saved sessions.';
+        copy.innerHTML = 'Install Bluey, then sign in when the desktop asks.';
       }
     }
 
@@ -965,8 +965,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         copy.textContent = `Enter the 6-digit code we sent to ${email || 'your email'}.`;
       } else if (copy && !enabled) {
         copy.textContent = accountAuthMode === 'signup'
-          ? 'Create a Bluey account, verify your email, then connect the desktop link if Terminal sent you here.'
-          : 'Sign in to manage credits, saved sessions, and desktop links.';
+          ? 'Create an account, verify email, then connect the desktop if asked.'
+          : 'Sign in to manage balance, sessions, and linked computers.';
       }
       if (emailLabel) emailLabel.hidden = enabled;
       if (passwordLabel) passwordLabel.hidden = enabled;
@@ -1005,11 +1005,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.hidden = false;
         el.replaceChildren();
         const title = document.createElement('strong');
-        title.textContent = 'Have a Bluey desktop code?';
+        title.textContent = 'Connect desktop';
         const body = document.createElement('span');
         body.textContent = accountToken()
-          ? 'Enter the code from Terminal or the Bluey window to connect this desktop to the account signed into this browser.'
-          : 'Enter the code from Terminal or the Bluey window, then sign in or create an account to confirm the desktop link.';
+          ? 'Enter the code shown by Bluey.'
+          : 'Enter the code, then sign in to confirm.';
         const form = document.createElement('form');
         form.className = 'device-code-form';
         form.noValidate = true;
@@ -1487,14 +1487,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function renderUsage(usage) {
       document.getElementById('usageValue').textContent = `${usage.total_cues || 0}`;
-      document.getElementById('usageHint').textContent = `${money(usage.total_cents_spent)} spent in ${usage.period_days || 7} days.`;
+      document.getElementById('usageHint').textContent = `${money(usage.total_cents_spent)} in ${usage.period_days || 7} days.`;
       document.getElementById('tierValue').textContent = usage.tier_label || '--';
       const projectedDays = Math.round(usage.projected_days_remaining || 0);
       const projectionLabel = (usage.projection_label || '').trim();
       document.getElementById('projectionHint').textContent = projectionLabel
         || (projectedDays > 0
           ? `~${Math.min(projectedDays, 90)} days at recent pace.`
-          : 'Projection appears after usage.');
+          : 'Appears after usage.');
       const list = document.getElementById('usageList');
       const rows = usage.mix || [];
       list.replaceChildren();
@@ -1641,8 +1641,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       method.textContent = me?.saved_payment_method_label
         ? `Saved card: ${me.saved_payment_method_label}`
         : canSaveSquareCard
-          ? 'No saved card. Save one to enable Auto Reload.'
-          : me?.auto_topup_unavailable_reason || 'Card saving is not configured for this account.';
+          ? 'No saved card.'
+          : me?.auto_topup_unavailable_reason || 'Card saving unavailable.';
     }
 
     function readAutoReloadSettings() {
@@ -1696,7 +1696,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const overviewReloadButton = document.getElementById('overviewReloadButton');
       try {
         const amount = readManualReloadCents();
-        if (rule) rule.textContent = `${money(amount)} reload gives ${money(amount)} Bluey credits. Checkout opens in a new tab; press Refresh balance here after payment succeeds.`;
+        if (rule) rule.textContent = `${money(amount)} adds ${money(amount)} credits.`;
         if (overviewReloadButton) overviewReloadButton.textContent = `Add ${money(amount)} credits`;
       } catch (error) {
         if (rule) rule.textContent = error.message;
@@ -1711,16 +1711,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function accountBalanceHint(me) {
       if (me?.is_temporary) {
         const minutes = trialMinutesRemaining(me);
-        return `${minutes} free minute${minutes === 1 ? '' : 's'} left. ${temporaryExpiryCopy(me.temporary_expires_at)} Create an account before adding credits.`;
+        return `${minutes} free minute${minutes === 1 ? '' : 's'} left. Save the trial before it expires.`;
       }
       const balanceCents = Number(me?.balance_cents || 0);
       if (balanceCents <= 0) {
-        return 'Balance is $0. Add credits to use paid cloud answers, transcription, screen analysis, and saved-session search.';
+        return 'Balance is $0. Add credits to continue paid cloud work.';
       }
       if (balanceCents < 500) {
-        return 'Balance is low. Add credits now to keep paid cloud work running.';
+        return 'Low balance. Add credits to keep work running.';
       }
-      return 'Credits are ready for paid cloud work. Add credits anytime from here or Billing.';
+      return 'Balance ready for paid cloud work.';
     }
 
     async function updateAutoReload(enabled) {
@@ -1956,7 +1956,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!sessions.length) {
         const empty = document.createElement('div');
         empty.className = 'session-empty';
-        empty.textContent = 'No saved sessions yet. Keep Bluey on while signed in. Local sessions sync automatically when saved-session sync is enabled.';
+        empty.textContent = 'No saved sessions yet. Save one from Bluey when you want it here.';
         list.append(empty);
         return;
       }
@@ -1964,7 +1964,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       for (const session of sessions) {
         const row = document.createElement('article');
         row.className = 'session-row';
-        const sessionCode = shortSessionId(session.session_id).toUpperCase();
 
         const body = document.createElement('div');
         const title = document.createElement('strong');
@@ -1973,11 +1972,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const meta = document.createElement('span');
         meta.className = 'session-meta';
         meta.textContent = [
-          `ID ${sessionCode}`,
           session.status || 'saved',
           `${session.transcript_count || 0} transcript`,
           `${session.response_count || 0} answer(s)`,
-          `${session.context_count || 0} context`,
           formatSessionTime(session.updated_at_ms || session.last_active_at_ms),
         ].join(' - ');
         body.append(title, meta);
@@ -1995,7 +1992,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         button.dataset.sessionOpen = accountSessionHref(session.session_id);
         button.setAttribute('aria-label', `Open ${session.title || 'saved session'} in a new tab`);
         button.title = 'Open session in a new tab';
-        button.textContent = 'Open';
+        button.textContent = 'Open tab';
         row.append(body, copyId, button);
         list.append(row);
       }
@@ -2254,7 +2251,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('accountPreviewCard').hidden = true;
       document.getElementById('accountDashboard').hidden = !authed;
       document.getElementById('accountRecoveryCard').hidden = true;
-      document.getElementById('accountSignOut').hidden = true;
       if (!authed) {
         setAdminDashboardAvailability(false);
         return;
@@ -2397,8 +2393,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function normalizeDashboardTabName(value) {
       const tab = String(value || '').replace(/^#/, '').trim().toLowerCase();
-      if (tab === 'sessions' || tab === 'computers' || tab === 'devices') return 'computers';
-      if (tab === 'session-history' || tab === 'history' || tab === 'saved-sessions') return 'history';
+      if (tab === 'computers' || tab === 'devices') return 'computers';
+      if (tab === 'sessions' || tab === 'session-history' || tab === 'history' || tab === 'saved-sessions') return 'history';
       if (tab === 'summary' || tab === 'usage') return 'summary';
       if (tab === 'billing' || tab === 'reload' || tab === 'credits') return 'billing';
       if (tab === 'admin' || tab === 'trial-protection' || tab === 'trial-abuse') return 'admin';
@@ -2697,7 +2693,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('accountPreviewCard').hidden = true;
       document.getElementById('accountDashboard').hidden = true;
       document.getElementById('accountRecoveryCard').hidden = false;
-      document.getElementById('accountSignOut').hidden = true;
       closeProfileMenu();
 
       const params = new URLSearchParams(location.search);
