@@ -1755,6 +1755,44 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return amount;
     }
 
+    function setReloadButtonsBusy(busy) {
+      [
+        document.getElementById('reloadButton'),
+        document.getElementById('overviewReloadButton'),
+      ].forEach((button) => {
+        if (!button) return;
+        button.disabled = busy;
+        button.classList.toggle('is-loading', busy);
+      });
+    }
+
+    function openCheckoutPlaceholder(amountCents) {
+      let checkoutWindow = null;
+      try {
+        checkoutWindow = window.open('', '_blank');
+      } catch {
+        checkoutWindow = null;
+      }
+      if (!checkoutWindow) return null;
+      try {
+        checkoutWindow.opener = null;
+        checkoutWindow.document.title = 'Opening Bluey checkout';
+        checkoutWindow.document.body.style.cssText = 'margin:0;background:#050505;color:#f5f5f5;font:18px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh;';
+        checkoutWindow.document.body.textContent = `Opening checkout for ${money(amountCents)} Bluey credits...`;
+      } catch {
+        // Some browsers lock down the placeholder tab; navigating it still works.
+      }
+      return checkoutWindow;
+    }
+
+    function closeCheckoutPlaceholder(checkoutWindow) {
+      try {
+        if (checkoutWindow && !checkoutWindow.closed) checkoutWindow.close();
+      } catch {
+        // Ignore popup cleanup failures.
+      }
+    }
+
     function updateManualReloadDraftCopy() {
       const rule = document.getElementById('manualReloadRule');
       const overviewReloadButton = document.getElementById('overviewReloadButton');
@@ -2604,23 +2642,39 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       try {
         amountCents = readManualReloadCents();
       } catch (error) {
-        accountMessage(error.message);
+        accountMessage(error.message, false, 'error');
         return;
       }
+      const checkoutWindow = openCheckoutPlaceholder(amountCents);
+      setReloadButtonsBusy(true);
       accountMessage(`Opening checkout for ${money(amountCents)} Bluey credits...`);
       try {
         const checkout = await apiJson('/billing/checkout', {
           method: 'POST',
           body: JSON.stringify({ amount_cents: amountCents }),
         });
-        const opened = window.open(checkout.checkout_url, '_blank', 'noopener,noreferrer');
-        if (!opened) {
-          accountMessage('Checkout was blocked by the browser. Allow popups for bluey.sh, then click Add credits again.');
-          return;
+        const url = String(checkout.checkout_url || '').trim();
+        if (!url) throw new Error('Checkout did not return a payment link.');
+        if (checkoutWindow && !checkoutWindow.closed) {
+          checkoutWindow.location.assign(url);
+        } else {
+          const opened = window.open(url, '_blank', 'noopener,noreferrer');
+          if (!opened) {
+            accountMessage('Checkout was blocked by the browser. Allow popups for bluey.sh, then click Add credits again.', false, 'error');
+            return;
+          }
         }
         accountMessage('Checkout opened in a new tab. Complete payment there, then return here and press Refresh balance.');
       } catch (error) {
-        accountMessage(`${error.message}. Billing may not be fully configured yet.`);
+        closeCheckoutPlaceholder(checkoutWindow);
+        const message = String(error?.message || 'Could not open checkout.');
+        if (/billing provider unavailable|billing checkout failed/i.test(message)) {
+          accountMessage(`${message} Please retry in a moment.`, false, 'error');
+        } else {
+          accountMessage(message, false, 'error');
+        }
+      } finally {
+        setReloadButtonsBusy(false);
       }
     }
 
