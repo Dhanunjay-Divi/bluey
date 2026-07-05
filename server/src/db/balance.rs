@@ -723,7 +723,8 @@ pub fn consume_trial_seconds(pool: &DbPool, account_id: &str, ms: i64) -> Result
     crate::db::run_blocking_db(|| {
         // Codex S4.2: floor of 1 second per successful trial request so
         // sub-second instant-lane requests do not give effectively
-        // unlimited free calls. The 600s trial budget remains honest.
+        // unlimited free calls. The trial budget remains honest even for
+        // sub-second completions.
         let secs = if ms <= 0 {
             1
         } else {
@@ -983,10 +984,10 @@ mod tests {
     fn trial_seconds_decrement_to_zero() {
         let pool = temp_pool();
         let id = make_account(&pool, "trial@example.com");
-        // start: 600s
-        // Ceiling-divide: 250_000ms = 250s consumed; 600 - 250 = 350.
+        // start: 15-minute trial budget
+        // Ceiling-divide: 250_000ms = 250s consumed.
         let r = consume_trial_seconds(&pool, &id, 250_000).unwrap();
-        assert_eq!(r, 350);
+        assert_eq!(r, crate::db::accounts::DEFAULT_TRIAL_SECONDS - 250);
         // Way over: 1_000_000ms = 1000s consumed; clamped to 0.
         let r = consume_trial_seconds(&pool, &id, 1_000_000).unwrap();
         assert_eq!(r, 0);
@@ -1001,10 +1002,10 @@ mod tests {
         let id = make_account(&pool, "trialmin@example.com");
         // Sub-second request must consume >=1s of trial budget.
         let r = consume_trial_seconds(&pool, &id, 100).unwrap();
-        assert_eq!(r, 599);
+        assert_eq!(r, crate::db::accounts::DEFAULT_TRIAL_SECONDS - 1);
         // 0ms (impossible in practice) still consumes 1s defensively.
         let r = consume_trial_seconds(&pool, &id, 0).unwrap();
-        assert_eq!(r, 598);
+        assert_eq!(r, crate::db::accounts::DEFAULT_TRIAL_SECONDS - 2);
     }
 
     #[test]

@@ -60,6 +60,10 @@ impl BalanceWatch {
     pub fn publish(&self, snapshot: BalanceSnapshot) {
         let _ = self.inner.send(Some(snapshot));
     }
+
+    pub fn clear(&self) {
+        let _ = self.inner.send(None);
+    }
 }
 
 /// Spawn the balance poll loop. Returns immediately; the loop runs
@@ -84,13 +88,23 @@ pub fn spawn_loop_with_shutdown(
     watch_handle: BalanceWatch,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move { run_loop_inner(client, watch_handle, shutdown).await })
+    spawn_loop_with_shutdown_for_device(client, watch_handle, shutdown, None)
+}
+
+pub fn spawn_loop_with_shutdown_for_device(
+    client: cue_cloud_client::CloudClient,
+    watch_handle: BalanceWatch,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    device_id: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { run_loop_inner(client, watch_handle, shutdown, device_id).await })
 }
 
 async fn run_loop_inner(
     client: cue_cloud_client::CloudClient,
     watch_handle: BalanceWatch,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    device_id: Option<String>,
 ) -> () {
     let interval_secs: u64 = std::env::var("BLUEY_BALANCE_POLL_SECS")
         .ok()
@@ -114,12 +128,22 @@ async fn run_loop_inner(
         } else {
             interval.tick().await;
         }
-        match poll_once(&client).await {
+        match poll_once(&client, device_id.as_deref()).await {
             Ok(snap) => {
                 consecutive_errors = 0;
                 let _ = watch_handle.inner.send(Some(snap));
             }
             Err(e) => {
+                if is_unauthorized(&e) {
+                    tracing::warn!(
+                        "balance poll unauthorized; clearing local Bluey account tokens"
+                    );
+                    if let Err(error) = client.clear_tokens() {
+                        tracing::warn!(error = %error, "could not clear revoked Bluey account tokens");
+                    }
+                    watch_handle.clear();
+                    return;
+                }
                 consecutive_errors += 1;
                 let error_message = e.to_string();
                 tracing::warn!(
@@ -128,13 +152,23 @@ async fn run_loop_inner(
                     "balance poll error; reloading stored tokens before retry"
                 );
                 match client.reload_tokens_from_store() {
-                    Ok(true) => match poll_once(&client).await {
+                    Ok(true) => match poll_once(&client, device_id.as_deref()).await {
                         Ok(snap) => {
                             consecutive_errors = 0;
                             let _ = watch_handle.inner.send(Some(snap));
                             continue;
                         }
                         Err(retry_error) => {
+                            if is_unauthorized(&retry_error) {
+                                tracing::warn!(
+                                    "balance poll unauthorized after reload; clearing local Bluey account tokens"
+                                );
+                                if let Err(error) = client.clear_tokens() {
+                                    tracing::warn!(error = %error, "could not clear revoked Bluey account tokens");
+                                }
+                                watch_handle.clear();
+                                return;
+                            }
                             tracing::warn!(
                                 error = %retry_error,
                                 "balance poll still failed after reloading stored tokens"
@@ -166,7 +200,26 @@ async fn run_loop_inner(
     }
 }
 
-async fn poll_once(client: &cue_cloud_client::CloudClient) -> Result<BalanceSnapshot> {
+async fn poll_once(
+    client: &cue_cloud_client::CloudClient,
+    device_id: Option<&str>,
+) -> Result<BalanceSnapshot> {
+    if let Some(device_id) = device_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "local-device")
+    {
+        let status: cue_cloud_client::DeviceStatusResponse = client
+            .auth_post(
+                "/account/devices/status",
+                &cue_cloud_client::DeviceStatusRequest {
+                    device_id: device_id.to_string(),
+                },
+            )
+            .await?;
+        if !status.active {
+            return Err(cue_cloud_client::Error::Unauthorized.into());
+        }
+    }
     let me: cue_cloud_client::AccountMe = client.auth_get("/account/me").await?;
     let snap = BalanceSnapshot {
         balance_cents: me.balance_cents,
@@ -179,6 +232,12 @@ async fn poll_once(client: &cue_cloud_client::CloudClient) -> Result<BalanceSnap
             && me.balance_cents > 0,
     };
     Ok(snap)
+}
+
+fn is_unauthorized(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<cue_cloud_client::Error>()
+        .is_some_and(|error| matches!(error, cue_cloud_client::Error::Unauthorized))
 }
 
 #[cfg(test)]
@@ -214,6 +273,28 @@ mod tests {
         let observed = rx.borrow().clone().unwrap();
         assert_eq!(observed.balance_cents, 2500);
         assert!(observed.auto_topup_enabled);
+    }
+
+    #[tokio::test]
+    async fn watch_clear_notifies_subscribers() {
+        let w = BalanceWatch::default();
+        let mut rx = w.subscribe();
+        w.publish(BalanceSnapshot {
+            balance_cents: 2500,
+            trial_seconds_remaining: 0,
+            auto_topup_enabled: true,
+            auto_topup_threshold_cents: 500,
+            auto_topup_amount_cents: 1500,
+            fetched_at_unix_ms: 1_700_000_000_000,
+            low_balance_warning: false,
+        });
+        assert!(rx.changed().await.is_ok());
+        assert!(rx.borrow().is_some());
+
+        w.clear();
+        assert!(rx.changed().await.is_ok());
+
+        assert!(rx.borrow().is_none());
     }
 
     #[test]

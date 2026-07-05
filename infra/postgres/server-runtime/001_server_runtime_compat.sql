@@ -16,12 +16,12 @@ CREATE TABLE IF NOT EXISTS accounts (
   last_login_at TIMESTAMPTZ,
   balance_cents BIGINT NOT NULL DEFAULT 0,
   reserved_cents BIGINT NOT NULL DEFAULT 0,
-  trial_seconds_remaining BIGINT NOT NULL DEFAULT 600,
+  trial_seconds_remaining BIGINT NOT NULL DEFAULT 900,
   is_temporary INTEGER NOT NULL DEFAULT 0,
   temporary_expires_at TIMESTAMPTZ,
   auto_topup_enabled INTEGER NOT NULL DEFAULT 0,
-  auto_topup_threshold_cents BIGINT NOT NULL DEFAULT 1000,
-  auto_topup_amount_cents BIGINT NOT NULL DEFAULT 3000,
+  auto_topup_threshold_cents BIGINT NOT NULL DEFAULT 500,
+  auto_topup_amount_cents BIGINT NOT NULL DEFAULT 1500,
   stripe_customer_id TEXT,
   stripe_payment_method_id TEXT,
   square_customer_id TEXT,
@@ -40,6 +40,12 @@ CREATE TABLE IF NOT EXISTS accounts (
   CHECK (auto_topup_amount_cents = 0 OR auto_topup_amount_cents > auto_topup_threshold_cents)
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);
+ALTER TABLE accounts
+  ALTER COLUMN trial_seconds_remaining SET DEFAULT 900;
+ALTER TABLE accounts
+  ALTER COLUMN auto_topup_threshold_cents SET DEFAULT 500;
+ALTER TABLE accounts
+  ALTER COLUMN auto_topup_amount_cents SET DEFAULT 1500;
 
 CREATE TABLE IF NOT EXISTS credit_batches (
   id TEXT PRIMARY KEY,
@@ -87,22 +93,43 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   token_hash TEXT PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   device_label TEXT,
+  device_id TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_used_at TIMESTAMPTZ,
   expires_at TIMESTAMPTZ NOT NULL,
   revoked_at TIMESTAMPTZ
 );
+ALTER TABLE refresh_tokens
+  ADD COLUMN IF NOT EXISTS device_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_account
   ON refresh_tokens(account_id);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_account_device
+  ON refresh_tokens(account_id, device_id)
+  WHERE device_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS device_codes (
   device_code TEXT PRIMARY KEY,
   user_code TEXT NOT NULL UNIQUE,
   account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
   approved INTEGER NOT NULL DEFAULT 0,
+  device_id TEXT,
+  device_name TEXT,
+  platform TEXT,
+  arch TEXT,
+  app_version TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE device_codes
+  ADD COLUMN IF NOT EXISTS device_id TEXT;
+ALTER TABLE device_codes
+  ADD COLUMN IF NOT EXISTS device_name TEXT;
+ALTER TABLE device_codes
+  ADD COLUMN IF NOT EXISTS platform TEXT;
+ALTER TABLE device_codes
+  ADD COLUMN IF NOT EXISTS arch TEXT;
+ALTER TABLE device_codes
+  ADD COLUMN IF NOT EXISTS app_version TEXT;
 CREATE INDEX IF NOT EXISTS idx_device_codes_user_code
   ON device_codes(user_code);
 
@@ -330,13 +357,15 @@ CREATE TABLE IF NOT EXISTS trial_grants (
   device_hash TEXT,
   user_agent_hash TEXT,
   ip_user_agent_hash TEXT,
-  granted_seconds BIGINT NOT NULL DEFAULT 600,
+  granted_seconds BIGINT NOT NULL DEFAULT 900,
   decision TEXT NOT NULL,
   reason TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE trial_grants
   ADD COLUMN IF NOT EXISTS email_domain_hash TEXT;
+ALTER TABLE trial_grants
+  ALTER COLUMN granted_seconds SET DEFAULT 900;
 CREATE INDEX IF NOT EXISTS idx_trial_grants_email
   ON trial_grants(email_hash, created_at);
 CREATE INDEX IF NOT EXISTS idx_trial_grants_email_domain
@@ -397,3 +426,47 @@ CREATE INDEX IF NOT EXISTS idx_ops_audit_event_created
   ON ops_audit_events(event_type, created_at);
 CREATE INDEX IF NOT EXISTS idx_ops_audit_account_created
   ON ops_audit_events(account_id_hash, created_at);
+
+CREATE TABLE IF NOT EXISTS diagnostic_log_chunks (
+  id TEXT PRIMARY KEY,
+  account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+  workspace_id TEXT,
+  session_id TEXT,
+  session_code TEXT,
+  kind TEXT NOT NULL,
+  storage TEXT NOT NULL DEFAULT 'local',
+  object_key TEXT,
+  local_path TEXT,
+  bytes BIGINT NOT NULL DEFAULT 0,
+  sha256 TEXT,
+  created_at_ms BIGINT NOT NULL,
+  expires_at_ms BIGINT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_account_created
+  ON diagnostic_log_chunks(account_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_session
+  ON diagnostic_log_chunks(account_id, session_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_expires
+  ON diagnostic_log_chunks(expires_at_ms);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_kind_created
+  ON diagnostic_log_chunks(kind, created_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS account_devices (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL,
+  device_name TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  arch TEXT,
+  app_version TEXT,
+  registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at TIMESTAMPTZ,
+  last_heartbeat_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ,
+  UNIQUE(account_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_account_devices_account
+  ON account_devices(account_id, revoked_at);
+CREATE INDEX IF NOT EXISTS idx_account_devices_account_device
+  ON account_devices(account_id, device_id);

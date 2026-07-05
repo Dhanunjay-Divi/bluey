@@ -467,6 +467,7 @@ mod tests {
             turnstile_secret_key: None,
             require_turnstile: false,
             object_storage: None,
+            log_storage: None,
         })
     }
 

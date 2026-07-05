@@ -3258,6 +3258,22 @@
       text-transform: uppercase;
     }
 
+    #accountApp .device-icon svg {
+      width: 24px;
+      height: 24px;
+      color: currentColor;
+    }
+
+    #accountApp .device-icon[data-platform="windows"] svg {
+      width: 23px;
+      height: 23px;
+    }
+
+    #accountApp .device-icon[data-platform="macos"] svg {
+      width: 22px;
+      height: 22px;
+    }
+
     #accountApp .device-title {
       display: flex;
       align-items: center;
@@ -5567,6 +5583,11 @@
       height: 36px;
       border-radius: 8px;
       font-size: .62rem;
+    }
+
+    #accountApp .device-icon svg {
+      width: 20px;
+      height: 20px;
     }
 
     #accountApp .device-title {

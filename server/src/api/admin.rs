@@ -14,7 +14,7 @@ use std::time::UNIX_EPOCH;
 use super::AppState;
 use crate::auth::AuthedAccount;
 use crate::db::accounts::Account;
-use crate::db::{account_data, ops_audit};
+use crate::db::{account_data, diagnostic_logs, ops_audit};
 
 #[derive(Serialize)]
 pub struct Health {
@@ -133,6 +133,9 @@ pub struct StorageHealth {
     pub object_storage_configured: bool,
     pub object_bucket: Option<String>,
     pub object_key_prefix: Option<String>,
+    pub log_storage_configured: bool,
+    pub log_bucket: Option<String>,
+    pub log_key_prefix: Option<String>,
     pub backup_dir: String,
     pub latest_backup: Option<BackupSnapshot>,
     pub offsite_destination_configured: bool,
@@ -140,6 +143,7 @@ pub struct StorageHealth {
     pub export_zip_supported: bool,
     pub retention_delete_objects_supported: bool,
     pub support_bundle_supported: bool,
+    pub diagnostic_log_index_supported: bool,
     pub restore_drill_script: String,
 }
 
@@ -157,6 +161,7 @@ pub async fn storage_health(State(state): State<AppState>) -> impl IntoResponse 
         std::env::var("BLUEY_BACKUP_DIR").unwrap_or_else(|_| "/var/backups/bluey-api".to_string());
     let offsite = std::env::var("OFFSITE_DESTINATION").ok();
     let object_storage = state.config.object_storage.as_ref();
+    let log_storage = state.config.log_storage.as_ref();
     (
         StatusCode::OK,
         Json(StorageHealth {
@@ -164,6 +169,9 @@ pub async fn storage_health(State(state): State<AppState>) -> impl IntoResponse 
             object_storage_configured: object_storage.is_some(),
             object_bucket: object_storage.map(|config| config.bucket.clone()),
             object_key_prefix: object_storage.map(|config| config.key_prefix.clone()),
+            log_storage_configured: log_storage.is_some(),
+            log_bucket: log_storage.map(|config| config.bucket.clone()),
+            log_key_prefix: log_storage.map(|config| config.key_prefix.clone()),
             latest_backup: latest_backup_snapshot(&backup_dir),
             backup_dir,
             offsite_destination_configured: offsite.is_some(),
@@ -171,6 +179,7 @@ pub async fn storage_health(State(state): State<AppState>) -> impl IntoResponse 
             export_zip_supported: true,
             retention_delete_objects_supported: true,
             support_bundle_supported: true,
+            diagnostic_log_index_supported: true,
             restore_drill_script: "ops/restore-drill-bluey-db.sh".to_string(),
         }),
     )
@@ -189,6 +198,7 @@ pub struct SupportAccountBundle {
     pub counts: SupportCounts,
     pub recent_usage_events: Vec<SupportUsageEvent>,
     pub recent_sessions: Vec<SupportSessionSummary>,
+    pub recent_diagnostic_logs: Vec<SupportDiagnosticLogChunk>,
     pub artifact_objects: Vec<SupportArtifactObject>,
     pub redaction_note: &'static str,
 }
@@ -205,6 +215,7 @@ pub struct SupportCounts {
     pub refresh_tokens: i64,
     pub stripe_webhook_events: i64,
     pub artifact_objects: usize,
+    pub diagnostic_log_chunks: usize,
 }
 
 #[derive(Serialize)]
@@ -241,6 +252,22 @@ pub struct SupportArtifactObject {
     pub size_bytes: Option<i64>,
     pub sha256: Option<String>,
     pub expires_at_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+pub struct SupportDiagnosticLogChunk {
+    pub chunk_id_hash: String,
+    pub session_ref: String,
+    pub session_id_hash: Option<String>,
+    pub session_code: Option<String>,
+    pub kind: String,
+    pub storage: String,
+    pub object_key_hash: Option<String>,
+    pub local_path_hash: Option<String>,
+    pub bytes: i64,
+    pub sha256: Option<String>,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
 }
 
 pub async fn support_account(
@@ -281,6 +308,18 @@ pub async fn support_account(
             Vec::new()
         }
     };
+    let diagnostic_chunks = match diagnostic_logs::recent_for_account(&state.pool, &account_id, 25)
+    {
+        Ok(chunks) => chunks,
+        Err(error) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+                error = %error,
+                "failed to list support diagnostic log chunks"
+            );
+            Vec::new()
+        }
+    };
     let response = SupportAccountBundle {
         generated_at: chrono::Utc::now().to_rfc3339(),
         account_id_hash: stable_hash(&bundle.account.id),
@@ -300,6 +339,7 @@ pub async fn support_account(
             refresh_tokens: bundle.refresh_tokens_count,
             stripe_webhook_events: bundle.stripe_webhook_events_count,
             artifact_objects: artifact_objects.len(),
+            diagnostic_log_chunks: diagnostic_chunks.len(),
         },
         recent_usage_events: bundle
             .usage_events
@@ -313,6 +353,10 @@ pub async fn support_account(
             .take(25)
             .map(support_session_summary)
             .collect(),
+        recent_diagnostic_logs: diagnostic_chunks
+            .into_iter()
+            .map(support_diagnostic_log_chunk)
+            .collect(),
         artifact_objects: artifact_objects
             .into_iter()
             .map(|object_ref| SupportArtifactObject {
@@ -325,7 +369,7 @@ pub async fn support_account(
             })
             .collect(),
         redaction_note:
-            "This admin support bundle excludes transcript text, answer text, document previews, source URIs, raw object keys, and raw email.",
+            "This admin support bundle excludes transcript text, answer text, document previews, source URIs, raw object keys, raw local paths, diagnostic log bodies, and raw email.",
     };
     if let Err(error) = ops_audit::record_event(
         &state.pool,
@@ -474,6 +518,25 @@ fn support_session_summary(value: &serde_json::Value) -> SupportSessionSummary {
         created_at_ms: i64_field(value, "created_at_ms"),
         updated_at_ms: i64_field(value, "updated_at_ms"),
         last_active_at_ms: i64_field(value, "last_active_at_ms"),
+    }
+}
+
+fn support_diagnostic_log_chunk(
+    chunk: diagnostic_logs::DiagnosticLogChunk,
+) -> SupportDiagnosticLogChunk {
+    SupportDiagnosticLogChunk {
+        chunk_id_hash: stable_hash(&chunk.id),
+        session_ref: cue_core::short_observability_ref(chunk.session_id.as_deref()),
+        session_id_hash: chunk.session_id.as_deref().map(stable_hash),
+        session_code: chunk.session_code,
+        kind: chunk.kind,
+        storage: chunk.storage,
+        object_key_hash: chunk.object_key.as_deref().map(stable_hash),
+        local_path_hash: chunk.local_path.as_deref().map(stable_hash),
+        bytes: chunk.bytes,
+        sha256: chunk.sha256,
+        created_at_ms: chunk.created_at_ms,
+        expires_at_ms: chunk.expires_at_ms,
     }
 }
 

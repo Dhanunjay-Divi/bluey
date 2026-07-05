@@ -171,10 +171,15 @@ Required production env:
 ```text
 BLUEY_REQUIRE_LOG_ARCHIVE=1
 BLUEY_LOG_ARCHIVE_DESTINATION=s3://bluey-prod/prod/logs/api
+BLUEY_LOG_STORAGE=r2
+BLUEY_LOG_R2_BUCKET=bluey-prod
 BLUEY_LOG_R2_ENDPOINT_URL=https://<cloudflare-account-id>.r2.cloudflarestorage.com
 BLUEY_LOG_R2_ACCESS_KEY_ID=<log-bucket write key>
 BLUEY_LOG_R2_SECRET_ACCESS_KEY=<log-bucket write secret>
 BLUEY_LOG_R2_REGION=auto
+BLUEY_LOG_STORAGE_PREFIX=prod
+BLUEY_UPLOAD_LOG_RETENTION_DAYS=180
+BLUEY_UPLOAD_LOG_MAX_BYTES=33554432
 BLUEY_LOG_LOCAL_RETENTION_DAYS=7
 BLUEY_LOG_ARCHIVE_LOCAL_RETENTION_DAYS=7
 BLUEY_LOG_DIR_MAX_BYTES=536870912
@@ -196,6 +201,11 @@ Boundary: this archive is for server operational logs and journald output. Do
 not auto-upload raw desktop logs, transcripts, screen contents, documents,
 clipboard contents, or keystrokes. Desktop evidence should go through
 `bluey support` or `bluey logs export`, which redacts by default.
+
+When `BLUEY_DATABASE_URL` and `psql` are available on the host, the archive
+script also records a `diagnostic_log_chunks` row for each uploaded log bundle.
+That row stores kind, storage, object key, size, checksum, timestamps, and
+expiry only. It does not store the log body in Postgres.
 
 ## Deploy Evidence To Record
 

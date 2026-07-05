@@ -34,6 +34,30 @@ pub struct DeviceStartResponse {
     pub interval: i64,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DeviceStartRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceStatusRequest {
+    pub device_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceStatusResponse {
+    pub active: bool,
+}
+
 // ─── Account ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -173,6 +197,8 @@ pub struct EmbedResponse {
     pub input_tokens: i64,
     pub cost_cents: i64,
     pub balance_cents_after: i64,
+    #[serde(default)]
+    pub trial_seconds_remaining: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -183,6 +209,8 @@ pub struct EmbedBatchResponse {
     pub input_tokens: i64,
     pub cost_cents: i64,
     pub balance_cents_after: i64,
+    #[serde(default)]
+    pub trial_seconds_remaining: i64,
 }
 
 // ─── Cloud Sync / RAG ───────────────────────────────────────────────────

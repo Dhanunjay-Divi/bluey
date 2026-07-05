@@ -47,6 +47,7 @@ async fn real_serve_path_installs_connect_info_and_rate_limit_sees_peer_ip() {
         turnstile_secret_key: None,
         require_turnstile: false,
         object_storage: None,
+        log_storage: None,
     };
 
     let app = build_router(pool.clone(), config.clone());

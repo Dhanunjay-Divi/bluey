@@ -110,6 +110,7 @@ async fn boot_harness_with_config(
         turnstile_secret_key: None,
         require_turnstile: false,
         object_storage: None,
+        log_storage: None,
     };
     configure(&mut config);
 
@@ -118,6 +119,8 @@ async fn boot_harness_with_config(
     // dispatcher to honor BLUEY_TEST_OPENAI_URL etc. That's a small
     // patch to dispatcher.rs covered in Stage 23 commit so this test
     // can hit the mock.
+    std::env::set_var("BLUEY_ROUTE_POLICY", "quality_first");
+    std::env::set_var("BLUEY_ANSWER_PLAN_ROUTING", "0");
     std::env::set_var("BLUEY_TEST_OPENAI_URL", openai.uri());
     std::env::set_var("BLUEY_TEST_ANTHROPIC_URL", anthropic.uri());
     std::env::set_var("BLUEY_TEST_STRIPE_URL", stripe.uri());
@@ -691,7 +694,7 @@ async fn router_embed_consumes_trial_seconds_and_records_bluey_cost() {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
-    assert_eq!(trial_remaining, 598);
+    assert_eq!(trial_remaining, 898);
     assert!(bluey_cost > 0);
     assert_eq!(customer_cost, 0);
 }
@@ -932,7 +935,7 @@ async fn router_complete_stream_openai_error_frame_is_retryable() {
         .unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("event: error"));
-    assert!(body.contains("upstream_stream_error"));
+    assert!(body.contains("provider_key_cooling_down"));
     assert!(!body.contains("event: billing"));
 
     let account = Account::fetch_by_email(&h.pool, email).unwrap().unwrap();
@@ -1199,7 +1202,7 @@ async fn router_complete_falls_back_when_preferred_provider_429s() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["text"], "fallback answer");
     assert_eq!(v["provider"], "openai");
-    assert_eq!(v["model"], "gpt-5.4-mini");
+    assert_eq!(v["model"], "gpt-5.5");
 }
 
 #[tokio::test]
@@ -2722,8 +2725,8 @@ async fn square_auto_reload_requires_saved_card_then_enables() {
     let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(me["billing_provider"], "square");
     assert_eq!(me["auto_topup_enabled"], false);
-    assert_eq!(me["auto_topup_threshold_cents"], 1000);
-    assert_eq!(me["auto_topup_amount_cents"], 3000);
+    assert_eq!(me["auto_topup_threshold_cents"], 500);
+    assert_eq!(me["auto_topup_amount_cents"], 1500);
     assert_eq!(me["auto_topup_available"], false);
     assert_eq!(me["square_application_id"], "sandbox-app");
     assert_eq!(me["square_location_id"], "sandbox-location");

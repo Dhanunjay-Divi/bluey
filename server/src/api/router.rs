@@ -2754,10 +2754,10 @@ fn prompt_with_answer_plan(
             "Answer directly in 1-4 sentences. Do not open with setup unless it prevents confusion."
         }
         AnswerIntent::Coding => {
-            "For first-time coding or algorithm answers, use this exact scan-friendly shape: `Approach`, then `Code`, then `Explanation`, then `Complexity`, then `Edge cases` when useful. Under Approach, give 2-4 clear bullets before the code. Under Code, give complete working code in a fenced code block with a language tag. Use the language implied by the prompt or screen; if none is specified for an interview algorithm prompt, use Python. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. For Python/LeetCode-style answers, include required imports or avoid type hints that need imports. Put each statement on its own line with correct indentation; never compress class, function, assignments, and return onto one wrapped line. Add concise comments inside non-trivial code: place a short comment above each major block and on the important decision lines that explain why that line or block exists. Do not comment every trivial assignment. For LeetCode/interview algorithm prompts, include the full class/function signature, initialization, loop/body, return value, and any sentinel/cleanup step; never provide only the inner loop or a pseudocode fragment. For data-structure interview prompts such as LRU cache, implement from first principles with a hashmap plus doubly linked list unless the user explicitly asks for a library shortcut; mention library helpers only as alternatives after the real implementation. For non-trivial code, add a short `Line notes:` block outside the code fence using `1: ...` or small `2-4: ...` notes for the important executable lines. Keep explanatory notes outside the code so copied code stays clean. Always include Time Complexity and Space Complexity explicitly. Do not give only a summary."
+            "For first-time coding or algorithm answers, start with a short spoken lead-in the user could say on a call: the core idea and why it works, in one or two natural sentences. Then use this exact scan-friendly shape when code is needed: `Approach`, then `Code`, then `Explanation`, then `Complexity`, then `Edge cases` when useful. Under Approach, give 2-4 clear bullets before the code. Under Code, give complete working code in a fenced code block with a language tag. Use the language implied by the prompt or screen; if none is specified for an interview algorithm prompt, use Python. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. For Python/LeetCode-style answers, include required imports or avoid type hints that need imports. Put each statement on its own line with correct indentation; never compress class, function, assignments, and return onto one wrapped line. Add concise comments inside non-trivial code: place a short comment above each major block and on the important decision lines that explain why that line or block exists. Do not comment every trivial assignment. For LeetCode/interview algorithm prompts, include the full class/function signature, initialization, loop/body, return value, and any sentinel/cleanup step; never provide only the inner loop or a pseudocode fragment. For data-structure interview prompts such as LRU cache, implement from first principles with a hashmap plus doubly linked list unless the user explicitly asks for a library shortcut; mention library helpers only as alternatives after the real implementation. For non-trivial code, add a short `Line notes:` block outside the code fence using `1: ...` or small `2-4: ...` notes for the important executable lines. Keep explanatory notes outside the code so copied code stays clean. Always include Time Complexity and Space Complexity explicitly. Do not give only a summary."
         }
         AnswerIntent::CodingFollowUp => {
-            "Treat this as a follow-up to existing code when relevant. Preserve the existing artifact unless the user asks for a new one. For requested changes, use `Approach`, then `Patch` or `Changed block`, then `Explanation`, then `Complexity` if the complexity changes. Prefer the smallest safe in-place code change, changed block, or unified diff; do not replace the whole implementation unless the user asks for a full rewrite, the existing code is tiny, or a full replacement is materially safer. If the user asks to regenerate the full solution or asks for the same code in another language, include the complete fenced implementation in that language with the full wrapper/signature, not only a middle fragment. Put each statement on its own line with correct indentation and add concise comments above changed blocks and on important decision lines. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
+            "Treat this as a follow-up to existing code when relevant. Answer like you are responding live on a call: start with the direct conclusion in plain English, then explain the reason, caveat, or better option. For line-number follow-ups, use the supplied prior code artifact display line numbers as authoritative. Do not say probably, likely, or I think when the referenced line is present; if the exact line is not in context, say the exact line is not available instead of guessing. For complexity questions, say exactly which part has that complexity and whether the whole algorithm can truly be improved. For questions like \"can we make it better\", give the honest answer first, then the practical optimization if one exists. Preserve the existing artifact unless the user asks for a new one. For requested changes, use `Approach`, then `Patch` or `Changed block`, then `Explanation`, then `Complexity` if the complexity changes. Prefer the smallest safe in-place code change, changed block, or unified diff; do not replace the whole implementation unless the user asks for a full rewrite, the existing code is tiny, or a full replacement is materially safer. If the user asks to regenerate the full solution or asks for the same code in another language, include the complete fenced implementation in that language with the full wrapper/signature, not only a middle fragment. Put each statement on its own line with correct indentation and add concise comments above changed blocks and on important decision lines. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
         }
         AnswerIntent::Behavioral => {
             "Answer like a polished interview coach and candidate voice: natural, first-person when appropriate, specific, and conversational. Use the supplied resume, JD, documents, transcript, and screen context to infer the role and domain, such as SDE, data engineer, BI engineer, data scientist, DevOps, security, product, or another role. First infer what the interviewer is testing, such as Dive Deep, ownership, technical depth, data quality, system judgment, prioritization, stakeholder communication, or tradeoffs, then make the response prove that signal. For resume-based introductions, self-introductions, or prompts like \"tell me about yourself\", do not compress the resume into one facts paragraph and do not ask the user what kind of long answer they want when the resume/context is already supplied. Use a speakable present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role. For introductions, give the full ready-to-say answer on the first response and aim for a 45-60 second answer unless the user explicitly asks for a shorter version. For role/domain interview questions, give a ready-to-say answer anchored only in the supplied company, project, tools, metrics, constraints, and role expectations; when useful, include a brief why-it-works or if-they-push-back recovery line. Do not defend weak story logic blindly: reframe it in a production-realistic way, such as code ownership, incident debugging, architecture tradeoffs, upstream data, ETL validation, reporting impact, stakeholder communication, or KPI definition. For interview stories, aim for a 45-90 second answer in tight paragraphs, not generic bullets, unless the user asks for notes. Do not invent metrics, employers, tools, source systems, clinical/finance details, latency windows, outcomes, or motivation beyond the supplied resume/JD/context. If exact story detail is missing, say the framing safely with phrases like \"I would frame it as...\" or \"the signal I would emphasize is...\" instead of fabricating a result. Never route resume/self-intro or interview-coaching prompts into system design just because they mention architecture or systems."
@@ -2781,7 +2781,7 @@ fn prompt_with_answer_plan(
             "Summarize the live/session context into decisions, action items, risks, and next steps when those are present."
         }
         AnswerIntent::FollowUp | AnswerIntent::General => {
-            "Answer naturally and use the conversation only when it is clearly relevant. If the new question is unrelated, do not drag old context into it."
+            "Answer naturally and use the conversation only when it is clearly relevant. For live coding or interview follow-ups, answer the exact question first in a spoken way, then add the minimum reasoning needed to defend it. If the new question is unrelated, do not drag old context into it."
         }
     };
     let overlay_shape = if plan.output == AnswerOutput::InterviewAnswer {
@@ -4242,35 +4242,6 @@ async fn complete_stream_inner(
                     } = streaming;
                     match tokio::time::timeout(first_output_deadline, stream_events.next()).await {
                         Ok(first_event) => {
-                            if let Some(Err(e)) = &first_event {
-                                if let Some(retry_after_secs) = routing::upstream_retry_after(e) {
-                                    let cooldown_secs = state
-                                        .provider_health
-                                        .record_cooldown(
-                                            route.provider,
-                                            route.model,
-                                            &selected_key.fingerprint,
-                                            retry_after_secs,
-                                        )
-                                        .await;
-                                    tracing::warn!(
-                                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                                        request_id = %req.request_id,
-                                        provider = %route.provider,
-                                        model = %route.model,
-                                        key_fingerprint = %selected_key.fingerprint,
-                                        retry_after_secs = cooldown_secs,
-                                        error = %e,
-                                        "streaming first event was upstream capacity; cooled key and retrying route"
-                                    );
-                                    last_capacity = Some(crate::rate_limit::CapacityDenied {
-                                        retry_after_secs: cooldown_secs,
-                                        reason: "provider_key_cooling_down",
-                                    });
-                                    last_failure_was_capacity = true;
-                                    continue;
-                                }
-                            }
                             selected_route_idx = idx;
                             selected_route = Some(*route);
                             let first_event_latency_ms = started.elapsed().as_millis() as i64;
@@ -5723,7 +5694,8 @@ async fn complete_inner(
         "managed chat completed and billed"
     );
 
-    let visible_response_text = visible_response_text_for_artifact(&response_text, artifact.as_ref());
+    let visible_response_text =
+        visible_response_text_for_artifact(&response_text, artifact.as_ref());
     let response = CompleteResponse {
         text: visible_response_text,
         provider: comp.provider,
@@ -5808,7 +5780,8 @@ fn visible_response_text_for_artifact(text: &str, artifact: Option<&ResponseArti
     let visible = strip_canvas_pointer_lines(&visible);
     let visible = visible.trim();
     if visible.is_empty() || code_answer_is_pointer_only(visible) {
-        return "I found the implementation shape and prepared the complete code artifact.".to_string();
+        return "I found the implementation shape and prepared the complete code artifact."
+            .to_string();
     }
     visible.to_string()
 }
@@ -6525,7 +6498,10 @@ fn looks_like_patch_or_diff(code: &str) -> bool {
         || trimmed.starts_with("@@")
         || trimmed.lines().any(|line| {
             let line = line.trim_start();
-            line.starts_with("+ ") || line.starts_with("- ") || line.starts_with("+\t") || line.starts_with("-\t")
+            line.starts_with("+ ")
+                || line.starts_with("- ")
+                || line.starts_with("+\t")
+                || line.starts_with("-\t")
         })
 }
 
@@ -6568,16 +6544,7 @@ fn looks_like_control_flow_fragment_without_entrypoint(code: &str) -> bool {
     .iter()
     .any(|signal| lower_code.contains(signal));
     let starts_with_control_flow = [
-        "for ",
-        "for(",
-        "while ",
-        "while(",
-        "if ",
-        "if(",
-        "else",
-        "switch ",
-        "switch(",
-        "case ",
+        "for ", "for(", "while ", "while(", "if ", "if(", "else", "switch ", "switch(", "case ",
     ]
     .iter()
     .any(|signal| lower_first.starts_with(signal));
@@ -6791,6 +6758,8 @@ pub struct EmbedResponse {
     pub input_tokens: i64,
     pub cost_cents: i64,
     pub balance_cents_after: i64,
+    #[serde(default)]
+    pub trial_seconds_remaining: i64,
 }
 
 #[derive(Deserialize)]
@@ -6810,6 +6779,8 @@ pub struct EmbedBatchResponse {
     pub input_tokens: i64,
     pub cost_cents: i64,
     pub balance_cents_after: i64,
+    #[serde(default)]
+    pub trial_seconds_remaining: i64,
 }
 
 pub async fn embed(
@@ -6848,6 +6819,7 @@ pub async fn embed(
         input_tokens: batch.input_tokens,
         cost_cents: batch.cost_cents,
         balance_cents_after: batch.balance_cents_after,
+        trial_seconds_remaining: batch.trial_seconds_remaining,
     }))
 }
 
@@ -6925,6 +6897,7 @@ async fn embed_batch_inner(
                 input_tokens: cached.input_tokens,
                 cost_cents: cached.cost_cents,
                 balance_cents_after: cached.balance_cents_after,
+                trial_seconds_remaining: cached.trial_seconds_remaining,
             });
         }
         idempotency::ReserveOutcome::InProgress => {
@@ -7133,18 +7106,18 @@ async fn embed_batch_inner(
     let charged_customer_cost = if on_trial { 0 } else { customer_cost };
 
     // Charge.
-    if on_trial {
+    let trial_remaining = if on_trial {
         let trial_ms = (((comp.input_tokens.max(1) + 999) / 1000).max(1)) * 1000;
-        if let Err(e) = balance::consume_trial_seconds(&state.pool, &account.id, trial_ms) {
+        balance::consume_trial_seconds(&state.pool, &account.id, trial_ms).map_err(|e| {
             let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            return Err((
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError {
                     error: format!("trial: {e}"),
                     ..Default::default()
                 }),
-            ));
-        }
+            )
+        })?
     } else {
         let ok = balance::deduct_for_request(
             &state.pool,
@@ -7170,7 +7143,8 @@ async fn embed_batch_inner(
                 "embed post-completion deduct failed; bluey absorbs overrun"
             );
         }
-    }
+        account.trial_seconds_remaining
+    };
 
     let balance_after = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
 
@@ -7218,6 +7192,7 @@ async fn embed_batch_inner(
         input_tokens: comp.input_tokens,
         cost_cents: charged_customer_cost,
         balance_cents_after: balance_after,
+        trial_seconds_remaining: trial_remaining,
     };
 
     if let Ok(json) = serde_json::to_string(&response) {
@@ -8475,6 +8450,7 @@ mod tests {
         assert!(system.contains("correct indentation"));
         assert!(system.contains("comments inside non-trivial code"));
         assert!(system.contains("above each major block"));
+        assert!(system.contains("spoken lead-in"));
     }
 
     #[test]
@@ -8521,6 +8497,18 @@ mod tests {
         assert_eq!(plan.intent, AnswerIntent::CodingFollowUp);
         assert_eq!(plan.output, AnswerOutput::CodeArtifact);
         assert_eq!(plan.recommended_lane, "deep");
+
+        let (system, _user) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(system.contains("responding live on a call"));
+        assert!(system.contains("direct conclusion"));
+        assert!(system.contains("display line numbers as authoritative"));
+        assert!(system.contains("Do not say probably"));
+        assert!(system.contains("complete fenced implementation"));
     }
 
     #[test]
@@ -8560,6 +8548,14 @@ mod tests {
         assert_eq!(plan.intent, AnswerIntent::Coding);
         assert_eq!(plan.output, AnswerOutput::Compact);
         assert_eq!(plan.recommended_lane, "deep");
+
+        let (system, _user) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(system.contains("spoken lead-in"));
     }
 
     #[test]

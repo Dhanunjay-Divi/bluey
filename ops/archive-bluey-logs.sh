@@ -49,6 +49,10 @@ LOG_ROOT_MAX_BYTES="${BLUEY_LOG_ROOT_MAX_BYTES:-2147483648}"
 ARCHIVE_MAX_FILES="${BLUEY_LOG_ARCHIVE_MAX_FILES:-160}"
 REQUIRE_OFFHOST="${BLUEY_LOG_ARCHIVE_REQUIRE_OFFHOST:-0}"
 STORAGE_PREFIX="${BLUEY_LOG_STORAGE_PREFIX:-prod}"
+DIAGNOSTIC_RETENTION_DAYS="${BLUEY_UPLOAD_LOG_RETENTION_DAYS:-${BLUEY_LOG_RETENTION_DAYS:-180}}"
+UPLOADED_STORAGE=""
+UPLOADED_OBJECT_KEY=""
+UPLOADED_LOCAL_PATH=""
 PRUNE_ONLY=0
 
 case "${1:-}" in
@@ -201,6 +205,9 @@ aws_endpoint() {
 
 upload_archive() {
     local archive="$1"
+    UPLOADED_STORAGE="local"
+    UPLOADED_OBJECT_KEY=""
+    UPLOADED_LOCAL_PATH="$archive"
     local destination
     destination="$(destination_base)"
     if [ -z "$destination" ]; then
@@ -233,18 +240,134 @@ upload_archive() {
             fi
             local date_prefix
             date_prefix="$(date -u +%Y/%m/%d)"
+            local destination_path destination_prefix object_key
+            destination_path="${destination#s3://}"
+            destination_prefix=""
+            if [ "$destination_path" != "${destination_path%%/*}" ]; then
+                destination_prefix="${destination_path#*/}"
+            fi
+            object_key="${destination_prefix%/}/$date_prefix/$(basename "$archive")"
+            object_key="${object_key#/}"
             aws "${extra_args[@]}" s3 cp "$archive" "$destination/$date_prefix/$(basename "$archive")" --quiet
             aws "${extra_args[@]}" s3 cp "${archive}.sha256" "$destination/$date_prefix/$(basename "$archive").sha256" --quiet
+            UPLOADED_STORAGE="r2"
+            UPLOADED_OBJECT_KEY="$object_key"
+            UPLOADED_LOCAL_PATH=""
             ;;
         *)
             if command -v rsync >/dev/null 2>&1; then
                 rsync -a --quiet "$archive" "${archive}.sha256" "$destination/"
+                UPLOADED_STORAGE="filesystem"
+                UPLOADED_OBJECT_KEY=""
+                UPLOADED_LOCAL_PATH="$destination/$(basename "$archive")"
             else
                 echo "non-s3 log archive destinations require rsync" >&2
                 exit 1
             fi
             ;;
     esac
+}
+
+index_archive_metadata() {
+    local archive="$1"
+    if [ -z "${BLUEY_DATABASE_URL:-}" ]; then
+        return
+    fi
+    if ! command -v psql >/dev/null 2>&1; then
+        echo "warn: psql not installed; skipped diagnostic_log_chunks index insert" >&2
+        return
+    fi
+    local retention_days
+    retention_days="$DIAGNOSTIC_RETENTION_DAYS"
+    if ! is_uint "$retention_days"; then
+        retention_days=180
+    fi
+    if [ "$retention_days" -gt 180 ]; then
+        retention_days=180
+    fi
+    if [ "$retention_days" -lt 1 ]; then
+        retention_days=1
+    fi
+
+    local now_s created_ms expires_ms bytes sha id archive_name host
+    now_s="$(date -u +%s)"
+    created_ms=$((now_s * 1000))
+    expires_ms=$(((now_s + retention_days * 86400) * 1000))
+    bytes="$(wc -c < "$archive" | tr -d ' ')"
+    sha="$(awk '{print $1}' "${archive}.sha256" 2>/dev/null || true)"
+    archive_name="$(basename "$archive")"
+    host="$(hostname -s 2>/dev/null || hostname || echo unknown-host)"
+    if command -v uuidgen >/dev/null 2>&1; then
+        id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+    else
+        id="diag-${now_s}-$$"
+    fi
+
+    if ! psql "$BLUEY_DATABASE_URL" \
+        -v ON_ERROR_STOP=1 \
+        -v id="$id" \
+        -v storage="$UPLOADED_STORAGE" \
+        -v object_key="$UPLOADED_OBJECT_KEY" \
+        -v local_path="$UPLOADED_LOCAL_PATH" \
+        -v bytes="$bytes" \
+        -v sha256="$sha" \
+        -v created_ms="$created_ms" \
+        -v expires_ms="$expires_ms" \
+        -v host="$host" \
+        -v services="$SERVICES" \
+        -v since="$SINCE" \
+        -v archive_name="$archive_name" \
+        >/dev/null <<'SQL'
+CREATE TABLE IF NOT EXISTS diagnostic_log_chunks (
+  id TEXT PRIMARY KEY,
+  account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+  workspace_id TEXT,
+  session_id TEXT,
+  session_code TEXT,
+  kind TEXT NOT NULL,
+  storage TEXT NOT NULL DEFAULT 'local',
+  object_key TEXT,
+  local_path TEXT,
+  bytes BIGINT NOT NULL DEFAULT 0,
+  sha256 TEXT,
+  created_at_ms BIGINT NOT NULL,
+  expires_at_ms BIGINT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_account_created
+  ON diagnostic_log_chunks(account_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_session
+  ON diagnostic_log_chunks(account_id, session_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_expires
+  ON diagnostic_log_chunks(expires_at_ms);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_kind_created
+  ON diagnostic_log_chunks(kind, created_at_ms DESC);
+
+INSERT INTO diagnostic_log_chunks
+  (id, account_id, workspace_id, session_id, session_code, kind, storage,
+   object_key, local_path, bytes, sha256, created_at_ms, expires_at_ms, metadata_json)
+VALUES
+  (:'id', NULL, NULL, NULL, NULL, 'server_operational_bundle', :'storage',
+   NULLIF(:'object_key', ''), NULLIF(:'local_path', ''), :'bytes'::bigint,
+   NULLIF(:'sha256', ''), :'created_ms'::bigint, :'expires_ms'::bigint,
+   jsonb_build_object(
+     'host', :'host',
+     'services', :'services',
+     'since', :'since',
+     'archive_name', :'archive_name',
+     'redacted', true,
+     'contains_user_content', false,
+     'backup_thread_id', '019e133e-d92a-7830-8df0-3a050a4e22f6'
+   )::text)
+ON CONFLICT (id) DO NOTHING;
+
+DELETE FROM diagnostic_log_chunks
+ WHERE account_id IS NULL
+   AND expires_at_ms < :'created_ms'::bigint;
+SQL
+    then
+        echo "warn: failed to index log archive metadata in diagnostic_log_chunks" >&2
+    fi
 }
 
 archive_logs() {
@@ -303,6 +426,7 @@ archive_logs() {
     tar -C "$WORK_ROOT" -czf "$archive" "$bundle_name"
     sha256sum "$archive" > "${archive}.sha256"
     upload_archive "$archive"
+    index_archive_metadata "$archive"
     rm -rf "$bundle"
     echo "$(date -u +%FT%TZ) log archive ok: $archive"
 }

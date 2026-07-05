@@ -21,6 +21,8 @@ pub mod accounts;
 pub mod auth_tokens;
 pub mod balance;
 pub mod device_codes;
+pub mod devices;
+pub mod diagnostic_logs;
 pub mod idempotency;
 pub mod link_codes;
 pub mod metrics;
@@ -269,12 +271,12 @@ const MIGRATIONS: &[&str] = &[
         created_at                  DATETIME NOT NULL DEFAULT (datetime('now')),
         last_login_at               DATETIME,
         balance_cents               INTEGER NOT NULL DEFAULT 0,
-        trial_seconds_remaining     INTEGER NOT NULL DEFAULT 600,      -- 10 min free trial
+        trial_seconds_remaining     INTEGER NOT NULL DEFAULT 900,      -- 15 min free trial
         is_temporary                INTEGER NOT NULL DEFAULT 0,
         temporary_expires_at        DATETIME,
         auto_topup_enabled          INTEGER NOT NULL DEFAULT 0,
-        auto_topup_threshold_cents  INTEGER NOT NULL DEFAULT 1000,     -- $10
-        auto_topup_amount_cents     INTEGER NOT NULL DEFAULT 3000,     -- $30
+        auto_topup_threshold_cents  INTEGER NOT NULL DEFAULT 500,      -- $5
+        auto_topup_amount_cents     INTEGER NOT NULL DEFAULT 1500,     -- $15
         stripe_customer_id          TEXT,
         stripe_payment_method_id    TEXT,
         is_admin                    INTEGER NOT NULL DEFAULT 0
@@ -301,6 +303,7 @@ const MIGRATIONS: &[&str] = &[
         token_hash       TEXT PRIMARY KEY,             -- sha256 of the token
         account_id       TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
         device_label     TEXT,
+        device_id        TEXT,
         created_at       DATETIME NOT NULL DEFAULT (datetime('now')),
         last_used_at     DATETIME,
         expires_at       DATETIME NOT NULL,
@@ -315,6 +318,11 @@ const MIGRATIONS: &[&str] = &[
         user_code        TEXT NOT NULL UNIQUE,
         account_id       TEXT REFERENCES accounts(id) ON DELETE SET NULL,
         approved         INTEGER NOT NULL DEFAULT 0,
+        device_id        TEXT,
+        device_name      TEXT,
+        platform         TEXT,
+        arch             TEXT,
+        app_version      TEXT,
         created_at       DATETIME NOT NULL DEFAULT (datetime('now')),
         expires_at       DATETIME NOT NULL
     );
@@ -591,7 +599,7 @@ const MIGRATIONS: &[&str] = &[
         device_hash           TEXT,
         user_agent_hash       TEXT,
         ip_user_agent_hash    TEXT,
-        granted_seconds       INTEGER NOT NULL DEFAULT 600,
+        granted_seconds       INTEGER NOT NULL DEFAULT 900,
         decision              TEXT NOT NULL,
         reason                TEXT,
         created_at            DATETIME NOT NULL DEFAULT (datetime('now'))
@@ -678,6 +686,60 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_ops_audit_account_created
         ON ops_audit_events(account_id_hash, created_at);
     "#,
+    // 0017 - diagnostic log chunk index.
+    //
+    // Operational logs and support diagnostics should live in bounded local
+    // files or private R2 objects, not as raw log bodies in the database. This
+    // table is the Postgres/SQLite index that lets support find the right
+    // durable object by account/session/kind without exposing transcripts,
+    // screenshots, document text, or prompts in ordinary support payloads.
+    r#"
+    CREATE TABLE IF NOT EXISTS diagnostic_log_chunks (
+        id              TEXT PRIMARY KEY,
+        account_id      TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+        workspace_id    TEXT,
+        session_id      TEXT,
+        session_code    TEXT,
+        kind            TEXT NOT NULL,
+        storage         TEXT NOT NULL DEFAULT 'local',
+        object_key      TEXT,
+        local_path      TEXT,
+        bytes           INTEGER NOT NULL DEFAULT 0,
+        sha256          TEXT,
+        created_at_ms   INTEGER NOT NULL,
+        expires_at_ms   INTEGER NOT NULL,
+        metadata_json   TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_account_created
+        ON diagnostic_log_chunks(account_id, created_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_session
+        ON diagnostic_log_chunks(account_id, session_id, created_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_expires
+        ON diagnostic_log_chunks(expires_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_diagnostic_log_chunks_kind_created
+        ON diagnostic_log_chunks(kind, created_at_ms DESC);
+    "#,
+    // 0018 - stable account desktop devices.
+    r#"
+    CREATE TABLE IF NOT EXISTS account_devices (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        device_id             TEXT NOT NULL,
+        device_name           TEXT NOT NULL,
+        platform              TEXT NOT NULL,
+        arch                  TEXT,
+        app_version           TEXT,
+        registered_at         DATETIME NOT NULL DEFAULT (datetime('now')),
+        last_seen_at          DATETIME,
+        last_heartbeat_at     DATETIME,
+        revoked_at            DATETIME,
+        UNIQUE(account_id, device_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_account_devices_account
+        ON account_devices(account_id, revoked_at);
+    CREATE INDEX IF NOT EXISTS idx_account_devices_account_device
+        ON account_devices(account_id, device_id);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -696,6 +758,12 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     ensure_column(&conn, "stt_sessions", "started_at_ms", "INTEGER")?;
     ensure_column(&conn, "stt_sessions", "ended_at_ms", "INTEGER")?;
     ensure_column(&conn, "stt_sessions", "relay_close_reason", "TEXT")?;
+    ensure_column(&conn, "device_codes", "device_id", "TEXT")?;
+    ensure_column(&conn, "device_codes", "device_name", "TEXT")?;
+    ensure_column(&conn, "device_codes", "platform", "TEXT")?;
+    ensure_column(&conn, "device_codes", "arch", "TEXT")?;
+    ensure_column(&conn, "device_codes", "app_version", "TEXT")?;
+    ensure_column(&conn, "refresh_tokens", "device_id", "TEXT")?;
     ensure_column(
         &conn,
         "accounts",

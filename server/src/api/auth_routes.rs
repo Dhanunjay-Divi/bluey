@@ -13,7 +13,12 @@ use std::net::{IpAddr, SocketAddr};
 use super::AppState;
 use crate::{
     auth,
-    db::{accounts::Account, device_codes, refresh_tokens, signup_otps, trial_abuse},
+    db::{
+        accounts::{Account, DEFAULT_TRIAL_SECONDS},
+        device_codes::{self, DeviceCodeMetadata},
+        devices::{self, DeviceRegistration},
+        refresh_tokens, signup_otps, trial_abuse,
+    },
 };
 
 // ─── Request / response shapes ───────────────────────────────────────────
@@ -162,7 +167,6 @@ fn allow_dev_auth_link_logs() -> bool {
 
 const SIGNUP_OTP_TTL_SECS: i64 = 10 * 60;
 const SIGNUP_OTP_MAX_ATTEMPTS: i64 = 5;
-const TEMPORARY_TRIAL_SECONDS: i64 = 15 * 60;
 const TEMPORARY_ACCOUNT_TTL_SECS: i64 = 24 * 60 * 60;
 const TEMPORARY_ACCOUNT_EMAIL_DOMAIN: &str = "try.bluey.sh";
 
@@ -404,6 +408,15 @@ fn auth_response(
     state: &AppState,
     account: &Account,
 ) -> Result<AuthResponse, (StatusCode, Json<ApiError>)> {
+    auth_response_with_label(state, account, None, None)
+}
+
+fn auth_response_with_label(
+    state: &AppState,
+    account: &Account,
+    refresh_label: Option<&str>,
+    refresh_device_id: Option<&str>,
+) -> Result<AuthResponse, (StatusCode, Json<ApiError>)> {
     let access = auth::jwt::issue(
         &state.config.jwt_secret,
         &account.id,
@@ -427,7 +440,14 @@ fn auth_response(
         )
     })?;
 
-    refresh_tokens::store(&state.pool, &refresh, &account.id, None).map_err(|e| {
+    refresh_tokens::store_with_device(
+        &state.pool,
+        &refresh,
+        &account.id,
+        refresh_label,
+        refresh_device_id,
+    )
+    .map_err(|e| {
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("store refresh: {e}"),
@@ -497,20 +517,23 @@ pub async fn trial_start(
         return Err(error);
     }
 
-    let decision =
-        trial_abuse::evaluate_trial_grant(&state.pool, state.config.trial_abuse, &signals)
-            .map_err(|e| {
-                err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("trial abuse: {e}"),
-                )
-            })?;
-    if !decision.allowed {
-        return Err(err(
-            StatusCode::TOO_MANY_REQUESTS,
-            decision.reason.as_deref().unwrap_or("trial limit reached"),
-        ));
-    }
+    let grant_id = match trial_abuse::reserve_trial_grant(
+        &state.pool,
+        state.config.trial_abuse,
+        &signals,
+        DEFAULT_TRIAL_SECONDS,
+    )
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("trial abuse: {e}"),
+        )
+    })? {
+        trial_abuse::TrialGrantReservation::Reserved { grant_id } => grant_id,
+        trial_abuse::TrialGrantReservation::Denied { reason } => {
+            return Err(err(StatusCode::TOO_MANY_REQUESTS, &reason));
+        }
+    };
 
     let password = random_human_secret(18);
     let password_hash = auth::password::hash_password(&password)
@@ -525,7 +548,7 @@ pub async fn trial_start(
             &state.pool,
             &email,
             &password_hash,
-            TEMPORARY_TRIAL_SECONDS,
+            DEFAULT_TRIAL_SECONDS,
             &temporary_expires_at,
         ) {
             Ok(account) => {
@@ -543,26 +566,28 @@ pub async fn trial_start(
             }
         }
     }
-    let account = account_result.ok_or_else(|| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!(
-                "create trial: {}",
-                last_error
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "could not allocate temporary email".to_string())
-            ),
-        )
-    })?;
+    let account = match account_result {
+        Some(account) => account,
+        None => {
+            let _ = trial_abuse::release_reserved_grant(&state.pool, &grant_id);
+            return Err(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "create trial: {}",
+                    last_error
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "could not allocate temporary email".to_string())
+                ),
+            ));
+        }
+    };
 
-    if let Err(error) =
-        trial_abuse::record_grant(&state.pool, &account.id, &signals, TEMPORARY_TRIAL_SECONDS)
-    {
+    if let Err(error) = trial_abuse::attach_grant_account(&state.pool, &grant_id, &account.id) {
         tracing::warn!(
             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
             %error,
-            "failed to record temporary trial grant"
+            "failed to attach temporary trial grant"
         );
     }
 
@@ -575,7 +600,7 @@ pub async fn trial_start(
             expires_in: auth.expires_in,
             account: auth.account,
             password,
-            trial_seconds: TEMPORARY_TRIAL_SECONDS,
+            trial_seconds: DEFAULT_TRIAL_SECONDS,
             temporary_expires_at,
         }),
     ))
@@ -873,25 +898,29 @@ pub async fn signup_confirm(
     }
 
     let signals = signup_signals(&email, &headers, peer_ip, req.device_fingerprint.as_deref());
-    let decision =
-        trial_abuse::evaluate_trial_grant(&state.pool, state.config.trial_abuse, &signals)
-            .map_err(|e| {
-                err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("trial abuse: {e}"),
-                )
-            })?;
-    if !decision.allowed {
-        return Err(err(
-            StatusCode::TOO_MANY_REQUESTS,
-            decision.reason.as_deref().unwrap_or("trial limit reached"),
-        ));
-    }
+    let grant_id = match trial_abuse::reserve_trial_grant(
+        &state.pool,
+        state.config.trial_abuse,
+        &signals,
+        DEFAULT_TRIAL_SECONDS,
+    )
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("trial abuse: {e}"),
+        )
+    })? {
+        trial_abuse::TrialGrantReservation::Reserved { grant_id } => grant_id,
+        trial_abuse::TrialGrantReservation::Denied { reason } => {
+            return Err(err(StatusCode::TOO_MANY_REQUESTS, &reason));
+        }
+    };
 
     let is_admin = state.config.is_admin_email(&email);
     let account =
         Account::create_with_admin(&state.pool, &email, &signup_otp.password_hash, is_admin)
             .map_err(|e| {
+                let _ = trial_abuse::release_reserved_grant(&state.pool, &grant_id);
                 if matches!(
                     e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
                     Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
@@ -904,16 +933,11 @@ pub async fn signup_confirm(
     let _ = signup_otps::delete(&state.pool, &email);
     Account::mark_email_verified(&state.pool, &account.id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-    if let Err(error) = trial_abuse::record_grant(
-        &state.pool,
-        &account.id,
-        &signals,
-        account.trial_seconds_remaining,
-    ) {
+    if let Err(error) = trial_abuse::attach_grant_account(&state.pool, &grant_id, &account.id) {
         tracing::warn!(
             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
             %error,
-            "failed to record trial grant"
+            "failed to attach trial grant"
         );
     }
 
@@ -981,9 +1005,10 @@ pub async fn refresh(
     // 2. ATOMICALLY consume the refresh token: revoke if and only if we are
     // the unique caller to claim it. Race-free against concurrent /auth/refresh
     // calls. (Codex S2.3 blocker fix.)
-    let account_id = refresh_tokens::consume(&state.pool, &req.refresh_token)
+    let consumed = refresh_tokens::consume_with_metadata(&state.pool, &req.refresh_token)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "refresh token revoked or expired"))?;
+    let account_id = consumed.account_id.clone();
 
     if account_id != claims.sub {
         return Err(err(
@@ -1000,7 +1025,12 @@ pub async fn refresh(
     }
 
     // 3. Issue a new pair (the old token is already revoked atomically above).
-    Ok(Json(auth_response(&state, &account)?))
+    Ok(Json(auth_response_with_label(
+        &state,
+        &account,
+        consumed.device_label.as_deref(),
+        consumed.device_id.as_deref(),
+    )?))
 }
 
 pub async fn logout(
@@ -1043,6 +1073,15 @@ pub struct DeviceStartResponse {
     pub interval: i64,
 }
 
+#[derive(Default, Deserialize)]
+pub struct DeviceStartRequest {
+    pub device_id: Option<String>,
+    pub device_name: Option<String>,
+    pub platform: Option<String>,
+    pub arch: Option<String>,
+    pub app_version: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub struct DevicePollRequest {
     pub device_code: String,
@@ -1080,15 +1119,52 @@ fn random_device_code() -> String {
     hex::encode(bytes)
 }
 
+fn device_code_metadata(req: DeviceStartRequest) -> Option<DeviceCodeMetadata> {
+    let device_id = clean_device_field(req.device_id)?;
+    Some(DeviceCodeMetadata {
+        device_id: Some(device_id),
+        device_name: clean_device_field(req.device_name),
+        platform: clean_device_field(req.platform),
+        arch: clean_device_field(req.arch),
+        app_version: clean_device_field(req.app_version),
+    })
+}
+
+fn device_registration_from_code(row: &device_codes::DeviceCodeRow) -> Option<DeviceRegistration> {
+    let device_id = clean_device_field(row.device_id.clone())?;
+    Some(DeviceRegistration {
+        device_id,
+        device_name: clean_device_field(row.device_name.clone())
+            .unwrap_or_else(|| "Bluey desktop".to_string()),
+        platform: clean_device_field(row.platform.clone()).unwrap_or_else(|| "desktop".to_string()),
+        arch: clean_device_field(row.arch.clone()),
+        app_version: clean_device_field(row.app_version.clone()),
+    })
+}
+
+fn clean_device_field(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().chars().take(128).collect::<String>())
+        .filter(|value| !value.is_empty())
+}
+
 pub async fn device_start(
     State(state): State<AppState>,
+    Json(req): Json<Option<DeviceStartRequest>>,
 ) -> Result<Json<DeviceStartResponse>, (StatusCode, Json<ApiError>)> {
     let device_code = random_device_code();
     let user_code = random_user_code();
     let expires_at =
         (chrono::Utc::now() + chrono::Duration::seconds(DEVICE_CODE_TTL_SECS)).to_rfc3339();
-    device_codes::insert(&state.pool, &device_code, &user_code, &expires_at)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
+    let metadata = device_code_metadata(req.unwrap_or_default());
+    device_codes::insert(
+        &state.pool,
+        &device_code,
+        &user_code,
+        &expires_at,
+        metadata.as_ref(),
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
     Ok(Json(DeviceStartResponse {
         device_code,
         user_code,
@@ -1117,7 +1193,7 @@ pub async fn device_poll(
     if row.approved == 0 {
         return Err(err(StatusCode::ACCEPTED, "authorization_pending"));
     }
-    let Some(account_id) = row.account_id else {
+    let Some(account_id) = row.account_id.clone() else {
         return Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "approved but no account",
@@ -1140,7 +1216,31 @@ pub async fn device_poll(
     if account.is_temporary_expired() {
         return Err(err(StatusCode::UNAUTHORIZED, "temporary account expired"));
     }
-    Ok(Json(auth_response(&state, &account)?))
+    let mut refresh_device_id = None;
+    let refresh_label = if let Some(registration) = device_registration_from_code(&row) {
+        refresh_device_id = Some(registration.device_id.clone());
+        devices::upsert(&state.pool, &account.id, &registration).map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                device_id_hash = %cue_core::account_id_hash_prefix(&registration.device_id),
+                error = %e,
+                "failed to register desktop during device login"
+            );
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not register device",
+            )
+        })?;
+        Some("bluey-desktop")
+    } else {
+        None
+    };
+    Ok(Json(auth_response_with_label(
+        &state,
+        &account,
+        refresh_label,
+        refresh_device_id.as_deref(),
+    )?))
 }
 
 pub async fn device_approve(
@@ -1376,8 +1476,12 @@ pub async fn password_change(
         .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
     Account::update_password_hash(&state.pool, &account.id, &new_hash)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-    refresh_tokens::revoke_all_for_account(&state.pool, &account.id)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("revoke refresh: {e}")))?;
+    refresh_tokens::revoke_all_for_account(&state.pool, &account.id).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("revoke refresh: {e}"),
+        )
+    })?;
     Ok(Json(auth_response(&state, &account)?))
 }
 

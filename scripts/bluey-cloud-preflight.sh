@@ -478,6 +478,8 @@ log_endpoint="${BLUEY_LOG_R2_ENDPOINT_URL:-${BLUEY_LOG_R2_ENDPOINT:-${BLUEY_BACK
 log_access_key="${BLUEY_LOG_R2_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-${BLUEY_OBJECT_ACCESS_KEY_ID:-${BLUEY_R2_ACCESS_KEY_ID:-}}}}"
 log_secret_key="${BLUEY_LOG_R2_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-${BLUEY_OBJECT_SECRET_ACCESS_KEY:-${BLUEY_R2_SECRET_ACCESS_KEY:-}}}}"
 log_region="${BLUEY_LOG_R2_REGION:-${AWS_DEFAULT_REGION:-${BLUEY_OBJECT_REGION:-${BLUEY_R2_REGION:-auto}}}}"
+log_storage="${BLUEY_LOG_STORAGE:-}"
+log_retention_days="${BLUEY_UPLOAD_LOG_RETENTION_DAYS:-${BLUEY_LOG_RETENTION_DAYS:-180}}"
 
 if [ -n "$log_destination" ] && ! is_placeholder "$log_destination"; then
   ok "log archive destination set"
@@ -539,6 +541,23 @@ elif [ -n "$log_bucket" ] && command -v aws >/dev/null 2>&1; then
   fi
 elif [ "$require_log_archive" = "1" ]; then
   warn "aws CLI not installed; skipped required log archive reachability check"
+fi
+if [ "$log_storage" = "r2" ] || [ "$log_storage" = "s3" ]; then
+  ok "diagnostic log storage mode=$log_storage"
+elif [ "$require_log_archive" = "1" ]; then
+  warn "BLUEY_LOG_STORAGE is not r2/s3; server-side account diagnostic chunks may not have durable log storage"
+else
+  warn "diagnostic log storage mode not set"
+fi
+if is_uint "$log_retention_days" && [ "$log_retention_days" -le 180 ]; then
+  ok "diagnostic log retention days=$log_retention_days"
+else
+  fail "diagnostic log retention must be a positive integer <= 180 days"
+fi
+if [ -n "${BLUEY_DATABASE_URL:-}" ] && command -v psql >/dev/null 2>&1; then
+  ok "diagnostic log archive indexing can use Postgres via psql"
+elif [ -n "${BLUEY_DATABASE_URL:-}" ]; then
+  warn "psql missing; log archive upload will work but diagnostic_log_chunks indexing will be skipped"
 fi
 ok "log hot cache retention days=${BLUEY_LOG_LOCAL_RETENTION_DAYS:-7}"
 ok "log dir max bytes=${BLUEY_LOG_DIR_MAX_BYTES:-536870912}"

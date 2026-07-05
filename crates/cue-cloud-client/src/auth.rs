@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::{
     client::{log_safe_response_body, CloudClient},
     error::{Error, Result},
-    types::{AuthResponse, DeviceStartResponse},
+    types::{AuthResponse, DeviceStartRequest, DeviceStartResponse},
 };
 
 #[derive(Debug, Clone)]
@@ -34,7 +34,14 @@ pub struct DeviceFlow {
 
 impl DeviceFlow {
     pub async fn start(client: &CloudClient) -> Result<Self> {
-        let resp: DeviceStartResponse = client.post_json("/auth/device/start", &()).await?;
+        Self::start_with_request(client, DeviceStartRequest::default()).await
+    }
+
+    pub async fn start_with_request(
+        client: &CloudClient,
+        request: DeviceStartRequest,
+    ) -> Result<Self> {
+        let resp: DeviceStartResponse = client.post_json("/auth/device/start", &request).await?;
         let interval_secs = resp.interval.max(1) as u64;
         let deadline =
             std::time::Instant::now() + Duration::from_secs(resp.expires_in.max(1) as u64);

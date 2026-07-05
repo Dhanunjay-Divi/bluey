@@ -19,7 +19,7 @@ Bluey is not a monthly subscription by default.
 
 | Item | Value |
 |---|---|
-| Free trial | 10 minutes of active session time (mirrors Pinky's free model) |
+| Free trial | 15 minutes of active session time (mirrors Pinky's free model) |
 | Initial reload | $30 USD |
 | Reload model | hosted checkout; manual reload in v0.2 |
 | Pricing basis | per request: input tokens + output tokens + model used |
@@ -45,12 +45,12 @@ Bluey is not a monthly subscription by default.
 ┌──────────────────────────────────────────────────────────────────┐
 │ 1. Customer visits  https://bluey.sh/signup                     │
 │    enters email + password                                       │
-│    bluey-server creates account, balance = $0.00, trial = 600s   │
+│    bluey-server creates account, balance = $0.00, trial = 900s   │
 │                                                                  │
 │ 2. Verification email confirms account.                          │
 │                                                                  │
 │ 3. Customer redirected to /account dashboard                     │
-│    Sees: "10 minutes free trial. After that, $15 minimum         │
+│    Sees: "15 minutes free trial. After that, $15 minimum         │
 │           reload. We deduct as you use."                         │
 │    Copies install command:                                       │
 │       curl https://bluey.sh/install.sh | sh                     │
@@ -339,14 +339,14 @@ recalibrate the estimate model OR cap individual request size
 more aggressively.
 ```
 
-## 8. Free trial (first 10 minutes)
+## 8. Free trial (first 15 minutes)
 
 ```
 On account creation:
   account.balance_cents = 0
-  account.trial_seconds_remaining = 600
+  account.trial_seconds_remaining = 900
 
-For the first 10 minutes of active session time (when daemon is
+For the first 15 minutes of active session time (when daemon is
 attached + emitting requests), bluey-server:
   - serves /router/complete normally
   - decrements trial_seconds_remaining by request duration
@@ -436,6 +436,6 @@ balance, tier projection. No hidden charges, no opaque billing.
 | LaneBadge with provider/model | response trailer with `lane`, `provider`, `model` |
 | "Add $30" banner | 402 Payment Required from server with reason field |
 | Reload notification | Square webhook → balance increment → daemon refresh |
-| 10-min trial countdown | `trial_seconds_remaining` field in every response |
+| 15-min trial countdown | `trial_seconds_remaining` field in every response |
 | Hard stop with partial answer | mid-stream balance check → cut + truncated chunk + banner |
 | OFFLINE tag | daemon detects bluey-server unreachable, flips local-fallback |

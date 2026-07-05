@@ -1035,6 +1035,6 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(trial_left, 590);
+        assert_eq!(trial_left, crate::db::accounts::DEFAULT_TRIAL_SECONDS - 10);
     }
 }

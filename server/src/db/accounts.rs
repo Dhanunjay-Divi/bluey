@@ -8,8 +8,9 @@ use rusqlite::params;
 
 use crate::db::DbPool;
 
-const DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS: i64 = 1000;
-const DEFAULT_AUTO_TOPUP_AMOUNT_CENTS: i64 = 3000;
+const DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS: i64 = 500;
+const DEFAULT_AUTO_TOPUP_AMOUNT_CENTS: i64 = 1500;
+pub const DEFAULT_TRIAL_SECONDS: i64 = 15 * 60;
 
 /// Codex Stage 10 round-2 typed-error nit: signup needs to distinguish
 /// "this email already exists" from generic DB errors without
@@ -221,15 +222,17 @@ impl Account {
                     match conn.execute(
                         "INSERT INTO accounts
                         (id, email, password_hash, is_admin, auto_topup_enabled,
-                         auto_topup_threshold_cents, auto_topup_amount_cents)
-                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                         auto_topup_threshold_cents, auto_topup_amount_cents,
+                         trial_seconds_remaining)
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
                         params![
                             id,
                             email,
                             password_hash,
                             if is_admin { 1 } else { 0 },
                             DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS,
-                            DEFAULT_AUTO_TOPUP_AMOUNT_CENTS
+                            DEFAULT_AUTO_TOPUP_AMOUNT_CENTS,
+                            DEFAULT_TRIAL_SECONDS
                         ],
                     ) {
                         Ok(_) => {}
@@ -258,8 +261,9 @@ impl Account {
                     if let Err(e) = conn.execute(
                         "INSERT INTO accounts
                         (id, email, password_hash, is_admin, auto_topup_enabled,
-                         auto_topup_threshold_cents, auto_topup_amount_cents)
-                     VALUES ($1, $2, $3, $4, 0, $5, $6)",
+                         auto_topup_threshold_cents, auto_topup_amount_cents,
+                         trial_seconds_remaining)
+                     VALUES ($1, $2, $3, $4, 0, $5, $6, $7)",
                         &[
                             &id,
                             &email,
@@ -267,6 +271,7 @@ impl Account {
                             &is_admin_i32,
                             &DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS,
                             &DEFAULT_AUTO_TOPUP_AMOUNT_CENTS,
+                            &DEFAULT_TRIAL_SECONDS,
                         ],
                     ) {
                         if e.code() == Some(&SqlState::UNIQUE_VIOLATION) {
@@ -281,12 +286,12 @@ impl Account {
                 email: email.to_string(),
                 email_verified_at: None,
                 balance_cents: 0,
-                trial_seconds_remaining: 600,
+                trial_seconds_remaining: DEFAULT_TRIAL_SECONDS,
                 is_temporary: false,
                 temporary_expires_at: None,
                 auto_topup_enabled: false,
-                auto_topup_threshold_cents: 1000,
-                auto_topup_amount_cents: 3000,
+                auto_topup_threshold_cents: DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS,
+                auto_topup_amount_cents: DEFAULT_AUTO_TOPUP_AMOUNT_CENTS,
                 is_admin,
                 stripe_customer_id: None,
                 stripe_payment_method_id: None,
@@ -932,6 +937,26 @@ mod create_dup_tests {
                 Some(AccountCreateError::DuplicateEmail)
             ),
             "expected AccountCreateError::DuplicateEmail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn create_initializes_fifteen_minute_trial_budget() {
+        let pool = temp_pool();
+        let account = Account::create(&pool, "trial@example.com", "hash").unwrap();
+        assert_eq!(account.trial_seconds_remaining, DEFAULT_TRIAL_SECONDS);
+
+        let stored = Account::fetch_by_email(&pool, "trial@example.com")
+            .unwrap()
+            .expect("account should be persisted");
+        assert_eq!(stored.trial_seconds_remaining, DEFAULT_TRIAL_SECONDS);
+        assert_eq!(
+            stored.auto_topup_threshold_cents,
+            DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS
+        );
+        assert_eq!(
+            stored.auto_topup_amount_cents,
+            DEFAULT_AUTO_TOPUP_AMOUNT_CENTS
         );
     }
 

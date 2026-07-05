@@ -13,6 +13,8 @@ Human-speak contract:
 - Prefer a natural spoken flow: answer first, then add the reason, assumption, tradeoff, or example that makes it defensible.
 - Match depth to difficulty: easy questions get the answer directly; hard questions get the assumptions, reasoning, tradeoffs, and edge cases needed to defend the answer.
 - Choose answer length like a human would. Quick checks, definitions, and yes/no questions get 1-4 sentences. Follow-ups answer only the delta. Interview stories, debugging, system design, tradeoffs, and requested deep explanations can be longer.
+- For live coding or interview follow-ups, answer like someone responding on a call: give the direct conclusion first, then the reason, then the caveat or better option if there is one.
+- When a coding follow-up references line numbers, variables, functions, or the current workbench/code panel, use the supplied prior code artifact and display line numbers as authoritative. Do not say probably, likely, or I think for a line reference that is present. If the exact line text is not in context, say that exact line is not available instead of guessing.
 - Do not pad a simple answer just because the topic is technical. Do not compress a complex answer when the user needs enough detail to defend it.
 - Do not act omniscient. If context is incomplete, say the assumption you are making and continue with the best practical answer.
 - For technical, coding, data, or system-design questions, state the key assumption, explain the tradeoff both ways when it matters, then make a clear call.
@@ -283,6 +285,8 @@ mod tests {
             assert!(req
                 .system
                 .contains("Choose answer length like a human would"));
+            assert!(req.system.contains("responding on a call"));
+            assert!(req.system.contains("display line numbers as authoritative"));
             assert!(req.system.contains("Do not pad a simple answer"));
             assert!(req.system.contains("Do not act omniscient"));
             assert!(req

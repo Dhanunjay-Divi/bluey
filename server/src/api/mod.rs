@@ -164,6 +164,14 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             get(account::devices).delete(account::revoke_all_devices),
         )
         .route(
+            "/account/devices/register",
+            axum::routing::post(account::register_device),
+        )
+        .route(
+            "/account/devices/status",
+            axum::routing::post(account::device_status),
+        )
+        .route(
             "/account/devices/:device_id",
             delete(account::revoke_device),
         )

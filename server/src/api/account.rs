@@ -16,11 +16,12 @@ use crate::billing::policy::{
     is_internal_or_test_billing_account, INTERNAL_TEST_BILLING_BLOCK_MESSAGE,
 };
 use crate::config::BillingProvider;
-use crate::db::account_data;
+use crate::db::devices::{DeviceRecord, DeviceRegistration};
+use crate::db::{account_data, diagnostic_logs};
 use crate::object_storage::ObjectStorage;
 
 const MIN_AUTO_RELOAD_CENTS: i64 = 1500;
-const MAX_AUTO_RELOAD_CENTS: i64 = 10_000;
+const MAX_AUTO_RELOAD_CENTS: i64 = 50_000;
 const MIN_AUTO_RELOAD_THRESHOLD_CENTS: i64 = 100;
 const MAX_AUTO_RELOAD_THRESHOLD_CENTS: i64 = 5_000;
 
@@ -55,16 +56,41 @@ pub struct ApiError {
 #[derive(Serialize)]
 pub struct AccountDevice {
     pub id: String,
+    pub device_id: String,
     pub label: String,
     pub kind: String,
+    pub platform: String,
+    pub arch: Option<String>,
+    pub app_version: Option<String>,
     pub created_at: String,
     pub last_used_at: Option<String>,
+    pub last_heartbeat_at: Option<String>,
+    pub live: bool,
     pub expires_at: String,
 }
 
 #[derive(Serialize)]
 pub struct AccountDevicesResponse {
     pub devices: Vec<AccountDevice>,
+}
+
+#[derive(Deserialize)]
+pub struct RegisterDeviceRequest {
+    pub device_id: String,
+    pub device_name: Option<String>,
+    pub platform: Option<String>,
+    pub arch: Option<String>,
+    pub app_version: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct DeviceStatusRequest {
+    pub device_id: String,
+}
+
+#[derive(Serialize)]
+pub struct DeviceStatusResponse {
+    pub active: bool,
 }
 
 #[derive(Deserialize)]
@@ -88,21 +114,110 @@ pub async fn devices(
     account_devices_payload(&state, &account.id).map(Json)
 }
 
+pub async fn register_device(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(req): Json<RegisterDeviceRequest>,
+) -> Result<Json<AccountDevice>, (StatusCode, Json<ApiError>)> {
+    let device_id = req.device_id.trim();
+    if device_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "device_id is required.".to_string(),
+            }),
+        ));
+    }
+    let registration = DeviceRegistration {
+        device_id: device_id.to_string(),
+        device_name: req
+            .device_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Bluey desktop")
+            .to_string(),
+        platform: req
+            .platform
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("desktop")
+            .to_string(),
+        arch: non_empty_trimmed(req.arch),
+        app_version: non_empty_trimmed(req.app_version),
+    };
+    let record =
+        crate::db::devices::upsert(&state.pool, &account.id, &registration).map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %e,
+                "failed to register linked device"
+            );
+            internal_error("Could not register this device.")
+        })?;
+    Ok(Json(account_device_from_record(record)))
+}
+
+pub async fn device_status(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(req): Json<DeviceStatusRequest>,
+) -> Result<Json<DeviceStatusResponse>, (StatusCode, Json<ApiError>)> {
+    let device_id = req.device_id.trim();
+    if device_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "device_id is required.".to_string(),
+            }),
+        ));
+    }
+    let active = crate::db::devices::is_active_for_account(&state.pool, &account.id, device_id)
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %e,
+                "failed to check linked device status"
+            );
+            internal_error("Could not check this device.")
+        })?;
+    if !active {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "This desktop is no longer linked to this account.".to_string(),
+            }),
+        ));
+    }
+    Ok(Json(DeviceStatusResponse { active }))
+}
+
 pub async fn revoke_device(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(device_id): Path<String>,
 ) -> Result<Json<AccountDevicesResponse>, (StatusCode, Json<ApiError>)> {
-    let removed =
-        crate::db::refresh_tokens::revoke_hash_for_account(&state.pool, &account.id, &device_id)
-            .map_err(|e| {
-                tracing::warn!(
-                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    error = %e,
-                    "failed to revoke linked device"
-                );
-                internal_error("Could not remove that device.")
-            })?;
+    let existing = crate::db::devices::list_for_account(&state.pool, &account.id)
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %e,
+                "failed to load linked device before revoke"
+            );
+            internal_error("Could not remove that device.")
+        })?
+        .into_iter()
+        .find(|device| device.id == device_id);
+    let removed = crate::db::devices::revoke_for_account(&state.pool, &account.id, &device_id)
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %e,
+                "failed to revoke linked device"
+            );
+            internal_error("Could not remove that device.")
+        })?;
     if !removed {
         return Err((
             StatusCode::NOT_FOUND,
@@ -111,6 +226,28 @@ pub async fn revoke_device(
             }),
         ));
     }
+    if let Some(device) = existing {
+        let revoked = crate::db::refresh_tokens::revoke_for_device(
+            &state.pool,
+            &account.id,
+            &device.device_id,
+        )
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                device_id_hash = %cue_core::account_id_hash_prefix(&device.device_id),
+                error = %e,
+                "failed to revoke linked device refresh tokens"
+            );
+            internal_error("Could not sign out that device.")
+        })?;
+        tracing::info!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            device_id_hash = %cue_core::account_id_hash_prefix(&device.device_id),
+            revoked_refresh_tokens = revoked,
+            "linked device removed and refresh tokens revoked"
+        );
+    }
     account_devices_payload(&state, &account.id).map(Json)
 }
 
@@ -118,7 +255,7 @@ pub async fn revoke_all_devices(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
 ) -> Result<Json<AccountDevicesResponse>, (StatusCode, Json<ApiError>)> {
-    crate::db::refresh_tokens::revoke_all_for_account(&state.pool, &account.id).map_err(|e| {
+    crate::db::devices::revoke_all_for_account(&state.pool, &account.id).map_err(|e| {
         tracing::warn!(
             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
             error = %e,
@@ -126,6 +263,16 @@ pub async fn revoke_all_devices(
         );
         internal_error("Could not remove linked devices.")
     })?;
+    crate::db::refresh_tokens::revoke_all_devices_for_account(&state.pool, &account.id).map_err(
+        |e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %e,
+                "failed to revoke linked-device refresh tokens"
+            );
+            internal_error("Could not sign out linked devices.")
+        },
+    )?;
     account_devices_payload(&state, &account.id).map(Json)
 }
 
@@ -136,12 +283,10 @@ pub async fn update_billing_settings(
 ) -> Result<Json<AccountMe>, (StatusCode, Json<ApiError>)> {
     let amount = req
         .auto_topup_amount_cents
-        .unwrap_or(account.auto_topup_amount_cents)
-        .clamp(0, MAX_AUTO_RELOAD_CENTS);
+        .unwrap_or(account.auto_topup_amount_cents);
     let threshold = req
         .auto_topup_threshold_cents
-        .unwrap_or(account.auto_topup_threshold_cents)
-        .clamp(0, MAX_AUTO_RELOAD_THRESHOLD_CENTS);
+        .unwrap_or(account.auto_topup_threshold_cents);
 
     let settings_changed =
         req.auto_topup_amount_cents.is_some() || req.auto_topup_threshold_cents.is_some();
@@ -154,11 +299,27 @@ pub async fn update_billing_settings(
                 }),
             ));
         }
+        if amount > MAX_AUTO_RELOAD_CENTS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "Auto Reload amount can be at most $500.".to_string(),
+                }),
+            ));
+        }
         if threshold < MIN_AUTO_RELOAD_THRESHOLD_CENTS {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ApiError {
                     error: "Auto Reload threshold must be at least $1.".to_string(),
+                }),
+            ));
+        }
+        if threshold > MAX_AUTO_RELOAD_THRESHOLD_CENTS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "Auto Reload threshold can be at most $50.".to_string(),
                 }),
             ));
         }
@@ -238,39 +399,66 @@ fn account_devices_payload(
     state: &AppState,
     account_id: &str,
 ) -> Result<AccountDevicesResponse, (StatusCode, Json<ApiError>)> {
-    let sessions = crate::db::refresh_tokens::list_active_for_account(&state.pool, account_id)
-        .map_err(|e| {
-            tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
-                error = %e,
-                "failed to list linked devices"
-            );
-            internal_error("Could not load linked devices.")
-        })?;
+    let records = crate::db::devices::list_for_account(&state.pool, account_id).map_err(|e| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            error = %e,
+            "failed to list linked devices"
+        );
+        internal_error("Could not load linked devices.")
+    })?;
     Ok(AccountDevicesResponse {
-        devices: sessions
+        devices: records
             .into_iter()
-            .map(|session| {
-                let (label, kind) = device_label_and_kind(session.device_label.as_deref());
-                AccountDevice {
-                    id: session.token_hash,
-                    label,
-                    kind,
-                    created_at: session.created_at,
-                    last_used_at: session.last_used_at,
-                    expires_at: session.expires_at,
-                }
-            })
+            .map(account_device_from_record)
             .collect(),
     })
 }
 
-fn device_label_and_kind(device_label: Option<&str>) -> (String, String) {
-    match device_label {
-        Some("device-link") => ("Bluey desktop".to_string(), "Desktop".to_string()),
-        Some(label) if !label.trim().is_empty() => (label.trim().to_string(), "Device".to_string()),
-        _ => ("Browser session".to_string(), "Browser".to_string()),
+fn account_device_from_record(record: DeviceRecord) -> AccountDevice {
+    let last_used_at = record
+        .last_heartbeat_at
+        .clone()
+        .or_else(|| record.last_seen_at.clone());
+    AccountDevice {
+        id: record.id,
+        device_id: record.device_id,
+        label: record.device_name,
+        kind: device_kind(&record.platform),
+        platform: record.platform,
+        arch: record.arch,
+        app_version: record.app_version,
+        created_at: record.registered_at,
+        live: is_live_device(record.last_heartbeat_at.as_deref()),
+        last_used_at,
+        last_heartbeat_at: record.last_heartbeat_at,
+        expires_at: String::new(),
     }
+}
+
+fn device_kind(platform: &str) -> String {
+    match platform.trim().to_lowercase().as_str() {
+        "macos" | "darwin" => "macOS".to_string(),
+        "windows" | "win32" => "Windows".to_string(),
+        "linux" => "Linux".to_string(),
+        _ => "Desktop".to_string(),
+    }
+}
+
+fn is_live_device(last_heartbeat_at: Option<&str>) -> bool {
+    let Some(last_heartbeat_at) = last_heartbeat_at else {
+        return false;
+    };
+    let Ok(last) = last_heartbeat_at.parse::<chrono::DateTime<chrono::Utc>>() else {
+        return false;
+    };
+    chrono::Utc::now().signed_duration_since(last).num_seconds() < 90
+}
+
+fn non_empty_trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().chars().take(128).collect::<String>())
+        .filter(|value| !value.is_empty())
 }
 
 fn internal_error(message: &str) -> (StatusCode, Json<ApiError>) {
@@ -508,7 +696,7 @@ pub async fn usage(
                 format!("~{rounded:.0} days at recent pace."),
                 "estimated".to_string(),
             )
-    };
+        };
 
     Ok(Json(UsageWindow {
         period_days: PERIOD_DAYS,
@@ -621,6 +809,48 @@ pub async fn delete_account(
                     artifact_id = %object_ref.artifact_id,
                     error = %e,
                     "failed to delete account artifact object"
+                );
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            object_count_deleted += 1;
+        }
+    }
+
+    let diagnostic_object_refs = diagnostic_logs::object_refs_for_account(&state.pool, &account.id)
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %e,
+                "failed to list account diagnostic log objects before delete"
+            );
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if !diagnostic_object_refs.is_empty() {
+        let storage_config = state
+            .config
+            .log_storage
+            .clone()
+            .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
+        let storage = ObjectStorage::new(storage_config);
+        for object_ref in &diagnostic_object_refs {
+            if !storage.key_belongs_to_account(&object_ref.object_key, &account.id) {
+                tracing::error!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    diagnostic_log_id_hash = %cue_core::account_id_hash_prefix(&object_ref.id),
+                    "refusing account delete because diagnostic log object key is outside account scope"
+                );
+                return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+        for object_ref in &diagnostic_object_refs {
+            storage.delete(&object_ref.object_key).await.map_err(|e| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    diagnostic_log_id_hash = %cue_core::account_id_hash_prefix(&object_ref.id),
+                    bytes = object_ref.bytes,
+                    sha256 = object_ref.sha256.as_deref().unwrap_or(""),
+                    error = %e,
+                    "failed to delete account diagnostic log object"
                 );
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
             })?;

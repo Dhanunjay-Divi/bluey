@@ -376,7 +376,7 @@
             <div class="preview-list">
               <div class="preview-item">
                 <div class="preview-icon">$</div>
-                <div><strong>Credits balance</strong><span>$30 reload adds $30 Bluey credits. No subscription is required.</span></div>
+                <div><strong>Credits balance</strong><span>$15 minimum reload. Every confirmed dollar becomes Bluey credits.</span></div>
               </div>
               <div class="preview-item">
                 <div class="preview-icon">AI</div>
@@ -431,7 +431,7 @@
                   <div>
                     <h2 id="balanceTitle">Balance</h2>
                     <p id="balanceHint">Ready for cloud answers, speech, screen, and saved sessions.</p>
-                    <p class="balance-map-hint" id="desktopBalanceHint">Overlay different? <button type="button" id="desktopBalanceHelpButton">Connect this desktop.</button></p>
+                    <p class="balance-map-hint" id="desktopBalanceHint">Desktop using another account? <button type="button" id="desktopBalanceHelpButton">Move it here.</button></p>
                   </div>
                   <strong id="balanceValue">$--</strong>
                 </div>
@@ -452,14 +452,14 @@
                     <div class="auto-reload-fields" aria-label="Auto Reload rule">
                       <label>
                         <span>When below</span>
-                        <input id="autoReloadThreshold" type="number" min="1" max="50" step="1" value="10" inputmode="decimal" />
+                        <input id="autoReloadThreshold" type="number" min="1" max="50" step="1" value="5" inputmode="decimal" />
                       </label>
                       <label>
                         <span>Add</span>
-                        <input id="autoReloadAmount" type="number" min="15" max="100" step="5" value="30" inputmode="decimal" />
+                        <input id="autoReloadAmount" type="number" min="15" max="500" step="5" value="15" inputmode="decimal" />
                       </label>
                     </div>
-                    <p class="auto-reload-rule" id="autoReloadRule">Below $10.00, add $30.00.</p>
+                    <p class="auto-reload-rule" id="autoReloadRule">Below $5.00, add $15.00.</p>
                     <p class="auto-reload-hint" id="autoReloadHint">Off until a card is saved in Billing.</p>
                   </div>
                 </div>
@@ -519,12 +519,12 @@
                 <div class="section-head">
                   <div>
                     <h3>Computers</h3>
-                    <p>Linked desktops and browsers.</p>
+                    <p>Host overlay desktops connected to this account.</p>
                   </div>
                 </div>
                 <div class="device-link-hint dashboard-device-link-hint" id="dashboardDeviceLinkHint" hidden></div>
                 <div class="device-summary-bar">
-                  <span id="linkedDeviceCount">No linked devices</span>
+                  <span id="linkedDeviceCount">No Bluey desktops</span>
                   <div class="account-actions-row">
                     <button class="account-button ghost compact" id="refreshDevicesButton" type="button">Refresh</button>
                     <button class="account-button danger compact" id="removeAllDevicesButton" type="button" disabled>Remove all</button>
@@ -590,9 +590,9 @@
                     <div>
                       <h3>Manual reload</h3>
                       <p>Checkout opens in a new tab. Payment adds the same amount to your Bluey balance.</p>
-                      <div class="credit-equation" aria-label="$30 reload gives $30 Bluey credits">
-                        <strong>$30 reload</strong>
-                        <span>= $30 Bluey credits</span>
+                      <div class="credit-equation" aria-label="$15 reload gives $15 Bluey credits">
+                        <strong>$15 reload</strong>
+                        <span>= $15 Bluey credits</span>
                       </div>
                     </div>
                     <div class="manual-reload-panel" aria-label="Manual credit reload">
@@ -600,12 +600,12 @@
                         <span>Credits to add</span>
                         <span class="manual-reload-input">
                           <span>$</span>
-                          <input id="manualReloadAmount" type="number" min="15" max="500" step="5" value="30" inputmode="decimal" />
+                          <input id="manualReloadAmount" type="number" min="15" max="500" step="5" value="15" inputmode="decimal" />
                         </span>
                       </label>
                       <button class="account-button primary" id="reloadButton" type="button">Add credits</button>
                     </div>
-                    <p class="manual-reload-rule" id="manualReloadRule">$30 recommended. $15 minimum.</p>
+                    <p class="manual-reload-rule" id="manualReloadRule">$15 minimum. Add more whenever you want.</p>
                   </div>
                   <div class="reload-card billing-payment-card" id="billingPaymentCard">
                     <div class="billing-payment-head">
@@ -931,7 +931,7 @@
             <input name="user_code" type="text" placeholder="connect code" autocomplete="one-time-code" spellcheck="false" aria-label="Bluey connect code">
             <button type="submit">Connect</button>
           </form>
-          <div class="connect-help">Have a Bluey desktop code? Enter it to connect your account.</div>
+          <div class="connect-help">Have a Bluey desktop code? Enter it to move that desktop to this account.</div>
           <div class="connect-status" id="productConnectStatus" aria-live="polite"></div>
           <div class="hero-note">native overlay · model routing · prepaid credits · sessions save only by choice</div>
         </section>
@@ -966,9 +966,9 @@
         <a href="/reload" class="plan featured">
           <div>
             <div class="plan-name">Add credits</div>
-            <div class="plan-detail">$30 becomes $30 Bluey credits for answers, speech, screen, and saved sessions.</div>
+            <div class="plan-detail">Start with $15 or add more for answers, speech, screen, and saved sessions.</div>
           </div>
-          <div class="plan-price"><strong>$30</strong><span>credits</span></div>
+          <div class="plan-price"><strong>$15</strong><span>min</span></div>
         </a>
         <span class="plan-sep">&middot;</span>
         <a href="mailto:hello@bluey.sh" class="plan">

@@ -38,12 +38,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let adminAbuseLoaded = false;
     let latestAccountForBilling = null;
     const AUTO_RELOAD_MIN_CENTS = 1500;
-    const AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 1000;
-    const AUTO_RELOAD_DEFAULT_AMOUNT_CENTS = 3000;
-    const LEGACY_AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 500;
-    const LEGACY_AUTO_RELOAD_DEFAULT_AMOUNT_CENTS = 1500;
+    const AUTO_RELOAD_MAX_CENTS = 50000;
+    const AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 500;
+    const AUTO_RELOAD_DEFAULT_AMOUNT_CENTS = 1500;
+    const LEGACY_AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 1000;
+    const LEGACY_AUTO_RELOAD_DEFAULT_AMOUNT_CENTS = 3000;
     const MANUAL_RELOAD_MIN_CENTS = 1500;
-    const MANUAL_RELOAD_AMOUNT_CENTS = 3000;
+    const MANUAL_RELOAD_AMOUNT_CENTS = 1500;
     let captchaConfigPromise = null;
     let captchaConfig = { provider: null, site_key: null };
     let signupTurnstileWidgetId = null;
@@ -1031,11 +1032,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.hidden = false;
         el.replaceChildren();
         const title = document.createElement('strong');
-        title.textContent = 'Connect this desktop';
+        title.textContent = 'Connect Bluey desktop';
         const body = document.createElement('span');
         body.textContent = accountToken()
-          ? 'Web balance is for this browser account. The overlay uses the desktop sign-in until you enter its code here.'
-          : 'Enter the code, then sign in to connect the desktop to the same account.';
+          ? 'Enter the code shown in the Bluey host overlay to sign that desktop into this account.'
+          : 'Enter the code shown in the Bluey host overlay, then sign in to connect that desktop.';
         const form = document.createElement('form');
         form.className = 'device-code-form';
         form.noValidate = true;
@@ -1056,7 +1057,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           event.preventDefault();
           const nextCode = normalizeDeviceCode(input.value);
           if (!nextCode) {
-            status.textContent = 'Enter the code shown in Bluey desktop.';
+            status.textContent = 'Enter the code shown in the Bluey host overlay.';
             input.focus();
             return;
           }
@@ -1078,7 +1079,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.replaceChildren();
         const title = document.createElement('strong');
         const approved = sessionStorage.getItem(`bluey_device_approved_${code}`) === '1';
-        title.textContent = approved ? 'Desktop Bluey is connected' : 'Finish connecting desktop Bluey';
+        title.textContent = approved ? 'Desktop Bluey is connected' : 'Finish moving desktop Bluey';
         const body = document.createElement('span');
         if (approved) {
           body.textContent = 'Return to Terminal or Bluey. This browser tab can stay open.';
@@ -1091,7 +1092,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         if (accountToken()) {
           body.append(
             codeEl,
-            `. This moves the desktop showing that code onto ${currentAccountEmail || 'the account signed into this browser'} so the dashboard and overlay balance match.`
+            `. This moves only that desktop to ${currentAccountEmail || 'this Bluey account'} so it uses this account's shared balance.`
           );
         } else {
           body.append(
@@ -1104,8 +1105,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           const button = document.createElement('button');
           button.type = 'button';
           button.className = 'account-button secondary compact';
-          button.textContent = 'Connect desktop';
-          button.setAttribute('aria-label', `Connect desktop Bluey using code ${code}`);
+          button.textContent = 'Move desktop';
+          button.setAttribute('aria-label', `Move desktop Bluey using code ${code}`);
           button.addEventListener('click', () => {
             button.disabled = true;
             button.textContent = 'Connecting...';
@@ -1114,7 +1115,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
               .then(() => loadAccount())
               .catch((error) => {
                 button.disabled = false;
-                button.textContent = 'Connect desktop';
+                button.textContent = 'Move desktop';
                 accountMessage(`Desktop link failed: ${error.message}`);
               });
             });
@@ -1143,7 +1144,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const storageKey = `bluey_device_approved_${code}`;
       if (sessionStorage.getItem(storageKey) === '1') return true;
       if (sessionStorage.getItem(`bluey_device_confirmed_${code}`) !== '1') {
-        accountMessage('Press Connect desktop to finish Bluey login.');
+        accountMessage('Press Move desktop to finish Bluey login.');
         return false;
       }
       accountMessage('Connecting this account to the desktop app...');
@@ -1686,13 +1687,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function readAutoReloadSettings() {
-      const threshold = dollarsToCents(document.getElementById('autoReloadThreshold')?.value || 10);
-      const amount = dollarsToCents(document.getElementById('autoReloadAmount')?.value || 30);
+      const threshold = dollarsToCents(document.getElementById('autoReloadThreshold')?.value || centsToDollars(AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS));
+      const amount = dollarsToCents(document.getElementById('autoReloadAmount')?.value || centsToDollars(AUTO_RELOAD_DEFAULT_AMOUNT_CENTS));
       if (!Number.isFinite(threshold) || !Number.isFinite(amount)) {
         throw new Error('Enter valid Auto Reload dollar amounts.');
       }
       if (amount < AUTO_RELOAD_MIN_CENTS) {
         throw new Error('Auto Reload amount must be at least $15.');
+      }
+      if (amount > AUTO_RELOAD_MAX_CENTS) {
+        throw new Error('Auto Reload amount can be at most $500.');
       }
       if (threshold < 100) {
         throw new Error('Auto Reload threshold must be at least $1.');
@@ -1885,18 +1889,89 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
     }
 
-    function deviceIconLabel(kind) {
-      const value = String(kind || '').toLowerCase();
-      if (value.includes('desktop') || value.includes('device')) return 'Bluey';
-      if (value.includes('browser')) return 'Web';
-      return 'Link';
+    function devicePlatform(device) {
+      const value = `${device?.platform || ''} ${device?.kind || ''} ${device?.label || ''}`.toLowerCase();
+      if (value.includes('macos') || value.includes('darwin') || value.includes('macbook') || value.includes('mac ')) return 'macos';
+      if (value.includes('windows') || value.includes('win32') || value.includes('dell')) return 'windows';
+      if (value.includes('linux')) return 'linux';
+      return 'desktop';
+    }
+
+    function isBrowserDevice(device) {
+      const platform = String(device?.platform || '').trim().toLowerCase();
+      const kind = String(device?.kind || '').trim().toLowerCase();
+      const label = String(device?.label || '').trim().toLowerCase();
+      const deviceId = String(device?.device_id || '').trim().toLowerCase();
+      // Browser-login rows are intentionally hidden until the account-session view is revisited.
+      return platform === 'web'
+        || platform === 'browser'
+        || kind === 'web'
+        || kind === 'browser'
+        || label.includes('browser session')
+        || label.includes('web session')
+        || deviceId.startsWith('web-')
+        || deviceId.startsWith('browser-');
+    }
+
+    function applySvgAttrs(node, attrs) {
+      const nextAttrs = { ...attrs };
+      if (!Object.prototype.hasOwnProperty.call(nextAttrs, 'fill')
+        && !Object.prototype.hasOwnProperty.call(nextAttrs, 'stroke')) {
+        nextAttrs.fill = 'currentColor';
+      }
+      Object.entries(nextAttrs).forEach(([key, value]) => node.setAttribute(key, value));
+    }
+
+    function appendSvgPath(svg, d, attrs = {}) {
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', d);
+      applySvgAttrs(path, attrs);
+      svg.append(path);
+    }
+
+    function appendSvgRect(svg, attrs) {
+      const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      applySvgAttrs(rect, attrs);
+      svg.append(rect);
+    }
+
+    function createDeviceIcon(device) {
+      const platform = devicePlatform(device);
+      const icon = document.createElement('div');
+      icon.className = 'device-icon';
+      icon.dataset.platform = platform;
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('viewBox', '0 0 24 24');
+      svg.setAttribute('aria-hidden', 'true');
+      svg.setAttribute('focusable', 'false');
+      if (platform === 'windows') {
+        appendSvgRect(svg, { x: '3.5', y: '4.5', width: '7.2', height: '6.6', rx: '.6' });
+        appendSvgRect(svg, { x: '12.2', y: '4.5', width: '8.3', height: '6.6', rx: '.6' });
+        appendSvgRect(svg, { x: '3.5', y: '12.7', width: '7.2', height: '6.8', rx: '.6' });
+        appendSvgRect(svg, { x: '12.2', y: '12.7', width: '8.3', height: '6.8', rx: '.6' });
+      } else if (platform === 'macos') {
+        appendSvgPath(svg, 'M16.7 12.3c0-2.3 1.9-3.4 2-3.5-1.1-1.6-2.7-1.8-3.3-1.9-1.4-.1-2.7.8-3.4.8-.7 0-1.8-.8-3-.8-1.5 0-2.9.9-3.7 2.3-1.6 2.8-.4 6.9 1.1 9.1.8 1.1 1.7 2.3 2.9 2.3 1.2 0 1.6-.7 3-.7s1.8.7 3 .7c1.3 0 2.1-1.1 2.8-2.2.9-1.3 1.2-2.5 1.2-2.6 0 0-2.5-1-2.6-3.5z');
+        appendSvgPath(svg, 'M14.5 5.5c.6-.7 1-1.7.9-2.7-.9.1-1.9.6-2.5 1.3-.6.7-1 1.6-.9 2.6.9.1 1.9-.5 2.5-1.2z');
+      } else if (platform === 'linux') {
+        const strokeAttrs = { fill: 'none', stroke: 'currentColor', 'stroke-width': '1.9', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
+        appendSvgPath(svg, 'M4.5 6.5A2.5 2.5 0 0 1 7 4h10a2.5 2.5 0 0 1 2.5 2.5v11A2.5 2.5 0 0 1 17 20H7a2.5 2.5 0 0 1-2.5-2.5v-11z', strokeAttrs);
+        appendSvgPath(svg, 'M8.2 9.1l3.2 2.9-3.2 2.9', strokeAttrs);
+        appendSvgPath(svg, 'M12.4 15h4', strokeAttrs);
+      } else {
+        const strokeAttrs = { fill: 'none', stroke: 'currentColor', 'stroke-width': '1.9', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
+        appendSvgRect(svg, { x: '4.5', y: '5.5', width: '15', height: '10', rx: '1.8', ...strokeAttrs });
+        appendSvgPath(svg, 'M9 19h6', strokeAttrs);
+        appendSvgPath(svg, 'M12 15.5V19', strokeAttrs);
+      }
+      icon.append(svg);
+      return icon;
     }
 
     function deviceStatus(device) {
-      const lastValue = device.last_used_at || device.created_at || '';
+      if (device?.live) return 'Active';
+      const lastValue = device?.last_heartbeat_at || device?.last_used_at || device?.created_at || '';
       const lastTime = lastValue ? new Date(String(lastValue).replace(' ', 'T')).getTime() : 0;
-      const isRecent = lastTime && Date.now() - lastTime < 1000 * 60 * 60 * 24;
-      return isRecent ? 'Active' : 'Linked';
+      return lastTime ? 'Linked' : 'Offline';
     }
 
     function renderLinkedDevices(payload, message = '') {
@@ -1904,35 +1979,34 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!list) return;
       list.replaceChildren();
       const devices = Array.isArray(payload?.devices) ? payload.devices : [];
+      const computers = devices.filter((device) => !isBrowserDevice(device));
       const countLabel = document.getElementById('linkedDeviceCount');
       const removeAllButton = document.getElementById('removeAllDevicesButton');
       if (countLabel) {
-        countLabel.textContent = devices.length === 0
-          ? 'No linked devices'
-          : devices.length === 1
-          ? '1 linked device'
-          : `${devices.length} linked devices`;
+        countLabel.textContent = computers.length === 0
+          ? 'No Bluey desktops'
+          : computers.length === 1
+          ? '1 Bluey desktop'
+          : `${computers.length} Bluey desktops`;
       }
       if (removeAllButton) {
-        removeAllButton.disabled = devices.length === 0;
+        removeAllButton.disabled = computers.length === 0;
       }
-      if (!devices.length) {
+      if (!computers.length) {
         const empty = document.createElement('div');
         empty.className = 'session-empty';
-        empty.textContent = message || 'No linked devices yet. Sign in from Bluey desktop to connect this machine.';
+        empty.textContent = message || 'No Bluey desktop connected yet. Open the host overlay and enter its code above.';
         list.append(empty);
         return;
       }
 
-      for (const device of devices) {
+      for (const device of computers) {
         const row = document.createElement('article');
         row.className = 'device-row';
 
         const body = document.createElement('div');
         body.className = 'device-main';
-        const icon = document.createElement('div');
-        icon.className = 'device-icon';
-        icon.textContent = deviceIconLabel(device.kind);
+        const icon = createDeviceIcon(device);
         const copy = document.createElement('div');
         const title = document.createElement('strong');
         title.className = 'device-title';
@@ -1945,8 +2019,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
         const meta = document.createElement('span');
         meta.className = 'device-meta';
-        const lastSeen = device.last_used_at
-          ? `Last active ${formatDeviceTime(device.last_used_at)}`
+        const lastSeenAt = device.last_heartbeat_at || device.last_used_at;
+        const lastSeen = lastSeenAt
+          ? `Last seen ${formatDeviceTime(lastSeenAt)}`
           : `Linked ${formatDeviceTime(device.created_at)}`;
         meta.textContent = lastSeen;
         copy.append(title, meta);
@@ -1975,7 +2050,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         method: 'DELETE',
       });
       renderLinkedDevices(devices);
-      accountMessage(`${label || 'Device'} removed.`);
+      accountMessage(`${label || 'Computer'} removed. Bluey will sign out on that desktop.`);
       return devices;
     }
 
@@ -1984,7 +2059,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         method: 'DELETE',
       });
       renderLinkedDevices(devices);
-      accountMessage('Desktop and browser access removed.');
+      accountMessage('Linked computers removed. Bluey will sign out on those desktops.');
       return devices;
     }
 
@@ -2312,7 +2387,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       accountMessage('Loading account...');
       renderCloudSessionsLoading();
       const linkedDevicesPromise = loadLinkedDevices().catch((error) => {
-        renderLinkedDevices({ devices: [] }, `Could not load linked devices: ${error.message}`);
+        renderLinkedDevices({ devices: [] }, `Could not load computers: ${error.message}`);
         return null;
       });
       const sessionsPromise = loadCloudSessions().then(async (sessions) => {
@@ -2643,9 +2718,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         openSquareCardSetup().catch((error) => accountMessage(error.message));
       });
       document.getElementById('refreshDevicesButton')?.addEventListener('click', () => {
-        renderLinkedDevices({ devices: [] }, 'Loading linked devices...');
+        renderLinkedDevices({ devices: [] }, 'Loading computers...');
         loadLinkedDevices().catch((error) => {
-          renderLinkedDevices({ devices: [] }, `Could not load linked devices: ${error.message}`);
+          renderLinkedDevices({ devices: [] }, `Could not load computers: ${error.message}`);
         });
       });
       document.getElementById('refreshAdminAbuseButton')?.addEventListener('click', () => {
@@ -2656,7 +2731,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('removeAllDevicesButton')?.addEventListener('click', () => {
         const button = document.getElementById('removeAllDevicesButton');
         if (!button || button.disabled) return;
-        if (!window.confirm('Remove all desktop and browser links for this account?')) return;
+        if (!window.confirm('Remove all linked computers and sign Bluey out on those desktops?')) return;
         const previous = button.textContent;
         button.disabled = true;
         button.textContent = 'Removing...';
@@ -2674,6 +2749,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('linkedDevicesList')?.addEventListener('click', (event) => {
         const button = event.target.closest('button[data-device-id]');
         if (!button) return;
+        const label = button.dataset.deviceLabel || 'this computer';
+        if (!window.confirm(`Remove ${label} and sign Bluey out on that desktop?`)) return;
         const previous = button.textContent;
         button.disabled = true;
         button.textContent = 'Removing...';

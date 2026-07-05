@@ -900,16 +900,8 @@ fn openai_stream_usage_or_estimate(
     output_chars: usize,
     fallback_input_tokens: Option<i64>,
 ) -> Result<OpenAiUsage> {
-    if !seen_done && output_chars == 0 {
-        return Err(anyhow!("{provider} stream ended before [DONE]"));
-    }
     if !seen_done {
-        tracing::warn!(
-            provider,
-            model,
-            output_chars,
-            "OpenAI-compatible stream ended without [DONE] after output; using token estimate"
-        );
+        return Err(anyhow!("{provider} stream ended before [DONE]"));
     }
     Ok(final_usage.unwrap_or_else(|| {
         tracing::warn!(
@@ -932,16 +924,8 @@ fn anthropic_stream_usage_or_estimate(
     output_chars: usize,
     fallback_input: i64,
 ) -> Result<(i64, i64)> {
-    if !seen_stop && output_chars == 0 {
-        return Err(anyhow!("anthropic stream ended before message_stop"));
-    }
     if !seen_stop {
-        tracing::warn!(
-            provider = "anthropic",
-            model,
-            output_chars,
-            "Anthropic stream ended without message_stop after output; using token estimate"
-        );
+        return Err(anyhow!("anthropic stream ended before message_stop"));
     }
     let output_tokens = output_tokens.unwrap_or_else(|| {
         tracing::warn!(
@@ -2545,7 +2529,10 @@ mod tests {
             ("anthropic", "claude-sonnet-4-6"),
         );
         assert_eq!(resolve_route("deep"), ("anthropic", "claude-opus-4-8"),);
-        assert_eq!(resolve_route("vision"), ("openai", "gpt-5.5"));
+        assert_eq!(
+            resolve_route("vision"),
+            ("gemini", "gemini-3-flash-preview")
+        );
         assert_eq!(resolve_route("local"), ("unsupported", "local"));
         // Unknown → balanced default.
         assert_eq!(resolve_route("???"), ("anthropic", "claude-sonnet-4-6"),);
@@ -2843,12 +2830,11 @@ mod tests {
     }
 
     #[test]
-    fn openai_stream_without_done_after_text_uses_estimated_usage() {
-        let usage =
-            openai_stream_usage_or_estimate("zai", "glm-5.2", false, None, 18, Some(12)).unwrap();
-
-        assert_eq!(usage.prompt_tokens, 12);
-        assert_eq!(usage.completion_tokens, 6);
+    fn openai_stream_without_done_after_text_is_error() {
+        match openai_stream_usage_or_estimate("zai", "glm-5.2", false, None, 18, Some(12)) {
+            Ok(_) => panic!("expected missing DONE error"),
+            Err(err) => assert!(err.to_string().contains("before [DONE]")),
+        }
     }
 
     #[test]
@@ -2883,13 +2869,12 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_stream_without_stop_after_text_uses_estimated_usage() {
-        let (input_tokens, output_tokens) =
+    fn anthropic_stream_without_stop_after_text_is_error() {
+        let err =
             anthropic_stream_usage_or_estimate("claude-sonnet-4-6", false, Some(9), None, 21, 7)
-                .unwrap();
+                .unwrap_err();
 
-        assert_eq!(input_tokens, 9);
-        assert_eq!(output_tokens, 7);
+        assert!(err.to_string().contains("message_stop"));
     }
 
     #[test]

@@ -68,7 +68,7 @@ CREATE TABLE wallets (
   workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id),
   balance_cents BIGINT NOT NULL DEFAULT 0,
   reserved_cents BIGINT NOT NULL DEFAULT 0,
-  trial_seconds_remaining BIGINT NOT NULL DEFAULT 600,
+  trial_seconds_remaining BIGINT NOT NULL DEFAULT 900,
   auto_topup_enabled BOOLEAN NOT NULL DEFAULT false,
   auto_topup_threshold_cents BIGINT NOT NULL DEFAULT 500,
   auto_topup_amount_cents BIGINT NOT NULL DEFAULT 1500,
@@ -342,6 +342,24 @@ CREATE TABLE audit_log (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE diagnostic_log_chunks (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  meeting_id TEXT REFERENCES meetings(id) ON DELETE SET NULL,
+  session_id TEXT,
+  session_code TEXT,
+  kind TEXT NOT NULL,
+  storage TEXT NOT NULL CHECK (storage IN ('r2', 's3', 'local', 'filesystem')),
+  object_key TEXT,
+  local_path TEXT,
+  byte_size BIGINT NOT NULL DEFAULT 0,
+  sha256 TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE export_requests (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id),
@@ -370,6 +388,12 @@ CREATE INDEX idx_chunks_workspace_meeting ON memory_chunks (workspace_id, meetin
 CREATE INDEX idx_chunks_workspace_expiry ON memory_chunks (workspace_id, expires_at);
 CREATE INDEX idx_answer_runs_workspace_created ON answer_runs (workspace_id, created_at DESC);
 CREATE INDEX idx_audit_workspace_created ON audit_log (workspace_id, created_at DESC);
+CREATE INDEX idx_diagnostic_logs_workspace_created
+  ON diagnostic_log_chunks (workspace_id, created_at DESC);
+CREATE INDEX idx_diagnostic_logs_meeting_created
+  ON diagnostic_log_chunks (workspace_id, meeting_id, created_at DESC);
+CREATE INDEX idx_diagnostic_logs_expires
+  ON diagnostic_log_chunks (expires_at);
 
 -- Add after embedding dimension and provider are finalized:
 -- CREATE INDEX idx_chunks_embedding ON memory_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);

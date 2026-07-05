@@ -44,6 +44,8 @@ pub struct Config {
     pub require_turnstile: bool,
     /// Optional S3-compatible object storage for synced document/image bytes.
     pub object_storage: Option<ObjectStorageConfig>,
+    /// Optional S3-compatible object storage for diagnostic log chunks.
+    pub log_storage: Option<ObjectStorageConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -336,6 +338,7 @@ impl Config {
         let turnstile_secret_key = env_any(&["BLUEY_TURNSTILE_SECRET_KEY", "TURNSTILE_SECRET_KEY"]);
         let require_turnstile = env_bool("BLUEY_REQUIRE_TURNSTILE").unwrap_or(false);
         let object_storage = object_storage_from_env();
+        let log_storage = log_storage_from_env();
 
         Ok(Self {
             port,
@@ -355,6 +358,7 @@ impl Config {
             turnstile_secret_key,
             require_turnstile,
             object_storage,
+            log_storage,
         })
     }
 
@@ -491,6 +495,83 @@ fn object_storage_from_env() -> Option<ObjectStorageConfig> {
         retention_days,
         max_object_bytes,
     })
+}
+
+fn log_storage_from_env() -> Option<ObjectStorageConfig> {
+    let storage = std::env::var("BLUEY_LOG_STORAGE")
+        .unwrap_or_else(|_| "".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if !storage.is_empty() && storage != "r2" && storage != "s3" {
+        return None;
+    }
+
+    let endpoint_url = env_any(&[
+        "BLUEY_LOG_R2_ENDPOINT_URL",
+        "BLUEY_LOG_R2_ENDPOINT",
+        "BLUEY_OBJECT_ENDPOINT_URL",
+        "BLUEY_R2_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_S3",
+    ])?;
+    let bucket = env_any(&[
+        "BLUEY_LOG_R2_BUCKET",
+        "BLUEY_OBJECT_BUCKET",
+        "BLUEY_R2_BUCKET",
+        "AWS_S3_BUCKET",
+    ])?;
+    let access_key_id = env_any(&[
+        "BLUEY_LOG_R2_ACCESS_KEY_ID",
+        "BLUEY_OBJECT_ACCESS_KEY_ID",
+        "BLUEY_R2_ACCESS_KEY_ID",
+        "AWS_ACCESS_KEY_ID",
+    ])?;
+    let secret_access_key = env_any(&[
+        "BLUEY_LOG_R2_SECRET_ACCESS_KEY",
+        "BLUEY_OBJECT_SECRET_ACCESS_KEY",
+        "BLUEY_R2_SECRET_ACCESS_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+    ])?;
+    let region = std::env::var("BLUEY_LOG_R2_REGION")
+        .or_else(|_| std::env::var("BLUEY_OBJECT_REGION"))
+        .or_else(|_| std::env::var("BLUEY_R2_REGION"))
+        .or_else(|_| std::env::var("AWS_REGION"))
+        .unwrap_or_else(|_| "auto".to_string());
+    let raw_prefix =
+        std::env::var("BLUEY_LOG_STORAGE_PREFIX").unwrap_or_else(|_| "prod".to_string());
+    let key_prefix = log_storage_key_prefix(&raw_prefix);
+    let retention_days = env_positive_i64("BLUEY_UPLOAD_LOG_RETENTION_DAYS")
+        .or_else(|| env_positive_i64("BLUEY_LOG_RETENTION_DAYS"))
+        .unwrap_or(180)
+        .clamp(1, 180);
+    let max_object_bytes = std::env::var("BLUEY_UPLOAD_LOG_MAX_BYTES")
+        .or_else(|_| std::env::var("BLUEY_LOG_OBJECT_MAX_BYTES"))
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32 * 1024 * 1024);
+
+    Some(ObjectStorageConfig {
+        endpoint_url,
+        bucket,
+        access_key_id,
+        secret_access_key,
+        region,
+        key_prefix,
+        retention_days,
+        max_object_bytes,
+    })
+}
+
+fn log_storage_key_prefix(raw: &str) -> String {
+    let prefix = raw.trim_matches('/').trim();
+    if prefix.is_empty() {
+        return "logs".to_string();
+    }
+    if prefix == "logs" || prefix.ends_with("/logs") || prefix.contains("/logs/") {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/logs")
+    }
 }
 
 fn upstream_spend_guard_from_env() -> Option<UpstreamSpendGuard> {
@@ -778,6 +859,7 @@ mod tests {
             turnstile_secret_key: None,
             require_turnstile: false,
             object_storage: None,
+            log_storage: None,
         };
 
         let square = cfg.square_config();
@@ -841,6 +923,7 @@ mod tests {
             turnstile_secret_key: None,
             require_turnstile: false,
             object_storage: None,
+            log_storage: None,
         };
 
         assert!(cfg.is_admin_email("owner@bluey.sh"));

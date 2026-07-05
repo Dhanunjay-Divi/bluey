@@ -24,6 +24,12 @@ pub struct TrialGrantDecision {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrialGrantReservation {
+    Reserved { grant_id: String },
+    Denied { reason: String },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TrialAbuseEventSummary {
     pub created_at: String,
@@ -147,6 +153,74 @@ pub fn record_grant(
             "granted",
             None,
         )
+    })
+}
+
+pub fn reserve_trial_grant(
+    pool: &DbPool,
+    cfg: TrialAbuseConfig,
+    signals: &TrialAbuseSignals,
+    granted_seconds: i64,
+) -> Result<TrialGrantReservation> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => reserve_trial_grant_sqlite(pool, cfg, signals, granted_seconds),
+        DbPool::Postgres(_) => reserve_trial_grant_pg(pool, cfg, signals, granted_seconds),
+    })
+}
+
+pub fn attach_grant_account(pool: &DbPool, grant_id: &str, account_id: &str) -> Result<()> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.execute(
+                "UPDATE trial_grants
+                    SET account_id = ?1
+                  WHERE id = ?2
+                    AND decision = 'granted'
+                    AND account_id IS NULL",
+                params![account_id, grant_id],
+            )?;
+            Ok(())
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.execute(
+                "UPDATE trial_grants
+                    SET account_id = $1
+                  WHERE id = $2
+                    AND decision = 'granted'
+                    AND account_id IS NULL",
+                &[&account_id, &grant_id],
+            )?;
+            Ok(())
+        }
+    })
+}
+
+pub fn release_reserved_grant(pool: &DbPool, grant_id: &str) -> Result<()> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.execute(
+                "DELETE FROM trial_grants
+                  WHERE id = ?1
+                    AND decision = 'granted'
+                    AND account_id IS NULL",
+                params![grant_id],
+            )?;
+            Ok(())
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.execute(
+                "DELETE FROM trial_grants
+                  WHERE id = $1
+                    AND decision = 'granted'
+                    AND account_id IS NULL",
+                &[&grant_id],
+            )?;
+            Ok(())
+        }
     })
 }
 
@@ -387,6 +461,85 @@ fn record_denial(pool: &DbPool, signals: &TrialAbuseSignals, reason: &str) -> Re
     insert_abuse_event(pool, None, signals, "trial_denied", 2, Some(reason))
 }
 
+fn reserve_trial_grant_sqlite(
+    pool: &DbPool,
+    cfg: TrialAbuseConfig,
+    signals: &TrialAbuseSignals,
+    granted_seconds: i64,
+) -> Result<TrialGrantReservation> {
+    let conn = pool.get()?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if let Some(reason) = evaluate_sqlite(&conn, cfg, signals)? {
+            insert_trial_grant_sqlite(&conn, None, signals, 0, "denied", Some(&reason), None)?;
+            insert_abuse_event_sqlite(&conn, None, signals, "trial_denied", 2, Some(&reason))?;
+            return Ok(TrialGrantReservation::Denied { reason });
+        }
+        let grant_id = uuid::Uuid::new_v4().to_string();
+        insert_trial_grant_sqlite(
+            &conn,
+            None,
+            signals,
+            granted_seconds.max(0),
+            "granted",
+            None,
+            Some(&grant_id),
+        )?;
+        Ok(TrialGrantReservation::Reserved { grant_id })
+    })();
+
+    match result {
+        Ok(reservation) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(reservation)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn reserve_trial_grant_pg(
+    pool: &DbPool,
+    cfg: TrialAbuseConfig,
+    signals: &TrialAbuseSignals,
+    granted_seconds: i64,
+) -> Result<TrialGrantReservation> {
+    let mut conn = pool.get_pg()?;
+    conn.batch_execute("BEGIN")?;
+    let result = (|| {
+        conn.batch_execute("LOCK TABLE trial_grants IN SHARE ROW EXCLUSIVE MODE")?;
+        if let Some(reason) = evaluate_pg(&mut conn, cfg, signals)? {
+            insert_trial_grant_pg(&mut conn, None, signals, 0, "denied", Some(&reason), None)?;
+            insert_abuse_event_pg(&mut conn, None, signals, "trial_denied", 2, Some(&reason))?;
+            return Ok(TrialGrantReservation::Denied { reason });
+        }
+        let grant_id = uuid::Uuid::new_v4().to_string();
+        insert_trial_grant_pg(
+            &mut conn,
+            None,
+            signals,
+            granted_seconds.max(0),
+            "granted",
+            None,
+            Some(&grant_id),
+        )?;
+        Ok(TrialGrantReservation::Reserved { grant_id })
+    })();
+
+    match result {
+        Ok(reservation) => {
+            conn.batch_execute("COMMIT")?;
+            Ok(reservation)
+        }
+        Err(error) => {
+            let _ = conn.batch_execute("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn insert_trial_grant(
     pool: &DbPool,
     account_id: Option<&str>,
@@ -395,53 +548,110 @@ fn insert_trial_grant(
     decision: &str,
     reason: Option<&str>,
 ) -> Result<()> {
-    let id = uuid::Uuid::new_v4().to_string();
     match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
-            conn.execute(
-                "INSERT INTO trial_grants
-                    (id, account_id, email_hash, email_domain_hash, ip_hash, device_hash,
-                     user_agent_hash, ip_user_agent_hash, granted_seconds, decision, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    id,
-                    account_id,
-                    &signals.email_hash,
-                    &signals.email_domain_hash,
-                    &signals.ip_hash,
-                    &signals.device_hash,
-                    &signals.user_agent_hash,
-                    &signals.ip_user_agent_hash,
-                    granted_seconds,
-                    decision,
-                    reason
-                ],
+            insert_trial_grant_sqlite(
+                &conn,
+                account_id,
+                signals,
+                granted_seconds,
+                decision,
+                reason,
+                None,
             )?;
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            conn.execute(
-                "INSERT INTO trial_grants
-                    (id, account_id, email_hash, email_domain_hash, ip_hash, device_hash,
-                     user_agent_hash, ip_user_agent_hash, granted_seconds, decision, reason)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-                &[
-                    &id,
-                    &account_id,
-                    &signals.email_hash,
-                    &signals.email_domain_hash,
-                    &signals.ip_hash,
-                    &signals.device_hash,
-                    &signals.user_agent_hash,
-                    &signals.ip_user_agent_hash,
-                    &granted_seconds,
-                    &decision,
-                    &reason,
-                ],
+            insert_trial_grant_pg(
+                &mut conn,
+                account_id,
+                signals,
+                granted_seconds,
+                decision,
+                reason,
+                None,
             )?;
         }
     }
+    Ok(())
+}
+
+fn insert_trial_grant_sqlite(
+    conn: &rusqlite::Connection,
+    account_id: Option<&str>,
+    signals: &TrialAbuseSignals,
+    granted_seconds: i64,
+    decision: &str,
+    reason: Option<&str>,
+    id: Option<&str>,
+) -> Result<()> {
+    let generated_id;
+    let id = match id {
+        Some(id) => id,
+        None => {
+            generated_id = uuid::Uuid::new_v4().to_string();
+            &generated_id
+        }
+    };
+    conn.execute(
+        "INSERT INTO trial_grants
+            (id, account_id, email_hash, email_domain_hash, ip_hash, device_hash,
+             user_agent_hash, ip_user_agent_hash, granted_seconds, decision, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            id,
+            account_id,
+            &signals.email_hash,
+            &signals.email_domain_hash,
+            &signals.ip_hash,
+            &signals.device_hash,
+            &signals.user_agent_hash,
+            &signals.ip_user_agent_hash,
+            granted_seconds,
+            decision,
+            reason
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_trial_grant_pg(
+    conn: &mut postgres::Client,
+    account_id: Option<&str>,
+    signals: &TrialAbuseSignals,
+    granted_seconds: i64,
+    decision: &str,
+    reason: Option<&str>,
+    id: Option<&str>,
+) -> Result<()> {
+    let generated_id;
+    let id = match id {
+        Some(id) => id,
+        None => {
+            generated_id = uuid::Uuid::new_v4().to_string();
+            &generated_id
+        }
+    };
+    conn.execute(
+        "INSERT INTO trial_grants
+            (id, account_id, email_hash, email_domain_hash, ip_hash, device_hash,
+             user_agent_hash, ip_user_agent_hash, granted_seconds, decision, reason)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        &[
+            &id,
+            &account_id,
+            &signals.email_hash,
+            &signals.email_domain_hash,
+            &signals.ip_hash,
+            &signals.device_hash,
+            &signals.user_agent_hash,
+            &signals.ip_user_agent_hash,
+            &granted_seconds,
+            &decision,
+            &reason,
+        ],
+    )?;
     Ok(())
 }
 
@@ -453,53 +663,78 @@ fn insert_abuse_event(
     severity: i64,
     reason: Option<&str>,
 ) -> Result<()> {
-    let id = uuid::Uuid::new_v4().to_string();
     match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
-            conn.execute(
-                "INSERT INTO trial_abuse_events
-                    (id, account_id, email_hash, email_domain_hash, ip_hash, device_hash,
-                     user_agent_hash, ip_user_agent_hash, event_type, severity, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    id,
-                    account_id,
-                    &signals.email_hash,
-                    &signals.email_domain_hash,
-                    &signals.ip_hash,
-                    &signals.device_hash,
-                    &signals.user_agent_hash,
-                    &signals.ip_user_agent_hash,
-                    event_type,
-                    severity.max(1),
-                    reason
-                ],
-            )?;
+            insert_abuse_event_sqlite(&conn, account_id, signals, event_type, severity, reason)?;
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            conn.execute(
-                "INSERT INTO trial_abuse_events
-                    (id, account_id, email_hash, email_domain_hash, ip_hash, device_hash,
-                     user_agent_hash, ip_user_agent_hash, event_type, severity, reason)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-                &[
-                    &id,
-                    &account_id,
-                    &signals.email_hash,
-                    &signals.email_domain_hash,
-                    &signals.ip_hash,
-                    &signals.device_hash,
-                    &signals.user_agent_hash,
-                    &signals.ip_user_agent_hash,
-                    &event_type,
-                    &severity.max(1),
-                    &reason,
-                ],
-            )?;
+            insert_abuse_event_pg(&mut conn, account_id, signals, event_type, severity, reason)?;
         }
     }
+    Ok(())
+}
+
+fn insert_abuse_event_sqlite(
+    conn: &rusqlite::Connection,
+    account_id: Option<&str>,
+    signals: &TrialAbuseSignals,
+    event_type: &str,
+    severity: i64,
+    reason: Option<&str>,
+) -> Result<()> {
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO trial_abuse_events
+            (id, account_id, email_hash, email_domain_hash, ip_hash, device_hash,
+             user_agent_hash, ip_user_agent_hash, event_type, severity, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            id,
+            account_id,
+            &signals.email_hash,
+            &signals.email_domain_hash,
+            &signals.ip_hash,
+            &signals.device_hash,
+            &signals.user_agent_hash,
+            &signals.ip_user_agent_hash,
+            event_type,
+            severity.max(1),
+            reason
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_abuse_event_pg(
+    conn: &mut postgres::Client,
+    account_id: Option<&str>,
+    signals: &TrialAbuseSignals,
+    event_type: &str,
+    severity: i64,
+    reason: Option<&str>,
+) -> Result<()> {
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO trial_abuse_events
+            (id, account_id, email_hash, email_domain_hash, ip_hash, device_hash,
+             user_agent_hash, ip_user_agent_hash, event_type, severity, reason)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        &[
+            &id,
+            &account_id,
+            &signals.email_hash,
+            &signals.email_domain_hash,
+            &signals.ip_hash,
+            &signals.device_hash,
+            &signals.user_agent_hash,
+            &signals.ip_user_agent_hash,
+            &event_type,
+            &severity.max(1),
+            &reason,
+        ],
+    )?;
     Ok(())
 }
 
@@ -588,7 +823,7 @@ mod tests {
         let account_id = crate::db::accounts::Account::create(&pool, "a@example.com", "stub")
             .unwrap()
             .id;
-        record_grant(&pool, &account_id, &signals, 600).unwrap();
+        record_grant(&pool, &account_id, &signals, 900).unwrap();
 
         let second = TrialAbuseSignals::from_raw(
             "b@example.com",
@@ -602,6 +837,52 @@ mod tests {
             decision.reason.as_deref(),
             Some("device_trial_already_used")
         );
+    }
+
+    #[test]
+    fn reserved_trial_blocks_same_device_before_account_attach() {
+        let pool = pool();
+        let cfg = TrialAbuseConfig::default();
+        let first = TrialAbuseSignals::from_raw(
+            "a@example.com",
+            Some("198.51.100.10"),
+            Some("device-1"),
+            Some("ua"),
+        );
+        let grant_id = match reserve_trial_grant(&pool, cfg, &first, 900).unwrap() {
+            TrialGrantReservation::Reserved { grant_id } => grant_id,
+            TrialGrantReservation::Denied { reason } => {
+                panic!("first trial should reserve, denied with {reason}")
+            }
+        };
+
+        let second = TrialAbuseSignals::from_raw(
+            "b@example.com",
+            Some("198.51.100.11"),
+            Some("device-1"),
+            Some("ua"),
+        );
+        let decision = evaluate_trial_grant(&pool, cfg, &second).unwrap();
+        assert!(!decision.allowed);
+        assert_eq!(
+            decision.reason.as_deref(),
+            Some("device_trial_already_used")
+        );
+
+        let account_id = crate::db::accounts::Account::create(&pool, "a@example.com", "stub")
+            .unwrap()
+            .id;
+        attach_grant_account(&pool, &grant_id, &account_id).unwrap();
+
+        let conn = pool.get().unwrap();
+        let stored_account_id: String = conn
+            .query_row(
+                "SELECT account_id FROM trial_grants WHERE id = ?1",
+                params![grant_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_account_id, account_id);
     }
 
     #[test]
@@ -624,7 +905,7 @@ mod tests {
         let account_id = crate::db::accounts::Account::create(&pool, "a@example.com", "stub")
             .unwrap()
             .id;
-        record_grant(&pool, &account_id, &first, 600).unwrap();
+        record_grant(&pool, &account_id, &first, 900).unwrap();
 
         let second = TrialAbuseSignals::from_raw(
             "b@example.com",

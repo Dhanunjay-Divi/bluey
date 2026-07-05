@@ -265,7 +265,7 @@ TOKEN=$(curl -fsS -X POST https://bluey.sh/auth/signup \
 
 # 2. Verify trial seconds initialised.
 curl -fsS https://bluey.sh/account/me -H "Authorization: Bearer $TOKEN" | jq '.trial_seconds_remaining'
-# Expect: 600
+# Expect: 900
 
 # 3. Reload via Checkout.
 CHECKOUT_URL=$(curl -fsS -X POST https://bluey.sh/billing/checkout \
