@@ -61,7 +61,18 @@ Deploy both together:
 - production static website from `/Users/uno/Downloads/cue`
 - live Caddy CSP with Cloudflare Turnstile allowances
 
-Post-deploy smoke should confirm:
+## Live Deployment Result
+
+Deployed on July 5, 2026:
+
+- API binary built from commit `668ce615b7a5addc6efcb7ec4b1db404f61c6942`.
+- Production `/health` reports commit `668ce615b7a5addc6efcb7ec4b1db404f61c6942`.
+- Static website deployed from commit `f398bb0b0737d266e14fa5404f2d78fc120c8440`.
+- Live Caddy CSP now allows `https://challenges.cloudflare.com` in `script-src`, `connect-src`, and `frame-src`.
+- Live `POST /auth/trial/start` returned `201` and created a temporary `@try.bluey.sh` account with `900` trial seconds.
+- Production API warning log check showed no warning-level entries after deployment.
+
+Post-deploy smoke confirmed:
 
 - `/auth/trial/start` no longer returns `404`
 - Try Us creates a temporary account or gives a clear trial-limit/human-check message
