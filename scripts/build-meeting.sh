@@ -96,19 +96,78 @@ cp native/macos/cue-picker/.build/bluey-file-picker-macos "$DIST/bluey-file-pick
 cp native/macos/cue-picker/.build/cue-file-picker-macos "$DIST/cue-file-picker-macos"
 cp -R native/macos/cue-picker/.build/BlueyFilePicker.app "$DIST/BlueyFilePicker.app"
 
-# Diarization build: the daemon links Homebrew's libopenblas via an absolute
-# path. Stage the dylib next to the daemon and rewrite the load command to
-# @loader_path so it runs without Homebrew present.
+# Diarization build: the daemon links Homebrew's libopenblas, which TRANSITIVELY
+# depends on more Homebrew dylibs (libgfortran, libomp, libquadmath, libgcc_s from
+# gcc). A fresh Mac has NONE of them, so bundling only libopenblas made the daemon
+# crash at load ("Library not loaded: .../libgfortran.5.dylib"). We must vendor the
+# ENTIRE recursive dependency closure next to the daemon with every inter-dylib
+# reference rewritten to @loader_path.
+#
+# dylibbundler (the standard tool for exactly this — auriamg/macdylibbundler) walks
+# the closure, copies each dylib in, rewrites its id + every consumer's reference,
+# and ad-hoc re-signs. We point its inner path at @loader_path/ because our layout
+# is flat (dylibs sit BESIDE the daemon in bin/, not in ../libs/). We fix bluey-
+# daemon first, then reuse its already-bundled dylibs when fixing cue-daemon.
 if [ "${BLUEY_DIARIZE_BUILD:-0}" = "1" ]; then
-  OPENBLAS_SRC="$(otool -L "$DIST/bluey-daemon" | awk '/libopenblas/{print $1; exit}')"
-  if [ -n "$OPENBLAS_SRC" ] && [ -f "$OPENBLAS_SRC" ]; then
-    OPENBLAS_BASE="$(basename "$OPENBLAS_SRC")"
-    cp "$OPENBLAS_SRC" "$DIST/$OPENBLAS_BASE"
-    for daemon_bin in "$DIST/bluey-daemon" "$DIST/cue-daemon"; do
-      install_name_tool -change "$OPENBLAS_SRC" "@loader_path/$OPENBLAS_BASE" "$daemon_bin"
-    done
-    echo "  staged $OPENBLAS_BASE for diarization (rpath fixed to @loader_path)"
+  if ! command -v dylibbundler >/dev/null 2>&1; then
+    echo "  ERROR: dylibbundler not found — install it: brew install dylibbundler" >&2
+    echo "  (required to vendor the OpenBLAS/gfortran/omp dylib closure for diarization)" >&2
+    exit 1
   fi
+  # Fix each daemon binary. -b bundle deps, -d dest = DIST (flat, beside daemon),
+  # -p @loader_path/ inner path, -of overwrite files (2nd daemon reuses 1st's
+  # dylibs), -cd create dir, -s search Homebrew's openblas lib dir. dylibbundler
+  # ad-hoc codesigns each dylib by default; install.sh re-signs the daemon after
+  # any later mutation, and re-signs everything on the receiver anyway.
+  for daemon_bin in bluey-daemon cue-daemon; do
+    [ -f "$DIST/$daemon_bin" ] || continue
+    dylibbundler \
+      -x "$DIST/$daemon_bin" \
+      -b -d "$DIST" -p "@loader_path/" -of -cd \
+      -s /opt/homebrew/opt/openblas/lib \
+      >/dev/null 2>&1 || {
+        echo "  ERROR: dylibbundler failed on $daemon_bin" >&2; exit 1;
+      }
+  done
+
+  # De-duplicate LC_RPATH. OpenBLAS ships with SEVERAL rpaths (gcc dirs); when
+  # dylibbundler rewrites each to '@loader_path/' they collapse into duplicates,
+  # and dyld REFUSES to load a binary with a duplicate LC_RPATH ("duplicate
+  # LC_RPATH '@loader_path/'") — the daemon then can't find its own dylibs and
+  # crashes at startup on EVERY Mac. Collapse each file's '@loader_path/' rpaths
+  # to exactly one, then re-sign.
+  for f in "$DIST"/*.dylib "$DIST/bluey-daemon" "$DIST/cue-daemon"; do
+    [ -f "$f" ] || continue
+    chmod u+w "$f"
+    while otool -l "$f" 2>/dev/null | grep -A2 LC_RPATH | grep -q "path @loader_path/ "; do
+      install_name_tool -delete_rpath "@loader_path/" "$f" 2>/dev/null || break
+    done
+    install_name_tool -add_rpath "@loader_path/" "$f" 2>/dev/null || true
+    codesign --force --sign - "$f" >/dev/null 2>&1 || true
+  done
+
+  # Verify: no Homebrew/absolute paths must remain in the daemon or any bundled
+  # dylib, or it crashes on a fresh Mac. Fail the build loudly if any slipped.
+  leftover="$(for f in "$DIST"/*.dylib "$DIST/bluey-daemon" "$DIST/cue-daemon"; do
+    [ -f "$f" ] && otool -L "$f" 2>/dev/null | tail -n +2 | grep -E "/opt/homebrew|/opt/local|/usr/local"
+  done)"
+  if [ -n "$leftover" ]; then
+    echo "  ERROR: unbundled Homebrew paths remain (would crash on a fresh Mac):" >&2
+    echo "$leftover" >&2
+    exit 1
+  fi
+
+  # Load-test: the daemon MUST start (--version) with only the bundled dylibs.
+  # This is the definitive check that the whole closure resolves via @loader_path
+  # and no rpath/duplicate/missing-dep issue survives. Fail loudly if it can't.
+  if ! ( cd "$DIST" && ./bluey-daemon --version >/dev/null 2>&1 ); then
+    echo "  ERROR: bundled daemon fails to load its dylibs (dyld error) — see:" >&2
+    ( cd "$DIST" && ./bluey-daemon --version 2>&1 | head -4 >&2 )
+    exit 1
+  fi
+
+  dylib_count="$(find "$DIST" -maxdepth 1 -name '*.dylib' 2>/dev/null | wc -l | tr -d ' ')"
+  echo "  bundled diarization dylib closure ($dylib_count dylibs) → @loader_path, self-contained + load-tested"
 fi
 
 echo "  MEETING-ONLY build — interview overlay excluded."
