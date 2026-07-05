@@ -471,6 +471,79 @@ else
   fail "OFFSITE_DESTINATION missing; off-host backups are required before paid users"
 fi
 
+require_log_archive="${BLUEY_REQUIRE_LOG_ARCHIVE:-0}"
+log_destination="${BLUEY_LOG_ARCHIVE_DESTINATION:-}"
+log_bucket="${BLUEY_LOG_R2_BUCKET:-${BLUEY_OBJECT_BUCKET:-${BLUEY_R2_BUCKET:-}}}"
+log_endpoint="${BLUEY_LOG_R2_ENDPOINT_URL:-${BLUEY_LOG_R2_ENDPOINT:-${BLUEY_BACKUP_S3_ENDPOINT_URL:-${BLUEY_OBJECT_ENDPOINT_URL:-${BLUEY_R2_ENDPOINT_URL:-}}}}}"
+log_access_key="${BLUEY_LOG_R2_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-${BLUEY_OBJECT_ACCESS_KEY_ID:-${BLUEY_R2_ACCESS_KEY_ID:-}}}}"
+log_secret_key="${BLUEY_LOG_R2_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-${BLUEY_OBJECT_SECRET_ACCESS_KEY:-${BLUEY_R2_SECRET_ACCESS_KEY:-}}}}"
+log_region="${BLUEY_LOG_R2_REGION:-${AWS_DEFAULT_REGION:-${BLUEY_OBJECT_REGION:-${BLUEY_R2_REGION:-auto}}}}"
+
+if [ -n "$log_destination" ] && ! is_placeholder "$log_destination"; then
+  ok "log archive destination set"
+elif [ -n "$log_bucket" ] && ! is_placeholder "$log_bucket"; then
+  ok "log archive bucket set; destination will use ${BLUEY_LOG_STORAGE_PREFIX:-prod}/logs/api"
+else
+  if [ "$require_log_archive" = "1" ]; then
+    fail "log archive destination missing; set BLUEY_LOG_ARCHIVE_DESTINATION or BLUEY_LOG_R2_BUCKET"
+  else
+    warn "log archive destination missing; production logs will remain local only"
+  fi
+fi
+if [ -n "$log_endpoint" ] && ! is_placeholder "$log_endpoint"; then
+  ok "log archive R2/S3 endpoint set"
+elif [ "$require_log_archive" = "1" ]; then
+  fail "log archive endpoint missing"
+else
+  warn "log archive endpoint missing"
+fi
+if [ -n "$log_access_key" ] && ! is_placeholder "$log_access_key"; then
+  ok "log archive access key set"
+elif [ "$require_log_archive" = "1" ]; then
+  fail "log archive access key missing"
+else
+  warn "log archive access key missing"
+fi
+if [ -n "$log_secret_key" ] && ! is_placeholder "$log_secret_key"; then
+  ok "log archive secret key set"
+elif [ "$require_log_archive" = "1" ]; then
+  fail "log archive secret key missing"
+else
+  warn "log archive secret key missing"
+fi
+if [ -n "$log_destination" ] && [[ "$log_destination" == s3://* ]] && command -v aws >/dev/null 2>&1; then
+  aws_log_args=()
+  if [ -n "$log_endpoint" ]; then
+    aws_log_args+=(--endpoint-url "$log_endpoint")
+  fi
+  if AWS_ACCESS_KEY_ID="$log_access_key" \
+     AWS_SECRET_ACCESS_KEY="$log_secret_key" \
+     AWS_DEFAULT_REGION="$log_region" \
+     aws "${aws_log_args[@]}" s3 ls "$log_destination" >/dev/null 2>&1; then
+    ok "R2/S3 log archive destination reachable"
+  else
+    warn "R2/S3 log archive destination not listable; verify bucket policy and prefix"
+  fi
+elif [ -n "$log_bucket" ] && command -v aws >/dev/null 2>&1; then
+  aws_log_args=()
+  if [ -n "$log_endpoint" ]; then
+    aws_log_args+=(--endpoint-url "$log_endpoint")
+  fi
+  if AWS_ACCESS_KEY_ID="$log_access_key" \
+     AWS_SECRET_ACCESS_KEY="$log_secret_key" \
+     AWS_DEFAULT_REGION="$log_region" \
+     aws "${aws_log_args[@]}" s3api head-bucket --bucket "$log_bucket" >/dev/null 2>&1; then
+    ok "R2/S3 log archive bucket reachable"
+  else
+    warn "R2/S3 log archive bucket not reachable; verify endpoint, bucket, and key policy"
+  fi
+elif [ "$require_log_archive" = "1" ]; then
+  warn "aws CLI not installed; skipped required log archive reachability check"
+fi
+ok "log hot cache retention days=${BLUEY_LOG_LOCAL_RETENTION_DAYS:-7}"
+ok "log dir max bytes=${BLUEY_LOG_DIR_MAX_BYTES:-536870912}"
+ok "log archive root max bytes=${BLUEY_LOG_ROOT_MAX_BYTES:-2147483648}"
+
 if [ -n "${BLUEY_PUBLIC_URL:-}" ] && command -v curl >/dev/null 2>&1; then
   if curl -fsS "${BLUEY_PUBLIC_URL%/}/health" >/dev/null 2>&1; then
     ok "health endpoint reachable"

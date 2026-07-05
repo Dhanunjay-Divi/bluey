@@ -64,7 +64,7 @@ echo '== journal disk =='
 journalctl --disk-usage || true
 echo '== recent storage errors =='
 journalctl -u bluey-api -u caddy --since '24 hours ago' --no-pager |
-  grep -Ei 'database or disk is full|no space|AccessDenied|SignatureDoesNotMatch|backup|object delete|export failed|panic' |
+  grep -Ei 'database or disk is full|no space|AccessDenied|SignatureDoesNotMatch|backup failed|failed backup|backup upload|object delete|export failed|panic|archive failed|failed archive' |
   tail -80 || true
 "
 ```
@@ -154,6 +154,49 @@ df -h /
 "
 ```
 
+## Log Archive Guard
+
+Production should keep server logs as a short local hot cache and archive
+operational diagnostics off-host. This follows the Pinky pattern: R2 is the
+durable diagnostic archive; the droplet is only for fresh incident grep.
+
+Install the host guards after deploying a release that includes `ops/`:
+
+```bash
+ssh "$BLUEY_HOST" "cd /opt/bluey-api/current 2>/dev/null || cd /opt/bluey-api && sudo ops/install-bluey-log-guards.sh"
+```
+
+Required production env:
+
+```text
+BLUEY_REQUIRE_LOG_ARCHIVE=1
+BLUEY_LOG_ARCHIVE_DESTINATION=s3://bluey-prod/prod/logs/api
+BLUEY_LOG_R2_ENDPOINT_URL=https://<cloudflare-account-id>.r2.cloudflarestorage.com
+BLUEY_LOG_R2_ACCESS_KEY_ID=<log-bucket write key>
+BLUEY_LOG_R2_SECRET_ACCESS_KEY=<log-bucket write secret>
+BLUEY_LOG_R2_REGION=auto
+BLUEY_LOG_LOCAL_RETENTION_DAYS=7
+BLUEY_LOG_ARCHIVE_LOCAL_RETENTION_DAYS=7
+BLUEY_LOG_DIR_MAX_BYTES=536870912
+BLUEY_LOG_ROOT_MAX_BYTES=2147483648
+```
+
+Manual smoke:
+
+```bash
+ssh "$BLUEY_HOST" "
+set -euo pipefail
+/usr/local/sbin/archive-bluey-logs.sh
+/usr/local/sbin/bluey-disk-guard.sh
+tail -80 /var/log/bluey-api/log-archive-cron.log 2>/dev/null || true
+"
+```
+
+Boundary: this archive is for server operational logs and journald output. Do
+not auto-upload raw desktop logs, transcripts, screen contents, documents,
+clipboard contents, or keystrokes. Desktop evidence should go through
+`bluey support` or `bluey logs export`, which redacts by default.
+
 ## Deploy Evidence To Record
 
 For every meaningful deploy or hotfix, record the following in the round doc or
@@ -164,6 +207,9 @@ deploy review:
 - Newest backup filename, size, checksum, and whether off-host upload exists.
 - Whether restore drill ran and its output summary.
 - Whether object storage is configured for original docs/screenshots.
+- Whether `/usr/local/sbin/archive-bluey-logs.sh` uploaded the current log
+  bundle and wrote a `.sha256`.
+- Whether `/usr/local/sbin/bluey-disk-guard.sh` passed.
 - Recent journal check showing no disk/R2/archive/export/delete errors.
 - If cleanup was performed, exactly what was deleted and how much space was
   recovered.
