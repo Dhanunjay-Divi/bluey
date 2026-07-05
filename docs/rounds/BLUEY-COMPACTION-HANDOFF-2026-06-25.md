@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 20:05 EDT
+Latest checkpoint: 2026-07-04 20:46 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,7 +30,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-349-FOLLOWUP-VISION-FALLBACK-FEED-GAP.md`; the next canonical Bluey round doc should start at `ROUND-350-...`.
+- Latest completed Bluey round doc is `ROUND-350-MACOS-CLICKTHROUGH-SCROLL-RECURSION.md`; the next canonical Bluey round doc should start at `ROUND-351-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
@@ -5899,6 +5899,88 @@ Deployment status:
 - `https://bluey.sh/health` reports commit `210a4f7559ffd13fe263b3891d75b5e93c39c9f3`.
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
+
+## Latest Round 350: macOS Click-Through Scroll Recursion
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Runtime worktree for this round:
+
+```bash
+/Users/uno/Downloads/cue-runtime-stream-attachments
+```
+
+Current branch:
+
+```bash
+codex/bluey-stream-attachments-20260704
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-350-MACOS-CLICKTHROUGH-SCROLL-RECURSION.md`
+
+Trigger:
+
+- The owner attached a macOS crash report asking why it happened.
+- Crash was in `bluey-overlay-macos`, triggered by the main thread during scroll handling.
+
+Root cause:
+
+- Crash report showed `EXC_BAD_ACCESS (SIGSEGV)` with `Thread stack size exceeded due to excessive recursion`.
+- The recursion path was:
+  - `OverlayApp.handleGlobalMouseEventForClickThrough(_:)`
+  - `ExpandedPanelView.routeScrollWheelAtScreenPoint(_:event:)`
+  - `ExpandedPanelView.scrollWheel(with:)`
+  - AppKit forwarding back through `-[NSView scrollWheel:]`
+- The click-through global scroll bridge forwarded the original `NSEvent` into child scroll views with `scrollWheel(with:)`.
+- If AppKit bubbled the event back to the parent, the parent routed it into the child again, creating an unbounded recursion loop.
+
+What changed:
+
+- Added `scrollViewDirectly(_:withWheelEvent:)` in the macOS overlay.
+- Feed, canvas, session drawer, transcript strip, and composer scroll now move the underlying `NSClipView` directly.
+- `CanvasPaneView` now has a direct `scrollByWheelEvent(_:)` path and override.
+- `ExpandedPanelView.routeScrollWheelAtScreenPoint(_:event:)` and normal expanded scroll routing no longer redispatch the original wheel event into child scroll views.
+- Desktop workspace version bumped to `0.1.89`.
+
+Windows parity:
+
+- This crash is macOS/AppKit-specific and depends on Swift `ExpandedPanelView` + `NSScrollView` event bubbling.
+- Windows overlay is a separate native C implementation, so there is no direct Windows equivalent to patch.
+
+Verification so far:
+
+```bash
+swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift
+cd native/macos/cue-overlay && swift build -c release
+cargo fmt --check
+cargo check -p cue-cli -p cue-daemon
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.89
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+/Users/uno/.bluey/bin/bluey off
+/Users/uno/.bluey/bin/bluey on
+/Users/uno/.bluey/bin/bluey status
+```
+
+Deployment status:
+
+- Desktop release `0.1.89` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.89/bluey-0.1.89-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `3f69b5d73636e01c464e45515e6515a429f3ac1ac11a62b182b34204da9e3e26`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.89`
+- Public installer smoke installed `0.1.89` locally and both installed binaries report `0.1.89`.
+- Local daemon restarted successfully with pid `50816`.
 
 ## Latest Round 349: Follow-up Vision Fallback and Feed Gap
 
