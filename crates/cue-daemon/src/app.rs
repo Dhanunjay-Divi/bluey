@@ -252,6 +252,26 @@ fn parse_attached_agent(label: Option<&str>) -> Option<AgentKind> {
     }
 }
 
+/// The snake_case wire label for a known `AgentKind` — the exact string
+/// [`parse_attached_agent`] reverses. `None` for `Other`/`Unknown` (no stable
+/// wire id). AgentKind derives serde `rename_all = "snake_case"`, so serializing
+/// yields `"copilot"` etc.; we strip the JSON quotes.
+fn agent_kind_wire(kind: &AgentKind) -> Option<String> {
+    // `Other`/`Unknown` have no stable, drivable wire id (parse_attached_agent
+    // rejects them), so they never round-trip — skip them here for symmetry.
+    if matches!(kind, AgentKind::Other(_) | AgentKind::Unknown) {
+        return None;
+    }
+    let json = serde_json::to_string(kind).ok()?;
+    // A unit variant serializes to a quoted string ("copilot"); an `Other`
+    // struct-variant would serialize to an object — guard against that too.
+    let unquoted = json.trim_matches('"');
+    if unquoted.is_empty() || unquoted.starts_with('{') {
+        return None;
+    }
+    Some(unquoted.to_string())
+}
+
 /// Normalize an inbound resume `session_id` into a value safe to persist:
 /// trims surrounding whitespace and maps an absent or blank id to `None`, so a
 /// blank string is never stored as a "session to resume".
@@ -2653,6 +2673,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                 pending_session_id.as_deref(),
             )
             .await;
+        }
+        OverlayEvent::AgentInstallResponded { kind, approved } => {
+            handle_agent_install_response(daemon, &kind, approved).await;
         }
         OverlayEvent::InstructionsRequested => {
             // Drive Idle -> InstructionsOpen while the daemon-owned prompt is
@@ -8663,14 +8686,20 @@ async fn answer_with_agent(
                     return Ok(agent_offline(provider, &mut stream, fallback_depth, &label).await);
                 }
 
-                return Ok(agent_not_ready(
+                let outcome = agent_not_ready(
                     provider,
                     &mut stream,
                     fallback_depth,
                     &label,
                     &failure.reason,
                 )
-                .await);
+                .await;
+                // If the CLI is simply missing AND installable, offer a one-click
+                // install alongside the guidance card (never signs in for them).
+                if let Some(stream) = stream.as_ref() {
+                    maybe_offer_agent_install(&stream.daemon, &kind, &failure.reason).await;
+                }
+                return Ok(outcome);
             }
         }
     };
@@ -8837,6 +8866,124 @@ Bluey answers live through your agent and never on your behalf."
                 .failed(format!("agent not ready: {label} {reason}")),
         ],
     }
+}
+
+/// If the attached agent's CLI is missing AND it has a vetted install recipe,
+/// push a one-click install offer to the overlay (in addition to the guidance
+/// card `agent_not_ready` already showed). No-op when the failure isn't a
+/// missing-binary case or the agent has no installer (e.g. VS Code). Bluey never
+/// signs the user in — this offers the INSTALL only.
+async fn maybe_offer_agent_install(
+    daemon: &Arc<Daemon>,
+    kind: &cue_agent_bridge::AgentKind,
+    reason: &str,
+) {
+    // Only when the reason is a missing binary — never for a signed-out or
+    // offline CLI (installing wouldn't help and would be confusing).
+    if !reason.contains("not found on PATH") {
+        return;
+    }
+    let Some(plan) = cue_agent_bridge::provision::plan_install(kind) else {
+        return; // no installer for this agent (VS Code, Windsurf, unknown)
+    };
+    let command = plan.human_command.clone();
+    let prerequisite = plan.prerequisite.map(|p| p.to_string());
+    let display_name = agent_display_name(kind);
+    // Snake_case wire form (the exact string `parse_attached_agent` reverses).
+    // AgentKind derives serde `rename_all = "snake_case"`, so JSON-serializing it
+    // yields e.g. `"copilot"` — strip the quotes. No installer plan exists for the
+    // `Other`/`Unknown` variants, so this is always a known variant here.
+    let Some(kind_wire) = agent_kind_wire(kind) else {
+        return;
+    };
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::PushAgentInstall {
+            kind: kind_wire,
+            display_name,
+            command,
+            prerequisite,
+        },
+    )
+    .await;
+}
+
+/// Handle the user's response to a [`OverlayCommand::PushAgentInstall`] offer.
+/// When approved, run the vetted install recipe for `kind` (in a blocking task —
+/// it spawns npm/curl), then report the outcome as an overlay card. Bluey NEVER
+/// signs the user in: on success the card tells them to sign in and ask again.
+async fn handle_agent_install_response(daemon: &Arc<Daemon>, kind: &str, approved: bool) {
+    use cue_agent_bridge::provision::{
+        plan_install, provision_with_recovery, InstallOutcome, RemedyConsent,
+    };
+
+    if !approved {
+        return; // user dismissed — nothing to do, guidance card already stands.
+    }
+    let Some(parsed) = parse_attached_agent(Some(kind)) else {
+        return;
+    };
+    let Some(plan) = plan_install(&parsed) else {
+        return;
+    };
+    let display = agent_display_name(&parsed);
+    let command = plan.human_command.clone();
+
+    // Progress card: the install can take many seconds.
+    push_system_card(
+        daemon,
+        CardKind::System,
+        format!("Installing {display}…"),
+        format!("Running `{command}`. This can take a moment."),
+    )
+    .await;
+
+    // provision_with_recovery uses std::process::Command (blocking) — run it off
+    // the async runtime. SafeOnly: apply safe remedies, but never a destructive
+    // one (removing a broken symlink) without a separate explicit consent.
+    let outcome = tokio::task::spawn_blocking(move || {
+        provision_with_recovery(&plan, RemedyConsent::SafeOnly)
+    })
+    .await;
+
+    let (kind_tag, title, body) = match outcome {
+        Ok(InstallOutcome::Installed { binary }) => (
+            CardKind::System,
+            format!("{display} installed"),
+            format!(
+                "`{binary}` is ready. Sign in to {display}, then ask again — \
+                 Bluey answers live through your agent and never on your behalf."
+            ),
+        ),
+        Ok(InstallOutcome::InstalledButNotRunnable { binary, detail }) => (
+            CardKind::Warning,
+            format!("{display} installed but not runnable"),
+            format!("`{binary}` is on PATH but won't run yet: {detail}"),
+        ),
+        Ok(InstallOutcome::MissingPrerequisite { needed }) => (
+            CardKind::Warning,
+            format!("Can't install {display}"),
+            format!(
+                "`{needed}` is required to install it. Install {needed} first, then try again."
+            ),
+        ),
+        Ok(InstallOutcome::VerificationFailed { binary, detail }) => (
+            CardKind::Warning,
+            format!("{display} install unverified"),
+            format!("The installer ran but `{binary}` didn't appear: {detail}"),
+        ),
+        Ok(InstallOutcome::InstallFailed { detail }) => (
+            CardKind::Warning,
+            format!("{display} install failed"),
+            detail,
+        ),
+        Err(join_err) => (
+            CardKind::Warning,
+            format!("{display} install failed"),
+            format!("the install task did not complete: {join_err}"),
+        ),
+    };
+    push_system_card(daemon, kind_tag, title, body).await;
 }
 
 /// Push an honest guidance card for a **transient backend outage**: the agent
@@ -13992,6 +14139,31 @@ mod tests {
             agent_model_label(&AgentKind::Other("zed".to_string())),
             "zed"
         );
+    }
+
+    #[test]
+    fn agent_kind_wire_roundtrips_through_parse() {
+        // The install-offer flow depends on this symmetry: the daemon serializes
+        // the kind to a wire string (PushAgentInstall.kind), the overlay echoes it
+        // back (AgentInstallResponded.kind), and the daemon must rebuild the SAME
+        // AgentKind via parse_attached_agent to run the right install recipe.
+        for kind in [
+            AgentKind::Copilot,
+            AgentKind::Codex,
+            AgentKind::Cursor,
+            AgentKind::ClaudeCode,
+            AgentKind::Gemini,
+        ] {
+            let wire = agent_kind_wire(&kind).expect("known kind has a wire form");
+            assert_eq!(
+                parse_attached_agent(Some(&wire)),
+                Some(kind.clone()),
+                "wire={wire:?} must round-trip back to {kind:?}"
+            );
+        }
+        // Freeform / unknown variants have no stable wire id → None.
+        assert_eq!(agent_kind_wire(&AgentKind::Other("zed".to_string())), None);
+        assert_eq!(agent_kind_wire(&AgentKind::Unknown), None);
     }
 
     #[test]

@@ -91,6 +91,20 @@ export interface MeetingClient {
   onForMeQuestion(
     cb: (q: { text: string; title?: string }) => void,
   ): () => void;
+  /** Subscribe to daemon offers to install a missing agent CLI. Returns an
+   *  unsubscribe fn. The daemon pushes this when the attached agent's CLI isn't
+   *  on PATH but has a vetted install recipe. */
+  onAgentInstall(
+    cb: (offer: {
+      kind: string;
+      displayName: string;
+      command: string;
+      prerequisite?: string;
+    }) => void,
+  ): () => void;
+  /** Answer an install offer. `approved` runs the vetted recipe on the daemon
+   *  (which reports the outcome as a card); Bluey never signs the user in. */
+  respondAgentInstall(kind: string, approved: boolean): void;
   /**
    * Ask the attached agent a question; streams chunks (text / tool-fired /
    * source / done) to `onChunk`. The agent answer is SLOW by nature (driving a

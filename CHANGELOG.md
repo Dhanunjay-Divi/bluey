@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the actual cure for the daemon-spawned subprocesses.
 
 ### Added
+- **One-click install for a missing agent CLI.** When the attached agent's CLI
+  isn't on PATH (e.g. `copilot`) but has a vetted install recipe, Bluey now shows
+  an Install / Not now card in the Ask screen instead of only telling you to
+  install it manually. Approving runs the exact vetted command
+  (`npm install -g @github/copilot`) via the existing `provision.rs` engine (which
+  preflights, clears safe obstructions, installs, and verifies the binary actually
+  appears + runs), then reports the outcome as a card. Bluey NEVER signs you in —
+  after install you sign in and ask again. Wired via new
+  `OverlayCommand::PushAgentInstall` / `OverlayEvent::AgentInstallResponded`, with
+  a snake_case kind that round-trips through `parse_attached_agent` (tested).
 - **Meeting-only macOS build (`scripts/build-meeting.sh`).** A distinct build that
   stages ONLY the meeting overlay (`cue-meeting-overlay`), never the legacy Swift
   interview overlay (`bluey-overlay-macos` / `cue-overlay-macos`). The shared

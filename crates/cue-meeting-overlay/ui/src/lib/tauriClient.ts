@@ -159,6 +159,13 @@ type OverlayCommand =
       steps: WireAnswerStatusStep[];
       done?: boolean;
     }
+  | {
+      type: "push_agent_install";
+      kind: string;
+      display_name: string;
+      command: string;
+      prerequisite?: string | null;
+    }
   | { type: string; [k: string]: unknown };
 
 // The daemon's AnswerStatusStep wire shape (serde: `kind` tag, snake_case
@@ -620,6 +627,31 @@ export function createTauriClient(): MeetingClient {
       };
       handlers.add(handler);
       return () => handlers.delete(handler);
+    },
+
+    onAgentInstall(cb) {
+      // The daemon pushes push_agent_install when the attached agent's CLI is
+      // missing but installable (a vetted registry recipe). We surface an
+      // Install / Cancel card; the answer goes back as agent_install_responded.
+      const handler = (cmd: OverlayCommand) => {
+        if (cmd.type !== "push_agent_install") return;
+        const c = cmd as Extract<
+          OverlayCommand,
+          { type: "push_agent_install" }
+        >;
+        cb({
+          kind: c.kind,
+          displayName: c.display_name,
+          command: c.command,
+          prerequisite: c.prerequisite ?? undefined,
+        });
+      };
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+
+    respondAgentInstall(kind, approved) {
+      sendEvent({ type: "agent_install_responded", kind, approved });
     },
 
     ask(question, onChunk, opts): AskHandle {

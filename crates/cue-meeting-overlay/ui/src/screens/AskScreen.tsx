@@ -14,6 +14,10 @@ import type {
   ListeningState,
 } from "../lib/types";
 import { AgentBar } from "../components/AgentBar";
+import {
+  AgentInstallCard,
+  type AgentInstallOffer,
+} from "../components/AgentInstallCard";
 import { AnswerCard, type AnswerState } from "../components/AnswerCard";
 import { Composer } from "../components/Composer";
 import { ThinkingState } from "../components/primitives";
@@ -49,6 +53,15 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [connectors, setConnectors] = useState<string[]>([]);
   const [listenState, setListenState] = useState<ListeningState>("idle");
+  // Daemon offer to install a missing agent CLI (push_agent_install). Shown as a
+  // card with Install / Not now; the daemon reports the install result as a card.
+  const [installOffer, setInstallOffer] = useState<AgentInstallOffer | null>(
+    null,
+  );
+  useEffect(
+    () => client.onAgentInstall((offer) => setInstallOffer(offer)),
+    [client],
+  );
   // The answer-speed preset, forwarded to the daemon as `mode`. Defaults to
   // "balanced" so an untouched composer behaves exactly as before.
   const [mode, setMode] = useState<AskMode>("balanced");
@@ -176,6 +189,20 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
         connectorNames={connectorNames}
         extraCount={extraConnectors}
       />
+
+      {installOffer && (
+        <AgentInstallCard
+          offer={installOffer}
+          onInstall={() => {
+            client.respondAgentInstall(installOffer.kind, true);
+            setInstallOffer(null);
+          }}
+          onCancel={() => {
+            client.respondAgentInstall(installOffer.kind, false);
+            setInstallOffer(null);
+          }}
+        />
+      )}
 
       <div
         style={{

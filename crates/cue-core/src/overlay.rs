@@ -398,6 +398,25 @@ pub enum OverlayCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_session_id: Option<String>,
     },
+    /// Offer to install a missing agent CLI. The attached (or requested) agent
+    /// has an [`crate`-external `provision::InstallPlan`] recipe but its binary
+    /// isn't on PATH, so live answers can't run. The overlay renders an
+    /// Install / Cancel card; the exact command is shown for transparency.
+    /// Acknowledgement is [`OverlayEvent::AgentInstallResponded`]. Bluey NEVER
+    /// signs the user in — install only; auth stays a manual step.
+    PushAgentInstall {
+        /// Agent kind (snake_case AgentKind wire form) the user echoes back.
+        kind: String,
+        /// Human display name for the agent (e.g. "GitHub Copilot").
+        display_name: String,
+        /// The exact command that will run, verbatim (e.g.
+        /// `npm install -g @github/copilot`). Shown in full for transparency.
+        command: String,
+        /// The prerequisite the install needs (e.g. "npm"), if any — the UI can
+        /// warn when it's absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prerequisite: Option<String>,
+    },
     Shutdown,
 }
 
@@ -538,6 +557,15 @@ pub enum OverlayEvent {
         pending_kind: String,
         #[serde(default)]
         pending_session_id: Option<String>,
+    },
+    /// The user answered a [`OverlayCommand::PushAgentInstall`] offer. `approved
+    /// = true` runs the vetted install recipe (via `provision_with_recovery`) for
+    /// `kind`; the daemon reports the outcome as a card. `false` dismisses it.
+    /// The install NEVER signs the user in — that stays a manual step.
+    AgentInstallResponded {
+        /// The `kind` echoed from the push, so the daemon rebuilds the exact plan.
+        kind: String,
+        approved: bool,
     },
     InstructionsRequested,
     InstructionsUpdated {
