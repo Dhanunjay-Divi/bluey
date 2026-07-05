@@ -617,14 +617,14 @@
       flex-shrink: 0;
       border-radius: 6px;
       background: rgba(99, 216, 255, .10);
-      box-shadow: 0 0 0 1px rgba(99, 216, 255, .36), 0 0 22px rgba(79, 141, 255, .34);
+      box-shadow: 0 0 0 1px rgba(99, 216, 255, .32), 0 0 8px rgba(79, 141, 255, .16);
     }
 
     #productSite .brand-wordmark {
       display: block;
       width: 68px;
       height: auto;
-      filter: drop-shadow(0 0 8px rgba(99, 216, 255, .46)) drop-shadow(0 0 18px rgba(79, 141, 255, .30));
+      filter: drop-shadow(0 0 4px rgba(99, 216, 255, .18));
     }
 
     #productSite .nav-links {
@@ -1660,7 +1660,7 @@
       height: 24px;
       border-radius: 6px;
       background: rgba(99, 216, 255, .10);
-      box-shadow: 0 0 0 1px rgba(99, 216, 255, .36), 0 0 22px rgba(79, 141, 255, .34);
+      box-shadow: 0 0 0 1px rgba(99, 216, 255, .32), 0 0 8px rgba(79, 141, 255, .16);
     }
 
     #downloadApp .brand-wordmark,
@@ -1669,7 +1669,7 @@
     #accountApp .account-rail .brand-wordmark {
       width: 68px;
       height: auto;
-      filter: drop-shadow(0 0 8px rgba(99, 216, 255, .46)) drop-shadow(0 0 18px rgba(79, 141, 255, .30));
+      filter: drop-shadow(0 0 4px rgba(99, 216, 255, .18));
     }
 
     #downloadApp .navlinks,
@@ -3615,7 +3615,7 @@
     }
 
     #accountApp .account-shell {
-      padding-top: 78px;
+      padding-top: 56px;
     }
 
     #accountApp .account-top {
@@ -3631,6 +3631,10 @@
       background: #050505;
       box-shadow: none;
       backdrop-filter: none;
+      min-height: 56px;
+      height: 56px;
+      padding-top: 0;
+      padding-bottom: 0;
     }
 
     #accountApp .account-top .account-actions-row {
@@ -3642,7 +3646,7 @@
       width: auto;
       flex-direction: row;
       flex-wrap: wrap;
-      gap: 1rem;
+      gap: .88rem;
       pointer-events: auto;
     }
 
@@ -3660,8 +3664,25 @@
       border-radius: 0;
       background: transparent;
       color: #888;
-      font-size: .9rem;
+      font-size: .88rem;
       font-weight: 500;
+    }
+
+    #accountApp .account-top .theme-toggle {
+      width: 48px;
+      min-width: 48px;
+      height: 24px;
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, .10),
+        inset 0 -5px 12px rgba(99, 216, 255, .04),
+        0 5px 12px rgba(0, 0, 0, .20);
+    }
+
+    #accountApp .account-top .theme-toggle:hover {
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, .12),
+        0 8px 20px rgba(0, 0, 0, .28),
+        0 0 12px rgba(99, 216, 255, .12);
     }
 
     #accountApp .account-top .account-link:hover,
@@ -3678,8 +3699,8 @@
     }
 
     #accountApp .account-top-connect input {
-      width: 90px;
-      height: 34px;
+      width: 88px;
+      height: 32px;
       padding: .35rem .6rem;
       border: 1px solid rgba(99, 216, 255, .28);
       border-radius: 6px;
@@ -3708,7 +3729,7 @@
     }
 
     #accountApp .account-top-connect button {
-      height: 34px;
+      height: 32px;
       padding: .35rem .7rem;
       border: 1px solid rgba(99, 216, 255, .28);
       border-radius: 6px;
@@ -3757,8 +3778,8 @@
       position: relative;
       display: inline-grid;
       place-items: center;
-      width: 32px;
-      height: 32px;
+      width: 30px;
+      height: 30px;
       border: 1px solid #333;
       border-radius: 50%;
       background: transparent;
@@ -3777,8 +3798,8 @@
 
     #accountApp .profile-glyph {
       position: relative;
-      width: 16px;
-      height: 16px;
+      width: 15px;
+      height: 15px;
     }
 
     #accountApp .profile-glyph::before,
@@ -3905,7 +3926,7 @@
 
     /* Bluey auth/legal polish keeps Pinky's structure while staying Bluey blue. */
     #accountApp.is-guest .account-shell {
-      padding-top: 64px;
+      padding-top: 56px;
     }
 
     #accountApp .account-theme-slot {
@@ -3914,8 +3935,9 @@
 
     #accountApp.is-guest .account-top {
       display: grid !important;
-      min-height: 64px;
-      padding: .82rem 2.5rem;
+      min-height: 56px;
+      height: 56px;
+      padding: 0 2.5rem;
     }
 
     #accountApp.is-guest .account-main {
@@ -3950,13 +3972,13 @@
       height: 42px;
       border-radius: 12px;
       background: rgba(99, 216, 255, .12);
-      box-shadow: 0 0 0 1px rgba(99, 216, 255, .38), 0 0 30px rgba(99, 216, 255, .20);
+      box-shadow: 0 0 0 1px rgba(99, 216, 255, .32), 0 0 12px rgba(99, 216, 255, .12);
     }
 
     #accountApp .auth-wordmark {
       width: 96px;
       height: auto;
-      filter: drop-shadow(0 0 10px rgba(99, 216, 255, .56)) drop-shadow(0 0 28px rgba(79, 141, 255, .32));
+      filter: drop-shadow(0 0 5px rgba(99, 216, 255, .18));
     }
 
     #accountApp.is-guest .account-card h2 {

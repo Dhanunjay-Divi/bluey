@@ -7,8 +7,8 @@
       <stop offset="1" stop-color="#4f8dff"/>
     </linearGradient>
     <filter id="wordmark-glow" x="-16" y="-18" width="324" height="132" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
-      <feDropShadow dx="0" dy="0" stdDeviation="3.5" flood-color="#63d8ff" flood-opacity=".30"/>
-      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#020811" flood-opacity=".55"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="1.25" flood-color="#63d8ff" flood-opacity=".16"/>
+      <feDropShadow dx="0" dy="5" stdDeviation="4" flood-color="#020811" flood-opacity=".34"/>
     </filter>
     <mask id="wordmark-cut-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="292" height="100">
       <rect width="292" height="100" fill="#fff"/>
