@@ -3810,35 +3810,14 @@
       box-shadow: none;
     }
 
-    #accountApp .profile-glyph {
-      position: relative;
-      width: 15px;
-      height: 15px;
-    }
-
-    #accountApp .profile-glyph::before,
-    #accountApp .profile-glyph::after {
-      content: "";
-      position: absolute;
-      left: 50%;
-      transform: translateX(-50%);
-      border: 1.8px solid currentColor;
-    }
-
-    #accountApp .profile-glyph::before {
-      top: 1px;
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: transparent;
-    }
-
-    #accountApp .profile-glyph::after {
-      bottom: 1px;
-      width: 13px;
-      height: 7px;
-      border-bottom: 0;
-      border-radius: 12px 12px 0 0;
+    #accountApp .profile-icon {
+      display: block;
+      width: 16px;
+      height: 16px;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
     }
 
     #accountApp .account-profile-menu {
