@@ -2545,7 +2545,7 @@ mod tests {
             ("anthropic", "claude-sonnet-4-6"),
         );
         assert_eq!(resolve_route("deep"), ("anthropic", "claude-opus-4-8"),);
-        assert_eq!(resolve_route("vision"), ("openai", "gpt-5.5"));
+        assert_eq!(resolve_route("vision"), ("gemini", "gemini-3-flash-preview"));
         assert_eq!(resolve_route("local"), ("unsupported", "local"));
         // Unknown → balanced default.
         assert_eq!(resolve_route("???"), ("anthropic", "claude-sonnet-4-6"),);
