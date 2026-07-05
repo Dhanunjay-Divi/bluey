@@ -668,9 +668,9 @@
       display: inline-flex;
       align-items: center;
       justify-content: flex-start;
-      width: 54px;
-      min-width: 54px;
-      height: 28px;
+      width: 50px;
+      min-width: 50px;
+      height: 24px;
       padding: 2px;
       border: 1px solid rgba(99, 216, 255, .42);
       border-radius: 999px;
@@ -680,8 +680,8 @@
       color: #dff8ff;
       box-shadow:
         inset 0 1px 0 rgba(255, 255, 255, .10),
-        inset 0 -8px 18px rgba(99, 216, 255, .05),
-        0 8px 18px rgba(0, 0, 0, .22);
+        inset 0 -6px 14px rgba(99, 216, 255, .05),
+        0 6px 14px rgba(0, 0, 0, .20);
       cursor: pointer;
       flex: 0 0 auto;
       transition: background .2s, border-color .2s, color .2s, box-shadow .2s, transform .2s;
@@ -692,8 +692,8 @@
       border-color: rgba(99, 216, 255, .68);
       box-shadow:
         inset 0 1px 0 rgba(255, 255, 255, .12),
-        0 12px 30px rgba(0, 0, 0, .34),
-        0 0 22px rgba(99, 216, 255, .18);
+        0 9px 22px rgba(0, 0, 0, .30),
+        0 0 18px rgba(99, 216, 255, .16);
       transform: translateY(-1px);
     }
 
@@ -708,15 +708,15 @@
       position: relative;
       display: inline-grid;
       place-items: center;
-      width: 22px;
-      height: 22px;
+      width: 20px;
+      height: 20px;
       flex: 0 0 auto;
       border-radius: 999px;
       background:
         radial-gradient(circle at 35% 25%, rgba(255, 255, 255, .34), transparent 32%),
         linear-gradient(145deg, var(--bluey-accent), var(--bluey-accent-2));
       box-shadow:
-        0 4px 12px rgba(99, 216, 255, .25),
+        0 3px 10px rgba(99, 216, 255, .24),
         inset 0 1px 0 rgba(255, 255, 255, .42);
       transform: translateX(0);
       transition: transform .24s cubic-bezier(.2, .8, .2, 1), background .2s, box-shadow .2s;
@@ -725,8 +725,8 @@
     #productSite .theme-toggle-icon,
     #accountApp .theme-toggle-icon {
       position: absolute;
-      width: 13px;
-      height: 13px;
+      width: 12px;
+      height: 12px;
       display: block;
       color: #061114;
       filter: drop-shadow(0 1px 2px rgba(4, 18, 28, .22));
@@ -786,8 +786,8 @@
       color: #172535;
       box-shadow:
         inset 0 1px 0 rgba(255, 255, 255, .92),
-        inset 0 -8px 18px rgba(99, 216, 255, .045),
-        0 8px 18px rgba(34, 87, 118, .10);
+        inset 0 -6px 14px rgba(99, 216, 255, .045),
+        0 6px 14px rgba(34, 87, 118, .10);
     }
 
     html[data-bluey-theme="light"] #productSite .theme-toggle-knob,
@@ -796,9 +796,9 @@
         radial-gradient(circle at 35% 25%, rgba(255, 255, 255, .55), transparent 32%),
         linear-gradient(145deg, #fff, #e6f8ff);
       box-shadow:
-        0 4px 11px rgba(34, 87, 118, .13),
+        0 3px 9px rgba(34, 87, 118, .13),
         inset 0 1px 0 rgba(255, 255, 255, .92);
-      transform: translateX(26px);
+      transform: translateX(24px);
     }
 
     html[data-bluey-theme="light"] #productSite .theme-toggle-icon,
@@ -4257,18 +4257,18 @@
       }
 
       #productSite .theme-toggle {
-        width: 48px;
-        min-width: 48px;
-        height: 26px;
+        width: 44px;
+        min-width: 44px;
+        height: 22px;
       }
 
       #productSite .theme-toggle-knob {
-        width: 20px;
-        height: 20px;
+        width: 18px;
+        height: 18px;
       }
 
       html[data-bluey-theme="light"] #productSite .theme-toggle-knob {
-        transform: translateX(22px);
+        transform: translateX(20px);
       }
 
       #accountApp.is-guest .account-shell {
@@ -4303,18 +4303,18 @@
       }
 
       #accountApp.is-guest .account-top .theme-toggle {
-        width: 48px;
-        min-width: 48px;
-        height: 26px;
+        width: 44px;
+        min-width: 44px;
+        height: 22px;
       }
 
       #accountApp.is-guest .account-top .theme-toggle-knob {
-        width: 20px;
-        height: 20px;
+        width: 18px;
+        height: 18px;
       }
 
       html[data-bluey-theme="light"] #accountApp.is-guest .account-top .theme-toggle-knob {
-        transform: translateX(22px);
+        transform: translateX(20px);
       }
 
       #accountApp.is-guest .account-main {
