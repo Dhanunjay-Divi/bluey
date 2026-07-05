@@ -1325,6 +1325,80 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (confirm) confirm.disabled = true;
     }
 
+    function changePasswordMessage(text, tone = '') {
+      const el = document.getElementById('changePasswordMessage');
+      if (!el) return;
+      el.textContent = text || '';
+      el.dataset.tone = tone || '';
+    }
+
+    function resetChangePasswordDialog() {
+      const dialog = document.getElementById('changePasswordDialog');
+      const form = document.getElementById('changePasswordForm');
+      if (dialog) dialog.hidden = true;
+      if (form) form.reset();
+      changePasswordMessage('');
+    }
+
+    function openChangePasswordDialog() {
+      const dialog = document.getElementById('changePasswordDialog');
+      const email = document.getElementById('changePasswordEmail');
+      const current = document.getElementById('changeCurrentPassword');
+      if (!dialog) return;
+      resetChangePasswordDialog();
+      if (email) email.textContent = currentAccountEmail || 'this Bluey account';
+      dialog.hidden = false;
+      setTimeout(() => current?.focus(), 0);
+    }
+
+    async function changePassword() {
+      const current = document.getElementById('changeCurrentPassword');
+      const next = document.getElementById('changeNewPassword');
+      const confirm = document.getElementById('changeConfirmPassword');
+      const submit = document.getElementById('changePasswordSubmit');
+      const currentPassword = current?.value || '';
+      const newPassword = next?.value || '';
+      const confirmPassword = confirm?.value || '';
+      if (!currentPassword) {
+        changePasswordMessage('Enter your current password.', 'error');
+        current?.focus();
+        return;
+      }
+      if (newPassword.length < 8) {
+        changePasswordMessage('New password must be at least 8 characters.', 'error');
+        next?.focus();
+        return;
+      }
+      if (newPassword !== confirmPassword) {
+        changePasswordMessage('New passwords do not match.', 'error');
+        confirm?.focus();
+        return;
+      }
+      const previous = submit?.textContent || 'Update';
+      if (submit) {
+        submit.disabled = true;
+        submit.textContent = 'Updating...';
+      }
+      changePasswordMessage('Updating password...');
+      try {
+        const auth = await apiJson('/auth/password/change', {
+          method: 'POST',
+          body: JSON.stringify({
+            current_password: currentPassword,
+            new_password: newPassword,
+          }),
+        });
+        if (auth?.access_token) setAccountToken(auth);
+        changePasswordMessage('Password updated.', 'success');
+        setTimeout(resetChangePasswordDialog, 900);
+      } finally {
+        if (submit) {
+          submit.disabled = false;
+          submit.textContent = previous;
+        }
+      }
+    }
+
     function updateDeleteAccountConfirmState() {
       const data = document.getElementById('deleteAcceptDataLoss');
       const credits = document.getElementById('deleteAcceptCreditLoss');
@@ -2518,6 +2592,19 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('accountProfileMenu')?.addEventListener('click', (event) => {
         event.stopPropagation();
       });
+      document.getElementById('changePasswordButton')?.addEventListener('click', () => {
+        closeProfileMenu();
+        openChangePasswordDialog();
+      });
+      document.getElementById('changePasswordForm')?.addEventListener('submit', (event) => {
+        event.preventDefault();
+        changePassword().catch((error) => changePasswordMessage(error.message, 'error'));
+      });
+      document.getElementById('changePasswordCancel')?.addEventListener('click', resetChangePasswordDialog);
+      document.getElementById('changePasswordCancelX')?.addEventListener('click', resetChangePasswordDialog);
+      document.getElementById('changePasswordDialog')?.addEventListener('click', (event) => {
+        if (event.target?.id === 'changePasswordDialog') resetChangePasswordDialog();
+      });
       document.getElementById('deleteAccountButton')?.addEventListener('click', () => {
         closeProfileMenu();
         openDeleteAccountDialog();
@@ -2694,6 +2781,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         closeProfileMenu();
+        resetChangePasswordDialog();
         setTrialModal(false);
       }
     });

@@ -1263,6 +1263,12 @@ pub struct ConfirmPasswordReset {
     pub new_password: String,
 }
 
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
 pub async fn password_reset_start(
     State(state): State<AppState>,
     Json(req): Json<StartPasswordReset>,
@@ -1351,6 +1357,28 @@ pub async fn password_reset_confirm(
         )
     })?;
     Ok(axum::http::StatusCode::OK)
+}
+
+pub async fn password_change(
+    State(state): State<AppState>,
+    Extension(crate::auth::AuthedAccount(account)): Extension<crate::auth::AuthedAccount>,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<AuthResponse>, (StatusCode, Json<ApiError>)> {
+    use crate::auth::password;
+
+    let stored_hash = Account::password_hash(&state.pool, &account.email)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "account not found"))?;
+    if !password::verify_password(&req.current_password, &stored_hash) {
+        return Err(err(StatusCode::UNAUTHORIZED, "current password is wrong"));
+    }
+    let new_hash = password::hash_password(&req.new_password)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    Account::update_password_hash(&state.pool, &account.id, &new_hash)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
+    refresh_tokens::revoke_all_for_account(&state.pool, &account.id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("revoke refresh: {e}")))?;
+    Ok(Json(auth_response(&state, &account)?))
 }
 
 // ─── Codex Stage 18: deep-link handoff (Onboarding Option A) ────────────

@@ -2152,6 +2152,65 @@
       line-height: 1.45;
     }
 
+    #accountApp .account-modal.password-modal {
+      border-color: rgba(99, 216, 255, .30);
+    }
+
+    #accountApp .account-modal-form {
+      display: grid;
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    #accountApp .account-modal-form label {
+      display: grid;
+      gap: 7px;
+      color: #9fb0ba;
+      font-size: 12px;
+      font-weight: 850;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .account-modal-form input {
+      height: 44px;
+      min-width: 0;
+      border: 1px solid rgba(99, 216, 255, .24);
+      border-radius: 12px;
+      padding: 0 13px;
+      color: #fff;
+      background: rgba(255, 255, 255, .04);
+      font: inherit;
+      font-size: 15px;
+      outline: none;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    #accountApp .account-modal-form input:focus {
+      border-color: rgba(99, 216, 255, .72);
+      box-shadow: 0 0 0 3px rgba(99, 216, 255, .12);
+    }
+
+    #accountApp .account-modal-message {
+      min-height: 1.1rem;
+      color: #8ea0aa;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    #accountApp .account-modal-message:empty {
+      display: none;
+    }
+
+    #accountApp .account-modal-message[data-tone="error"] {
+      color: #ff747d;
+    }
+
+    #accountApp .account-modal-message[data-tone="success"] {
+      color: #69f08f;
+    }
+
     #accountApp .account-modal-close {
       width: 34px;
       height: 34px;
@@ -4475,6 +4534,46 @@
     html[data-bluey-theme="light"] #accountApp .account-profile-menu button:hover {
       background: #f1fbff;
       color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-modal-backdrop {
+      background: rgba(10, 24, 34, .38);
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-modal {
+      border-color: #dceaf2;
+      background: #ffffff;
+      box-shadow: 0 28px 90px rgba(40, 82, 110, .22);
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-modal.password-modal {
+      border-color: rgba(49, 146, 206, .30);
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-modal h2 {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-modal p,
+    html[data-bluey-theme="light"] #accountApp .account-modal-form label,
+    html[data-bluey-theme="light"] #accountApp .account-modal-message {
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-modal-form input {
+      border-color: #d8e8f0;
+      background: #fafdff;
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-modal-form input::placeholder {
+      color: #8da1ad;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-modal-close {
+      border-color: #d8e8f0;
+      background: #fafdff;
+      color: #657888;
     }
 
     html[data-bluey-theme="light"] #accountApp .auth-card-links a {

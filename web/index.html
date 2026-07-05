@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070425"
+    href="/assets/bluey-site.css?v=2026070426"
   >
   <script type="application/ld+json">
   {
@@ -270,7 +270,7 @@
             </button>
             <div class="account-profile-menu" id="accountProfileMenu" role="menu" hidden>
               <div class="profile-email" id="profileEmailLabel">Bluey account</div>
-              <a href="/password-reset" role="menuitem">Change Password</a>
+              <button id="changePasswordButton" type="button" role="menuitem">Change Password</button>
               <button class="danger" id="deleteAccountButton" type="button" role="menuitem">Delete Account</button>
               <button type="button" role="menuitem" data-sign-out>Logout</button>
             </div>
@@ -621,6 +621,36 @@
           </section>
         </section>
       </main>
+      <div class="account-modal-backdrop" id="changePasswordDialog" hidden>
+        <section class="account-modal password-modal" role="dialog" aria-modal="true" aria-labelledby="changePasswordTitle">
+          <div class="account-modal-head">
+            <div>
+              <h2 id="changePasswordTitle">Change password</h2>
+              <p>Update the password for <span id="changePasswordEmail">this Bluey account</span>.</p>
+            </div>
+            <button class="account-modal-close" id="changePasswordCancelX" type="button" aria-label="Close change password dialog">×</button>
+          </div>
+          <form class="account-modal-form" id="changePasswordForm">
+            <label for="changeCurrentPassword">
+              Current password
+              <input id="changeCurrentPassword" type="password" autocomplete="current-password" placeholder="Current password">
+            </label>
+            <label for="changeNewPassword">
+              New password
+              <input id="changeNewPassword" type="password" autocomplete="new-password" placeholder="New password (min 8 chars)">
+            </label>
+            <label for="changeConfirmPassword">
+              Confirm new password
+              <input id="changeConfirmPassword" type="password" autocomplete="new-password" placeholder="Confirm new password">
+            </label>
+            <div class="account-modal-message" id="changePasswordMessage" aria-live="polite"></div>
+            <div class="account-modal-actions">
+              <button class="account-button primary" id="changePasswordSubmit" type="submit">Update</button>
+              <button class="account-button ghost" id="changePasswordCancel" type="button">Cancel</button>
+            </div>
+          </form>
+        </section>
+      </div>
       <div class="account-modal-backdrop" id="deleteAccountDialog" hidden>
         <section class="account-modal" role="dialog" aria-modal="true" aria-labelledby="deleteAccountTitle">
           <div class="account-modal-head">
@@ -949,7 +979,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070425"
+    src="/assets/bluey-site.js?v=2026070426"
   ></script>
 </body>
 </html>
