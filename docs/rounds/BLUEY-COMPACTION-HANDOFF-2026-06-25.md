@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 20:46 EDT
+Latest checkpoint: 2026-07-04 21:09 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,7 +30,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-350-MACOS-CLICKTHROUGH-SCROLL-RECURSION.md`; the next canonical Bluey round doc should start at `ROUND-351-...`.
+- Latest completed Bluey round doc is `ROUND-351-CLICKTHROUGH-CONTENT-SCROLL-POLICY.md`; the next canonical Bluey round doc should start at `ROUND-352-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
@@ -5899,6 +5899,88 @@ Deployment status:
 - `https://bluey.sh/health` reports commit `210a4f7559ffd13fe263b3891d75b5e93c39c9f3`.
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
+
+## Latest Round 351: Click-Through Content Scroll Policy
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Runtime worktree for this round:
+
+```bash
+/Users/uno/Downloads/cue-runtime-stream-attachments
+```
+
+Current branch:
+
+```bash
+codex/bluey-stream-attachments-20260704
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-351-CLICKTHROUGH-CONTENT-SCROLL-POLICY.md`
+
+Trigger:
+
+- The owner asked for a better click-through scroll model:
+  - scroll over question/answer content should scroll Bluey
+  - scroll over blank black/empty panel area should pass through to the app behind Bluey
+  - a visible Bluey scrollbar/scroller should remain an intentional scroll target
+
+Product decision:
+
+- In click-through mode, Bluey captures feed scrolling only over real rendered card bubbles or the visible feed scroller.
+- Blank feed glass/background no longer acts like an invisible Bluey scroll target.
+- In normal interactive mode, the full feed region can still scroll Bluey because Bluey is intentionally active.
+
+What changed:
+
+- Added `FeedView.shouldCapturePassThroughScroll(at:)`.
+- It allows click-through feed scroll only over:
+  - visible question/answer/card bubble rects, or
+  - the visible vertical feed scroller.
+- Updated `ExpandedPanelView.scrollWheel(with:)` pass-through feed routing.
+- Updated `ExpandedPanelView.routeScrollWheelAtScreenPoint(_:event:)` global click-through routing.
+- Desktop workspace version bumped to `0.1.90`.
+
+Windows parity:
+
+- This round changes macOS AppKit click-through scroll routing.
+- Windows overlay is a separate native C implementation and does not share this Swift `FeedView` / `ExpandedPanelView` path.
+- Desired Windows parity behavior is the same product rule: content or visible scroller captures scroll; blank overlay space passes through.
+
+Verification so far:
+
+```bash
+swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift
+cd native/macos/cue-overlay && swift build -c release
+cargo fmt --check
+cargo check -p cue-cli -p cue-daemon
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem PUBLISH_DO=1 PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem scripts/bluey-release-live-verify.sh 0.1.90
+curl -fsSL https://bluey.sh/install.sh | bash
+/Users/uno/.bluey/bin/bluey --version
+/Users/uno/.bluey/bin/bluey-daemon --version
+/Users/uno/.bluey/bin/bluey off
+/Users/uno/.bluey/bin/bluey on
+/Users/uno/.bluey/bin/bluey status
+```
+
+Deployment status:
+
+- Desktop release `0.1.90` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.90/bluey-0.1.90-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `260f5351872fedb552370a39aa87217b1eb4652dc3271d52d4bd70ff1879738b`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.90`
+- Public installer smoke installed `0.1.90` locally and both installed binaries report `0.1.90`.
+- Local daemon restarted successfully with pid `61294`.
 
 ## Latest Round 350: macOS Click-Through Scroll Recursion
 

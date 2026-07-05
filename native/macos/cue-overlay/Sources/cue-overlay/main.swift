@@ -3070,6 +3070,31 @@ private final class FeedView: NSView {
         updateScrollPinAfterUserInput()
     }
 
+    func shouldCapturePassThroughScroll(at point: NSPoint) -> Bool {
+        guard bounds.contains(point), !cards.isEmpty else { return false }
+        let scrollPoint = scroll.convert(point, from: self)
+        guard scroll.bounds.contains(scrollPoint) else { return false }
+
+        if let scroller = scroll.verticalScroller,
+           !scroller.isHidden,
+           scroller.alphaValue > 0.01,
+           scroller.convert(scroller.bounds, to: self)
+               .insetBy(dx: -8, dy: -8)
+               .contains(point) {
+            return true
+        }
+
+        for row in stack.arrangedSubviews where !row.isHidden && row.alphaValue > 0.01 {
+            guard let bubble = row.subviews.first else { continue }
+            let bubbleRect = bubble.convert(bubble.bounds, to: self)
+                .insetBy(dx: -4, dy: -4)
+            if bubbleRect.contains(point) {
+                return true
+            }
+        }
+        return false
+    }
+
     func scrollByKeyboard(direction: CGFloat) {
         let step = max(120, scroll.contentView.bounds.height * 0.82)
         scrollClipView(scroll.contentView, documentView: scroll.documentView, deltaY: direction * step)
@@ -6073,6 +6098,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         if passThroughMode {
             if rectForView(feed).contains(localPoint) {
+                let feedPoint = feed.convert(localPoint, from: self)
+                guard feed.shouldCapturePassThroughScroll(at: feedPoint) else {
+                    super.scrollWheel(with: event)
+                    return
+                }
                 feed.scrollByWheelEvent(event)
                 return
             }
@@ -6113,6 +6143,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         if rectForView(feed).contains(localPoint) {
+            let feedPoint = feed.convert(localPoint, from: self)
+            guard feed.shouldCapturePassThroughScroll(at: feedPoint) else {
+                return false
+            }
             feed.scrollByWheelEvent(event)
             return true
         }
