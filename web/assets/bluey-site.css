@@ -660,72 +660,89 @@
       color: #061114;
     }
 
-    #productSite .theme-toggle {
+    #productSite .theme-toggle,
+    #accountApp .theme-toggle {
+      appearance: none;
+      -webkit-appearance: none;
       position: relative;
       display: inline-flex;
       align-items: center;
       justify-content: flex-start;
-      width: 58px;
-      height: 30px;
-      padding: 0 4px;
+      width: 54px;
+      min-width: 54px;
+      height: 28px;
+      padding: 2px;
       border: 1px solid rgba(99, 216, 255, .42);
       border-radius: 999px;
-      background: rgba(99, 216, 255, .08);
-      box-shadow: inset 0 0 18px rgba(79, 141, 255, .12);
+      background:
+        linear-gradient(135deg, rgba(99, 216, 255, .16), transparent 46%),
+        linear-gradient(145deg, #061015, #111923);
+      color: #dff8ff;
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, .10),
+        inset 0 -8px 18px rgba(99, 216, 255, .05),
+        0 8px 18px rgba(0, 0, 0, .22);
       cursor: pointer;
-      transition: background .2s, border-color .2s, box-shadow .2s, transform .2s;
+      flex: 0 0 auto;
+      transition: background .2s, border-color .2s, color .2s, box-shadow .2s, transform .2s;
     }
 
-    #productSite .theme-toggle:hover {
+    #productSite .theme-toggle:hover,
+    #accountApp .theme-toggle:hover {
       border-color: rgba(99, 216, 255, .68);
-      box-shadow: inset 0 0 18px rgba(79, 141, 255, .14), 0 10px 28px rgba(79, 141, 255, .16);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, .12),
+        0 12px 30px rgba(0, 0, 0, .34),
+        0 0 22px rgba(99, 216, 255, .18);
       transform: translateY(-1px);
     }
 
-    #productSite .theme-toggle:focus-visible {
+    #productSite .theme-toggle:focus-visible,
+    #accountApp .theme-toggle:focus-visible {
       outline: 2px solid rgba(99, 216, 255, .62);
       outline-offset: 3px;
     }
 
-    #productSite .theme-toggle-knob {
+    #productSite .theme-toggle-knob,
+    #accountApp .theme-toggle-knob {
       position: relative;
       display: inline-grid;
       place-items: center;
       width: 22px;
       height: 22px;
+      flex: 0 0 auto;
       border-radius: 999px;
-      background: linear-gradient(135deg, #d7f7ff 0%, var(--bluey-accent) 45%, var(--bluey-accent-2) 100%);
-      box-shadow: 0 0 18px rgba(99, 216, 255, .52);
+      background:
+        radial-gradient(circle at 35% 25%, rgba(255, 255, 255, .34), transparent 32%),
+        linear-gradient(145deg, var(--bluey-accent), var(--bluey-accent-2));
+      box-shadow:
+        0 4px 12px rgba(99, 216, 255, .25),
+        inset 0 1px 0 rgba(255, 255, 255, .42);
+      transform: translateX(0);
+      transition: transform .24s cubic-bezier(.2, .8, .2, 1), background .2s, box-shadow .2s;
     }
 
-    #productSite .theme-toggle-knob::before,
-    #productSite .theme-toggle-knob::after {
-      content: "";
+    #productSite .theme-toggle-icon,
+    #accountApp .theme-toggle-icon {
       position: absolute;
-      border-radius: 999px;
-      background: #061114;
-      opacity: .85;
+      width: 13px;
+      height: 13px;
+      display: block;
+      color: #061114;
+      filter: drop-shadow(0 1px 2px rgba(4, 18, 28, .22));
+      transition: opacity .18s ease, transform .22s ease, color .2s, filter .2s;
     }
 
-    #productSite .theme-toggle-knob::before {
-      width: 4px;
-      height: 4px;
-      box-shadow:
-        0 -7px 0 rgba(6, 17, 20, .82),
-        0 7px 0 rgba(6, 17, 20, .82),
-        7px 0 0 rgba(6, 17, 20, .82),
-        -7px 0 0 rgba(6, 17, 20, .82);
+    #productSite .theme-toggle-sun,
+    #accountApp .theme-toggle-sun {
+      opacity: 1;
+      transform: scale(1) rotate(0deg);
     }
 
-    #productSite .theme-toggle-knob::after {
-      width: 3px;
-      height: 3px;
-      transform: rotate(45deg);
-      box-shadow:
-        5px 5px 0 rgba(6, 17, 20, .70),
-        -5px -5px 0 rgba(6, 17, 20, .70),
-        5px -5px 0 rgba(6, 17, 20, .70),
-        -5px 5px 0 rgba(6, 17, 20, .70);
+    #productSite .theme-toggle-moon,
+    #accountApp .theme-toggle-moon {
+      opacity: 0;
+      transform: scale(.72) rotate(-16deg);
     }
 
     html[data-bluey-theme="light"] {
@@ -759,16 +776,47 @@
       color: #0c1d2a;
     }
 
-    html[data-bluey-theme="light"] #productSite .theme-toggle {
-      justify-content: flex-end;
+    html[data-bluey-theme="light"] #productSite .theme-toggle,
+    html[data-bluey-theme="light"] #accountApp .theme-toggle {
+      justify-content: flex-start;
       border-color: rgba(48, 151, 210, .28);
-      background: #ffffff;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9), 0 8px 24px rgba(34, 87, 118, .10);
+      background:
+        linear-gradient(135deg, rgba(99, 216, 255, .12), transparent 48%),
+        linear-gradient(145deg, rgba(255, 255, 255, .96), rgba(237, 248, 253, .88));
+      color: #172535;
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, .92),
+        inset 0 -8px 18px rgba(99, 216, 255, .045),
+        0 8px 18px rgba(34, 87, 118, .10);
     }
 
-    html[data-bluey-theme="light"] #productSite .theme-toggle-knob {
-      background: linear-gradient(135deg, #ffffff 0%, #d7f7ff 48%, #74dfff 100%);
-      box-shadow: 0 4px 14px rgba(48, 151, 210, .24);
+    html[data-bluey-theme="light"] #productSite .theme-toggle-knob,
+    html[data-bluey-theme="light"] #accountApp .theme-toggle-knob {
+      background:
+        radial-gradient(circle at 35% 25%, rgba(255, 255, 255, .55), transparent 32%),
+        linear-gradient(145deg, #fff, #e6f8ff);
+      box-shadow:
+        0 4px 11px rgba(34, 87, 118, .13),
+        inset 0 1px 0 rgba(255, 255, 255, .92);
+      transform: translateX(26px);
+    }
+
+    html[data-bluey-theme="light"] #productSite .theme-toggle-icon,
+    html[data-bluey-theme="light"] #accountApp .theme-toggle-icon {
+      color: #172535;
+      filter: drop-shadow(0 2px 5px rgba(0, 0, 0, .12));
+    }
+
+    html[data-bluey-theme="light"] #productSite .theme-toggle-sun,
+    html[data-bluey-theme="light"] #accountApp .theme-toggle-sun {
+      opacity: 0;
+      transform: scale(.72) rotate(22deg);
+    }
+
+    html[data-bluey-theme="light"] #productSite .theme-toggle-moon,
+    html[data-bluey-theme="light"] #accountApp .theme-toggle-moon {
+      opacity: 1;
+      transform: scale(1) rotate(0deg);
     }
 
     html[data-bluey-theme="light"] #productSite .hero h1 {
@@ -1329,6 +1377,10 @@
       margin-top: 14px;
     }
 
+    .trial-actions:has(#trialCopyLogin[hidden]) {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
     .trial-actions .btn {
       display: inline-flex;
       align-items: center;
@@ -1494,6 +1546,8 @@
       --bluey-accent: #63d8ff;
       --bluey-accent-2: #4f8dff;
       --bluey-line: #1a1a1a;
+      --bluey-text: #e0e0e0;
+      --bluey-muted: #777;
     }
 
     #accountApp a,
@@ -3675,5 +3729,524 @@
 
       #accountApp .account-top .account-actions-row {
         justify-content: center;
+      }
+    }
+
+    /* Bluey auth/legal polish keeps Pinky's structure while staying Bluey blue. */
+    #accountApp.is-guest .account-shell {
+      padding-top: 0;
+    }
+
+    #accountApp .account-theme-slot {
+      display: none;
+    }
+
+    #accountApp.is-guest .account-theme-slot {
+      position: fixed;
+      top: 1rem;
+      right: 1.5rem;
+      z-index: 90;
+      display: block;
+    }
+
+    #accountApp.is-guest .account-top {
+      display: none !important;
+    }
+
+    #accountApp.is-guest .account-main {
+      width: 100%;
+      max-width: 430px;
+      min-height: 100vh;
+      min-height: 100dvh;
+      padding: 4.5rem 1.25rem 2rem;
+    }
+
+    #accountApp.is-guest .account-hero {
+      display: none;
+    }
+
+    #accountApp.is-guest .account-card {
+      max-width: 410px;
+      padding: 2.4rem 2.1rem;
+      border-color: #1f1f1f;
+      border-radius: 16px;
+      background: #0a0a0a;
+    }
+
+    #accountApp .auth-brand {
+      display: grid;
+      justify-items: center;
+      gap: 1rem;
+      margin-bottom: 1.45rem;
+    }
+
+    #accountApp .auth-logo {
+      width: 54px;
+      height: 54px;
+      border-radius: 14px;
+      background: rgba(99, 216, 255, .12);
+      box-shadow: 0 0 0 1px rgba(99, 216, 255, .38), 0 0 30px rgba(99, 216, 255, .20);
+    }
+
+    #accountApp .auth-wordmark {
+      width: 128px;
+      height: auto;
+      filter: drop-shadow(0 0 10px rgba(99, 216, 255, .56)) drop-shadow(0 0 28px rgba(79, 141, 255, .32));
+    }
+
+    #accountApp.is-guest .account-card h2 {
+      margin: 0 0 1.35rem;
+      color: #9b9b9b;
+      font-size: 1.08rem;
+      font-weight: 500;
+      text-align: center;
+      letter-spacing: 0;
+    }
+
+    #accountApp.is-guest #accountAuthCard > p {
+      display: none;
+      max-width: 20rem;
+      margin: -.75rem auto 1.25rem;
+      color: #8b8b8b;
+      text-align: center;
+      font-size: .88rem;
+      line-height: 1.5;
+    }
+
+    #accountApp.is-guest.is-verifying #accountAuthCard > p {
+      display: block;
+    }
+
+    #accountApp.is-guest .account-form {
+      gap: .72rem;
+    }
+
+    #accountApp.is-guest .account-form label:not(.terms-check) {
+      display: block;
+      color: transparent;
+      font-size: 0;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    #accountApp.is-guest .account-form input {
+      height: 54px;
+      margin-top: 0;
+      padding: 0 1rem;
+      border-color: #252525;
+      border-radius: 10px;
+      background: #121212;
+      color: #f1f4f6;
+      font-size: 1rem;
+      font-weight: 500;
+      letter-spacing: 0;
+    }
+
+    #accountApp.is-guest .account-form input::placeholder {
+      color: #777;
+    }
+
+    #accountApp.is-guest .account-form input:focus {
+      border-color: var(--bluey-accent);
+      box-shadow: 0 0 0 3px rgba(99, 216, 255, .10);
+    }
+
+    #accountApp .password-input {
+      position: relative;
+      display: block;
+    }
+
+    #accountApp .password-input input {
+      padding-right: 3rem;
+    }
+
+    #accountApp .password-toggle {
+      position: absolute;
+      top: 50%;
+      right: .7rem;
+      width: 2rem;
+      height: 2rem;
+      padding: 0;
+      transform: translateY(-50%);
+      border: 0;
+      background: transparent;
+      color: #555;
+      cursor: pointer;
+    }
+
+    #accountApp .password-toggle::before,
+    #accountApp .password-toggle::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      transition: border-color .18s ease, background .18s ease, opacity .18s ease;
+    }
+
+    #accountApp .password-toggle::before {
+      width: .98rem;
+      height: .98rem;
+      border: 2px solid currentColor;
+      border-radius: 78% 18%;
+      transform: translate(-50%, -50%) rotate(45deg);
+    }
+
+    #accountApp .password-toggle::after {
+      width: .34rem;
+      height: .34rem;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    #accountApp .password-toggle:hover,
+    #accountApp .password-toggle.is-showing {
+      color: var(--bluey-accent);
+    }
+
+    #accountApp.is-guest .terms-check {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: flex-start;
+      gap: .5rem;
+      margin: .1rem 0;
+    }
+
+    #accountApp.is-guest .account-form .terms-check input {
+      width: 14px;
+      height: 14px;
+      margin: .17rem 0 0;
+      padding: 0;
+      border-radius: 3px;
+      background: #111;
+      accent-color: var(--bluey-accent);
+    }
+
+    #accountApp.is-guest .terms-check span {
+      color: #858585;
+      font-size: .76rem;
+    }
+
+    #accountApp.is-guest .auth-submit-row {
+      margin-top: .45rem;
+    }
+
+    #accountApp.is-guest #accountAuthCard .account-button {
+      min-height: 52px;
+      border-radius: 10px;
+      font-size: .98rem;
+      font-weight: 760;
+    }
+
+    #accountApp.is-guest .auth-switch {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: .28rem;
+      margin-top: 1rem;
+      color: #777;
+      text-align: center;
+      font-size: .88rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .auth-link-button {
+      appearance: none;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--bluey-accent);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 720;
+      text-decoration: none;
+    }
+
+    #accountApp .auth-link-button:hover {
+      text-decoration: underline;
+    }
+
+    #accountApp.is-verifying .auth-switch {
+      gap: .7rem .32rem;
+    }
+
+    #accountApp.is-verifying #createAccountButton {
+      flex: 1 0 100%;
+      min-height: 50px;
+      border: 1px solid #272727;
+      border-radius: 10px;
+      background: #121212;
+      color: #e9e9e9;
+      font-weight: 760;
+      text-decoration: none;
+    }
+
+    #accountApp.is-verifying #createAccountButton:hover {
+      border-color: rgba(99, 216, 255, .38);
+      color: var(--bluey-accent);
+      text-decoration: none;
+    }
+
+    #accountApp.is-guest #signupOtp {
+      text-align: center;
+      letter-spacing: .28em;
+      font-size: 1.14rem;
+    }
+
+    #accountApp .auth-card-links {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1.55rem;
+      margin: 1.35rem 0 1.15rem;
+    }
+
+    #accountApp .auth-card-links a {
+      color: #8a8a8a;
+      text-decoration: none;
+      font-size: .88rem;
+      font-weight: 620;
+    }
+
+    #accountApp .auth-card-links a:hover {
+      color: var(--bluey-accent);
+    }
+
+    #accountApp.is-guest .account-note {
+      margin: 0;
+      padding-top: 1.25rem;
+      border-top: 1px solid rgba(99, 216, 255, .16);
+      color: #777;
+      font-size: .82rem;
+      line-height: 1.5;
+    }
+
+    #accountApp.is-guest .account-note a {
+      color: #a9eeff;
+      font-weight: 720;
+    }
+
+    #accountApp.is-guest #accountAuthMessage:not(:empty) {
+      margin: 0 0 1.15rem;
+      padding: .8rem .9rem;
+      border: 1px solid rgba(99, 216, 255, .28);
+      border-radius: 10px;
+      background: rgba(99, 216, 255, .08);
+      color: #bdefff;
+      text-align: left;
+      font-size: .9rem;
+    }
+
+    #accountApp.is-guest #accountAuthMessage[data-tone="error"]:not(:empty) {
+      border-color: rgba(255, 96, 111, .38);
+      background: rgba(90, 18, 24, .52);
+      color: #ff8f98;
+    }
+
+    #accountApp.is-guest #accountAuthMessage[data-tone="success"]:not(:empty) {
+      border-color: rgba(115, 247, 186, .34);
+      background: rgba(24, 91, 61, .30);
+      color: #8dffc0;
+    }
+
+    #policyApp .policy-shell {
+      min-height: 100vh;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    #policyApp .policy-card {
+      width: min(720px, calc(100% - 4rem));
+      margin: 3rem auto 1.5rem;
+      padding: 0 0 2rem;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+    }
+
+    #policyApp .policy-card h1 {
+      font-size: 1.9rem;
+    }
+
+    #policyApp .policy-card h2 {
+      color: #e7eef2;
+      font-size: 1rem;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    #policyApp .policy-card p,
+    #policyApp .policy-card li {
+      color: #adadad;
+      font-size: .94rem;
+    }
+
+    #policyApp .page-footer-links {
+      margin-top: auto;
+    }
+
+    html[data-bluey-theme="light"] #accountApp,
+    html[data-bluey-theme="light"] #downloadApp,
+    html[data-bluey-theme="light"] #policyApp {
+      background: #f7fbff;
+      color: #102130;
+      --bluey-line: #dceaf2;
+      --bluey-text: #102130;
+      --bluey-muted: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-top,
+    html[data-bluey-theme="light"] #downloadApp .site-nav,
+    html[data-bluey-theme="light"] #policyApp .site-nav {
+      border-bottom-color: #dceaf2;
+      background: rgba(247, 251, 255, .94);
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-guest .account-card,
+    html[data-bluey-theme="light"] #accountApp.is-authed .dashboard-card,
+    html[data-bluey-theme="light"] #accountApp .reload-card,
+    html[data-bluey-theme="light"] #accountApp .dashboard-section,
+    html[data-bluey-theme="light"] #accountApp .account-kpi,
+    html[data-bluey-theme="light"] #accountApp .usage-row,
+    html[data-bluey-theme="light"] #accountApp .device-row,
+    html[data-bluey-theme="light"] #accountApp .session-row,
+    html[data-bluey-theme="light"] #accountApp .session-detail,
+    html[data-bluey-theme="light"] #downloadApp .download-card,
+    html[data-bluey-theme="light"] #downloadApp .platform-instructions,
+    html[data-bluey-theme="light"] #downloadApp .download-note,
+    html[data-bluey-theme="light"] #downloadApp .viewer-note {
+      border-color: #dceaf2;
+      background: #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .auth-logo {
+      background: rgba(99, 216, 255, .18);
+      box-shadow: 0 0 0 1px rgba(49, 146, 206, .30), 0 0 24px rgba(49, 146, 206, .16);
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-guest .account-card h2,
+    html[data-bluey-theme="light"] #accountApp .dashboard-head h2,
+    html[data-bluey-theme="light"] #accountApp .section-head h3,
+    html[data-bluey-theme="light"] #accountApp .reload-card h3,
+    html[data-bluey-theme="light"] #downloadApp .download-hero h1,
+    html[data-bluey-theme="light"] #policyApp .policy-card h1 {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-guest #accountAuthCard > p,
+    html[data-bluey-theme="light"] #accountApp .account-hero p,
+    html[data-bluey-theme="light"] #accountApp .dashboard-head p,
+    html[data-bluey-theme="light"] #accountApp .section-head p,
+    html[data-bluey-theme="light"] #accountApp .reload-card p,
+    html[data-bluey-theme="light"] #accountApp.is-guest .auth-switch,
+    html[data-bluey-theme="light"] #downloadApp .download-hero p,
+    html[data-bluey-theme="light"] #policyApp .policy-card p,
+    html[data-bluey-theme="light"] #policyApp .policy-card li {
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-guest .account-form input,
+    html[data-bluey-theme="light"] #accountApp .auto-reload-fields input,
+    html[data-bluey-theme="light"] #accountApp .manual-reload-input,
+    html[data-bluey-theme="light"] #accountApp .square-card-container,
+    html[data-bluey-theme="light"] #downloadApp .install-command,
+    html[data-bluey-theme="light"] #downloadApp .cmd {
+      border-color: #d8e8f0;
+      background: #fafdff;
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-guest .account-form input::placeholder {
+      color: #8da1ad;
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-verifying #createAccountButton {
+      border-color: #d8e8f0;
+      background: #fafdff;
+      color: #173447;
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-guest .account-note {
+      border-top-color: #dceaf2;
+      color: #667887;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .auth-link-button,
+    html[data-bluey-theme="light"] #accountApp.is-guest .account-note a,
+    html[data-bluey-theme="light"] #accountApp .auth-card-links a:hover {
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .auth-card-links a {
+      color: #657888;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .page-footer-links,
+    html[data-bluey-theme="light"] #downloadApp .page-footer-links,
+    html[data-bluey-theme="light"] #policyApp .page-footer-links {
+      color: #536879;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .page-footer-links a,
+    html[data-bluey-theme="light"] #downloadApp .page-footer-links a,
+    html[data-bluey-theme="light"] #policyApp .page-footer-links a {
+      color: #132839;
+    }
+
+    @media (max-width: 520px) {
+      #productSite .nav {
+        padding: 1rem;
+        column-gap: .75rem;
+      }
+
+      #productSite .brand-wordmark {
+        width: 58px;
+      }
+
+      #productSite .nav-links {
+        gap: .55rem;
+      }
+
+      #productSite .nav-links a,
+      #productSite .nav-links .nav-signout {
+        font-size: .82rem;
+      }
+
+      #productSite .nav-links .btn-nav {
+        padding: .45rem .78rem;
+      }
+
+      #productSite .theme-toggle {
+        width: 48px;
+        min-width: 48px;
+        height: 26px;
+      }
+
+      #productSite .theme-toggle-knob {
+        width: 20px;
+        height: 20px;
+      }
+
+      html[data-bluey-theme="light"] #productSite .theme-toggle-knob {
+        transform: translateX(22px);
+      }
+
+      #accountApp.is-guest .account-main {
+        padding: 4.25rem 1rem 1.5rem;
+      }
+
+      #accountApp.is-guest .account-card {
+        padding: 2rem 1.35rem;
+      }
+
+      #accountApp .auth-card-links {
+        gap: 1rem;
+      }
+
+      .trial-actions,
+      .trial-actions:has(#trialCopyLogin[hidden]) {
+        grid-template-columns: 1fr;
       }
     }

@@ -7,7 +7,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const productSite = document.getElementById('productSite');
     const downloadRoutes = new Set(['/download', '/install']);
     const accountRoutes = new Set(['/account', '/reload', '/link', '/login', '/device', '/verify-email', '/password-reset']);
-    const policyRoutes = new Set(['/docs/privacy', '/docs/terms', '/docs/disguise']);
+    const policyRoutes = new Set(['/privacy', '/terms', '/docs/privacy', '/docs/terms', '/docs/disguise']);
     function normalizeRoutePath(path) {
       const value = String(path || '').trim();
       if (!value || !value.startsWith('/')) return '';
@@ -422,30 +422,68 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       modal.hidden = !open;
     }
 
-    function renderTrialModal({ title, copy, email, password, expires, note, canCopy = true }) {
+    function renderTrialModal({
+      title,
+      copy,
+      email,
+      password,
+      expires,
+      note,
+      canCopy = true,
+      showCredentials = true,
+      accountActionText = 'Dashboard',
+      accountActionHref = '/account',
+      downloadActionText = 'Download Bluey',
+    }) {
       const titleEl = document.getElementById('trialModalTitle');
       const copyEl = document.getElementById('trialModalCopy');
       const emailEl = document.getElementById('trialEmail');
       const passwordEl = document.getElementById('trialPassword');
       const expiresEl = document.getElementById('trialExpires');
       const noteEl = document.getElementById('trialNote');
+      const gridEl = document.querySelector('#blueyTrialModal .trial-grid');
       const copyButton = document.getElementById('trialCopyLogin');
+      const accountAction = document.getElementById('trialAccountAction');
+      const downloadAction = document.getElementById('trialDownloadAction');
       if (titleEl) titleEl.textContent = title || 'Bluey trial';
       if (copyEl) copyEl.textContent = copy || '';
       if (emailEl) emailEl.textContent = email || '-';
       if (passwordEl) passwordEl.textContent = password || '-';
       if (expiresEl) expiresEl.textContent = expires ? formatDeviceTime(expires) : '24 hours';
       if (noteEl) noteEl.textContent = note || '';
-      if (copyButton) copyButton.disabled = !canCopy;
+      if (gridEl) gridEl.hidden = !showCredentials;
+      if (copyButton) {
+        copyButton.disabled = !canCopy;
+        copyButton.hidden = !canCopy;
+      }
+      if (accountAction) {
+        accountAction.textContent = accountActionText;
+        accountAction.setAttribute('href', accountActionHref);
+      }
+      if (downloadAction) downloadAction.textContent = downloadActionText;
     }
 
-    function trialStartErrorCopy(error) {
+    function trialStartErrorState(error) {
       const message = String(error?.message || '').toLowerCase();
-      if (!message) return 'Bluey could not create a temporary trial right now. Try again in a minute.';
-      if (message.includes('trial') || message.includes('velocity') || message.includes('already_used') || message.includes('rate')) {
-        return 'This browser or network has already used its temporary trial. Create an account to keep going.';
+      if (message.includes('404') || message.includes('501') || message.includes('unsupported method')) {
+        return {
+          title: 'Try Us is being connected',
+          copy: 'The Bluey website is updated, but the temporary-trial server endpoint is not live yet. You can still download Bluey or create a normal account now.',
+          note: 'No trial minutes were created and nothing was charged. The 15-minute trial will turn on after the API rollout finishes.',
+        };
       }
-      return 'Bluey could not create a temporary trial right now. Try again in a minute.';
+      if (message.includes('trial') || message.includes('velocity') || message.includes('already_used') || message.includes('rate')) {
+        return {
+          title: 'Trial already used here',
+          copy: 'This browser or network has already used its temporary trial. Create an account to keep going.',
+          note: 'Trials are limited per browser and network so the free 15 minutes cannot be looped indefinitely.',
+        };
+      }
+      return {
+        title: 'Try Us is temporarily unavailable',
+        copy: 'Bluey could not create a temporary trial right now. Download Bluey or create an account, then try again in a minute.',
+        note: 'No trial minutes were created and nothing was charged.',
+      };
     }
 
     async function startTrial() {
@@ -459,6 +497,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           expires: '',
           note: 'Temporary trials are for new users who have not signed in yet.',
           canCopy: false,
+          showCredentials: false,
         });
         setTrialModal(true);
         return;
@@ -488,17 +527,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           expires: trialCredentials.expires,
           note: 'Trial includes 15 free minutes for cloud work and expires after 24 hours unless you save it as an account.',
           canCopy: true,
+          showCredentials: true,
         });
         setTrialModal(true);
       } catch (error) {
+        const state = trialStartErrorState(error);
         renderTrialModal({
-          title: 'Try Us is unavailable',
-          copy: trialStartErrorCopy(error),
-          email: 'Create an account to continue',
-          password: 'Trial credentials are not available',
+          title: state.title,
+          copy: state.copy,
+          email: '',
+          password: '',
           expires: '',
-          note: 'Trials are limited per browser and network so the free 15 minutes cannot be looped indefinitely.',
+          note: state.note,
           canCopy: false,
+          showCredentials: false,
+          accountActionText: 'Create account',
+          accountActionHref: '/login',
         });
         setTrialModal(true);
       } finally {
@@ -524,15 +568,17 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (note) note.textContent = 'Copied. Keep this password somewhere safe if you may use another browser.';
     }
 
-    function accountMessage(text, auth = false) {
+    function accountMessage(text, auth = false, tone = '') {
       const el = document.getElementById(auth ? 'accountAuthMessage' : 'accountMessage');
-      if (el) el.textContent = text || '';
+      if (!el) return;
+      el.textContent = text || '';
+      el.dataset.tone = tone || '';
     }
 
     function requireSignupTerms() {
       const terms = document.getElementById('signupTerms');
       if (!terms || terms.checked) return true;
-      accountMessage('Accept Terms and Privacy to create an account.', true);
+      accountMessage('Accept Terms and Privacy to create an account.', true, 'error');
       terms.focus();
       return false;
     }
@@ -608,27 +654,43 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       accountAuthMode = mode === 'signup' ? 'signup' : 'login';
       const title = document.getElementById('accountAuthTitle');
       const copy = document.getElementById('accountAuthCopy');
+      const app = document.getElementById('accountApp');
+      const emailLabel = document.getElementById('accountEmailLabel');
+      const passwordLabel = document.getElementById('accountPasswordLabel');
+      const confirmLabel = document.getElementById('accountPasswordConfirmLabel');
       const terms = document.getElementById('signupTermsLabel');
       const primary = document.getElementById('accountPrimaryButton');
       const create = document.getElementById('createAccountButton');
+      const switchText = document.getElementById('authSwitchText');
+      const differentEmail = document.getElementById('useDifferentEmailButton');
       const password = document.getElementById('accountPassword');
-      if (title) title.textContent = accountAuthMode === 'signup' ? 'Create account' : 'Sign in';
+      const passwordConfirm = document.getElementById('accountPasswordConfirm');
+      app?.classList.toggle('is-signup', accountAuthMode === 'signup');
+      app?.classList.remove('is-verifying');
+      if (title) title.textContent = accountAuthMode === 'signup' ? 'Create account' : 'Welcome back';
       if (copy) {
         copy.textContent = accountAuthMode === 'signup'
           ? 'Create a Bluey account, verify your email, then connect the desktop link if Terminal sent you here.'
-          : 'Use your Bluey account. If Terminal opened this page, sign in here, then connect the desktop link.';
+          : 'Sign in to manage credits, saved sessions, and desktop links.';
       }
+      if (emailLabel) emailLabel.hidden = false;
+      if (passwordLabel) passwordLabel.hidden = false;
+      if (confirmLabel) confirmLabel.hidden = accountAuthMode !== 'signup';
       if (terms) terms.hidden = accountAuthMode !== 'signup';
       if (primary) primary.textContent = accountAuthMode === 'signup' ? 'Send verification code' : 'Sign in';
-      if (create) create.textContent = accountAuthMode === 'signup' ? 'Sign in instead' : 'Create account';
+      if (primary) primary.hidden = false;
+      if (create) create.textContent = accountAuthMode === 'signup' ? 'Log in' : 'Sign up';
+      if (switchText) switchText.textContent = accountAuthMode === 'signup' ? 'Already have an account?' : "Don't have an account?";
+      if (differentEmail) differentEmail.hidden = true;
       if (password) {
         password.autocomplete = accountAuthMode === 'signup' ? 'new-password' : 'current-password';
         password.placeholder = accountAuthMode === 'signup' ? 'Create a password' : 'Password';
       }
+      if (passwordConfirm) passwordConfirm.required = accountAuthMode === 'signup';
       if (accountAuthMode !== 'signup') {
         setSignupOtpMode(false);
       }
-      refreshSignupCaptcha().catch((error) => accountMessage(error.message, true));
+      refreshSignupCaptcha().catch((error) => accountMessage(error.message, true, 'error'));
       accountMessage('', true);
     }
 
@@ -673,11 +735,39 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const otp = document.getElementById('signupOtp');
       const confirm = document.getElementById('confirmSignupButton');
       const create = document.getElementById('createAccountButton');
+      const app = document.getElementById('accountApp');
+      const title = document.getElementById('accountAuthTitle');
+      const copy = document.getElementById('accountAuthCopy');
+      const emailLabel = document.getElementById('accountEmailLabel');
+      const passwordLabel = document.getElementById('accountPasswordLabel');
+      const confirmLabel = document.getElementById('accountPasswordConfirmLabel');
+      const terms = document.getElementById('signupTermsLabel');
+      const captcha = document.getElementById('signupCaptcha');
+      const primary = document.getElementById('accountPrimaryButton');
+      const switchText = document.getElementById('authSwitchText');
+      const differentEmail = document.getElementById('useDifferentEmailButton');
       if (!label || !otp || !confirm || !create) return;
       pendingSignupEmail = enabled ? email : '';
+      app?.classList.toggle('is-verifying', enabled);
+      if (title && enabled) title.textContent = 'Check your email';
+      if (copy && enabled) {
+        copy.textContent = `Enter the 6-digit code we sent to ${email || 'your email'}.`;
+      } else if (copy && !enabled) {
+        copy.textContent = accountAuthMode === 'signup'
+          ? 'Create a Bluey account, verify your email, then connect the desktop link if Terminal sent you here.'
+          : 'Sign in to manage credits, saved sessions, and desktop links.';
+      }
+      if (emailLabel) emailLabel.hidden = enabled;
+      if (passwordLabel) passwordLabel.hidden = enabled;
+      if (confirmLabel) confirmLabel.hidden = enabled || accountAuthMode !== 'signup';
+      if (terms) terms.hidden = enabled || accountAuthMode !== 'signup';
+      if (captcha) captcha.hidden = enabled || captcha.hidden;
+      if (primary) primary.hidden = enabled;
       label.hidden = !enabled;
       confirm.hidden = !enabled;
-      create.textContent = enabled ? 'Resend code' : (accountAuthMode === 'signup' ? 'Sign in instead' : 'Create account');
+      create.textContent = enabled ? 'Resend code' : (accountAuthMode === 'signup' ? 'Log in' : 'Sign up');
+      if (switchText) switchText.textContent = enabled ? 'No email yet? Check spam or' : (accountAuthMode === 'signup' ? 'Already have an account?' : "Don't have an account?");
+      if (differentEmail) differentEmail.hidden = !enabled;
       if (!enabled) otp.value = '';
     }
 
@@ -779,7 +869,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const email = document.getElementById('accountEmail').value.trim();
       const password = document.getElementById('accountPassword').value;
       if (!email || !password) {
-        accountMessage('Email and password are required.', true);
+        accountMessage('Email and password are required.', true, 'error');
         return;
       }
       if (mode === 'signup' && !requireSignupTerms()) return;
@@ -796,15 +886,21 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     async function startSignupOtp() {
       const email = document.getElementById('accountEmail').value.trim();
       const password = document.getElementById('accountPassword').value;
+      const passwordConfirm = document.getElementById('accountPasswordConfirm')?.value || '';
       if (!email || !password) {
-        accountMessage('Email and password are required.', true);
+        accountMessage('Email and password are required.', true, 'error');
+        return;
+      }
+      if (password !== passwordConfirm) {
+        accountMessage('Passwords do not match.', true, 'error');
+        document.getElementById('accountPasswordConfirm')?.focus();
         return;
       }
       if (!requireSignupTerms()) return;
       await loadCaptchaConfig();
       const turnstileToken = signupTurnstilePayload();
       if (captchaConfig.provider === 'turnstile' && captchaConfig.site_key && !turnstileToken) {
-        accountMessage('Complete the security check to create an account.', true);
+        accountMessage('Complete the security check to create an account.', true, 'error');
         refreshSignupCaptcha().catch(() => {});
         return;
       }
@@ -819,7 +915,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }),
       });
       setSignupOtpMode(true, result.email || email);
-      accountMessage(`Code sent to ${result.email || email}. Enter it below to finish creating the account.`, true);
+      accountMessage('', true);
       document.getElementById('signupOtp')?.focus();
     }
 
@@ -827,7 +923,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const email = (pendingSignupEmail || document.getElementById('accountEmail').value).trim();
       const otp = document.getElementById('signupOtp').value.trim();
       if (!email || !otp) {
-        accountMessage('Enter the 6-digit verification code.', true);
+        accountMessage('Enter the 6-digit verification code.', true, 'error');
         return;
       }
       if (!requireSignupTerms()) return;
@@ -1788,8 +1884,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         accountApp.hidden = true;
         downloadApp.hidden = true;
         policyApp.hidden = false;
-        document.getElementById('privacyPolicy').hidden = currentPath !== '/docs/privacy';
-        document.getElementById('termsPolicy').hidden = currentPath !== '/docs/terms';
+        document.getElementById('privacyPolicy').hidden = currentPath !== '/privacy' && currentPath !== '/docs/privacy';
+        document.getElementById('termsPolicy').hidden = currentPath !== '/terms' && currentPath !== '/docs/terms';
         document.getElementById('disguisePolicy').hidden = currentPath !== '/docs/disguise';
         return;
       }
@@ -1812,14 +1908,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('accountForm').addEventListener('submit', (event) => {
         event.preventDefault();
         if (accountAuthMode === 'signup') {
-          startSignupOtp().catch((error) => accountMessage(error.message, true));
+          startSignupOtp().catch((error) => accountMessage(error.message, true, 'error'));
         } else {
-          accountAuth('login').catch((error) => accountMessage(error.message, true));
+          accountAuth('login').catch((error) => accountMessage(error.message, true, 'error'));
         }
       });
       document.getElementById('createAccountButton').addEventListener('click', () => {
         if (pendingSignupEmail) {
-          startSignupOtp().catch((error) => accountMessage(error.message, true));
+          startSignupOtp().catch((error) => accountMessage(error.message, true, 'error'));
           return;
         }
         if (accountAuthMode === 'signup') {
@@ -1829,8 +1925,25 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           document.getElementById('accountEmail')?.focus();
         }
       });
+      document.getElementById('useDifferentEmailButton')?.addEventListener('click', () => {
+        setSignupOtpMode(false);
+        setAccountAuthMode('signup');
+        document.getElementById('accountEmail')?.focus();
+      });
+      document.querySelectorAll('[data-password-toggle]').forEach((button) => {
+        if (button.dataset.passwordReady === '1') return;
+        button.dataset.passwordReady = '1';
+        button.addEventListener('click', () => {
+          const target = document.getElementById(button.dataset.passwordToggle || '');
+          if (!target) return;
+          const showing = target.getAttribute('type') === 'text';
+          target.setAttribute('type', showing ? 'password' : 'text');
+          button.classList.toggle('is-showing', !showing);
+          button.setAttribute('aria-label', `${showing ? 'Show' : 'Hide'} ${target.id === 'accountPasswordConfirm' ? 'confirm password' : 'password'}`);
+        });
+      });
       document.getElementById('confirmSignupButton').addEventListener('click', () => {
-        confirmSignupOtp().catch((error) => accountMessage(error.message, true));
+        confirmSignupOtp().catch((error) => accountMessage(error.message, true, 'error'));
       });
       document.getElementById('trialConvertForm')?.addEventListener('submit', (event) => {
         event.preventDefault();

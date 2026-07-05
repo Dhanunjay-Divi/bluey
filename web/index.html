@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070403"
+    href="/assets/bluey-site.css?v=2026070408"
   >
   <script type="application/ld+json">
   {
@@ -103,8 +103,8 @@
           <a href="/account" data-auth-only hidden>Dashboard</a>
           <button class="nav-signout" type="button" data-auth-only data-sign-out hidden>Sign out</button>
           <a href="/docs/disguise">Controls</a>
-          <a href="/docs/privacy">Privacy</a>
-          <a href="/docs/terms">Terms</a>
+          <a href="/privacy">Privacy</a>
+          <a href="/terms">Terms</a>
         </div>
       </nav>
 
@@ -206,13 +206,26 @@
       </article>
 
       <div class="page-footer-links">
-        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Private context for live work</span><span class="dot">&middot;</span><a href="/how-bluey-works/">How it works</a><span class="dot">&middot;</span><a href="/bluey-faq/">FAQ</a><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Built with open source technology</span><span class="dot">&middot;</span><a href="/terms">Terms</a><span class="dot">&middot;</span><a href="/privacy">Privacy</a>
       </div>
     </div>
   </section>
 
   <section class="account-app" id="accountApp" hidden>
     <div class="account-shell">
+      <div class="account-theme-slot" aria-hidden="false">
+        <button class="theme-toggle" type="button" aria-label="Switch to light theme" aria-pressed="false">
+          <span class="theme-toggle-knob" aria-hidden="true">
+            <svg class="theme-toggle-icon theme-toggle-sun" viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="4.3" fill="currentColor"></circle>
+              <path d="M12 2.8v2.5M12 18.7v2.5M4.2 4.2 6 6M18 18l1.8 1.8M2.8 12h2.5M18.7 12h2.5M4.2 19.8 6 18M18 6l1.8-1.8" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"></path>
+            </svg>
+            <svg class="theme-toggle-icon theme-toggle-moon" viewBox="0 0 24 24" fill="none">
+              <path d="M18.7 14.2A7.5 7.5 0 0 1 9.8 5.3a7.7 7.7 0 1 0 8.9 8.9Z" fill="currentColor"></path>
+            </svg>
+          </span>
+        </button>
+      </div>
       <aside class="account-rail" aria-label="Bluey account navigation">
         <a class="brand" href="/">
           <img src="/assets/bluey-logo.svg" alt="">
@@ -229,7 +242,7 @@
         </div>
         <div class="account-rail-footer">
           <span>Credits are used for AI models, speech, screen analysis, and saved-session features.</span>
-          <span><a href="/docs/privacy">Privacy</a> · <a href="/docs/terms">Terms</a> · <a href="/docs/disguise">Controls</a></span>
+          <span><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> · <a href="/docs/disguise">Controls</a></span>
         </div>
       </aside>
 
@@ -269,17 +282,32 @@
 
         <section class="account-grid">
           <aside class="account-card" id="accountAuthCard">
-            <h2 id="accountAuthTitle">Sign in</h2>
-            <p id="accountAuthCopy">Use your Bluey account. If Terminal opened this page, sign in here, then connect the desktop link.</p>
+            <div class="auth-brand">
+              <img class="auth-logo" src="/assets/bluey-logo.svg" alt="">
+              <img class="auth-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
+            </div>
+            <div class="account-message" id="accountAuthMessage"></div>
+            <h2 id="accountAuthTitle">Welcome back</h2>
+            <p id="accountAuthCopy">Sign in to manage credits, saved sessions, and desktop links.</p>
             <div class="device-link-hint" id="deviceLinkHint" hidden></div>
             <form class="account-form" id="accountForm">
-              <label>
+              <label id="accountEmailLabel">
                 Email
                 <input id="accountEmail" type="email" autocomplete="email" placeholder="you@company.com" required>
               </label>
-              <label>
+              <label id="accountPasswordLabel" class="password-label">
                 Password
-                <input id="accountPassword" type="password" autocomplete="current-password" placeholder="Password" required>
+                <span class="password-input">
+                  <input id="accountPassword" type="password" autocomplete="current-password" placeholder="Password" required>
+                  <button class="password-toggle" type="button" data-password-toggle="accountPassword" aria-label="Show password"></button>
+                </span>
+              </label>
+              <label id="accountPasswordConfirmLabel" class="password-label" hidden>
+                Confirm password
+                <span class="password-input">
+                  <input id="accountPasswordConfirm" type="password" autocomplete="new-password" placeholder="Confirm password">
+                  <button class="password-toggle" type="button" data-password-toggle="accountPasswordConfirm" aria-label="Show confirm password"></button>
+                </span>
               </label>
               <label id="signupOtpLabel" hidden>
                 Verification code
@@ -287,17 +315,25 @@
               </label>
               <label class="terms-check" id="signupTermsLabel" hidden>
                 <input type="checkbox" id="signupTerms">
-                <span>I agree to the <a href="/docs/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/docs/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>.</span>
+                <span>I agree to the <a href="/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>.</span>
               </label>
               <div class="signup-captcha" id="signupCaptcha" hidden></div>
-              <div class="account-actions-row">
+              <div class="account-actions-row auth-submit-row">
                 <button class="account-button primary" id="accountPrimaryButton" type="submit">Sign in</button>
-                <button class="account-button" id="createAccountButton" type="button">Create account</button>
                 <button class="account-button primary" id="confirmSignupButton" type="button" hidden>Verify code</button>
               </div>
             </form>
-            <div class="account-message" id="accountAuthMessage"></div>
-            <div class="account-note"><a href="/password-reset">Forgot password?</a> By continuing, use Bluey under the <a href="/docs/terms">Terms</a> and <a href="/docs/privacy">Privacy Policy</a>.</div>
+            <div class="auth-switch">
+              <span id="authSwitchText">Don't have an account?</span>
+              <button class="auth-link-button" id="createAccountButton" type="button">Sign up</button>
+              <button class="auth-link-button" id="useDifferentEmailButton" type="button" hidden>use a different email</button>
+            </div>
+            <nav class="auth-card-links" aria-label="Account page links">
+              <a href="/">Home</a>
+              <a href="/download">Download</a>
+              <a href="/reload">Pricing</a>
+            </nav>
+            <div class="account-note"><a href="/password-reset">Forgot password?</a> By continuing, use Bluey under the <a href="/terms">Terms</a> and <a href="/privacy">Privacy Policy</a>.</div>
           </aside>
 
           <section class="account-card account-preview-card" id="accountPreviewCard">
@@ -376,7 +412,7 @@
                   </label>
                   <label class="terms-check">
                     <input type="checkbox" id="trialConvertTerms">
-                    <span>I agree to the <a href="/docs/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/docs/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>.</span>
+                    <span>I agree to the <a href="/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>.</span>
                   </label>
                   <button class="account-button primary" id="trialConvertStartButton" type="submit">Send verification code</button>
                 </div>
@@ -555,7 +591,7 @@
         </section>
       </div>
       <div class="page-footer-links">
-        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Private context for live work</span><span class="dot">&middot;</span><a href="/how-bluey-works/">How it works</a><span class="dot">&middot;</span><a href="/bluey-faq/">FAQ</a><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Built with open source technology</span><span class="dot">&middot;</span><a href="/terms">Terms</a><span class="dot">&middot;</span><a href="/privacy">Privacy</a>
       </div>
     </div>
   </section>
@@ -724,7 +760,7 @@
       </div>
 
       <div class="page-footer-links">
-        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Private context for live work</span><span class="dot">&middot;</span><a href="/how-bluey-works/">How it works</a><span class="dot">&middot;</span><a href="/bluey-faq/">FAQ</a><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Built with open source technology</span><span class="dot">&middot;</span><a href="/terms">Terms</a><span class="dot">&middot;</span><a href="/privacy">Privacy</a>
       </div>
     </div>
   </section>
@@ -737,7 +773,15 @@
       </a>
       <div class="nav-links">
         <button class="theme-toggle" type="button" aria-label="Switch to light theme" aria-pressed="false">
-          <span class="theme-toggle-knob" aria-hidden="true"></span>
+          <span class="theme-toggle-knob" aria-hidden="true">
+            <svg class="theme-toggle-icon theme-toggle-sun" viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="4.3" fill="currentColor"></circle>
+              <path d="M12 2.8v2.5M12 18.7v2.5M4.2 4.2 6 6M18 18l1.8 1.8M2.8 12h2.5M18.7 12h2.5M4.2 19.8 6 18M18 6l1.8-1.8" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"></path>
+            </svg>
+            <svg class="theme-toggle-icon theme-toggle-moon" viewBox="0 0 24 24" fill="none">
+              <path d="M18.7 14.2A7.5 7.5 0 0 1 9.8 5.3a7.7 7.7 0 1 0 8.9 8.9Z" fill="currentColor"></path>
+            </svg>
+          </span>
         </button>
         <a href="/download">Download</a>
         <a class="btn-nav" href="/login" data-guest-only>Login</a>
@@ -807,7 +851,7 @@
       </div>
       <p class="pricing-note">Teams are concierge for now.</p>
       <div class="footer-meta">
-        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Private context for live work</span><span class="dot">&middot;</span><a href="/how-bluey-works/">How it works</a><span class="dot">&middot;</span><a href="/bluey-faq/">FAQ</a><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Built with open source technology</span><span class="dot">&middot;</span><a href="/terms">Terms</a><span class="dot">&middot;</span><a href="/privacy">Privacy</a>
       </div>
     </footer>
   </main>
@@ -833,15 +877,15 @@
       </div>
       <div class="trial-actions">
         <button class="btn btn-primary" id="trialCopyLogin" type="button">Copy login</button>
-        <a class="btn btn-ghost" href="/download">Download Bluey</a>
-        <a class="btn btn-ghost" href="/account">Dashboard</a>
+        <a class="btn btn-ghost" id="trialDownloadAction" href="/download">Download Bluey</a>
+        <a class="btn btn-ghost" id="trialAccountAction" href="/account">Dashboard</a>
       </div>
       <div class="trial-note" id="trialNote">Trial includes 15 free minutes for cloud work and expires after 24 hours unless you save it as an account.</div>
     </section>
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070403"
+    src="/assets/bluey-site.js?v=2026070408"
   ></script>
 </body>
 </html>
