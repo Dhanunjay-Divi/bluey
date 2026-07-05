@@ -625,6 +625,7 @@
       width: 68px;
       height: auto;
       filter: drop-shadow(0 0 4px rgba(99, 216, 255, .18));
+      transform: translateY(2px);
     }
 
     #productSite .nav-links {
@@ -1682,6 +1683,7 @@
       width: 68px;
       height: auto;
       filter: drop-shadow(0 0 4px rgba(99, 216, 255, .18));
+      transform: translateY(2px);
     }
 
     #downloadApp .navlinks,
