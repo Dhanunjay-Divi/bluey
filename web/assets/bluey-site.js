@@ -273,57 +273,64 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function initProductJoinForm() {
-      const form = document.getElementById('productJoinForm');
-      if (!form || form.dataset.joinReady === '1') return;
-      form.dataset.joinReady = '1';
-      form.addEventListener('submit', (event) => {
-        const input = form.querySelector('input[name="user_code"]');
-        const code = normalizeDeviceCode(input?.value || '');
-        if (!code) {
-          event.preventDefault();
-          input?.focus();
-          return;
-        }
-        input.value = code;
-        rememberPendingDeviceCode(code);
-        if (accountToken()) {
-          event.preventDefault();
-          approveProductConnectCode(code, form);
-        }
+      document.querySelectorAll('[data-connect-code-form], #productJoinForm').forEach((form) => {
+        if (!form || form.dataset.joinReady === '1') return;
+        form.dataset.joinReady = '1';
+        form.addEventListener('submit', (event) => {
+          const input = form.querySelector('input[name="user_code"]');
+          const code = normalizeDeviceCode(input?.value || '');
+          if (!code) {
+            event.preventDefault();
+            input?.focus();
+            return;
+          }
+          input.value = code;
+          rememberPendingDeviceCode(code);
+          if (accountToken()) {
+            event.preventDefault();
+            approveProductConnectCode(code, form, form.dataset.statusTarget || '');
+          }
+        });
       });
     }
 
-    function productConnectStatus(text, tone = '') {
-      const el = document.getElementById('productConnectStatus');
-      if (!el) return;
-      el.textContent = text || '';
-      el.dataset.tone = tone || '';
+    function connectCodeStatus(targetId, text, tone = '') {
+      const el = targetId ? document.getElementById(targetId) : null;
+      if (el) {
+        el.textContent = text || '';
+        el.dataset.tone = tone || '';
+        return;
+      }
+      if (isAccountRoute) {
+        accountMessage(text, false, tone);
+      }
     }
 
-    async function approveProductConnectCode(code, form) {
+    async function approveProductConnectCode(code, form, statusTargetId = '') {
       const button = form?.querySelector('button[type="submit"]');
+      const previousText = button?.textContent || 'Connect';
       if (button) {
         button.disabled = true;
         button.textContent = 'Connecting...';
       }
-      productConnectStatus('Connecting this account to Bluey desktop...');
+      connectCodeStatus(statusTargetId, 'Connecting this account to Bluey desktop...');
       try {
         await apiJson('/auth/device/approve', {
           method: 'POST',
           body: JSON.stringify({ user_code: code }),
         });
         sessionStorage.setItem(`bluey_device_approved_${code}`, '1');
-        productConnectStatus('Connected. Return to Bluey desktop; it will finish automatically.', 'success');
+        connectCodeStatus(statusTargetId, 'Connected. Return to Bluey desktop; it will finish automatically.', 'success');
       } catch (error) {
         if (!accountToken()) {
           window.location.href = `/login?user_code=${encodeURIComponent(code)}`;
           return;
         }
-        productConnectStatus(`Could not connect: ${error.message}`, 'error');
+        connectCodeStatus(statusTargetId, `Could not connect: ${error.message}`, 'error');
       } finally {
         if (button) {
           button.disabled = false;
-          button.textContent = 'Connect';
+          button.textContent = previousText;
         }
       }
     }

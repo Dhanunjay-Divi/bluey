@@ -3636,6 +3636,65 @@
       background: transparent;
     }
 
+    #accountApp .account-top-connect {
+      display: inline-flex;
+      align-items: center;
+      gap: .38rem;
+      margin-left: .16rem;
+    }
+
+    #accountApp .account-top-connect input {
+      width: 106px;
+      height: 34px;
+      padding: 0 .75rem;
+      border: 1px solid rgba(99, 216, 255, .28);
+      border-radius: 8px;
+      background: #101010;
+      color: #e8f7ff;
+      font: inherit;
+      font-size: .82rem;
+      font-weight: 600;
+      outline: 0;
+      text-transform: uppercase;
+      transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
+    }
+
+    #accountApp .account-top-connect input::placeholder {
+      color: #555;
+      text-transform: none;
+    }
+
+    #accountApp .account-top-connect input:focus {
+      border-color: rgba(99, 216, 255, .66);
+      background: #12181b;
+      box-shadow: 0 0 0 2px rgba(99, 216, 255, .10);
+    }
+
+    #accountApp .account-top-connect button {
+      height: 34px;
+      padding: 0 .88rem;
+      border: 1px solid rgba(99, 216, 255, .34);
+      border-radius: 8px;
+      background: rgba(99, 216, 255, .10);
+      color: var(--bluey-accent);
+      cursor: pointer;
+      font: inherit;
+      font-size: .82rem;
+      font-weight: 800;
+      transition: border-color .18s ease, background .18s ease, color .18s ease, opacity .18s ease;
+    }
+
+    #accountApp .account-top-connect button:hover {
+      border-color: rgba(99, 216, 255, .68);
+      background: rgba(79, 141, 255, .16);
+      color: #bff8ff;
+    }
+
+    #accountApp .account-top-connect button:disabled {
+      cursor: wait;
+      opacity: .62;
+    }
+
     #accountApp .account-top .nav-cta {
       min-height: 34px;
       padding: 0 .95rem;
@@ -3661,11 +3720,11 @@
       position: relative;
       display: inline-grid;
       place-items: center;
-      width: 38px;
-      height: 38px;
-      border: 1px solid rgba(99, 216, 255, .48);
+      width: 34px;
+      height: 34px;
+      border: 1px solid rgba(99, 216, 255, .38);
       border-radius: 50%;
-      background: rgba(99, 216, 255, .06);
+      background: rgba(99, 216, 255, .045);
       color: var(--bluey-accent);
       cursor: pointer;
       transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
@@ -3673,15 +3732,15 @@
 
     #accountApp .profile-button:hover,
     #accountApp .profile-button[aria-expanded="true"] {
-      border-color: rgba(99, 216, 255, .82);
-      background: rgba(99, 216, 255, .12);
-      box-shadow: 0 0 20px rgba(99, 216, 255, .16);
+      border-color: rgba(99, 216, 255, .80);
+      background: rgba(99, 216, 255, .10);
+      box-shadow: 0 0 16px rgba(99, 216, 255, .14);
     }
 
     #accountApp .profile-glyph {
       position: relative;
-      width: 18px;
-      height: 18px;
+      width: 16px;
+      height: 16px;
     }
 
     #accountApp .profile-glyph::before,
@@ -3690,21 +3749,21 @@
       position: absolute;
       left: 50%;
       transform: translateX(-50%);
-      border: 2px solid currentColor;
+      border: 1.8px solid currentColor;
     }
 
     #accountApp .profile-glyph::before {
       top: 1px;
-      width: 7px;
-      height: 7px;
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
       background: transparent;
     }
 
     #accountApp .profile-glyph::after {
       bottom: 1px;
-      width: 15px;
-      height: 8px;
+      width: 13px;
+      height: 7px;
       border-bottom: 0;
       border-radius: 12px 12px 0 0;
     }
@@ -3714,7 +3773,7 @@
       top: calc(100% + .7rem);
       right: 0;
       z-index: 100;
-      min-width: 260px;
+      width: min(260px, calc(100vw - 2rem));
       overflow: hidden;
       border: 1px solid #242424;
       border-radius: 12px;
@@ -3723,10 +3782,10 @@
     }
 
     #accountApp .profile-email {
-      padding: 1rem 1.1rem;
+      padding: .82rem 1rem;
       border-bottom: 1px solid #1d1d1d;
       color: #777;
-      font-size: .9rem;
+      font-size: .82rem;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -3736,16 +3795,16 @@
     #accountApp .account-profile-menu button {
       display: flex;
       width: 100%;
-      min-height: 46px;
+      min-height: 41px;
       align-items: center;
-      padding: 0 1.1rem;
+      padding: 0 1rem;
       border: 0;
       border-bottom: 1px solid #1d1d1d;
       background: transparent;
       color: #e0e0e0;
       cursor: pointer;
       font: inherit;
-      font-size: .95rem;
+      font-size: .88rem;
       text-align: left;
       text-decoration: none;
     }
@@ -3757,8 +3816,12 @@
     }
 
     #accountApp .account-profile-menu .danger {
-      border-bottom: 0;
       color: #ff747d;
+    }
+
+    #accountApp .account-profile-menu a:last-child,
+    #accountApp .account-profile-menu button:last-child {
+      border-bottom: 0;
     }
 
     #accountApp.is-guest .account-top {
@@ -3790,6 +3853,10 @@
 
       #accountApp .account-top .account-actions-row {
         justify-content: center;
+      }
+
+      #accountApp .account-top-connect {
+        display: none !important;
       }
     }
 
@@ -4254,6 +4321,62 @@
     html[data-bluey-theme="light"] #accountApp .auth-link-button,
     html[data-bluey-theme="light"] #accountApp.is-guest .account-note a,
     html[data-bluey-theme="light"] #accountApp .auth-card-links a:hover {
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-top-connect input {
+      border-color: #d8e8f0;
+      background: #ffffff;
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-top-connect input::placeholder {
+      color: #8da1ad;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-top-connect button {
+      border-color: #bfe6f4;
+      background: #ebf9ff;
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .profile-button {
+      border-color: rgba(48, 151, 210, .34);
+      background: rgba(255, 255, 255, .72);
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .profile-button:hover,
+    html[data-bluey-theme="light"] #accountApp .profile-button[aria-expanded="true"] {
+      border-color: rgba(48, 151, 210, .62);
+      background: #ffffff;
+      box-shadow: 0 0 16px rgba(48, 151, 210, .12);
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-profile-menu {
+      border-color: #dceaf2;
+      background: #ffffff;
+      box-shadow: 0 18px 42px rgba(40, 82, 110, .16);
+    }
+
+    html[data-bluey-theme="light"] #accountApp .profile-email,
+    html[data-bluey-theme="light"] #accountApp .account-profile-menu a,
+    html[data-bluey-theme="light"] #accountApp .account-profile-menu button {
+      border-bottom-color: #dceaf2;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .profile-email {
+      color: #657888;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-profile-menu a,
+    html[data-bluey-theme="light"] #accountApp .account-profile-menu button {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .account-profile-menu a:hover,
+    html[data-bluey-theme="light"] #accountApp .account-profile-menu button:hover {
+      background: #f1fbff;
       color: #087ca6;
     }
 
