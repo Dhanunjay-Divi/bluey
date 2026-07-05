@@ -4554,6 +4554,14 @@
         #090909;
     }
 
+    #accountApp .dashboard-overview-card.balance-trial {
+      grid-template-columns: minmax(0, 1fr);
+      border-color: rgba(99, 216, 255, .34);
+      background:
+        linear-gradient(135deg, rgba(99, 216, 255, .12), rgba(79, 141, 255, .045) 46%, transparent),
+        #090909;
+    }
+
     #accountApp .dashboard-overview-main {
       min-width: 0;
       display: grid;
@@ -4609,11 +4617,22 @@
       color: #ff5a66;
     }
 
+    #accountApp .dashboard-overview-card.balance-trial #balanceValue {
+      color: var(--bluey-accent);
+    }
+
     #accountApp .dashboard-overview-side {
       display: grid;
       align-content: start;
       gap: .55rem;
       min-width: 0;
+    }
+
+    #accountApp .dashboard-overview-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .45rem;
+      align-items: center;
     }
 
     #accountApp .dashboard-overview-side .dashboard-actions {
@@ -4929,6 +4948,10 @@
       background:
         linear-gradient(135deg, rgba(99, 216, 255, .12), rgba(79, 141, 255, .045) 46%, transparent),
         #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-card.balance-trial {
+      border-color: rgba(49, 146, 206, .34);
     }
 
     html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row h2,

@@ -1587,13 +1587,34 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function updateManualReloadDraftCopy() {
       const rule = document.getElementById('manualReloadRule');
-      if (!rule) return;
+      const overviewReloadButton = document.getElementById('overviewReloadButton');
       try {
         const amount = readManualReloadCents();
-        rule.textContent = `${money(amount)} reload gives ${money(amount)} Bluey credits. Checkout opens in a new tab; press Refresh balance here after payment succeeds.`;
+        if (rule) rule.textContent = `${money(amount)} reload gives ${money(amount)} Bluey credits. Checkout opens in a new tab; press Refresh balance here after payment succeeds.`;
+        if (overviewReloadButton) overviewReloadButton.textContent = `Add ${money(amount)} credits`;
       } catch (error) {
-        rule.textContent = error.message;
+        if (rule) rule.textContent = error.message;
+        if (overviewReloadButton) overviewReloadButton.textContent = 'Add credits';
       }
+    }
+
+    function trialMinutesRemaining(me) {
+      return Math.max(0, Math.ceil(Number(me?.trial_seconds_remaining || 0) / 60));
+    }
+
+    function accountBalanceHint(me) {
+      if (me?.is_temporary) {
+        const minutes = trialMinutesRemaining(me);
+        return `${minutes} free minute${minutes === 1 ? '' : 's'} left. ${temporaryExpiryCopy(me.temporary_expires_at)} Create an account before adding credits.`;
+      }
+      const balanceCents = Number(me?.balance_cents || 0);
+      if (balanceCents <= 0) {
+        return 'Balance is $0. Add credits to use paid cloud answers, transcription, screen analysis, and saved-session search.';
+      }
+      if (balanceCents < 500) {
+        return 'Balance is low. Add credits now to keep paid cloud work running.';
+      }
+      return 'Credits are ready for paid cloud work. Add credits anytime from here or Billing.';
     }
 
     async function updateAutoReload(enabled) {
@@ -2178,28 +2199,36 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }
         const balanceValue = document.getElementById('balanceValue');
         const balanceCard = balanceValue?.closest('.balance-kpi');
+        const balanceTitle = document.getElementById('balanceTitle');
+        const overviewReloadButton = document.getElementById('overviewReloadButton');
+        const balanceReloadPanel = document.getElementById('balanceReloadPanel');
+        const isTemporaryAccount = Boolean(me.is_temporary);
+        const trialMinutes = trialMinutesRemaining(me);
+        if (balanceTitle) balanceTitle.textContent = isTemporaryAccount ? 'Free trial' : 'Balance';
         if (balanceValue) {
-          balanceValue.textContent = money(me.balance_cents);
-          balanceCard?.classList.toggle('balance-critical', me.balance_cents < 500);
-          balanceCard?.classList.toggle('balance-low', me.balance_cents >= 500 && me.balance_cents < 1000);
+          balanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
+          balanceCard?.classList.toggle('balance-trial', isTemporaryAccount);
+          balanceCard?.classList.toggle('balance-critical', !isTemporaryAccount && me.balance_cents < 500);
+          balanceCard?.classList.toggle('balance-low', !isTemporaryAccount && me.balance_cents >= 500 && me.balance_cents < 1000);
+        }
+        if (overviewReloadButton) {
+          overviewReloadButton.hidden = isTemporaryAccount;
+        }
+        if (balanceReloadPanel) {
+          balanceReloadPanel.hidden = isTemporaryAccount;
         }
         const summaryBalanceValue = document.getElementById('summaryBalanceValue');
+        const summaryBalanceLabel = document.getElementById('summaryBalanceLabel');
         const summaryBalanceCard = summaryBalanceValue?.closest('.summary-balance-kpi');
+        if (summaryBalanceLabel) summaryBalanceLabel.textContent = isTemporaryAccount ? 'Free trial' : 'Credits balance';
         if (summaryBalanceValue) {
-          summaryBalanceValue.textContent = money(me.balance_cents);
-          summaryBalanceCard?.classList.toggle('balance-critical', me.balance_cents < 500);
-          summaryBalanceCard?.classList.toggle('balance-low', me.balance_cents >= 500 && me.balance_cents < 1000);
+          summaryBalanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
+          summaryBalanceCard?.classList.toggle('balance-critical', !isTemporaryAccount && me.balance_cents < 500);
+          summaryBalanceCard?.classList.toggle('balance-low', !isTemporaryAccount && me.balance_cents >= 500 && me.balance_cents < 1000);
         }
         const balanceHint = document.getElementById('balanceHint');
         const summaryBalanceHint = document.getElementById('summaryBalanceHint');
-        let balanceHintText = '';
-        if (me.is_temporary) {
-          balanceHintText = `${Math.round(me.trial_seconds_remaining / 60)} free minutes left. ${temporaryExpiryCopy(me.temporary_expires_at)} Save it as an account before adding credits.`;
-        } else {
-          balanceHintText = me.trial_seconds_remaining > 0
-            ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes left. Credits are used after the trial when paid cloud work is needed.`
-            : 'When balance reaches $0, paid cloud work pauses until you add credits.';
-        }
+        const balanceHintText = accountBalanceHint(me);
         if (balanceHint) balanceHint.textContent = balanceHintText;
         if (summaryBalanceHint) summaryBalanceHint.textContent = balanceHintText;
         renderTemporaryAccount(me);
@@ -2398,6 +2427,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         confirmTrialConversion();
       });
       document.getElementById('reloadButton').addEventListener('click', () => {
+        startReload();
+      });
+      document.getElementById('overviewReloadButton')?.addEventListener('click', () => {
         startReload();
       });
       document.getElementById('refreshAccountButton')?.addEventListener('click', () => {

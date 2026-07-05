@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070424"
+    href="/assets/bluey-site.css?v=2026070425"
   >
   <script type="application/ld+json">
   {
@@ -399,13 +399,16 @@
               <div class="dashboard-overview-main">
                 <div class="dashboard-overview-title-row">
                   <div>
-                    <h2>Balance</h2>
+                    <h2 id="balanceTitle">Balance</h2>
                     <p id="balanceHint">Credits are used for paid cloud work after any trial time.</p>
                   </div>
                   <strong id="balanceValue">$--</strong>
                 </div>
+                <div class="dashboard-overview-actions" id="balanceActions">
+                  <button class="account-button primary compact" id="overviewReloadButton" type="button" hidden>Add credits</button>
+                </div>
               </div>
-              <div class="dashboard-overview-side">
+              <div class="dashboard-overview-side" id="balanceReloadPanel">
                 <div class="reload-card auto-reload-card compact-auto-reload" id="autoReloadCard">
                   <div>
                     <div class="auto-reload-head">
@@ -524,7 +527,7 @@
                 </div>
                 <div class="summary-metric-grid">
                   <div class="summary-metric summary-balance-kpi">
-                    <span>Credits balance</span>
+                    <span id="summaryBalanceLabel">Credits balance</span>
                     <strong id="summaryBalanceValue">$--</strong>
                     <em id="summaryBalanceHint">Credits are used after trial time.</em>
                   </div>
@@ -946,7 +949,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070424"
+    src="/assets/bluey-site.js?v=2026070425"
   ></script>
 </body>
 </html>
