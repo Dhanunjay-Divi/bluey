@@ -1597,6 +1597,7 @@
     }
 
     #productSite .footer-meta .email-link {
+      margin-left: .18rem;
       color: var(--bluey-accent);
     }
 
@@ -3807,6 +3808,18 @@
       padding: .65rem .7rem;
       text-align: left;
       overflow: hidden;
+      cursor: pointer;
+      transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
+    }
+
+    #downloadApp .install-command:hover,
+    #downloadApp .install-command:focus,
+    #downloadApp .install-command:focus-within,
+    #downloadApp .install-command.is-active {
+      border-color: rgba(99, 216, 255, .55);
+      background: rgba(99, 216, 255, .055);
+      box-shadow: 0 0 0 1px rgba(99, 216, 255, .14);
+      outline: none;
     }
 
     #downloadApp .install-command code {
@@ -3825,7 +3838,34 @@
       margin-top: 0;
       min-height: 32px;
       padding: 0 .7rem;
+      border-color: rgba(99, 216, 255, .42);
+      border-radius: 999px;
+      background: rgba(99, 216, 255, .07);
+      color: var(--bluey-accent);
+      font-weight: 850;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(5px);
+      transition: opacity .16s ease, transform .16s ease, background .16s ease, color .16s ease, border-color .16s ease;
+      visibility: hidden;
       white-space: nowrap;
+    }
+
+    #downloadApp .install-command:hover .copy-command,
+    #downloadApp .install-command:focus .copy-command,
+    #downloadApp .install-command:focus-within .copy-command,
+    #downloadApp .install-command.is-active .copy-command,
+    #downloadApp .install-command .copy-command.copied {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0);
+      visibility: visible;
+    }
+
+    #downloadApp .install-command .copy-command.copied {
+      border-color: transparent;
+      background: linear-gradient(135deg, #bff5ff, var(--bluey-accent), var(--bluey-accent-2));
+      color: #061114;
     }
 
     #downloadApp .copy-command {
@@ -3847,7 +3887,7 @@
 
     #downloadApp .platform-instructions {
       width: min(700px, calc(100% - 4rem));
-      margin: 1rem auto 0;
+      margin: 1.35rem auto 0;
       padding: 1rem;
       border: 1px solid #222;
       border-radius: 12px;
@@ -4032,6 +4072,7 @@
     #accountApp .page-footer-links .email-link,
     #downloadApp .page-footer-links .email-link,
     #policyApp .page-footer-links .email-link {
+      margin-left: .18rem;
       color: var(--bluey-accent);
     }
 
@@ -4275,6 +4316,10 @@
 
       #downloadApp .install-command .copy-command {
         width: 100%;
+        opacity: 1;
+        pointer-events: auto;
+        transform: none;
+        visibility: visible;
       }
 
       #downloadApp .instruction-step {
@@ -5092,6 +5137,15 @@
 
     html[data-bluey-theme="light"] #accountApp.is-guest .account-form input::placeholder {
       color: #8da1ad;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .install-command:hover,
+    html[data-bluey-theme="light"] #downloadApp .install-command:focus,
+    html[data-bluey-theme="light"] #downloadApp .install-command:focus-within,
+    html[data-bluey-theme="light"] #downloadApp .install-command.is-active {
+      border-color: rgba(49, 146, 206, .46);
+      background: #eefaff;
+      box-shadow: 0 0 0 1px rgba(49, 146, 206, .14);
     }
 
     html[data-bluey-theme="light"] #accountApp.is-verifying #createAccountButton {
