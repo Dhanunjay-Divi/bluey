@@ -650,22 +650,21 @@
         <section class="account-modal password-modal" role="dialog" aria-modal="true" aria-labelledby="changePasswordTitle">
           <div class="account-modal-head">
             <div>
-              <h2 id="changePasswordTitle">Change password</h2>
-              <p>Update the password for <span id="changePasswordEmail">this Bluey account</span>.</p>
+              <h2 id="changePasswordTitle">Change Password</h2>
             </div>
-            <button class="account-modal-close" id="changePasswordCancelX" type="button" aria-label="Close change password dialog">×</button>
+            <button class="account-modal-close password-modal-close" id="changePasswordCancelX" type="button" aria-label="Close change password dialog">×</button>
           </div>
           <form class="account-modal-form" id="changePasswordForm">
-            <label for="changeCurrentPassword">
-              Current password
+            <label class="password-only-label" for="changeCurrentPassword">
+              <span>Current password</span>
               <input id="changeCurrentPassword" type="password" autocomplete="current-password" placeholder="Current password">
             </label>
-            <label for="changeNewPassword">
-              New password
+            <label class="password-only-label" for="changeNewPassword">
+              <span>New password</span>
               <input id="changeNewPassword" type="password" autocomplete="new-password" placeholder="New password (min 8 chars)">
             </label>
-            <label for="changeConfirmPassword">
-              Confirm new password
+            <label class="password-only-label" for="changeConfirmPassword">
+              <span>Confirm new password</span>
               <input id="changeConfirmPassword" type="password" autocomplete="new-password" placeholder="Confirm new password">
             </label>
             <div class="account-modal-message" id="changePasswordMessage" aria-live="polite"></div>
