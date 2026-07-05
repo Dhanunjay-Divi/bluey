@@ -2618,11 +2618,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function normalizeDashboardTabName(value) {
       const tab = String(value || '').replace(/^#/, '').trim().toLowerCase();
-      if (tab === 'computers' || tab === 'devices') return 'computers';
+      if (tab === 'computers' || tab === 'my-computers' || tab === 'devices' || tab === 'linked-devices') return 'computers';
       if (tab === 'sessions' || tab === 'session-history' || tab === 'history' || tab === 'saved-sessions') return 'history';
-      if (tab === 'summary' || tab === 'usage') return 'summary';
+      if (tab === 'summary' || tab === 'usage-summary' || tab === 'usage') return 'summary';
       if (tab === 'billing' || tab === 'reload' || tab === 'credits') return 'billing';
-      if (tab === 'admin' || tab === 'trial-protection' || tab === 'trial-abuse') return 'admin';
+      if (tab === 'admin' || tab === 'trial-ops' || tab === 'trial-protection' || tab === 'trial-abuse') return 'admin';
       return '';
     }
 

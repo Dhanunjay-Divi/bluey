@@ -507,18 +507,18 @@
             <div class="account-message" id="accountMessage"></div>
 
             <div class="dashboard-tabs" role="tablist" aria-label="Dashboard sections">
-              <button class="dashboard-tab is-active" id="dashboardTabComputersButton" type="button" role="tab" aria-selected="true" aria-controls="dashboardTabComputers" data-dashboard-tab="computers">Computers</button>
-              <button class="dashboard-tab" id="dashboardTabHistoryButton" type="button" role="tab" aria-selected="false" aria-controls="dashboardTabHistory" data-dashboard-tab="history">Sessions</button>
-              <button class="dashboard-tab" id="dashboardTabSummaryButton" type="button" role="tab" aria-selected="false" aria-controls="dashboardTabSummary" data-dashboard-tab="summary">Summary</button>
+              <button class="dashboard-tab is-active" id="dashboardTabComputersButton" type="button" role="tab" aria-selected="true" aria-controls="dashboardTabComputers" data-dashboard-tab="computers">My Computers</button>
+              <button class="dashboard-tab" id="dashboardTabHistoryButton" type="button" role="tab" aria-selected="false" aria-controls="dashboardTabHistory" data-dashboard-tab="history">Session History</button>
+              <button class="dashboard-tab" id="dashboardTabSummaryButton" type="button" role="tab" aria-selected="false" aria-controls="dashboardTabSummary" data-dashboard-tab="summary">Usage Summary</button>
               <button class="dashboard-tab" id="dashboardTabBillingButton" type="button" role="tab" aria-selected="false" aria-controls="dashboardTabBilling" data-dashboard-tab="billing">Billing</button>
-              <button class="dashboard-tab" id="dashboardTabAdminButton" type="button" role="tab" aria-selected="false" aria-controls="dashboardTabAdmin" data-dashboard-tab="admin" hidden>Admin</button>
+              <button class="dashboard-tab" id="dashboardTabAdminButton" type="button" role="tab" aria-selected="false" aria-controls="dashboardTabAdmin" data-dashboard-tab="admin" hidden>Trial Ops</button>
             </div>
 
             <section class="dashboard-tab-panel is-active" id="dashboardTabComputers" role="tabpanel" aria-labelledby="dashboardTabComputersButton" data-dashboard-panel="computers">
               <section class="dashboard-section device-section" aria-label="Computers">
                 <div class="section-head">
                   <div>
-                    <h3>Computers</h3>
+                    <h3>My Computers</h3>
                     <p>Host overlay desktops connected to this account.</p>
                   </div>
                 </div>
@@ -538,7 +538,7 @@
               <section class="dashboard-section" aria-label="Sessions">
                 <div class="section-head">
                   <div>
-                    <h3>Sessions</h3>
+                    <h3>Session History</h3>
                     <p>Uploaded transcript and Bluey answers from signed-in desktop sessions. View-only on web for now.</p>
                   </div>
                   <button class="account-button ghost compact" id="refreshSessionsButton" type="button">Refresh</button>
@@ -552,7 +552,7 @@
               <section class="dashboard-section summary-section" aria-label="Usage summary">
                 <div class="section-head">
                   <div>
-                    <h3>Summary</h3>
+                    <h3>Usage Summary</h3>
                     <p>Recent paid work and credit use.</p>
                   </div>
                 </div>
@@ -634,8 +634,8 @@
               <section class="dashboard-section admin-abuse-section" id="adminAbuseSection" aria-label="Trial protection" hidden>
                 <div class="section-head">
                   <div>
-                    <h3>Trial protection</h3>
-                    <p>Admin-only view of trial grants, denials, and signup protection events.</p>
+                    <h3>Trial Ops</h3>
+                    <p>Internal admin-only trial protection: grants, denials, and signup protection events.</p>
                   </div>
                   <button class="account-button ghost compact" id="refreshAdminAbuseButton" type="button">Refresh</button>
                 </div>
