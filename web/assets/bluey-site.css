@@ -661,14 +661,18 @@
       color: #061114;
     }
 
-    #productSite .nav-connect {
+    #productSite .nav-connect,
+    #downloadApp .nav-connect,
+    #policyApp .nav-connect {
       display: inline-flex;
       align-items: center;
       gap: .4rem;
       margin: 0;
     }
 
-    #productSite .nav-connect input {
+    #productSite .nav-connect input,
+    #downloadApp .nav-connect input,
+    #policyApp .nav-connect input {
       width: 88px;
       height: 32px;
       padding: .34rem .58rem;
@@ -683,18 +687,24 @@
       transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
     }
 
-    #productSite .nav-connect input::placeholder {
+    #productSite .nav-connect input::placeholder,
+    #downloadApp .nav-connect input::placeholder,
+    #policyApp .nav-connect input::placeholder {
       color: #444;
       font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
       font-weight: 600;
     }
 
-    #productSite .nav-connect input:focus {
+    #productSite .nav-connect input:focus,
+    #downloadApp .nav-connect input:focus,
+    #policyApp .nav-connect input:focus {
       border-color: rgba(99, 216, 255, .78);
       box-shadow: 0 0 0 2px rgba(99, 216, 255, .16);
     }
 
-    #productSite .nav-connect button {
+    #productSite .nav-connect button,
+    #downloadApp .nav-connect button,
+    #policyApp .nav-connect button {
       height: 32px;
       padding: .34rem .7rem;
       border: 1px solid rgba(99, 216, 255, .28);
@@ -708,12 +718,16 @@
       transition: border-color .18s ease, background .18s ease, color .18s ease, opacity .18s ease;
     }
 
-    #productSite .nav-connect button:hover {
+    #productSite .nav-connect button:hover,
+    #downloadApp .nav-connect button:hover,
+    #policyApp .nav-connect button:hover {
       border-color: rgba(99, 216, 255, .72);
       background: rgba(99, 216, 255, .18);
     }
 
-    #productSite .nav-connect button:disabled {
+    #productSite .nav-connect button:disabled,
+    #downloadApp .nav-connect button:disabled,
+    #policyApp .nav-connect button:disabled {
       cursor: wait;
       opacity: .62;
     }
@@ -1005,17 +1019,23 @@
       background: #ebf9ff;
     }
 
-    html[data-bluey-theme="light"] #productSite .nav-connect input {
+    html[data-bluey-theme="light"] #productSite .nav-connect input,
+    html[data-bluey-theme="light"] #downloadApp .nav-connect input,
+    html[data-bluey-theme="light"] #policyApp .nav-connect input {
       border-color: #d8e8f0;
       background: #ffffff;
       color: #102130;
     }
 
-    html[data-bluey-theme="light"] #productSite .nav-connect input::placeholder {
+    html[data-bluey-theme="light"] #productSite .nav-connect input::placeholder,
+    html[data-bluey-theme="light"] #downloadApp .nav-connect input::placeholder,
+    html[data-bluey-theme="light"] #policyApp .nav-connect input::placeholder {
       color: #8da1ad;
     }
 
-    html[data-bluey-theme="light"] #productSite .nav-connect button {
+    html[data-bluey-theme="light"] #productSite .nav-connect button,
+    html[data-bluey-theme="light"] #downloadApp .nav-connect button,
+    html[data-bluey-theme="light"] #policyApp .nav-connect button {
       border-color: #bfe6f4;
       background: #ebf9ff;
       color: #087ca6;
@@ -1081,6 +1101,16 @@
     html[data-bluey-theme="light"] #productSite .footer-meta .muted-note,
     html[data-bluey-theme="light"] #productSite .footer-meta .dot {
       color: #6f8291;
+    }
+
+    html[data-bluey-theme="light"] #productSite .footer-meta .email-link,
+    html[data-bluey-theme="light"] #productSite .footer-meta .instagram-link {
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #productSite .footer-meta .email-link:hover,
+    html[data-bluey-theme="light"] #productSite .footer-meta .instagram-link:hover {
+      color: #075d82;
     }
 
     html[data-bluey-theme="light"] #productSite .product-preview {
@@ -1530,6 +1560,26 @@
 
     #productSite .footer-meta .email-link:hover {
       color: #dff7ff;
+    }
+
+    #productSite .footer-meta .instagram-link {
+      display: inline-flex;
+      align-items: center;
+      gap: .22rem;
+      color: var(--bluey-accent);
+      text-decoration: none;
+      vertical-align: -.18em;
+    }
+
+    #productSite .footer-meta .instagram-link:hover {
+      color: #dff7ff;
+    }
+
+    #productSite .footer-meta .instagram-link svg {
+      width: .86rem;
+      height: .86rem;
+      flex: 0 0 auto;
+      filter: drop-shadow(0 0 8px rgba(99, 216, 255, .20));
     }
 
     #productSite .footer-meta .muted-note {
@@ -3354,10 +3404,10 @@
     }
 
     #downloadApp .platform-grid {
-      width: min(380px, 100%);
+      width: min(700px, 100%);
       display: grid;
-      grid-template-columns: 1fr;
-      gap: .5rem;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: .65rem;
       margin: 0 auto;
       padding: 0 2rem;
     }
@@ -3420,7 +3470,7 @@
       background: #111;
       text-align: center;
       box-shadow: none;
-      transition: border-color .2s, transform .15s;
+      transition: border-color .2s, transform .15s, opacity .18s ease;
     }
 
     #downloadApp .platform-note {
@@ -3450,8 +3500,13 @@
     }
 
     #downloadApp .download-card.disabled {
-      opacity: .5;
+      opacity: .58;
       cursor: default;
+    }
+
+    #downloadApp .download-card.disabled:hover {
+      border-color: var(--bluey-line);
+      transform: none;
     }
 
     #downloadApp .download-card-head {
@@ -3519,6 +3574,10 @@
       font-size: .7rem;
       line-height: 1.35;
       margin: 0;
+    }
+
+    #downloadApp .download-card.coming-soon p {
+      color: #777;
     }
 
     #downloadApp .download-card-action {
@@ -3789,6 +3848,32 @@
       color: #dff7ff;
     }
 
+    #accountApp .page-footer-links .instagram-link,
+    #downloadApp .page-footer-links .instagram-link,
+    #policyApp .page-footer-links .instagram-link {
+      display: inline-flex;
+      align-items: center;
+      gap: .22rem;
+      color: var(--bluey-accent);
+      text-decoration: none;
+      vertical-align: -.18em;
+    }
+
+    #accountApp .page-footer-links .instagram-link:hover,
+    #downloadApp .page-footer-links .instagram-link:hover,
+    #policyApp .page-footer-links .instagram-link:hover {
+      color: #dff7ff;
+    }
+
+    #accountApp .page-footer-links .instagram-link svg,
+    #downloadApp .page-footer-links .instagram-link svg,
+    #policyApp .page-footer-links .instagram-link svg {
+      width: .86rem;
+      height: .86rem;
+      flex: 0 0 auto;
+      filter: drop-shadow(0 0 8px rgba(99, 216, 255, .20));
+    }
+
     #accountApp .page-footer-links .muted-note,
     #downloadApp .page-footer-links .muted-note,
     #policyApp .page-footer-links .muted-note {
@@ -3802,6 +3887,7 @@
       margin: 0 .4rem;
     }
 
+    #accountApp .page-footer-links,
     #downloadApp .page-footer-links {
       margin-top: auto;
     }
@@ -4744,6 +4830,40 @@
       color: #5f7281;
     }
 
+    html[data-bluey-theme="light"] #downloadApp .platform-name,
+    html[data-bluey-theme="light"] #downloadApp .os-icon,
+    html[data-bluey-theme="light"] #downloadApp .platform-instructions h2,
+    html[data-bluey-theme="light"] #downloadApp .commands h2 {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .download-card p,
+    html[data-bluey-theme="light"] #downloadApp .download-card.coming-soon p,
+    html[data-bluey-theme="light"] #downloadApp .platform-instructions > p,
+    html[data-bluey-theme="light"] #downloadApp .instruction-help,
+    html[data-bluey-theme="light"] #downloadApp .cmd span {
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .download-card.disabled .platform-name,
+    html[data-bluey-theme="light"] #downloadApp .download-card.disabled .os-icon {
+      color: #8da1ad;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .instruction-step {
+      border-color: #d8e8f0;
+      background: #fafdff;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .instruction-body p,
+    html[data-bluey-theme="light"] #downloadApp .install-command code {
+      color: #243b4d;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .cmd .copy-command {
+      color: #5f7281;
+    }
+
     html[data-bluey-theme="light"] #accountApp.is-guest .account-form input,
     html[data-bluey-theme="light"] #accountApp .auto-reload-fields input,
     html[data-bluey-theme="light"] #accountApp .manual-reload-input,
@@ -4958,6 +5078,24 @@
     html[data-bluey-theme="light"] #downloadApp .page-footer-links a,
     html[data-bluey-theme="light"] #policyApp .page-footer-links a {
       color: #132839;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .page-footer-links .email-link,
+    html[data-bluey-theme="light"] #accountApp .page-footer-links .instagram-link,
+    html[data-bluey-theme="light"] #downloadApp .page-footer-links .email-link,
+    html[data-bluey-theme="light"] #downloadApp .page-footer-links .instagram-link,
+    html[data-bluey-theme="light"] #policyApp .page-footer-links .email-link,
+    html[data-bluey-theme="light"] #policyApp .page-footer-links .instagram-link {
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .page-footer-links .email-link:hover,
+    html[data-bluey-theme="light"] #accountApp .page-footer-links .instagram-link:hover,
+    html[data-bluey-theme="light"] #downloadApp .page-footer-links .email-link:hover,
+    html[data-bluey-theme="light"] #downloadApp .page-footer-links .instagram-link:hover,
+    html[data-bluey-theme="light"] #policyApp .page-footer-links .email-link:hover,
+    html[data-bluey-theme="light"] #policyApp .page-footer-links .instagram-link:hover {
+      color: #075d82;
     }
 
     /* Round 359 dashboard: Pinky-like structure with Bluey colors. */
@@ -5816,12 +5954,16 @@
     }
 
     #productSite .nav-connect,
-    #accountApp .account-top-connect {
+    #accountApp .account-top-connect,
+    #downloadApp .nav-connect,
+    #policyApp .nav-connect {
       gap: .4rem;
     }
 
     #productSite .nav-connect input,
-    #accountApp .account-top-connect input {
+    #accountApp .account-top-connect input,
+    #downloadApp .nav-connect input,
+    #policyApp .nav-connect input {
       width: 90px;
       height: 32px;
       padding: .35rem .6rem;
@@ -5833,7 +5975,9 @@
     }
 
     #productSite .nav-connect button,
-    #accountApp .account-top-connect button {
+    #accountApp .account-top-connect button,
+    #downloadApp .nav-connect button,
+    #policyApp .nav-connect button {
       height: 32px;
       min-width: 76px;
       padding: .35rem .7rem;
