@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070426"
+    href="/assets/bluey-site.css?v=2026070427"
   >
   <script type="application/ld+json">
   {
@@ -99,12 +99,24 @@
         <div class="navlinks">
           <a href="/">Product</a>
           <a href="/download">Download</a>
-          <a class="nav-cta" href="/login" data-guest-only>Login</a>
-          <a href="/account" data-auth-only hidden>Dashboard</a>
-          <button class="nav-signout" type="button" data-auth-only data-sign-out hidden>Sign out</button>
           <a href="/docs/disguise">Controls</a>
           <a href="/privacy">Privacy</a>
           <a href="/terms">Terms</a>
+          <a class="nav-cta" href="/login" data-guest-only>Login</a>
+          <a href="/account" data-auth-only hidden>Dashboard</a>
+          <div class="account-profile" data-account-profile data-auth-only hidden>
+            <button class="profile-button" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Account menu" data-account-profile-button>
+              <svg class="profile-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                <circle cx="12" cy="7" r="4"></circle>
+              </svg>
+            </button>
+            <div class="account-profile-menu" role="menu" data-account-profile-menu hidden>
+              <div class="profile-email" data-profile-email-label>Bluey account</div>
+              <a href="/account" role="menuitem">Dashboard</a>
+              <button type="button" role="menuitem" data-sign-out>Logout</button>
+            </div>
+          </div>
         </div>
       </nav>
 
@@ -261,17 +273,17 @@
             <input name="user_code" type="text" placeholder="Code" autocomplete="one-time-code" spellcheck="false" aria-label="Bluey connect code">
             <button type="submit">Connect</button>
           </form>
-          <div class="account-profile" id="accountProfile" data-auth-only hidden>
-            <button class="profile-button" id="accountProfileButton" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Account menu">
+          <div class="account-profile" id="accountProfile" data-account-profile data-auth-only hidden>
+            <button class="profile-button" id="accountProfileButton" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Account menu" data-account-profile-button>
               <svg class="profile-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none">
                 <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
                 <circle cx="12" cy="7" r="4"></circle>
               </svg>
             </button>
-            <div class="account-profile-menu" id="accountProfileMenu" role="menu" hidden>
-              <div class="profile-email" id="profileEmailLabel">Bluey account</div>
-              <button id="changePasswordButton" type="button" role="menuitem">Change Password</button>
-              <button class="danger" id="deleteAccountButton" type="button" role="menuitem">Delete Account</button>
+            <div class="account-profile-menu" id="accountProfileMenu" role="menu" data-account-profile-menu hidden>
+              <div class="profile-email" id="profileEmailLabel" data-profile-email-label>Bluey account</div>
+              <button id="changePasswordButton" type="button" role="menuitem" data-change-password-button>Change Password</button>
+              <button class="danger" id="deleteAccountButton" type="button" role="menuitem" data-delete-account-button>Delete Account</button>
               <button type="button" role="menuitem" data-sign-out>Logout</button>
             </div>
           </div>
@@ -699,7 +711,19 @@
           <a href="/">Product</a>
           <a class="nav-cta" href="/login" data-guest-only>Login</a>
           <a href="/account" data-auth-only hidden>Dashboard</a>
-          <button class="nav-signout" type="button" data-auth-only data-sign-out hidden>Sign out</button>
+          <div class="account-profile" data-account-profile data-auth-only hidden>
+            <button class="profile-button" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Account menu" data-account-profile-button>
+              <svg class="profile-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                <circle cx="12" cy="7" r="4"></circle>
+              </svg>
+            </button>
+            <div class="account-profile-menu" role="menu" data-account-profile-menu hidden>
+              <div class="profile-email" data-profile-email-label>Bluey account</div>
+              <a href="/account" role="menuitem">Dashboard</a>
+              <button type="button" role="menuitem" data-sign-out>Logout</button>
+            </div>
+          </div>
         </div>
       </nav>
 
@@ -876,9 +900,25 @@
           </span>
         </button>
         <a href="/download">Download</a>
-        <a class="btn-nav" href="/login" data-guest-only>Login</a>
         <a href="/account" data-auth-only hidden>Dashboard</a>
-        <button class="nav-signout" type="button" data-auth-only data-sign-out hidden>Sign out</button>
+        <form class="nav-connect" action="/login" method="get" aria-label="Connect a Bluey desktop code" data-connect-code-form data-auth-only hidden>
+          <input name="user_code" type="text" placeholder="Code" autocomplete="one-time-code" spellcheck="false" aria-label="Bluey connect code">
+          <button type="submit">Connect</button>
+        </form>
+        <div class="account-profile" data-account-profile data-auth-only hidden>
+          <button class="profile-button" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Account menu" data-account-profile-button>
+            <svg class="profile-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+              <circle cx="12" cy="7" r="4"></circle>
+            </svg>
+          </button>
+          <div class="account-profile-menu" role="menu" data-account-profile-menu hidden>
+            <div class="profile-email" data-profile-email-label>Bluey account</div>
+            <a href="/account" role="menuitem">Dashboard</a>
+            <button type="button" role="menuitem" data-sign-out>Logout</button>
+          </div>
+        </div>
+        <a class="btn-nav" href="/login" data-guest-only>Login</a>
       </div>
     </nav>
 
@@ -890,7 +930,8 @@
           <p class="hero-proof"><span>Install, run, ask.</span> Bluey keeps transcript, screen, code, docs, and saved notes close without switching apps.</p>
           <div class="hero-actions">
             <a class="btn btn-primary" href="/download">Get Started</a>
-            <button class="btn btn-ghost" id="tryUsButton" type="button">Try Us</button>
+            <button class="btn btn-ghost" id="tryUsButton" type="button" data-guest-only>Try Us</button>
+            <a class="btn btn-ghost" href="/account" data-auth-only hidden>Dashboard</a>
           </div>
           <form class="join-bar" id="productJoinForm" action="/login" method="get" aria-label="Connect a Bluey desktop code" data-connect-code-form data-status-target="productConnectStatus">
             <input name="user_code" type="text" placeholder="connect code" autocomplete="one-time-code" spellcheck="false" aria-label="Bluey connect code">
@@ -918,31 +959,7 @@
       </div>
     </div>
 
-    <footer class="footer" id="pricing">
-      <div class="pricing">
-        <a href="/download" class="plan featured">
-          <div>
-            <div class="plan-name">Start free</div>
-            <div class="plan-detail">Download Bluey, run <code>bluey on</code>, and use included trial time before adding credits.</div>
-          </div>
-          <div class="plan-price">Download</div>
-        </a>
-        <a href="/reload" class="plan">
-          <div>
-            <div class="plan-name">Add credits</div>
-            <div class="plan-detail">$30 becomes $30 Bluey credits for AI answers, speech, screen analysis, and saved-session search. $15 minimum, no subscription.</div>
-          </div>
-          <div class="plan-price"><strong>$30</strong><span>credits</span></div>
-        </a>
-        <a href="mailto:hello@bluey.sh" class="plan">
-          <div>
-            <div class="plan-name">Teams</div>
-            <div class="plan-detail">Concierge setup for shared engineering workflows, account support, and team rollout planning.</div>
-          </div>
-          <div class="plan-price"><strong>Contact</strong><span>team</span></div>
-        </a>
-      </div>
-      <p class="pricing-note">Teams are concierge for now.</p>
+    <footer class="footer">
       <div class="footer-meta">
         Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Built with open source technology</span><span class="dot">&middot;</span><a href="/terms">Terms</a><span class="dot">&middot;</span><a href="/privacy">Privacy</a>
       </div>
@@ -979,7 +996,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070426"
+    src="/assets/bluey-site.js?v=2026070427"
   ></script>
 </body>
 </html>

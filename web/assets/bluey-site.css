@@ -632,7 +632,7 @@
       display: flex;
       align-items: center;
       justify-self: end;
-      gap: 1.55rem;
+      gap: 1rem;
     }
 
     #productSite .nav-links a,
@@ -659,6 +659,150 @@
     #productSite .nav-links .btn-nav:hover {
       background: #8ff5ff;
       color: #061114;
+    }
+
+    #productSite .nav-connect {
+      display: inline-flex;
+      align-items: center;
+      gap: .4rem;
+      margin: 0;
+    }
+
+    #productSite .nav-connect input {
+      width: 88px;
+      height: 32px;
+      padding: .34rem .58rem;
+      border: 1px solid rgba(99, 216, 255, .28);
+      border-radius: 6px;
+      background: #111;
+      color: #e0e0e0;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: .8rem;
+      font-weight: 650;
+      outline: 0;
+      transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
+    }
+
+    #productSite .nav-connect input::placeholder {
+      color: #444;
+      font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+      font-weight: 600;
+    }
+
+    #productSite .nav-connect input:focus {
+      border-color: rgba(99, 216, 255, .78);
+      box-shadow: 0 0 0 2px rgba(99, 216, 255, .16);
+    }
+
+    #productSite .nav-connect button {
+      height: 32px;
+      padding: .34rem .7rem;
+      border: 1px solid rgba(99, 216, 255, .28);
+      border-radius: 6px;
+      background: rgba(99, 216, 255, .12);
+      color: var(--bluey-accent);
+      cursor: pointer;
+      font: inherit;
+      font-size: .8rem;
+      font-weight: 700;
+      transition: border-color .18s ease, background .18s ease, color .18s ease, opacity .18s ease;
+    }
+
+    #productSite .nav-connect button:hover {
+      border-color: rgba(99, 216, 255, .72);
+      background: rgba(99, 216, 255, .18);
+    }
+
+    #productSite .nav-connect button:disabled {
+      cursor: wait;
+      opacity: .62;
+    }
+
+    #productSite .account-profile {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+    }
+
+    #productSite .profile-button {
+      display: inline-grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      border: 1px solid #333;
+      border-radius: 50%;
+      background: transparent;
+      color: #888;
+      cursor: pointer;
+      transition: border-color .18s ease, background .18s ease, color .18s ease;
+    }
+
+    #productSite .profile-button:hover,
+    #productSite .profile-button[aria-expanded="true"] {
+      border-color: var(--bluey-accent);
+      color: var(--bluey-accent);
+    }
+
+    #productSite .profile-icon {
+      display: block;
+      width: 16px;
+      height: 16px;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    #productSite .account-profile-menu {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      z-index: 100;
+      width: min(230px, calc(100vw - 2rem));
+      overflow: hidden;
+      border: 1px solid #222;
+      border-radius: 10px;
+      background: #111;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, .50);
+    }
+
+    #productSite .profile-email {
+      padding: .82rem 1rem;
+      border-bottom: 1px solid #1a1a1a;
+      color: #666;
+      font-size: .8rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #productSite .account-profile-menu a,
+    #productSite .account-profile-menu button {
+      display: flex;
+      width: 100%;
+      min-height: 0;
+      align-items: center;
+      padding: .6rem 1rem;
+      border: 0;
+      border-bottom: 1px solid #1a1a1a;
+      background: transparent;
+      color: #ccc;
+      cursor: pointer;
+      font: inherit;
+      font-size: .85rem;
+      text-align: left;
+      text-decoration: none;
+    }
+
+    #productSite .account-profile-menu a:hover,
+    #productSite .account-profile-menu button:hover {
+      background: #1a1a1a;
+      color: #e0e0e0;
+    }
+
+    #productSite .account-profile-menu a:last-child,
+    #productSite .account-profile-menu button:last-child {
+      border-bottom: 0;
     }
 
     #productSite .theme-toggle,
@@ -859,6 +1003,60 @@
       color: #087ca6;
       border-color: #bfe6f4;
       background: #ebf9ff;
+    }
+
+    html[data-bluey-theme="light"] #productSite .nav-connect input {
+      border-color: #d8e8f0;
+      background: #ffffff;
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #productSite .nav-connect input::placeholder {
+      color: #8da1ad;
+    }
+
+    html[data-bluey-theme="light"] #productSite .nav-connect button {
+      border-color: #bfe6f4;
+      background: #ebf9ff;
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #productSite .profile-button {
+      border-color: #d8e8f0;
+      color: #657888;
+    }
+
+    html[data-bluey-theme="light"] #productSite .profile-button:hover,
+    html[data-bluey-theme="light"] #productSite .profile-button[aria-expanded="true"] {
+      border-color: rgba(48, 151, 210, .62);
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #productSite .account-profile-menu {
+      border-color: #dceaf2;
+      background: #ffffff;
+      box-shadow: 0 18px 42px rgba(40, 82, 110, .16);
+    }
+
+    html[data-bluey-theme="light"] #productSite .profile-email,
+    html[data-bluey-theme="light"] #productSite .account-profile-menu a,
+    html[data-bluey-theme="light"] #productSite .account-profile-menu button {
+      border-bottom-color: #dceaf2;
+    }
+
+    html[data-bluey-theme="light"] #productSite .profile-email {
+      color: #657888;
+    }
+
+    html[data-bluey-theme="light"] #productSite .account-profile-menu a,
+    html[data-bluey-theme="light"] #productSite .account-profile-menu button {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #productSite .account-profile-menu a:hover,
+    html[data-bluey-theme="light"] #productSite .account-profile-menu button:hover {
+      background: #f1fbff;
+      color: #087ca6;
     }
 
     html[data-bluey-theme="light"] #productSite .connect-help {
@@ -1592,6 +1790,10 @@
         grid-template-columns: 1fr;
       }
 
+      #productSite .nav-connect {
+        display: none !important;
+      }
+
       .trial-actions {
         grid-template-columns: 1fr;
       }
@@ -1750,6 +1952,107 @@
     #accountApp .account-actions-row .nav-cta:hover {
       color: #061114;
       background: #8ff5ff;
+    }
+
+    #downloadApp .account-profile,
+    #policyApp .account-profile {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+    }
+
+    #downloadApp .profile-button,
+    #policyApp .profile-button {
+      display: inline-grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      border: 1px solid #333;
+      border-radius: 50%;
+      background: transparent;
+      color: #888;
+      cursor: pointer;
+      transition: border-color .18s ease, color .18s ease;
+    }
+
+    #downloadApp .profile-button:hover,
+    #downloadApp .profile-button[aria-expanded="true"],
+    #policyApp .profile-button:hover,
+    #policyApp .profile-button[aria-expanded="true"] {
+      border-color: var(--bluey-accent);
+      color: var(--bluey-accent);
+    }
+
+    #downloadApp .profile-icon,
+    #policyApp .profile-icon {
+      display: block;
+      width: 16px;
+      height: 16px;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    #downloadApp .account-profile-menu,
+    #policyApp .account-profile-menu {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      z-index: 100;
+      width: min(230px, calc(100vw - 2rem));
+      overflow: hidden;
+      border: 1px solid #222;
+      border-radius: 10px;
+      background: #111;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, .50);
+    }
+
+    #downloadApp .profile-email,
+    #policyApp .profile-email {
+      padding: .82rem 1rem;
+      border-bottom: 1px solid #1a1a1a;
+      color: #666;
+      font-size: .8rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #downloadApp .navlinks .account-profile-menu a,
+    #downloadApp .navlinks .account-profile-menu button,
+    #policyApp .navlinks .account-profile-menu a,
+    #policyApp .navlinks .account-profile-menu button {
+      display: flex;
+      width: 100%;
+      min-height: 0;
+      align-items: center;
+      padding: .6rem 1rem;
+      border: 0;
+      border-bottom: 1px solid #1a1a1a;
+      background: transparent;
+      color: #ccc;
+      cursor: pointer;
+      font: inherit;
+      font-size: .85rem;
+      font-weight: 500;
+      text-align: left;
+      text-decoration: none;
+    }
+
+    #downloadApp .navlinks .account-profile-menu a:hover,
+    #downloadApp .navlinks .account-profile-menu button:hover,
+    #policyApp .navlinks .account-profile-menu a:hover,
+    #policyApp .navlinks .account-profile-menu button:hover {
+      background: #1a1a1a;
+      color: #e0e0e0;
+    }
+
+    #downloadApp .account-profile-menu a:last-child,
+    #downloadApp .account-profile-menu button:last-child,
+    #policyApp .account-profile-menu a:last-child,
+    #policyApp .account-profile-menu button:last-child {
+      border-bottom: 0;
     }
 
     #accountApp .account-actions-row button.account-link {
@@ -4532,6 +4835,56 @@
 
     html[data-bluey-theme="light"] #accountApp .account-profile-menu a:hover,
     html[data-bluey-theme="light"] #accountApp .account-profile-menu button:hover {
+      background: #f1fbff;
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .profile-button,
+    html[data-bluey-theme="light"] #policyApp .profile-button {
+      border-color: #d8e8f0;
+      color: #657888;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .profile-button:hover,
+    html[data-bluey-theme="light"] #downloadApp .profile-button[aria-expanded="true"],
+    html[data-bluey-theme="light"] #policyApp .profile-button:hover,
+    html[data-bluey-theme="light"] #policyApp .profile-button[aria-expanded="true"] {
+      border-color: rgba(48, 151, 210, .62);
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .account-profile-menu,
+    html[data-bluey-theme="light"] #policyApp .account-profile-menu {
+      border-color: #dceaf2;
+      background: #ffffff;
+      box-shadow: 0 18px 42px rgba(40, 82, 110, .16);
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .profile-email,
+    html[data-bluey-theme="light"] #downloadApp .account-profile-menu a,
+    html[data-bluey-theme="light"] #downloadApp .account-profile-menu button,
+    html[data-bluey-theme="light"] #policyApp .profile-email,
+    html[data-bluey-theme="light"] #policyApp .account-profile-menu a,
+    html[data-bluey-theme="light"] #policyApp .account-profile-menu button {
+      border-bottom-color: #dceaf2;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .profile-email,
+    html[data-bluey-theme="light"] #policyApp .profile-email {
+      color: #657888;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .account-profile-menu a,
+    html[data-bluey-theme="light"] #downloadApp .account-profile-menu button,
+    html[data-bluey-theme="light"] #policyApp .account-profile-menu a,
+    html[data-bluey-theme="light"] #policyApp .account-profile-menu button {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .account-profile-menu a:hover,
+    html[data-bluey-theme="light"] #downloadApp .account-profile-menu button:hover,
+    html[data-bluey-theme="light"] #policyApp .account-profile-menu a:hover,
+    html[data-bluey-theme="light"] #policyApp .account-profile-menu button:hover {
       background: #f1fbff;
       color: #087ca6;
     }

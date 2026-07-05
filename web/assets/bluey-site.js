@@ -193,20 +193,52 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
-    function closeProfileMenu() {
-      const button = document.getElementById('accountProfileButton');
-      const menu = document.getElementById('accountProfileMenu');
-      if (button) button.setAttribute('aria-expanded', 'false');
-      if (menu) menu.hidden = true;
+    function closeProfileMenu(exceptProfile = null) {
+      const profiles = document.querySelectorAll('[data-account-profile]');
+      if (!profiles.length) {
+        const button = document.getElementById('accountProfileButton');
+        const menu = document.getElementById('accountProfileMenu');
+        if (button) button.setAttribute('aria-expanded', 'false');
+        if (menu) menu.hidden = true;
+        return;
+      }
+      profiles.forEach((profile) => {
+        if (exceptProfile && profile === exceptProfile) return;
+        const button = profile.querySelector('[data-account-profile-button]');
+        const menu = profile.querySelector('[data-account-profile-menu]');
+        if (button) button.setAttribute('aria-expanded', 'false');
+        if (menu) menu.hidden = true;
+      });
     }
 
-    function toggleProfileMenu() {
-      const button = document.getElementById('accountProfileButton');
-      const menu = document.getElementById('accountProfileMenu');
+    function toggleProfileMenu(profile = null) {
+      const root = profile || document;
+      const button = root.querySelector?.('[data-account-profile-button]') || document.getElementById('accountProfileButton');
+      const menu = root.querySelector?.('[data-account-profile-menu]') || document.getElementById('accountProfileMenu');
       if (!button || !menu) return;
       const open = menu.hidden;
+      closeProfileMenu(open ? profile : null);
       menu.hidden = !open;
       button.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+
+    function initProfileMenus() {
+      document.querySelectorAll('[data-account-profile-button], #accountProfileButton').forEach((button) => {
+        if (button.dataset.profileReady === '1') return;
+        button.dataset.profileReady = '1';
+        button.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          toggleProfileMenu(button.closest('[data-account-profile]'));
+        });
+      });
+      document.querySelectorAll('[data-account-profile-menu], #accountProfileMenu').forEach((menu) => {
+        if (menu.dataset.profileMenuReady === '1') return;
+        menu.dataset.profileMenuReady = '1';
+        menu.addEventListener('click', (event) => {
+          event.stopPropagation();
+        });
+      });
     }
 
     function filePreviewHref(route) {
@@ -2260,8 +2292,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         ]);
         currentAccountEmail = me.email || '';
         const accountLabel = me.is_temporary ? 'Temporary Bluey trial' : (me.email || 'Bluey account');
-        const profileEmailLabel = document.getElementById('profileEmailLabel');
-        if (profileEmailLabel) profileEmailLabel.textContent = accountLabel;
+        document.querySelectorAll('[data-profile-email-label]').forEach((profileEmailLabel) => {
+          profileEmailLabel.textContent = accountLabel;
+        });
         setRailCommand(true, accountLabel);
         const billingProviderLabel = document.getElementById('billingProviderLabel');
         if (billingProviderLabel) {
@@ -2584,17 +2617,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
             button.textContent = previous;
           });
       });
-      document.getElementById('accountProfileButton')?.addEventListener('click', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        toggleProfileMenu();
-      });
-      document.getElementById('accountProfileMenu')?.addEventListener('click', (event) => {
-        event.stopPropagation();
-      });
-      document.getElementById('changePasswordButton')?.addEventListener('click', () => {
-        closeProfileMenu();
-        openChangePasswordDialog();
+      initProfileMenus();
+      document.querySelectorAll('[data-change-password-button], #changePasswordButton').forEach((button) => {
+        if (button.dataset.changePasswordReady === '1') return;
+        button.dataset.changePasswordReady = '1';
+        button.addEventListener('click', () => {
+          closeProfileMenu();
+          openChangePasswordDialog();
+        });
       });
       document.getElementById('changePasswordForm')?.addEventListener('submit', (event) => {
         event.preventDefault();
@@ -2605,9 +2635,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('changePasswordDialog')?.addEventListener('click', (event) => {
         if (event.target?.id === 'changePasswordDialog') resetChangePasswordDialog();
       });
-      document.getElementById('deleteAccountButton')?.addEventListener('click', () => {
-        closeProfileMenu();
-        openDeleteAccountDialog();
+      document.querySelectorAll('[data-delete-account-button], #deleteAccountButton').forEach((button) => {
+        if (button.dataset.deleteAccountReady === '1') return;
+        button.dataset.deleteAccountReady = '1';
+        button.addEventListener('click', () => {
+          closeProfileMenu();
+          openDeleteAccountDialog();
+        });
       });
       document.getElementById('deleteAcceptDataLoss')?.addEventListener('change', updateDeleteAccountConfirmState);
       document.getElementById('deleteAcceptCreditLoss')?.addEventListener('change', updateDeleteAccountConfirmState);
@@ -2731,7 +2765,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     document.addEventListener('click', async (event) => {
-      if (!event.target.closest('#accountProfile')) {
+      if (!event.target.closest('[data-account-profile]')) {
         closeProfileMenu();
       }
 
@@ -2788,6 +2822,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     initFilePreview();
     initSiteTheme();
+    initProfileMenus();
     initProductJoinForm();
     bootBlueyTerminal();
     syncAccountNav();
