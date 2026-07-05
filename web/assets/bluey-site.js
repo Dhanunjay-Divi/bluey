@@ -34,6 +34,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let squareCardSetupPromise = null;
     let refreshAccountTokenPromise = null;
     let currentAccountEmail = '';
+    let latestAccountForBilling = null;
     const AUTO_RELOAD_MIN_CENTS = 1500;
     const AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 1000;
     const AUTO_RELOAD_DEFAULT_AMOUNT_CENTS = 3000;
@@ -1256,14 +1257,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         || (projectedDays > 0
           ? `~${Math.min(projectedDays, 90)} days at recent pace.`
           : 'Projection appears after usage.');
-      const summaryUsageValue = document.getElementById('summaryUsageValue');
-      const summaryUsageHint = document.getElementById('summaryUsageHint');
-      const summaryTierValue = document.getElementById('summaryTierValue');
-      const summaryProjectionHint = document.getElementById('summaryProjectionHint');
-      if (summaryUsageValue) summaryUsageValue.textContent = `${usage.total_cues || 0}`;
-      if (summaryUsageHint) summaryUsageHint.textContent = `${money(usage.total_cents_spent)} spent in ${usage.period_days || 7} days.`;
-      if (summaryTierValue) summaryTierValue.textContent = usage.tier_label || '--';
-      if (summaryProjectionHint) summaryProjectionHint.textContent = document.getElementById('projectionHint').textContent;
       const list = document.getElementById('usageList');
       const rows = usage.mix || [];
       list.replaceChildren();
@@ -1348,12 +1341,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function renderAutoReload(me) {
+      latestAccountForBilling = me || null;
       const card = document.getElementById('autoReloadCard');
       const hint = document.getElementById('autoReloadHint');
       const method = document.getElementById('autoReloadMethod');
       const toggle = document.getElementById('autoReloadToggle');
       const setup = document.getElementById('squareCardSetup');
       const saveButton = document.getElementById('saveSquareCardButton');
+      const changeCardButton = document.getElementById('changeSquareCardButton');
       const thresholdInput = document.getElementById('autoReloadThreshold');
       const amountInput = document.getElementById('autoReloadAmount');
       const rule = document.getElementById('autoReloadRule');
@@ -1373,41 +1368,43 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         && Boolean(me.square_application_id)
         && Boolean(me.square_location_id);
       const hasSavedMethod = Boolean(me?.auto_topup_available);
-      const shouldShowSquareSetup = !hasSavedMethod && canSaveSquareCard;
 
       card.classList.toggle('is-on', Boolean(me?.auto_topup_enabled));
       toggle.checked = Boolean(me?.auto_topup_enabled);
       toggle.disabled = !hasSavedMethod;
-      setup.hidden = !shouldShowSquareSetup;
+      if (setup.dataset.open !== '1') {
+        setup.hidden = true;
+      }
       if (saveButton) {
-        saveButton.disabled = !shouldShowSquareSetup;
-        saveButton.textContent = 'Save card';
+        saveButton.disabled = !canSaveSquareCard;
+        saveButton.textContent = hasSavedMethod ? 'Update card' : 'Save card';
+      }
+      if (changeCardButton) {
+        changeCardButton.hidden = !canSaveSquareCard || setup.dataset.open === '1';
+        changeCardButton.disabled = !canSaveSquareCard;
+        changeCardButton.textContent = hasSavedMethod ? 'Change card' : 'Save card';
       }
       if (thresholdInput) thresholdInput.value = centsToDollars(thresholdCents);
       if (amountInput) amountInput.value = centsToDollars(amountCents);
       if (rule) {
-        rule.textContent = `Optional backup: below ${threshold}, charge ${amount} and add ${amount} credits after payment succeeds.`;
+        rule.textContent = `Below ${threshold}, add ${amount}.`;
       }
 
       if (me?.auto_topup_enabled) {
-        hint.textContent = `On. Bluey adds ${amount} credits when your balance drops below ${threshold}.`;
+        hint.textContent = 'On';
       } else if (hasSavedMethod) {
-        hint.textContent = `Off. Turn on only if you want Bluey to reload ${amount} below ${threshold}.`;
-      } else if (shouldShowSquareSetup) {
-        hint.textContent = 'Off by default. Save a card only if you want Bluey to reload automatically.';
+        hint.textContent = 'Off';
+      } else if (canSaveSquareCard) {
+        hint.textContent = 'Save a card in Billing to turn on.';
       } else {
-        hint.textContent = me?.auto_topup_unavailable_reason || 'Add credits manually any time. Auto Reload is optional and off by default.';
+        hint.textContent = me?.auto_topup_unavailable_reason || 'Unavailable';
       }
 
       method.textContent = me?.saved_payment_method_label
-        ? `Saved card for Auto Reload: ${me.saved_payment_method_label}`
-        : shouldShowSquareSetup
-          ? 'No saved card yet'
-          : '';
-
-      if (shouldShowSquareSetup) {
-        setupSquareCard(me).catch((error) => accountMessage(error.message));
-      }
+        ? `Saved card: ${me.saved_payment_method_label}`
+        : canSaveSquareCard
+          ? 'No saved card. Save one to enable Auto Reload.'
+          : me?.auto_topup_unavailable_reason || 'Card saving is not configured for this account.';
     }
 
     function readAutoReloadSettings() {
@@ -1436,7 +1433,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!rule) return;
       try {
         const settings = readAutoReloadSettings();
-        rule.textContent = `Optional backup: below ${money(settings.auto_topup_threshold_cents)}, charge ${money(settings.auto_topup_amount_cents)} and add ${money(settings.auto_topup_amount_cents)} credits after payment succeeds.`;
+        rule.textContent = `Below ${money(settings.auto_topup_threshold_cents)}, add ${money(settings.auto_topup_amount_cents)}.`;
       } catch (error) {
         rule.textContent = error.message;
       }
@@ -1483,6 +1480,45 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return me;
     }
 
+    async function openSquareCardSetup() {
+      const button = document.getElementById('changeSquareCardButton');
+      const setup = document.getElementById('squareCardSetup');
+      if (!setup) return;
+      if (!latestAccountForBilling?.square_application_id || !latestAccountForBilling?.square_location_id) {
+        throw new Error('Card changes are not configured for this account yet.');
+      }
+      const previous = button?.textContent || 'Save card';
+      setup.hidden = false;
+      setup.dataset.open = '1';
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Loading...';
+      }
+      try {
+        await setupSquareCard(latestAccountForBilling);
+        if (button) button.hidden = true;
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = previous;
+        }
+      }
+    }
+
+    function closeSquareCardSetup() {
+      const setup = document.getElementById('squareCardSetup');
+      const changeCardButton = document.getElementById('changeSquareCardButton');
+      const container = document.getElementById('squareCardContainer');
+      if (setup) {
+        setup.hidden = true;
+        setup.dataset.open = '';
+      }
+      if (container) container.replaceChildren();
+      if (changeCardButton) changeCardButton.hidden = false;
+      squareCard = null;
+      squareCardEnvironment = '';
+    }
+
     async function saveSquareCard() {
       const button = document.getElementById('saveSquareCardButton');
       if (!squareCard) {
@@ -1503,6 +1539,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           method: 'POST',
           body: JSON.stringify({ source_id: result.token }),
         });
+        closeSquareCardSetup();
         renderAutoReload(me);
         me = await updateAutoReload(true);
         renderAutoReload(me);
@@ -1911,8 +1948,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         ]);
         currentAccountEmail = me.email || '';
         const accountLabel = me.is_temporary ? 'Temporary Bluey trial' : (me.email || 'Bluey account');
-        const dashboardEmailLabel = document.getElementById('accountDashboardEmailLabel');
-        if (dashboardEmailLabel) dashboardEmailLabel.textContent = accountLabel;
         const profileEmailLabel = document.getElementById('profileEmailLabel');
         if (profileEmailLabel) profileEmailLabel.textContent = accountLabel;
         setRailCommand(true, accountLabel);
@@ -2155,6 +2190,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       document.getElementById('saveSquareCardButton')?.addEventListener('click', () => {
         saveSquareCard().catch((error) => accountMessage(error.message));
+      });
+      document.getElementById('changeSquareCardButton')?.addEventListener('click', () => {
+        openSquareCardSetup().catch((error) => accountMessage(error.message));
       });
       document.getElementById('refreshDevicesButton')?.addEventListener('click', () => {
         renderLinkedDevices({ devices: [] }, 'Loading linked devices...');

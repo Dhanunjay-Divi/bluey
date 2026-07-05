@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070416"
+    href="/assets/bluey-site.css?v=2026070417"
   >
   <script type="application/ld+json">
   {
@@ -392,31 +392,17 @@
           </section>
 
           <section class="account-card dashboard-card" id="accountDashboard" hidden>
-            <section class="dashboard-overview-card balance-kpi" aria-label="Balance remaining and Auto Reload">
+            <section class="dashboard-overview-card balance-kpi" aria-label="Balance and Auto Reload">
               <div class="dashboard-overview-main">
-                <div class="dashboard-overview-kicker">
-                  <span id="accountDashboardEmailLabel">Bluey account</span>
-                  <span class="pill-muted" id="billingProviderLabel">No subscription</span>
-                </div>
                 <div class="dashboard-overview-title-row">
                   <div>
-                    <h2>Balance remaining</h2>
+                    <h2>Balance</h2>
                     <p id="balanceHint">Credits are used for paid cloud work after any trial time.</p>
                   </div>
                   <strong id="balanceValue">$--</strong>
                 </div>
-                <div class="dashboard-overview-meta" aria-label="Account summary">
-                  <span><strong id="usageValue">--</strong> paid answers</span>
-                  <span id="usageHint">Paid requests appear here.</span>
-                  <span>Tier <strong id="tierValue">--</strong></span>
-                  <span id="projectionHint">Projection appears after usage.</span>
-                </div>
               </div>
               <div class="dashboard-overview-side">
-                <div class="dashboard-actions">
-                  <a class="account-button ghost compact" href="/account#billing">Add credits</a>
-                  <button class="account-button ghost compact" id="refreshAccountButton" type="button">Refresh</button>
-                </div>
                 <div class="reload-card auto-reload-card compact-auto-reload" id="autoReloadCard">
                   <div>
                     <div class="auto-reload-head">
@@ -426,7 +412,6 @@
                         <span></span>
                       </label>
                     </div>
-                    <p id="autoReloadHint">Off by default. Turn it on only if you want Bluey to add credits automatically.</p>
                     <div class="auto-reload-fields" aria-label="Auto Reload rule">
                       <label>
                         <span>When below</span>
@@ -437,21 +422,12 @@
                         <input id="autoReloadAmount" type="number" min="15" max="100" step="5" value="30" inputmode="decimal" />
                       </label>
                     </div>
-                    <p class="auto-reload-rule" id="autoReloadRule">Optional backup: below $10.00, charge $30.00 and add $30.00 credits after payment succeeds.</p>
-                    <div class="auto-reload-method" id="autoReloadMethod"></div>
-                    <div class="square-card-setup" id="squareCardSetup" hidden>
-                      <div class="square-card-copy">
-                        <strong>Save a card for Auto Reload</strong>
-                        <span>Square handles the card details. Bluey keeps only the saved card reference.</span>
-                      </div>
-                      <div id="squareCardContainer" class="square-card-container"></div>
-                      <button class="account-button ghost" id="saveSquareCardButton" type="button">Save card</button>
-                    </div>
+                    <p class="auto-reload-rule" id="autoReloadRule">Below $10.00, add $30.00.</p>
+                    <p class="auto-reload-hint" id="autoReloadHint">Off until a card is saved in Billing.</p>
                   </div>
                 </div>
               </div>
             </section>
-            <div class="device-link-hint dashboard-device-link-hint" id="dashboardDeviceLinkHint" hidden></div>
 
             <section class="dashboard-section trial-convert-section" id="trialConvertSection" aria-label="Save temporary trial as account" hidden>
               <div class="section-head">
@@ -508,6 +484,7 @@
                     <p>Computers and browsers linked with a Bluey code or desktop sign-in. Remove anything you do not recognize.</p>
                   </div>
                 </div>
+                <div class="device-link-hint dashboard-device-link-hint" id="dashboardDeviceLinkHint" hidden></div>
                 <div class="device-summary-bar">
                   <span id="linkedDeviceCount">No linked devices</span>
                   <div class="account-actions-row">
@@ -549,13 +526,13 @@
                   </div>
                   <div class="summary-metric">
                     <span>Paid answers</span>
-                    <strong id="summaryUsageValue">--</strong>
-                    <em id="summaryUsageHint">Paid requests appear here.</em>
+                    <strong id="usageValue">--</strong>
+                    <em id="usageHint">Paid requests appear here.</em>
                   </div>
                   <div class="summary-metric">
                     <span>Tier</span>
-                    <strong id="summaryTierValue">--</strong>
-                    <em id="summaryProjectionHint">Projection appears after usage.</em>
+                    <strong id="tierValue">--</strong>
+                    <em id="projectionHint">Projection appears after usage.</em>
                   </div>
                 </div>
                 <div class="usage-list" id="usageList"></div>
@@ -597,6 +574,25 @@
                       <button class="account-button primary" id="reloadButton" type="button">Add credits</button>
                     </div>
                     <p class="manual-reload-rule" id="manualReloadRule">$30 recommended. $15 minimum. Checkout opens in a new tab; refresh here after payment succeeds.</p>
+                  </div>
+                  <div class="reload-card billing-payment-card" id="billingPaymentCard">
+                    <div class="billing-payment-head">
+                      <div>
+                        <h3>Payment method</h3>
+                        <p>Used only for Auto Reload. Square handles card details; Bluey stores only the saved card reference.</p>
+                      </div>
+                      <span class="pill-muted" id="billingProviderLabel">No subscription</span>
+                    </div>
+                    <div class="auto-reload-method" id="autoReloadMethod">No saved card yet</div>
+                    <button class="account-button ghost compact" id="changeSquareCardButton" type="button" hidden>Save card</button>
+                    <div class="square-card-setup" id="squareCardSetup" hidden>
+                      <div class="square-card-copy">
+                        <strong>Secure card form</strong>
+                        <span>Enter a card, then save. Bluey never sees the card number.</span>
+                      </div>
+                      <div id="squareCardContainer" class="square-card-container"></div>
+                      <button class="account-button ghost compact" id="saveSquareCardButton" type="button">Save card</button>
+                    </div>
                   </div>
                 </div>
               </section>
@@ -943,7 +939,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070416"
+    src="/assets/bluey-site.js?v=2026070417"
   ></script>
 </body>
 </html>
