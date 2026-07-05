@@ -411,6 +411,8 @@ pub struct UsageWindow {
     pub mix: Vec<MixEntry>,
     pub tier_label: String,
     pub projected_days_remaining: f64,
+    pub projection_label: String,
+    pub projection_quality: String,
 }
 
 #[derive(Serialize)]
@@ -469,13 +471,43 @@ pub async fn usage(
         "Heavy"
     };
 
-    // Projected days remaining at current burn rate.
+    // Projected days remaining at current burn rate. Very small samples make
+    // the math look falsely precise, so expose a human label and cap the
+    // legacy numeric field for older clients.
     let cues_per_day = (total_cues as f64) / (PERIOD_DAYS as f64);
     let avg_cents_per_day = cues_per_day * avg_cost_per_cue_cents;
-    let projected_days_remaining = if avg_cents_per_day > 0.01 {
+    let raw_projected_days_remaining = if avg_cents_per_day > 0.01 {
         (account.balance_cents as f64) / avg_cents_per_day
     } else {
-        365.0 // no usage yet → cap at 1 year (credit-validity boundary)
+        0.0
+    };
+    let low_sample = total_cues < 20 || total_cents_spent < 100;
+    let (projected_days_remaining, projection_label, projection_quality) =
+        if total_cues == 0 || total_cents_spent == 0 {
+            (
+                0.0,
+                "Projection appears after usage.".to_string(),
+                "none".to_string(),
+            )
+        } else if low_sample {
+            (
+                raw_projected_days_remaining.min(60.0),
+                "Light recent usage; estimate needs more activity.".to_string(),
+                "low_sample".to_string(),
+            )
+        } else if raw_projected_days_remaining >= 90.0 {
+            (
+                90.0,
+                "90+ days at recent pace.".to_string(),
+                "capped".to_string(),
+            )
+        } else {
+            let rounded = raw_projected_days_remaining.round().max(1.0);
+            (
+                raw_projected_days_remaining,
+                format!("~{rounded:.0} days at recent pace."),
+                "estimated".to_string(),
+            )
     };
 
     Ok(Json(UsageWindow {
@@ -485,6 +517,8 @@ pub async fn usage(
         mix,
         tier_label: tier_label.to_string(),
         projected_days_remaining: (projected_days_remaining * 10.0).round() / 10.0,
+        projection_label,
+        projection_quality,
     }))
 }
 

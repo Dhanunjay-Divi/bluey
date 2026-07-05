@@ -31,10 +31,15 @@ pub async fn show_usage(client: &CloudClient) -> Result<()> {
         usage.total_cents_spent as f64 / 100.0,
     );
     println!("Tier            {} user", usage.tier_label);
-    println!(
-        "Projection      ${:.2} lasts ~{:.0} days at your current rate",
-        balance_dollars, usage.projected_days_remaining,
-    );
+    let projection = if usage.projection_label.trim().is_empty() {
+        format!(
+            "${balance_dollars:.2} lasts ~{:.0} days at your current rate",
+            usage.projected_days_remaining
+        )
+    } else {
+        usage.projection_label.clone()
+    };
+    println!("Projection      {projection}");
 
     if me.trial_seconds_remaining > 0 {
         let mins = (me.trial_seconds_remaining as f64 / 60.0).round();
