@@ -1031,11 +1031,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.hidden = false;
         el.replaceChildren();
         const title = document.createElement('strong');
-        title.textContent = 'Connect desktop';
+        title.textContent = 'Connect this desktop';
         const body = document.createElement('span');
         body.textContent = accountToken()
-          ? 'Enter the code shown by Bluey.'
-          : 'Enter the code, then sign in to confirm.';
+          ? 'Web balance is for this browser account. The overlay uses the desktop sign-in until you enter its code here.'
+          : 'Enter the code, then sign in to connect the desktop to the same account.';
         const form = document.createElement('form');
         form.className = 'device-code-form';
         form.noValidate = true;
@@ -1049,14 +1049,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const button = document.createElement('button');
         button.type = 'submit';
         button.className = 'account-button secondary compact';
-        button.textContent = 'Use code';
+        button.textContent = 'Connect';
         const status = document.createElement('span');
         status.className = 'device-code-status';
         form.addEventListener('submit', (event) => {
           event.preventDefault();
           const nextCode = normalizeDeviceCode(input.value);
           if (!nextCode) {
-            status.textContent = 'Enter the code shown by Bluey desktop.';
+            status.textContent = 'Enter the code shown in Bluey desktop.';
             input.focus();
             return;
           }
@@ -1091,7 +1091,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         if (accountToken()) {
           body.append(
             codeEl,
-            `. This connects the desktop showing that code to ${currentAccountEmail || 'the account signed into this browser'}. Only approve codes from your own Bluey desktop.`
+            `. This moves the desktop showing that code onto ${currentAccountEmail || 'the account signed into this browser'} so the dashboard and overlay balance match.`
           );
         } else {
           body.append(
@@ -1125,6 +1125,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         ? [dashboardHint].filter(Boolean)
         : [authHint].filter(Boolean);
       for (const el of visibleTargets) renderInto(el);
+    }
+
+    function focusDesktopConnectCard() {
+      setDashboardTab('computers');
+      renderDeviceLinkHint();
+      const hint = document.getElementById('dashboardDeviceLinkHint');
+      if (!hint || hint.hidden) return;
+      hint.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      const input = hint.querySelector('input[name="user_code"]');
+      if (input) input.focus();
     }
 
     async function approvePendingDevice() {
@@ -2592,6 +2602,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       document.getElementById('overviewReloadButton')?.addEventListener('click', () => {
         startReload();
+      });
+      document.getElementById('desktopBalanceHelpButton')?.addEventListener('click', () => {
+        focusDesktopConnectCard();
       });
       document.getElementById('refreshAccountButton')?.addEventListener('click', () => {
         loadAccount().catch((error) => accountMessage(error.message));
