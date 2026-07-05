@@ -286,7 +286,46 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }
         input.value = code;
         rememberPendingDeviceCode(code);
+        if (accountToken()) {
+          event.preventDefault();
+          approveProductConnectCode(code, form);
+        }
       });
+    }
+
+    function productConnectStatus(text, tone = '') {
+      const el = document.getElementById('productConnectStatus');
+      if (!el) return;
+      el.textContent = text || '';
+      el.dataset.tone = tone || '';
+    }
+
+    async function approveProductConnectCode(code, form) {
+      const button = form?.querySelector('button[type="submit"]');
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Connecting...';
+      }
+      productConnectStatus('Connecting this account to Bluey desktop...');
+      try {
+        await apiJson('/auth/device/approve', {
+          method: 'POST',
+          body: JSON.stringify({ user_code: code }),
+        });
+        sessionStorage.setItem(`bluey_device_approved_${code}`, '1');
+        productConnectStatus('Connected. Return to Bluey desktop; it will finish automatically.', 'success');
+      } catch (error) {
+        if (!accountToken()) {
+          window.location.href = `/login?user_code=${encodeURIComponent(code)}`;
+          return;
+        }
+        productConnectStatus(`Could not connect: ${error.message}`, 'error');
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = 'Connect';
+        }
+      }
     }
 
     function bootBlueyTerminal() {

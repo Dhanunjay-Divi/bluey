@@ -864,6 +864,18 @@
       color: #5f7281;
     }
 
+    html[data-bluey-theme="light"] #productSite .connect-status {
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #productSite .connect-status[data-tone="success"] {
+      color: #177545;
+    }
+
+    html[data-bluey-theme="light"] #productSite .connect-status[data-tone="error"] {
+      color: #a8273a;
+    }
+
     html[data-bluey-theme="light"] #productSite .hero-note,
     html[data-bluey-theme="light"] #productSite .plan-detail,
     html[data-bluey-theme="light"] #productSite .pricing-note,
@@ -1089,6 +1101,11 @@
       color: #bff8ff;
     }
 
+    #productSite .join-bar button:disabled {
+      cursor: wait;
+      opacity: .62;
+    }
+
     #productSite .connect-help {
       max-width: 386px;
       margin-top: .45rem;
@@ -1096,6 +1113,27 @@
       font-size: .73rem;
       font-weight: 560;
       line-height: 1.38;
+    }
+
+    #productSite .connect-status {
+      max-width: 386px;
+      margin-top: .42rem;
+      color: #9be8ff;
+      font-size: .73rem;
+      font-weight: 650;
+      line-height: 1.38;
+    }
+
+    #productSite .connect-status:empty {
+      display: none;
+    }
+
+    #productSite .connect-status[data-tone="success"] {
+      color: #7df2a5;
+    }
+
+    #productSite .connect-status[data-tone="error"] {
+      color: #ff8f98;
     }
 
     #productSite .hero-note {
@@ -1486,6 +1524,11 @@
       }
 
       #productSite .connect-help {
+        max-width: 100%;
+        text-align: center;
+      }
+
+      #productSite .connect-status {
         max-width: 100%;
         text-align: center;
       }
