@@ -1227,6 +1227,11 @@ pub async fn run() -> Result<()> {
     // measure latency without the overlay. Read-only; gated to localhost.
     spawn_live_transcript_ws(daemon.clone());
 
+    // First-run model download (~600MB) is otherwise silent — forward its progress
+    // to the overlay as a system card so the app doesn't look hung on first run.
+    #[cfg(feature = "parakeet-stt")]
+    spawn_model_progress_forwarder(daemon.clone());
+
     let listener = TcpListener::bind(&args.addr)
         .await
         .with_context(|| format!("failed to bind Bluey daemon IPC at {}", args.addr))?;
@@ -10999,6 +11004,127 @@ async fn push_system_card(
 ) {
     let card = CueCard::new(kind, title, body).with_source("screen context");
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+}
+
+/// Forward first-run model-download progress (from `stt::model_setup`) to the
+/// overlay so the ~600MB fetch isn't a silent hang. Pushes a "Setting up" card at
+/// start, then updates it in place as bytes arrive (throttled to whole-percent
+/// changes), and a final "ready" card when done. Best-effort: a lagged/closed
+/// broadcast just ends the task.
+#[cfg(feature = "parakeet-stt")]
+fn spawn_model_progress_forwarder(daemon: Arc<Daemon>) {
+    use crate::stt::model_setup::{subscribe_model_progress, ModelProgress};
+
+    let mut rx = subscribe_model_progress();
+    tokio::spawn(async move {
+        // One stable card id per model label. First sighting PUSHES a card (with a
+        // title); subsequent updates edit its body via UpdateCard (which can't set
+        // a title). So each label gets exactly one card that fills in progressively.
+        let mut card_ids: std::collections::HashMap<String, uuid::Uuid> =
+            std::collections::HashMap::new();
+        let mut last_pct: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+        loop {
+            let update: ModelProgress = match rx.recv().await {
+                Ok(u) => u,
+                // Lagged (we fell behind) — keep going with the newest we can get.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+
+            // Push the card the first time we see this label.
+            let (id, is_new) = match card_ids.get(&update.label) {
+                Some(id) => (*id, false),
+                None => {
+                    let id = uuid::Uuid::new_v4();
+                    card_ids.insert(update.label.clone(), id);
+                    let mut card = CueCard::new(
+                        CardKind::System,
+                        format!("Setting up {}", update.label),
+                        "Downloading…".to_string(),
+                    )
+                    .with_source("model setup");
+                    card.id = id;
+                    let _ = send_overlay(&daemon, OverlayCommand::PushCard { card }).await;
+                    (id, true)
+                }
+            };
+
+            if update.done {
+                let _ = send_overlay(
+                    &daemon,
+                    OverlayCommand::UpdateCard {
+                        id,
+                        body: format!(
+                            "{} ready — on-device, nothing leaves this machine.",
+                            capitalize_first(&update.label)
+                        ),
+                        done: true,
+                        cost_label: None,
+                        artifact: None,
+                    },
+                )
+                .await;
+                continue;
+            }
+
+            let (pct, body) = match update.total {
+                Some(total) if total > 0 => {
+                    let pct = ((update.downloaded.min(total) as f64 / total as f64) * 100.0).round()
+                        as u8;
+                    (
+                        Some(pct),
+                        format!(
+                            "Downloading… {pct}% ({} / {})",
+                            fmt_mb(update.downloaded),
+                            fmt_mb(total)
+                        ),
+                    )
+                }
+                _ => (None, format!("Downloading… {}", fmt_mb(update.downloaded))),
+            };
+
+            // Throttle to whole-percent changes (skip if same pct), but always send
+            // the first update right after the push so the body isn't stuck at "…".
+            if let Some(pct) = pct {
+                if !is_new && last_pct.get(&update.label) == Some(&pct) {
+                    continue;
+                }
+                last_pct.insert(update.label.clone(), pct);
+            }
+
+            let _ = send_overlay(
+                &daemon,
+                OverlayCommand::UpdateCard {
+                    id,
+                    body,
+                    done: false,
+                    cost_label: None,
+                    artifact: None,
+                },
+            )
+            .await;
+        }
+    });
+}
+
+/// "1.2 GB" / "540 MB" for a byte count (progress UI).
+#[cfg(feature = "parakeet-stt")]
+fn fmt_mb(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else {
+        format!("{:.0} MB", mb)
+    }
+}
+
+#[cfg(feature = "parakeet-stt")]
+fn capitalize_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
 }
 
 async fn current_or_last_meeting(daemon: &Arc<Daemon>) -> Result<Option<MeetingRecord>> {

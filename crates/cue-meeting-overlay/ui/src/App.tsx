@@ -5,7 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { getClient } from "./lib";
 import { useDragHeader } from "./lib/useDragHeader";
-import { useCollapse } from "./lib/useCollapse";
+import { useCollapse, useOnboardingWindowSize } from "./lib/useCollapse";
 import { useDataStore } from "./lib/dataStore";
 import {
   Glass,
@@ -46,6 +46,11 @@ export function App() {
   const { collapsed, collapse, expand } = useCollapse();
   const pillRef = useRef<HTMLDivElement>(null);
   useDragHeader(pillRef);
+
+  // First-run onboarding is a compact centered card — shrink the OS window to it
+  // while onboarding, then restore the full panel when it's done (fixes the card
+  // rendering full-size in a large empty window).
+  useOnboardingWindowSize(onboarding, collapsed);
 
   // Real connectors for the attached agent — the footer lists the actual ready
   // ones, never hardcoded brand names.

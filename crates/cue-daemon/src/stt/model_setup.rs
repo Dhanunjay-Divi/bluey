@@ -16,12 +16,49 @@
 #![cfg(feature = "parakeet-stt")]
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use cue_core::app_paths::AppPaths;
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use super::parakeet::ParakeetPaths;
+
+/// A first-run model-download progress update, broadcast so the daemon can
+/// surface it in the overlay (the ~600MB fetch is otherwise silent — the app
+/// looks hung on first `bluey on`). `total` is `None` when the server sends no
+/// Content-Length. `done` marks the whole model provisioned (all files present).
+#[derive(Clone, Debug)]
+pub struct ModelProgress {
+    /// Human label for what's downloading, e.g. "speech model" / "speaker model".
+    pub label: String,
+    /// Bytes written so far across the current model's files.
+    pub downloaded: u64,
+    /// Total bytes expected for the current file, if the server reported it.
+    pub total: Option<u64>,
+    /// True once the full model set is present (terminal event).
+    pub done: bool,
+}
+
+/// Process-wide progress bus. Lazily created; if no one has subscribed the
+/// `send` is a cheap no-op (broadcast drops when there are no receivers).
+static PROGRESS_TX: OnceLock<broadcast::Sender<ModelProgress>> = OnceLock::new();
+
+fn progress_tx() -> &'static broadcast::Sender<ModelProgress> {
+    PROGRESS_TX.get_or_init(|| broadcast::channel(64).0)
+}
+
+/// Subscribe to model-download progress. The daemon calls this once at startup
+/// and forwards each update to the overlay.
+pub fn subscribe_model_progress() -> broadcast::Receiver<ModelProgress> {
+    progress_tx().subscribe()
+}
+
+fn publish(update: ModelProgress) {
+    // Ignore the "no receivers" error — progress is best-effort telemetry.
+    let _ = progress_tx().send(update);
+}
 
 /// The three files a Nemotron English model dir must contain (verified against
 /// `parakeet-rs` `NemotronModel::from_pretrained`: it requires `encoder.onnx`
@@ -109,15 +146,17 @@ pub async fn ensure_parakeet_model(paths: &AppPaths) -> Result<ParakeetPaths> {
         .build()
         .context("failed to build model-download HTTP client")?;
 
+    let mut base_downloaded: u64 = 0;
     for file in NEMOTRON_FILES {
         let dest = model_dir.join(file);
         if dest.is_file() {
             continue; // partial prior run — keep what's already there
         }
         let url = format!("{base}/{file}");
-        download_file(&client, &url, &dest)
+        let written = download_file(&client, &url, &dest, "speech model", base_downloaded)
             .await
             .with_context(|| format!("failed to download {file}"))?;
+        base_downloaded += written;
     }
 
     // Verify the set is complete before declaring success (guards a truncated /
@@ -129,6 +168,12 @@ pub async fn ensure_parakeet_model(paths: &AppPaths) -> Result<ParakeetPaths> {
         );
     }
     info!(dir = %model_dir.display(), "parakeet model ready");
+    publish(ModelProgress {
+        label: "speech model".to_string(),
+        downloaded: base_downloaded,
+        total: Some(base_downloaded),
+        done: true,
+    });
     Ok(parakeet_paths(model_dir).await)
 }
 
@@ -200,7 +245,7 @@ async fn ensure_sortformer_model(model_dir: &Path) -> Result<PathBuf> {
         .timeout(std::time::Duration::from_secs(900))
         .build()
         .context("failed to build sortformer-download HTTP client")?;
-    download_file(&client, &url, &dest)
+    let written = download_file(&client, &url, &dest, "speaker model", 0)
         .await
         .context("failed to download sortformer diarization model")?;
 
@@ -211,12 +256,28 @@ async fn ensure_sortformer_model(model_dir: &Path) -> Result<PathBuf> {
         );
     }
     info!(path = %dest.display(), "sortformer diarization model ready");
+    publish(ModelProgress {
+        label: "speaker model".to_string(),
+        downloaded: written,
+        total: Some(written),
+        done: true,
+    });
     Ok(dest)
 }
 
 /// Stream one file to `dest`, writing to a `.part` temp first and renaming on
 /// success so an interrupted download never leaves a half-written model file.
-async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
+///
+/// `label` names the model for progress UI ("speech model" / "speaker model");
+/// `base_downloaded` is the byte count already fetched for earlier files of the
+/// same model, so the progress bar advances across a multi-file model.
+async fn download_file(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    label: &str,
+    base_downloaded: u64,
+) -> Result<u64> {
     use tokio::io::AsyncWriteExt;
 
     info!(%url, "downloading parakeet model file");
@@ -229,12 +290,25 @@ async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Resu
         anyhow::bail!("download {url} returned HTTP {}", resp.status());
     }
 
+    // Total for the progress bar: this file's Content-Length plus what earlier
+    // files already contributed (None if the server omits Content-Length).
+    let total = resp.content_length().map(|len| len + base_downloaded);
+
     let tmp = dest.with_extension("part");
     let mut file = tokio::fs::File::create(&tmp)
         .await
         .with_context(|| format!("failed to create {}", tmp.display()))?;
     let mut stream = resp;
     let mut written: u64 = 0;
+    // Throttle progress emits to ~every 2MB so we don't flood the overlay.
+    let mut last_emit: u64 = 0;
+    const EMIT_EVERY: u64 = 2 * 1024 * 1024;
+    publish(ModelProgress {
+        label: label.to_string(),
+        downloaded: base_downloaded,
+        total,
+        done: false,
+    });
     while let Some(chunk) = stream
         .chunk()
         .await
@@ -244,6 +318,15 @@ async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Resu
             .await
             .with_context(|| format!("write error to {}", tmp.display()))?;
         written += chunk.len() as u64;
+        if written - last_emit >= EMIT_EVERY {
+            last_emit = written;
+            publish(ModelProgress {
+                label: label.to_string(),
+                downloaded: base_downloaded + written,
+                total,
+                done: false,
+            });
+        }
     }
     file.flush().await.ok();
     drop(file);
@@ -258,5 +341,5 @@ async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Resu
         .await
         .with_context(|| format!("failed to finalize {}", dest.display()))?;
     info!(dest = %dest.display(), bytes = written, "parakeet model file ready");
-    Ok(())
+    Ok(written)
 }
