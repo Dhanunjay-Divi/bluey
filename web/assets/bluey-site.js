@@ -172,23 +172,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return id;
     }
 
-    async function revokeBrowserSession() {
-      const previousRefreshToken = accountRefreshToken();
+    async function revokeBrowserSession(accessToken = accountToken(), refreshToken = accountRefreshToken()) {
+      if (!accessToken) return;
       try {
-        if (previousRefreshToken) {
-          await refreshAccountToken();
-        }
-      } catch {
-        // Sign-out should always clear the local browser, even if refresh is
-        // unavailable during a deploy or network blip.
-      }
-      const refreshToken = accountRefreshToken() || previousRefreshToken;
-      if (!accountToken() && !refreshToken) return;
-      try {
-        await apiJson('/auth/logout', {
+        await fetch('/auth/logout', {
           method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
           body: JSON.stringify({ refresh_token: refreshToken || null }),
-          skipAuthRefresh: true,
         });
       } catch {
         // Always let local sign-out complete. Stale or already-revoked server
@@ -197,11 +190,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function signOut() {
-      await revokeBrowserSession();
+      const accessToken = accountToken();
+      const refreshToken = accountRefreshToken();
       clearAccountToken();
       if (isAccountRoute) {
         loadAccount().catch((error) => accountMessage(error.message));
       }
+      await revokeBrowserSession(accessToken, refreshToken);
     }
 
     function syncAccountNav() {
@@ -260,6 +255,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         if (menu.dataset.profileMenuReady === '1') return;
         menu.dataset.profileMenuReady = '1';
         menu.addEventListener('click', (event) => {
+          const signOutButton = event.target.closest('[data-sign-out]');
+          if (signOutButton) {
+            event.preventDefault();
+            event.stopPropagation();
+            closeProfileMenu();
+            signOut().catch(() => {
+              clearAccountToken();
+            });
+            return;
+          }
           event.stopPropagation();
         });
       });
@@ -1627,10 +1632,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const toggle = document.getElementById('autoReloadToggle');
       const setup = document.getElementById('squareCardSetup');
       const saveButton = document.getElementById('saveSquareCardButton');
+      const saveAutoReloadButton = document.getElementById('saveAutoReloadButton');
       const changeCardButton = document.getElementById('changeSquareCardButton');
       const thresholdInput = document.getElementById('autoReloadThreshold');
       const amountInput = document.getElementById('autoReloadAmount');
-      const rule = document.getElementById('autoReloadRule');
       if (!card || !hint || !method || !toggle || !setup) return;
 
       let amountCents = Number(me?.auto_topup_amount_cents || AUTO_RELOAD_DEFAULT_AMOUNT_CENTS);
@@ -1650,7 +1655,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
       card.classList.toggle('is-on', Boolean(me?.auto_topup_enabled));
       toggle.checked = Boolean(me?.auto_topup_enabled);
-      toggle.disabled = !hasSavedMethod;
+      toggle.disabled = false;
       if (setup.dataset.open !== '1') {
         setup.hidden = true;
       }
@@ -1665,18 +1670,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       if (thresholdInput) thresholdInput.value = centsToDollars(thresholdCents);
       if (amountInput) amountInput.value = centsToDollars(amountCents);
-      if (rule) {
-        rule.textContent = `Below ${threshold}, add ${amount}.`;
-      }
 
       if (me?.auto_topup_enabled) {
-        hint.textContent = 'On';
+        hint.textContent = `On. Reloads ${amount} when below ${threshold}.`;
       } else if (hasSavedMethod) {
-        hint.textContent = 'Off';
+        hint.textContent = 'Off. Turn on and click Save to enable.';
       } else if (canSaveSquareCard) {
-        hint.textContent = 'Save a card in Billing to turn on.';
+        hint.textContent = 'Save a card in Billing before turning on.';
       } else {
         hint.textContent = me?.auto_topup_unavailable_reason || 'Unavailable';
+      }
+
+      if (saveAutoReloadButton) {
+        saveAutoReloadButton.disabled = !hasSavedMethod && !me?.auto_topup_enabled;
+        saveAutoReloadButton.textContent = 'Save';
       }
 
       method.textContent = me?.saved_payment_method_label
@@ -1684,6 +1691,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         : canSaveSquareCard
           ? 'No saved card.'
           : me?.auto_topup_unavailable_reason || 'Card saving unavailable.';
+      updateAutoReloadDraftCopy();
     }
 
     function readAutoReloadSettings() {
@@ -1712,12 +1720,24 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function updateAutoReloadDraftCopy() {
       const rule = document.getElementById('autoReloadRule');
+      const toggle = document.getElementById('autoReloadToggle');
+      const saveButton = document.getElementById('saveAutoReloadButton');
       if (!rule) return;
+      const enabled = Boolean(toggle?.checked);
+      const wasEnabled = Boolean(latestAccountForBilling?.auto_topup_enabled);
+      const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
+      if (!enabled) {
+        rule.textContent = wasEnabled ? 'Click Save to turn Auto Reload off.' : 'Auto Reload is off.';
+        if (saveButton) saveButton.disabled = !wasEnabled;
+        return;
+      }
       try {
         const settings = readAutoReloadSettings();
-        rule.textContent = `Below ${money(settings.auto_topup_threshold_cents)}, add ${money(settings.auto_topup_amount_cents)}.`;
+        rule.textContent = `When balance is below ${money(settings.auto_topup_threshold_cents)}, reload ${money(settings.auto_topup_amount_cents)}.`;
+        if (saveButton) saveButton.disabled = !hasSavedMethod;
       } catch (error) {
         rule.textContent = error.message;
+        if (saveButton) saveButton.disabled = true;
       }
     }
 
@@ -1759,12 +1779,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       const balanceCents = Number(me?.balance_cents || 0);
       if (balanceCents <= 0) {
-        return 'Balance is $0. Add credits to continue paid cloud work.';
+        return 'Add credits before paid cloud work.';
       }
       if (balanceCents < 500) {
-        return 'Low balance. Add credits to keep work running.';
+        return 'Low balance. Add credits when you need more.';
       }
-      return 'Balance ready for paid cloud work.';
+      return 'Ready for paid cloud work.';
     }
 
     async function updateAutoReload(enabled) {
@@ -1778,9 +1798,38 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       renderAutoReload(me);
       accountMessage(enabled
-        ? `Auto Reload is on. Bluey will add ${money(settings.auto_topup_amount_cents)} credits when balance drops below ${money(settings.auto_topup_threshold_cents)}.`
+        ? `Auto Reload is on. Bluey will reload ${money(settings.auto_topup_amount_cents)} when balance drops below ${money(settings.auto_topup_threshold_cents)}.`
         : 'Auto Reload is off. You can add credits manually whenever you need them.');
       return me;
+    }
+
+    async function saveAutoReloadSettings() {
+      const button = document.getElementById('saveAutoReloadButton');
+      const toggle = document.getElementById('autoReloadToggle');
+      const enabled = Boolean(toggle?.checked);
+      const wasEnabled = Boolean(latestAccountForBilling?.auto_topup_enabled);
+
+      if (!enabled && !wasEnabled) {
+        updateAutoReloadDraftCopy();
+        return;
+      }
+      if (enabled && !latestAccountForBilling?.auto_topup_available) {
+        throw new Error('Save a card in Billing before turning on Auto Reload.');
+      }
+
+      const previous = button?.textContent || 'Save';
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Saving...';
+      }
+      try {
+        await updateAutoReload(enabled);
+      } finally {
+        if (button) {
+          button.textContent = previous;
+        }
+        updateAutoReloadDraftCopy();
+      }
     }
 
     async function openSquareCardSetup() {
@@ -1844,8 +1893,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         });
         closeSquareCardSetup();
         renderAutoReload(me);
-        me = await updateAutoReload(true);
-        renderAutoReload(me);
+        accountMessage('Card saved. Turn on Auto Reload and click Save when you want it active.');
       } finally {
         if (button) {
           button.disabled = false;
@@ -2071,14 +2119,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!sessions.length) {
         const empty = document.createElement('div');
         empty.className = 'session-empty';
-        empty.textContent = 'No saved sessions yet. Save one from Bluey when you want it here.';
+        empty.textContent = 'No uploaded desktop sessions yet. Sign in from Bluey desktop, then refresh after a chat or transcript syncs.';
         list.append(empty);
         return;
       }
 
       for (const session of sessions) {
+        const counts = sessionUploadCounts(session);
+        const hasContent = sessionHasUploadedContent(session);
         const row = document.createElement('article');
-        row.className = 'session-row';
+        row.className = `session-row${hasContent ? '' : ' session-row-empty'}`;
 
         const body = document.createElement('div');
         const title = document.createElement('strong');
@@ -2086,13 +2136,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         title.textContent = session.title || `Session ${shortSessionId(session.session_id)}`;
         const meta = document.createElement('span');
         meta.className = 'session-meta';
-        meta.textContent = [
-          session.status || 'saved',
-          `${session.transcript_count || 0} transcript`,
-          `${session.response_count || 0} answer(s)`,
-          formatSessionTime(session.updated_at_ms || session.last_active_at_ms),
-        ].join(' - ');
-        body.append(title, meta);
+        meta.textContent = hasContent
+          ? `${session.status || 'uploaded'} - ${formatSessionTime(session.updated_at_ms || session.last_active_at_ms)}`
+          : `Session record uploaded - no chat transcript or Bluey answers yet - ${formatSessionTime(session.updated_at_ms || session.last_active_at_ms)}`;
+        const chips = document.createElement('div');
+        chips.className = 'session-upload-chips';
+        for (const chipText of sessionUploadChipLabels(counts)) {
+          const chip = document.createElement('span');
+          chip.className = 'session-upload-chip';
+          chip.textContent = chipText;
+          chips.append(chip);
+        }
+        body.append(title, meta, chips);
 
         const copyId = document.createElement('button');
         copyId.className = 'account-button ghost compact';
@@ -2100,17 +2155,49 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         copyId.dataset.copy = session.session_id || '';
         copyId.textContent = 'Copy ID';
 
-        const button = document.createElement('button');
-        button.className = 'account-button ghost';
-        button.type = 'button';
-        button.dataset.sessionId = session.session_id || '';
-        button.dataset.sessionOpen = accountSessionHref(session.session_id);
-        button.setAttribute('aria-label', `Open ${session.title || 'saved session'} in a new tab`);
-        button.title = 'Open session in a new tab';
-        button.textContent = 'Open tab';
-        row.append(body, copyId, button);
+        const link = document.createElement('a');
+        link.className = 'account-button ghost';
+        link.href = accountSessionHref(session.session_id);
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.dataset.sessionId = session.session_id || '';
+        link.setAttribute('aria-label', `Open ${session.title || 'uploaded session'} in a new tab`);
+        link.title = hasContent
+          ? 'Open uploaded conversation in a new tab'
+          : 'Open upload status in a new tab';
+        link.textContent = 'Open tab';
+        row.append(body, copyId, link);
         list.append(row);
       }
+    }
+
+    function countLabel(count, singular, plural = `${singular}s`) {
+      const value = Number(count || 0);
+      return `${value} ${value === 1 ? singular : plural}`;
+    }
+
+    function sessionUploadCounts(session) {
+      return {
+        transcript: Number(session?.transcript_count || 0),
+        responses: Number(session?.response_count || 0),
+        context: Number(session?.context_count || 0),
+      };
+    }
+
+    function sessionHasUploadedContent(session) {
+      const counts = sessionUploadCounts(session);
+      return counts.transcript > 0 || counts.responses > 0 || counts.context > 0;
+    }
+
+    function sessionUploadChipLabels(counts) {
+      if (!counts.transcript && !counts.responses && !counts.context) {
+        return ['No chat uploaded yet'];
+      }
+      return [
+        counts.responses ? countLabel(counts.responses, 'chat turn') : '',
+        counts.transcript ? countLabel(counts.transcript, 'transcript segment') : '',
+        counts.context ? countLabel(counts.context, 'context item') : '',
+      ].filter(Boolean);
     }
 
     function renderCloudSessionsLoading() {
@@ -2219,6 +2306,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!detail) return;
       detail.hidden = false;
       detail.replaceChildren();
+      const transcriptSegments = Array.isArray(bundle.transcript_segments) ? bundle.transcript_segments : [];
+      const cueResponses = Array.isArray(bundle.cue_responses) ? bundle.cue_responses : [];
+      const contextArtifacts = Array.isArray(bundle.context_artifacts) ? bundle.context_artifacts : [];
+      const hasUploadedContent = transcriptSegments.length > 0 || cueResponses.length > 0 || contextArtifacts.length > 0;
 
       const title = document.createElement('strong');
       title.textContent = bundle.session?.title || `Session ${shortSessionId(sessionId)}`;
@@ -2226,11 +2317,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const sessionCode = shortSessionId(sessionId).toUpperCase();
       meta.textContent = [
         `ID ${sessionCode}`,
-        `${bundle.transcript_segments?.length || 0} transcript segment(s)`,
-        `${bundle.cue_responses?.length || 0} answer(s)`,
-        `${bundle.context_artifacts?.length || 0} context item(s)`,
+        countLabel(transcriptSegments.length, 'transcript segment'),
+        countLabel(cueResponses.length, 'chat turn'),
+        countLabel(contextArtifacts.length, 'context item'),
       ].join(' - ');
-      detail.append(title, meta);
+      const uploadState = document.createElement('p');
+      uploadState.className = `session-upload-state${hasUploadedContent ? '' : ' is-empty'}`;
+      uploadState.textContent = hasUploadedContent
+        ? 'Uploaded from Bluey desktop. This is view-only on web for now.'
+        : 'Only the session record has uploaded so far. No local chat transcript, Bluey answers, or context have arrived for this session yet.';
+      detail.append(title, meta, uploadState);
 
       const copyId = document.createElement('button');
       copyId.className = 'account-button ghost compact';
@@ -2245,9 +2341,34 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       appendBundlePreview(detail, 'Diagnostics', diagnosticsText(bundle.session?.metadata));
       appendSessionBundleSection(
         detail,
+        'Conversation',
+        cueResponses,
+        'No Bluey desktop conversation uploaded for this session yet.',
+        (answer) => {
+          const answerText = answer.text || '';
+          const artifactText = answer.artifact_body && answer.artifact_body !== answerText
+            ? answer.artifact_body
+            : '';
+          return {
+            title: answer.source_text ? 'You asked' : 'Bluey answer',
+            meta: joinSessionMeta([
+              formatSessionTime(answer.ts_ms),
+              answer.model || answer.provider,
+              answer.cost_label || (answer.cost_cents ? money(answer.cost_cents) : ''),
+            ]),
+            body: [
+              answer.source_text ? `You\n${answer.source_text}` : '',
+              answerText ? `Bluey\n${answerText}` : '',
+              artifactText ? `Artifact\n${artifactText}` : '',
+            ].filter(Boolean).join('\n\n'),
+          };
+        }
+      );
+      appendSessionBundleSection(
+        detail,
         'Transcript',
-        bundle.transcript_segments,
-        'No transcript saved for this session yet.',
+        transcriptSegments,
+        'No live transcript uploaded for this session yet.',
         (segment) => ({
           title: segment.speaker || segment.source || 'Speaker',
           meta: joinSessionMeta([
@@ -2260,24 +2381,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       );
       appendSessionBundleSection(
         detail,
-        'Answers',
-        bundle.cue_responses,
-        'No Bluey answers saved for this session yet.',
-        (answer) => ({
-          title: answer.kind || answer.task_type || 'Answer',
-          meta: joinSessionMeta([
-            formatSessionTime(answer.ts_ms),
-            answer.model,
-            answer.cost_label || (answer.cost_cents ? money(answer.cost_cents) : ''),
-          ]),
-          body: answer.text || answer.artifact_body || answer.source_text || '',
-        })
-      );
-      appendSessionBundleSection(
-        detail,
         'Context',
-        bundle.context_artifacts,
-        'No context files or notes saved for this session yet.',
+        contextArtifacts,
+        'No context files or notes uploaded for this session yet.',
         (artifact) => ({
           title: artifact.title || artifact.kind || artifact.artifact_id || 'Context',
           meta: joinSessionMeta([
@@ -2382,6 +2488,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return;
       }
       const requestedSessionId = pendingSessionId();
+      const requestedHashTab = normalizeDashboardTabName(window.location.hash);
+      const shouldOpenRequestedSession = Boolean(requestedSessionId)
+        && (!requestedHashTab || requestedHashTab === 'history');
       const refreshButton = document.getElementById('refreshAccountButton');
       if (refreshButton) refreshButton.disabled = true;
       accountMessage('Loading account...');
@@ -2391,7 +2500,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return null;
       });
       const sessionsPromise = loadCloudSessions().then(async (sessions) => {
-        if (requestedSessionId) {
+        if (shouldOpenRequestedSession) {
           setDashboardTab('history');
           try {
             await loadCloudSessionDetail(requestedSessionId);
@@ -2433,7 +2542,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const balanceReloadPanel = document.getElementById('balanceReloadPanel');
         const isTemporaryAccount = Boolean(me.is_temporary);
         const trialMinutes = trialMinutesRemaining(me);
-        if (balanceTitle) balanceTitle.textContent = isTemporaryAccount ? 'Trial time' : 'Balance';
+        if (balanceTitle) balanceTitle.textContent = isTemporaryAccount ? 'Trial time' : 'Remaining balance';
         if (balanceValue) {
           balanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
           balanceCard?.classList.toggle('balance-trial', isTemporaryAccount);
@@ -2517,11 +2626,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function normalizeDashboardTabName(value) {
       const tab = String(value || '').replace(/^#/, '').trim().toLowerCase();
-      if (tab === 'computers' || tab === 'devices') return 'computers';
+      if (tab === 'computers' || tab === 'my-computers' || tab === 'devices' || tab === 'linked-devices') return 'computers';
       if (tab === 'sessions' || tab === 'session-history' || tab === 'history' || tab === 'saved-sessions') return 'history';
-      if (tab === 'summary' || tab === 'usage') return 'summary';
+      if (tab === 'summary' || tab === 'usage-summary' || tab === 'usage') return 'summary';
       if (tab === 'billing' || tab === 'reload' || tab === 'credits') return 'billing';
-      if (tab === 'admin' || tab === 'trial-protection' || tab === 'trial-abuse') return 'admin';
+      if (tab === 'admin' || tab === 'trial-ops' || tab === 'trial-protection' || tab === 'trial-abuse') return 'admin';
       return '';
     }
 
@@ -2572,7 +2681,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       if (name === 'admin') maybeLoadAdminAbuse();
       if (updateHash && window.history?.replaceState) {
-        const nextUrl = `${window.location.pathname}${window.location.search}#${name}`;
+        const url = new URL(window.location.href);
+        if (name !== 'history') {
+          url.searchParams.delete('session');
+        }
+        url.hash = name;
+        const nextUrl = `${url.pathname}${url.search}${url.hash}`;
         window.history.replaceState(null, '', nextUrl);
       }
     }
@@ -2678,38 +2792,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('overviewReloadButton')?.addEventListener('click', () => {
         startReload();
       });
-      document.getElementById('desktopBalanceHelpButton')?.addEventListener('click', () => {
-        focusDesktopConnectCard();
-      });
       document.getElementById('refreshAccountButton')?.addEventListener('click', () => {
         loadAccount().catch((error) => accountMessage(error.message));
       });
       document.getElementById('manualReloadAmount')?.addEventListener('input', () => {
         updateManualReloadDraftCopy();
       });
-      document.getElementById('autoReloadToggle')?.addEventListener('change', (event) => {
-        const enabled = Boolean(event.target.checked);
-        event.target.disabled = true;
-        updateAutoReload(enabled)
-          .catch((error) => {
-            accountMessage(error.message);
-            event.target.checked = !enabled;
-          })
-          .finally(() => {
-            loadAccount().catch((error) => accountMessage(error.message));
-          });
+      document.getElementById('autoReloadToggle')?.addEventListener('change', () => {
+        updateAutoReloadDraftCopy();
       });
       ['autoReloadThreshold', 'autoReloadAmount'].forEach((id) => {
-        document.getElementById(id)?.addEventListener('change', () => {
-          const toggle = document.getElementById('autoReloadToggle');
-          if (!toggle?.checked) {
-            updateAutoReloadDraftCopy();
-            return;
-          }
-          updateAutoReload(true)
-            .catch((error) => accountMessage(error.message))
-            .finally(() => loadAccount().catch((error) => accountMessage(error.message)));
+        document.getElementById(id)?.addEventListener('input', () => {
+          updateAutoReloadDraftCopy();
         });
+      });
+      document.getElementById('saveAutoReloadButton')?.addEventListener('click', () => {
+        saveAutoReloadSettings().catch((error) => accountMessage(error.message));
       });
       document.getElementById('saveSquareCardButton')?.addEventListener('click', () => {
         saveSquareCard().catch((error) => accountMessage(error.message));
@@ -2801,20 +2899,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('refreshSessionsButton').addEventListener('click', () => {
         setCloudSessionDetail('');
         loadCloudSessions().catch((error) => setCloudSessionDetail(`Could not load saved sessions: ${error.message}`));
-      });
-      document.getElementById('cloudSessionsList').addEventListener('click', (event) => {
-        const button = event.target.closest('button[data-session-id]');
-        if (!button) return;
-        const url = button.dataset.sessionOpen || accountSessionHref(button.dataset.sessionId);
-        const opened = window.open(url, '_blank');
-        if (opened) opened.opener = null;
-        if (!opened) {
-          setDashboardTab('history', true);
-          loadCloudSessionDetail(button.dataset.sessionId).catch((error) => {
-            setCloudSessionDetail(`Could not load saved session: ${error.message}`);
-          });
-          accountMessage('Popup blocked. Showing the saved session here instead.');
-        }
       });
       document.getElementById('passwordResetStartForm').addEventListener('submit', (event) => {
         event.preventDefault();

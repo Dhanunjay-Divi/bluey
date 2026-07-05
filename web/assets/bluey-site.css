@@ -2566,7 +2566,83 @@
     }
 
     #accountApp .account-modal.password-modal {
-      border-color: rgba(99, 216, 255, .30);
+      width: min(760px, calc(100vw - 40px));
+      border-color: rgba(255, 255, 255, .12);
+      border-radius: 18px;
+      padding: 34px 42px 38px;
+      background: #111111;
+      box-shadow: 0 30px 88px rgba(0, 0, 0, .58);
+    }
+
+    #accountApp .password-modal .account-modal-head {
+      margin-bottom: 26px;
+    }
+
+    #accountApp .password-modal .account-modal-close {
+      display: none;
+    }
+
+    #accountApp .password-modal h2 {
+      font-size: 1.55rem;
+      font-weight: 800;
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+
+    #accountApp .password-modal .account-modal-form {
+      gap: 18px;
+      margin-top: 0;
+    }
+
+    #accountApp .password-modal .password-only-label {
+      gap: 0;
+    }
+
+    #accountApp .password-modal .password-only-label > span {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    #accountApp .password-modal .account-modal-form input {
+      height: 56px;
+      border-color: #2a2a2a;
+      border-radius: 11px;
+      padding: 0 20px;
+      color: #f2fbff;
+      background: #0b0b0b;
+      font-size: 1rem;
+      font-weight: 700;
+    }
+
+    #accountApp .password-modal .account-modal-form input:focus {
+      border-color: var(--bluey-accent);
+      box-shadow: 0 0 0 1px var(--bluey-accent), 0 0 24px rgba(99, 216, 255, .14);
+    }
+
+    #accountApp .password-modal .account-modal-message {
+      min-height: 1rem;
+      margin-top: -4px;
+    }
+
+    #accountApp .password-modal .account-modal-actions {
+      justify-content: flex-start;
+      gap: .72rem;
+      margin-top: 16px;
+    }
+
+    #accountApp .password-modal .account-modal-actions .account-button {
+      min-height: 44px;
+      padding: .58rem 1.1rem;
+      border-radius: 10px;
+      font-size: .9rem;
+      font-weight: 800;
     }
 
     #accountApp .account-modal-form {
@@ -3360,6 +3436,33 @@
       margin-top: .2rem;
     }
 
+    #accountApp .session-upload-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .32rem;
+      margin-top: .45rem;
+    }
+
+    #accountApp .session-upload-chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 1.45rem;
+      padding: .18rem .45rem;
+      border: 1px solid rgba(99, 216, 255, .24);
+      border-radius: 999px;
+      background: rgba(99, 216, 255, .08);
+      color: var(--bluey-accent);
+      font-size: .68rem;
+      font-weight: 800;
+      line-height: 1;
+    }
+
+    #accountApp .session-row-empty .session-upload-chip {
+      border-color: rgba(255, 189, 99, .22);
+      background: rgba(255, 189, 99, .06);
+      color: #b7a276;
+    }
+
     #accountApp .session-empty {
       color: #666;
       text-align: center;
@@ -3374,6 +3477,21 @@
       margin-top: .75rem;
       color: #aaa;
       font-size: .85rem;
+    }
+
+    #accountApp .session-upload-state {
+      margin: .1rem 0 .35rem;
+      color: #7c8a93;
+      font-size: .78rem;
+      line-height: 1.45;
+    }
+
+    #accountApp .session-upload-state.is-empty {
+      padding: .62rem .72rem;
+      border: 1px solid rgba(255, 189, 99, .20);
+      border-radius: 8px;
+      background: rgba(255, 189, 99, .055);
+      color: #b7a276;
     }
 
     #accountApp .session-detail-section {
@@ -5135,7 +5253,9 @@
     }
 
     html[data-bluey-theme="light"] #accountApp .account-modal.password-modal {
-      border-color: rgba(49, 146, 206, .30);
+      border-color: #dce4ea;
+      background: #ffffff;
+      box-shadow: 0 28px 82px rgba(34, 64, 82, .20);
     }
 
     html[data-bluey-theme="light"] #accountApp .account-modal h2 {
@@ -5152,6 +5272,17 @@
       border-color: #d8e8f0;
       background: #fafdff;
       color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .password-modal .account-modal-form input {
+      border-color: #d9e2e8;
+      background: #ffffff;
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .password-modal .account-modal-form input:focus {
+      border-color: var(--bluey-accent);
+      box-shadow: 0 0 0 1px var(--bluey-accent), 0 0 22px rgba(49, 146, 206, .14);
     }
 
     html[data-bluey-theme="light"] #accountApp .account-modal-form input::placeholder {
@@ -5689,6 +5820,23 @@
       color: #5f7281;
     }
 
+    html[data-bluey-theme="light"] #accountApp .session-upload-chip {
+      border-color: rgba(0, 128, 172, .22);
+      background: rgba(99, 216, 255, .11);
+      color: #05789c;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .session-row-empty .session-upload-chip,
+    html[data-bluey-theme="light"] #accountApp .session-upload-state.is-empty {
+      border-color: rgba(170, 112, 0, .22);
+      background: rgba(255, 189, 99, .13);
+      color: #84601f;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .session-upload-state {
+      color: #5f7281;
+    }
+
     html[data-bluey-theme="light"] #accountApp .dashboard-tabs {
       border-bottom-color: #dceaf2;
     }
@@ -5727,6 +5875,15 @@
     }
 
     @media (max-width: 620px) {
+      #accountApp .account-modal.password-modal {
+        width: min(100%, calc(100vw - 28px));
+        padding: 26px 24px 28px;
+      }
+
+      #accountApp .password-modal .account-modal-form input {
+        height: 52px;
+      }
+
       #accountApp .dashboard-overview-title-row {
         grid-template-columns: 1fr;
         gap: .65rem;
@@ -5975,19 +6132,6 @@
       border: 0;
       background: transparent;
       padding: 0;
-    }
-
-    #accountApp .compact-auto-reload:not(.is-on) .auto-reload-fields,
-    #accountApp .compact-auto-reload:not(.is-on) .auto-reload-rule {
-      display: none;
-    }
-
-    #accountApp .compact-auto-reload:not(.is-on) .auto-reload-head {
-      grid-column: 1 / -1;
-    }
-
-    #accountApp .compact-auto-reload:not(.is-on) .auto-reload-hint {
-      margin-top: .08rem;
     }
 
     #accountApp .dashboard-tabs {
@@ -6459,29 +6603,6 @@
       line-height: 1.5;
     }
 
-    #accountApp .dashboard-overview-title-row .balance-map-hint {
-      margin-top: .18rem;
-      color: #5f6a71;
-      font-size: .68rem;
-      font-weight: 800;
-      line-height: 1.3;
-    }
-
-    #accountApp .dashboard-overview-title-row .balance-map-hint button {
-      appearance: none;
-      border: 0;
-      padding: 0;
-      background: transparent;
-      color: var(--bluey-accent);
-      font: inherit;
-      cursor: pointer;
-    }
-
-    #accountApp .dashboard-overview-title-row .balance-map-hint button:hover,
-    #accountApp .dashboard-overview-title-row .balance-map-hint button:focus-visible {
-      text-decoration: underline;
-    }
-
     #accountApp .dashboard-overview-title-row #balanceValue {
       color: #f2f2f2;
       font-size: 1.45rem;
@@ -6489,7 +6610,11 @@
     }
 
     #accountApp .dashboard-overview-actions {
-      display: none;
+      display: flex;
+      flex-wrap: wrap;
+      gap: .45rem;
+      align-items: center;
+      margin-top: .08rem;
     }
 
     #accountApp .dashboard-overview-side {
@@ -6546,6 +6671,16 @@
       color: #777;
       font-size: .7rem;
       line-height: 1.35;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-save {
+      grid-column: 1 / -1;
+      justify-self: start;
+      min-height: 30px;
+      margin-top: .1rem;
+      padding: .38rem .72rem;
+      border-radius: 8px;
+      font-size: .72rem;
     }
 
     #accountApp .dashboard-tabs {
@@ -6646,10 +6781,6 @@
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-rule,
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-hint {
       color: #5f7281;
-    }
-
-    html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row .balance-map-hint {
-      color: #7890a0;
     }
 
     html[data-bluey-theme="light"] #accountApp .dashboard-tab.is-active {
