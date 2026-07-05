@@ -4951,6 +4951,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let drawerTitleLabel: NSTextField
     let drawerSubtitleLabel: NSTextField
     let drawerCloseButton: NSButton
+    let sessionSearchField: NSTextField
     let latestSessionButton: NSButton
     let sessionScroll: NSScrollView
     let sessionStack: NSStackView
@@ -5011,6 +5012,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var lastTranscriptStripSource: String?
     private var transcriptStripShouldFollowTail = false
     private var sessionItems: [OverlaySessionItem] = []
+    private var sessionSearchQuery = ""
     private var sessionsHaveLoaded = false
     private var activeSessionId: String?
     private var activeSessionCode: String?
@@ -5142,6 +5144,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         drawerTitleLabel = NSTextField(labelWithString: "History")
         drawerSubtitleLabel = NSTextField(labelWithString: "Local recordings on this device.")
         drawerCloseButton = NSButton(title: "", target: nil, action: nil)
+        sessionSearchField = ArrowCursorTextField()
         latestSessionButton = NSButton(title: "Continue latest", target: nil, action: nil)
         sessionScroll = NSScrollView()
         sessionStack = FlippedStackView()
@@ -5272,6 +5275,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             drawerTitleLabel,
             drawerSubtitleLabel,
             drawerCloseButton,
+            sessionSearchField,
             latestSessionButton,
             sessionScroll,
             sessionStack,
@@ -5356,6 +5360,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionDrawer.addSubview(drawerTitleLabel)
         sessionDrawer.addSubview(drawerSubtitleLabel)
         sessionDrawer.addSubview(drawerCloseButton)
+        sessionDrawer.addSubview(sessionSearchField)
         sessionDrawer.addSubview(latestSessionButton)
         sessionDrawer.addSubview(sessionScroll)
         addSubview(transcriptStrip)
@@ -5513,7 +5518,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             drawerSubtitleLabel.leadingAnchor.constraint(equalTo: drawerTitleLabel.leadingAnchor),
             drawerSubtitleLabel.trailingAnchor.constraint(equalTo: drawerTitleLabel.trailingAnchor),
 
-            latestSessionButton.topAnchor.constraint(equalTo: drawerSubtitleLabel.bottomAnchor, constant: 16),
+            sessionSearchField.topAnchor.constraint(equalTo: drawerSubtitleLabel.bottomAnchor, constant: 10),
+            sessionSearchField.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
+            sessionSearchField.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
+            sessionSearchField.heightAnchor.constraint(equalToConstant: 30),
+
+            latestSessionButton.topAnchor.constraint(equalTo: sessionSearchField.bottomAnchor, constant: 10),
             latestSessionButton.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
             latestSessionButton.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
             latestSessionButton.heightAnchor.constraint(equalToConstant: 32),
@@ -5696,6 +5706,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleSaveButton.target = self
         answerStyleSaveButton.action = #selector(saveAnswerStyleClicked)
         answerStyleBox.delegate = self
+        sessionSearchField.delegate = self
         hideButton.target = self
         hideButton.action = #selector(hideClicked)
         fullSizeButton.target = self
@@ -5982,6 +5993,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             : BlueyTheme.hairline).cgColor
         drawerTitleLabel.textColor = themedTextColor
         drawerSubtitleLabel.textColor = themedDimTextColor
+        refreshSessionSearchChrome()
         answerStylePanel.layer?.backgroundColor = BlueyTheme.panelDeep
             .withAlphaComponent(materialAlpha(0.97))
             .cgColor
@@ -6012,6 +6024,32 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         feed.setLightTheme(lightThemeEnabled, opacity: backgroundOpacity)
         canvasPane.applyBackgroundOpacity(backgroundOpacity)
         needsDisplay = true
+    }
+
+    private func refreshSessionSearchChrome() {
+        let focused = sessionSearchField.currentEditor() != nil && !sessionDrawer.isHidden
+        let accent = themedAccentBorderColor
+        let fill = lightThemeEnabled
+            ? BlueyLightTheme.surfaceRaised.withAlphaComponent(lightMaterialAlpha(0.92, floor: 0.22))
+            : NSColor.white.withAlphaComponent(materialAlpha(0.055, floor: 0.018))
+        let placeholderColor = themedDimTextColor.withAlphaComponent(lightThemeEnabled ? 0.80 : 0.72)
+        sessionSearchField.backgroundColor = fill
+        sessionSearchField.textColor = themedTextColor
+        sessionSearchField.layer?.backgroundColor = fill.cgColor
+        sessionSearchField.layer?.borderWidth = focused ? 2 : 1
+        sessionSearchField.layer?.borderColor = accent
+            .withAlphaComponent(focused ? (lightThemeEnabled ? 0.98 : 0.88) : (lightThemeEnabled ? 0.46 : 0.24))
+            .cgColor
+        sessionSearchField.layer?.shadowColor = accent.cgColor
+        sessionSearchField.layer?.shadowOpacity = focused ? (lightThemeEnabled ? 0.22 : 0.28) : 0
+        sessionSearchField.layer?.shadowRadius = focused ? 8 : 0
+        sessionSearchField.layer?.shadowOffset = .zero
+        sessionSearchField.placeholderAttributedString = NSAttributedString(
+            string: "Search title or session ID",
+            attributes: [
+                .font: sessionSearchField.font ?? NSFont.systemFont(ofSize: 11.5, weight: .medium),
+                .foregroundColor: placeholderColor,
+            ])
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -7097,6 +7135,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if control === sessionSearchField {
+            if commandSelector == #selector(NSResponder.insertNewline(_:))
+                || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
+                openFirstFilteredSession()
+                return true
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                if sessionSearchQuery.isEmpty {
+                    closeSessionsClicked()
+                } else {
+                    clearSessionSearch()
+                }
+                return true
+            }
+            return false
+        }
         guard control === answerStyleBox else { return false }
         if commandSelector == #selector(NSResponder.insertNewline(_:))
             || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
@@ -7111,21 +7165,39 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func controlTextDidBeginEditing(_ obj: Notification) {
-        guard (obj.object as? NSControl) === answerStyleBox else { return }
+        guard let control = obj.object as? NSControl else { return }
+        if control === sessionSearchField {
+            applyAccentInsertionPoint(to: sessionSearchField)
+            refreshSessionSearchChrome()
+            return
+        }
+        guard control === answerStyleBox else { return }
         setAnswerStyleInputFocused(true)
         applyAccentInsertionPoint(to: answerStyleBox)
         applyAnswerStyleEditorCursor()
     }
 
     func controlTextDidChange(_ obj: Notification) {
-        guard (obj.object as? NSControl) === answerStyleBox else { return }
+        guard let control = obj.object as? NSControl else { return }
+        if control === sessionSearchField {
+            sessionSearchQuery = sessionSearchField.stringValue
+            renderSessionRows(log: false)
+            refreshSessionSearchChrome()
+            return
+        }
+        guard control === answerStyleBox else { return }
         answerStyleCaretVisible = true
         applyAccentInsertionPoint(to: answerStyleBox)
         updateAnswerStyleCaretPosition()
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
-        guard (obj.object as? NSControl) === answerStyleBox else { return }
+        guard let control = obj.object as? NSControl else { return }
+        if control === sessionSearchField {
+            refreshSessionSearchChrome()
+            return
+        }
+        guard control === answerStyleBox else { return }
         setAnswerStyleInputFocused(false)
     }
 
@@ -8278,6 +8350,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         drawerSubtitleLabel.textColor = BlueyTheme.textDim
         drawerSubtitleLabel.lineBreakMode = .byWordWrapping
         drawerSubtitleLabel.maximumNumberOfLines = 2
+        sessionSearchField.placeholderString = "Search title or session ID"
+        sessionSearchField.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        sessionSearchField.isBezeled = false
+        sessionSearchField.drawsBackground = true
+        sessionSearchField.focusRingType = .none
+        sessionSearchField.alignment = .left
+        sessionSearchField.wantsLayer = true
+        sessionSearchField.layer?.cornerRadius = 10
+        sessionSearchField.layer?.borderWidth = 1
+        sessionSearchField.layer?.masksToBounds = true
+        refreshSessionSearchChrome()
 
         sessionStack.orientation = .vertical
         sessionStack.alignment = .centerX
@@ -8471,6 +8554,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         headerLogo.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
         headerWordmark.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
         brandStack.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
+        sessionSearchField.toolTip = "Search by recording title, date, full UUID, or the short session ID shown in Bluey"
         latestSessionButton.toolTip = "Continue the latest recording"
         answerStyleSaveButton.toolTip = "Save answer style for this session"
     }
@@ -8930,6 +9014,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "session_drawer_opened",
             detail: "had_loaded=\(sessionsHaveLoaded) cached_sessions=\(sessionItems.count)"
         )
+        clearSessionSearch()
         if !sessionsHaveLoaded {
             renderSessionDrawerMessage("Loading...")
         }
@@ -10436,31 +10521,107 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionItems = sessions
         sessionsHaveLoaded = true
         renameField = nil
+        renderSessionRows()
+    }
+
+    private func filteredSessionItems() -> [OverlaySessionItem] {
+        let rawQuery = sessionSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawQuery.isEmpty else { return sessionItems }
+        let lowerQuery = rawQuery.lowercased()
+        let compactQuery = compactSessionSearchToken(rawQuery)
+        return sessionItems.filter { session in
+            let code = shortSessionCode(session.id)
+            let values = [
+                session.id,
+                code,
+                "ID \(code)",
+                session.title,
+                session.subtitle,
+            ]
+            if values.contains(where: { $0.lowercased().contains(lowerQuery) }) {
+                return true
+            }
+            guard !compactQuery.isEmpty else { return false }
+            return values.contains { compactSessionSearchToken($0).contains(compactQuery) }
+        }
+    }
+
+    private func compactSessionSearchToken(_ value: String) -> String {
+        value
+            .lowercased()
+            .unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .map { String($0) }
+            .joined()
+    }
+
+    private func sessionSearchDisplayQuery() -> String {
+        let collapsed = sessionSearchQuery
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard collapsed.count > 34 else { return collapsed }
+        return String(collapsed.prefix(31)) + "..."
+    }
+
+    private func renderSessionRows(log: Bool = true) {
         updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
         for view in sessionStack.arrangedSubviews {
             sessionStack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
 
-        if sessions.isEmpty {
-            emitLifecycle("session_drawer_sessions_rendered", detail: "session_count=0 active_count=0 context_total=0 image_total=0")
+        if sessionItems.isEmpty {
+            if log {
+                emitLifecycle("session_drawer_sessions_rendered", detail: "session_count=0 active_count=0 context_total=0 image_total=0")
+            }
             renderSessionDrawerMessage("No local saved recordings found. Synced sessions live on the web dashboard.")
+            updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
             return
         }
 
-        let activeCount = sessions.filter { $0.isActive }.count
-        let contextTotal = sessions.reduce(0) { $0 + $1.contextCount }
-        let imageTotal = sessions.reduce(0) { $0 + $1.imageCount }
-        emitLifecycle(
-            "session_drawer_sessions_rendered",
-            detail: "session_count=\(sessions.count) active_count=\(activeCount) context_total=\(contextTotal) image_total=\(imageTotal)"
-        )
-        for session in sessions {
+        let filtered = filteredSessionItems()
+        if filtered.isEmpty {
+            if log {
+                emitLifecycle(
+                    "session_drawer_search_no_results",
+                    detail: "session_count=\(sessionItems.count) query_len=\(sessionSearchQuery.count)"
+                )
+            }
+            renderSessionDrawerMessage("No sessions match \"\(sessionSearchDisplayQuery())\". Try the session ID, title, or date.")
+            updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
+            return
+        }
+
+        let activeCount = sessionItems.filter { $0.isActive }.count
+        let contextTotal = sessionItems.reduce(0) { $0 + $1.contextCount }
+        let imageTotal = sessionItems.reduce(0) { $0 + $1.imageCount }
+        if log {
+            emitLifecycle(
+                "session_drawer_sessions_rendered",
+                detail: "session_count=\(sessionItems.count) visible_count=\(filtered.count) active_count=\(activeCount) context_total=\(contextTotal) image_total=\(imageTotal)"
+            )
+        }
+        for session in filtered {
             let row = makeSessionRow(session)
             sessionStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: sessionStack.widthAnchor, constant: -2).isActive = true
         }
         updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
+    }
+
+    private func clearSessionSearch() {
+        guard !sessionSearchQuery.isEmpty || !sessionSearchField.stringValue.isEmpty else { return }
+        sessionSearchQuery = ""
+        sessionSearchField.stringValue = ""
+        renderSessionRows(log: false)
+        refreshSessionSearchChrome()
+    }
+
+    private func openFirstFilteredSession() {
+        guard let session = filteredSessionItems().first else { return }
+        sessionDrawer.isHidden = true
+        setHeaderSubtitle()
+        emitSessionOpen(id: session.id)
     }
 
     private func renderSessionDrawerMessage(_ message: String) {
@@ -10487,8 +10648,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             + 44
         let availableWidth = max(260, layoutWidth - sideInset * 2)
         let availableHeight = max(190, layoutHeight - headerClearance - bottomClearance)
-        let visibleRows = CGFloat(min(max(sessionItems.count, 1), 6))
-        let desiredHeight = 104 + visibleRows * 58
+        let renderedRows = sessionItems.isEmpty ? 1 : max(filteredSessionItems().count, 1)
+        let visibleRows = CGFloat(min(renderedRows, 6))
+        let desiredHeight = 142 + visibleRows * 58
         let drawerWidth = min(380, max(310, min(availableWidth, layoutWidth * 0.36)))
         let drawerHeight = min(availableHeight, max(220, desiredHeight))
 
