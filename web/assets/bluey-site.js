@@ -3058,6 +3058,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return;
       }
 
+      const installCommand = event.target.closest('#downloadApp .install-command');
+      document.querySelectorAll('#downloadApp .install-command.is-active').forEach((command) => {
+        if (command !== installCommand) command.classList.remove('is-active');
+      });
+      if (installCommand) installCommand.classList.add('is-active');
+
       const button = event.target.closest('[data-copy]');
       if (!button) return;
       const text = button.dataset.copy || '';
@@ -3065,6 +3071,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const old = button.textContent;
       try {
         await navigator.clipboard.writeText(text);
+        button.closest('.install-command')?.classList.add('is-active');
         button.textContent = 'Copied!';
         button.classList.add('copied');
         setTimeout(() => {
