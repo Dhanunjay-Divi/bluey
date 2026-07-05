@@ -314,6 +314,25 @@ async fn signup_with_otp(harness: &Harness, email: &str, password: &str) -> serd
     serde_json::from_slice(&body).unwrap()
 }
 
+async fn start_trial(harness: &Harness, device_fingerprint: &str) -> serde_json::Value {
+    let req = Request::post("/auth/trial/start")
+        .header("content-type", "application/json")
+        .header("user-agent", "bluey-e2e-trial")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "device_fingerprint": device_fingerprint
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = harness.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "trial start failed");
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
 #[tokio::test]
 #[serial]
 async fn signup_otp_email_confirms_and_marks_email_verified() {
@@ -333,6 +352,157 @@ async fn signup_otp_email_confirms_and_marks_email_verified() {
             |r| r.get(0),
         )
         .unwrap();
+    assert!(verified_at.is_some());
+}
+
+#[tokio::test]
+#[serial]
+async fn trial_start_creates_temporary_account_with_fifteen_minutes() {
+    let h = boot_harness().await;
+    let auth = start_trial(&h, "trial-device-create").await;
+    assert_eq!(auth["account"]["is_temporary"], true);
+    assert_eq!(auth["account"]["trial_seconds_remaining"], 900);
+    assert!(auth["password"].as_str().unwrap().len() >= 12);
+
+    let access = auth["access_token"].as_str().unwrap();
+    let req = Request::get("/account/me")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(me["is_temporary"], true);
+    assert_eq!(me["trial_seconds_remaining"], 900);
+
+    let account_id = auth["account"]["id"].as_str().unwrap();
+    let conn = h.pool.get().unwrap();
+    let (is_temporary, trial_seconds): (i64, i64) = conn
+        .query_row(
+            "SELECT is_temporary, trial_seconds_remaining FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(is_temporary, 1);
+    assert_eq!(trial_seconds, 900);
+
+    let req = Request::post("/auth/trial/start")
+        .header("content-type", "application/json")
+        .header("user-agent", "bluey-e2e-trial")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "device_fingerprint": "trial-device-create"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+#[serial]
+async fn expired_temporary_account_cannot_access_or_refresh() {
+    let h = boot_harness().await;
+    let auth = start_trial(&h, "trial-device-expired").await;
+    let account_id = auth["account"]["id"].as_str().unwrap();
+    h.pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE accounts SET temporary_expires_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+
+    let access = auth["access_token"].as_str().unwrap();
+    let req = Request::get("/account/me")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let refresh = auth["refresh_token"].as_str().unwrap();
+    let req = Request::post("/auth/refresh")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "refresh_token": refresh })).unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[serial]
+async fn temporary_trial_converts_to_verified_account() {
+    let h = boot_harness().await;
+    let auth = start_trial(&h, "trial-device-convert").await;
+    let access = auth["access_token"].as_str().unwrap();
+    let account_id = auth["account"]["id"].as_str().unwrap().to_string();
+
+    Mock::given(method("POST"))
+        .and(path("/emails"))
+        .and(header("Authorization", "Bearer test-resend-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"trial-convert"})))
+        .mount(&h.mail)
+        .await;
+
+    let email = "saved-trial@example.com";
+    let req = Request::post("/auth/trial/convert/start")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "email": email,
+                "password": "longenoughpw",
+                "terms_accepted": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let requests = h.mail.received_requests().await.unwrap();
+    let mail_body: serde_json::Value =
+        serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+    let code = extract_six_digit_code(mail_body["text"].as_str().unwrap()).unwrap();
+
+    let req = Request::post("/auth/trial/convert/confirm")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "email": email,
+                "otp": code
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let converted: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(converted["account"]["email"], email);
+    assert_eq!(converted["account"]["is_temporary"], false);
+
+    let conn = h.pool.get().unwrap();
+    let (stored_email, is_temporary, verified_at): (String, i64, Option<String>) = conn
+        .query_row(
+            "SELECT email, is_temporary, email_verified_at FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_email, email);
+    assert_eq!(is_temporary, 0);
     assert!(verified_at.is_some());
 }
 

@@ -270,6 +270,8 @@ const MIGRATIONS: &[&str] = &[
         last_login_at               DATETIME,
         balance_cents               INTEGER NOT NULL DEFAULT 0,
         trial_seconds_remaining     INTEGER NOT NULL DEFAULT 600,      -- 10 min free trial
+        is_temporary                INTEGER NOT NULL DEFAULT 0,
+        temporary_expires_at        DATETIME,
         auto_topup_enabled          INTEGER NOT NULL DEFAULT 0,
         auto_topup_threshold_cents  INTEGER NOT NULL DEFAULT 1000,     -- $10
         auto_topup_amount_cents     INTEGER NOT NULL DEFAULT 3000,     -- $30
@@ -566,6 +568,7 @@ const MIGRATIONS: &[&str] = &[
         email           TEXT PRIMARY KEY,
         otp_hash        TEXT NOT NULL,
         password_hash   TEXT NOT NULL,
+        account_id      TEXT REFERENCES accounts(id) ON DELETE CASCADE,
         attempts        INTEGER NOT NULL DEFAULT 0,
         created_at      DATETIME NOT NULL DEFAULT (datetime('now')),
         expires_at      DATETIME NOT NULL
@@ -711,6 +714,19 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     )?;
     ensure_column(&conn, "accounts", "billing_restriction_reason", "TEXT")?;
     ensure_column(&conn, "accounts", "billing_restricted_at", "DATETIME")?;
+    ensure_column(
+        &conn,
+        "accounts",
+        "is_temporary",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(&conn, "accounts", "temporary_expires_at", "DATETIME")?;
+    ensure_column(
+        &conn,
+        "signup_otps",
+        "account_id",
+        "TEXT REFERENCES accounts(id) ON DELETE CASCADE",
+    )?;
     ensure_column(
         &conn,
         "stt_sessions",

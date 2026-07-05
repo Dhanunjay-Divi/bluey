@@ -31,6 +31,9 @@ pub async fn require_auth(
     let account = Account::fetch_by_id(&state.pool, &claims.sub)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
+    if account.is_temporary_expired() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     req.extensions_mut().insert(AuthedAccount(account));
     Ok(next.run(req).await)
 }
@@ -73,6 +76,8 @@ mod admin_tests {
             email_verified_at: None,
             balance_cents: 0,
             trial_seconds_remaining: 0,
+            is_temporary: false,
+            temporary_expires_at: None,
             auto_topup_enabled: false,
             auto_topup_threshold_cents: 0,
             auto_topup_amount_cents: 0,

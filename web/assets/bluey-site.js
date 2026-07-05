@@ -21,10 +21,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const currentPath = window.location.protocol === 'file:'
       ? filePreviewRoute || '/'
       : normalizeRoutePath(window.location.pathname) || '/';
+    const SITE_THEME_STORAGE_KEY = 'bluey_site_theme';
     const isAccountRoute = accountRoutes.has(currentPath);
     const isPolicyRoute = policyRoutes.has(currentPath);
     const isDownloadRoute = downloadRoutes.has(currentPath);
     let pendingSignupEmail = '';
+    let pendingTrialConvertEmail = '';
+    let trialCredentials = null;
     let accountAuthMode = 'login';
     let squareCard = null;
     let squareCardEnvironment = '';
@@ -228,6 +231,64 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
     }
 
+    function storedSiteTheme() {
+      try {
+        return localStorage.getItem(SITE_THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
+      } catch {
+        return 'dark';
+      }
+    }
+
+    function applySiteTheme(theme) {
+      const normalized = theme === 'light' ? 'light' : 'dark';
+      document.documentElement.dataset.blueyTheme = normalized;
+      document.documentElement.style.colorScheme = normalized;
+      document.querySelectorAll('.theme-toggle').forEach((button) => {
+        const isLight = normalized === 'light';
+        button.setAttribute('aria-pressed', isLight ? 'true' : 'false');
+        button.setAttribute('aria-label', isLight ? 'Switch to dark theme' : 'Switch to light theme');
+        button.title = isLight ? 'Switch to dark theme' : 'Switch to light theme';
+      });
+    }
+
+    function setSiteTheme(theme) {
+      const normalized = theme === 'light' ? 'light' : 'dark';
+      try {
+        localStorage.setItem(SITE_THEME_STORAGE_KEY, normalized);
+      } catch {
+        // Theme still applies for the current page even when storage is blocked.
+      }
+      applySiteTheme(normalized);
+    }
+
+    function initSiteTheme() {
+      applySiteTheme(storedSiteTheme());
+      document.querySelectorAll('.theme-toggle').forEach((button) => {
+        if (button.dataset.themeReady === '1') return;
+        button.dataset.themeReady = '1';
+        button.addEventListener('click', () => {
+          setSiteTheme(storedSiteTheme() === 'light' ? 'dark' : 'light');
+        });
+      });
+    }
+
+    function initProductJoinForm() {
+      const form = document.getElementById('productJoinForm');
+      if (!form || form.dataset.joinReady === '1') return;
+      form.dataset.joinReady = '1';
+      form.addEventListener('submit', (event) => {
+        const input = form.querySelector('input[name="user_code"]');
+        const code = normalizeDeviceCode(input?.value || '');
+        if (!code) {
+          event.preventDefault();
+          input?.focus();
+          return;
+        }
+        input.value = code;
+        rememberPendingDeviceCode(code);
+      });
+    }
+
     function bootBlueyTerminal() {
       const term = document.getElementById('blueyTerminal');
       if (!term || term.dataset.booted === '1') return;
@@ -353,6 +414,114 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         throw new Error(body?.error || `${response.status} ${response.statusText}`);
       }
       return body;
+    }
+
+    function setTrialModal(open) {
+      const modal = document.getElementById('blueyTrialModal');
+      if (!modal) return;
+      modal.hidden = !open;
+    }
+
+    function renderTrialModal({ title, copy, email, password, expires, note, canCopy = true }) {
+      const titleEl = document.getElementById('trialModalTitle');
+      const copyEl = document.getElementById('trialModalCopy');
+      const emailEl = document.getElementById('trialEmail');
+      const passwordEl = document.getElementById('trialPassword');
+      const expiresEl = document.getElementById('trialExpires');
+      const noteEl = document.getElementById('trialNote');
+      const copyButton = document.getElementById('trialCopyLogin');
+      if (titleEl) titleEl.textContent = title || 'Bluey trial';
+      if (copyEl) copyEl.textContent = copy || '';
+      if (emailEl) emailEl.textContent = email || '-';
+      if (passwordEl) passwordEl.textContent = password || '-';
+      if (expiresEl) expiresEl.textContent = expires ? formatDeviceTime(expires) : '24 hours';
+      if (noteEl) noteEl.textContent = note || '';
+      if (copyButton) copyButton.disabled = !canCopy;
+    }
+
+    function trialStartErrorCopy(error) {
+      const message = String(error?.message || '').toLowerCase();
+      if (!message) return 'Bluey could not create a temporary trial right now. Try again in a minute.';
+      if (message.includes('trial') || message.includes('velocity') || message.includes('already_used') || message.includes('rate')) {
+        return 'This browser or network has already used its temporary trial. Create an account to keep going.';
+      }
+      return 'Bluey could not create a temporary trial right now. Try again in a minute.';
+    }
+
+    async function startTrial() {
+      const button = document.getElementById('tryUsButton');
+      if (accountToken()) {
+        renderTrialModal({
+          title: 'Already signed in',
+          copy: 'This browser already has a Bluey account. Use Dashboard, or sign out before creating a new temporary trial.',
+          email: currentAccountEmail || 'Signed in',
+          password: 'Not needed',
+          expires: '',
+          note: 'Temporary trials are for new users who have not signed in yet.',
+          canCopy: false,
+        });
+        setTrialModal(true);
+        return;
+      }
+
+      const label = button?.querySelector('span') || button;
+      const previous = label?.textContent || 'Try Us';
+      if (button) button.disabled = true;
+      if (label) label.textContent = 'Creating...';
+      try {
+        const auth = await apiJson('/auth/trial/start', {
+          method: 'POST',
+          body: JSON.stringify({ device_fingerprint: browserTrialDeviceId() }),
+        });
+        setAccountToken(auth);
+        currentAccountEmail = auth?.account?.email || '';
+        trialCredentials = {
+          email: currentAccountEmail,
+          password: auth?.password || '',
+          expires: auth?.temporary_expires_at || auth?.account?.temporary_expires_at || '',
+        };
+        renderTrialModal({
+          title: '15-minute trial ready',
+          copy: 'This browser is signed in automatically. Save the password if you may use another browser, then download Bluey and run bluey on.',
+          email: trialCredentials.email,
+          password: trialCredentials.password || 'Already signed in on this browser',
+          expires: trialCredentials.expires,
+          note: 'Trial includes 15 free minutes for cloud work and expires after 24 hours unless you save it as an account.',
+          canCopy: true,
+        });
+        setTrialModal(true);
+      } catch (error) {
+        renderTrialModal({
+          title: 'Try Us is unavailable',
+          copy: trialStartErrorCopy(error),
+          email: 'Create an account to continue',
+          password: 'Trial credentials are not available',
+          expires: '',
+          note: 'Trials are limited per browser and network so the free 15 minutes cannot be looped indefinitely.',
+          canCopy: false,
+        });
+        setTrialModal(true);
+      } finally {
+        if (button) button.disabled = false;
+        if (label) label.textContent = previous;
+      }
+    }
+
+    async function copyTrialLogin() {
+      if (!trialCredentials?.email) return;
+      const password = trialCredentials.password || '(already signed in on this browser)';
+      const text = [
+        'Bluey 15-minute trial',
+        `Username: ${trialCredentials.email}`,
+        `Password: ${password}`,
+        '',
+        'Save this now. The password is shown only once.',
+        'Run on your laptop or desktop: bluey on',
+        'The temporary account expires after 24 hours unless you save it as an account.',
+      ].join('\n');
+      await navigator.clipboard.writeText(text);
+      const note = document.getElementById('trialNote');
+      if (note) note.textContent = 'Copied. Keep this password somewhere safe if you may use another browser.';
     }
 
     function accountMessage(text, auth = false) {
@@ -671,6 +840,128 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       setSignupOtpMode(false);
       accountMessage('', true);
       await loadAccount();
+    }
+
+    function trialConvertMessage(text, tone = '') {
+      const el = document.getElementById('trialConvertMessage');
+      if (!el) return;
+      el.textContent = text || '';
+      el.dataset.tone = tone || '';
+    }
+
+    function resetTrialConvertForm() {
+      pendingTrialConvertEmail = '';
+      ['trialConvertEmail', 'trialConvertPassword', 'trialConvertPasswordConfirm', 'trialConvertOtp'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+      });
+      const terms = document.getElementById('trialConvertTerms');
+      if (terms) terms.checked = false;
+      const accountFields = document.getElementById('trialConvertAccountFields');
+      const verifyFields = document.getElementById('trialConvertVerifyFields');
+      if (accountFields) accountFields.hidden = false;
+      if (verifyFields) verifyFields.hidden = true;
+      trialConvertMessage('');
+    }
+
+    function temporaryExpiryCopy(expiresAt) {
+      if (!expiresAt) return 'Temporary trial expires after 24 hours.';
+      const text = formatDeviceTime(expiresAt);
+      return text === 'unknown time'
+        ? 'Temporary trial expires after 24 hours.'
+        : `Temporary trial expires ${text}.`;
+    }
+
+    function renderTemporaryAccount(me) {
+      const isTemporary = Boolean(me?.is_temporary);
+      const section = document.getElementById('trialConvertSection');
+      const copy = document.getElementById('trialConvertCopy');
+      const billing = document.querySelector('#accountApp .billing-section');
+      if (section) section.hidden = !isTemporary;
+      if (billing) billing.hidden = isTemporary;
+      if (!isTemporary) {
+        resetTrialConvertForm();
+        return;
+      }
+      if (copy) {
+        copy.textContent = `${temporaryExpiryCopy(me.temporary_expires_at)} Create an account before then to keep this browser, desktop link, and saved sessions attached.`;
+      }
+    }
+
+    async function startTrialConversion() {
+      const email = document.getElementById('trialConvertEmail')?.value.trim() || '';
+      const password = document.getElementById('trialConvertPassword')?.value || '';
+      const confirm = document.getElementById('trialConvertPasswordConfirm')?.value || '';
+      const terms = document.getElementById('trialConvertTerms');
+      const button = document.getElementById('trialConvertStartButton');
+      if (!email || !password) {
+        trialConvertMessage('Enter your email and password.', 'error');
+        return;
+      }
+      if (password !== confirm) {
+        trialConvertMessage('Passwords do not match.', 'error');
+        return;
+      }
+      if (!terms?.checked) {
+        trialConvertMessage('Accept Terms and Privacy to continue.', 'error');
+        return;
+      }
+      const previous = button?.textContent || 'Send verification code';
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Sending...';
+      }
+      try {
+        const result = await apiJson('/auth/trial/convert/start', {
+          method: 'POST',
+          body: JSON.stringify({ email, password, terms_accepted: true }),
+        });
+        pendingTrialConvertEmail = result.email || email;
+        const accountFields = document.getElementById('trialConvertAccountFields');
+        const verifyFields = document.getElementById('trialConvertVerifyFields');
+        if (accountFields) accountFields.hidden = true;
+        if (verifyFields) verifyFields.hidden = false;
+        trialConvertMessage(`Code sent to ${pendingTrialConvertEmail}.`, 'success');
+        document.getElementById('trialConvertOtp')?.focus();
+      } catch (error) {
+        trialConvertMessage(error.message, 'error');
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = previous;
+        }
+      }
+    }
+
+    async function confirmTrialConversion() {
+      const otp = document.getElementById('trialConvertOtp')?.value.trim() || '';
+      const button = document.getElementById('trialConvertConfirmButton');
+      if (!pendingTrialConvertEmail || !otp) {
+        trialConvertMessage('Enter the verification code.', 'error');
+        return;
+      }
+      const previous = button?.textContent || 'Verify and save account';
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Verifying...';
+      }
+      try {
+        const auth = await apiJson('/auth/trial/convert/confirm', {
+          method: 'POST',
+          body: JSON.stringify({ email: pendingTrialConvertEmail, otp }),
+        });
+        setAccountToken(auth);
+        resetTrialConvertForm();
+        await loadAccount();
+        accountMessage('Account saved. Your trial, browser session, and desktop links stay attached.');
+      } catch (error) {
+        trialConvertMessage(error.message, 'error');
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = previous;
+        }
+      }
     }
 
     async function startPasswordReset(email) {
@@ -1412,10 +1703,19 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           apiJson('/account/usage'),
         ]);
         currentAccountEmail = me.email || '';
-        document.getElementById('accountEmailLabel').textContent = me.email || 'Bluey account';
+        const accountLabel = me.is_temporary ? 'Temporary Bluey trial' : (me.email || 'Bluey account');
+        document.getElementById('accountEmailLabel').textContent = accountLabel;
         const profileEmailLabel = document.getElementById('profileEmailLabel');
-        if (profileEmailLabel) profileEmailLabel.textContent = me.email || 'Bluey account';
-        setRailCommand(true, me.email || '');
+        if (profileEmailLabel) profileEmailLabel.textContent = accountLabel;
+        setRailCommand(true, accountLabel);
+        const billingProviderLabel = document.getElementById('billingProviderLabel');
+        if (billingProviderLabel) {
+          billingProviderLabel.textContent = me.is_temporary
+            ? 'Temporary trial'
+            : me.billing_provider === 'square'
+              ? 'Square checkout'
+              : 'No subscription';
+        }
         const balanceValue = document.getElementById('balanceValue');
         const balanceCard = balanceValue?.closest('.balance-kpi');
         if (balanceValue) {
@@ -1423,9 +1723,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           balanceCard?.classList.toggle('balance-critical', me.balance_cents < 500);
           balanceCard?.classList.toggle('balance-low', me.balance_cents >= 500 && me.balance_cents < 1000);
         }
-        document.getElementById('balanceHint').textContent = me.trial_seconds_remaining > 0
-          ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes left. Credits are used after the trial when paid cloud work is needed.`
-          : 'When balance reaches $0, paid cloud work pauses until you add credits.';
+        if (me.is_temporary) {
+          document.getElementById('balanceHint').textContent = `${Math.round(me.trial_seconds_remaining / 60)} free minutes left. ${temporaryExpiryCopy(me.temporary_expires_at)} Save it as an account before adding credits.`;
+        } else {
+          document.getElementById('balanceHint').textContent = me.trial_seconds_remaining > 0
+            ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes left. Credits are used after the trial when paid cloud work is needed.`
+            : 'When balance reaches $0, paid cloud work pauses until you add credits.';
+        }
+        renderTemporaryAccount(me);
         renderUsage(usage);
         renderAutoReload(me);
         updateManualReloadDraftCopy();
@@ -1526,6 +1831,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       document.getElementById('confirmSignupButton').addEventListener('click', () => {
         confirmSignupOtp().catch((error) => accountMessage(error.message, true));
+      });
+      document.getElementById('trialConvertForm')?.addEventListener('submit', (event) => {
+        event.preventDefault();
+        startTrialConversion();
+      });
+      document.getElementById('trialConvertConfirmButton')?.addEventListener('click', () => {
+        confirmTrialConversion();
       });
       document.getElementById('reloadButton').addEventListener('click', () => {
         startReload();
@@ -1756,13 +2068,35 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     });
 
+    document.getElementById('tryUsButton')?.addEventListener('click', () => {
+      startTrial();
+    });
+
+    document.getElementById('trialModalClose')?.addEventListener('click', () => {
+      setTrialModal(false);
+    });
+
+    document.getElementById('blueyTrialModal')?.addEventListener('click', (event) => {
+      if (event.target?.id === 'blueyTrialModal') setTrialModal(false);
+    });
+
+    document.getElementById('trialCopyLogin')?.addEventListener('click', () => {
+      copyTrialLogin().catch(() => {
+        const note = document.getElementById('trialNote');
+        if (note) note.textContent = 'Copy failed. You can select the username and password above.';
+      });
+    });
+
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         closeProfileMenu();
+        setTrialModal(false);
       }
     });
 
     initFilePreview();
+    initSiteTheme();
+    initProductJoinForm();
     bootBlueyTerminal();
     syncAccountNav();
     initDownloadInstructions();

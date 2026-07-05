@@ -77,6 +77,15 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
                 ),
             ),
         )
+        .route(
+            "/auth/trial/start",
+            axum::routing::post(auth_routes::trial_start).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_signup,
+                ),
+            ),
+        )
         .route("/auth/captcha/config", get(auth_routes::captcha_config))
         .route(
             "/auth/login",
@@ -246,6 +255,14 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route(
             "/auth/link/mint",
             axum::routing::post(auth_routes::link_mint),
+        )
+        .route(
+            "/auth/trial/convert/start",
+            axum::routing::post(auth_routes::trial_convert_start),
+        )
+        .route(
+            "/auth/trial/convert/confirm",
+            axum::routing::post(auth_routes::trial_convert_confirm),
         )
         .merge(admin_only)
         .route_layer(axum::middleware::from_fn_with_state(

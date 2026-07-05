@@ -10,6 +10,7 @@ use crate::db::DbPool;
 pub struct SignupOtp {
     pub otp_hash: String,
     pub password_hash: String,
+    pub account_id: Option<String>,
     pub expires_at: String,
     pub attempts: i64,
 }
@@ -21,20 +22,50 @@ pub fn upsert(
     password_hash: &str,
     expires_at: &str,
 ) -> Result<()> {
+    upsert_inner(pool, email, otp_hash, password_hash, expires_at, None)
+}
+
+pub fn upsert_for_account(
+    pool: &DbPool,
+    email: &str,
+    otp_hash: &str,
+    password_hash: &str,
+    expires_at: &str,
+    account_id: &str,
+) -> Result<()> {
+    upsert_inner(
+        pool,
+        email,
+        otp_hash,
+        password_hash,
+        expires_at,
+        Some(account_id),
+    )
+}
+
+fn upsert_inner(
+    pool: &DbPool,
+    email: &str,
+    otp_hash: &str,
+    password_hash: &str,
+    expires_at: &str,
+    account_id: Option<&str>,
+) -> Result<()> {
     crate::db::run_blocking_db(|| {
         match pool {
             DbPool::Sqlite(_) => {
                 let conn = pool.get()?;
                 conn.execute(
-                    "INSERT INTO signup_otps (email, otp_hash, password_hash, attempts, expires_at)
-                 VALUES (?1, ?2, ?3, 0, ?4)
+                    "INSERT INTO signup_otps (email, otp_hash, password_hash, account_id, attempts, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)
                  ON CONFLICT(email) DO UPDATE SET
                     otp_hash = excluded.otp_hash,
                     password_hash = excluded.password_hash,
+                    account_id = excluded.account_id,
                     attempts = 0,
                     created_at = datetime('now'),
                     expires_at = excluded.expires_at",
-                    params![email, otp_hash, password_hash, expires_at],
+                    params![email, otp_hash, password_hash, account_id, expires_at],
                 )?;
             }
             DbPool::Postgres(_) => {
@@ -42,15 +73,16 @@ pub fn upsert(
                 let expires_at =
                     chrono::DateTime::parse_from_rfc3339(expires_at)?.with_timezone(&chrono::Utc);
                 conn.execute(
-                    "INSERT INTO signup_otps (email, otp_hash, password_hash, attempts, expires_at)
-                 VALUES ($1, $2, $3, 0, $4)
+                    "INSERT INTO signup_otps (email, otp_hash, password_hash, account_id, attempts, expires_at)
+                 VALUES ($1, $2, $3, $4, 0, $5)
                  ON CONFLICT(email) DO UPDATE SET
                     otp_hash = excluded.otp_hash,
                     password_hash = excluded.password_hash,
+                    account_id = excluded.account_id,
                     attempts = 0,
                     created_at = now(),
                     expires_at = excluded.expires_at",
-                    &[&email, &otp_hash, &password_hash, &expires_at],
+                    &[&email, &otp_hash, &password_hash, &account_id, &expires_at],
                 )?;
             }
         }
@@ -64,15 +96,16 @@ pub fn fetch(pool: &DbPool, email: &str) -> Result<Option<SignupOtp>> {
             let conn = pool.get()?;
             let row = conn
                 .query_row(
-                    "SELECT otp_hash, password_hash, expires_at, attempts
+                    "SELECT otp_hash, password_hash, account_id, expires_at, attempts
                      FROM signup_otps WHERE email = ?1",
                     params![email],
                     |r| {
                         Ok(SignupOtp {
                             otp_hash: r.get(0)?,
                             password_hash: r.get(1)?,
-                            expires_at: r.get(2)?,
-                            attempts: r.get(3)?,
+                            account_id: r.get(2)?,
+                            expires_at: r.get(3)?,
+                            attempts: r.get(4)?,
                         })
                     },
                 )
@@ -82,17 +115,18 @@ pub fn fetch(pool: &DbPool, email: &str) -> Result<Option<SignupOtp>> {
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let row = conn.query_opt(
-                "SELECT otp_hash, password_hash, expires_at, attempts
+                "SELECT otp_hash, password_hash, account_id, expires_at, attempts
                  FROM signup_otps WHERE email = $1",
                 &[&email],
             )?;
             row.map(|row| {
-                let expires_at: chrono::DateTime<chrono::Utc> = row.try_get(2)?;
+                let expires_at: chrono::DateTime<chrono::Utc> = row.try_get(3)?;
                 Ok(SignupOtp {
                     otp_hash: row.try_get(0)?,
                     password_hash: row.try_get(1)?,
+                    account_id: row.try_get(2)?,
                     expires_at: expires_at.to_rfc3339(),
-                    attempts: row.try_get(3)?,
+                    attempts: row.try_get(4)?,
                 })
             })
             .transpose()
@@ -170,6 +204,7 @@ mod tests {
         let row = fetch(&pool, "a@example.com").unwrap().unwrap();
         assert_eq!(row.otp_hash, "otp2");
         assert_eq!(row.password_hash, "pw2");
+        assert_eq!(row.account_id, None);
         assert_eq!(row.attempts, 0);
     }
 }

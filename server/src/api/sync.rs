@@ -372,6 +372,8 @@ mod tests {
             email_verified_at: None,
             balance_cents: 0,
             trial_seconds_remaining: 0,
+            is_temporary: false,
+            temporary_expires_at: None,
             auto_topup_enabled: false,
             auto_topup_threshold_cents: 1000,
             auto_topup_amount_cents: 3000,

@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   balance_cents BIGINT NOT NULL DEFAULT 0,
   reserved_cents BIGINT NOT NULL DEFAULT 0,
   trial_seconds_remaining BIGINT NOT NULL DEFAULT 600,
+  is_temporary INTEGER NOT NULL DEFAULT 0,
+  temporary_expires_at TIMESTAMPTZ,
   auto_topup_enabled INTEGER NOT NULL DEFAULT 0,
   auto_topup_threshold_cents BIGINT NOT NULL DEFAULT 1000,
   auto_topup_amount_cents BIGINT NOT NULL DEFAULT 3000,
@@ -311,6 +313,7 @@ CREATE TABLE IF NOT EXISTS signup_otps (
   email TEXT PRIMARY KEY,
   otp_hash TEXT NOT NULL,
   password_hash TEXT NOT NULL,
+  account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
   attempts BIGINT NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at TIMESTAMPTZ NOT NULL
@@ -371,6 +374,13 @@ CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_ip
   ON trial_abuse_events(ip_hash, created_at);
 CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_device
   ON trial_abuse_events(device_hash, created_at);
+
+ALTER TABLE IF EXISTS accounts
+  ADD COLUMN IF NOT EXISTS is_temporary INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE IF EXISTS accounts
+  ADD COLUMN IF NOT EXISTS temporary_expires_at TIMESTAMPTZ;
+ALTER TABLE IF EXISTS signup_otps
+  ADD COLUMN IF NOT EXISTS account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE;
 
 CREATE TABLE IF NOT EXISTS ops_audit_events (
   id TEXT PRIMARY KEY,

@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070402"
+    href="/assets/bluey-site.css?v=2026070403"
   >
   <script type="application/ld+json">
   {
@@ -352,6 +352,44 @@
               </div>
             </div>
             <div class="device-link-hint dashboard-device-link-hint" id="dashboardDeviceLinkHint" hidden></div>
+
+            <section class="dashboard-section trial-convert-section" id="trialConvertSection" aria-label="Save temporary trial as account" hidden>
+              <div class="section-head">
+                <div>
+                  <h3>Save this trial</h3>
+                  <p id="trialConvertCopy">Temporary trials expire after 24 hours. Create an account before then to keep this browser, desktop link, and saved sessions attached.</p>
+                </div>
+              </div>
+              <form class="account-form trial-convert-form" id="trialConvertForm">
+                <div class="trial-convert-fields" id="trialConvertAccountFields">
+                  <label>
+                    Email
+                    <input id="trialConvertEmail" type="email" autocomplete="email" placeholder="you@company.com">
+                  </label>
+                  <label>
+                    Password
+                    <input id="trialConvertPassword" type="password" autocomplete="new-password" placeholder="Create a password">
+                  </label>
+                  <label>
+                    Confirm password
+                    <input id="trialConvertPasswordConfirm" type="password" autocomplete="new-password" placeholder="Confirm password">
+                  </label>
+                  <label class="terms-check">
+                    <input type="checkbox" id="trialConvertTerms">
+                    <span>I agree to the <a href="/docs/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/docs/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>.</span>
+                  </label>
+                  <button class="account-button primary" id="trialConvertStartButton" type="submit">Send verification code</button>
+                </div>
+                <div class="trial-convert-fields" id="trialConvertVerifyFields" hidden>
+                  <label>
+                    Verification code
+                    <input id="trialConvertOtp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="6-digit code">
+                  </label>
+                  <button class="account-button primary" id="trialConvertConfirmButton" type="button">Verify and save account</button>
+                </div>
+              </form>
+              <div class="account-message" id="trialConvertMessage"></div>
+            </section>
 
             <div class="account-kpis">
               <div class="account-kpi balance-kpi">
@@ -698,7 +736,7 @@
         <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
       </a>
       <div class="nav-links">
-        <button class="theme-toggle" type="button" aria-label="Theme toggle preview" tabindex="-1">
+        <button class="theme-toggle" type="button" aria-label="Switch to light theme" aria-pressed="false">
           <span class="theme-toggle-knob" aria-hidden="true"></span>
         </button>
         <a href="/download">Download</a>
@@ -716,9 +754,9 @@
           <p class="hero-proof"><span>Install, run, ask.</span> Bluey keeps transcript, screen, files, code, docs, and saved session notes available without switching apps.</p>
           <div class="hero-actions">
             <a class="btn btn-primary" href="/download">Get Started</a>
-            <a class="btn btn-ghost" href="/login">Try Us</a>
+            <button class="btn btn-ghost" id="tryUsButton" type="button">Try Us</button>
           </div>
-          <form class="join-bar" action="/login" method="get">
+          <form class="join-bar" id="productJoinForm" action="/login" method="get">
             <input name="user_code" type="text" placeholder="session code" autocomplete="one-time-code" spellcheck="false">
             <button type="submit">Join</button>
           </form>
@@ -774,8 +812,36 @@
     </footer>
   </main>
 
+  <div class="trial-modal" id="blueyTrialModal" hidden>
+    <section class="trial-card" role="dialog" aria-modal="true" aria-labelledby="trialModalTitle">
+      <button class="trial-close" id="trialModalClose" type="button" aria-label="Close trial dialog">×</button>
+      <h2 id="trialModalTitle">15-minute trial ready</h2>
+      <p id="trialModalCopy">This browser is signed in to a temporary Bluey trial. Save the password if you may use another browser, then download Bluey and run <code>bluey on</code>.</p>
+      <div class="trial-grid">
+        <div class="trial-field">
+          <div class="trial-label">Username</div>
+          <div class="trial-value" id="trialEmail">-</div>
+        </div>
+        <div class="trial-field">
+          <div class="trial-label">Password</div>
+          <div class="trial-value" id="trialPassword">-</div>
+        </div>
+        <div class="trial-field">
+          <div class="trial-label">Expires</div>
+          <div class="trial-value" id="trialExpires">24 hours</div>
+        </div>
+      </div>
+      <div class="trial-actions">
+        <button class="btn btn-primary" id="trialCopyLogin" type="button">Copy login</button>
+        <a class="btn btn-ghost" href="/download">Download Bluey</a>
+        <a class="btn btn-ghost" href="/account">Dashboard</a>
+      </div>
+      <div class="trial-note" id="trialNote">Trial includes 15 free minutes for cloud work and expires after 24 hours unless you save it as an account.</div>
+    </section>
+  </div>
+
   <script
-    src="/assets/bluey-site.js?v=2026070402"
+    src="/assets/bluey-site.js?v=2026070403"
   ></script>
 </body>
 </html>
