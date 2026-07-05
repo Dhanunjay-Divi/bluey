@@ -2005,6 +2005,38 @@
       letter-spacing: .04em;
     }
 
+    #accountApp .device-code-form {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: .75rem;
+      align-items: center;
+    }
+
+    #accountApp .device-code-form input {
+      min-width: 0;
+      padding: .8rem .9rem;
+      border: 1px solid rgba(148, 190, 204, .28);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, .06);
+      color: #fff;
+      font-size: .95rem;
+      font-weight: 800;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      outline: none;
+    }
+
+    #accountApp .device-code-form input:focus {
+      border-color: rgba(76, 200, 255, .82);
+      box-shadow: 0 0 0 3px rgba(76, 200, 255, .16);
+    }
+
+    #accountApp .device-code-status {
+      min-height: 1rem;
+      color: #9fb3bd;
+      font-size: .86rem;
+    }
+
     #accountApp .device-link-hint .account-button {
       width: fit-content;
       min-width: 180px;
@@ -4415,6 +4447,526 @@
     html[data-bluey-theme="light"] #downloadApp .page-footer-links a,
     html[data-bluey-theme="light"] #policyApp .page-footer-links a {
       color: #132839;
+    }
+
+    /* Round 359 dashboard: Pinky-like structure with Bluey colors. */
+    #accountApp.is-authed .account-main {
+      width: min(920px, 100%);
+      padding-top: 1.35rem;
+    }
+
+    #accountApp.is-authed .dashboard-card {
+      border: 0;
+      background: transparent;
+      padding: 0;
+    }
+
+    #accountApp .dashboard-overview-card {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(280px, .56fr);
+      gap: .85rem;
+      align-items: stretch;
+      margin-bottom: 1rem;
+      padding: 1.08rem 1.18rem;
+      border: 1px solid rgba(99, 216, 255, .22);
+      border-radius: 12px;
+      background:
+        linear-gradient(135deg, rgba(99, 216, 255, .075), rgba(79, 141, 255, .025) 46%, transparent),
+        #090909;
+    }
+
+    #accountApp .dashboard-overview-card.balance-low {
+      border-color: rgba(255, 189, 99, .42);
+      background:
+        linear-gradient(135deg, rgba(255, 189, 99, .10), rgba(99, 216, 255, .035) 42%, transparent),
+        #090909;
+    }
+
+    #accountApp .dashboard-overview-card.balance-critical {
+      border-color: rgba(255, 90, 102, .48);
+      background:
+        linear-gradient(135deg, rgba(255, 90, 102, .12), rgba(99, 216, 255, .035) 42%, transparent),
+        #090909;
+    }
+
+    #accountApp .dashboard-overview-main {
+      min-width: 0;
+      display: grid;
+      align-content: start;
+      gap: .72rem;
+    }
+
+    #accountApp .dashboard-overview-kicker {
+      display: flex;
+      align-items: center;
+      gap: .55rem;
+      min-width: 0;
+      color: #6d7881;
+      font-size: .75rem;
+      font-weight: 850;
+    }
+
+    #accountApp .dashboard-overview-kicker #accountDashboardEmailLabel {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #accountApp .dashboard-overview-title-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 1rem;
+      align-items: start;
+    }
+
+    #accountApp .dashboard-overview-title-row h2 {
+      margin: 0 0 .24rem;
+      color: #f2f2f2;
+      font-size: 1.18rem;
+      line-height: 1.05;
+    }
+
+    #accountApp .dashboard-overview-title-row p {
+      margin: 0;
+      max-width: 34rem;
+      color: #858f98;
+      font-size: .82rem;
+      line-height: 1.45;
+    }
+
+    #accountApp .dashboard-overview-title-row #balanceValue {
+      color: #f6fbff;
+      font-size: 1.6rem;
+      line-height: 1;
+      letter-spacing: -.02em;
+      white-space: nowrap;
+    }
+
+    #accountApp .dashboard-overview-card.balance-low #balanceValue {
+      color: #ffbd63;
+    }
+
+    #accountApp .dashboard-overview-card.balance-critical #balanceValue {
+      color: #ff5a66;
+    }
+
+    #accountApp .dashboard-overview-meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: .38rem .7rem;
+      color: #6c7780;
+      font-size: .75rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .dashboard-overview-meta span {
+      min-width: 0;
+    }
+
+    #accountApp .dashboard-overview-meta strong {
+      color: #f2f2f2;
+      font-weight: 900;
+    }
+
+    #accountApp .dashboard-overview-side {
+      display: grid;
+      align-content: start;
+      gap: .55rem;
+      min-width: 0;
+    }
+
+    #accountApp .dashboard-overview-side .dashboard-actions {
+      justify-content: flex-end;
+      gap: .45rem;
+    }
+
+    #accountApp .compact-auto-reload {
+      display: block;
+      margin: 0;
+      padding: .82rem .9rem;
+      border-color: rgba(99, 216, 255, .18);
+      background: rgba(0, 0, 0, .30);
+    }
+
+    #accountApp .auto-reload-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: .75rem;
+      margin-bottom: .35rem;
+    }
+
+    #accountApp .auto-reload-head h3 {
+      margin: 0;
+      color: #f2f2f2;
+      font-size: .9rem;
+    }
+
+    #accountApp .compact-auto-reload p {
+      margin: 0;
+      color: #7e8b94;
+      font-size: .74rem;
+      line-height: 1.42;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-fields {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .5rem;
+      margin-top: .65rem;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-fields label {
+      min-width: 0;
+      font-size: .62rem;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-fields input {
+      min-height: 34px;
+      padding: .45rem .55rem;
+      border-radius: 8px;
+      font-size: .82rem;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-rule {
+      margin-top: .55rem;
+      color: #8d9aa3;
+      font-size: .72rem;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-method {
+      min-height: 0;
+      margin-top: .4rem;
+      font-size: .7rem;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-toggle {
+      padding: 0;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-toggle span {
+      width: 2.75rem;
+      height: 1.45rem;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-toggle span::after {
+      left: .18rem;
+      top: .17rem;
+      width: 1.02rem;
+      height: 1.02rem;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-toggle input:checked + span::after {
+      transform: translateX(1.28rem);
+    }
+
+    #accountApp .compact-auto-reload .square-card-setup {
+      margin-top: .65rem;
+      padding: .65rem;
+    }
+
+    #accountApp .dashboard-tabs {
+      display: flex;
+      gap: 0;
+      margin: 1rem 0 .75rem;
+      border-bottom: 1px solid #1a1a1a;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    #accountApp .dashboard-tabs::-webkit-scrollbar {
+      display: none;
+    }
+
+    #accountApp .dashboard-tab {
+      appearance: none;
+      border: 0;
+      border-bottom: 2px solid transparent;
+      background: transparent;
+      color: #666;
+      cursor: pointer;
+      font: inherit;
+      font-size: .86rem;
+      font-weight: 850;
+      padding: .68rem 1.05rem;
+      white-space: nowrap;
+      transition: border-color .18s ease, color .18s ease;
+    }
+
+    #accountApp .dashboard-tab:hover {
+      color: #d7e8ef;
+    }
+
+    #accountApp .dashboard-tab.is-active {
+      color: var(--bluey-accent);
+      border-bottom-color: var(--bluey-accent);
+    }
+
+    #accountApp .dashboard-tab-panel {
+      display: block;
+    }
+
+    #accountApp .dashboard-tab-panel .dashboard-section {
+      margin-top: 0;
+      padding: 1rem 1.1rem;
+    }
+
+    #accountApp .summary-section {
+      min-height: 12rem;
+    }
+
+    #accountApp .summary-metric-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: .6rem;
+      margin-bottom: .75rem;
+    }
+
+    #accountApp .summary-metric {
+      min-width: 0;
+      padding: .8rem .85rem;
+      border: 1px solid rgba(255, 255, 255, .08);
+      border-radius: 10px;
+      background: #101010;
+    }
+
+    #accountApp .summary-balance-kpi {
+      border-color: rgba(99, 216, 255, .24);
+      background: linear-gradient(135deg, rgba(99, 216, 255, .07), #101010 48%);
+    }
+
+    #accountApp .summary-balance-kpi.balance-low {
+      border-color: rgba(255, 189, 99, .42);
+    }
+
+    #accountApp .summary-balance-kpi.balance-critical {
+      border-color: rgba(255, 90, 102, .48);
+    }
+
+    #accountApp .summary-metric span {
+      display: block;
+      color: #68737b;
+      font-size: .64rem;
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .summary-metric strong {
+      display: block;
+      margin-top: .25rem;
+      color: #f2f2f2;
+      font-size: 1.08rem;
+      line-height: 1;
+    }
+
+    #accountApp .summary-balance-kpi.balance-low strong {
+      color: #ffbd63;
+    }
+
+    #accountApp .summary-balance-kpi.balance-critical strong {
+      color: #ff5a66;
+    }
+
+    #accountApp .summary-metric em {
+      display: block;
+      margin-top: .4rem;
+      color: #6d7881;
+      font-size: .72rem;
+      font-style: normal;
+      line-height: 1.35;
+    }
+
+    #accountApp .device-summary-bar {
+      min-height: 48px;
+      margin-bottom: .65rem;
+      padding: .65rem .8rem;
+      border-radius: 10px;
+      font-size: .84rem;
+    }
+
+    #accountApp .device-list,
+    #accountApp .session-list,
+    #accountApp .usage-list {
+      gap: .5rem;
+    }
+
+    #accountApp .usage-list {
+      margin: 0;
+    }
+
+    #accountApp .usage-row,
+    #accountApp .device-row,
+    #accountApp .session-row {
+      border-radius: 10px;
+      padding: .66rem .78rem;
+      font-size: .8rem;
+    }
+
+    #accountApp .device-row {
+      min-height: 64px;
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    #accountApp .device-main {
+      grid-template-columns: 36px minmax(0, 1fr);
+      gap: .65rem;
+    }
+
+    #accountApp .device-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      font-size: .62rem;
+    }
+
+    #accountApp .device-title {
+      font-size: .9rem;
+    }
+
+    #accountApp .device-meta,
+    #accountApp .session-meta {
+      font-size: .72rem;
+    }
+
+    #accountApp .session-empty {
+      padding: 1.35rem;
+    }
+
+    #accountApp .billing-section {
+      background:
+        linear-gradient(180deg, rgba(99, 216, 255, .028), transparent 42%),
+        #0a0a0a;
+    }
+
+    #accountApp .billing-grid {
+      grid-template-columns: 1fr;
+    }
+
+    #accountApp .billing-primary-card {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(220px, .45fr);
+      align-items: start;
+      gap: .8rem;
+      padding: .95rem 1rem;
+    }
+
+    #accountApp .manual-reload-rule {
+      grid-column: 1 / -1;
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-authed .dashboard-card {
+      border: 0;
+      background: transparent;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-card,
+    html[data-bluey-theme="light"] #accountApp .dashboard-section,
+    html[data-bluey-theme="light"] #accountApp .compact-auto-reload,
+    html[data-bluey-theme="light"] #accountApp .summary-metric,
+    html[data-bluey-theme="light"] #accountApp .device-summary-bar,
+    html[data-bluey-theme="light"] #accountApp .usage-row,
+    html[data-bluey-theme="light"] #accountApp .device-row,
+    html[data-bluey-theme="light"] #accountApp .session-row,
+    html[data-bluey-theme="light"] #accountApp .session-detail {
+      border-color: #dceaf2;
+      background: #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-card {
+      background:
+        linear-gradient(135deg, rgba(99, 216, 255, .12), rgba(79, 141, 255, .045) 46%, transparent),
+        #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row h2,
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row #balanceValue,
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-meta strong,
+    html[data-bluey-theme="light"] #accountApp .summary-metric strong,
+    html[data-bluey-theme="light"] #accountApp .auto-reload-head h3,
+    html[data-bluey-theme="light"] #accountApp .device-title,
+    html[data-bluey-theme="light"] #accountApp .session-title,
+    html[data-bluey-theme="light"] #accountApp .credit-equation strong {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row p,
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-kicker,
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-meta,
+    html[data-bluey-theme="light"] #accountApp .summary-metric span,
+    html[data-bluey-theme="light"] #accountApp .summary-metric em,
+    html[data-bluey-theme="light"] #accountApp .compact-auto-reload p,
+    html[data-bluey-theme="light"] #accountApp .auto-reload-rule,
+    html[data-bluey-theme="light"] #accountApp .device-meta,
+    html[data-bluey-theme="light"] #accountApp .session-meta {
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .dashboard-tabs {
+      border-bottom-color: #dceaf2;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .dashboard-tab {
+      color: #6b7f8d;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .dashboard-tab:hover,
+    html[data-bluey-theme="light"] #accountApp .dashboard-tab.is-active {
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .billing-section {
+      background:
+        linear-gradient(180deg, rgba(99, 216, 255, .08), transparent 42%),
+        #ffffff;
+    }
+
+    @media (max-width: 820px) {
+      #accountApp.is-authed .account-main {
+        padding: 1.15rem 1rem 3rem;
+      }
+
+      #accountApp .dashboard-overview-card {
+        grid-template-columns: 1fr;
+      }
+
+      #accountApp .dashboard-overview-side .dashboard-actions {
+        justify-content: flex-start;
+      }
+
+      #accountApp .billing-primary-card {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 620px) {
+      #accountApp .dashboard-overview-title-row {
+        grid-template-columns: 1fr;
+        gap: .65rem;
+      }
+
+      #accountApp .dashboard-overview-title-row #balanceValue {
+        font-size: 1.42rem;
+      }
+
+      #accountApp .compact-auto-reload .auto-reload-fields {
+        grid-template-columns: 1fr;
+      }
+
+      #accountApp .dashboard-tab {
+        padding-left: .8rem;
+        padding-right: .8rem;
+      }
+
+      #accountApp .session-row {
+        grid-template-columns: 1fr;
+      }
+
+      #accountApp .summary-metric-grid {
+        grid-template-columns: 1fr;
+      }
     }
 
     @media (max-width: 520px) {

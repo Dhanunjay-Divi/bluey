@@ -835,7 +835,52 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.hidden = true;
         el.replaceChildren();
       }
-      if (!code) return;
+
+      const renderCodeEntry = (el) => {
+        el.hidden = false;
+        el.replaceChildren();
+        const title = document.createElement('strong');
+        title.textContent = 'Have a Bluey desktop code?';
+        const body = document.createElement('span');
+        body.textContent = accountToken()
+          ? 'Enter the code from Terminal or the Bluey window to connect this desktop to the account signed into this browser.'
+          : 'Enter the code from Terminal or the Bluey window, then sign in or create an account to confirm the desktop link.';
+        const form = document.createElement('form');
+        form.className = 'device-code-form';
+        form.noValidate = true;
+        const input = document.createElement('input');
+        input.name = 'user_code';
+        input.type = 'text';
+        input.placeholder = 'XXXX-XXXX';
+        input.autocomplete = 'one-time-code';
+        input.spellcheck = false;
+        input.inputMode = 'text';
+        const button = document.createElement('button');
+        button.type = 'submit';
+        button.className = 'account-button secondary compact';
+        button.textContent = 'Use code';
+        const status = document.createElement('span');
+        status.className = 'device-code-status';
+        form.addEventListener('submit', (event) => {
+          event.preventDefault();
+          const nextCode = normalizeDeviceCode(input.value);
+          if (!nextCode) {
+            status.textContent = 'Enter the code shown by Bluey desktop.';
+            input.focus();
+            return;
+          }
+          rememberPendingDeviceCode(nextCode);
+          status.textContent = '';
+          renderDeviceLinkHint();
+        });
+        form.append(input, button);
+        el.append(title, body, form, status);
+      };
+
+      if (!code) {
+        for (const el of targets) renderCodeEntry(el);
+        return;
+      }
 
       const renderInto = (el) => {
         el.hidden = false;
@@ -852,9 +897,17 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         body.append('Terminal is waiting on code ');
         const codeEl = document.createElement('code');
         codeEl.textContent = code;
-        body.append(codeEl, accountToken()
-          ? '. Press Connect desktop to finish Bluey login.'
-          : '. This code came from your desktop app. Sign in or create an account here, then connect the desktop link.');
+        if (accountToken()) {
+          body.append(
+            codeEl,
+            `. This connects the desktop showing that code to ${currentAccountEmail || 'the account signed into this browser'}. Only approve codes from your own Bluey desktop.`
+          );
+        } else {
+          body.append(
+            codeEl,
+            '. This code came from your desktop app. Sign in or create an account here, then confirm the desktop link before Bluey can use credits or cloud answers.'
+          );
+        }
         el.append(title, body);
         if (accountToken()) {
           const button = document.createElement('button');
@@ -1203,6 +1256,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         || (projectedDays > 0
           ? `~${Math.min(projectedDays, 90)} days at recent pace.`
           : 'Projection appears after usage.');
+      const summaryUsageValue = document.getElementById('summaryUsageValue');
+      const summaryUsageHint = document.getElementById('summaryUsageHint');
+      const summaryTierValue = document.getElementById('summaryTierValue');
+      const summaryProjectionHint = document.getElementById('summaryProjectionHint');
+      if (summaryUsageValue) summaryUsageValue.textContent = `${usage.total_cues || 0}`;
+      if (summaryUsageHint) summaryUsageHint.textContent = `${money(usage.total_cents_spent)} spent in ${usage.period_days || 7} days.`;
+      if (summaryTierValue) summaryTierValue.textContent = usage.tier_label || '--';
+      if (summaryProjectionHint) summaryProjectionHint.textContent = document.getElementById('projectionHint').textContent;
       const list = document.getElementById('usageList');
       const rows = usage.mix || [];
       list.replaceChildren();
@@ -1850,7 +1911,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         ]);
         currentAccountEmail = me.email || '';
         const accountLabel = me.is_temporary ? 'Temporary Bluey trial' : (me.email || 'Bluey account');
-        document.getElementById('accountEmailLabel').textContent = accountLabel;
+        const dashboardEmailLabel = document.getElementById('accountDashboardEmailLabel');
+        if (dashboardEmailLabel) dashboardEmailLabel.textContent = accountLabel;
         const profileEmailLabel = document.getElementById('profileEmailLabel');
         if (profileEmailLabel) profileEmailLabel.textContent = accountLabel;
         setRailCommand(true, accountLabel);
@@ -1869,13 +1931,25 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           balanceCard?.classList.toggle('balance-critical', me.balance_cents < 500);
           balanceCard?.classList.toggle('balance-low', me.balance_cents >= 500 && me.balance_cents < 1000);
         }
+        const summaryBalanceValue = document.getElementById('summaryBalanceValue');
+        const summaryBalanceCard = summaryBalanceValue?.closest('.summary-balance-kpi');
+        if (summaryBalanceValue) {
+          summaryBalanceValue.textContent = money(me.balance_cents);
+          summaryBalanceCard?.classList.toggle('balance-critical', me.balance_cents < 500);
+          summaryBalanceCard?.classList.toggle('balance-low', me.balance_cents >= 500 && me.balance_cents < 1000);
+        }
+        const balanceHint = document.getElementById('balanceHint');
+        const summaryBalanceHint = document.getElementById('summaryBalanceHint');
+        let balanceHintText = '';
         if (me.is_temporary) {
-          document.getElementById('balanceHint').textContent = `${Math.round(me.trial_seconds_remaining / 60)} free minutes left. ${temporaryExpiryCopy(me.temporary_expires_at)} Save it as an account before adding credits.`;
+          balanceHintText = `${Math.round(me.trial_seconds_remaining / 60)} free minutes left. ${temporaryExpiryCopy(me.temporary_expires_at)} Save it as an account before adding credits.`;
         } else {
-          document.getElementById('balanceHint').textContent = me.trial_seconds_remaining > 0
+          balanceHintText = me.trial_seconds_remaining > 0
             ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes left. Credits are used after the trial when paid cloud work is needed.`
             : 'When balance reaches $0, paid cloud work pauses until you add credits.';
         }
+        if (balanceHint) balanceHint.textContent = balanceHintText;
+        if (summaryBalanceHint) summaryBalanceHint.textContent = balanceHintText;
         renderTemporaryAccount(me);
         renderUsage(usage);
         renderAutoReload(me);
@@ -1928,6 +2002,49 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
+    function normalizeDashboardTabName(value) {
+      const tab = String(value || '').replace(/^#/, '').trim().toLowerCase();
+      if (tab === 'sessions' || tab === 'computers' || tab === 'devices') return 'computers';
+      if (tab === 'session-history' || tab === 'history' || tab === 'saved-sessions') return 'history';
+      if (tab === 'summary' || tab === 'usage') return 'summary';
+      if (tab === 'billing' || tab === 'reload' || tab === 'credits') return 'billing';
+      return '';
+    }
+
+    function setDashboardTab(tabName, updateHash = false) {
+      const name = normalizeDashboardTabName(tabName) || 'computers';
+      document.querySelectorAll('[data-dashboard-tab]').forEach((button) => {
+        const active = button.dataset.dashboardTab === name;
+        button.classList.toggle('is-active', active);
+        button.setAttribute('aria-selected', active ? 'true' : 'false');
+      });
+      document.querySelectorAll('[data-dashboard-panel]').forEach((panel) => {
+        const active = panel.dataset.dashboardPanel === name;
+        panel.hidden = !active;
+        panel.classList.toggle('is-active', active);
+      });
+      if (updateHash && window.history?.replaceState) {
+        const nextUrl = `${window.location.pathname}${window.location.search}#${name}`;
+        window.history.replaceState(null, '', nextUrl);
+      }
+    }
+
+    function initDashboardTabs() {
+      const hashTab = normalizeDashboardTabName(window.location.hash);
+      setDashboardTab(hashTab || (currentPath === '/reload' ? 'billing' : 'computers'));
+      document.querySelectorAll('[data-dashboard-tab]').forEach((button) => {
+        if (button.dataset.dashboardReady === '1') return;
+        button.dataset.dashboardReady = '1';
+        button.addEventListener('click', () => {
+          setDashboardTab(button.dataset.dashboardTab, true);
+        });
+      });
+      window.addEventListener('hashchange', () => {
+        const tab = normalizeDashboardTabName(window.location.hash);
+        if (tab) setDashboardTab(tab);
+      });
+    }
+
     function initAccountApp() {
       if (isPolicyRoute) {
         productSite.hidden = true;
@@ -1954,6 +2071,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       loadCaptchaConfig()
         .then(() => refreshSignupCaptcha())
         .catch(() => {});
+      initDashboardTabs();
 
       document.getElementById('accountForm').addEventListener('submit', (event) => {
         event.preventDefault();
