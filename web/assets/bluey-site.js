@@ -118,6 +118,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return storedPendingDeviceCode();
     }
 
+    function pendingSessionId() {
+      const id = new URLSearchParams(location.search).get('session') || '';
+      return String(id).trim().slice(0, 160);
+    }
+
     function setAccountToken(auth) {
       localStorage.setItem('bluey_access_token', auth.access_token);
       localStorage.setItem('bluey_refresh_token', auth.refresh_token || '');
@@ -206,6 +211,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function filePreviewHref(route) {
       return `${window.location.pathname}?route=${encodeURIComponent(normalizeRoutePath(route) || '/')}`;
+    }
+
+    function accountSessionHref(sessionId) {
+      const id = String(sessionId || '').trim();
+      const base = window.location.protocol === 'file:' ? filePreviewHref('/account') : '/account';
+      if (!id) return `${base}#history`;
+      const separator = base.includes('?') ? '&' : '?';
+      return `${base}${separator}session=${encodeURIComponent(id)}#history`;
     }
 
     function initFilePreview() {
@@ -1852,6 +1865,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         button.className = 'account-button ghost';
         button.type = 'button';
         button.dataset.sessionId = session.session_id || '';
+        button.dataset.sessionOpen = accountSessionHref(session.session_id);
+        button.setAttribute('aria-label', `Open ${session.title || 'saved session'} in a new tab`);
+        button.title = 'Open session in a new tab';
         button.textContent = 'Open';
         row.append(body, copyId, button);
         list.append(row);
@@ -1879,10 +1895,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       detail.append(empty);
     }
 
-    function latestRecord(records) {
-      return Array.isArray(records) && records.length ? records[records.length - 1] : null;
-    }
-
     function appendBundlePreview(detail, label, text) {
       if (!text) return;
       const pre = document.createElement('pre');
@@ -1906,6 +1918,52 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (diagnostics.last_error_message) lines.push(String(diagnostics.last_error_message));
       if (diagnostics.last_error_at) lines.push(`last error at: ${formatSessionTime(diagnostics.last_error_at)}`);
       return lines.join('\n');
+    }
+
+    function joinSessionMeta(values) {
+      return values
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+        .join(' - ');
+    }
+
+    function appendSessionBundleSection(detail, heading, records, emptyText, renderRecord) {
+      const section = document.createElement('section');
+      section.className = 'session-detail-section';
+      const title = document.createElement('h4');
+      title.textContent = heading;
+      section.append(title);
+
+      const items = Array.isArray(records) ? records : [];
+      if (!items.length) {
+        const empty = document.createElement('p');
+        empty.className = 'session-detail-empty';
+        empty.textContent = emptyText;
+        section.append(empty);
+        detail.append(section);
+        return;
+      }
+
+      const list = document.createElement('div');
+      list.className = 'session-detail-list';
+      for (const item of items) {
+        const rendered = renderRecord(item) || {};
+        const row = document.createElement('article');
+        row.className = 'session-detail-item';
+        const rowTitle = document.createElement('strong');
+        rowTitle.textContent = rendered.title || heading;
+        const meta = document.createElement('span');
+        meta.textContent = rendered.meta || '';
+        row.append(rowTitle, meta);
+        if (rendered.body) {
+          const pre = document.createElement('pre');
+          pre.textContent = rendered.body;
+          row.append(pre);
+        }
+        list.append(row);
+      }
+      section.append(list);
+      detail.append(section);
     }
 
     async function loadCloudSessions() {
@@ -1946,24 +2004,51 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         appendBundlePreview(detail, 'Answer style', bundle.session.answer_style);
       }
       appendBundlePreview(detail, 'Diagnostics', diagnosticsText(bundle.session?.metadata));
-      const transcript = latestRecord(bundle.transcript_segments);
-      if (transcript?.text) {
-        appendBundlePreview(detail, `Latest transcript (${transcript.speaker || 'speaker'})`, transcript.text);
-      }
-      const answer = latestRecord(bundle.cue_responses);
-      if (answer?.text) {
-        appendBundlePreview(detail, 'Latest answer', answer.text);
-      }
-      if (Array.isArray(bundle.context_artifacts) && bundle.context_artifacts.length) {
-        appendBundlePreview(
-          detail,
-          'Attached context',
-          bundle.context_artifacts
-            .slice(-5)
-            .map((artifact) => `${artifact.kind || 'context'}: ${artifact.title || artifact.artifact_id}`)
-            .join('\n')
-        );
-      }
+      appendSessionBundleSection(
+        detail,
+        'Transcript',
+        bundle.transcript_segments,
+        'No transcript saved for this session yet.',
+        (segment) => ({
+          title: segment.speaker || segment.source || 'Speaker',
+          meta: joinSessionMeta([
+            formatSessionTime(segment.ts_ms),
+            segment.source,
+            segment.is_final === false ? 'draft' : 'final',
+          ]),
+          body: segment.text || '',
+        })
+      );
+      appendSessionBundleSection(
+        detail,
+        'Answers',
+        bundle.cue_responses,
+        'No Bluey answers saved for this session yet.',
+        (answer) => ({
+          title: answer.kind || answer.task_type || 'Answer',
+          meta: joinSessionMeta([
+            formatSessionTime(answer.ts_ms),
+            answer.model,
+            answer.cost_label || (answer.cost_cents ? money(answer.cost_cents) : ''),
+          ]),
+          body: answer.text || answer.artifact_body || answer.source_text || '',
+        })
+      );
+      appendSessionBundleSection(
+        detail,
+        'Context',
+        bundle.context_artifacts,
+        'No context files or notes saved for this session yet.',
+        (artifact) => ({
+          title: artifact.title || artifact.kind || artifact.artifact_id || 'Context',
+          meta: joinSessionMeta([
+            artifact.kind,
+            formatSessionTime(artifact.created_at_ms),
+            artifact.source_uri,
+          ]),
+          body: [artifact.note, artifact.text_preview].filter(Boolean).join('\n\n'),
+        })
+      );
     }
 
     function renderAdminAbuse(payload, message = '') {
@@ -2044,6 +2129,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('accountRecoveryCard').hidden = true;
       document.getElementById('accountSignOut').hidden = true;
       if (!authed) return;
+      const requestedSessionId = pendingSessionId();
       const refreshButton = document.getElementById('refreshAccountButton');
       if (refreshButton) refreshButton.disabled = true;
       accountMessage('Loading account...');
@@ -2052,8 +2138,17 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         renderLinkedDevices({ devices: [] }, `Could not load linked devices: ${error.message}`);
         return null;
       });
-      const sessionsPromise = loadCloudSessions().then((sessions) => {
-        setCloudSessionDetail('');
+      const sessionsPromise = loadCloudSessions().then(async (sessions) => {
+        if (requestedSessionId) {
+          setDashboardTab('history');
+          try {
+            await loadCloudSessionDetail(requestedSessionId);
+          } catch (error) {
+            setCloudSessionDetail(`Could not load saved session: ${error.message}`);
+          }
+        } else {
+          setCloudSessionDetail('');
+        }
         return sessions;
       }).catch((error) => {
         renderCloudSessions({ sessions: [] });
@@ -2385,9 +2480,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('cloudSessionsList').addEventListener('click', (event) => {
         const button = event.target.closest('button[data-session-id]');
         if (!button) return;
-        loadCloudSessionDetail(button.dataset.sessionId).catch((error) => {
-          setCloudSessionDetail(`Could not load saved session: ${error.message}`);
-        });
+        const url = button.dataset.sessionOpen || accountSessionHref(button.dataset.sessionId);
+        const opened = window.open(url, '_blank');
+        if (opened) opened.opener = null;
+        if (!opened) {
+          setDashboardTab('history', true);
+          loadCloudSessionDetail(button.dataset.sessionId).catch((error) => {
+            setCloudSessionDetail(`Could not load saved session: ${error.message}`);
+          });
+          accountMessage('Popup blocked. Showing the saved session here instead.');
+        }
       });
       document.getElementById('passwordResetStartForm').addEventListener('submit', (event) => {
         event.preventDefault();

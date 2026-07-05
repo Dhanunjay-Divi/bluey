@@ -2916,6 +2916,44 @@
       font-size: .85rem;
     }
 
+    #accountApp .session-detail-section {
+      display: grid;
+      gap: .45rem;
+      padding-top: .45rem;
+      border-top: 1px solid rgba(255, 255, 255, .08);
+    }
+
+    #accountApp .session-detail-section h4 {
+      margin: .25rem 0 0;
+      color: #e6e6e6;
+      font-size: .85rem;
+    }
+
+    #accountApp .session-detail-list {
+      display: grid;
+      gap: .45rem;
+    }
+
+    #accountApp .session-detail-item {
+      display: grid;
+      gap: .2rem;
+      padding: .7rem;
+      border: 1px solid rgba(255, 255, 255, .08);
+      border-radius: 8px;
+      background: #0b0b0b;
+    }
+
+    #accountApp .session-detail-item strong {
+      color: #e0e0e0;
+    }
+
+    #accountApp .session-detail-item span,
+    #accountApp .session-detail-empty {
+      margin: 0;
+      color: #666;
+      font-size: .76rem;
+    }
+
     #accountApp .session-detail pre {
       overflow-x: auto;
       margin: .35rem 0 0;
@@ -4871,9 +4909,20 @@
     html[data-bluey-theme="light"] #accountApp .usage-row,
     html[data-bluey-theme="light"] #accountApp .device-row,
     html[data-bluey-theme="light"] #accountApp .session-row,
-    html[data-bluey-theme="light"] #accountApp .session-detail {
+    html[data-bluey-theme="light"] #accountApp .session-detail,
+    html[data-bluey-theme="light"] #accountApp .session-detail-item {
       border-color: #dceaf2;
       background: #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .session-detail-section {
+      border-top-color: #dceaf2;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .session-detail pre {
+      border-color: #dceaf2;
+      background: #f7fbff;
+      color: #244052;
     }
 
     html[data-bluey-theme="light"] #accountApp .dashboard-overview-card {
@@ -4888,6 +4937,8 @@
     html[data-bluey-theme="light"] #accountApp .auto-reload-head h3,
     html[data-bluey-theme="light"] #accountApp .device-title,
     html[data-bluey-theme="light"] #accountApp .session-title,
+    html[data-bluey-theme="light"] #accountApp .session-detail-section h4,
+    html[data-bluey-theme="light"] #accountApp .session-detail-item strong,
     html[data-bluey-theme="light"] #accountApp .credit-equation strong {
       color: #102130;
     }
@@ -4899,7 +4950,9 @@
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload p,
     html[data-bluey-theme="light"] #accountApp .auto-reload-rule,
     html[data-bluey-theme="light"] #accountApp .device-meta,
-    html[data-bluey-theme="light"] #accountApp .session-meta {
+    html[data-bluey-theme="light"] #accountApp .session-meta,
+    html[data-bluey-theme="light"] #accountApp .session-detail-item span,
+    html[data-bluey-theme="light"] #accountApp .session-detail-empty {
       color: #5f7281;
     }
 
