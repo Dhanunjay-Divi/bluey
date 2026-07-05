@@ -1399,6 +1399,18 @@
       margin: 14px 0;
     }
 
+    .trial-turnstile {
+      min-height: 66px;
+      margin: 12px 0 2px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .trial-turnstile[hidden] {
+      display: none;
+    }
+
     .trial-field {
       padding: 12px;
       border: 1px solid rgba(99, 216, 255, .16);

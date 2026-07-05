@@ -46,6 +46,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let captchaConfig = { provider: null, site_key: null };
     let signupTurnstileWidgetId = null;
     let signupTurnstileToken = '';
+    let trialTurnstileWidgetId = null;
+    let trialTurnstileToken = '';
+    let pendingTrialButton = null;
     const DEVICE_LINK_TTL_MS = 10 * 60 * 1000;
     const DEVICE_LINK_STORAGE_KEY = 'bluey_pending_device_code';
 
@@ -489,6 +492,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const expiresEl = document.getElementById('trialExpires');
       const noteEl = document.getElementById('trialNote');
       const gridEl = document.querySelector('#blueyTrialModal .trial-grid');
+      const turnstileEl = document.getElementById('trialTurnstile');
       const copyButton = document.getElementById('trialCopyLogin');
       const accountAction = document.getElementById('trialAccountAction');
       const downloadAction = document.getElementById('trialDownloadAction');
@@ -499,6 +503,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (expiresEl) expiresEl.textContent = expires ? formatDeviceTime(expires) : '24 hours';
       if (noteEl) noteEl.textContent = note || '';
       if (gridEl) gridEl.hidden = !showCredentials;
+      if (turnstileEl) turnstileEl.hidden = true;
       if (copyButton) {
         copyButton.disabled = !canCopy;
         copyButton.hidden = !canCopy;
@@ -510,6 +515,55 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (downloadAction) downloadAction.textContent = downloadActionText;
     }
 
+    function isPhoneTrialBrowser() {
+      const ua = navigator.userAgent || '';
+      if (/Android|iPhone|iPod|Mobile/i.test(ua)) return true;
+      const coarseNarrow = window.matchMedia
+        && window.matchMedia('(pointer: coarse)').matches
+        && Math.min(window.innerWidth || 0, window.innerHeight || 0) < 768;
+      return Boolean(coarseNarrow);
+    }
+
+    function showDesktopTrialRequired() {
+      renderTrialModal({
+        title: 'Open Try Us on Mac or Windows',
+        copy: 'Bluey starts from the desktop overlay. Open this page on the computer where you want to run Bluey, then click Try Us there.',
+        email: 'Use a desktop browser',
+        password: 'Trial login is created there',
+        expires: '',
+        note: 'After the trial is created, copy the one-time username and password if you need another browser. The trial includes 15 free minutes.',
+        canCopy: false,
+      });
+      setTrialModal(true);
+    }
+
+    function showTrialStatus() {
+      if (trialCredentials?.email && trialCredentials?.password) {
+        renderTrialModal({
+          title: 'Trial is active',
+          copy: 'This browser is signed in to your Bluey trial. Copy the login before closing this page, then download Bluey and run bluey on.',
+          email: trialCredentials.email,
+          password: trialCredentials.password,
+          expires: trialCredentials.expires,
+          note: 'The password is shown only once. Save it if you may use another browser.',
+          canCopy: true,
+          showCredentials: true,
+        });
+      } else {
+        renderTrialModal({
+          title: 'Already signed in',
+          copy: 'This browser already has a Bluey account. Download Bluey and run bluey on, or open Dashboard to manage credits and saved sessions.',
+          email: currentAccountEmail || 'Signed in',
+          password: 'Not needed',
+          expires: '',
+          note: 'Temporary trials are for new browsers that have not signed in yet.',
+          canCopy: false,
+          showCredentials: false,
+        });
+      }
+      setTrialModal(true);
+    }
+
     function trialStartErrorState(error) {
       const message = String(error?.message || '').toLowerCase();
       if (message.includes('404') || message.includes('501') || message.includes('unsupported method')) {
@@ -517,6 +571,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           title: 'Try Us is being connected',
           copy: 'The Bluey website is updated, but the temporary-trial server endpoint is not live yet. You can still download Bluey or create a normal account now.',
           note: 'No trial minutes were created and nothing was charged. The 15-minute trial will turn on after the API rollout finishes.',
+        };
+      }
+      if (message.includes('captcha') || message.includes('human check') || message.includes('turnstile')) {
+        return {
+          title: 'Human check needed',
+          copy: 'Complete the Try Us human check, then Bluey will create the temporary trial automatically.',
+          note: 'This keeps the free trial available for real users and blocks automated loops.',
+        };
+      }
+      if (message.includes('signed in')) {
+        return {
+          title: 'Already signed in',
+          copy: 'This browser already has a Bluey account. Use Dashboard, or sign out before creating a new temporary trial.',
+          note: 'Temporary trials are only created for browsers that are not already linked.',
         };
       }
       if (message.includes('trial') || message.includes('velocity') || message.includes('already_used') || message.includes('rate')) {
@@ -533,20 +601,64 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       };
     }
 
-    async function startTrial() {
-      const button = document.getElementById('tryUsButton');
-      if (accountToken()) {
-        renderTrialModal({
-          title: 'Already signed in',
-          copy: 'This browser already has a Bluey account. Use Dashboard, or sign out before creating a new temporary trial.',
-          email: currentAccountEmail || 'Signed in',
-          password: 'Not needed',
-          expires: '',
-          note: 'Temporary trials are for new users who have not signed in yet.',
-          canCopy: false,
-          showCredentials: false,
-        });
-        setTrialModal(true);
+    function resetTrialTurnstile() {
+      trialTurnstileToken = '';
+      if (window.turnstile && trialTurnstileWidgetId !== null) {
+        window.turnstile.reset(trialTurnstileWidgetId);
+      }
+    }
+
+    async function ensureTrialHumanCheck(button) {
+      const config = await loadCaptchaConfig();
+      if (config.provider !== 'turnstile' || !config.site_key) return true;
+      if (trialTurnstileToken) return true;
+      renderTrialModal({
+        title: 'One quick human check',
+        copy: 'Complete the check below. Bluey will create your 15-minute trial as soon as it passes.',
+        email: 'Waiting for check',
+        password: 'Shown once after the check passes',
+        expires: '',
+        note: 'This protects the free trial from automated abuse.',
+        canCopy: false,
+        showCredentials: false,
+      });
+      const mount = document.getElementById('trialTurnstile');
+      if (mount) mount.hidden = false;
+      setTrialModal(true);
+      pendingTrialButton = button || null;
+      await loadTurnstileScript();
+      if (!mount || !window.turnstile) throw new Error('Human check could not start.');
+      if (trialTurnstileWidgetId !== null) {
+        window.turnstile.reset(trialTurnstileWidgetId);
+        return false;
+      }
+      trialTurnstileWidgetId = window.turnstile.render(mount, {
+        sitekey: config.site_key,
+        theme: storedSiteTheme() === 'light' ? 'light' : 'dark',
+        action: 'try_us',
+        callback: (token) => {
+          trialTurnstileToken = token || '';
+          const resumeButton = pendingTrialButton;
+          pendingTrialButton = null;
+          if (trialTurnstileToken) startTrial(resumeButton);
+        },
+        'expired-callback': () => {
+          trialTurnstileToken = '';
+        },
+        'error-callback': () => {
+          trialTurnstileToken = '';
+        },
+      });
+      return false;
+    }
+
+    async function startTrial(button = document.getElementById('tryUsButton')) {
+      if (accountToken() || button?.dataset.trialState === 'active') {
+        showTrialStatus();
+        return;
+      }
+      if (isPhoneTrialBrowser()) {
+        showDesktopTrialRequired();
         return;
       }
 
@@ -555,10 +667,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (button) button.disabled = true;
       if (label) label.textContent = 'Creating...';
       try {
+        if (!await ensureTrialHumanCheck(button)) return;
         const auth = await apiJson('/auth/trial/start', {
           method: 'POST',
-          body: JSON.stringify({ device_fingerprint: browserTrialDeviceId() }),
+          body: JSON.stringify({
+            device_fingerprint: browserTrialDeviceId(),
+            turnstile_token: trialTurnstileToken || null,
+          }),
         });
+        resetTrialTurnstile();
         setAccountToken(auth);
         currentAccountEmail = auth?.account?.email || '';
         trialCredentials = {
@@ -576,8 +693,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           canCopy: true,
           showCredentials: true,
         });
+        if (button) button.dataset.trialState = 'active';
         setTrialModal(true);
       } catch (error) {
+        resetTrialTurnstile();
         const state = trialStartErrorState(error);
         renderTrialModal({
           title: state.title,
@@ -594,7 +713,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         setTrialModal(true);
       } finally {
         if (button) button.disabled = false;
-        if (label) label.textContent = previous;
+        if (label) label.textContent = button?.dataset.trialState === 'active' ? 'Trial Active' : previous;
       }
     }
 

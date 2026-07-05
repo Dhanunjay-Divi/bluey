@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 18:55 EDT
+Latest checkpoint: 2026-07-05 00:00 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,11 +30,16 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-347-CLICKTHROUGH-SCROLL-ROUTING.md`; the next canonical Bluey round doc should start at `ROUND-348-...`.
+- Latest completed Bluey round doc is `ROUND-363-TRY-US-TRIAL-PARITY.md`; the next canonical Bluey round doc should start at `ROUND-364-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
+- Round 363 fixes the public Try Us flow:
+  - live pre-fix smoke showed `POST /auth/trial/start` returned `404`
+  - runtime backend now includes temporary trial account endpoints, expiry checks, and conversion flow
+  - web UI now follows Pinky's Try Us pattern with desktop-required, active-trial, and optional Turnstile human-check states
+  - round doc: `docs/rounds/ROUND-363-TRY-US-TRIAL-PARITY.md`
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
 - Round 338 is complete and deployed for canvas click-through hit testing:
   - owner reported canvas mode click-through was not working
