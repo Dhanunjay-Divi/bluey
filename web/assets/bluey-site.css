@@ -930,8 +930,8 @@
     #productSite .content {
       display: grid;
       grid-template-columns: minmax(360px, .92fr) minmax(380px, 1fr);
-      gap: 3.4rem;
-      max-width: 1040px;
+      gap: 3rem;
+      max-width: 1000px;
       width: 100%;
       align-items: center;
       position: relative;
@@ -953,11 +953,11 @@
 
     #productSite .hero h1 {
       color: #f4f7f8;
-      font-size: clamp(2.55rem, 4vw, 3.05rem);
+      font-size: clamp(2.28rem, 3.45vw, 2.7rem);
       font-weight: 740;
-      line-height: 1.07;
-      margin: 0 0 1.05rem;
-      letter-spacing: -.04em;
+      line-height: 1.05;
+      margin: 0 0 .82rem;
+      letter-spacing: -.03em;
       text-wrap: balance;
     }
 
@@ -969,21 +969,21 @@
     }
 
     #productSite .hero p {
-      max-width: 430px;
+      max-width: 390px;
       color: #8d8d8d;
-      font-size: 1.03rem;
-      line-height: 1.58;
+      font-size: .94rem;
+      line-height: 1.5;
     }
 
     #productSite .hero-lede {
-      margin-bottom: .65rem;
+      margin-bottom: .54rem;
     }
 
     #productSite .hero-proof {
       color: #e7e7e7 !important;
-      font-size: 1.03rem !important;
+      font-size: .94rem !important;
       font-weight: 650;
-      margin-bottom: 1.55rem;
+      margin-bottom: 1.18rem;
     }
 
     #productSite .hero-proof span {
@@ -995,10 +995,10 @@
 
     #productSite .hero-actions {
       display: grid;
-      grid-template-columns: repeat(2, minmax(145px, 1fr));
-      gap: .7rem;
+      grid-template-columns: repeat(2, minmax(128px, 1fr));
+      gap: .56rem;
       align-items: stretch;
-      max-width: 392px;
+      max-width: 344px;
       margin-top: 0;
     }
 
@@ -1006,11 +1006,11 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-height: 56px;
-      padding: .72rem 1.45rem;
+      min-height: 46px;
+      padding: .58rem 1.15rem;
       border: 1px solid transparent;
-      border-radius: 12px;
-      font-size: .98rem;
+      border-radius: 10px;
+      font-size: .88rem;
       font-family: inherit;
       font-weight: 800;
       text-decoration: none;
@@ -1048,9 +1048,9 @@
 
     #productSite .join-bar {
       display: flex;
-      gap: .5rem;
-      margin-top: 1.35rem;
-      max-width: 386px;
+      gap: .45rem;
+      margin-top: 1rem;
+      max-width: 344px;
     }
 
     #productSite .join-bar input {
@@ -1061,8 +1061,8 @@
       border: 1px solid rgba(99, 216, 255, .30);
       color: #e0e0e0;
       border-radius: 8px;
-      padding: .7rem 1rem;
-      font-size: 1rem;
+      padding: .56rem .86rem;
+      font-size: .88rem;
       font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
       letter-spacing: 0;
       text-transform: lowercase;
@@ -1088,8 +1088,8 @@
       color: var(--bluey-accent);
       border: 1px solid rgba(99, 216, 255, .30);
       border-radius: 8px;
-      padding: .7rem 1.2rem;
-      font-size: .9rem;
+      padding: .56rem .92rem;
+      font-size: .82rem;
       font-weight: 800;
       cursor: pointer;
       transition: all .2s;
@@ -1107,21 +1107,21 @@
     }
 
     #productSite .connect-help {
-      max-width: 386px;
-      margin-top: .45rem;
+      max-width: 344px;
+      margin-top: .38rem;
       color: #777;
-      font-size: .73rem;
+      font-size: .68rem;
       font-weight: 560;
-      line-height: 1.38;
+      line-height: 1.34;
     }
 
     #productSite .connect-status {
-      max-width: 386px;
-      margin-top: .42rem;
+      max-width: 344px;
+      margin-top: .36rem;
       color: #9be8ff;
-      font-size: .73rem;
+      font-size: .68rem;
       font-weight: 650;
-      line-height: 1.38;
+      line-height: 1.34;
     }
 
     #productSite .connect-status:empty {
@@ -1138,9 +1138,9 @@
 
     #productSite .hero-note {
       max-width: none;
-      margin-top: .6rem;
+      margin-top: .5rem;
       color: #555;
-      font-size: .75rem;
+      font-size: .68rem;
     }
 
     #productSite .hero-note + .hero-note {
