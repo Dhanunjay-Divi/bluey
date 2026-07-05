@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-04 21:53 EDT
+Latest checkpoint: 2026-07-04 22:20 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -6037,7 +6037,26 @@ cd /Users/uno/Downloads/cue/server && cargo check -p bluey-server
 
 Deployment status:
 
-- Not deployed yet in this round.
+- Desktop release `0.1.91` is live on `https://bluey.sh/latest.json`.
+- Darwin arm64 artifact:
+  `https://bluey.sh/releases/v0.1.91/bluey-0.1.91-darwin-arm64.tar.gz`
+- Artifact SHA256:
+  `fcc27fcf6eaaedaeeaff8bfd9b5b8b9c74ff32c70b59b25c951ea59f5a9540de`
+- Release verification passed:
+  - `latest.json` signature verification
+  - installer MIME checks
+  - Darwin arm64 artifact SHA verification
+  - unpacked `bluey` and `bluey-daemon` version checks for `0.1.91`
+- Static web asset sync from `/Users/uno/Downloads/cue` completed with release-safe excludes.
+- Production API server deployed from `/opt/bluey-build-codex-round352-balance-runway`.
+- Production API health reports commit `a6bbc4604c4b0426dd522c43f5ef9c65f1a8e7b7`.
+- Production binary SHA256:
+  `028715066c9f82cdcfa73f71f82e6ae51b4ce44a1109bb1e755376b0becdc01b`
+- Previous API binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260705T021937Z`
+- `bluey-api.service` is active with `NRestarts=0`.
+- Recent production warning/error scan after restart returned no entries.
+- Public installer smoke installed `0.1.91`, and both installed binaries report `0.1.91`.
 
 ## Latest Round 350: macOS Click-Through Scroll Recursion
 
