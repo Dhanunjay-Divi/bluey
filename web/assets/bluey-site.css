@@ -3734,31 +3734,25 @@
 
     /* Bluey auth/legal polish keeps Pinky's structure while staying Bluey blue. */
     #accountApp.is-guest .account-shell {
-      padding-top: 0;
+      padding-top: 64px;
     }
 
     #accountApp .account-theme-slot {
       display: none;
     }
 
-    #accountApp.is-guest .account-theme-slot {
-      position: fixed;
-      top: 1rem;
-      right: 1.5rem;
-      z-index: 90;
-      display: block;
-    }
-
     #accountApp.is-guest .account-top {
-      display: none !important;
+      display: grid !important;
+      min-height: 64px;
+      padding: .82rem 2.5rem;
     }
 
     #accountApp.is-guest .account-main {
       width: 100%;
-      max-width: 430px;
-      min-height: 100vh;
-      min-height: 100dvh;
-      padding: 4.5rem 1.25rem 2rem;
+      max-width: 370px;
+      min-height: auto;
+      flex: 1 0 auto;
+      padding: 1.3rem 1.25rem .9rem;
     }
 
     #accountApp.is-guest .account-hero {
@@ -3766,38 +3760,38 @@
     }
 
     #accountApp.is-guest .account-card {
-      max-width: 410px;
-      padding: 2.4rem 2.1rem;
+      max-width: 350px;
+      padding: 1.45rem 1.45rem 1.35rem;
       border-color: #1f1f1f;
-      border-radius: 16px;
+      border-radius: 14px;
       background: #0a0a0a;
     }
 
     #accountApp .auth-brand {
       display: grid;
       justify-items: center;
-      gap: 1rem;
-      margin-bottom: 1.45rem;
+      gap: .65rem;
+      margin-bottom: .95rem;
     }
 
     #accountApp .auth-logo {
-      width: 54px;
-      height: 54px;
-      border-radius: 14px;
+      width: 42px;
+      height: 42px;
+      border-radius: 12px;
       background: rgba(99, 216, 255, .12);
       box-shadow: 0 0 0 1px rgba(99, 216, 255, .38), 0 0 30px rgba(99, 216, 255, .20);
     }
 
     #accountApp .auth-wordmark {
-      width: 128px;
+      width: 96px;
       height: auto;
       filter: drop-shadow(0 0 10px rgba(99, 216, 255, .56)) drop-shadow(0 0 28px rgba(79, 141, 255, .32));
     }
 
     #accountApp.is-guest .account-card h2 {
-      margin: 0 0 1.35rem;
+      margin: 0 0 .95rem;
       color: #9b9b9b;
-      font-size: 1.08rem;
+      font-size: .96rem;
       font-weight: 500;
       text-align: center;
       letter-spacing: 0;
@@ -3830,14 +3824,14 @@
     }
 
     #accountApp.is-guest .account-form input {
-      height: 54px;
+      height: 44px;
       margin-top: 0;
-      padding: 0 1rem;
+      padding: 0 .9rem;
       border-color: #252525;
-      border-radius: 10px;
+      border-radius: 9px;
       background: #121212;
       color: #f1f4f6;
-      font-size: 1rem;
+      font-size: .9rem;
       font-weight: 500;
       letter-spacing: 0;
     }
@@ -3863,9 +3857,9 @@
     #accountApp .password-toggle {
       position: absolute;
       top: 50%;
-      right: .7rem;
-      width: 2rem;
-      height: 2rem;
+      right: .58rem;
+      width: 1.8rem;
+      height: 1.8rem;
       padding: 0;
       transform: translateY(-50%);
       border: 0;
@@ -3885,16 +3879,16 @@
     }
 
     #accountApp .password-toggle::before {
-      width: .98rem;
-      height: .98rem;
+      width: .86rem;
+      height: .86rem;
       border: 2px solid currentColor;
       border-radius: 78% 18%;
       transform: translate(-50%, -50%) rotate(45deg);
     }
 
     #accountApp .password-toggle::after {
-      width: .34rem;
-      height: .34rem;
+      width: .28rem;
+      height: .28rem;
       border-radius: 50%;
       background: currentColor;
     }
@@ -3909,7 +3903,7 @@
       grid-template-columns: auto minmax(0, 1fr);
       align-items: flex-start;
       gap: .5rem;
-      margin: .1rem 0;
+      margin: 0;
     }
 
     #accountApp.is-guest .account-form .terms-check input {
@@ -3924,17 +3918,17 @@
 
     #accountApp.is-guest .terms-check span {
       color: #858585;
-      font-size: .76rem;
+      font-size: .68rem;
     }
 
     #accountApp.is-guest .auth-submit-row {
-      margin-top: .45rem;
+      margin-top: .28rem;
     }
 
     #accountApp.is-guest #accountAuthCard .account-button {
-      min-height: 52px;
-      border-radius: 10px;
-      font-size: .98rem;
+      min-height: 44px;
+      border-radius: 9px;
+      font-size: .9rem;
       font-weight: 760;
     }
 
@@ -3944,10 +3938,10 @@
       justify-content: center;
       flex-wrap: wrap;
       gap: .28rem;
-      margin-top: 1rem;
+      margin-top: .72rem;
       color: #777;
       text-align: center;
-      font-size: .88rem;
+      font-size: .78rem;
       line-height: 1.35;
     }
 
@@ -3973,9 +3967,9 @@
 
     #accountApp.is-verifying #createAccountButton {
       flex: 1 0 100%;
-      min-height: 50px;
+      min-height: 42px;
       border: 1px solid #272727;
-      border-radius: 10px;
+      border-radius: 9px;
       background: #121212;
       color: #e9e9e9;
       font-weight: 760;
@@ -3991,21 +3985,21 @@
     #accountApp.is-guest #signupOtp {
       text-align: center;
       letter-spacing: .28em;
-      font-size: 1.14rem;
+      font-size: .98rem;
     }
 
     #accountApp .auth-card-links {
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 1.55rem;
-      margin: 1.35rem 0 1.15rem;
+      gap: 1.15rem;
+      margin: .92rem 0 .85rem;
     }
 
     #accountApp .auth-card-links a {
       color: #8a8a8a;
       text-decoration: none;
-      font-size: .88rem;
+      font-size: .78rem;
       font-weight: 620;
     }
 
@@ -4015,10 +4009,10 @@
 
     #accountApp.is-guest .account-note {
       margin: 0;
-      padding-top: 1.25rem;
+      padding-top: .85rem;
       border-top: 1px solid rgba(99, 216, 255, .16);
       color: #777;
-      font-size: .82rem;
+      font-size: .7rem;
       line-height: 1.5;
     }
 
@@ -4028,14 +4022,14 @@
     }
 
     #accountApp.is-guest #accountAuthMessage:not(:empty) {
-      margin: 0 0 1.15rem;
-      padding: .8rem .9rem;
+      margin: 0 0 .8rem;
+      padding: .62rem .72rem;
       border: 1px solid rgba(99, 216, 255, .28);
       border-radius: 10px;
       background: rgba(99, 216, 255, .08);
       color: #bdefff;
       text-align: left;
-      font-size: .9rem;
+      font-size: .78rem;
     }
 
     #accountApp.is-guest #accountAuthMessage[data-tone="error"]:not(:empty) {
@@ -4233,12 +4227,60 @@
         transform: translateX(22px);
       }
 
+      #accountApp.is-guest .account-shell {
+        padding-top: 58px;
+      }
+
+      #accountApp.is-guest .account-top {
+        min-height: 58px;
+        grid-template-columns: auto minmax(0, 1fr);
+        justify-items: stretch;
+        padding: .75rem 1rem;
+        gap: .7rem;
+      }
+
+      #accountApp.is-guest .account-top .account-actions-row {
+        justify-content: flex-end;
+        flex-wrap: nowrap;
+        gap: .55rem;
+      }
+
+      #accountApp.is-guest .account-top .account-link[href="/"] {
+        display: none !important;
+      }
+
+      #accountApp.is-guest .account-top .account-link {
+        font-size: .82rem;
+      }
+
+      #accountApp.is-guest .account-top .nav-cta {
+        min-height: 30px;
+        padding: 0 .72rem;
+      }
+
+      #accountApp.is-guest .account-top .theme-toggle {
+        width: 48px;
+        min-width: 48px;
+        height: 26px;
+      }
+
+      #accountApp.is-guest .account-top .theme-toggle-knob {
+        width: 20px;
+        height: 20px;
+      }
+
+      html[data-bluey-theme="light"] #accountApp.is-guest .account-top .theme-toggle-knob {
+        transform: translateX(22px);
+      }
+
       #accountApp.is-guest .account-main {
-        padding: 4.25rem 1rem 1.5rem;
+        max-width: 100%;
+        padding: 1rem .85rem .8rem;
       }
 
       #accountApp.is-guest .account-card {
-        padding: 2rem 1.35rem;
+        max-width: 100%;
+        padding: 1.35rem 1.1rem;
       }
 
       #accountApp .auth-card-links {
