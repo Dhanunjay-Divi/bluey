@@ -5747,6 +5747,667 @@
       background: rgba(99, 216, 255, .12);
     }
 
+    /* Round 372: Pinky sibling proportions with Bluey color. */
+    #productSite.page {
+      overflow: hidden;
+    }
+
+    #productSite .nav {
+      padding: 1rem 2.5rem;
+      column-gap: 1.25rem;
+    }
+
+    #productSite .logo,
+    #accountApp .account-top-brand,
+    #downloadApp .brand,
+    #policyApp .brand {
+      gap: .5rem;
+      line-height: 1;
+      letter-spacing: 0;
+    }
+
+    #productSite .logo img:not(.brand-wordmark),
+    #accountApp .account-top-brand img:not(.brand-wordmark),
+    #downloadApp .brand img:not(.brand-wordmark),
+    #policyApp .brand img:not(.brand-wordmark) {
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      object-fit: contain;
+      box-shadow: none;
+    }
+
+    #productSite .brand-wordmark,
+    #accountApp .account-top-brand .brand-wordmark,
+    #downloadApp .brand-wordmark,
+    #policyApp .brand-wordmark {
+      width: 68px;
+      height: auto;
+      filter: none;
+      transform: translateY(1px);
+    }
+
+    #productSite .nav-links,
+    #accountApp .account-top .account-actions-row,
+    #downloadApp .navlinks,
+    #policyApp .navlinks {
+      gap: 1.5rem;
+    }
+
+    #productSite .nav-links a,
+    #accountApp .account-top .account-link,
+    #accountApp .account-top #accountSignOut,
+    #downloadApp .navlinks a,
+    #policyApp .navlinks a {
+      font-size: .9rem;
+      font-weight: 600;
+      color: #888;
+      letter-spacing: 0;
+    }
+
+    #productSite .nav-links .btn-nav,
+    #accountApp .account-top .nav-cta,
+    #downloadApp .navlinks .nav-cta,
+    #policyApp .navlinks .nav-cta {
+      min-height: 34px;
+      padding: 0 1.1rem;
+      border-radius: 6px;
+      font-weight: 700;
+    }
+
+    #productSite .nav-connect,
+    #accountApp .account-top-connect {
+      gap: .4rem;
+    }
+
+    #productSite .nav-connect input,
+    #accountApp .account-top-connect input {
+      width: 90px;
+      height: 32px;
+      padding: .35rem .6rem;
+      border-radius: 6px;
+      font-size: .8rem;
+      font-weight: 650;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    #productSite .nav-connect button,
+    #accountApp .account-top-connect button {
+      height: 32px;
+      min-width: 76px;
+      padding: .35rem .7rem;
+      border-radius: 6px;
+      font-size: .8rem;
+      font-weight: 750;
+    }
+
+    #productSite .profile-button,
+    #accountApp .profile-button,
+    #downloadApp .profile-button,
+    #policyApp .profile-button {
+      width: 32px;
+      height: 32px;
+      border-color: #333;
+      background: transparent;
+      color: #888;
+      box-shadow: none;
+    }
+
+    #productSite .profile-button:hover,
+    #productSite .profile-button[aria-expanded="true"],
+    #accountApp .profile-button:hover,
+    #accountApp .profile-button[aria-expanded="true"],
+    #downloadApp .profile-button:hover,
+    #downloadApp .profile-button[aria-expanded="true"],
+    #policyApp .profile-button:hover,
+    #policyApp .profile-button[aria-expanded="true"] {
+      border-color: var(--bluey-accent);
+      color: var(--bluey-accent);
+    }
+
+    #productSite .profile-icon,
+    #accountApp .profile-icon,
+    #downloadApp .profile-icon,
+    #policyApp .profile-icon {
+      width: 17px;
+      height: 17px;
+      stroke-width: 1.9;
+    }
+
+    #productSite .account-profile-menu,
+    #accountApp .account-profile-menu,
+    #downloadApp .account-profile-menu,
+    #policyApp .account-profile-menu {
+      width: min(260px, calc(100vw - 2rem));
+      border-radius: 10px;
+    }
+
+    #productSite .main {
+      padding: 0 3rem;
+    }
+
+    #productSite .content {
+      grid-template-columns: minmax(360px, .92fr) minmax(380px, 1fr);
+      gap: 3.4rem;
+      max-width: 1040px;
+    }
+
+    #productSite .hero h1 {
+      font-size: clamp(2.55rem, 4vw, 3.05rem);
+      line-height: 1.07;
+      margin: 0 0 1.05rem;
+      letter-spacing: 0;
+    }
+
+    #productSite .hero p {
+      max-width: 430px;
+      font-size: 1.03rem;
+      line-height: 1.58;
+    }
+
+    #productSite .hero-lede {
+      margin-bottom: .65rem;
+    }
+
+    #productSite .hero-proof {
+      margin-bottom: 1.55rem;
+      font-size: 1.03rem !important;
+    }
+
+    #productSite .hero-actions {
+      grid-template-columns: repeat(2, minmax(145px, 1fr));
+      gap: .7rem;
+      max-width: 335px;
+    }
+
+    #productSite .btn {
+      min-height: 46px;
+      padding: .72rem 1.45rem;
+      border-radius: 12px;
+      font-size: .93rem;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    #productSite .join-bar {
+      gap: .5rem;
+      max-width: 320px;
+      margin-top: 1.2rem;
+    }
+
+    #productSite .join-bar input {
+      padding: .6rem 1rem;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 1rem;
+    }
+
+    #productSite .join-bar button {
+      padding: .6rem 1.2rem;
+      font-size: .9rem;
+      font-weight: 750;
+    }
+
+    #productSite .connect-help,
+    #productSite .connect-status,
+    #productSite .hero-note {
+      max-width: 430px;
+      font-size: .75rem;
+      line-height: 1.38;
+    }
+
+    #productSite .product-preview {
+      width: min(100%, 500px);
+      padding: 10px;
+      border-radius: 30px;
+    }
+
+    #productSite .bluey-terminal {
+      min-height: 398px;
+      border-radius: 24px;
+      overflow: hidden;
+      box-shadow: 0 30px 84px rgba(0, 0, 0, .48), inset 0 1px 0 rgba(255, 255, 255, .055);
+    }
+
+    #productSite .bluey-terminal-bar {
+      min-height: 52px;
+      padding: 0 15px;
+    }
+
+    #productSite .bluey-terminal-code {
+      height: 346px;
+      padding: 24px 26px 32px;
+      font-size: 13px;
+      line-height: 1.78;
+    }
+
+    #productSite .footer {
+      padding: 1.2rem 2.5rem .7rem;
+      border-top: 1px solid #111;
+    }
+
+    #productSite .pricing {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 2rem;
+      max-width: none;
+      margin: 0 auto;
+    }
+
+    #productSite .plan {
+      flex: 1 1 0;
+      max-width: 520px;
+      min-height: 58px;
+      padding: .6rem 1.5rem;
+      border-radius: 8px;
+      gap: .8rem;
+      align-items: center;
+    }
+
+    #productSite .plan-name {
+      font-size: .9rem;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    #productSite .plan-detail {
+      margin-top: .05rem;
+      font-size: .75rem;
+      line-height: 1.3;
+    }
+
+    #productSite .plan-price {
+      flex: 0 0 auto;
+      font-size: .85rem;
+      font-weight: 800;
+    }
+
+    #productSite .plan-price strong {
+      font-size: .95rem;
+    }
+
+    #productSite .plan-sep {
+      color: #222;
+      font-size: .95rem;
+    }
+
+    #accountApp.is-guest .account-main {
+      max-width: 430px;
+      padding: 1.35rem 1.25rem .9rem;
+    }
+
+    #accountApp.is-guest .account-card {
+      max-width: 380px;
+      padding: 1.8rem 2.2rem;
+      border-radius: 16px;
+    }
+
+    #accountApp .auth-brand {
+      gap: .62rem;
+      margin-bottom: 1rem;
+    }
+
+    #accountApp .auth-logo {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      box-shadow: none;
+    }
+
+    #accountApp .auth-wordmark {
+      width: 92px;
+      transform: translateY(1px);
+    }
+
+    #accountApp.is-guest .account-card h2 {
+      margin-bottom: 1.15rem;
+      font-size: 1rem;
+      font-weight: 500;
+      letter-spacing: 0;
+    }
+
+    #accountApp.is-guest .account-form {
+      gap: .65rem;
+    }
+
+    #accountApp.is-guest .account-form input {
+      height: 42px;
+      border-radius: 8px;
+      font-size: .88rem;
+    }
+
+    #accountApp.is-guest #accountAuthCard .account-button,
+    #accountApp.is-guest #accountRecoveryCard .account-button {
+      min-height: 42px;
+      border-radius: 8px;
+      font-size: .9rem;
+      font-weight: 700;
+    }
+
+    #accountApp.is-guest .auth-card-links {
+      margin: .9rem 0 .8rem;
+      gap: 1.45rem;
+    }
+
+    #accountApp.is-guest .account-note {
+      font-size: .72rem;
+      text-align: center;
+    }
+
+    #accountApp.is-guest .device-link-hint {
+      gap: .36rem;
+      margin: .55rem 0 .75rem;
+      padding: .62rem .7rem;
+      border-radius: 10px;
+    }
+
+    #accountApp.is-guest .device-link-hint strong {
+      font-size: .8rem;
+      line-height: 1.2;
+    }
+
+    #accountApp.is-guest .device-link-hint span {
+      font-size: .72rem;
+      line-height: 1.35;
+    }
+
+    #accountApp.is-guest .device-code-form {
+      grid-template-columns: minmax(0, 1fr) minmax(84px, auto);
+      gap: .42rem;
+    }
+
+    #accountApp.is-guest .device-code-form input {
+      height: 34px;
+      border-radius: 8px;
+      font-size: .76rem;
+    }
+
+    #accountApp.is-guest .device-link-hint .account-button {
+      min-height: 34px;
+      padding: .4rem .62rem;
+      border-radius: 8px;
+      font-size: .78rem;
+    }
+
+    #accountApp.is-authed .account-main {
+      width: min(860px, 100%);
+      padding: 2rem 2rem 4rem;
+    }
+
+    #accountApp .dashboard-overview-card {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(236px, auto);
+      gap: .9rem;
+      align-items: center;
+      margin-bottom: 1rem;
+      padding: 1.05rem 1.25rem;
+      border-color: #1a1a1a;
+      border-radius: 12px;
+      background: #0a0a0a;
+    }
+
+    #accountApp .dashboard-overview-card.balance-low {
+      border-color: rgba(255, 189, 99, .34);
+      background: #0a0a0a;
+    }
+
+    #accountApp .dashboard-overview-card.balance-critical {
+      border-color: rgba(255, 90, 102, .40);
+      background: #0a0a0a;
+    }
+
+    #accountApp .dashboard-overview-card.balance-trial {
+      grid-template-columns: minmax(0, 1fr);
+      border-color: rgba(99, 216, 255, .28);
+      background: #0a0a0a;
+    }
+
+    #accountApp .dashboard-overview-main {
+      gap: .55rem;
+    }
+
+    #accountApp .dashboard-overview-title-row {
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    #accountApp .dashboard-overview-title-row h2 {
+      margin: 0 0 .25rem;
+      color: #f2f2f2;
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    #accountApp .dashboard-overview-title-row p {
+      max-width: 34rem;
+      color: #777;
+      font-size: .82rem;
+      line-height: 1.5;
+    }
+
+    #accountApp .dashboard-overview-title-row #balanceValue {
+      color: #f2f2f2;
+      font-size: 1.45rem;
+      letter-spacing: 0;
+    }
+
+    #accountApp .dashboard-overview-actions {
+      display: none;
+    }
+
+    #accountApp .dashboard-overview-side {
+      align-content: center;
+    }
+
+    #accountApp .compact-auto-reload {
+      min-width: 236px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+    }
+
+    #accountApp .compact-auto-reload > div {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: .35rem .6rem;
+      align-items: center;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-head {
+      grid-column: 1 / -1;
+      margin: 0;
+      gap: .65rem;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-head h3 {
+      color: #f2f2f2;
+      font-size: .88rem;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-fields {
+      grid-column: 1 / -1;
+      grid-template-columns: repeat(2, minmax(80px, 1fr));
+      gap: .45rem;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-fields label {
+      gap: .2rem;
+      font-size: .58rem;
+      letter-spacing: .08em;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-fields input {
+      min-height: 32px;
+      border-radius: 7px;
+      font-size: .8rem;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-rule,
+    #accountApp .compact-auto-reload .auto-reload-hint {
+      color: #777;
+      font-size: .7rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .dashboard-tabs {
+      gap: 0;
+      margin: 1rem 0 1.5rem;
+      border-bottom-color: #1a1a1a;
+    }
+
+    #accountApp .dashboard-tab {
+      padding: .7rem 1.5rem;
+      border-radius: 0;
+      background: transparent;
+      color: #666;
+      font-size: .9rem;
+      font-weight: 600;
+    }
+
+    #accountApp .dashboard-tab.is-active {
+      color: var(--bluey-accent);
+      background: transparent;
+    }
+
+    #accountApp .dashboard-tab-panel .dashboard-section {
+      padding: 1.05rem 1.2rem;
+      border-radius: 12px;
+      background: #0a0a0a;
+    }
+
+    #accountApp .section-head {
+      margin-bottom: .95rem;
+    }
+
+    #accountApp .section-head h3,
+    #accountApp .reload-card h3 {
+      font-size: 1rem;
+      font-weight: 700;
+    }
+
+    #accountApp .section-head p,
+    #accountApp .reload-card p {
+      color: #777;
+      font-size: .82rem;
+      line-height: 1.45;
+    }
+
+    #accountApp .device-row,
+    #accountApp .session-row,
+    #accountApp .usage-row {
+      min-height: 60px;
+      padding: .72rem .85rem;
+      border-radius: 10px;
+      background: #101010;
+    }
+
+    #accountApp .session-row {
+      grid-template-columns: minmax(0, 1fr) auto auto;
+    }
+
+    #accountApp .billing-section {
+      background: #0a0a0a;
+    }
+
+    #accountApp .billing-grid {
+      grid-template-columns: minmax(0, 1fr) minmax(240px, .56fr);
+      gap: .75rem;
+    }
+
+    #accountApp .billing-primary-card,
+    #accountApp .billing-payment-card {
+      padding: 1rem 1.05rem;
+      border-radius: 10px;
+      background: #101010;
+    }
+
+    html[data-bluey-theme="light"] #productSite.page {
+      overflow: hidden;
+    }
+
+    html[data-bluey-theme="light"] #productSite .plan,
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-card,
+    html[data-bluey-theme="light"] #accountApp .dashboard-section,
+    html[data-bluey-theme="light"] #accountApp .billing-primary-card,
+    html[data-bluey-theme="light"] #accountApp .billing-payment-card,
+    html[data-bluey-theme="light"] #accountApp .device-row,
+    html[data-bluey-theme="light"] #accountApp .session-row,
+    html[data-bluey-theme="light"] #accountApp .usage-row {
+      background: #ffffff;
+      border-color: #dceaf2;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row h2,
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row #balanceValue,
+    html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-head h3 {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row p,
+    html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-rule,
+    html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-hint {
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .dashboard-tab.is-active {
+      background: transparent;
+    }
+
+    html[data-bluey-theme="light"] #productSite .hero-proof span {
+      background: linear-gradient(135deg, #087ca6, var(--bluey-accent-2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    @media (max-width: 980px) {
+      #productSite.page {
+        overflow-y: auto;
+      }
+
+      #productSite .pricing {
+        gap: .75rem;
+      }
+
+      #productSite .plan-sep {
+        display: none;
+      }
+
+      #productSite .plan {
+        padding: .7rem .85rem;
+      }
+    }
+
+    @media (max-width: 820px) {
+      #productSite .content {
+        grid-template-columns: 1fr;
+        max-width: 500px;
+        gap: 2rem;
+        padding: 2rem 0;
+      }
+
+      #productSite .product-preview {
+        display: none;
+      }
+
+      #productSite .pricing,
+      #accountApp .billing-grid,
+      #accountApp .dashboard-overview-card {
+        grid-template-columns: 1fr;
+      }
+
+      #productSite .pricing {
+        display: grid;
+        grid-template-columns: 1fr;
+      }
+    }
+
     html[data-bluey-theme="light"] #downloadApp .platform-note {
       border-color: transparent;
       background: transparent;

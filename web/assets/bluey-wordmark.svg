@@ -1,9 +1,9 @@
 <svg viewBox="0 0 292 100" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="bluey">
   <defs>
     <linearGradient id="wordmark-fill" x1="0" y1="8" x2="292" y2="88" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#c7f4ff"/>
-      <stop offset=".32" stop-color="#91e6ff"/>
-      <stop offset=".68" stop-color="#63d8ff"/>
+      <stop stop-color="#63d8ff"/>
+      <stop offset=".32" stop-color="#35c7ff"/>
+      <stop offset=".68" stop-color="#168fff"/>
       <stop offset="1" stop-color="#4f8dff"/>
     </linearGradient>
     <filter id="wordmark-glow" x="-16" y="-18" width="324" height="132" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">

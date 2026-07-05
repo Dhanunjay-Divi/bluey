@@ -1711,7 +1711,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function accountBalanceHint(me) {
       if (me?.is_temporary) {
         const minutes = trialMinutesRemaining(me);
-        return `${minutes} free minute${minutes === 1 ? '' : 's'} left. Save the trial before it expires.`;
+        return `${minutes} free minute${minutes === 1 ? '' : 's'} left. Create an account within 24 hours to keep it.`;
       }
       const balanceCents = Number(me?.balance_cents || 0);
       if (balanceCents <= 0) {
@@ -2307,7 +2307,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const balanceReloadPanel = document.getElementById('balanceReloadPanel');
         const isTemporaryAccount = Boolean(me.is_temporary);
         const trialMinutes = trialMinutesRemaining(me);
-        if (balanceTitle) balanceTitle.textContent = isTemporaryAccount ? 'Free trial' : 'Balance';
+        if (balanceTitle) balanceTitle.textContent = isTemporaryAccount ? 'Trial time' : 'Balance';
         if (balanceValue) {
           balanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
           balanceCard?.classList.toggle('balance-trial', isTemporaryAccount);
@@ -2323,7 +2323,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const summaryBalanceValue = document.getElementById('summaryBalanceValue');
         const summaryBalanceLabel = document.getElementById('summaryBalanceLabel');
         const summaryBalanceCard = summaryBalanceValue?.closest('.summary-balance-kpi');
-        if (summaryBalanceLabel) summaryBalanceLabel.textContent = isTemporaryAccount ? 'Free trial' : 'Credits balance';
+        if (summaryBalanceLabel) summaryBalanceLabel.textContent = isTemporaryAccount ? 'Trial time' : 'Credits balance';
         if (summaryBalanceValue) {
           summaryBalanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
           summaryBalanceCard?.classList.toggle('balance-critical', !isTemporaryAccount && me.balance_cents < 500);
