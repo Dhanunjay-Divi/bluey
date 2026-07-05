@@ -3360,6 +3360,33 @@
       margin-top: .2rem;
     }
 
+    #accountApp .session-upload-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .32rem;
+      margin-top: .45rem;
+    }
+
+    #accountApp .session-upload-chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 1.45rem;
+      padding: .18rem .45rem;
+      border: 1px solid rgba(99, 216, 255, .24);
+      border-radius: 999px;
+      background: rgba(99, 216, 255, .08);
+      color: var(--bluey-accent);
+      font-size: .68rem;
+      font-weight: 800;
+      line-height: 1;
+    }
+
+    #accountApp .session-row-empty .session-upload-chip {
+      border-color: rgba(255, 189, 99, .22);
+      background: rgba(255, 189, 99, .06);
+      color: #b7a276;
+    }
+
     #accountApp .session-empty {
       color: #666;
       text-align: center;
@@ -3374,6 +3401,21 @@
       margin-top: .75rem;
       color: #aaa;
       font-size: .85rem;
+    }
+
+    #accountApp .session-upload-state {
+      margin: .1rem 0 .35rem;
+      color: #7c8a93;
+      font-size: .78rem;
+      line-height: 1.45;
+    }
+
+    #accountApp .session-upload-state.is-empty {
+      padding: .62rem .72rem;
+      border: 1px solid rgba(255, 189, 99, .20);
+      border-radius: 8px;
+      background: rgba(255, 189, 99, .055);
+      color: #b7a276;
     }
 
     #accountApp .session-detail-section {
@@ -5686,6 +5728,23 @@
     html[data-bluey-theme="light"] #accountApp .session-meta,
     html[data-bluey-theme="light"] #accountApp .session-detail-item span,
     html[data-bluey-theme="light"] #accountApp .session-detail-empty {
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .session-upload-chip {
+      border-color: rgba(0, 128, 172, .22);
+      background: rgba(99, 216, 255, .11);
+      color: #05789c;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .session-row-empty .session-upload-chip,
+    html[data-bluey-theme="light"] #accountApp .session-upload-state.is-empty {
+      border-color: rgba(170, 112, 0, .22);
+      background: rgba(255, 189, 99, .13);
+      color: #84601f;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .session-upload-state {
       color: #5f7281;
     }
 

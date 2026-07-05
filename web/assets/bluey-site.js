@@ -2114,14 +2114,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!sessions.length) {
         const empty = document.createElement('div');
         empty.className = 'session-empty';
-        empty.textContent = 'No saved sessions yet. Save one from Bluey when you want it here.';
+        empty.textContent = 'No uploaded desktop sessions yet. Sign in from Bluey desktop, then refresh after a chat or transcript syncs.';
         list.append(empty);
         return;
       }
 
       for (const session of sessions) {
+        const counts = sessionUploadCounts(session);
+        const hasContent = sessionHasUploadedContent(session);
         const row = document.createElement('article');
-        row.className = 'session-row';
+        row.className = `session-row${hasContent ? '' : ' session-row-empty'}`;
 
         const body = document.createElement('div');
         const title = document.createElement('strong');
@@ -2129,13 +2131,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         title.textContent = session.title || `Session ${shortSessionId(session.session_id)}`;
         const meta = document.createElement('span');
         meta.className = 'session-meta';
-        meta.textContent = [
-          session.status || 'saved',
-          `${session.transcript_count || 0} transcript`,
-          `${session.response_count || 0} answer(s)`,
-          formatSessionTime(session.updated_at_ms || session.last_active_at_ms),
-        ].join(' - ');
-        body.append(title, meta);
+        meta.textContent = hasContent
+          ? `${session.status || 'uploaded'} - ${formatSessionTime(session.updated_at_ms || session.last_active_at_ms)}`
+          : `Session record uploaded - no chat transcript or Bluey answers yet - ${formatSessionTime(session.updated_at_ms || session.last_active_at_ms)}`;
+        const chips = document.createElement('div');
+        chips.className = 'session-upload-chips';
+        for (const chipText of sessionUploadChipLabels(counts)) {
+          const chip = document.createElement('span');
+          chip.className = 'session-upload-chip';
+          chip.textContent = chipText;
+          chips.append(chip);
+        }
+        body.append(title, meta, chips);
 
         const copyId = document.createElement('button');
         copyId.className = 'account-button ghost compact';
@@ -2143,17 +2150,49 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         copyId.dataset.copy = session.session_id || '';
         copyId.textContent = 'Copy ID';
 
-        const button = document.createElement('button');
-        button.className = 'account-button ghost';
-        button.type = 'button';
-        button.dataset.sessionId = session.session_id || '';
-        button.dataset.sessionOpen = accountSessionHref(session.session_id);
-        button.setAttribute('aria-label', `Open ${session.title || 'saved session'} in a new tab`);
-        button.title = 'Open session in a new tab';
-        button.textContent = 'Open tab';
-        row.append(body, copyId, button);
+        const link = document.createElement('a');
+        link.className = 'account-button ghost';
+        link.href = accountSessionHref(session.session_id);
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.dataset.sessionId = session.session_id || '';
+        link.setAttribute('aria-label', `Open ${session.title || 'uploaded session'} in a new tab`);
+        link.title = hasContent
+          ? 'Open uploaded conversation in a new tab'
+          : 'Open upload status in a new tab';
+        link.textContent = 'Open tab';
+        row.append(body, copyId, link);
         list.append(row);
       }
+    }
+
+    function countLabel(count, singular, plural = `${singular}s`) {
+      const value = Number(count || 0);
+      return `${value} ${value === 1 ? singular : plural}`;
+    }
+
+    function sessionUploadCounts(session) {
+      return {
+        transcript: Number(session?.transcript_count || 0),
+        responses: Number(session?.response_count || 0),
+        context: Number(session?.context_count || 0),
+      };
+    }
+
+    function sessionHasUploadedContent(session) {
+      const counts = sessionUploadCounts(session);
+      return counts.transcript > 0 || counts.responses > 0 || counts.context > 0;
+    }
+
+    function sessionUploadChipLabels(counts) {
+      if (!counts.transcript && !counts.responses && !counts.context) {
+        return ['No chat uploaded yet'];
+      }
+      return [
+        counts.responses ? countLabel(counts.responses, 'chat turn') : '',
+        counts.transcript ? countLabel(counts.transcript, 'transcript segment') : '',
+        counts.context ? countLabel(counts.context, 'context item') : '',
+      ].filter(Boolean);
     }
 
     function renderCloudSessionsLoading() {
@@ -2262,6 +2301,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!detail) return;
       detail.hidden = false;
       detail.replaceChildren();
+      const transcriptSegments = Array.isArray(bundle.transcript_segments) ? bundle.transcript_segments : [];
+      const cueResponses = Array.isArray(bundle.cue_responses) ? bundle.cue_responses : [];
+      const contextArtifacts = Array.isArray(bundle.context_artifacts) ? bundle.context_artifacts : [];
+      const hasUploadedContent = transcriptSegments.length > 0 || cueResponses.length > 0 || contextArtifacts.length > 0;
 
       const title = document.createElement('strong');
       title.textContent = bundle.session?.title || `Session ${shortSessionId(sessionId)}`;
@@ -2269,11 +2312,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const sessionCode = shortSessionId(sessionId).toUpperCase();
       meta.textContent = [
         `ID ${sessionCode}`,
-        `${bundle.transcript_segments?.length || 0} transcript segment(s)`,
-        `${bundle.cue_responses?.length || 0} answer(s)`,
-        `${bundle.context_artifacts?.length || 0} context item(s)`,
+        countLabel(transcriptSegments.length, 'transcript segment'),
+        countLabel(cueResponses.length, 'chat turn'),
+        countLabel(contextArtifacts.length, 'context item'),
       ].join(' - ');
-      detail.append(title, meta);
+      const uploadState = document.createElement('p');
+      uploadState.className = `session-upload-state${hasUploadedContent ? '' : ' is-empty'}`;
+      uploadState.textContent = hasUploadedContent
+        ? 'Uploaded from Bluey desktop. This is view-only on web for now.'
+        : 'Only the session record has uploaded so far. No local chat transcript, Bluey answers, or context have arrived for this session yet.';
+      detail.append(title, meta, uploadState);
 
       const copyId = document.createElement('button');
       copyId.className = 'account-button ghost compact';
@@ -2288,9 +2336,34 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       appendBundlePreview(detail, 'Diagnostics', diagnosticsText(bundle.session?.metadata));
       appendSessionBundleSection(
         detail,
+        'Conversation',
+        cueResponses,
+        'No Bluey desktop conversation uploaded for this session yet.',
+        (answer) => {
+          const answerText = answer.text || '';
+          const artifactText = answer.artifact_body && answer.artifact_body !== answerText
+            ? answer.artifact_body
+            : '';
+          return {
+            title: answer.source_text ? 'You asked' : 'Bluey answer',
+            meta: joinSessionMeta([
+              formatSessionTime(answer.ts_ms),
+              answer.model || answer.provider,
+              answer.cost_label || (answer.cost_cents ? money(answer.cost_cents) : ''),
+            ]),
+            body: [
+              answer.source_text ? `You\n${answer.source_text}` : '',
+              answerText ? `Bluey\n${answerText}` : '',
+              artifactText ? `Artifact\n${artifactText}` : '',
+            ].filter(Boolean).join('\n\n'),
+          };
+        }
+      );
+      appendSessionBundleSection(
+        detail,
         'Transcript',
-        bundle.transcript_segments,
-        'No transcript saved for this session yet.',
+        transcriptSegments,
+        'No live transcript uploaded for this session yet.',
         (segment) => ({
           title: segment.speaker || segment.source || 'Speaker',
           meta: joinSessionMeta([
@@ -2303,24 +2376,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       );
       appendSessionBundleSection(
         detail,
-        'Answers',
-        bundle.cue_responses,
-        'No Bluey answers saved for this session yet.',
-        (answer) => ({
-          title: answer.kind || answer.task_type || 'Answer',
-          meta: joinSessionMeta([
-            formatSessionTime(answer.ts_ms),
-            answer.model,
-            answer.cost_label || (answer.cost_cents ? money(answer.cost_cents) : ''),
-          ]),
-          body: answer.text || answer.artifact_body || answer.source_text || '',
-        })
-      );
-      appendSessionBundleSection(
-        detail,
         'Context',
-        bundle.context_artifacts,
-        'No context files or notes saved for this session yet.',
+        contextArtifacts,
+        'No context files or notes uploaded for this session yet.',
         (artifact) => ({
           title: artifact.title || artifact.kind || artifact.artifact_id || 'Context',
           meta: joinSessionMeta([
