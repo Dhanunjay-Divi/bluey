@@ -37,4 +37,31 @@ Close the concrete AnswerPlan issues from `ROUND-399-LIVE-ANSWER-LATENCY-EVAL` s
 
 ## Deploy Status
 
-Not deployed at the time this doc was first written. Deploy after commit if the branch remains clean.
+Deployed to production after commit `e6423245 Fix AnswerPlan live regressions`.
+
+- Production host: `root@165.227.77.152`
+- Service: `bluey-api.service`
+- Build directory: `/opt/bluey-builds/round402-answerplan-e6423245a615`
+- Build commit: `e6423245a615ddeda8b060addd1c1d6bcdcd38ac`
+- Installed binary SHA256: `42f48013fdd5db5d4f974bd129d511ae7837382fb132039eddbcfd4d9e9b8dd9`
+- Prior binary backup: `/var/backups/bluey-api/bin/bluey-server.previous-20260706T074532Z`
+- Pre-restart DB backup: `/var/backups/bluey-api/hourly/bluey-postgres-20260706T074524Z.pgdump`
+- Health check returned commit `e6423245a615ddeda8b060addd1c1d6bcdcd38ac`
+- `journalctl -u bluey-api.service --since "20 minutes ago" -p warning..alert` returned no warning/error entries after the smoke checks.
+
+Production env still has:
+
+- `BLUEY_ANSWER_PLAN_ROUTING=1`
+- `BLUEY_ROUTE_POLICY=provider_mix`
+
+## Live Smoke
+
+Ran authenticated streamed checks against `https://bluey.sh` using the local linked account token without printing the token or response text.
+
+| Prompt shape | Lane | Provider/model | First token | Full stream | Result |
+| --- | --- | --- | ---: | ---: | --- |
+| Quick concept: event loop vs thread pool | `instant` | `zai` / `glm-5.2` | 4056.5 ms | 4329.3 ms | OK |
+| System design: URL shortener | `deep` | `openai` / `gpt-5.5` | 5607.8 ms | 8988.8 ms | OK |
+| Screen-context coding OCR text | `deep` | `zai` / `glm-5.2` | 3416.1 ms | 9540.7 ms | OK |
+
+The live path is now traceable and completed cleanly, but first-token latency is still in the `watch` range. That is a separate latency/provider-warmup issue, not the Round 399 routing regression itself.
