@@ -31,6 +31,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let accountAuthMode = 'login';
     let squareCard = null;
     let squareCardEnvironment = '';
+    let squareCardSetupId = '';
+    let squareCardContainerId = '';
     let squareCardSetupPromise = null;
     let refreshAccountTokenPromise = null;
     let currentAccountEmail = '';
@@ -1599,16 +1601,25 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
     }
 
-    async function setupSquareCard(me) {
-      const setup = document.getElementById('squareCardSetup');
-      const container = document.getElementById('squareCardContainer');
+    async function setupSquareCard(me, options = {}) {
+      const setupId = options.setupId || 'squareCardSetup';
+      const containerId = options.containerId || 'squareCardContainer';
+      const setup = document.getElementById(setupId);
+      const container = document.getElementById(containerId);
       if (!setup || !container) return;
       if (!me?.square_application_id || !me?.square_location_id) return;
       const environment = me.square_environment || 'sandbox';
-      if (squareCard && squareCardEnvironment === environment) return;
+      if (squareCard && squareCardEnvironment === environment && squareCardContainerId === containerId) return;
       if (squareCardSetupPromise) return squareCardSetupPromise;
 
       squareCardSetupPromise = (async () => {
+        if (squareCard && typeof squareCard.destroy === 'function') {
+          try {
+            await squareCard.destroy();
+          } catch {
+            // Square cleanup is best-effort when moving the form between panels.
+          }
+        }
         await loadSquareSdk(environment);
         if (!window.Square?.payments) {
           throw new Error('Square card form is unavailable.');
@@ -1617,7 +1628,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         container.replaceChildren();
         squareCard = await payments.card();
         squareCardEnvironment = environment;
-        await squareCard.attach('#squareCardContainer');
+        squareCardSetupId = setupId;
+        squareCardContainerId = containerId;
+        await squareCard.attach(`#${containerId}`);
       })().finally(() => {
         squareCardSetupPromise = null;
       });
@@ -1692,11 +1705,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           ? 'No saved card.'
           : me?.auto_topup_unavailable_reason || 'Card saving unavailable.';
       updateAutoReloadDraftCopy();
+      renderReloadSetupCardState(me);
+      if (!document.getElementById('addCreditsDialog')?.hidden) updateReloadSetupDraftCopy();
     }
 
-    function readAutoReloadSettings() {
-      const threshold = dollarsToCents(document.getElementById('autoReloadThreshold')?.value || centsToDollars(AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS));
-      const amount = dollarsToCents(document.getElementById('autoReloadAmount')?.value || centsToDollars(AUTO_RELOAD_DEFAULT_AMOUNT_CENTS));
+    function readAutoReloadSettings(options = {}) {
+      const thresholdInputId = options.thresholdInputId || 'autoReloadThreshold';
+      const amountInputId = options.amountInputId || 'autoReloadAmount';
+      const threshold = dollarsToCents(document.getElementById(thresholdInputId)?.value || centsToDollars(AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS));
+      const amount = dollarsToCents(document.getElementById(amountInputId)?.value || centsToDollars(AUTO_RELOAD_DEFAULT_AMOUNT_CENTS));
       if (!Number.isFinite(threshold) || !Number.isFinite(amount)) {
         throw new Error('Enter valid Auto Reload dollar amounts.');
       }
@@ -1741,8 +1758,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
-    function readManualReloadCents() {
-      const input = document.getElementById('manualReloadAmount');
+    function readManualReloadCents(inputId = 'manualReloadAmount') {
+      const input = document.getElementById(inputId);
       const amount = dollarsToCents(input?.value || centsToDollars(MANUAL_RELOAD_AMOUNT_CENTS));
       if (!Number.isFinite(amount)) {
         input?.focus();
@@ -1759,6 +1776,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       [
         document.getElementById('reloadButton'),
         document.getElementById('overviewReloadButton'),
+        document.getElementById('reloadSetupCheckoutButton'),
       ].forEach((button) => {
         if (!button) return;
         button.disabled = busy;
@@ -1796,12 +1814,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function updateManualReloadDraftCopy() {
       const rule = document.getElementById('manualReloadRule');
       const overviewReloadButton = document.getElementById('overviewReloadButton');
+      const modalRule = document.getElementById('modalReloadRule');
       try {
         const amount = readManualReloadCents();
         if (rule) rule.textContent = `${money(amount)} adds ${money(amount)} credits.`;
+        if (modalRule) modalRule.textContent = `${money(amount)} minimum checkout. Credits are added after Square confirms payment.`;
         if (overviewReloadButton) overviewReloadButton.textContent = `Add ${money(amount)} credits`;
       } catch (error) {
         if (rule) rule.textContent = error.message;
+        if (modalRule) modalRule.textContent = error.message;
         if (overviewReloadButton) overviewReloadButton.textContent = 'Add credits';
       }
     }
@@ -1870,9 +1891,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
-    async function openSquareCardSetup() {
-      const button = document.getElementById('changeSquareCardButton');
-      const setup = document.getElementById('squareCardSetup');
+    async function openSquareCardSetup(options = {}) {
+      const button = document.getElementById(options.buttonId || 'changeSquareCardButton');
+      const setupId = options.setupId || 'squareCardSetup';
+      const containerId = options.containerId || 'squareCardContainer';
+      const setup = document.getElementById(setupId);
       if (!setup) return;
       if (!latestAccountForBilling?.square_application_id || !latestAccountForBilling?.square_location_id) {
         throw new Error('Card changes are not configured for this account yet.');
@@ -1885,7 +1908,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         button.textContent = 'Loading...';
       }
       try {
-        await setupSquareCard(latestAccountForBilling);
+        await setupSquareCard(latestAccountForBilling, { setupId, containerId });
         if (button) button.hidden = true;
       } finally {
         if (button) {
@@ -1895,22 +1918,37 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
-    function closeSquareCardSetup() {
-      const setup = document.getElementById('squareCardSetup');
-      const changeCardButton = document.getElementById('changeSquareCardButton');
-      const container = document.getElementById('squareCardContainer');
+    function closeSquareCardSetup(options = {}) {
+      const setupId = options.setupId || 'squareCardSetup';
+      const containerId = options.containerId || 'squareCardContainer';
+      const changeButtonId = options.changeButtonId || 'changeSquareCardButton';
+      const setup = document.getElementById(setupId);
+      const changeCardButton = document.getElementById(changeButtonId);
+      const container = document.getElementById(containerId);
       if (setup) {
         setup.hidden = true;
         setup.dataset.open = '';
       }
       if (container) container.replaceChildren();
       if (changeCardButton) changeCardButton.hidden = false;
-      squareCard = null;
-      squareCardEnvironment = '';
+      if (!squareCardContainerId || squareCardContainerId === containerId) {
+        if (squareCard && typeof squareCard.destroy === 'function') {
+          try {
+            const destroyed = squareCard.destroy();
+            if (destroyed && typeof destroyed.catch === 'function') destroyed.catch(() => {});
+          } catch {
+            // Ignore cleanup failures while closing a hidden card form.
+          }
+        }
+        squareCard = null;
+        squareCardEnvironment = '';
+        squareCardSetupId = '';
+        squareCardContainerId = '';
+      }
     }
 
-    async function saveSquareCard() {
-      const button = document.getElementById('saveSquareCardButton');
+    async function saveSquareCard(options = {}) {
+      const button = document.getElementById(options.buttonId || 'saveSquareCardButton');
       if (!squareCard) {
         throw new Error('Card form is still loading. Try again in a moment.');
       }
@@ -1929,8 +1967,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           method: 'POST',
           body: JSON.stringify({ source_id: result.token }),
         });
-        closeSquareCardSetup();
+        closeSquareCardSetup({
+          setupId: options.setupId || squareCardSetupId || 'squareCardSetup',
+          containerId: options.containerId || squareCardContainerId || 'squareCardContainer',
+          changeButtonId: options.changeButtonId || 'changeSquareCardButton',
+        });
         renderAutoReload(me);
+        if (typeof options.onSaved === 'function') options.onSaved(me);
         accountMessage('Card saved. Turn on Auto Reload and click Save when you want it active.');
       } finally {
         if (button) {
@@ -1938,6 +1981,177 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           button.textContent = previous;
         }
       }
+    }
+
+    function reloadSetupMessage(text, tone = '') {
+      const el = document.getElementById('reloadSetupMessage');
+      if (!el) return;
+      el.textContent = text || '';
+      el.dataset.tone = tone || '';
+    }
+
+    function readModalAutoReloadSettings() {
+      return readAutoReloadSettings({
+        thresholdInputId: 'modalAutoReloadThreshold',
+        amountInputId: 'modalAutoReloadAmount',
+      });
+    }
+
+    function syncReloadSetupFromDashboard() {
+      const modalAmount = document.getElementById('modalReloadAmount');
+      const manualAmount = document.getElementById('manualReloadAmount');
+      const modalToggle = document.getElementById('modalAutoReloadToggle');
+      const dashboardToggle = document.getElementById('autoReloadToggle');
+      const modalThreshold = document.getElementById('modalAutoReloadThreshold');
+      const dashboardThreshold = document.getElementById('autoReloadThreshold');
+      const modalAutoAmount = document.getElementById('modalAutoReloadAmount');
+      const dashboardAutoAmount = document.getElementById('autoReloadAmount');
+
+      if (modalAmount) modalAmount.value = manualAmount?.value || centsToDollars(MANUAL_RELOAD_AMOUNT_CENTS);
+      if (modalToggle) modalToggle.checked = Boolean(dashboardToggle?.checked);
+      if (modalThreshold) modalThreshold.value = dashboardThreshold?.value || centsToDollars(AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS);
+      if (modalAutoAmount) modalAutoAmount.value = dashboardAutoAmount?.value || centsToDollars(AUTO_RELOAD_DEFAULT_AMOUNT_CENTS);
+      renderReloadSetupCardState();
+      updateReloadSetupDraftCopy();
+    }
+
+    function applyReloadSetupToDashboard() {
+      const modalAmount = document.getElementById('modalReloadAmount');
+      const manualAmount = document.getElementById('manualReloadAmount');
+      const modalToggle = document.getElementById('modalAutoReloadToggle');
+      const dashboardToggle = document.getElementById('autoReloadToggle');
+      const modalThreshold = document.getElementById('modalAutoReloadThreshold');
+      const dashboardThreshold = document.getElementById('autoReloadThreshold');
+      const modalAutoAmount = document.getElementById('modalAutoReloadAmount');
+      const dashboardAutoAmount = document.getElementById('autoReloadAmount');
+
+      if (manualAmount && modalAmount) manualAmount.value = modalAmount.value;
+      if (dashboardToggle && modalToggle) dashboardToggle.checked = modalToggle.checked;
+      if (dashboardThreshold && modalThreshold) dashboardThreshold.value = modalThreshold.value;
+      if (dashboardAutoAmount && modalAutoAmount) dashboardAutoAmount.value = modalAutoAmount.value;
+      updateManualReloadDraftCopy();
+      updateAutoReloadDraftCopy();
+    }
+
+    function renderReloadSetupCardState(me = latestAccountForBilling) {
+      const cardButton = document.getElementById('reloadSetupCardButton');
+      const saveAutoButton = document.getElementById('reloadSetupSaveAutoButton');
+      if (!cardButton && !saveAutoButton) return;
+      const canSaveSquareCard = me?.billing_provider === 'square'
+        && Boolean(me.square_application_id)
+        && Boolean(me.square_location_id);
+      const hasSavedMethod = Boolean(me?.auto_topup_available);
+
+      if (cardButton) {
+        cardButton.disabled = !canSaveSquareCard;
+        cardButton.textContent = hasSavedMethod ? 'Change saved card' : 'Save card for Auto Reload';
+      }
+      if (saveAutoButton) {
+        saveAutoButton.disabled = !hasSavedMethod && !me?.auto_topup_enabled;
+      }
+    }
+
+    function updateReloadSetupDraftCopy() {
+      const checkoutButton = document.getElementById('reloadSetupCheckoutButton');
+      const reloadRule = document.getElementById('modalReloadRule');
+      const autoRule = document.getElementById('modalAutoReloadRule');
+      const saveAutoButton = document.getElementById('reloadSetupSaveAutoButton');
+      const toggle = document.getElementById('modalAutoReloadToggle');
+      const enabled = Boolean(toggle?.checked);
+      const wasEnabled = Boolean(latestAccountForBilling?.auto_topup_enabled);
+      const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
+
+      try {
+        const amount = readManualReloadCents('modalReloadAmount');
+        if (reloadRule) reloadRule.textContent = `${money(amount)} will be added after Square confirms payment.`;
+        if (checkoutButton) checkoutButton.textContent = `Continue to ${money(amount)} checkout`;
+      } catch (error) {
+        if (reloadRule) reloadRule.textContent = error.message;
+        if (checkoutButton) checkoutButton.textContent = 'Continue to secure checkout';
+      }
+
+      if (!autoRule) return;
+      if (!enabled) {
+        autoRule.textContent = wasEnabled ? 'Auto Reload will turn off after you click Save.' : 'Auto Reload is off.';
+        if (saveAutoButton) saveAutoButton.disabled = !wasEnabled;
+        return;
+      }
+
+      try {
+        const settings = readModalAutoReloadSettings();
+        autoRule.textContent = hasSavedMethod
+          ? `When balance is below ${money(settings.auto_topup_threshold_cents)}, reload ${money(settings.auto_topup_amount_cents)}.`
+          : 'Save a card here before turning Auto Reload on.';
+        if (saveAutoButton) saveAutoButton.disabled = !hasSavedMethod;
+      } catch (error) {
+        autoRule.textContent = error.message;
+        if (saveAutoButton) saveAutoButton.disabled = true;
+      }
+    }
+
+    function resetReloadSetupDialog() {
+      const dialog = document.getElementById('addCreditsDialog');
+      if (dialog) dialog.hidden = true;
+      reloadSetupMessage('');
+      closeSquareCardSetup({
+        setupId: 'reloadSetupSquareCardSetup',
+        containerId: 'reloadSetupSquareCardContainer',
+        changeButtonId: 'reloadSetupCardButton',
+      });
+    }
+
+    function openReloadSetupDialog() {
+      const dialog = document.getElementById('addCreditsDialog');
+      const amount = document.getElementById('modalReloadAmount');
+      if (!dialog) {
+        startReload();
+        return;
+      }
+      syncReloadSetupFromDashboard();
+      reloadSetupMessage('');
+      dialog.hidden = false;
+      setTimeout(() => amount?.focus(), 0);
+    }
+
+    async function openReloadSetupCard() {
+      await openSquareCardSetup({
+        buttonId: 'reloadSetupCardButton',
+        setupId: 'reloadSetupSquareCardSetup',
+        containerId: 'reloadSetupSquareCardContainer',
+      });
+      reloadSetupMessage('Enter a card, then save. Square handles the card details.');
+    }
+
+    async function saveReloadSetupCard() {
+      await saveSquareCard({
+        buttonId: 'reloadSetupSaveSquareCardButton',
+        setupId: 'reloadSetupSquareCardSetup',
+        containerId: 'reloadSetupSquareCardContainer',
+        changeButtonId: 'reloadSetupCardButton',
+        onSaved: (me) => {
+          latestAccountForBilling = me || latestAccountForBilling;
+          renderReloadSetupCardState(me);
+          updateReloadSetupDraftCopy();
+          reloadSetupMessage('Card saved. You can now turn on Auto Reload and save it.', 'success');
+        },
+      });
+    }
+
+    async function saveReloadSetupAutoReload() {
+      applyReloadSetupToDashboard();
+      await saveAutoReloadSettings();
+      updateReloadSetupDraftCopy();
+      reloadSetupMessage('Auto Reload settings saved.', 'success');
+    }
+
+    async function startReloadFromSetup() {
+      applyReloadSetupToDashboard();
+      reloadSetupMessage('Opening secure checkout...');
+      const opened = await startReload();
+      reloadSetupMessage(opened
+        ? 'Checkout opened in a new tab. Complete payment there, then return to Bluey.'
+        : 'Checkout did not open. Check the message above and try again.',
+      opened ? 'success' : 'error');
     }
 
     function shortSessionId(id) {
@@ -2643,7 +2857,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         amountCents = readManualReloadCents();
       } catch (error) {
         accountMessage(error.message, false, 'error');
-        return;
+        return false;
       }
       const checkoutWindow = openCheckoutPlaceholder(amountCents);
       setReloadButtonsBusy(true);
@@ -2661,10 +2875,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           const opened = window.open(url, '_blank', 'noopener,noreferrer');
           if (!opened) {
             accountMessage('Checkout was blocked by the browser. Allow popups for bluey.sh, then click Add credits again.', false, 'error');
-            return;
+            return false;
           }
         }
         accountMessage('Checkout opened in a new tab. Complete payment there, then return here and press Refresh balance.');
+        return true;
       } catch (error) {
         closeCheckoutPlaceholder(checkoutWindow);
         const message = String(error?.message || 'Could not open checkout.');
@@ -2673,6 +2888,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         } else {
           accountMessage(message, false, 'error');
         }
+        return false;
       } finally {
         setReloadButtonsBusy(false);
       }
@@ -2841,16 +3057,26 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         confirmTrialConversion();
       });
       document.getElementById('reloadButton').addEventListener('click', () => {
-        startReload();
+        openReloadSetupDialog();
       });
       document.getElementById('overviewReloadButton')?.addEventListener('click', () => {
-        startReload();
+        openReloadSetupDialog();
+      });
+      document.getElementById('reloadSetupCheckoutButton')?.addEventListener('click', () => {
+        startReloadFromSetup().catch((error) => reloadSetupMessage(error.message, 'error'));
+      });
+      document.getElementById('addCreditsCancelX')?.addEventListener('click', resetReloadSetupDialog);
+      document.getElementById('addCreditsDialog')?.addEventListener('click', (event) => {
+        if (event.target?.id === 'addCreditsDialog') resetReloadSetupDialog();
       });
       document.getElementById('refreshAccountButton')?.addEventListener('click', () => {
         loadAccount().catch((error) => accountMessage(error.message));
       });
       document.getElementById('manualReloadAmount')?.addEventListener('input', () => {
         updateManualReloadDraftCopy();
+      });
+      document.getElementById('modalReloadAmount')?.addEventListener('input', () => {
+        updateReloadSetupDraftCopy();
       });
       document.getElementById('autoReloadToggle')?.addEventListener('change', () => {
         updateAutoReloadDraftCopy();
@@ -2860,14 +3086,31 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           updateAutoReloadDraftCopy();
         });
       });
+      document.getElementById('modalAutoReloadToggle')?.addEventListener('change', () => {
+        updateReloadSetupDraftCopy();
+      });
+      ['modalAutoReloadThreshold', 'modalAutoReloadAmount'].forEach((id) => {
+        document.getElementById(id)?.addEventListener('input', () => {
+          updateReloadSetupDraftCopy();
+        });
+      });
       document.getElementById('saveAutoReloadButton')?.addEventListener('click', () => {
         saveAutoReloadSettings().catch((error) => accountMessage(error.message));
+      });
+      document.getElementById('reloadSetupSaveAutoButton')?.addEventListener('click', () => {
+        saveReloadSetupAutoReload().catch((error) => reloadSetupMessage(error.message, 'error'));
       });
       document.getElementById('saveSquareCardButton')?.addEventListener('click', () => {
         saveSquareCard().catch((error) => accountMessage(error.message));
       });
       document.getElementById('changeSquareCardButton')?.addEventListener('click', () => {
         openSquareCardSetup().catch((error) => accountMessage(error.message));
+      });
+      document.getElementById('reloadSetupCardButton')?.addEventListener('click', () => {
+        openReloadSetupCard().catch((error) => reloadSetupMessage(error.message, 'error'));
+      });
+      document.getElementById('reloadSetupSaveSquareCardButton')?.addEventListener('click', () => {
+        saveReloadSetupCard().catch((error) => reloadSetupMessage(error.message, 'error'));
       });
       document.getElementById('refreshDevicesButton')?.addEventListener('click', () => {
         renderLinkedDevices({ devices: [] }, 'Loading computers...');

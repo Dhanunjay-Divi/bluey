@@ -646,6 +646,67 @@
           </section>
         </section>
       </main>
+      <div class="account-modal-backdrop" id="addCreditsDialog" hidden>
+        <section class="account-modal reload-setup-modal" role="dialog" aria-modal="true" aria-labelledby="addCreditsTitle">
+          <div class="account-modal-head">
+            <div>
+              <h2 id="addCreditsTitle">Add Bluey credits</h2>
+              <p>Choose credits, set Auto Reload if you want it, then finish payment in Square checkout.</p>
+            </div>
+            <button class="account-modal-close" id="addCreditsCancelX" type="button" aria-label="Close add credits dialog">×</button>
+          </div>
+          <div class="reload-setup-grid">
+            <section class="reload-setup-panel" aria-label="One-time credits">
+              <span class="reload-setup-kicker">One-time reload</span>
+              <label class="manual-reload-field" for="modalReloadAmount">
+                <span>Credits to add</span>
+                <span class="manual-reload-input">
+                  <span>$</span>
+                  <input id="modalReloadAmount" type="number" min="15" max="500" step="5" value="15" inputmode="decimal" />
+                </span>
+              </label>
+              <p id="modalReloadRule">$15 minimum. Credits are added after Square confirms payment.</p>
+              <button class="account-button primary" id="reloadSetupCheckoutButton" type="button">Continue to secure checkout</button>
+            </section>
+            <section class="reload-setup-panel" aria-label="Auto Reload setup">
+              <div class="auto-reload-head">
+                <div>
+                  <span class="reload-setup-kicker">Optional</span>
+                  <h3>Auto Reload</h3>
+                </div>
+                <label class="auto-reload-toggle" for="modalAutoReloadToggle">
+                  <input id="modalAutoReloadToggle" type="checkbox" />
+                  <span></span>
+                </label>
+              </div>
+              <div class="auto-reload-fields" aria-label="Auto Reload rule">
+                <label>
+                  <span>When below</span>
+                  <input id="modalAutoReloadThreshold" type="number" min="1" max="50" step="1" value="5" inputmode="decimal" />
+                </label>
+                <label>
+                  <span>Reload</span>
+                  <input id="modalAutoReloadAmount" type="number" min="15" max="500" step="5" value="15" inputmode="decimal" />
+                </label>
+              </div>
+              <p class="auto-reload-rule" id="modalAutoReloadRule">Auto Reload is off.</p>
+              <div class="reload-setup-card-actions">
+                <button class="account-button ghost compact" id="reloadSetupCardButton" type="button">Save card for Auto Reload</button>
+                <button class="account-button ghost compact" id="reloadSetupSaveAutoButton" type="button">Save Auto Reload</button>
+              </div>
+              <div class="square-card-setup reload-setup-square-card" id="reloadSetupSquareCardSetup" hidden>
+                <div class="square-card-copy">
+                  <strong>Secure card form</strong>
+                  <span>Square handles card details. Bluey stores only the saved-card reference for future reloads.</span>
+                </div>
+                <div id="reloadSetupSquareCardContainer" class="square-card-container"></div>
+                <button class="account-button ghost compact" id="reloadSetupSaveSquareCardButton" type="button">Save card</button>
+              </div>
+            </section>
+          </div>
+          <div class="account-modal-message" id="reloadSetupMessage" aria-live="polite"></div>
+        </section>
+      </div>
       <div class="account-modal-backdrop" id="changePasswordDialog" hidden>
         <section class="account-modal password-modal" role="dialog" aria-modal="true" aria-labelledby="changePasswordTitle">
           <div class="account-modal-head">

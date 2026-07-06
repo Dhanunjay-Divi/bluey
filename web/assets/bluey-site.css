@@ -6809,6 +6809,83 @@
       background: #101010;
     }
 
+    #accountApp .reload-setup-modal {
+      width: min(760px, calc(100vw - 36px));
+      border-color: rgba(99, 216, 255, .30);
+      border-radius: 18px;
+      padding: 1.25rem;
+      background: #101010;
+    }
+
+    #accountApp .reload-setup-grid {
+      display: grid;
+      grid-template-columns: minmax(0, .95fr) minmax(0, 1.05fr);
+      gap: .85rem;
+      align-items: stretch;
+    }
+
+    #accountApp .reload-setup-panel {
+      display: grid;
+      align-content: start;
+      gap: .75rem;
+      min-width: 0;
+      padding: .95rem;
+      border: 1px solid #242424;
+      border-radius: 12px;
+      background: #0a0a0a;
+    }
+
+    #accountApp .reload-setup-panel h3 {
+      margin: .1rem 0 0;
+      color: #f2f2f2;
+      font-size: 1rem;
+      line-height: 1.1;
+    }
+
+    #accountApp .reload-setup-kicker {
+      color: #6f7b84;
+      font-size: .66rem;
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .reload-setup-panel .manual-reload-field {
+      gap: .36rem;
+    }
+
+    #accountApp .reload-setup-panel .manual-reload-input {
+      min-height: 44px;
+    }
+
+    #accountApp .reload-setup-panel > p,
+    #accountApp .reload-setup-panel .auto-reload-rule {
+      margin: -.2rem 0 0;
+      color: #858f98;
+      font-size: .78rem;
+      line-height: 1.42;
+    }
+
+    #accountApp .reload-setup-panel .account-button.primary {
+      width: 100%;
+      min-height: 42px;
+      border-radius: 10px;
+    }
+
+    #accountApp .reload-setup-card-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem;
+      align-items: center;
+    }
+
+    #accountApp .reload-setup-square-card {
+      width: 100%;
+      margin: 0;
+      padding: .75rem;
+      border-radius: 10px;
+    }
+
     html[data-bluey-theme="light"] #productSite.page {
       overflow: hidden;
     }
@@ -6834,6 +6911,27 @@
     html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row p,
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-rule,
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-hint {
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-modal {
+      border-color: #cfe3ef;
+      background: #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-panel,
+    html[data-bluey-theme="light"] #accountApp .reload-setup-square-card {
+      border-color: #dceaf2;
+      background: #f7fbff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-panel h3 {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-kicker,
+    html[data-bluey-theme="light"] #accountApp .reload-setup-panel > p,
+    html[data-bluey-theme="light"] #accountApp .reload-setup-panel .auto-reload-rule {
       color: #5f7281;
     }
 
@@ -6880,6 +6978,7 @@
 
       #productSite .pricing,
       #accountApp .billing-grid,
+      #accountApp .reload-setup-grid,
       #accountApp .dashboard-overview-card {
         grid-template-columns: 1fr;
       }
