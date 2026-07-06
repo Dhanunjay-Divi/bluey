@@ -69,7 +69,48 @@ git diff --check
 
 ## Deployment Status
 
-Not deployed at the moment this doc was written. This is a backend-only admin endpoint and should be included in the next API deploy.
+Deployed to the production API droplet on 2026-07-06.
+
+Deploy proof:
+
+- Commit: `ba093252ba6426cae98fe743433cb5888586fb39`
+- Source was uploaded as a git archive and built on the droplet as Linux x86_64.
+- Fresh Postgres backup before swap:
+
+```text
+/var/backups/bluey-api/hourly/bluey-postgres-20260706T063718Z.pgdump
+```
+
+- Installed binary SHA-256:
+
+```text
+dfc6dd42f3e38b355af92fcf2cddc339f6699494c293091e4b9b085cca87d7e7
+```
+
+- Previous binary backup:
+
+```text
+/var/backups/bluey-api/bin/bluey-server.previous-20260706T064203Z
+```
+
+- `bluey-api.service`: active
+- `NRestarts`: 0
+- `/health` reports commit `ba093252ba6426cae98fe743433cb5888586fb39`
+- Unauthenticated `/admin/provider-routing?hours=24` returns `401`.
+- Admin-authenticated smoke returned `200` with aggregate rows.
+- `journalctl -u bluey-api.service --since "10 min ago" -p warning` showed no entries.
+
+Live 24-hour admin smoke summary immediately after deploy:
+
+```json
+{
+  "total_events": 19,
+  "fallback_events": 3,
+  "provider_rows": 6,
+  "lane_rows": 3,
+  "task_rows": 5
+}
+```
 
 ## Remaining
 
