@@ -1131,6 +1131,7 @@ fn answer_plan_for_request(
     let transcript_placeholder = looks_like_transcript_placeholder(&normalized);
     let has_images = !req.image_data_urls.is_empty() || requested_lane == "vision";
     let has_planning_context = !planning_context.trim().is_empty();
+    let generic_screen_capture_prompt = looks_like_generic_screen_capture_prompt(&normalized);
     let quick_conceptual = !has_images
         && !has_planning_context
         && looks_like_quick_conceptual_question(&normalized, word_count);
@@ -1164,13 +1165,16 @@ fn answer_plan_for_request(
         && (((!diagram_request || explicit_code_generation)
             && looks_like_coding_question(&normalized))
             || (has_images && context_coding)
+            || (generic_screen_capture_prompt && context_coding)
             || (generic_live_transcript_prompt && context_coding));
     let coding_followup = looks_like_coding_followup(&normalized, follow_up)
         || (has_planning_context
             && context_coding
             && looks_like_contextual_code_generation_followup(&normalized))
         || (has_images && context_coding && follow_up);
-    let simple_coding = coding && looks_like_simple_coding_question(&normalized, short_question);
+    let simple_coding = coding
+        && !(context_coding && (has_images || generic_screen_capture_prompt))
+        && looks_like_simple_coding_question(&normalized, short_question);
     let context_behavioral = generic_live_transcript_prompt
         && has_planning_context
         && !context_coding
@@ -1202,7 +1206,6 @@ fn answer_plan_for_request(
             "spreadsheet",
         ],
     );
-    let generic_screen_capture_prompt = looks_like_generic_screen_capture_prompt(&normalized);
     let docs = docs_requested
         && (!generic_screen_capture_prompt
             || planning_context_has_document_signal(&normalized_context));
@@ -1272,7 +1275,7 @@ fn answer_plan_for_request(
             || normalized.contains(" information about "));
     let needs_web_search =
         !screen && !coding && !behavioral && !system_design && (explicit_web || about_unknown);
-    let screen_without_image = screen && !has_images;
+    let screen_without_image = screen && !has_images && !has_planning_context;
     let has_any_attached_evidence = has_images || has_planning_context || !rag_matches.is_empty();
     let missing_context = !needs_web_search
         && rag_matches.is_empty()
@@ -2735,6 +2738,25 @@ fn looks_like_system_design_question(normalized: &str) -> bool {
         normalized,
         &[
             "system design",
+            "design url shortener",
+            "design a url shortener",
+            "design an url shortener",
+            "design tinyurl",
+            "design bitly",
+            "design a rate limiter",
+            "design rate limiter",
+            "design notification system",
+            "design a notification system",
+            "design chat app",
+            "design a chat app",
+            "design messaging app",
+            "design a messaging app",
+            "design news feed",
+            "design a news feed",
+            "design pastebin",
+            "design a cache",
+            "design cache",
+            "design distributed",
             "design a system",
             "design an app",
             "design the architecture",
@@ -3734,7 +3756,7 @@ fn retrieval_status_entries(
             "Using relevant conversation context...".to_string(),
         ));
     }
-    if web_search.attempted {
+    if web_search.attempted && web_search.skipped_reason.is_none() {
         statuses.push(("searching_web".to_string(), "Searching web...".to_string()));
     }
     if web_search.sources.len() > 0 {
@@ -8552,10 +8574,38 @@ mod tests {
         assert!(!plan.needs_memory);
         assert!(!plan.needs_web_search);
 
-        let api = complete_request("Question:\nHow do you approach API versioning in your project?");
+        let api =
+            complete_request("Question:\nHow do you approach API versioning in your project?");
         let api_plan = answer_plan_for_request(&api, "balanced", &[]);
         assert_eq!(api_plan.intent, AnswerIntent::Quick);
         assert_eq!(api_plan.recommended_lane, "instant");
+    }
+
+    #[test]
+    fn answer_plan_round399_quick_concept_does_not_trigger_research() {
+        let req = complete_request(
+            "Question:\nCan you explain the difference between event loop and thread pool?",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Quick);
+        assert_eq!(plan.output, AnswerOutput::Compact);
+        assert_eq!(plan.recommended_lane, "instant");
+        assert!(!plan.needs_memory);
+        assert!(!plan.needs_web_search);
+    }
+
+    #[test]
+    fn answer_plan_round399_url_shortener_is_system_design() {
+        let req = complete_request("Question:\nDesign a URL shortener.");
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::SystemDesign);
+        assert_eq!(plan.output, AnswerOutput::CanvasDetail);
+        assert_eq!(plan.recommended_lane, "deep");
+        assert!(!plan.needs_web_search);
     }
 
     #[test]
@@ -8824,6 +8874,22 @@ mod tests {
     }
 
     #[test]
+    fn answer_plan_round399_screen_context_ocr_code_without_image_is_code_artifact() {
+        let req = complete_request(
+            "Question:\nAnswer using the attached screen context.\n\nSession context:\n[Screen context from screenshot]\nYou are given an array of positive integers nums.\n\nAlice and Bob are playing a game. Alice can choose either all single-digit numbers or all double-digit numbers from nums, and the rest of the numbers are given to Bob. Alice wins if the sum of her numbers is strictly greater than the sum of Bob's numbers.\n\nReturn true if Alice can win this game, otherwise return false.",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Coding);
+        assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+        assert_eq!(plan.recommended_lane, "deep");
+        assert!(plan.needs_screen);
+        assert!(!plan.needs_docs);
+        assert!(!plan.needs_web_search);
+    }
+
+    #[test]
     fn generic_screen_template_with_image_is_not_missing_context() {
         let mut req = complete_request(
             "Question:\nAnswer using the attached screen capture, documents, and current session context.",
@@ -8912,7 +8978,8 @@ mod tests {
 
     #[test]
     fn answer_plan_routing_preserves_requested_instant_for_compact_answers() {
-        let req = complete_request("Question:\nHow do you approach API versioning in your project?");
+        let req =
+            complete_request("Question:\nHow do you approach API versioning in your project?");
         let plan = answer_plan_for_request(&req, "instant", &[]);
 
         assert_eq!(plan.output, AnswerOutput::Compact);
@@ -9059,6 +9126,37 @@ mod tests {
         assert!(system.contains("Managed web search did not return usable sources"));
         assert!(system.contains("Web search is not configured yet."));
         assert!(system.contains("Do not imply web search succeeded"));
+    }
+
+    #[test]
+    fn retrieval_status_does_not_show_searching_when_search_was_skipped() {
+        let plan = AnswerPlan {
+            intent: AnswerIntent::Research,
+            output: AnswerOutput::SourceAnswer,
+            recommended_lane: "balanced",
+            confidence: 0.90,
+            interview_context: false,
+            needs_screen: false,
+            needs_docs: false,
+            needs_transcript: false,
+            needs_memory: false,
+            needs_web_search: true,
+        };
+        let web_search = WebSearchOutcome {
+            attempted: true,
+            skipped_reason: Some("provider_not_configured"),
+            ..Default::default()
+        };
+
+        let statuses = retrieval_status_entries(&plan, 0, &web_search);
+        let status_text = statuses
+            .iter()
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!status_text.contains("Searching web"));
+        assert!(status_text.contains("Web search is not configured yet."));
     }
 
     #[test]

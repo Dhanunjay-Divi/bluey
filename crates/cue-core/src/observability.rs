@@ -173,16 +173,39 @@ pub fn short_observability_ref(value: Option<&str>) -> String {
     let Some(value) = value else {
         return "NONE".to_string();
     };
-    let short = value
+    let trimmed = value.trim();
+    let compact = trimmed
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
-        .take(8)
         .collect::<String>();
+    if compact.is_empty() {
+        return "NONE".to_string();
+    }
+
+    let short = if looks_like_uuid_reference(trimmed) || compact.len() <= 8 {
+        compact.chars().take(8).collect::<String>()
+    } else {
+        let mut tail = compact.chars().rev().take(8).collect::<Vec<_>>();
+        tail.reverse();
+        tail.into_iter().collect::<String>()
+    };
     if short.is_empty() {
         "NONE".to_string()
     } else {
         short.to_ascii_uppercase()
     }
+}
+
+fn looks_like_uuid_reference(value: &str) -> bool {
+    let value = value.trim();
+    let prefix = value.chars().take(36).collect::<Vec<_>>();
+    if prefix.len() < 36 {
+        return false;
+    }
+    prefix.iter().enumerate().all(|(idx, ch)| match idx {
+        8 | 13 | 18 | 23 => *ch == '-',
+        _ => ch.is_ascii_hexdigit(),
+    })
 }
 
 /// SHA-256 of account id, first 12 hex chars. This is the support join key
@@ -235,6 +258,18 @@ mod tests {
         );
         assert_eq!(short_observability_ref(None), "NONE");
         assert_eq!(short_observability_ref(Some(" --- ")), "NONE");
+    }
+
+    #[test]
+    fn short_observability_ref_uses_entropy_suffix_for_prefixed_request_ids() {
+        assert_eq!(
+            short_observability_ref(Some("live-eval-20260706-quick-concept-a1b2c3d4")),
+            "A1B2C3D4"
+        );
+        assert_eq!(
+            short_observability_ref(Some("live-eval-20260706-system-design-e5f60718")),
+            "E5F60718"
+        );
     }
 
     #[test]
