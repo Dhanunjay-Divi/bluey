@@ -185,10 +185,19 @@ pub async fn get_balance_snapshot() -> Result<Option<BalanceSnapshotPayload>, St
         return Ok(None);
     }
 
-    let me: cue_cloud_client::AccountMe = client
-        .auth_get("/account/me")
-        .await
-        .map_err(|e| format!("balance lookup failed: {e}"))?;
+    let me: cue_cloud_client::AccountMe = match async {
+        verify_dashboard_device_link(&client).await?;
+        client.auth_get("/account/me").await
+    }
+    .await
+    {
+        Ok(me) => me,
+        Err(error) if dashboard_auth_error_should_clear_tokens(&error) => {
+            let _ = client.clear_tokens();
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("balance lookup failed: {error}")),
+    };
     Ok(Some(BalanceSnapshotPayload {
         balance_cents: me.balance_cents,
         balance_label: format_cents(me.balance_cents),
@@ -209,10 +218,19 @@ pub async fn account_me() -> Result<Option<AccountMePayload>, String> {
         return Ok(None);
     }
 
-    let me: cue_cloud_client::AccountMe = client
-        .auth_get("/account/me")
-        .await
-        .map_err(|e| format!("account lookup failed: {e}"))?;
+    let me: cue_cloud_client::AccountMe = match async {
+        verify_dashboard_device_link(&client).await?;
+        client.auth_get("/account/me").await
+    }
+    .await
+    {
+        Ok(me) => me,
+        Err(error) if dashboard_auth_error_should_clear_tokens(&error) => {
+            let _ = client.clear_tokens();
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("account lookup failed: {error}")),
+    };
     Ok(Some(AccountMePayload {
         id: me.id,
         email: me.email,
@@ -222,6 +240,45 @@ pub async fn account_me() -> Result<Option<AccountMePayload>, String> {
         auto_topup_threshold_cents: me.auto_topup_threshold_cents,
         auto_topup_amount_cents: me.auto_topup_amount_cents,
     }))
+}
+
+async fn verify_dashboard_device_link(
+    client: &cue_cloud_client::CloudClient,
+) -> Result<(), cue_cloud_client::Error> {
+    let Some(device_id) = dashboard_stored_cloud_device_id() else {
+        return Ok(());
+    };
+    let status: cue_cloud_client::DeviceStatusResponse = client
+        .auth_post(
+            "/account/devices/status",
+            &cue_cloud_client::DeviceStatusRequest { device_id },
+        )
+        .await?;
+    if status.active {
+        Ok(())
+    } else {
+        Err(cue_cloud_client::Error::Unauthorized)
+    }
+}
+
+fn dashboard_stored_cloud_device_id() -> Option<String> {
+    let paths = cue_core::app_paths::AppPaths::discover().ok()?;
+    cue_core::load_account(&paths)
+        .ok()
+        .flatten()
+        .map(|account| account.device_id)
+        .filter(|device_id| {
+            let value = device_id.trim();
+            !value.is_empty() && value != "local-device"
+        })
+}
+
+fn dashboard_auth_error_should_clear_tokens(error: &cue_cloud_client::Error) -> bool {
+    matches!(
+        error,
+        cue_cloud_client::Error::Unauthorized
+            | cue_cloud_client::Error::Server { status: 403 | 404 }
+    )
 }
 
 #[tauri::command]

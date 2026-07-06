@@ -1131,6 +1131,9 @@ fn answer_plan_for_request(
     let transcript_placeholder = looks_like_transcript_placeholder(&normalized);
     let has_images = !req.image_data_urls.is_empty() || requested_lane == "vision";
     let has_planning_context = !planning_context.trim().is_empty();
+    let quick_conceptual = !has_images
+        && !has_planning_context
+        && looks_like_quick_conceptual_question(&normalized, word_count);
     let follow_up = !topic_reset
         && short_question
         && contains_any(
@@ -1157,10 +1160,11 @@ fn answer_plan_for_request(
         has_planning_context && looks_like_system_design_question(&normalized_context);
     let diagram_request = looks_like_diagram_request(&normalized);
     let explicit_code_generation = looks_like_explicit_code_generation_request(&normalized);
-    let coding = ((!diagram_request || explicit_code_generation)
-        && looks_like_coding_question(&normalized))
-        || (has_images && context_coding)
-        || (generic_live_transcript_prompt && context_coding);
+    let coding = !quick_conceptual
+        && (((!diagram_request || explicit_code_generation)
+            && looks_like_coding_question(&normalized))
+            || (has_images && context_coding)
+            || (generic_live_transcript_prompt && context_coding));
     let coding_followup = looks_like_coding_followup(&normalized, follow_up)
         || (has_planning_context
             && context_coding
@@ -1253,7 +1257,8 @@ fn answer_plan_for_request(
                 ],
             ));
     let public_lookup_phrase = looks_like_public_lookup_phrase(&normalized, word_count);
-    let about_unknown = rag_matches.is_empty()
+    let about_unknown = !quick_conceptual
+        && rag_matches.is_empty()
         && !screen
         && !coding
         && !behavioral
@@ -1301,6 +1306,8 @@ fn answer_plan_for_request(
         AnswerIntent::Coding
     } else if screen {
         AnswerIntent::Screen
+    } else if quick_conceptual {
+        AnswerIntent::Quick
     } else if topic_reset && short_question {
         AnswerIntent::Quick
     } else if meeting {
@@ -1496,11 +1503,25 @@ fn lane_for_answer_plan(requested_lane: &str, plan: &AnswerPlan, enabled: bool) 
     if requested == "vision" {
         return "vision".to_string();
     }
+    if requested == "instant"
+        && plan.output == AnswerOutput::Compact
+        && !matches!(
+            plan.intent,
+            AnswerIntent::Coding
+                | AnswerIntent::CodingFollowUp
+                | AnswerIntent::SystemDesign
+                | AnswerIntent::Screen
+                | AnswerIntent::Research
+        )
+    {
+        return "instant".to_string();
+    }
     plan.recommended_lane.to_string()
 }
 
 fn max_tokens_for_answer_plan(requested: Option<u32>, output: AnswerOutput) -> Option<u32> {
     match output {
+        AnswerOutput::Compact => Some(requested.unwrap_or(512).min(512)),
         AnswerOutput::CodeArtifact => Some(
             requested
                 .unwrap_or(CODE_ARTIFACT_MIN_OUTPUT_TOKENS)
@@ -2242,6 +2263,59 @@ fn looks_like_simple_coding_question(normalized: &str, short_question: bool) -> 
                 "function",
             ],
         )
+}
+
+fn looks_like_quick_conceptual_question(normalized: &str, word_count: usize) -> bool {
+    if word_count == 0 || word_count > 16 || normalized.chars().count() > 180 {
+        return false;
+    }
+
+    if looks_like_algorithmic_challenge_prompt(normalized)
+        || looks_like_explicit_code_generation_request(normalized)
+        || contains_any(
+            normalized,
+            &[
+                "system design",
+                "design a system",
+                "architecture",
+                "scale this",
+                "scalability",
+                "screenshot",
+                "screen context",
+                "attached",
+                "current session",
+                "current context",
+                "transcript",
+                "search web",
+                "web search",
+                "look up",
+                "latest",
+            ],
+        )
+    {
+        return false;
+    }
+
+    contains_any(
+        normalized,
+        &[
+            "difference between",
+            "compare",
+            " vs ",
+            " versus ",
+            "what is",
+            "what are",
+            "why is",
+            "why does",
+            "how does",
+            "how do",
+            "how would you approach",
+            "can you explain",
+            "explain me",
+            "explain the difference",
+            "when would",
+        ],
+    )
 }
 
 fn looks_like_coding_followup(normalized: &str, follow_up: bool) -> bool {
@@ -8465,6 +8539,26 @@ mod tests {
     }
 
     #[test]
+    fn answer_plan_short_conceptual_comparisons_use_quick_instant() {
+        let req = complete_request(
+            "Question:\nCan you explain me the difference between LRU cache and SRU?",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Quick);
+        assert_eq!(plan.output, AnswerOutput::Compact);
+        assert_eq!(plan.recommended_lane, "instant");
+        assert!(!plan.needs_memory);
+        assert!(!plan.needs_web_search);
+
+        let api = complete_request("Question:\nHow do you approach API versioning in your project?");
+        let api_plan = answer_plan_for_request(&api, "balanced", &[]);
+        assert_eq!(api_plan.intent, AnswerIntent::Quick);
+        assert_eq!(api_plan.recommended_lane, "instant");
+    }
+
+    #[test]
     fn answer_plan_algorithmic_solver_code_uses_deep_code_artifact() {
         let req = complete_request("Question:\nGive me Python code which solves Sudoku.");
 
@@ -8814,6 +8908,24 @@ mod tests {
 
         assert_eq!(lane_for_answer_plan("balanced", &plan, false), "balanced");
         assert_eq!(lane_for_answer_plan("balanced", &plan, true), "deep");
+    }
+
+    #[test]
+    fn answer_plan_routing_preserves_requested_instant_for_compact_answers() {
+        let req = complete_request("Question:\nHow do you approach API versioning in your project?");
+        let plan = answer_plan_for_request(&req, "instant", &[]);
+
+        assert_eq!(plan.output, AnswerOutput::Compact);
+        assert_eq!(lane_for_answer_plan("instant", &plan, true), "instant");
+    }
+
+    #[test]
+    fn answer_plan_routing_can_upgrade_requested_instant_for_code() {
+        let req = complete_request("Question:\nBuild me LRU cache in Python.");
+        let plan = answer_plan_for_request(&req, "instant", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Coding);
+        assert_eq!(lane_for_answer_plan("instant", &plan, true), "deep");
     }
 
     #[test]

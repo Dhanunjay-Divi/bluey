@@ -73,10 +73,23 @@ function AccountCard() {
   const [acceptCreditLoss, setAcceptCreditLoss] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
   useEffect(() => {
-    invoke<AccountMe | null>("account_me")
-      .then(setMe)
-      .catch(() => {})
-      .finally(() => setLoaded(true));
+    let cancelled = false;
+    const loadAccount = (markLoaded: boolean) => {
+      invoke<AccountMe | null>("account_me")
+        .then((next) => {
+          if (!cancelled) setMe(next);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled && markLoaded) setLoaded(true);
+        });
+    };
+    loadAccount(true);
+    const id = window.setInterval(() => loadAccount(false), 10_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
   }, []);
 
   async function signIn() {

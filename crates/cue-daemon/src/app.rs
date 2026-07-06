@@ -14,8 +14,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::Parser;
 use cue_core::ai::{
     AnswerFinishReason, AnswerRequest, AnswerResponse, AnswerResponseMetadata, AnswerStreamEvent,
-    CostEstimate, ProviderClientConfig, ProviderRequestPayload, RouteAttemptMetadata,
-    SafetyOutcome, TokenUsage,
+    CostBudget, CostEstimate, LatencyBudget, ProviderClientConfig, ProviderRequestPayload,
+    RouteAttemptMetadata, SafetyOutcome, TokenUsage,
 };
 use cue_core::app_paths::AppPaths;
 use cue_core::audio::{AudioPlatformCapability, AudioRuntimeMode};
@@ -38,6 +38,7 @@ use cue_llm::{
     LlmArtifactMetadata, LlmProvider as _, LlmRequest, LlmSourceMetadata,
 };
 use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command as TokioCommand;
@@ -288,6 +289,79 @@ fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn stable_text_hash_prefix(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "none".to_string();
+    }
+    let digest = Sha256::digest(trimmed.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+fn contains_any_text(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn looks_like_fast_conceptual_overlay_question(compact_question: &str) -> bool {
+    let word_count = word_count(compact_question);
+    if word_count == 0 || word_count > 16 || compact_question.chars().count() > 180 {
+        return false;
+    }
+
+    if looks_like_algorithmic_challenge_question(compact_question)
+        || contains_any_text(
+            compact_question,
+            &[
+                "write code",
+                "write a code",
+                "give me code",
+                "full code",
+                "complete code",
+                "build me",
+                "implement",
+                "debug",
+                "fix this",
+                "stack trace",
+                "leetcode",
+                "screenshot",
+                "screen context",
+                "attached",
+                "current session",
+                "transcript",
+                "search web",
+                "look up",
+                "latest",
+            ],
+        )
+    {
+        return false;
+    }
+
+    contains_any_text(
+        compact_question,
+        &[
+            "difference between",
+            "compare",
+            " vs ",
+            " versus ",
+            "what is",
+            "what are",
+            "why is",
+            "why does",
+            "how does",
+            "how do",
+            "can you explain",
+            "explain me",
+            "explain the difference",
+            "when would",
+        ],
+    )
+}
+
 fn answer_context_shape(context: &[AnswerContext]) -> AnswerContextShape {
     let mut shape = AnswerContextShape {
         total: context.len(),
@@ -308,6 +382,9 @@ fn answer_context_shape(context: &[AnswerContext]) -> AnswerContextShape {
 fn question_intent_label(question: &str) -> &'static str {
     let lower = question.to_ascii_lowercase();
     let compact = lower.replace(|ch: char| !ch.is_ascii_alphanumeric(), " ");
+    if looks_like_fast_conceptual_overlay_question(&compact) {
+        return "quick_explanation";
+    }
     let has_code_signal = looks_like_algorithmic_challenge_question(&compact)
         || [
             "code",
@@ -418,6 +495,7 @@ fn log_answer_request_diagnostics(
     let context = answer_context_shape(&request.context);
     info!(
         request_id = %request.metadata.request_id,
+        question_hash = %stable_text_hash_prefix(&request.question),
         source = %source,
         route_primary = %request.route.primary.provider.display_label(),
         route_fallbacks = request.route.fallbacks.len(),
@@ -522,6 +600,7 @@ fn log_answer_failure_diagnostics(
     warn!(
         request_id = %request.metadata.request_id,
         request_ref = %short_request_ref(request.metadata.request_id),
+        question_hash = %stable_text_hash_prefix(&request.question),
         meeting_id = %meeting.id,
         session_code = %meeting.session_code(),
         source = %source,
@@ -2310,11 +2389,7 @@ async fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let device_id = load_account(&daemon.paths)
-        .ok()
-        .flatten()
-        .map(|account| account.device_id)
-        .filter(|device_id| is_persisted_cloud_device_id(device_id));
+    let device_id = stored_cloud_device_id(&daemon.paths);
     crate::cloud::balance::spawn_loop_with_shutdown_for_device(
         client,
         daemon.balance_watch.clone(),
@@ -2333,6 +2408,24 @@ async fn stop_balance_polling(daemon: &Arc<Daemon>) {
 async fn restart_balance_polling(daemon: &Arc<Daemon>) {
     stop_balance_polling(daemon).await;
     maybe_spawn_balance_polling(daemon).await;
+}
+
+async fn mark_cloud_account_signed_out(daemon: &Arc<Daemon>, reason: &'static str) {
+    clear_listen_account_verification(daemon).await;
+    stop_balance_polling(daemon).await;
+    daemon.balance_watch.clear();
+    info!(
+        reason,
+        "local Bluey account tokens cleared; overlay marked signed out"
+    );
+    let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: false }).await;
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetBalance {
+            label: "Sign in".to_string(),
+        },
+    )
+    .await;
 }
 
 fn spawn_auto_cloud_sync(daemon: &Arc<Daemon>, reason: &'static str, trace_id: Option<String>) {
@@ -2473,6 +2566,8 @@ fn spawn_overlay_balance_bridge(daemon: Arc<Daemon>) {
             match next {
                 Some(snapshot) => push_overlay_balance_snapshot(&daemon, snapshot).await,
                 None => {
+                    clear_listen_account_verification(&daemon).await;
+                    stop_balance_polling(&daemon).await;
                     let _ = send_overlay(
                         &daemon,
                         OverlayCommand::SetAccountState { signed_in: false },
@@ -3086,15 +3181,17 @@ async fn verify_cloud_account_for_listen(
         }
     };
 
-    match timeout(
-        Duration::from_secs(4),
-        client.auth_get::<cue_cloud_client::AccountMe>("/account/me"),
-    )
+    match timeout(Duration::from_secs(4), async {
+        verify_stored_cloud_device_link(paths, &client).await?;
+        client
+            .auth_get::<cue_cloud_client::AccountMe>("/account/me")
+            .await
+    })
     .await
     {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => {
-            if listen_auth_error_should_clear_tokens(&error) {
+            if cloud_auth_error_should_clear_tokens(&error) {
                 if let Err(clear_error) = client.clear_tokens() {
                     warn!("failed to clear invalid Bluey account tokens: {clear_error:#}");
                 }
@@ -3134,14 +3231,6 @@ async fn verify_cloud_account_for_listen(
                 .to_string(),
         )),
     }
-}
-
-fn listen_auth_error_should_clear_tokens(error: &cue_cloud_client::Error) -> bool {
-    matches!(
-        error,
-        cue_cloud_client::Error::Unauthorized
-            | cue_cloud_client::Error::Server { status: 403 | 404 }
-    )
 }
 
 async fn ensure_active_meeting_for_session(
@@ -4420,10 +4509,19 @@ async fn real_audio_relay_loop(
     let mut handles = Vec::with_capacity(source_count);
     let relay_cloud = match build_cloud_client(&daemon.paths, None) {
         Ok(client) => {
-            if let Err(error) = client
-                .auth_get::<cue_cloud_client::AccountMe>("/account/me")
-                .await
-            {
+            let account_check = async {
+                verify_stored_cloud_device_link(&daemon.paths, &client).await?;
+                client
+                    .auth_get::<cue_cloud_client::AccountMe>("/account/me")
+                    .await
+            };
+            if let Err(error) = account_check.await {
+                if cloud_auth_error_should_clear_tokens(&error) {
+                    if let Err(clear_error) = client.clear_tokens() {
+                        warn!("failed to clear invalid Bluey account tokens: {clear_error:#}");
+                    }
+                    mark_cloud_account_signed_out(&daemon, "live_audio_account_check").await;
+                }
                 let message = compact_snippet(
                     &format!("Bluey account is not ready for live captions: {error:#}"),
                     260,
@@ -5322,18 +5420,26 @@ fn format_duration(duration: Duration) -> String {
 }
 
 async fn refresh_overlay_balance(daemon: &Arc<Daemon>, trace_id: Option<&str>) -> Option<String> {
-    let snapshot = fetch_current_balance_snapshot(trace_id).await?;
-    let label = format_balance_cents(snapshot.balance_cents);
-    daemon.balance_watch.publish(snapshot);
-    let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
-    let _ = send_overlay(
-        daemon,
-        OverlayCommand::SetBalance {
-            label: label.clone(),
-        },
-    )
-    .await;
-    Some(label)
+    match fetch_current_balance_snapshot(trace_id).await {
+        BalanceLookup::Snapshot(snapshot) => {
+            let label = format_balance_cents(snapshot.balance_cents);
+            daemon.balance_watch.publish(snapshot);
+            let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::SetBalance {
+                    label: label.clone(),
+                },
+            )
+            .await;
+            Some(label)
+        }
+        BalanceLookup::SignedOut => {
+            mark_cloud_account_signed_out(daemon, "balance_refresh").await;
+            None
+        }
+        BalanceLookup::Unavailable => None,
+    }
 }
 
 async fn refresh_overlay_context_items(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
@@ -5878,31 +5984,37 @@ fn should_show_overlay_context_item(item: &ContextArtifact) -> bool {
     }
 }
 
-async fn fetch_current_balance_snapshot(
-    trace_id: Option<&str>,
-) -> Option<crate::cloud::balance::BalanceSnapshot> {
+enum BalanceLookup {
+    Snapshot(crate::cloud::balance::BalanceSnapshot),
+    SignedOut,
+    Unavailable,
+}
+
+async fn fetch_current_balance_snapshot(trace_id: Option<&str>) -> BalanceLookup {
     let paths = match AppPaths::discover() {
         Ok(paths) => paths,
         Err(error) => {
             debug!("balance lookup skipped; app paths unavailable: {error}");
-            return None;
+            return BalanceLookup::Unavailable;
         }
     };
     let client = match build_cloud_client(&paths, trace_id) {
         Ok(client) => client,
         Err(error) => {
             debug!("balance lookup skipped; account store unavailable: {error}");
-            return None;
+            return BalanceLookup::Unavailable;
         }
     };
 
-    match tokio::time::timeout(
-        Duration::from_secs(3),
-        client.auth_get::<cue_cloud_client::AccountMe>("/account/me"),
-    )
+    match tokio::time::timeout(Duration::from_secs(3), async {
+        verify_stored_cloud_device_link(&paths, &client).await?;
+        client
+            .auth_get::<cue_cloud_client::AccountMe>("/account/me")
+            .await
+    })
     .await
     {
-        Ok(Ok(me)) => Some(crate::cloud::balance::BalanceSnapshot {
+        Ok(Ok(me)) => BalanceLookup::Snapshot(crate::cloud::balance::BalanceSnapshot {
             balance_cents: me.balance_cents,
             trial_seconds_remaining: me.trial_seconds_remaining,
             auto_topup_enabled: me.auto_topup_enabled,
@@ -5913,12 +6025,20 @@ async fn fetch_current_balance_snapshot(
                 && me.balance_cents > 0,
         }),
         Ok(Err(error)) => {
-            debug!("balance lookup skipped: {error}");
-            None
+            if cloud_auth_error_should_clear_tokens(&error) {
+                warn!(error = %error, "balance lookup found revoked Bluey account; clearing local tokens");
+                if let Err(clear_error) = client.clear_tokens() {
+                    warn!("failed to clear invalid Bluey account tokens: {clear_error:#}");
+                }
+                BalanceLookup::SignedOut
+            } else {
+                debug!("balance lookup skipped: {error}");
+                BalanceLookup::Unavailable
+            }
         }
         Err(_) => {
             debug!("balance lookup skipped: timed out");
-            None
+            BalanceLookup::Unavailable
         }
     }
 }
@@ -6207,6 +6327,42 @@ fn stable_cloud_device_id_path(paths: &AppPaths) -> PathBuf {
 fn is_persisted_cloud_device_id(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty() && value != "local-device"
+}
+
+fn stored_cloud_device_id(paths: &AppPaths) -> Option<String> {
+    load_account(paths)
+        .ok()
+        .flatten()
+        .map(|account| account.device_id)
+        .filter(|device_id| is_persisted_cloud_device_id(device_id))
+}
+
+async fn verify_stored_cloud_device_link(
+    paths: &AppPaths,
+    client: &cue_cloud_client::CloudClient,
+) -> std::result::Result<(), cue_cloud_client::Error> {
+    let Some(device_id) = stored_cloud_device_id(paths) else {
+        return Ok(());
+    };
+    let status: cue_cloud_client::DeviceStatusResponse = client
+        .auth_post(
+            "/account/devices/status",
+            &cue_cloud_client::DeviceStatusRequest { device_id },
+        )
+        .await?;
+    if status.active {
+        Ok(())
+    } else {
+        Err(cue_cloud_client::Error::Unauthorized)
+    }
+}
+
+fn cloud_auth_error_should_clear_tokens(error: &cue_cloud_client::Error) -> bool {
+    matches!(
+        error,
+        cue_cloud_client::Error::Unauthorized
+            | cue_cloud_client::Error::Server { status: 403 | 404 }
+    )
 }
 
 fn write_private_text(path: &Path, value: &str) -> Result<()> {
@@ -7218,6 +7374,7 @@ async fn answer_with_provider_runtime(
     mut request: AnswerRequest,
     source: impl Into<String>,
 ) -> Result<(AnswerResponse, Vec<AnswerStreamEvent>)> {
+    let pipeline_started_at = Instant::now();
     let source = source.into();
     request.question = request.question.trim().to_string();
     if request.question.is_empty() {
@@ -7253,7 +7410,9 @@ async fn answer_with_provider_runtime(
         (meeting.clone(), answer_meeting)
     };
 
-    if request.context.is_empty() {
+    let context_started_at = Instant::now();
+    let context_was_empty = request.context.is_empty();
+    if context_was_empty {
         request.context = answer_context_for_question(
             daemon,
             &meeting_snapshot,
@@ -7263,6 +7422,7 @@ async fn answer_with_provider_runtime(
         .await;
     }
     promote_request_to_vision_for_screen_context(&daemon.paths, &mut request);
+    let context_prepare_ms = elapsed_ms(context_started_at);
 
     let question_attachment_ids = question_attachment_ids_for_request(
         &meeting_snapshot,
@@ -7291,6 +7451,7 @@ async fn answer_with_provider_runtime(
     .await;
     write_state(daemon).await?;
 
+    let answer_card_started_at = Instant::now();
     let initial_progress = initial_answer_progress_text(&request);
     let answer_card = CueCard::new(CardKind::Answer, "Bluey", initial_progress)
         .with_source(format!("{} ({})", source, request.metadata.request_id));
@@ -7307,7 +7468,30 @@ async fn answer_with_provider_runtime(
         progress = initial_progress,
         "answer pipeline created visible progress card"
     );
+    let overlay_card_ms = elapsed_ms(answer_card_started_at);
 
+    info!(
+        request_id = %request.metadata.request_id,
+        request_ref = %short_request_ref(request.metadata.request_id),
+        meeting_id = %meeting_snapshot.id,
+        session_code = %meeting_snapshot.session_code(),
+        generation_id,
+        route_primary = %request.route.primary.provider.display_label(),
+        route_fallbacks = request.route.fallbacks.len(),
+        question_hash = %stable_text_hash_prefix(&request.question),
+        question_chars = request.question.chars().count(),
+        question_words = word_count(&request.question),
+        question_intent = question_intent_label(&request.question),
+        context_was_empty,
+        context_prepare_ms,
+        overlay_card_ms,
+        prep_total_ms = elapsed_ms(pipeline_started_at),
+        visible_context_count = question_display_context.len(),
+        attachment_ids = question_attachment_ids.len(),
+        "answer pipeline route start diagnostics"
+    );
+
+    let route_started_at = Instant::now();
     let outcome = match resolve_answer_route(
         &daemon.paths,
         &request,
@@ -7336,7 +7520,20 @@ async fn answer_with_provider_runtime(
             return Err(error);
         }
     };
+    let route_total_ms = elapsed_ms(route_started_at);
     let safety = outcome.safety.clone();
+    info!(
+        request_id = %request.metadata.request_id,
+        request_ref = %short_request_ref(request.metadata.request_id),
+        generation_id,
+        provider = %outcome.provider.display_label(),
+        route_total_ms,
+        answer_start_latency_ms = overlay_stream.answer_start_latency_ms(),
+        pipeline_total_ms = elapsed_ms(pipeline_started_at),
+        attempt_count = outcome.attempts.len(),
+        sources_count = outcome.sources.len(),
+        "answer pipeline route completed diagnostics"
+    );
     log_answer_completion_diagnostics(
         &request,
         &outcome.provider,
@@ -9324,15 +9521,27 @@ async fn call_bluey_managed_provider(
         info!(
             provider = %provider.display_label(),
             request_id = %request.metadata.request_id,
+            request_ref = %short_request_ref(request.metadata.request_id),
             lane = ?lane,
             max_tokens = llm_request.max_tokens,
             image_count = llm_request.image_data_urls.len(),
+            system_chars = llm_request.system.chars().count(),
+            user_chars = llm_request.user.chars().count(),
+            user_hash = %stable_text_hash_prefix(&llm_request.user),
             "managed provider stream starting"
         );
         let mut chunks = managed
             .complete_stream(&llm_request)
             .await
             .map_err(managed_llm_error)?;
+        info!(
+            provider = %provider.display_label(),
+            request_id = %request.metadata.request_id,
+            request_ref = %short_request_ref(request.metadata.request_id),
+            lane = ?lane,
+            stream_connect_ms = elapsed_ms(started_at),
+            "managed provider stream connected"
+        );
         let mut answer = String::new();
         let mut token_usage = None;
         let mut cost_label = None;
@@ -9340,6 +9549,8 @@ async fn call_bluey_managed_provider(
         let mut sources = Vec::new();
         let mut saw_finished = false;
         let mut blocked_internal_output = false;
+        let mut first_event_logged = false;
+        let mut first_text_logged = false;
         while let Some(chunk) = chunks.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
@@ -9386,6 +9597,20 @@ async fn call_bluey_managed_provider(
                     return Err(error);
                 }
             };
+            if !first_event_logged {
+                first_event_logged = true;
+                info!(
+                    provider = %provider.display_label(),
+                    request_id = %request.metadata.request_id,
+                    request_ref = %short_request_ref(request.metadata.request_id),
+                    lane = ?lane,
+                    first_event_ms = elapsed_ms(started_at),
+                    has_status = chunk.status.is_some(),
+                    text_chars = chunk.text.chars().count(),
+                    sources_count = chunk.sources.len(),
+                    "managed provider stream first event"
+                );
+            }
             if let Some(status) = chunk.status.as_ref() {
                 if let Some(stream) = stream.as_mut() {
                     stream.push_status(&status.message).await?;
@@ -9400,6 +9625,18 @@ async fn call_bluey_managed_provider(
                 }
             }
             if !chunk.text.is_empty() && !blocked_internal_output {
+                if !first_text_logged {
+                    first_text_logged = true;
+                    info!(
+                        provider = %provider.display_label(),
+                        request_id = %request.metadata.request_id,
+                        request_ref = %short_request_ref(request.metadata.request_id),
+                        lane = ?lane,
+                        first_text_ms = elapsed_ms(started_at),
+                        first_text_chars = chunk.text.chars().count(),
+                        "managed provider stream first text"
+                    );
+                }
                 let text = sanitize_answer_text(&chunk.text);
                 let candidate = format!("{answer}{text}");
                 let text = if text == INTERNAL_DISCLOSURE_REFUSAL
@@ -9429,6 +9666,21 @@ async fn call_bluey_managed_provider(
                 saw_finished = true;
             }
         }
+        info!(
+            provider = %provider.display_label(),
+            request_id = %request.metadata.request_id,
+            request_ref = %short_request_ref(request.metadata.request_id),
+            lane = ?lane,
+            stream_total_ms = elapsed_ms(started_at),
+            answer_chars = answer.chars().count(),
+            saw_finished,
+            first_event_seen = first_event_logged,
+            first_text_seen = first_text_logged,
+            sources_count = sources.len(),
+            token_output = token_usage.map(|usage| usage.output_tokens),
+            token_total = token_usage.map(|usage| usage.total_tokens),
+            "managed provider stream finished reading"
+        );
 
         let answer = answer.trim().to_string();
         if answer.is_empty() {
@@ -11240,7 +11492,7 @@ fn vision_answer_request(question: &str, provider: ProviderSelector) -> AnswerRe
 fn managed_provider_route(lane: &str) -> ProviderRoute {
     let lane = managed_lane_name_from_value(lane).unwrap_or("balanced");
     let mut route = ProviderRoute::direct(ProviderSelector::cue_managed(lane))
-        .with_budgets(RouteBudget::realtime())
+        .with_budgets(managed_route_budget_for_lane(lane))
         .with_policy(cue_core::ai::RouteSelectionPolicy::Balanced)
         .with_privacy(PrivacyFlags::managed_commercial());
     if lane == "vision" {
@@ -11249,6 +11501,16 @@ fn managed_provider_route(lane: &str) -> ProviderRoute {
             .with_privacy(PrivacyFlags::managed_commercial().with_image_upload());
     }
     route
+}
+
+fn managed_route_budget_for_lane(lane: &str) -> RouteBudget {
+    if lane == "instant" {
+        return RouteBudget::new(
+            LatencyBudget::realtime(),
+            CostBudget::new(None, Some(384), Some(4_000), None),
+        );
+    }
+    RouteBudget::realtime()
 }
 
 fn select_vision_provider(paths: &AppPaths) -> Option<ProviderSelector> {
@@ -11300,7 +11562,13 @@ fn answer_request_from_overlay(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("auto");
     let model = normalized_overlay_model(provider, model.as_deref());
-    let route = if let Some(lane) = overlay_managed_lane(provider, model, mode.as_deref()) {
+    let route = if let Some(lane) = overlay_managed_lane(
+        provider,
+        model,
+        mode.as_deref(),
+        &question,
+        !visible_context_ids.is_empty(),
+    ) {
         managed_provider_route(lane)
     } else if dev_direct_provider_keys_enabled() {
         ProviderRoute::direct(provider_selector(provider, model))
@@ -11352,17 +11620,75 @@ fn overlay_managed_lane<'a>(
     provider: &str,
     model: Option<&'a str>,
     mode: Option<&'a str>,
+    question: &str,
+    has_visible_context: bool,
 ) -> Option<&'static str> {
-    for value in [model, mode, Some(provider)].into_iter().flatten() {
-        if let Some(lane) = managed_lane_name_from_value(value) {
+    if let Some(value) = model {
+        if let Some(lane) = explicit_overlay_lane_from_model(value) {
             return Some(lane);
         }
     }
-    if is_auto_provider(provider) {
-        Some("balanced")
-    } else {
-        None
+    if let Some(value) = mode {
+        if let Some(lane) = explicit_overlay_lane_from_mode(value) {
+            return Some(lane);
+        }
     }
+    if !is_auto_provider(provider) {
+        return managed_lane_name_from_value(provider);
+    }
+    Some(infer_auto_managed_lane(question, has_visible_context))
+}
+
+fn explicit_overlay_lane_from_model(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase().replace(['-', '_'], " ");
+    if matches!(normalized.as_str(), "auto" | "default" | "general") {
+        return None;
+    }
+    managed_lane_name_from_value(value)
+}
+
+fn explicit_overlay_lane_from_mode(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase().replace(['-', '_'], " ");
+    match normalized.as_str() {
+        "code" | "system design" | "system-design" | "reasoning" | "deep" | "hard" => Some("deep"),
+        "screen" | "vision" | "screenshot" | "analyse screen" | "analyze screen" => Some("vision"),
+        "instant" | "quick" | "fast" | "easy" => Some("instant"),
+        "balanced" | "normal" => Some("balanced"),
+        _ => None,
+    }
+}
+
+fn infer_auto_managed_lane(question: &str, has_visible_context: bool) -> &'static str {
+    if has_visible_context {
+        return "vision";
+    }
+    let lower = question.to_ascii_lowercase();
+    let compact = lower.replace(|ch: char| !ch.is_ascii_alphanumeric(), " ");
+    if looks_like_fast_conceptual_overlay_question(&compact) {
+        return "instant";
+    }
+    if looks_like_algorithmic_challenge_question(&compact)
+        || contains_any_text(
+            &compact,
+            &[
+                "write code",
+                "write a code",
+                "give me code",
+                "full code",
+                "complete code",
+                "build me",
+                "implement",
+                "leetcode",
+                "sudoku",
+                "lru cache",
+                "dynamic programming",
+                "backtracking",
+            ],
+        )
+    {
+        return "deep";
+    }
+    "balanced"
 }
 
 fn managed_lane_name_from_value(value: &str) -> Option<&'static str> {
@@ -17208,7 +17534,7 @@ mod tests {
     fn answer_diagnostics_classify_question_and_text_shape_without_content() {
         assert_eq!(
             question_intent_label("Can you explain the logic for an LRU cache?"),
-            "code_explanation"
+            "quick_explanation"
         );
         assert_eq!(
             question_intent_label("Build me an LRU cache"),
@@ -17510,6 +17836,42 @@ mod tests {
             .is_some_and(|instructions| instructions.contains("small changed block")
                 && instructions.contains("PATCH")
                 && instructions.contains("unified diff")));
+    }
+
+    #[test]
+    fn overlay_auto_routes_short_conceptual_questions_to_instant() {
+        let request = answer_request_from_overlay(
+            "Can you explain me the difference between LRU cache and SRU?",
+            Some("auto".to_string()),
+            Some("auto".to_string()),
+            Some("Auto".to_string()),
+            Vec::new(),
+        );
+
+        assert_eq!(request.route.primary.provider.model_or(""), "instant");
+        assert_eq!(request.route.budgets.cost.max_output_tokens, Some(384));
+
+        let api = answer_request_from_overlay(
+            "How do you approach API versioning in your project?",
+            Some("auto".to_string()),
+            None,
+            Some("Auto".to_string()),
+            Vec::new(),
+        );
+        assert_eq!(api.route.primary.provider.model_or(""), "instant");
+    }
+
+    #[test]
+    fn overlay_auto_keeps_code_generation_on_deep_lane() {
+        let request = answer_request_from_overlay(
+            "Build me LRU cache in Python.",
+            Some("auto".to_string()),
+            Some("auto".to_string()),
+            Some("Auto".to_string()),
+            Vec::new(),
+        );
+
+        assert_eq!(request.route.primary.provider.model_or(""), "deep");
     }
 
     #[test]
@@ -18241,13 +18603,13 @@ mod tests {
 
     #[test]
     fn listen_auth_gate_clears_deleted_account_errors() {
-        assert!(listen_auth_error_should_clear_tokens(
+        assert!(cloud_auth_error_should_clear_tokens(
             &cue_cloud_client::Error::Unauthorized
         ));
-        assert!(listen_auth_error_should_clear_tokens(
+        assert!(cloud_auth_error_should_clear_tokens(
             &cue_cloud_client::Error::Server { status: 404 }
         ));
-        assert!(!listen_auth_error_should_clear_tokens(
+        assert!(!cloud_auth_error_should_clear_tokens(
             &cue_cloud_client::Error::RateLimited {
                 retry_after_secs: 10
             }
