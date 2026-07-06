@@ -431,7 +431,7 @@ balance, tier projection. No hidden charges, no opaque billing.
 
 | Customer sees | Server does |
 |---|---|
-| Pill with live balance | `/account/me` polled every 30s OR balance pushed via WebSocket |
+| Pill with live balance | `/account/me` polled every 10s OR balance pushed after paid actions |
 | Per-card cost label | response header trailer with `actual_cost_cents` |
 | LaneBadge with provider/model | response trailer with `lane`, `provider`, `model` |
 | "Add $30" banner | 402 Payment Required from server with reason field |

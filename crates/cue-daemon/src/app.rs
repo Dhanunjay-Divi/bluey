@@ -2389,11 +2389,7 @@ async fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let device_id = load_account(&daemon.paths)
-        .ok()
-        .flatten()
-        .map(|account| account.device_id)
-        .filter(|device_id| is_persisted_cloud_device_id(device_id));
+    let device_id = stored_cloud_device_id(&daemon.paths);
     crate::cloud::balance::spawn_loop_with_shutdown_for_device(
         client,
         daemon.balance_watch.clone(),
@@ -2412,6 +2408,24 @@ async fn stop_balance_polling(daemon: &Arc<Daemon>) {
 async fn restart_balance_polling(daemon: &Arc<Daemon>) {
     stop_balance_polling(daemon).await;
     maybe_spawn_balance_polling(daemon).await;
+}
+
+async fn mark_cloud_account_signed_out(daemon: &Arc<Daemon>, reason: &'static str) {
+    clear_listen_account_verification(daemon).await;
+    stop_balance_polling(daemon).await;
+    daemon.balance_watch.clear();
+    info!(
+        reason,
+        "local Bluey account tokens cleared; overlay marked signed out"
+    );
+    let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: false }).await;
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetBalance {
+            label: "Sign in".to_string(),
+        },
+    )
+    .await;
 }
 
 fn spawn_auto_cloud_sync(daemon: &Arc<Daemon>, reason: &'static str, trace_id: Option<String>) {
@@ -2552,6 +2566,8 @@ fn spawn_overlay_balance_bridge(daemon: Arc<Daemon>) {
             match next {
                 Some(snapshot) => push_overlay_balance_snapshot(&daemon, snapshot).await,
                 None => {
+                    clear_listen_account_verification(&daemon).await;
+                    stop_balance_polling(&daemon).await;
                     let _ = send_overlay(
                         &daemon,
                         OverlayCommand::SetAccountState { signed_in: false },
@@ -3165,15 +3181,17 @@ async fn verify_cloud_account_for_listen(
         }
     };
 
-    match timeout(
-        Duration::from_secs(4),
-        client.auth_get::<cue_cloud_client::AccountMe>("/account/me"),
-    )
+    match timeout(Duration::from_secs(4), async {
+        verify_stored_cloud_device_link(paths, &client).await?;
+        client
+            .auth_get::<cue_cloud_client::AccountMe>("/account/me")
+            .await
+    })
     .await
     {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => {
-            if listen_auth_error_should_clear_tokens(&error) {
+            if cloud_auth_error_should_clear_tokens(&error) {
                 if let Err(clear_error) = client.clear_tokens() {
                     warn!("failed to clear invalid Bluey account tokens: {clear_error:#}");
                 }
@@ -3213,14 +3231,6 @@ async fn verify_cloud_account_for_listen(
                 .to_string(),
         )),
     }
-}
-
-fn listen_auth_error_should_clear_tokens(error: &cue_cloud_client::Error) -> bool {
-    matches!(
-        error,
-        cue_cloud_client::Error::Unauthorized
-            | cue_cloud_client::Error::Server { status: 403 | 404 }
-    )
 }
 
 async fn ensure_active_meeting_for_session(
@@ -4499,10 +4509,19 @@ async fn real_audio_relay_loop(
     let mut handles = Vec::with_capacity(source_count);
     let relay_cloud = match build_cloud_client(&daemon.paths, None) {
         Ok(client) => {
-            if let Err(error) = client
-                .auth_get::<cue_cloud_client::AccountMe>("/account/me")
-                .await
-            {
+            let account_check = async {
+                verify_stored_cloud_device_link(&daemon.paths, &client).await?;
+                client
+                    .auth_get::<cue_cloud_client::AccountMe>("/account/me")
+                    .await
+            };
+            if let Err(error) = account_check.await {
+                if cloud_auth_error_should_clear_tokens(&error) {
+                    if let Err(clear_error) = client.clear_tokens() {
+                        warn!("failed to clear invalid Bluey account tokens: {clear_error:#}");
+                    }
+                    mark_cloud_account_signed_out(&daemon, "live_audio_account_check").await;
+                }
                 let message = compact_snippet(
                     &format!("Bluey account is not ready for live captions: {error:#}"),
                     260,
@@ -5401,18 +5420,26 @@ fn format_duration(duration: Duration) -> String {
 }
 
 async fn refresh_overlay_balance(daemon: &Arc<Daemon>, trace_id: Option<&str>) -> Option<String> {
-    let snapshot = fetch_current_balance_snapshot(trace_id).await?;
-    let label = format_balance_cents(snapshot.balance_cents);
-    daemon.balance_watch.publish(snapshot);
-    let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
-    let _ = send_overlay(
-        daemon,
-        OverlayCommand::SetBalance {
-            label: label.clone(),
-        },
-    )
-    .await;
-    Some(label)
+    match fetch_current_balance_snapshot(trace_id).await {
+        BalanceLookup::Snapshot(snapshot) => {
+            let label = format_balance_cents(snapshot.balance_cents);
+            daemon.balance_watch.publish(snapshot);
+            let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::SetBalance {
+                    label: label.clone(),
+                },
+            )
+            .await;
+            Some(label)
+        }
+        BalanceLookup::SignedOut => {
+            mark_cloud_account_signed_out(daemon, "balance_refresh").await;
+            None
+        }
+        BalanceLookup::Unavailable => None,
+    }
 }
 
 async fn refresh_overlay_context_items(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
@@ -5957,31 +5984,37 @@ fn should_show_overlay_context_item(item: &ContextArtifact) -> bool {
     }
 }
 
-async fn fetch_current_balance_snapshot(
-    trace_id: Option<&str>,
-) -> Option<crate::cloud::balance::BalanceSnapshot> {
+enum BalanceLookup {
+    Snapshot(crate::cloud::balance::BalanceSnapshot),
+    SignedOut,
+    Unavailable,
+}
+
+async fn fetch_current_balance_snapshot(trace_id: Option<&str>) -> BalanceLookup {
     let paths = match AppPaths::discover() {
         Ok(paths) => paths,
         Err(error) => {
             debug!("balance lookup skipped; app paths unavailable: {error}");
-            return None;
+            return BalanceLookup::Unavailable;
         }
     };
     let client = match build_cloud_client(&paths, trace_id) {
         Ok(client) => client,
         Err(error) => {
             debug!("balance lookup skipped; account store unavailable: {error}");
-            return None;
+            return BalanceLookup::Unavailable;
         }
     };
 
-    match tokio::time::timeout(
-        Duration::from_secs(3),
-        client.auth_get::<cue_cloud_client::AccountMe>("/account/me"),
-    )
+    match tokio::time::timeout(Duration::from_secs(3), async {
+        verify_stored_cloud_device_link(&paths, &client).await?;
+        client
+            .auth_get::<cue_cloud_client::AccountMe>("/account/me")
+            .await
+    })
     .await
     {
-        Ok(Ok(me)) => Some(crate::cloud::balance::BalanceSnapshot {
+        Ok(Ok(me)) => BalanceLookup::Snapshot(crate::cloud::balance::BalanceSnapshot {
             balance_cents: me.balance_cents,
             trial_seconds_remaining: me.trial_seconds_remaining,
             auto_topup_enabled: me.auto_topup_enabled,
@@ -5992,12 +6025,20 @@ async fn fetch_current_balance_snapshot(
                 && me.balance_cents > 0,
         }),
         Ok(Err(error)) => {
-            debug!("balance lookup skipped: {error}");
-            None
+            if cloud_auth_error_should_clear_tokens(&error) {
+                warn!(error = %error, "balance lookup found revoked Bluey account; clearing local tokens");
+                if let Err(clear_error) = client.clear_tokens() {
+                    warn!("failed to clear invalid Bluey account tokens: {clear_error:#}");
+                }
+                BalanceLookup::SignedOut
+            } else {
+                debug!("balance lookup skipped: {error}");
+                BalanceLookup::Unavailable
+            }
         }
         Err(_) => {
             debug!("balance lookup skipped: timed out");
-            None
+            BalanceLookup::Unavailable
         }
     }
 }
@@ -6286,6 +6327,42 @@ fn stable_cloud_device_id_path(paths: &AppPaths) -> PathBuf {
 fn is_persisted_cloud_device_id(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty() && value != "local-device"
+}
+
+fn stored_cloud_device_id(paths: &AppPaths) -> Option<String> {
+    load_account(paths)
+        .ok()
+        .flatten()
+        .map(|account| account.device_id)
+        .filter(|device_id| is_persisted_cloud_device_id(device_id))
+}
+
+async fn verify_stored_cloud_device_link(
+    paths: &AppPaths,
+    client: &cue_cloud_client::CloudClient,
+) -> std::result::Result<(), cue_cloud_client::Error> {
+    let Some(device_id) = stored_cloud_device_id(paths) else {
+        return Ok(());
+    };
+    let status: cue_cloud_client::DeviceStatusResponse = client
+        .auth_post(
+            "/account/devices/status",
+            &cue_cloud_client::DeviceStatusRequest { device_id },
+        )
+        .await?;
+    if status.active {
+        Ok(())
+    } else {
+        Err(cue_cloud_client::Error::Unauthorized)
+    }
+}
+
+fn cloud_auth_error_should_clear_tokens(error: &cue_cloud_client::Error) -> bool {
+    matches!(
+        error,
+        cue_cloud_client::Error::Unauthorized
+            | cue_cloud_client::Error::Server { status: 403 | 404 }
+    )
 }
 
 fn write_private_text(path: &Path, value: &str) -> Result<()> {
@@ -18526,13 +18603,13 @@ mod tests {
 
     #[test]
     fn listen_auth_gate_clears_deleted_account_errors() {
-        assert!(listen_auth_error_should_clear_tokens(
+        assert!(cloud_auth_error_should_clear_tokens(
             &cue_cloud_client::Error::Unauthorized
         ));
-        assert!(listen_auth_error_should_clear_tokens(
+        assert!(cloud_auth_error_should_clear_tokens(
             &cue_cloud_client::Error::Server { status: 404 }
         ));
-        assert!(!listen_auth_error_should_clear_tokens(
+        assert!(!cloud_auth_error_should_clear_tokens(
             &cue_cloud_client::Error::RateLimited {
                 retry_after_secs: 10
             }

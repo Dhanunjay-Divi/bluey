@@ -42,9 +42,9 @@ export function Home() {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    if (!silent) setError(null);
     const [sessionResult, accountResult, activeResult] = await Promise.allSettled([
       invoke<Session[]>("list_sessions"),
       invoke<AccountMe | null>("account_me"),
@@ -52,7 +52,7 @@ export function Home() {
     ]);
     if (sessionResult.status === "fulfilled") {
       setSessions(sessionResult.value);
-    } else {
+    } else if (!silent) {
       setError(String(sessionResult.reason));
     }
     if (accountResult.status === "fulfilled") {
@@ -61,11 +61,18 @@ export function Home() {
     if (activeResult.status === "fulfilled") {
       setActiveId(activeResult.value);
     }
-    setLoading(false);
+    if (!silent) setLoading(false);
   }, []);
 
   useEffect(() => {
     void load();
+  }, [load]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      void load(true);
+    }, 10_000);
+    return () => window.clearInterval(id);
   }, [load]);
 
   const recentSessions = useMemo(

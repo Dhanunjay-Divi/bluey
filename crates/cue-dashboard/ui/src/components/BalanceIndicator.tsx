@@ -31,7 +31,7 @@ export function BalanceIndicator() {
         });
     };
     poll();
-    const id = setInterval(poll, 30_000);
+    const id = setInterval(poll, 10_000);
     return () => {
       cancelled = true;
       clearInterval(id);
