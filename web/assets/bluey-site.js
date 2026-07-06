@@ -38,6 +38,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let currentAccountEmail = '';
     let currentAccountIsAdmin = false;
     let adminAbuseLoaded = false;
+    let accountSignOutInProgress = false;
+    let accountAuthEpoch = 0;
     let latestAccountForBilling = null;
     const AUTO_RELOAD_MIN_CENTS = 1500;
     const AUTO_RELOAD_MAX_CENTS = 50000;
@@ -140,6 +142,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function setAccountToken(auth, remember = accountTokenPersists()) {
+      accountSignOutInProgress = false;
+      accountAuthEpoch += 1;
       const target = remember ? localStorage : sessionStorage;
       const other = remember ? sessionStorage : localStorage;
       other.removeItem(ACCESS_TOKEN_KEY);
@@ -159,6 +163,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       currentAccountEmail = '';
       currentAccountIsAdmin = false;
       adminAbuseLoaded = false;
+      refreshAccountTokenPromise = null;
       syncAccountNav();
     }
 
@@ -192,10 +197,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function signOut() {
+      accountSignOutInProgress = true;
+      accountAuthEpoch += 1;
       const accessToken = accountToken();
       const refreshToken = accountRefreshToken();
       clearAccountToken();
+      closeProfileMenu();
       if (isAccountRoute) {
+        setAccountChrome(false);
         loadAccount().catch((error) => accountMessage(error.message));
       }
       await revokeBrowserSession(accessToken, refreshToken);
@@ -243,6 +252,17 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       button.setAttribute('aria-expanded', open ? 'true' : 'false');
     }
 
+    function handleSignOutClick(event) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      event?.stopImmediatePropagation?.();
+      closeProfileMenu();
+      signOut().catch(() => {
+        clearAccountToken();
+        if (isAccountRoute) setAccountChrome(false);
+      });
+    }
+
     function initProfileMenus() {
       document.querySelectorAll('[data-account-profile-button], #accountProfileButton').forEach((button) => {
         if (button.dataset.profileReady === '1') return;
@@ -259,16 +279,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         menu.addEventListener('click', (event) => {
           const signOutButton = event.target.closest('[data-sign-out]');
           if (signOutButton) {
-            event.preventDefault();
-            event.stopPropagation();
-            closeProfileMenu();
-            signOut().catch(() => {
-              clearAccountToken();
-            });
+            handleSignOutClick(event);
             return;
           }
           event.stopPropagation();
         });
+      });
+      document.querySelectorAll('[data-sign-out]').forEach((button) => {
+        if (button.dataset.signOutReady === '1') return;
+        button.dataset.signOutReady = '1';
+        button.addEventListener('click', handleSignOutClick);
       });
     }
 
@@ -490,8 +510,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     async function refreshAccountToken() {
       if (refreshAccountTokenPromise) return refreshAccountTokenPromise;
       refreshAccountTokenPromise = (async () => {
+        const epoch = accountAuthEpoch;
         const refreshToken = accountRefreshToken();
-        if (!refreshToken) return '';
+        if (!refreshToken || accountSignOutInProgress) return '';
         const response = await fetch('/auth/refresh', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -505,6 +526,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }
         if (!response.ok || !body?.access_token) {
           clearAccountToken();
+          return '';
+        }
+        if (accountSignOutInProgress || epoch !== accountAuthEpoch || !accountRefreshToken()) {
           return '';
         }
         setAccountToken(body, accountTokenPersists());
