@@ -14,7 +14,7 @@ use std::time::UNIX_EPOCH;
 use super::AppState;
 use crate::auth::AuthedAccount;
 use crate::db::accounts::Account;
-use crate::db::{account_data, diagnostic_logs, ops_audit};
+use crate::db::{account_data, diagnostic_logs, ops_audit, usage};
 
 #[derive(Serialize)]
 pub struct Health {
@@ -118,6 +118,28 @@ pub async fn echo_peer_key(req: axum::extract::Request) -> impl IntoResponse {
 /// Admin-only trial abuse summary. Returns hashed signals only.
 pub async fn trial_abuse(State(state): State<AppState>) -> impl IntoResponse {
     match crate::db::trial_abuse::admin_summary(&state.pool, 100) {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ProviderRoutingQuery {
+    pub hours: Option<i64>,
+}
+
+/// Admin-only provider routing summary. Aggregates final provider/model usage
+/// without returning prompts, transcripts, documents, or generated answer text.
+pub async fn provider_routing(
+    State(state): State<AppState>,
+    Query(query): Query<ProviderRoutingQuery>,
+) -> impl IntoResponse {
+    let hours = query.hours.unwrap_or(24).clamp(1, 24 * 30);
+    match usage::provider_routing_summary(&state.pool, hours) {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
