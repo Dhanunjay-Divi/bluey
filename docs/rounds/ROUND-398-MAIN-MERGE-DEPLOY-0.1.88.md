@@ -14,6 +14,7 @@ Merge the parallel Bluey web UI work and the latest backend/overlay fixes into `
 - Confirm `codex/bluey-web-ui-parallel-20260704` is already included in `main`.
 - Bump the desktop release version to `0.1.88` so update/download flows can distinguish this build from `0.1.87`.
 - Publish the static web UI and signed release manifest/artifact.
+- Fix the production preflight helper so diagnostic log retention checks run instead of failing on a missing `is_uint` helper.
 
 ## Included Fixes
 
@@ -33,6 +34,7 @@ Merge the parallel Bluey web UI work and the latest backend/overlay fixes into `
 - Release packaging with updater public key.
 - Signed live manifest verification after deploy.
 - Installer and public URL smoke checks after deploy.
+- Production preflight should pass all code checks; any remaining config gap must be recorded explicitly.
 
 ## Notes
 
