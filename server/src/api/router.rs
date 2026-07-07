@@ -1169,6 +1169,11 @@ fn answer_plan_for_request(
         && (looks_like_coding_question(&normalized_context) || has_code_shape(&normalized_context));
     let context_system_design =
         has_planning_context && looks_like_system_design_question(&normalized_context);
+    let context_system_design_followup = context_system_design
+        && !topic_reset
+        && looks_like_system_design_followup_question(&normalized);
+    let context_system_design_canvas_followup = context_system_design_followup
+        && looks_like_system_design_canvas_followup_question(&normalized);
     let diagram_request = looks_like_diagram_request(&normalized);
     let explicit_code_generation = looks_like_explicit_code_generation_request(&normalized);
     let coding = !quick_conceptual
@@ -1199,6 +1204,7 @@ fn answer_plan_for_request(
     let system_design = !behavioral
         && (diagram_request
             || looks_like_system_design_question(&normalized)
+            || context_system_design_canvas_followup
             || (generic_live_transcript_prompt && context_system_design));
     let screen = has_images
         || contains_any(
@@ -1319,6 +1325,8 @@ fn answer_plan_for_request(
         AnswerIntent::Coding
     } else if screen {
         AnswerIntent::Screen
+    } else if context_system_design_followup {
+        AnswerIntent::FollowUp
     } else if quick_conceptual {
         AnswerIntent::Quick
     } else if topic_reset && short_question {
@@ -2786,6 +2794,148 @@ fn looks_like_system_design_question(normalized: &str) -> bool {
     )
 }
 
+fn looks_like_system_design_followup_question(normalized: &str) -> bool {
+    if normalized.trim().is_empty() {
+        return false;
+    }
+    let followup_signal = contains_any(
+        normalized,
+        &[
+            "this design",
+            "that design",
+            "same design",
+            "above design",
+            "previous design",
+            "current design",
+            "this architecture",
+            "that architecture",
+            "same architecture",
+            "above architecture",
+            "previous architecture",
+            "current architecture",
+            "what about",
+            "how about",
+            "what happens if",
+            "what if",
+            "where would",
+            "when would",
+            "can we",
+            "should we",
+            "why did",
+            "why do",
+            "why use",
+            "why would",
+            "explain",
+            "walk me through",
+            "continue",
+            "keep going",
+            "go on",
+            "next section",
+            "next part",
+            "expand",
+            "elaborate",
+            "add ",
+            "include ",
+            "cover ",
+            "extend ",
+        ],
+    );
+    if !followup_signal {
+        return false;
+    }
+    contains_any(
+        normalized,
+        &[
+            "design",
+            "architecture",
+            "requirement",
+            "api",
+            "gateway",
+            "service",
+            "services",
+            "endpoint",
+            "token",
+            "counter",
+            "counters",
+            "redis",
+            "data model",
+            "database",
+            "schema",
+            "cache",
+            "queue",
+            "worker",
+            "workers",
+            "event",
+            "stream",
+            "latency",
+            "throughput",
+            "scale",
+            "scaling",
+            "shard",
+            "partition",
+            "replica",
+            "region",
+            "availability",
+            "consistency",
+            "tradeoff",
+            "failure",
+            "fallback",
+            "retry",
+            "observability",
+            "metrics",
+            "logs",
+            "security",
+            "auth",
+            "rate limit",
+        ],
+    ) || contains_any(
+        normalized,
+        &[
+            "continue",
+            "keep going",
+            "go on",
+            "next section",
+            "next part",
+        ],
+    )
+}
+
+fn looks_like_system_design_canvas_followup_question(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "continue",
+            "keep going",
+            "go on",
+            "next section",
+            "next part",
+            "expand",
+            "elaborate",
+            "add ",
+            "include ",
+            "cover ",
+            "extend ",
+            "append ",
+            "update ",
+            "fill in",
+            "what about",
+            "how about",
+            "failure mode",
+            "failure modes",
+            "tradeoff",
+            "tradeoffs",
+            "scaling",
+            "scale",
+            "data model",
+            "api design",
+            "observability",
+            "security",
+            "rate limiting",
+            "rollout",
+        ],
+    )
+}
+
 fn looks_like_diagram_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -2869,7 +3019,7 @@ fn prompt_with_answer_plan(
             "Answer like a polished interview coach and candidate voice: natural, first-person when appropriate, specific, and conversational. Use the supplied resume, JD, documents, transcript, and screen context to infer the role and domain, such as SDE, data engineer, BI engineer, data scientist, DevOps, security, product, or another role. First infer what the interviewer is testing, such as Dive Deep, ownership, technical depth, data quality, system judgment, prioritization, stakeholder communication, or tradeoffs, then make the response prove that signal. For resume-based introductions, self-introductions, or prompts like \"tell me about yourself\", do not compress the resume into one facts paragraph and do not ask the user what kind of long answer they want when the resume/context is already supplied. Use a speakable present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role. For introductions, give the full ready-to-say answer on the first response and aim for a 45-60 second answer unless the user explicitly asks for a shorter version. For role/domain interview questions, give a ready-to-say answer anchored only in the supplied company, project, tools, metrics, constraints, and role expectations; when useful, include a brief why-it-works or if-they-push-back recovery line. Do not defend weak story logic blindly: reframe it in a production-realistic way, such as code ownership, incident debugging, architecture tradeoffs, upstream data, ETL validation, reporting impact, stakeholder communication, or KPI definition. For interview stories, aim for a 45-90 second answer in tight paragraphs, not generic bullets, unless the user asks for notes. Do not invent metrics, employers, tools, source systems, clinical/finance details, latency windows, outcomes, or motivation beyond the supplied resume/JD/context. If exact story detail is missing, say the framing safely with phrases like \"I would frame it as...\" or \"the signal I would emphasize is...\" instead of fabricating a result. Never route resume/self-intro or interview-coaching prompts into system design just because they mention architecture or systems."
         }
         AnswerIntent::SystemDesign => {
-            "Use clear sections for requirements, architecture, data flow, tradeoffs, scaling, and failure modes. When the user asks for a diagram, pictorial representation, flowchart, sequence diagram, or visual explanation, start the canvas detail with `### Diagram` and include a compact ASCII box/arrow diagram or a fenced `mermaid` diagram with short labels. Keep it practical and avoid overexplaining obvious basics."
+            "Use clear sections for requirements, architecture, data flow, tradeoffs, scaling, and failure modes. When this is a follow-up to an existing system-design canvas, answer only the requested continuation or section; do not repeat the entire previous design, because the canvas keeps the earlier material. When the user asks for a diagram, pictorial representation, flowchart, sequence diagram, or visual explanation, start the canvas detail with `### Diagram` and include a compact ASCII box/arrow diagram or a fenced `mermaid` diagram with short labels. Keep it practical and avoid overexplaining obvious basics."
         }
         AnswerIntent::Screen => {
             "Use visible screen details first. Say when an important detail is not visible instead of inventing it."
@@ -8718,6 +8868,43 @@ mod tests {
         assert_eq!(plan.intent, AnswerIntent::SystemDesign);
         assert_eq!(plan.output, AnswerOutput::CanvasDetail);
         assert_eq!(plan.recommended_lane, "deep");
+        assert!(!plan.needs_web_search);
+    }
+
+    #[test]
+    fn answer_plan_system_design_section_followup_appends_canvas() {
+        let req = complete_request(
+            "Question:\nWhat about failure modes?\n\nSession context:\nPrevious system design answer:\nSystem Design\nDesign a rate limiter with an API gateway, token bucket, Redis counters, Postgres storage, queue workers, scaling, observability, and security.",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::SystemDesign);
+        assert_eq!(plan.output, AnswerOutput::CanvasDetail);
+        assert_eq!(plan.recommended_lane, "deep");
+        assert!(!plan.needs_web_search);
+
+        let (system, _user) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(system.contains("follow-up to an existing system-design canvas"));
+        assert!(system.contains("do not repeat the entire previous design"));
+    }
+
+    #[test]
+    fn answer_plan_system_design_explain_followup_stays_compact() {
+        let req = complete_request(
+            "Question:\nWhy did you choose Redis for the counters?\n\nSession context:\nPrevious system design answer:\nSystem Design\nDesign a rate limiter with an API gateway, Redis token counters, Postgres storage, queue workers, scaling, failure modes, and observability.",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::FollowUp);
+        assert_eq!(plan.output, AnswerOutput::Compact);
+        assert_eq!(plan.recommended_lane, "balanced");
         assert!(!plan.needs_web_search);
     }
 

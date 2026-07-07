@@ -11217,6 +11217,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if looksLikeNewCanvasQuestion(lower) {
             return false
         }
+        if artifact.kind == .systemDesign && looksLikeSystemDesignCanvasAppendFollowup(lower) {
+            return true
+        }
         if looksLikeCanvasExplanationFollowup(lower) && !looksLikeCanvasMutationFollowup(lower) {
             return false
         }
@@ -11244,6 +11247,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return false
         }
         let lower = question.lowercased()
+        if artifactKind == .systemDesign && looksLikeSystemDesignCanvasAppendFollowup(lower) {
+            return false
+        }
         if looksLikeNewCanvasQuestion(lower) || looksLikeCanvasMutationFollowup(lower) {
             return false
         }
@@ -11319,6 +11325,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "canvas",
             "workbench",
             "why did you use",
+            "why did you choose",
             "why are you using",
             "why can't we do",
             "why cant we do",
@@ -11327,6 +11334,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "explain that",
             "make it",
             "change it",
+            "continue",
+            "keep going",
+            "go on",
+            "next section",
+            "next part",
+            "what about",
+            "how about",
         ]
         return directSignals.contains { lower.contains($0) }
     }
@@ -11380,6 +11394,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let designSignals = [
             "architecture",
             "design",
+            "requirement",
+            "requirements",
             "scale",
             "scaling",
             "latency",
@@ -11389,6 +11405,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "database",
             "storage",
             "api",
+            "gateway",
+            "service",
+            "services",
+            "token",
+            "counter",
+            "counters",
+            "redis",
             "contract",
             "load balancer",
             "region",
@@ -11401,9 +11424,91 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "rollout",
             "vpc",
             "subnet",
+            "security",
+            "rate limit",
+            "rate limiting",
+            "consistency",
+            "availability",
+            "data model",
         ]
+        if looksLikeSystemDesignCanvasAppendFollowup(lower) {
+            return true
+        }
         return looksLikeCanvasExplanationFollowup(lower)
             && designSignals.contains { lower.contains($0) }
+    }
+
+    private func looksLikeSystemDesignCanvasAppendFollowup(_ lower: String) -> Bool {
+        let appendSignals = [
+            "continue",
+            "keep going",
+            "go on",
+            "next section",
+            "next part",
+            "expand",
+            "elaborate",
+            "add ",
+            "include ",
+            "cover ",
+            "extend ",
+            "append ",
+            "update ",
+            "fill in",
+            "what about",
+            "how about",
+        ]
+        guard appendSignals.contains(where: { lower.hasPrefix($0) || lower.contains(" \($0)") }) else {
+            return false
+        }
+        let designSections = [
+            "requirement",
+            "requirements",
+            "api",
+            "gateway",
+            "service",
+            "services",
+            "endpoint",
+            "token",
+            "counter",
+            "counters",
+            "redis",
+            "data model",
+            "database",
+            "schema",
+            "cache",
+            "queue",
+            "worker",
+            "workers",
+            "event",
+            "stream",
+            "latency",
+            "throughput",
+            "scale",
+            "scaling",
+            "shard",
+            "partition",
+            "replica",
+            "region",
+            "availability",
+            "consistency",
+            "tradeoff",
+            "tradeoffs",
+            "failure",
+            "failure mode",
+            "failure modes",
+            "fallback",
+            "retry",
+            "observability",
+            "metrics",
+            "logs",
+            "security",
+            "auth",
+            "rate limit",
+            "rate limiting",
+            "rollout",
+        ]
+        return designSections.contains { lower.contains($0) }
+            || ["continue", "keep going", "go on", "next section", "next part"].contains { lower.contains($0) }
     }
 
     private func sharesCanvasQuestionTerm(_ lower: String, sourceQuestion: String?) -> Bool {
