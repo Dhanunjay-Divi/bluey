@@ -130,6 +130,19 @@ pub struct CueSettings {
     /// to ask. Opt-in auto mode per the master doc's "suggest by default".
     #[serde(default)]
     pub auto_trigger_enabled: bool,
+
+    /// Live meeting memory (PLAN-CONTEXT-WARMUP SET 0): the decisions ledger +
+    /// rolling summary that keep the attached agent current during a meeting.
+    /// Extraction runs through a throwaway one-shot drive of the user's OWN
+    /// attached agent (never a Bluey-hosted model); the cloud cheap-lane is
+    /// only a fallback when one is configured. Default ON — this is the
+    /// product's context spine; turn off to stop all background extraction.
+    #[serde(default = "default_live_memory_enabled")]
+    pub live_memory_enabled: bool,
+}
+
+fn default_live_memory_enabled() -> bool {
+    true
 }
 
 impl Default for CueSettings {
@@ -156,6 +169,7 @@ impl Default for CueSettings {
             pinned_overlay_sessions: Vec::new(),
             my_names: Vec::new(),
             auto_trigger_enabled: false,
+            live_memory_enabled: true,
         }
     }
 }

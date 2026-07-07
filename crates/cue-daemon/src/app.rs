@@ -1019,6 +1019,11 @@ pub(crate) struct Daemon {
     /// Set true before spawning the bg refresh, cleared in the spawned task's
     /// finally-path.
     agent_refresh_inflight: std::sync::atomic::AtomicBool,
+    /// True while a rolling-summary pass is running (a throwaway one-shot drive
+    /// of the attached agent can take seconds), so interval boundaries hit while
+    /// a pass is in flight don't stack overlapping drives. Cleared in the
+    /// spawned task's finally-path.
+    summary_inflight: std::sync::atomic::AtomicBool,
     /// Monotonic generation counter bumped on every attach/detach cache flip
     /// (`refresh_overlay_agents_attached_only`). A background full-discovery
     /// tail captures this epoch at spawn time and only writes its result if the
@@ -1202,6 +1207,7 @@ pub async fn run() -> Result<()> {
         )),
         agent_cache: Mutex::new(None),
         agent_refresh_inflight: std::sync::atomic::AtomicBool::new(false),
+        summary_inflight: std::sync::atomic::AtomicBool::new(false),
         agent_cache_epoch: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "diarize")]
         audio_retention: Mutex::new(None),
@@ -1921,6 +1927,7 @@ async fn handle_request_inner(
                     ));
             }
             maybe_fire_ledger(daemon, &meeting_snapshot);
+            maybe_fire_summary(daemon, &meeting_snapshot);
             let has_cards = !cards.is_empty();
             for card in cards {
                 let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
@@ -6855,12 +6862,54 @@ async fn add_audio_transcript_segment_allowing_session_start(
 /// speaker-labelled window, runs a stateless cheap-lane extraction, verifies the
 /// output against the transcript, and merges surviving items into the daemon's
 /// ledger. The network call NEVER blocks the transcript path (fire-and-forget).
-fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
-    if !crate::ledger::enabled() {
-        return;
+/// Whether live meeting memory (ledger + rolling summary) is on. The
+/// `BLUEY_LEDGER` env var, when set, wins in both directions (dev/test
+/// override); otherwise the `live_memory_enabled` setting decides (default ON —
+/// extraction now runs through the user's own attached agent, so the original
+/// cloud-cost reason for gating no longer applies by default).
+fn live_memory_enabled(daemon: &Arc<Daemon>) -> bool {
+    if std::env::var("BLUEY_LEDGER").is_ok() {
+        return crate::ledger::enabled();
     }
+    load_settings(&daemon.paths)
+        .map(|settings| settings.live_memory_enabled)
+        .unwrap_or(true)
+}
+
+/// Run one **stateless, throwaway one-shot drive** of the attached agent for
+/// background memory work (ledger extraction / rolling summary). `resume: None`
+/// drives the agent's headless print mode — verified (claude, 2026-07) to
+/// persist NO session, so this never pollutes the user's session list or their
+/// answer session (PLAN-CONTEXT-WARMUP Appendix C). Returns `None` when no
+/// agent is attached or the drive fails — callers fall back or skip.
+async fn memory_oneshot_via_agent(daemon: &Arc<Daemon>, prompt: String) -> Option<String> {
+    let settings = load_settings(&daemon.paths).ok()?;
+    let kind = parse_attached_agent(settings.attached_agent.as_deref())?;
+    let question = AgentQuestion {
+        prompt,
+        context: None,
+        resume: None,
+        cwd: None,
+    };
+    match drive_and_collect(kind.clone(), question, DriveMode::Answer).await {
+        Ok(body) => Some(body),
+        Err(error) => {
+            debug!(
+                agent = %agent_display_name(&kind),
+                "memory one-shot drive failed: {error}"
+            );
+            None
+        }
+    }
+}
+
+fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     let len = meeting.transcript.len();
     if !crate::ledger::should_fire(len) {
+        return;
+    }
+    // Settings read only on interval boundaries — never per-segment.
+    if !live_memory_enabled(daemon) {
         return;
     }
     let window = crate::ledger::build_window(&meeting.last_transcript_text_bounded(
@@ -6872,7 +6921,22 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     }
     let daemon = Arc::clone(daemon);
     tokio::spawn(async move {
-        match ledger_extract_once(&window).await {
+        // Primary: the user's own attached agent (throwaway one-shot).
+        // Fallback: the legacy cloud cheap-lane, only when one is configured.
+        let extracted = match memory_oneshot_via_agent(
+            &daemon,
+            format!(
+                "{}\n\nTRANSCRIPT WINDOW:\n{}",
+                crate::ledger::system_prompt(),
+                window
+            ),
+        )
+        .await
+        {
+            Some(raw) => Ok(Some(raw)),
+            None => ledger_extract_once(&window).await,
+        };
+        match extracted {
             Ok(Some(raw)) => {
                 let (added, block) = {
                     let mut ledger = daemon.ledger.lock().await;
@@ -6901,12 +6965,85 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                 }
             }
             Ok(None) => {
-                debug!("ledger: no usable cheap provider configured; pass skipped");
+                debug!("ledger: no attached agent and no usable cheap provider; pass skipped");
             }
             Err(error) => {
                 warn!("ledger extraction pass failed: {error:#}");
             }
         }
+    });
+}
+
+/// Fire a rolling-summary pass on interval boundaries (see [`crate::summary`]).
+/// The pass drives the attached agent in a throwaway one-shot with (current
+/// summary + newest window) and REPLACES `meeting.summary` with the bounded
+/// result — the accumulation lives in OUR store, never in an agent session, so
+/// it survives agent restarts/compaction. `generate_recap` reuses a set
+/// `meeting.summary`, so the live summary also becomes the recap seed at
+/// meeting end. Fire-and-forget; the inflight guard stops passes stacking when
+/// the agent is slow.
+fn maybe_fire_summary(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let len = meeting.transcript.len();
+    if !crate::summary::should_fire(len) {
+        return;
+    }
+    if !live_memory_enabled(daemon) {
+        return;
+    }
+    if daemon.summary_inflight.swap(true, SeqCst) {
+        return; // a pass is already running; this boundary is skipped
+    }
+    let window = meeting.last_transcript_text_bounded(
+        crate::summary::interval_segments(),
+        crate::summary::WINDOW_MAX_CHARS,
+    );
+    if window.trim().is_empty() {
+        daemon.summary_inflight.store(false, SeqCst);
+        return;
+    }
+    let meeting_id = meeting.id;
+    let current_summary = meeting.summary.clone();
+    let daemon = Arc::clone(daemon);
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering::SeqCst;
+        let prompt = crate::summary::build_prompt(current_summary.as_deref(), &window);
+        match memory_oneshot_via_agent(&daemon, prompt).await {
+            Some(raw) => {
+                let bounded = crate::summary::bound_summary(&raw);
+                if bounded.is_empty() {
+                    debug!("rolling summary pass produced no usable text; kept previous");
+                } else {
+                    // Update ONLY if the same meeting is still active, and save
+                    // OFF the meeting lock (disk writes under that lock stall
+                    // the STT sink — see the streaming-audio invariants).
+                    let updated = {
+                        let mut guard = daemon.meeting.lock().await;
+                        match guard.as_mut() {
+                            Some(active) if active.id == meeting_id => {
+                                active.summary = Some(bounded);
+                                Some(active.clone())
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(meeting) = updated {
+                        if let Err(error) = daemon.store.save_active(&meeting) {
+                            warn!("rolling summary save failed: {error:#}");
+                        } else {
+                            debug!(
+                                chars = meeting.summary.as_deref().map(str::len).unwrap_or(0),
+                                "rolling summary refreshed"
+                            );
+                        }
+                    }
+                }
+            }
+            None => {
+                debug!("rolling summary pass skipped (no attached agent / drive failed)");
+            }
+        }
+        daemon.summary_inflight.store(false, SeqCst);
     });
 }
 
@@ -7009,6 +7146,7 @@ async fn add_audio_transcript_segment_inner(
 
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
     maybe_fire_ledger(daemon, &meeting_snapshot);
+    maybe_fire_summary(daemon, &meeting_snapshot);
     let title = match speaker {
         Speaker::System => "System",
         Speaker::User => "Mic",
@@ -10132,23 +10270,25 @@ fn answer_context_from_meeting_within(meeting: &MeetingRecord, primed: bool) -> 
         );
     }
 
-    // FIRST-TURN ONLY: the saved compacted summary is back-history the resumed
-    // agent (and later turns) don't need re-sent every message.
-    if !primed {
-        if let Some(summary) = meeting
-            .summary
-            .as_ref()
-            .filter(|summary| !summary.trim().is_empty())
-        {
-            context.push(
-                AnswerContext::new(
-                    AnswerContextKind::MeetingMemory,
-                    format!("Compacted summary:\n{}", summary.trim()),
-                )
-                .with_title(format!("{} summary", meeting.title))
-                .with_source("saved session summary"),
-            );
-        }
+    // ALWAYS: the rolling meeting summary (SET 0.3). It is refreshed live every
+    // interval (`maybe_fire_summary`) and bounded (≤ summary::SUMMARY_MAX_CHARS),
+    // so re-sending it each turn is cheap — and it carries the narrative that has
+    // scrolled OUT of the recency-bounded transcript window (the ledger carries
+    // decisions; the summary carries everything else). Pushed after the ledger,
+    // before the transcript, so compaction keeps it ahead of raw speech.
+    if let Some(summary) = meeting
+        .summary
+        .as_ref()
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        context.push(
+            AnswerContext::new(
+                AnswerContextKind::MeetingMemory,
+                format!("Meeting so far (rolling summary):\n{}", summary.trim()),
+            )
+            .with_title(format!("{} summary", meeting.title))
+            .with_source("live rolling summary"),
+        );
     }
 
     // ALWAYS: the recency-bounded transcript — the newest speech, which changes
@@ -13418,7 +13558,7 @@ mod tests {
 
         let summary = context
             .iter()
-            .find(|item| item.source.as_deref() == Some("saved session summary"))
+            .find(|item| item.source.as_deref() == Some("live rolling summary"))
             .expect("summary context");
         assert_eq!(summary.kind, AnswerContextKind::MeetingMemory);
         assert_eq!(summary.title.as_deref(), Some("System design prep summary"));
@@ -13428,12 +13568,12 @@ mod tests {
 
     #[test]
     fn primed_context_sends_only_the_pinned_delta_not_the_heavy_first_turn_blob() {
-        // A meeting with a saved summary + brief-worthy title + transcript. On the
+        // A meeting with a rolling summary + brief-worthy title + Q&A. On the
         // FIRST turn (unprimed) the heavy pieces are sent; on a PRIMED turn only
-        // the always-pinned delta (decisions ledger + recent transcript) is sent —
-        // no brief, no summary, no Bluey Q&A, no artifacts.
+        // the always-pinned delta is sent (decisions ledger + ROLLING SUMMARY +
+        // recent transcript — SET 0.3) — no brief, no Bluey Q&A, no artifacts.
         let mut meeting = MeetingRecord::new(Some("System design prep".to_string()));
-        meeting.summary = Some("Prior compacted summary text.".to_string());
+        meeting.summary = Some("- discussed sharding by tenant".to_string());
         meeting.push_conversation_turn(ConversationTurn::new(
             "what changed?".to_string(),
             "let me check the git state...".to_string(),
@@ -13444,25 +13584,27 @@ mod tests {
         let full = answer_context_from_meeting_within(&meeting, false);
         let primed = answer_context_from_meeting_within(&meeting, true);
 
-        // The saved summary + the Bluey Q&A are FIRST-TURN ONLY.
+        // The ROLLING SUMMARY is part of the every-turn delta (it is refreshed
+        // live and carries what scrolled out of the transcript window).
         assert!(
             full.iter()
-                .any(|i| i.source.as_deref() == Some("saved session summary")),
-            "unprimed must include the saved summary"
+                .any(|i| i.source.as_deref() == Some("live rolling summary")),
+            "unprimed must include the rolling summary"
         );
         assert!(
-            !primed
+            primed
                 .iter()
-                .any(|i| i.source.as_deref() == Some("saved session summary")),
-            "primed must NOT re-send the saved summary"
+                .any(|i| i.source.as_deref() == Some("live rolling summary")),
+            "primed delta must ALSO carry the rolling summary (SET 0.3)"
         );
+        // Bluey's own Q&A stays FIRST-TURN ONLY (the redundant blob).
         assert!(
             !primed
                 .iter()
                 .any(|i| i.source.as_deref() == Some("active session answer history")),
             "primed must NOT re-send Bluey's own prior Q&A (the redundant blob)"
         );
-        // Primed sends strictly fewer items (the heavy pieces are dropped).
+        // Primed still sends strictly fewer items (brief/Q&A/artifacts dropped).
         assert!(
             primed.len() < full.len(),
             "primed package must be smaller than the first-turn package"

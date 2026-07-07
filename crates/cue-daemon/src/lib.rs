@@ -14,6 +14,8 @@ pub mod overlay;
 pub mod secrets;
 pub mod storage;
 pub mod stt;
+// Rolling-summary orchestration: throwaway agent one-shot every N segments.
+pub mod summary;
 pub mod util;
 
 /// Test-only re-exports of internal app helpers needed by integration tests.
