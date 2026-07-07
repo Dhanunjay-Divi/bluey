@@ -6670,6 +6670,11 @@ fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
     if let Some(line_notes) = line_notes {
         sections.push(format!("LINE NOTES\n----------\n{line_notes}"));
     }
+    let complexity = extract_complexity_lines(&remaining_notes);
+    if !complexity.is_empty() {
+        sections.push(format!("COMPLEXITY\n----------\n{complexity}"));
+    }
+    let remaining_notes = strip_complexity_lines(&remaining_notes);
     if !remaining_notes.is_empty() {
         sections.push(format!("NOTES\n-----\n{remaining_notes}"));
     }
@@ -6678,6 +6683,128 @@ fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
     } else {
         sections.join("\n\n")
     }
+}
+
+fn extract_complexity_lines(text: &str) -> String {
+    let mut captured = Vec::new();
+    let mut fallback = Vec::new();
+    let mut in_complexity = false;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if !in_complexity {
+            if let Some(rest) = complexity_heading_remainder(line) {
+                in_complexity = true;
+                if !rest.trim().is_empty() {
+                    captured.push(rest.trim().to_string());
+                }
+                continue;
+            }
+            if is_complexity_line(line.trim()) {
+                fallback.push(line.trim().to_string());
+            }
+            continue;
+        }
+
+        if looks_like_post_complexity_heading(line) {
+            break;
+        }
+        if is_section_separator_line(line) {
+            continue;
+        }
+        captured.push(line.to_string());
+    }
+
+    let captured = trim_joined_lines(captured);
+    if !captured.is_empty() {
+        captured
+    } else {
+        trim_joined_lines(fallback)
+    }
+}
+
+fn strip_complexity_lines(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_complexity = false;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if !in_complexity {
+            if complexity_heading_remainder(line).is_some() {
+                in_complexity = true;
+                continue;
+            }
+            if is_complexity_line(line.trim()) {
+                continue;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+
+        if looks_like_post_complexity_heading(line) {
+            in_complexity = false;
+            out.push(line.to_string());
+        }
+    }
+
+    trim_joined_lines(out)
+}
+
+fn complexity_heading_remainder(line: &str) -> Option<&str> {
+    let trimmed = trim_markdown_heading(line);
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "complexity" {
+        return Some("");
+    }
+    if let Some(rest) = lower.strip_prefix("complexity:") {
+        let offset = trimmed.len().saturating_sub(rest.len());
+        return Some(trimmed[offset..].trim_start());
+    }
+    None
+}
+
+fn looks_like_post_complexity_heading(line: &str) -> bool {
+    let trimmed = trim_markdown_heading(line);
+    if trimmed.is_empty() || is_complexity_line(trimmed) {
+        return false;
+    }
+    let lower = trimmed.trim_end_matches(':').to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "notes"
+            | "line notes"
+            | "line-by-line notes"
+            | "line by line notes"
+            | "explanation"
+            | "approach"
+            | "code"
+            | "implementation"
+            | "edge cases"
+            | "examples"
+            | "walkthrough"
+            | "why this works"
+    )
+}
+
+fn is_complexity_line(line: &str) -> bool {
+    let lower = line
+        .trim()
+        .trim_start_matches(['-', '*', '•'])
+        .trim_start()
+        .trim_matches('*')
+        .trim()
+        .to_ascii_lowercase();
+    lower.contains("time complexity")
+        || lower.contains("space complexity")
+        || lower.starts_with("time:")
+        || lower.starts_with("space:")
+        || lower.starts_with("time ")
+        || lower.starts_with("space ")
+}
+
+fn is_section_separator_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '-' || ch == '=')
 }
 
 fn code_artifact_has_complete_code(body: &str) -> bool {
@@ -8183,7 +8310,7 @@ mod tests {
     #[test]
     fn response_artifact_repairs_malformed_python_fence() {
         let artifact = response_artifact(
-            "Approach\n- Sum both choices.\n\n```pythonfrom typing import List\nclass Solution:\n    def canAliceWin(self, nums: List[int]) -> bool:\n        total = sum(nums)\n        single_sum = sum(x for x in nums if x < 10)\n        double_sum = sum(x for x in nums if 10 <= x <= 99)\n        return single_sum > total - single_sum or double_sum > total - double_sum```\nLine notes:\n1: Import List for the LeetCode signature.\n4-6: Compare each Alice choice against Bob's remaining total.\nExplanation:\nAlice only has two legal choices.",
+            "Approach\n- Sum both choices.\n\n```pythonfrom typing import List\nclass Solution:\n    def canAliceWin(self, nums: List[int]) -> bool:\n        total = sum(nums)\n        single_sum = sum(x for x in nums if x < 10)\n        double_sum = sum(x for x in nums if 10 <= x <= 99)\n        return single_sum > total - single_sum or double_sum > total - double_sum```\nLine notes:\n1: Import List for the LeetCode signature.\n4-6: Compare each Alice choice against Bob's remaining total.\nExplanation:\nAlice only has two legal choices.\nTime Complexity: O(n)\nSpace Complexity: O(1)",
         )
         .expect("code artifact");
 
@@ -8193,6 +8320,9 @@ mod tests {
         assert!(!artifact.body.contains("```"));
         assert!(artifact.body.contains("LINE NOTES\n----------"));
         assert!(artifact.body.contains("4-6: Compare each Alice choice"));
+        assert!(artifact.body.contains("COMPLEXITY\n----------"));
+        assert!(artifact.body.contains("Time Complexity: O(n)"));
+        assert!(artifact.body.contains("Space Complexity: O(1)"));
         assert!(artifact.body.contains("NOTES\n-----\nApproach"));
         assert!(artifact.body.contains("Explanation:"));
     }
@@ -8210,6 +8340,21 @@ mod tests {
         assert!(artifact.body.contains("return x == 0 && y == 0;"));
         assert!(!artifact.body.contains("cppclass"));
         assert!(!artifact.body.contains("```"));
+    }
+
+    #[test]
+    fn response_artifact_keeps_full_complexity_block() {
+        let artifact = response_artifact(
+            "I'd solve this with histogram rows.\n\n```cpp\nclass Solution {\npublic:\n    int maximalRectangle(vector<vector<char>>& matrix) {\n        return 0;\n    }\n};\n```\n\nComplexity\nTime Complexity: O(rows * cols)\nEach cell is processed once, and each histogram index is pushed and popped at most once per row.\nSpace Complexity: O(cols)\nThe heights array and stack both use space proportional to the number of columns.",
+        )
+        .expect("code artifact");
+
+        assert!(artifact.body.contains("COMPLEXITY\n----------"));
+        assert!(artifact.body.contains("Time Complexity: O(rows * cols)"));
+        assert!(artifact.body.contains("Each cell is processed once"));
+        assert!(artifact.body.contains("Space Complexity: O(cols)"));
+        assert!(artifact.body.contains("heights array and stack"));
+        assert!(!artifact.body.contains("NOTES\n-----\nComplexity"));
     }
 
     #[test]
@@ -8271,13 +8416,14 @@ mod tests {
     #[test]
     fn response_artifact_keeps_complete_robot_return_code() {
         let artifact = response_artifact(
-            "Approach\nTrack net displacement.\n\n```cpp\nclass Solution {\npublic:\n    bool judgeCircle(string moves) {\n        int x = 0;\n        int y = 0;\n        for (char move : moves) {\n            if (move == 'U') y++;\n            else if (move == 'D') y--;\n            else if (move == 'L') x--;\n            else if (move == 'R') x++;\n        }\n        return x == 0 && y == 0;\n    }\n};\n```\n\nComplexity\nTime Complexity: O(N)",
+            "Approach\nTrack net displacement.\n\n```cpp\nclass Solution {\npublic:\n    bool judgeCircle(string moves) {\n        int x = 0;\n        int y = 0;\n        for (char move : moves) {\n            if (move == 'U') y++;\n            else if (move == 'D') y--;\n            else if (move == 'L') x--;\n            else if (move == 'R') x++;\n        }\n        return x == 0 && y == 0;\n    }\n};\n```\n\nComplexity\nTime Complexity: O(N)\nSpace Complexity: O(1)",
         )
         .expect("complete code artifact");
 
         assert_eq!(artifact.artifact_type, "code");
         assert!(artifact.body.contains("class Solution"));
         assert!(artifact.body.contains("judgeCircle"));
+        assert!(artifact.body.contains("Space Complexity: O(1)"));
     }
 
     #[test]

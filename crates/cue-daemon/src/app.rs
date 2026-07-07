@@ -853,6 +853,8 @@ impl OverlayAnswerStream {
         cost_label: Option<String>,
         artifact: Option<CueCardArtifact>,
     ) -> Result<()> {
+        let artifact = artifact
+            .map(|artifact| merge_code_artifact_complexity_from_answer(artifact, final_body));
         let final_body = visible_answer_body_for_artifact(final_body, artifact.as_ref());
         if self.body != final_body {
             if !final_body.trim().is_empty() {
@@ -7917,7 +7919,7 @@ fn visible_answer_body_for_artifact(
 }
 
 fn code_chat_body_for_artifact(body: &str, artifact: &CueCardArtifact) -> String {
-    let Some(code) = first_code_section_from_artifact(&artifact.body) else {
+    let Some(_code) = first_code_section_from_artifact(&artifact.body) else {
         return body.to_string();
     };
     let body = if has_unclosed_code_fence(body) {
@@ -7927,13 +7929,101 @@ fn code_chat_body_for_artifact(body: &str, artifact: &CueCardArtifact) -> String
     };
     let mut visible = strip_canvas_pointer_lines(&body).trim().to_string();
     if visible.is_empty() || code_answer_is_pointer_only(&visible) {
-        visible = "Complete code with comments:".to_string();
+        visible =
+            "I prepared the complete implementation with comments and kept the explanation here."
+                .to_string();
     }
-    if code.lines().count() > 80 || code.chars().count() > 5_000 {
-        return format!("{visible}\n\nThe full code is open in the code panel.");
+    visible
+}
+
+fn merge_code_artifact_complexity_from_answer(
+    mut artifact: CueCardArtifact,
+    answer: &str,
+) -> CueCardArtifact {
+    if artifact.artifact_type != CardArtifactType::Code {
+        return artifact;
     }
-    let language = infer_code_language(&code);
-    format!("{visible}\n\n```{language}\n{code}\n```")
+    let answer_complexity = extract_complexity_lines(&strip_fenced_code(answer));
+    if answer_complexity.is_empty() {
+        return artifact;
+    }
+    artifact.body = merge_code_artifact_complexity(&artifact.body, &answer_complexity);
+    artifact
+}
+
+fn merge_code_artifact_complexity(body: &str, answer_complexity: &str) -> String {
+    let missing_lines = answer_complexity
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_section_separator_line(line))
+        .filter(|line| !code_artifact_contains_complexity_line(body, line))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if missing_lines.is_empty() {
+        return body.to_string();
+    }
+
+    let normalized = body.replace("\r\n", "\n");
+    let mut lines = normalized.lines().map(str::to_string).collect::<Vec<_>>();
+    if let Some(start) = lines.iter().position(|line| {
+        matches!(
+            trim_markdown_heading(line).to_ascii_uppercase().as_str(),
+            "COMPLEXITY" | "TIME" | "SPACE"
+        )
+    }) {
+        let mut insert_at = start + 1;
+        while insert_at < lines.len() {
+            let trimmed = lines[insert_at].trim();
+            if is_section_separator_line(trimmed) {
+                insert_at += 1;
+                continue;
+            }
+            if looks_like_post_complexity_heading(trimmed) {
+                break;
+            }
+            insert_at += 1;
+        }
+        lines.splice(insert_at..insert_at, missing_lines);
+        return lines.join("\n").trim().to_string();
+    }
+
+    let section = format!("COMPLEXITY\n----------\n{}", missing_lines.join("\n"));
+    if let Some(notes_at) = lines
+        .iter()
+        .position(|line| trim_markdown_heading(line).eq_ignore_ascii_case("NOTES"))
+    {
+        let mut insert = vec![section, String::new()];
+        if notes_at > 0 && !lines[notes_at - 1].trim().is_empty() {
+            insert.insert(0, String::new());
+        }
+        lines.splice(notes_at..notes_at, insert);
+        lines.join("\n").trim().to_string()
+    } else if body.trim().is_empty() {
+        section
+    } else {
+        format!("{}\n\n{section}", body.trim())
+    }
+}
+
+fn code_artifact_contains_complexity_line(body: &str, line: &str) -> bool {
+    let needle = normalized_complexity_line(line);
+    !needle.is_empty()
+        && body
+            .lines()
+            .map(normalized_complexity_line)
+            .any(|candidate| candidate == needle)
+}
+
+fn normalized_complexity_line(line: &str) -> String {
+    line.trim()
+        .trim_start_matches(['-', '*', '•'])
+        .trim_start()
+        .trim_matches('*')
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn strip_unclosed_code_fence_tail(body: &str) -> String {
@@ -8061,31 +8151,6 @@ fn clamp_code_preview(code: &str, max_lines: usize) -> String {
         lines.push_str("\n# ...");
     }
     lines
-}
-
-fn infer_code_language(code: &str) -> &'static str {
-    let lower = code.to_ascii_lowercase();
-    if lower.contains("def ")
-        || lower.contains("print(")
-        || lower.contains("__init__")
-        || looks_like_python_assignment(code)
-    {
-        "python"
-    } else if lower.contains("select ") && lower.contains(" from ") {
-        "sql"
-    } else if lower.contains("function ") || lower.contains("const ") || lower.contains("let ") {
-        "javascript"
-    } else if lower.contains("#include")
-        || lower.contains("std::")
-        || lower.contains("public:")
-        || lower.contains("string ")
-    {
-        "cpp"
-    } else if lower.contains("public static void main") {
-        "java"
-    } else {
-        "text"
-    }
 }
 
 fn compact_system_design_chat_body(body: &str) -> String {
@@ -8525,6 +8590,11 @@ fn trim_joined_lines(lines: Vec<String>) -> String {
     lines.join("\n").trim().to_string()
 }
 
+fn is_section_separator_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '-' || ch == '=')
+}
+
 fn line_notes_heading_remainder(line: &str) -> Option<&str> {
     let trimmed = trim_markdown_heading(line);
     let lower = trimmed.to_ascii_lowercase();
@@ -8827,16 +8897,6 @@ fn looks_like_code_assignment(code: &str) -> bool {
     })
 }
 
-fn looks_like_python_assignment(code: &str) -> bool {
-    code.lines().map(str::trim).any(|line| {
-        line.contains('=')
-            && line.contains(',')
-            && !line.contains(';')
-            && !line.contains('{')
-            && !line.contains('}')
-    })
-}
-
 fn extract_code_section_from_canvas(body: &str) -> String {
     let normalized = body.replace("\r\n", "\n");
     let mut lines = Vec::new();
@@ -8880,33 +8940,120 @@ fn extract_code_section_from_canvas(body: &str) -> String {
 }
 
 fn extract_complexity_lines(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| is_complexity_line(line))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut captured = Vec::new();
+    let mut fallback = Vec::new();
+    let mut in_complexity = false;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if !in_complexity {
+            if let Some(rest) = complexity_heading_remainder(line) {
+                in_complexity = true;
+                if !rest.trim().is_empty() {
+                    captured.push(rest.trim().to_string());
+                }
+                continue;
+            }
+            if is_complexity_line(line.trim()) {
+                fallback.push(line.trim().to_string());
+            }
+            continue;
+        }
+
+        if looks_like_post_complexity_heading(line) {
+            break;
+        }
+        if is_section_separator_line(line) {
+            continue;
+        }
+        captured.push(line.to_string());
+    }
+
+    let captured = trim_joined_lines(captured);
+    if !captured.is_empty() {
+        captured
+    } else {
+        trim_joined_lines(fallback)
+    }
 }
 
 fn is_complexity_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
+    let lower = line
+        .trim()
+        .trim_start_matches(['-', '*', '•'])
+        .trim_start()
+        .trim_matches('*')
+        .trim()
+        .to_ascii_lowercase();
     lower.contains("time complexity")
         || lower.contains("space complexity")
         || lower.starts_with("time:")
         || lower.starts_with("space:")
-        || lower.starts_with("- time:")
-        || lower.starts_with("- space:")
         || lower.starts_with("time ")
         || lower.starts_with("space ")
 }
 
 fn strip_complexity_lines(text: &str) -> String {
-    text.lines()
-        .map(str::trim_end)
-        .filter(|line| !is_complexity_line(line.trim()))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
+    let mut out = Vec::new();
+    let mut in_complexity = false;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if !in_complexity {
+            if complexity_heading_remainder(line).is_some() {
+                in_complexity = true;
+                continue;
+            }
+            if is_complexity_line(line.trim()) {
+                continue;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+
+        if looks_like_post_complexity_heading(line) {
+            in_complexity = false;
+            out.push(line.to_string());
+        }
+    }
+
+    trim_joined_lines(out)
+}
+
+fn complexity_heading_remainder(line: &str) -> Option<&str> {
+    let trimmed = trim_markdown_heading(line);
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "complexity" {
+        return Some("");
+    }
+    if let Some(rest) = lower.strip_prefix("complexity:") {
+        let offset = trimmed.len().saturating_sub(rest.len());
+        return Some(trimmed[offset..].trim_start());
+    }
+    None
+}
+
+fn looks_like_post_complexity_heading(line: &str) -> bool {
+    let trimmed = trim_markdown_heading(line);
+    if trimmed.is_empty() || is_complexity_line(trimmed) {
+        return false;
+    }
+    let lower = trimmed.trim_end_matches(':').to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "notes"
+            | "line notes"
+            | "line-by-line notes"
+            | "line by line notes"
+            | "explanation"
+            | "approach"
+            | "code"
+            | "implementation"
+            | "edge cases"
+            | "examples"
+            | "walkthrough"
+            | "why this works"
+    )
 }
 
 fn format_structured_artifact(body: &str, fallback_heading: &str) -> String {
@@ -9686,6 +9833,9 @@ async fn call_bluey_managed_provider(
         if answer.is_empty() {
             return Err(anyhow!("managed provider stream returned no answer text"));
         }
+        let overlay_artifact = overlay_artifact
+            .map(|artifact| merge_code_artifact_complexity_from_answer(artifact, &answer))
+            .or_else(|| answer_overlay_artifact(&answer));
         if let Some(reason) = incomplete_answer_reason(&answer) {
             if let Some(artifact) = overlay_artifact
                 .as_ref()
@@ -9826,7 +9976,12 @@ async fn call_bluey_managed_provider(
     if answer.is_empty() {
         return Err(anyhow!("managed provider returned no answer text"));
     }
-    let overlay_artifact = response.artifact.as_ref().and_then(llm_overlay_artifact);
+    let overlay_artifact = response
+        .artifact
+        .as_ref()
+        .and_then(llm_overlay_artifact)
+        .map(|artifact| merge_code_artifact_complexity_from_answer(artifact, &answer))
+        .or_else(|| answer_overlay_artifact(&answer));
     if let Some(reason) = incomplete_answer_reason(&answer) {
         if let Some(artifact) = overlay_artifact
             .as_ref()
@@ -15976,8 +16131,14 @@ mod tests {
                 .map(|artifact| artifact.artifact_type),
             Some(CardArtifactType::Code)
         );
-        assert!(answer.body.contains("```python"));
-        assert!(answer.body.contains("a, b = b, a"));
+        assert!(answer.body.contains("Here is the Python code"));
+        assert!(!answer.body.contains("```python"));
+        assert!(!answer.body.contains("a, b = b, a"));
+        assert!(answer
+            .artifact
+            .as_ref()
+            .map(|artifact| artifact.body.contains("a, b = b, a"))
+            .unwrap_or(false));
     }
 
     #[test]
@@ -18126,6 +18287,7 @@ mod tests {
         assert!(artifact.body.contains("4-6: Compare each Alice choice"));
         assert!(artifact.body.contains("COMPLEXITY\n----------"));
         assert!(artifact.body.contains("Time Complexity: O(n)"));
+        assert!(artifact.body.contains("Space Complexity: O(1)"));
         assert!(artifact.body.contains("NOTES\n-----"));
         assert!(artifact.body.contains("Alice only has two legal choices"));
     }
@@ -18146,7 +18308,40 @@ mod tests {
     }
 
     #[test]
-    fn visible_answer_body_includes_normal_code_when_canvas_exists() {
+    fn answer_overlay_artifact_keeps_full_complexity_block() {
+        let artifact = answer_overlay_artifact(
+            "I'd solve this with histogram rows.\n\n```cpp\nclass Solution {\npublic:\n    int maximalRectangle(vector<vector<char>>& matrix) {\n        return 0;\n    }\n};\n```\n\nComplexity\nTime Complexity: O(rows * cols)\nEach cell is processed once, and each histogram index is pushed and popped at most once per row.\nSpace Complexity: O(cols)\nThe heights array and stack both use space proportional to the number of columns.",
+        )
+        .expect("code artifact");
+
+        assert!(artifact.body.contains("COMPLEXITY\n----------"));
+        assert!(artifact.body.contains("Time Complexity: O(rows * cols)"));
+        assert!(artifact.body.contains("Each cell is processed once"));
+        assert!(artifact.body.contains("Space Complexity: O(cols)"));
+        assert!(artifact.body.contains("heights array and stack"));
+        assert!(!artifact.body.contains("NOTES\n-----\nComplexity"));
+    }
+
+    #[test]
+    fn code_artifact_merge_restores_missing_space_complexity() {
+        let artifact = CueCardArtifact {
+            artifact_type: CardArtifactType::Code,
+            title: "Code canvas".to_string(),
+            body: "CODE\n----\nclass Solution {};\n\nCOMPLEXITY\n----------\nTime Complexity: O(rows * cols)"
+                .to_string(),
+            confidence: 0.95,
+        };
+        let answer = "Complexity\nTime Complexity: O(rows * cols)\nEach cell is processed once.\nSpace Complexity: O(cols)\nThe heights array and stack both use column space.";
+        let merged = merge_code_artifact_complexity_from_answer(artifact, answer);
+
+        assert!(merged.body.contains("Time Complexity: O(rows * cols)"));
+        assert!(merged.body.contains("Each cell is processed once."));
+        assert!(merged.body.contains("Space Complexity: O(cols)"));
+        assert!(merged.body.contains("both use column space"));
+    }
+
+    #[test]
+    fn visible_answer_body_keeps_code_in_canvas_when_canvas_exists() {
         let answer = "Approach\n- Track x and y.\n\n```cpp\nclass Solution {\npublic:\n    bool judgeCircle(string moves) {\n        int x = 0;\n        int y = 0;\n        for (char move : moves) {\n            if (move == 'U') y++;\n            else if (move == 'D') y--;\n            else if (move == 'L') x--;\n            else if (move == 'R') x++;\n        }\n        return x == 0 && y == 0;\n    }\n};\n```\n\nExplanation\nThe counters cancel opposing moves.\nComplexity\nTime Complexity: O(N)\nSpace Complexity: O(1)";
         let artifact = answer_overlay_artifact(answer).expect("code artifact");
         let visible = visible_answer_body_for_artifact(answer, Some(&artifact));
@@ -18154,9 +18349,11 @@ mod tests {
         assert!(visible.contains("Approach"));
         assert!(visible.contains("Explanation"));
         assert!(visible.contains("Complexity"));
-        assert!(visible.contains("```cpp"));
-        assert!(visible.contains("class Solution"));
-        assert!(visible.contains("return x == 0 && y == 0;"));
+        assert!(!visible.contains("```cpp"));
+        assert!(!visible.contains("class Solution"));
+        assert!(!visible.contains("return x == 0 && y == 0;"));
+        assert!(artifact.body.contains("class Solution"));
+        assert!(artifact.body.contains("return x == 0 && y == 0;"));
     }
 
     #[test]
@@ -18177,7 +18374,6 @@ mod tests {
         );
 
         assert!(visible.contains("Approach"));
-        assert!(visible.contains("full code is open in the code panel"));
         assert!(!visible.contains("generated line 89"));
     }
 
@@ -18274,9 +18470,9 @@ mod tests {
             Some(&artifact),
         );
 
-        assert!(body.contains("```python"));
-        assert!(body.contains("a, b = b, a"));
-        assert!(body.contains("print('After:', a, b)"));
+        assert!(body.contains("Here is the Python code"));
+        assert!(!body.contains("```python"));
+        assert!(!body.contains("a, b = b, a"));
     }
 
     #[test]
@@ -18295,12 +18491,12 @@ mod tests {
 
         assert_eq!(incomplete_answer_reason(&body), None);
         assert!(body.contains("Here is the Python code:"));
-        assert!(body.contains("```python"));
-        assert!(body.contains("a, b = b, a + b"));
+        assert!(!body.contains("```python"));
+        assert!(!body.contains("a, b = b, a + b"));
     }
 
     #[test]
-    fn code_artifact_preview_keeps_line_notes_out_of_code_fence() {
+    fn code_artifact_keeps_line_notes_out_of_visible_chat() {
         let artifact = CueCardArtifact {
             artifact_type: CardArtifactType::Code,
             title: "Code canvas".to_string(),
@@ -18310,8 +18506,9 @@ mod tests {
         };
         let body = visible_answer_body_for_artifact("Here is the code:", Some(&artifact));
 
-        assert!(body.contains("```python\ndef fib(n):\n    return n\n```"));
-        assert!(!body.contains("1: demo note\n```"));
+        assert_eq!(body, "Here is the code:");
+        assert!(!body.contains("def fib"));
+        assert!(!body.contains("1: demo note"));
         assert_eq!(incomplete_answer_reason(&body), None);
     }
 
@@ -18330,8 +18527,8 @@ mod tests {
 
         assert_eq!(incomplete_answer_reason(&body), None);
         assert!(body.contains("I would write the Go version"));
-        assert!(body.contains("```text"));
-        assert!(body.contains("func solve() int"));
+        assert!(!body.contains("```text"));
+        assert!(!body.contains("func solve() int"));
         assert!(!body.trim_end().ends_with("Code"));
     }
 
