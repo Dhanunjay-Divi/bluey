@@ -14,6 +14,7 @@ Continue the code-follow-up replacement release and make the Windows binary inst
 - Updated the macOS dashboard build command for the current Tauri CLI so macOS packaging does not cancel the Windows matrix job.
 - Made the Tauri dashboard UI build path-independent in CI after `cargo tauri build` ran `beforeBuildCommand` from a different working directory than expected.
 - Disabled matrix fail-fast so a macOS packaging issue does not cancel Windows artifact validation before we can inspect it.
+- Fixed the Windows overlay helper link line to include `advapi32.lib`, which is required for the registry placement APIs used by the overlay.
 - Removed the `BLUEY_WINDOWS_INSTALL_PREVIEW=1` guard from `ops/install/install.ps1`.
 - Prepared desktop release `0.1.90` so macOS and Windows can be published under one signed manifest.
 
