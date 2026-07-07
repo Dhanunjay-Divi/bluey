@@ -26,6 +26,8 @@ and document-heavy work sessions.
   saved memory, or managed web sources.
 - Balance model: start free, then add account balance for paid AI models,
   speech transcription, screen analysis, and saved-session search.
+- Usage estimates are approximate because transcript, screen, files, saved
+  context, and answer depth can change the route and balance use.
 
 ## Trust And Safety
 

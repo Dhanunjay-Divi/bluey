@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070713"
+    href="/assets/bluey-site.css?v=2026070714"
   >
   <script type="application/ld+json">
   {
@@ -137,7 +137,7 @@
       </nav>
 
       <article class="policy-card" id="privacyPolicy" hidden>
-        <div class="policy-updated">Last updated June 24, 2026</div>
+        <div class="policy-updated">Last updated July 7, 2026</div>
         <h1>Privacy Policy</h1>
         <p>Bluey is an AI work assistant that runs a desktop overlay and optional cloud services. We collect only what is needed for account login, balance reloads, AI answers, saved sessions, support, and abuse prevention.</p>
 
@@ -152,8 +152,8 @@
         <h2>How We Use Data</h2>
         <p>We use account and session data to authenticate you, answer requests, meter paid usage, save approved context, provide searchable history, show balance and cost labels, debug failures, prevent abuse, and support export or deletion requests.</p>
 
-        <h2>AI Providers and Context</h2>
-        <p>When a request needs an AI model, Bluey sends only the context needed for that request: your prompt, selected transcript snippets, attached document text, screen-analysis output, saved session memory, and request details such as task type and cost estimate. Speech transcription, image understanding, embedding, and answer generation may use separate services.</p>
+        <h2>AI, Speech, and Context</h2>
+        <p>When a request needs AI, Bluey sends only the context needed for that request: your prompt, selected transcript snippets, attached document text, screen-analysis output, saved session memory, and request details such as task type and approximate cost. Bluey may route different requests through different answer, speech, image, or search paths depending on the task and selected context.</p>
 
         <h2>Files, Sessions, and Memory</h2>
         <p>Documents, images, screenshots, and other files you attach are parsed into readable text where supported and are tied to the active Bluey session. When you sign in with saved-session sync on, Bluey may store the original synced file bytes, lightweight previews, extracted text, summaries, and search indexes so another signed-in device can restore the session and answer from the same context. You can turn cloud sync off in settings and keep using local sessions.</p>
@@ -178,13 +178,14 @@
       </article>
 
       <article class="policy-card" id="termsPolicy" hidden>
-        <div class="policy-updated">Last updated June 24, 2026</div>
+        <div class="policy-updated">Last updated July 7, 2026</div>
         <h1>Terms of Use</h1>
         <p>These terms cover the Bluey alpha service. By creating an account, installing Bluey, or using Bluey Cloud, you agree to use the product responsibly and only where you have the right to capture, upload, or analyze the context you provide.</p>
 
         <h2>Account Balance</h2>
         <ul>
           <li>Bluey is not a monthly subscription by default. You add prepaid account balance and spend it on AI model requests, speech transcription, screen analysis, searchable history, and related cloud work.</li>
+          <li>Usage estimates are approximate. Auto routing may choose a lighter or deeper path based on the task, transcript, screen, files, saved context, and answer depth.</li>
           <li>Balance has no cash value, is not a stored-value card or gift card, is not transferable, and cannot be used outside Bluey.</li>
           <li>Balance is valid for up to 12 months (365 days) from purchase. Bluey spends the oldest unexpired balance first and stops at zero so you do not accrue usage debt.</li>
           <li>Deleting your account forfeits unused balance. Contact support before deleting if you want a billing review.</li>
@@ -204,7 +205,7 @@
         <p>Bluey can help draft answers, summarize sessions, explain code, reason about systems, and organize context. AI output may be incomplete or wrong. You are responsible for reviewing generated output before relying on it, sending it, submitting it, or using it to make decisions.</p>
 
         <h2>Payments</h2>
-        <p>Payment, receipts, disputes, and saved cards are managed through checkout. Bluey keeps what is needed to update your balance, show usage, and support refunds or account deletion.</p>
+        <p>Payments, receipts, disputes, and saved cards are managed through checkout. Bluey keeps what is needed to update your balance, show usage, and support refunds or account deletion.</p>
 
         <h2>Service Availability</h2>
         <p>Bluey is an alpha product. AI, speech transcription, billing, networks, and local OS permissions can fail or degrade. We work to fail clearly with status and support details, but we do not guarantee uninterrupted service.</p>
@@ -554,7 +555,7 @@
                 <div class="section-head">
                   <div>
                     <h3>Usage Summary</h3>
-                    <p>Recent paid work, balance use, and practical estimates.</p>
+                    <p>Approximate pace for AI, transcription, screen/context, and saved-session work.</p>
                   </div>
                 </div>
                 <div class="summary-metric-grid">
@@ -564,26 +565,31 @@
                     <em id="summaryBalanceHint">Balance is used after trial time.</em>
                   </div>
                   <div class="summary-metric">
-                    <span>Paid answers</span>
+                    <span>Paid work</span>
                     <strong id="usageValue">--</strong>
                     <em id="usageHint">Paid requests appear here.</em>
                   </div>
                   <div class="summary-metric">
-                    <span>$15 estimate</span>
+                    <span>At current pace</span>
                     <strong id="tierValue">--</strong>
                     <em id="projectionHint">Projection appears after usage.</em>
                   </div>
                 </div>
                 <div class="usage-estimate-card" id="usageEstimateCard">
                   <div>
-                    <span>$15 reload</span>
-                    <strong id="reloadEstimateValue">~680 answers</strong>
-                    <em id="reloadEstimateHint">Typical text use; screen and audio can spend faster.</em>
+                    <span>$15 balance</span>
+                    <strong id="reloadEstimateValue">~2-5 hrs</strong>
+                    <em id="reloadEstimateHint">Approximate light mixed use. Audio, screen, files, and deeper routes can spend faster.</em>
                   </div>
                   <div>
                     <span>Auto Reload</span>
                     <strong id="autoReloadEstimateValue">Off</strong>
-                    <em id="autoReloadEstimateHint">Turn it on to top up before balance runs out.</em>
+                    <em id="autoReloadEstimateHint">Turn it on to add balance automatically when balance is low.</em>
+                  </div>
+                  <div>
+                    <span>Auto routing</span>
+                    <strong>Best fit</strong>
+                    <em>Bluey chooses the route for each request by task and context, so usage varies.</em>
                   </div>
                 </div>
                 <div class="usage-list" id="usageList"></div>
@@ -601,7 +607,7 @@
                 <div class="billing-grid billing-credits-grid">
                   <div class="reload-card billing-primary-card">
                     <div>
-                      <span class="reload-setup-kicker">Account wallet</span>
+                      <span class="reload-setup-kicker">Account balance</span>
                       <h3>Balance</h3>
                       <p>Add prepaid balance shared across every Bluey sign-in.</p>
                       <div class="credit-equation" aria-label="$15 minimum reload. $1 added becomes $1 balance.">
@@ -652,7 +658,7 @@
                   <div class="billing-status-head">
                     <div>
                       <h4>Billing status</h4>
-                      <p id="billingStatusCopy">Prepaid wallet, card, and Auto Reload state.</p>
+                      <p id="billingStatusCopy">Balance, card, and Auto Reload state.</p>
                     </div>
                   </div>
                   <div class="billing-status-table-wrap">
@@ -693,7 +699,7 @@
           <div class="account-modal-head">
             <div>
               <h2 id="addCreditsTitle">Add balance</h2>
-              <p>Add money once. Keep Auto Reload on to keep Bluey ready when the balance gets low.</p>
+              <p>Choose an amount. Keep Auto Reload on to save a card and top up before balance gets low.</p>
             </div>
             <button class="account-modal-close" id="addCreditsCancelX" type="button" aria-label="Close add balance dialog">×</button>
           </div>
@@ -735,7 +741,7 @@
                   <input id="modalAutoReloadAmount" type="text" value="15" inputmode="decimal" autocomplete="off" />
                 </label>
               </div>
-              <p class="auto-reload-rule" id="modalAutoReloadRule">Auto Reload updates when you continue.</p>
+              <p class="auto-reload-rule" id="modalAutoReloadRule">On. Adds $15 when balance is below $5.</p>
               <div class="reload-setup-card-actions">
                 <button class="account-button ghost compact" id="reloadSetupCardButton" type="button">Add card</button>
               </div>
@@ -1074,7 +1080,7 @@
         <a href="/reload" class="plan featured">
           <div>
             <div class="plan-name">Add balance</div>
-            <div class="plan-detail">$15 is enough for many normal questions; screen and audio use more.</div>
+            <div class="plan-detail">$15 starts a light mixed-use balance. Audio, screen, and files use more.</div>
           </div>
           <div class="plan-price"><strong>$15</strong><span>min</span></div>
         </a>
@@ -1123,7 +1129,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070713"
+    src="/assets/bluey-site.js?v=2026070714"
   ></script>
 </body>
 </html>

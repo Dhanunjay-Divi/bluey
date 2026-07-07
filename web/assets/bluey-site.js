@@ -51,7 +51,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const MANUAL_RELOAD_MIN_CENTS = 1500;
     const MANUAL_RELOAD_MAX_CENTS = 50000;
     const MANUAL_RELOAD_AMOUNT_CENTS = 1500;
-    const TYPICAL_ANSWER_COST_CENTS = 2.2;
+    const MIXED_USE_LOW_CENTS_PER_HOUR = 300;
+    const MIXED_USE_HIGH_CENTS_PER_HOUR = 750;
+    const AUTO_ROUTING_USAGE_HINT = 'Bluey routes each request by task and context, so audio, screen, files, and deeper routes can spend faster.';
     let captchaConfigPromise = null;
     let captchaConfig = { provider: null, site_key: null };
     let signupTurnstileWidgetId = null;
@@ -79,12 +81,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     }
 
-    function compactCount(value) {
-      const count = Math.max(0, Math.round(Number(value || 0)));
-      if (count >= 1000) return `${(count / 1000).toFixed(count >= 10000 ? 0 : 1)}k`;
-      return String(count);
-    }
-
     function formatApproxDays(days) {
       const value = Number(days || 0);
       if (!Number.isFinite(value) || value <= 0) return '';
@@ -93,6 +89,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (value < 60) return `~${Math.max(2, Math.round(value / 7))} weeks`;
       if (value < 90) return `~${Math.round(value)} days`;
       return '90+ days';
+    }
+
+    function formatApproxHoursRange(cents) {
+      const amount = Math.max(MANUAL_RELOAD_MIN_CENTS, Number(cents || MANUAL_RELOAD_AMOUNT_CENTS));
+      const low = Math.max(1, Math.floor(amount / MIXED_USE_HIGH_CENTS_PER_HOUR));
+      const high = Math.max(low, Math.ceil(amount / MIXED_USE_LOW_CENTS_PER_HOUR));
+      return `~${low}-${high} hrs`;
+    }
+
+    function formatAverageCost(cents) {
+      const value = Number(cents || 0);
+      if (!Number.isFinite(value) || value <= 0) return '';
+      if (value < 1) return '<$0.01 avg per paid request';
+      return `~${money(value)} avg per paid request`;
     }
 
     function usageEstimate(usage, me) {
@@ -104,9 +114,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const thresholdCents = Math.max(100, Number(me?.auto_topup_threshold_cents || AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS));
       const avgCostCents = totalCues > 0 && spentCents > 0
         ? spentCents / totalCues
-        : TYPICAL_ANSWER_COST_CENTS;
-      const answersPerReload = Math.max(1, Math.round(reloadCents / avgCostCents));
-      const typicalAnswers = Math.max(1, Math.round(MANUAL_RELOAD_AMOUNT_CENTS / TYPICAL_ANSWER_COST_CENTS));
+        : 0;
       const centsPerDay = spentCents > 0 ? spentCents / periodDays : 0;
       const balanceDays = centsPerDay > 0 ? balanceCents / centsPerDay : 0;
       const reloadDays = centsPerDay > 0 ? reloadCents / centsPerDay : 0;
@@ -119,8 +127,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         reloadCents,
         thresholdCents,
         avgCostCents,
-        answersPerReload,
-        typicalAnswers,
+        defaultUseCopy: formatApproxHoursRange(MANUAL_RELOAD_AMOUNT_CENTS),
+        reloadUseCopy: formatApproxHoursRange(reloadCents),
         balanceDays,
         reloadDays,
         hasRecentPace,
@@ -1701,19 +1709,19 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function renderUsage(usage, me = latestAccountForBilling) {
       const estimate = usageEstimate(usage, me);
       document.getElementById('usageValue').textContent = `${usage.total_cues || 0}`;
+      const averageCopy = formatAverageCost(estimate.avgCostCents);
       document.getElementById('usageHint').textContent = estimate.spentCents > 0
-        ? `${money(estimate.spentCents)} in ${estimate.periodDays} days · ~${money(estimate.avgCostCents)} each.`
-        : `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} usually covers about ${compactCount(estimate.typicalAnswers)} normal answers.`;
+        ? `${money(estimate.spentCents)} in ${estimate.periodDays} days${averageCopy ? ` · ${averageCopy}.` : '.'}`
+        : `No paid work yet. ${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} is a starter balance for light mixed use.`;
 
       const reloadDaysCopy = formatApproxDays(estimate.reloadDays);
       const balanceDaysCopy = formatApproxDays(estimate.balanceDays);
-      const reloadAnswerCopy = `~${compactCount(estimate.answersPerReload)} answers`;
       document.getElementById('tierValue').textContent = estimate.hasRecentPace && reloadDaysCopy
         ? reloadDaysCopy
-        : `~${compactCount(estimate.typicalAnswers)}`;
+        : estimate.defaultUseCopy;
       document.getElementById('projectionHint').textContent = estimate.hasRecentPace
-        ? `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} at recent pace; about ${reloadAnswerCopy}.`
-        : 'Typical text answers; screen and audio can spend faster.';
+        ? `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} at recent pace. Actual use varies by route and context.`
+        : `Approximate light mixed use. ${AUTO_ROUTING_USAGE_HINT}`;
 
       const reloadEstimateValue = document.getElementById('reloadEstimateValue');
       const reloadEstimateHint = document.getElementById('reloadEstimateHint');
@@ -1722,12 +1730,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (reloadEstimateValue) {
         reloadEstimateValue.textContent = estimate.hasRecentPace && reloadDaysCopy
           ? reloadDaysCopy
-          : `~${compactCount(estimate.typicalAnswers)} answers`;
+          : estimate.defaultUseCopy;
       }
       if (reloadEstimateHint) {
         reloadEstimateHint.textContent = estimate.hasRecentPace
-          ? `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} at recent pace; about ${reloadAnswerCopy}.`
-          : `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} is plenty for many normal text questions.`;
+          ? `Based on recent spend. ${AUTO_ROUTING_USAGE_HINT}`
+          : `Approximate light mixed use. ${AUTO_ROUTING_USAGE_HINT}`;
       }
       if (autoReloadEstimateValue) {
         autoReloadEstimateValue.textContent = estimate.autoReloadOn
@@ -1736,8 +1744,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       if (autoReloadEstimateHint) {
         autoReloadEstimateHint.textContent = estimate.autoReloadOn
-          ? `${reloadDaysCopy || reloadAnswerCopy} each time; reloads below ${money(estimate.thresholdCents)}.`
-          : 'Optional. Turn it on to top up before balance runs out.';
+          ? `${reloadDaysCopy || estimate.reloadUseCopy} per reload, approximate. Adds ${money(estimate.reloadCents)} below ${money(estimate.thresholdCents)}.`
+          : 'Optional. Turn it on to add balance automatically when balance is low.';
       }
 
       const list = document.getElementById('usageList');
@@ -1904,11 +1912,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (amountInput) amountInput.value = centsToDollars(amountCents);
 
       if (me?.auto_topup_enabled) {
-        hint.textContent = `On. Reloads ${amount} when below ${threshold}.`;
+        hint.textContent = `On. Adds ${amount} when balance is below ${threshold}.`;
       } else if (hasSavedMethod) {
         hint.textContent = 'Off. Turn on to resume automatic reloads.';
       } else if (canSaveSquareCard) {
-        hint.textContent = 'Add balance once to set up Auto Reload.';
+        hint.textContent = 'Add balance once and keep Auto Reload on to save a card.';
       } else {
         hint.textContent = me?.auto_topup_unavailable_reason || 'Unavailable';
       }
@@ -1950,7 +1958,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         {
           item: 'Auto Reload',
           detail: autoReloadOn
-            ? `Reloads when balance is below ${money(thresholdCents)}`
+            ? `Adds balance below ${money(thresholdCents)}`
             : 'No automatic reloads',
           amount: autoReloadOn ? money(amountCents) : '-',
           status: autoReloadOn ? 'On' : 'Off',
@@ -1989,7 +1997,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           ? `Auto Reload is active with ${savedMethod || 'a saved card'}.`
           : savedMethod
             ? 'Auto Reload is off. Your saved card stays available if you turn it back on.'
-            : 'No saved card. Add balance manually, or save a card when you enable Auto Reload.';
+            : 'Add balance once, or keep Auto Reload on to save a card.';
       }
     }
 
@@ -2033,8 +2041,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       try {
         const settings = readAutoReloadSettings();
         rule.textContent = hasSavedMethod
-          ? `Reloads ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`
-          : `Add balance once to reload ${money(settings.auto_topup_amount_cents)} when below ${money(settings.auto_topup_threshold_cents)}.`;
+          ? `Adds ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`
+          : `Add balance once and keep Auto Reload on to add ${money(settings.auto_topup_amount_cents)} below ${money(settings.auto_topup_threshold_cents)}.`;
       } catch (error) {
         rule.textContent = error.message;
       }
@@ -2125,15 +2133,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       const balanceCents = Number(me?.balance_cents || 0);
       if (balanceCents <= 0) {
-        return `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} is enough for many normal questions.`;
+        return 'Add balance to start. Keep Auto Reload on to top up before work stops.';
       }
       if (balanceCents < 100) {
-        return 'Almost out. Add balance to keep Bluey ready.';
+        return 'Almost out. Add balance or keep Auto Reload on.';
       }
       if (balanceCents < 500) {
         return 'Low balance. Add more soon.';
       }
-      return 'Ready for paid cloud work.';
+      return 'Ready across this Bluey account.';
     }
 
     function accountBalanceUsageHint(me, usage) {
@@ -2141,12 +2149,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const estimate = usageEstimate(usage, me);
       const balanceDaysCopy = formatApproxDays(estimate.balanceDays);
       if (estimate.balanceCents <= 0) {
-        return `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} usually covers about ${compactCount(estimate.typicalAnswers)} normal answers.`;
+        return `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} starts about ${estimate.defaultUseCopy} of light mixed use.`;
       }
       if (estimate.hasRecentPace && balanceDaysCopy) {
         return `At recent pace, this balance lasts ${balanceDaysCopy}.`;
       }
-      return `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} is plenty for many normal text questions.`;
+      return `Approximate: ${estimate.defaultUseCopy} of light mixed use per ${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)}.`;
     }
 
     async function updateAutoReload(enabled) {
@@ -2160,7 +2168,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       renderAutoReload(me);
       accountMessage(enabled
-        ? `Auto Reload is on. Bluey will reload ${money(settings.auto_topup_amount_cents)} when balance drops below ${money(settings.auto_topup_threshold_cents)}.`
+        ? `Auto Reload is on. Bluey adds ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`
         : 'Auto Reload is off. You can add balance manually whenever you need it.');
       return me;
     }
@@ -2416,9 +2424,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       try {
         const settings = readModalAutoReloadSettings();
         autoRule.textContent = hasSavedMethod
-          ? `Reload ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`
+          ? `Add ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`
           : canUseCard
-            ? `Add a card once. Then Bluey reloads ${money(settings.auto_topup_amount_cents)} when below ${money(settings.auto_topup_threshold_cents)}.`
+            ? `Add a card once. Then Bluey adds ${money(settings.auto_topup_amount_cents)} when below ${money(settings.auto_topup_threshold_cents)}.`
             : 'Auto Reload is not available for this account yet.';
       } catch (error) {
         autoRule.textContent = error.message;
