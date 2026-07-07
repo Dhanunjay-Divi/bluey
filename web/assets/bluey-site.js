@@ -1205,11 +1205,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!targets.length) return;
       for (const el of targets) {
         el.hidden = true;
+        el.classList.remove('is-code-entry', 'is-awaiting-action');
+        el.closest('.device-connect-section')?.classList.remove('is-action-needed');
         el.replaceChildren();
       }
 
       const renderCodeEntry = (el) => {
         el.hidden = false;
+        el.classList.add('is-code-entry');
+        el.closest('.device-connect-section')?.classList.add('is-action-needed');
         el.replaceChildren();
         const title = document.createElement('strong');
         title.textContent = 'Connect Bluey desktop';
@@ -1230,7 +1234,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         input.inputMode = 'text';
         const button = document.createElement('button');
         button.type = 'submit';
-        button.className = 'account-button secondary compact';
+        button.className = 'account-button secondary compact device-primary-action';
         button.textContent = 'Connect';
         const status = document.createElement('span');
         status.className = 'device-code-status';
@@ -1260,13 +1264,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.replaceChildren();
         const title = document.createElement('strong');
         const approved = sessionStorage.getItem(`bluey_device_approved_${code}`) === '1';
-        title.textContent = approved ? 'Desktop Bluey is connected' : 'Finish moving desktop Bluey';
+        title.textContent = approved ? 'Bluey desktop is connected' : 'Finish desktop sign-in';
         const body = document.createElement('span');
         if (approved) {
           body.textContent = 'Return to Terminal or Bluey. This browser tab can stay open.';
           el.append(title, body);
           return;
         }
+        el.classList.add('is-awaiting-action');
+        el.closest('.device-connect-section')?.classList.add('is-action-needed');
         body.append('Terminal is waiting on code ');
         const codeEl = document.createElement('code');
         codeEl.textContent = code;
@@ -1283,9 +1289,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }
         el.append(title, body);
         if (accountToken()) {
+          const actionRow = document.createElement('div');
+          actionRow.className = 'device-action-row';
+          const cue = document.createElement('span');
+          cue.className = 'device-action-cue';
+          cue.textContent = 'Next step';
           const button = document.createElement('button');
           button.type = 'button';
-          button.className = 'account-button secondary compact';
+          button.className = 'account-button secondary compact device-primary-action';
           button.textContent = 'Move desktop';
           button.setAttribute('aria-label', `Move desktop Bluey using code ${code}`);
           button.addEventListener('click', () => {
@@ -1300,7 +1311,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
                 accountMessage(`Desktop link failed: ${error.message}`);
               });
             });
-          el.append(button);
+          actionRow.append(cue, button);
+          el.append(actionRow);
         }
       };
       const visibleTargets = accountToken()

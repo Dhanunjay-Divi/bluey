@@ -5417,6 +5417,28 @@
       color: #5f7281;
     }
 
+    html[data-bluey-theme="light"] #accountApp #dashboardTabComputers .device-connect-section.is-action-needed {
+      border-color: rgba(39, 151, 208, .34);
+      box-shadow:
+        0 0 0 1px rgba(39, 151, 208, .08),
+        0 18px 46px rgba(53, 138, 188, .14);
+    }
+
+    html[data-bluey-theme="light"] #accountApp #dashboardTabComputers .device-connect-section.is-action-needed::before {
+      background: linear-gradient(
+        100deg,
+        transparent 0%,
+        transparent 32%,
+        rgba(62, 183, 236, .16) 48%,
+        transparent 66%,
+        transparent 100%
+      );
+    }
+
+    html[data-bluey-theme="light"] #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-action-cue {
+      color: #087ca6;
+    }
+
     html[data-bluey-theme="light"] #accountApp .account-modal-form input {
       border-color: #d8e8f0;
       background: #fafdff;
@@ -7083,11 +7105,43 @@
     }
 
     #accountApp #dashboardTabComputers .device-connect-section {
+      position: relative;
+      overflow: hidden;
       padding: .68rem .78rem;
       border-color: rgba(99, 216, 255, .22);
       background:
         linear-gradient(135deg, rgba(99, 216, 255, .06), rgba(79, 141, 255, .018) 48%, transparent),
         #0a0a0a;
+    }
+
+    #accountApp #dashboardTabComputers .device-connect-section > * {
+      position: relative;
+      z-index: 1;
+    }
+
+    #accountApp #dashboardTabComputers .device-connect-section.is-action-needed {
+      border-color: rgba(99, 216, 255, .46);
+      box-shadow:
+        0 0 0 1px rgba(99, 216, 255, .08),
+        0 18px 52px rgba(16, 150, 220, .11);
+    }
+
+    #accountApp #dashboardTabComputers .device-connect-section.is-action-needed::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      background: linear-gradient(
+        100deg,
+        transparent 0%,
+        transparent 32%,
+        rgba(99, 216, 255, .12) 48%,
+        transparent 66%,
+        transparent 100%
+      );
+      transform: translateX(-115%);
+      animation: blueyConnectWave 3.4s ease-in-out infinite;
+      pointer-events: none;
     }
 
     #accountApp #dashboardTabComputers .dashboard-device-link-hint {
@@ -7114,6 +7168,37 @@
       font-size: .86rem;
       font-weight: 750;
       line-height: 1.15;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-action-row {
+      grid-column: 1;
+      grid-row: 2;
+      display: grid;
+      gap: .35rem;
+      justify-items: start;
+      align-self: start;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-action-cue {
+      display: inline-flex;
+      align-items: center;
+      gap: .34rem;
+      color: #7fdfff;
+      font-size: .62rem;
+      font-weight: 850;
+      line-height: 1;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-action-cue::before {
+      content: "";
+      width: .42rem;
+      height: .42rem;
+      border-radius: 999px;
+      background: #63d8ff;
+      box-shadow: 0 0 0 0 rgba(99, 216, 255, .34);
+      animation: blueyCueDot 1.7s ease-out infinite;
     }
 
     #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-helper {
@@ -7147,6 +7232,37 @@
       padding: .42rem .75rem;
       border-radius: 8px;
       font-size: .74rem;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-primary-action {
+      position: relative;
+      overflow: visible;
+      border-color: rgba(147, 231, 255, .58);
+      background:
+        linear-gradient(135deg, rgba(192, 244, 255, .98), rgba(82, 189, 255, .96));
+      color: #061018;
+      box-shadow:
+        0 0 0 1px rgba(99, 216, 255, .16),
+        0 12px 28px rgba(28, 171, 239, .2);
+      animation: blueyActionButton 2.4s ease-in-out infinite;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-primary-action::after {
+      content: "";
+      position: absolute;
+      inset: -5px;
+      border: 1px solid rgba(99, 216, 255, .32);
+      border-radius: 12px;
+      opacity: 0;
+      animation: blueyActionRing 2.4s ease-out infinite;
+      pointer-events: none;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-primary-action:hover {
+      transform: translateY(-1px);
+      box-shadow:
+        0 0 0 1px rgba(99, 216, 255, .24),
+        0 16px 34px rgba(28, 171, 239, .25);
     }
 
     #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-status {
@@ -7201,6 +7317,63 @@
       font-size: .8rem;
       line-height: 1.4;
       text-align: center;
+    }
+
+    @keyframes blueyConnectWave {
+      0%,
+      42% {
+        transform: translateX(-115%);
+        opacity: 0;
+      }
+      52% {
+        opacity: .78;
+      }
+      78%,
+      100% {
+        transform: translateX(115%);
+        opacity: 0;
+      }
+    }
+
+    @keyframes blueyActionButton {
+      0%,
+      100% {
+        filter: saturate(1);
+      }
+      50% {
+        filter: saturate(1.18);
+      }
+    }
+
+    @keyframes blueyActionRing {
+      0% {
+        opacity: .55;
+        transform: scale(.98);
+      }
+      72%,
+      100% {
+        opacity: 0;
+        transform: scale(1.12);
+      }
+    }
+
+    @keyframes blueyCueDot {
+      0% {
+        box-shadow: 0 0 0 0 rgba(99, 216, 255, .36);
+      }
+      72%,
+      100% {
+        box-shadow: 0 0 0 8px rgba(99, 216, 255, 0);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      #accountApp #dashboardTabComputers .device-connect-section.is-action-needed::before,
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-action-cue::before,
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-primary-action,
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-primary-action::after {
+        animation: none;
+      }
     }
 
     #accountApp .billing-section {
@@ -7576,7 +7749,8 @@
 
       #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-form,
       #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-helper,
-      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-status {
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-status,
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-action-row {
         grid-column: 1;
         grid-row: auto;
       }
