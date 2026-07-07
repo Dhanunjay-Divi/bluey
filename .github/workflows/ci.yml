@@ -31,6 +31,7 @@ jobs:
             wget \
             file \
             libssl-dev \
+            libasound2-dev \
             libayatana-appindicator3-dev \
             libxdo-dev
 

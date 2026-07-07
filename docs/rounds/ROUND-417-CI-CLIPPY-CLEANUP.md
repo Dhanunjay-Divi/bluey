@@ -13,6 +13,7 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - Cleaned STT relay logging counters to use the current integer multiple helper.
 - Added an explicit `too_many_arguments` allowance to the managed stream recovery helper because it intentionally carries provider, stream, request, timing, and failure context for recovery logging.
 - Cleaned duplicate internal-disclosure guard trimming logic in the LLM answer helper.
+- Added the missing Ubuntu ALSA development package to CI, observability, and release Linux dependency setup so audio crates can build on hosted runners.
 
 ## Verification
 
