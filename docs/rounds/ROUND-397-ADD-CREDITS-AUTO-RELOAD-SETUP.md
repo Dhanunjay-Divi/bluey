@@ -20,6 +20,14 @@ Make the account balance card and Add Credits flow feel clear for first-time cre
 ## Verification
 
 - `node --check web/assets/bluey-site.js`
+- `git diff --check`
 - Local browser harness with a zero-balance Square-enabled mock account:
   - Dashboard showed neutral `$0.00`, `Add credits`, and no disabled Auto Reload save button.
   - Add Credits opened the popup with `$15`, Auto Reload checked on, card setup inside the popup, and `Continue to $15.00 checkout`.
+- Static web deploy:
+  - `rsync -av --delete --exclude 'install.sh' --exclude 'install.ps1' --exclude 'latest.json' --exclude 'latest.json.sig' --exclude 'releases/***' --exclude 'backups/***' web/ root@165.227.77.152:/var/www/bluey/`
+- Live checks:
+  - `https://bluey.sh/account` serves `bluey-site.css?v=2026070602` and `bluey-site.js?v=2026070602`.
+  - Live JS contains the new Add Credits Auto Reload setup copy and no longer contains the old `Save a card in Billing` copy.
+  - `https://bluey.sh/install.sh` still returns `application/x-shellscript`.
+  - `https://bluey.sh/latest.json` still returns release metadata.
