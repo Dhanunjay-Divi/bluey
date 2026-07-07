@@ -3212,10 +3212,55 @@
       justify-self: start;
     }
 
+    #accountApp .square-card-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .45rem;
+      align-items: center;
+    }
+
     #accountApp .usage-list {
       display: grid;
       gap: .5rem;
       margin: 1rem 0;
+    }
+
+    #accountApp .usage-estimate-card {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: .65rem;
+      margin: .85rem 0 .75rem;
+    }
+
+    #accountApp .usage-estimate-card > div {
+      min-width: 0;
+      padding: .72rem .82rem;
+      border: 1px solid rgba(99, 216, 255, .18);
+      border-radius: 10px;
+      background: rgba(99, 216, 255, .045);
+    }
+
+    #accountApp .usage-estimate-card span,
+    #accountApp .usage-estimate-card em {
+      display: block;
+      color: #75818a;
+      font-size: .72rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .usage-estimate-card span {
+      margin-bottom: .24rem;
+      font-weight: 900;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .usage-estimate-card strong {
+      display: block;
+      margin-bottom: .2rem;
+      color: #f1f1f1;
+      font-size: 1.02rem;
+      line-height: 1.1;
     }
 
     #accountApp .usage-row,
@@ -6041,6 +6086,20 @@
       color: #5f7281;
     }
 
+    html[data-bluey-theme="light"] #accountApp .usage-estimate-card > div {
+      border-color: #dceaf2;
+      background: #f7fbff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .usage-estimate-card strong {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .usage-estimate-card span,
+    html[data-bluey-theme="light"] #accountApp .usage-estimate-card em {
+      color: #5f7281;
+    }
+
     html[data-bluey-theme="light"] #accountApp .dashboard-tabs {
       border-bottom-color: #dceaf2;
     }
@@ -6111,6 +6170,10 @@
       }
 
       #accountApp .summary-metric-grid {
+        grid-template-columns: 1fr;
+      }
+
+      #accountApp .usage-estimate-card {
         grid-template-columns: 1fr;
       }
     }
@@ -6303,11 +6366,162 @@
       justify-self: start;
     }
 
+    #accountApp .billing-payment-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem;
+      align-items: center;
+    }
+
     #accountApp .billing-payment-card .square-card-setup {
       width: 100%;
       margin-top: 0;
-      padding: .75rem;
+      gap: .48rem;
+      max-width: 100%;
+      padding: .62rem;
+      border-radius: 9px;
+      background: rgba(255, 255, 255, .025);
+    }
+
+    #accountApp .billing-payment-card .square-card-copy {
+      gap: .08rem;
+    }
+
+    #accountApp .billing-payment-card .square-card-copy strong {
+      font-size: .76rem;
+    }
+
+    #accountApp .billing-payment-card .square-card-copy span {
+      font-size: .68rem;
+      line-height: 1.28;
+    }
+
+    #accountApp .billing-payment-card .square-card-container {
+      min-height: 38px;
+      padding: .45rem .55rem;
+      border-radius: 8px;
+    }
+
+    #accountApp .billing-payment-card .square-card-actions .account-button {
+      min-height: 31px;
+      padding: .34rem .55rem;
+      border-radius: 8px;
+      font-size: .72rem;
+    }
+
+    #accountApp .manual-reload-rule:empty {
+      display: none;
+    }
+
+    #accountApp .billing-status-card {
+      margin-top: .8rem;
+      padding: .9rem 1rem;
+      border: 1px solid #222;
       border-radius: 10px;
+      background: #101010;
+    }
+
+    #accountApp .billing-status-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    #accountApp .billing-status-head h4 {
+      margin: 0;
+      color: #f1f1f1;
+      font-size: .98rem;
+      line-height: 1.1;
+    }
+
+    #accountApp .billing-status-head p {
+      margin: .32rem 0 0;
+      color: #858f98;
+      font-size: .78rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .billing-status-table-wrap {
+      margin-top: .72rem;
+      overflow-x: auto;
+      border-top: 1px solid rgba(255, 255, 255, .08);
+    }
+
+    #accountApp .billing-status-table {
+      width: 100%;
+      min-width: 620px;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+
+    #accountApp .billing-status-table th,
+    #accountApp .billing-status-table td {
+      padding: .62rem .45rem;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    #accountApp .billing-status-table th {
+      color: #687681;
+      font-size: .62rem;
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .billing-status-table td {
+      border-top: 1px solid rgba(255, 255, 255, .07);
+      color: #cfcfcf;
+      font-size: .78rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .billing-status-table tbody tr:first-child td {
+      border-top-color: rgba(255, 255, 255, .11);
+    }
+
+    #accountApp .billing-status-item,
+    #accountApp .billing-status-amount {
+      color: #f1f1f1;
+      font-weight: 850;
+      white-space: nowrap;
+    }
+
+    #accountApp .billing-status-detail {
+      color: #7d878e;
+    }
+
+    #accountApp .billing-status-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: .16rem .42rem;
+      border: 1px solid rgba(255, 255, 255, .10);
+      border-radius: 999px;
+      color: #9a9a9a;
+      font-size: .68rem;
+      font-weight: 900;
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    #accountApp .billing-status-badge.is-good {
+      border-color: rgba(104, 244, 157, .22);
+      background: rgba(104, 244, 157, .10);
+      color: #7df1aa;
+    }
+
+    #accountApp .billing-status-badge.is-warn {
+      border-color: rgba(255, 210, 117, .25);
+      background: rgba(255, 210, 117, .10);
+      color: #ffd277;
+    }
+
+    #accountApp .billing-status-badge.is-danger {
+      border-color: rgba(255, 116, 125, .26);
+      background: rgba(255, 116, 125, .11);
+      color: #ff858d;
     }
 
     html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row h2,
@@ -6755,14 +6969,16 @@
 
     #accountApp .dashboard-overview-card {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(236px, auto);
-      gap: .9rem;
+      grid-template-columns: minmax(0, 1fr) minmax(250px, auto);
+      gap: .95rem;
       align-items: center;
       margin-bottom: 1rem;
-      padding: 1.05rem 1.25rem;
-      border-color: #1a1a1a;
+      padding: 1rem 1.1rem;
+      border-color: rgba(99, 216, 255, .18);
       border-radius: 12px;
-      background: #0a0a0a;
+      background:
+        linear-gradient(135deg, rgba(99, 216, 255, .045), rgba(79, 141, 255, .015) 46%, transparent),
+        #0a0a0a;
     }
 
     #accountApp .dashboard-overview-card.balance-low {
@@ -6786,9 +7002,16 @@
     }
 
     #accountApp .dashboard-overview-title-row {
-      grid-template-columns: minmax(0, 1fr) auto;
+      display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 1rem;
+      justify-content: flex-start;
+      gap: .4rem clamp(1.15rem, 3.2vw, 2.15rem);
+    }
+
+    #accountApp .dashboard-overview-title-row > div {
+      flex: 0 1 24rem;
+      min-width: 13rem;
     }
 
     #accountApp .dashboard-overview-title-row h2 {
@@ -6808,6 +7031,7 @@
     }
 
     #accountApp .dashboard-overview-title-row #balanceValue {
+      flex: 0 0 auto;
       color: #f2f2f2;
       font-size: 1.45rem;
       letter-spacing: 0;
@@ -6826,7 +7050,7 @@
     }
 
     #accountApp .compact-auto-reload {
-      min-width: 236px;
+      min-width: 250px;
       padding: 0;
       border: 0;
       background: transparent;
@@ -6852,6 +7076,10 @@
       letter-spacing: 0;
     }
 
+    #accountApp .compact-auto-reload.is-setup-default .auto-reload-head h3 {
+      color: var(--bluey-accent);
+    }
+
     #accountApp .compact-auto-reload .auto-reload-fields {
       grid-column: 1 / -1;
       grid-template-columns: repeat(2, minmax(80px, 1fr));
@@ -6875,6 +7103,11 @@
       color: #777;
       font-size: .7rem;
       line-height: 1.35;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-hint {
+      color: #8897a1;
+      font-weight: 700;
     }
 
     #accountApp .compact-auto-reload .auto-reload-save {
@@ -6943,6 +7176,133 @@
       grid-template-columns: minmax(0, 1fr) auto auto;
     }
 
+    /* Round 398: keep desktop connect compact and separate from session history. */
+    #accountApp #dashboardTabComputers {
+      display: grid;
+      gap: .7rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-connect-section {
+      padding: .68rem .78rem;
+      border-color: rgba(99, 216, 255, .22);
+      background:
+        linear-gradient(135deg, rgba(99, 216, 255, .06), rgba(79, 141, 255, .018) 48%, transparent),
+        #0a0a0a;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint {
+      display: grid;
+      grid-template-columns: minmax(9.5rem, .3fr) minmax(0, 1fr);
+      gap: .35rem .9rem;
+      align-items: start;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint[hidden] {
+      display: none;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint strong {
+      grid-column: 1;
+      grid-row: 1;
+      align-self: center;
+      color: #f2f2f2;
+      font-size: .86rem;
+      font-weight: 750;
+      line-height: 1.15;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-helper {
+      grid-column: 2;
+      grid-row: 2;
+      max-width: none;
+      margin-top: -.08rem;
+      color: #838f97;
+      font-size: .68rem;
+      line-height: 1.35;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-form {
+      grid-column: 2;
+      grid-row: 1;
+      grid-template-columns: minmax(0, 1fr) minmax(5.9rem, auto);
+      gap: .45rem;
+      align-self: center;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-form input {
+      min-height: 34px;
+      height: 34px;
+      padding: .42rem .62rem;
+      border-radius: 8px;
+      font-size: .76rem;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .account-button {
+      min-height: 34px;
+      padding: .42rem .75rem;
+      border-radius: 8px;
+      font-size: .74rem;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-status {
+      grid-column: 2;
+      grid-row: 3;
+      min-height: 0;
+      margin-top: -.18rem;
+      text-align: left;
+      font-size: .66rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-section {
+      padding: .88rem .95rem;
+      border-color: #1a1a1a;
+      background: #0a0a0a;
+    }
+
+    #accountApp #dashboardTabComputers .device-section .section-head {
+      margin-bottom: .7rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-section .section-head h3 {
+      font-size: .98rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-section .section-head p {
+      font-size: .76rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-summary-bar {
+      min-height: 42px;
+      margin-bottom: .55rem;
+      padding: .5rem .6rem;
+      border-radius: 9px;
+      background: #0d0d0d;
+      font-size: .78rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-summary-bar .account-button {
+      min-height: 32px;
+      padding: .4rem .65rem;
+      border-radius: 8px;
+      font-size: .72rem;
+    }
+
+    #accountApp .device-empty {
+      padding: 1rem .75rem;
+      border: 1px dashed rgba(255, 255, 255, .10);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, .015);
+      color: #666;
+      font-size: .8rem;
+      line-height: 1.4;
+      text-align: center;
+    }
+
     #accountApp .billing-section {
       background: #0a0a0a;
     }
@@ -6952,11 +7312,196 @@
       gap: .75rem;
     }
 
+    #accountApp .billing-credits-grid {
+      align-items: stretch;
+    }
+
     #accountApp .billing-primary-card,
     #accountApp .billing-payment-card {
       padding: 1rem 1.05rem;
       border-radius: 10px;
       background: #101010;
+    }
+
+    #accountApp .billing-primary-card {
+      display: grid;
+      gap: 1rem;
+    }
+
+    #accountApp .reload-setup-modal {
+      width: min(680px, calc(100vw - 36px));
+      border-color: rgba(99, 216, 255, .30);
+      border-radius: 16px;
+      padding: 1rem;
+      background: #101010;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-head {
+      margin-bottom: .9rem;
+    }
+
+    #accountApp .reload-setup-modal h2 {
+      font-size: 1.35rem;
+      line-height: 1.05;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-head p {
+      max-width: 32rem;
+      margin-top: .45rem;
+      font-size: .8rem;
+      line-height: 1.38;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-close {
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+    }
+
+    #accountApp .reload-setup-grid {
+      display: grid;
+      grid-template-columns: minmax(0, .9fr) minmax(0, 1fr);
+      gap: .7rem;
+      align-items: start;
+    }
+
+    #accountApp .reload-setup-panel {
+      display: grid;
+      align-content: start;
+      gap: .62rem;
+      min-width: 0;
+      padding: .82rem;
+      border: 1px solid #242424;
+      border-radius: 10px;
+      background: #0a0a0a;
+    }
+
+    #accountApp .reload-setup-panel h3 {
+      margin: .1rem 0 0;
+      color: #f2f2f2;
+      font-size: 1rem;
+      line-height: 1.1;
+    }
+
+    #accountApp .reload-amount-presets {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: .35rem;
+    }
+
+    #accountApp .reload-amount-presets button {
+      min-height: 34px;
+      border: 1px solid rgba(255, 255, 255, .12);
+      border-radius: 8px;
+      background: #111;
+      color: #d7d7d7;
+      font: inherit;
+      font-size: .78rem;
+      font-weight: 850;
+      cursor: pointer;
+      transition: border-color .18s ease, background .18s ease, color .18s ease, box-shadow .18s ease;
+    }
+
+    #accountApp .reload-amount-presets button:hover,
+    #accountApp .reload-amount-presets button.is-active {
+      border-color: rgba(99, 216, 255, .58);
+      background: rgba(99, 216, 255, .10);
+      color: #75dcff;
+      box-shadow: 0 0 0 3px rgba(99, 216, 255, .08);
+    }
+
+    #accountApp .reload-setup-kicker {
+      color: #6f7b84;
+      font-size: .66rem;
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .reload-setup-panel .manual-reload-field {
+      gap: .36rem;
+    }
+
+    #accountApp .reload-setup-panel .manual-reload-input {
+      min-height: 40px;
+      border-radius: 9px;
+    }
+
+    #accountApp .reload-setup-panel > p,
+    #accountApp .reload-setup-panel .auto-reload-rule {
+      margin: -.2rem 0 0;
+      color: #858f98;
+      font-size: .78rem;
+      line-height: 1.42;
+    }
+
+    #accountApp .reload-setup-panel .account-button.primary {
+      width: 100%;
+      min-height: 42px;
+      border-radius: 10px;
+    }
+
+    #accountApp .reload-setup-card-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem;
+      align-items: center;
+    }
+
+    #accountApp .reload-setup-footer {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: .75rem;
+      align-items: center;
+      margin-top: .75rem;
+      padding-top: .75rem;
+      border-top: 1px solid rgba(255, 255, 255, .08);
+    }
+
+    #accountApp .reload-setup-footer p {
+      margin: 0;
+      color: #7f8b92;
+      font-size: .74rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .reload-setup-footer .account-button.primary {
+      min-height: 40px;
+      border-radius: 9px;
+      white-space: nowrap;
+    }
+
+    #accountApp .reload-setup-square-card {
+      width: 100%;
+      margin: 0;
+      padding: .68rem;
+      border-radius: 10px;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-message {
+      margin-top: .65rem;
+      padding: .56rem .68rem;
+      border: 1px solid rgba(99, 216, 255, .18);
+      border-radius: 9px;
+      background: rgba(99, 216, 255, .055);
+      color: #9fb4be;
+      font-size: .74rem;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-message:empty {
+      display: none;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-message[data-tone="error"] {
+      border-color: rgba(255, 116, 125, .28);
+      background: rgba(255, 116, 125, .075);
+      color: #ff8b94;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-message[data-tone="success"] {
+      border-color: rgba(105, 240, 143, .24);
+      background: rgba(105, 240, 143, .075);
+      color: #9df5b2;
     }
 
     html[data-bluey-theme="light"] #productSite.page {
@@ -6985,6 +7530,90 @@
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-rule,
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-hint {
       color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-modal {
+      border-color: #cfe3ef;
+      background: #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-panel,
+    html[data-bluey-theme="light"] #accountApp .reload-setup-square-card {
+      border-color: #dceaf2;
+      background: #f7fbff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .billing-status-card {
+      border-color: #dceaf2;
+      background: #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .billing-status-head h4,
+    html[data-bluey-theme="light"] #accountApp .billing-status-item,
+    html[data-bluey-theme="light"] #accountApp .billing-status-amount {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .billing-status-head p,
+    html[data-bluey-theme="light"] #accountApp .billing-status-detail {
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .billing-status-table-wrap,
+    html[data-bluey-theme="light"] #accountApp .billing-status-table td,
+    html[data-bluey-theme="light"] #accountApp .billing-status-table tbody tr:first-child td {
+      border-color: #dceaf2;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-amount-presets button {
+      border-color: #d8e7f0;
+      background: #ffffff;
+      color: #53697a;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-amount-presets button:hover,
+    html[data-bluey-theme="light"] #accountApp .reload-amount-presets button.is-active {
+      border-color: rgba(8, 124, 166, .40);
+      background: #eaf8ff;
+      color: #087ca6;
+      box-shadow: 0 0 0 3px rgba(8, 124, 166, .08);
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-panel h3 {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-kicker,
+    html[data-bluey-theme="light"] #accountApp .reload-setup-panel > p,
+    html[data-bluey-theme="light"] #accountApp .reload-setup-panel .auto-reload-rule,
+    html[data-bluey-theme="light"] #accountApp .reload-setup-footer p {
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-footer {
+      border-top-color: #dceaf2;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-modal .account-modal-message {
+      border-color: #cfe3ef;
+      background: #eff9ff;
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-modal .account-modal-message[data-tone="error"] {
+      border-color: rgba(211, 58, 71, .24);
+      background: #fff1f2;
+      color: #ba2434;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-modal .account-modal-message[data-tone="success"] {
+      border-color: rgba(16, 144, 84, .22);
+      background: #effcf4;
+      color: #147447;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .compact-auto-reload.is-setup-default .auto-reload-head h3 {
+      color: #087ca6;
     }
 
     html[data-bluey-theme="light"] #accountApp .dashboard-tab.is-active {
@@ -7030,8 +7659,30 @@
 
       #productSite .pricing,
       #accountApp .billing-grid,
+      #accountApp .reload-setup-grid,
+      #accountApp .reload-setup-footer,
       #accountApp .dashboard-overview-card {
         grid-template-columns: 1fr;
+      }
+
+      #accountApp .reload-setup-footer .account-button.primary {
+        width: 100%;
+      }
+
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint {
+        grid-template-columns: 1fr;
+        gap: .35rem;
+      }
+
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-form,
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-helper,
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-status {
+        grid-column: 1;
+        grid-row: auto;
+      }
+
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-status {
+        text-align: left;
       }
 
       #productSite .pricing {

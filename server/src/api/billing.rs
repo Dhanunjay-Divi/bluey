@@ -51,7 +51,31 @@ pub struct SaveSquareCardRequest {
     pub source_id: String,
 }
 
+#[derive(Deserialize)]
+pub struct SquarePayRequest {
+    pub amount_cents: i64,
+    pub source_id: Option<String>,
+    pub use_saved_card: Option<bool>,
+    pub save_card_for_auto_reload: Option<bool>,
+    pub auto_topup_enabled: Option<bool>,
+    pub auto_topup_threshold_cents: Option<i64>,
+    pub auto_topup_amount_cents: Option<i64>,
+    pub client_request_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SquarePayResponse {
+    pub account: super::account::AccountMe,
+    pub credited: bool,
+    pub payment_status: String,
+}
+
 const MINIMUM_RELOAD_CENTS: i64 = 1500;
+const MAXIMUM_RELOAD_CENTS: i64 = 50000;
+const MIN_AUTO_RELOAD_CENTS: i64 = 1500;
+const MAX_AUTO_RELOAD_CENTS: i64 = 50000;
+const MIN_AUTO_RELOAD_THRESHOLD_CENTS: i64 = 100;
+const MAX_AUTO_RELOAD_THRESHOLD_CENTS: i64 = 5000;
 const SQUARE_API_VERSION: &str = "2025-04-16";
 
 fn square_idempotency_key(
@@ -63,6 +87,36 @@ fn square_idempotency_key(
         "{prefix}-{}-{suffix}",
         cue_core::account_id_hash_prefix(account_id)
     )
+}
+
+fn square_payment_idempotency_key(
+    account_id: &str,
+    amount_cents: i64,
+    client_request_id: Option<&str>,
+) -> String {
+    let suffix = client_request_id
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(20)
+        .collect::<String>();
+    let suffix = if suffix.is_empty() {
+        uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(18)
+            .collect::<String>()
+    } else {
+        suffix
+    };
+    square_idempotency_key("bpay", account_id, format!("{amount_cents}-{suffix}"))
+}
+
+fn clean_source_id(source_id: Option<String>) -> Option<String> {
+    source_id
+        .map(|value| value.trim().chars().take(512).collect::<String>())
+        .filter(|value| !value.is_empty())
 }
 
 fn ensure_payment_setup_allowed(
@@ -88,8 +142,79 @@ fn ensure_payment_setup_allowed(
         return Err((
             StatusCode::FORBIDDEN,
             Json(ApiError {
-                error: "Verify your email before adding credits or saving a payment method."
+                error: "Verify your email before adding balance or saving a payment method."
                     .to_string(),
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reload_amount(amount_cents: i64) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if amount_cents < MINIMUM_RELOAD_CENTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("Minimum reload is ${}.", MINIMUM_RELOAD_CENTS / 100),
+            }),
+        ));
+    }
+    if amount_cents > MAXIMUM_RELOAD_CENTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("Maximum reload is ${}.", MAXIMUM_RELOAD_CENTS / 100),
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_auto_reload_settings(
+    enabled: bool,
+    threshold_cents: i64,
+    amount_cents: i64,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if !enabled {
+        return Ok(());
+    }
+    if amount_cents < MIN_AUTO_RELOAD_CENTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "Auto Reload amount must be at least $15.".to_string(),
+            }),
+        ));
+    }
+    if amount_cents > MAX_AUTO_RELOAD_CENTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "Auto Reload amount can be at most $500.".to_string(),
+            }),
+        ));
+    }
+    if threshold_cents < MIN_AUTO_RELOAD_THRESHOLD_CENTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "Auto Reload threshold must be at least $1.".to_string(),
+            }),
+        ));
+    }
+    if threshold_cents > MAX_AUTO_RELOAD_THRESHOLD_CENTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "Auto Reload threshold can be at most $50.".to_string(),
+            }),
+        ));
+    }
+    if threshold_cents >= amount_cents {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "Auto Reload amount must be greater than the threshold.".to_string(),
             }),
         ));
     }
@@ -167,7 +292,7 @@ pub async fn save_square_card(
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ApiError {
-                error: "Square billing is not active.".to_string(),
+                error: "Card changes are not available for this account.".to_string(),
             }),
         ));
     }
@@ -185,7 +310,7 @@ pub async fn save_square_card(
     let access_token = square
         .access_token
         .as_deref()
-        .ok_or_else(|| square_missing("Square billing not configured"))?;
+        .ok_or_else(|| square_missing("Card changes are unavailable right now."))?;
 
     let customer_id = if let Some(existing) = account.square_customer_id.clone() {
         existing
@@ -226,6 +351,240 @@ pub async fn save_square_card(
     Ok(Json(super::account::account_me_payload(&state, updated)))
 }
 
+pub async fn square_pay(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(req): Json<SquarePayRequest>,
+) -> Result<Json<SquarePayResponse>, (StatusCode, Json<ApiError>)> {
+    ensure_payment_setup_allowed(&account)?;
+    if !matches!(state.config.billing_provider(), BillingProvider::Square) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "Card payment is not available for this account.".to_string(),
+            }),
+        ));
+    }
+    validate_reload_amount(req.amount_cents)?;
+
+    let auto_topup_enabled = req.auto_topup_enabled.unwrap_or(account.auto_topup_enabled);
+    let auto_topup_threshold_cents = req
+        .auto_topup_threshold_cents
+        .unwrap_or(account.auto_topup_threshold_cents);
+    let auto_topup_amount_cents = req
+        .auto_topup_amount_cents
+        .unwrap_or(account.auto_topup_amount_cents);
+    validate_auto_reload_settings(
+        auto_topup_enabled,
+        auto_topup_threshold_cents,
+        auto_topup_amount_cents,
+    )?;
+
+    let square = state.config.square_config();
+    let access_token = square
+        .access_token
+        .as_deref()
+        .ok_or_else(|| square_missing("Payment is unavailable right now."))?;
+    let location_id = square
+        .location_id
+        .as_deref()
+        .ok_or_else(|| square_missing("Payment is unavailable right now."))?;
+
+    let mut updated_account = account.clone();
+    let source_id = clean_source_id(req.source_id);
+    let save_card = req.save_card_for_auto_reload.unwrap_or(false);
+    let use_saved_card = req.use_saved_card.unwrap_or(source_id.is_none());
+
+    let (charge_source_id, customer_id) = if save_card {
+        let source_id = source_id.ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "Enter a card to turn on Auto Reload.".to_string(),
+                }),
+            )
+        })?;
+        let customer_id = if let Some(existing) = updated_account.square_customer_id.clone() {
+            existing
+        } else {
+            create_square_customer(&square, access_token, &updated_account).await?
+        };
+        let card = create_square_card(
+            &square,
+            access_token,
+            &customer_id,
+            &source_id,
+            &updated_account,
+        )
+        .await?;
+        updated_account = Account::save_square_card(
+            &state.pool,
+            &updated_account.id,
+            &customer_id,
+            &card.id,
+            card.brand.as_deref(),
+            card.last4.as_deref(),
+        )
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&updated_account.id),
+                error = %e,
+                "failed to save Square card metadata before payment"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "Could not save card.".to_string(),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "Account not found.".to_string(),
+                }),
+            )
+        })?;
+        (card.id, Some(customer_id))
+    } else if use_saved_card {
+        let card_id = updated_account.square_card_id.clone().ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "Add a card to continue.".to_string(),
+                }),
+            )
+        })?;
+        let customer_id = updated_account.square_customer_id.clone().ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "Add a card to continue.".to_string(),
+                }),
+            )
+        })?;
+        (card_id, Some(customer_id))
+    } else {
+        let source_id = source_id.ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "Enter a card to continue.".to_string(),
+                }),
+            )
+        })?;
+        (source_id, updated_account.square_customer_id.clone())
+    };
+
+    if auto_topup_enabled && updated_account.square_card_id.is_none() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "Add a card to turn on Auto Reload.".to_string(),
+            }),
+        ));
+    }
+
+    let result = create_square_payment(
+        &square,
+        access_token,
+        location_id,
+        &updated_account.id,
+        req.amount_cents,
+        &charge_source_id,
+        customer_id.as_deref(),
+        req.client_request_id.as_deref(),
+    )
+    .await?;
+
+    let credited = if result.status == "COMPLETED" {
+        balance::credit_processor_payment(
+            &state.pool,
+            &updated_account.id,
+            req.amount_cents,
+            "square",
+            &result.payment_id,
+        )
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&updated_account.id),
+                square_payment_id = %result.payment_id,
+                error = %e,
+                "failed to credit completed Square payment"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "Payment succeeded, but balance is still updating. Refresh in a moment."
+                        .to_string(),
+                }),
+            )
+        })?
+    } else {
+        false
+    };
+
+    updated_account = Account::update_auto_topup_settings(
+        &state.pool,
+        &updated_account.id,
+        auto_topup_enabled,
+        auto_topup_threshold_cents,
+        auto_topup_amount_cents,
+    )
+    .map_err(|e| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&updated_account.id),
+            error = %e,
+            "failed to update Auto Reload after payment"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "Payment succeeded, but Auto Reload did not update. Refresh and try again."
+                    .to_string(),
+            }),
+        )
+    })?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: "Account not found.".to_string(),
+            }),
+        )
+    })?;
+
+    updated_account = Account::fetch_by_id(&state.pool, &updated_account.id)
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&updated_account.id),
+                error = %e,
+                "failed to reload account after Square payment"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "Payment succeeded. Refresh balance in a moment.".to_string(),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "Account not found.".to_string(),
+                }),
+            )
+        })?;
+
+    Ok(Json(SquarePayResponse {
+        account: super::account::account_me_payload(&state, updated_account),
+        credited,
+        payment_status: result.status,
+    }))
+}
+
 async fn stripe_checkout(
     state: AppState,
     account: crate::db::accounts::Account,
@@ -235,7 +594,7 @@ async fn stripe_checkout(
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiError {
-                error: "billing not configured".into(),
+                error: "Checkout is unavailable right now.".into(),
             }),
         )
     })?;
@@ -268,7 +627,7 @@ async fn stripe_checkout(
         ("line_items[0][price_data][currency]", "usd"),
         (
             "line_items[0][price_data][product_data][name]",
-            "Bluey credits",
+            "Bluey balance",
         ),
         (
             "line_items[0][price_data][unit_amount]",
@@ -310,7 +669,7 @@ async fn stripe_checkout(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
-                    error: "billing provider unavailable; please retry".into(),
+                    error: "Checkout is unavailable right now. Please retry.".into(),
                 }),
             )
         })?;
@@ -329,7 +688,7 @@ async fn stripe_checkout(
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ApiError {
-                error: "billing checkout failed; please retry".into(),
+                error: "Checkout could not start. Please retry.".into(),
             }),
         ));
     }
@@ -340,7 +699,7 @@ async fn stripe_checkout(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
-                    error: "stripe response missing url".into(),
+                    error: "Checkout did not return a link. Please retry.".into(),
                 }),
             )
         })?
@@ -374,6 +733,12 @@ struct SavedSquareCard {
     last4: Option<String>,
 }
 
+#[derive(Debug)]
+struct SquarePaymentResult {
+    payment_id: String,
+    status: String,
+}
+
 async fn create_square_customer(
     square: &crate::config::SquareConfig,
     access_token: &str,
@@ -401,7 +766,7 @@ async fn create_square_customer(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
-                    error: "Could not create Square customer; please retry.".to_string(),
+                    error: "Could not prepare card setup. Please retry.".to_string(),
                 }),
             )
         })?;
@@ -417,7 +782,7 @@ async fn create_square_customer(
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ApiError {
-                error: "Could not create Square customer; please retry.".to_string(),
+                error: "Could not prepare card setup. Please retry.".to_string(),
             }),
         ));
     }
@@ -428,7 +793,7 @@ async fn create_square_customer(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
-                    error: "Square customer response missing id.".to_string(),
+                    error: "Card setup response was incomplete. Please retry.".to_string(),
                 }),
             )
         })
@@ -495,7 +860,7 @@ async fn create_square_card(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
-                    error: "Square card response missing id.".to_string(),
+                    error: "Card setup response was incomplete. Please retry.".to_string(),
                 }),
             )
         })?
@@ -510,6 +875,185 @@ async fn create_square_card(
         .map(|value| value.to_string());
 
     Ok(SavedSquareCard { id, brand, last4 })
+}
+
+fn build_square_payment_body(
+    location_id: &str,
+    account_id: &str,
+    amount_cents: i64,
+    source_id: &str,
+    customer_id: Option<&str>,
+    client_request_id: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "idempotency_key": square_payment_idempotency_key(account_id, amount_cents, client_request_id),
+        "source_id": source_id,
+        "amount_money": {
+            "amount": amount_cents,
+            "currency": "USD"
+        },
+        "location_id": location_id,
+        "autocomplete": true,
+        "reference_id": square_reload_reference_id(account_id),
+        "note": "Bluey balance"
+    });
+    if let Some(customer_id) = customer_id.filter(|value| !value.trim().is_empty()) {
+        body["customer_id"] = serde_json::Value::String(customer_id.to_string());
+    }
+    body
+}
+
+async fn create_square_payment(
+    square: &crate::config::SquareConfig,
+    access_token: &str,
+    location_id: &str,
+    account_id: &str,
+    amount_cents: i64,
+    source_id: &str,
+    customer_id: Option<&str>,
+    client_request_id: Option<&str>,
+) -> Result<SquarePaymentResult, (StatusCode, Json<ApiError>)> {
+    let body = build_square_payment_body(
+        location_id,
+        account_id,
+        amount_cents,
+        source_id,
+        customer_id,
+        client_request_id,
+    );
+    let account_id_hash = cue_core::account_id_hash_prefix(account_id);
+    let resp = reqwest::Client::new()
+        .post(square_api_url(square, "/v2/payments"))
+        .bearer_auth(access_token)
+        .header("Square-Version", SQUARE_API_VERSION)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %account_id_hash,
+                amount_cents,
+                error = %e,
+                "Square balance payment http failed"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "Payment is unavailable right now. Try again in a moment.".to_string(),
+                }),
+            )
+        })?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        tracing::warn!(
+            account_id_hash = %account_id_hash,
+            amount_cents,
+            square_status = %status,
+            square_body = %log_safe_square_body(&body),
+            "Square balance payment failed"
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: "Payment did not go through. Check the card and try again.".to_string(),
+            }),
+        ));
+    }
+
+    let payment = body.pointer("/payment").ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: "Payment response was incomplete. Refresh and try again.".to_string(),
+            }),
+        )
+    })?;
+    validate_square_direct_payment_response(
+        payment,
+        account_id,
+        &square_reload_reference_id(account_id),
+        customer_id,
+        amount_cents,
+    )
+    .map_err(|e| {
+        tracing::warn!(
+            account_id_hash = %account_id_hash,
+            error = %e,
+            "Square balance payment validation failed"
+        );
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: "Payment response could not be verified. Refresh and try again.".to_string(),
+            }),
+        )
+    })?;
+    let payment_id = payment
+        .pointer("/id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "Payment response was incomplete. Refresh and try again.".to_string(),
+                }),
+            )
+        })?
+        .to_string();
+    let payment_status = payment
+        .pointer("/status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN")
+        .to_string();
+
+    tracing::info!(
+        account_id_hash = %account_id_hash,
+        amount_cents,
+        square_payment_id = %payment_id,
+        square_payment_status = %payment_status,
+        "Square balance payment created"
+    );
+
+    Ok(SquarePaymentResult {
+        payment_id,
+        status: payment_status,
+    })
+}
+
+fn validate_square_direct_payment_response(
+    payment: &serde_json::Value,
+    account_id: &str,
+    expected_reference_id: &str,
+    expected_customer_id: Option<&str>,
+    expected_amount_cents: i64,
+) -> Result<()> {
+    let observed_amount = required_square_money_amount(payment, "/amount_money", "payment amount")?;
+    ensure_square_amount_match(expected_amount_cents, observed_amount, "payment amount")?;
+
+    let observed_reference_id =
+        required_square_string(payment, "/reference_id", "payment reference_id")?;
+    if observed_reference_id != expected_reference_id {
+        return Err(anyhow!(
+            "Square payment reference mismatch for account {}",
+            cue_core::account_id_hash_prefix(account_id)
+        ));
+    }
+
+    if let Some(expected_customer_id) = expected_customer_id {
+        if let Some(observed_customer_id) = payment.pointer("/customer_id").and_then(|v| v.as_str())
+        {
+            if observed_customer_id != expected_customer_id {
+                return Err(anyhow!(
+                    "Square payment customer mismatch for account {}",
+                    cue_core::account_id_hash_prefix(account_id)
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn square_missing(message: &str) -> (StatusCode, Json<ApiError>) {
@@ -540,7 +1084,7 @@ fn build_square_payment_link_body(
                 "bluey_amount_cents": amount_cents.to_string()
             },
             "line_items": [{
-                "name": "Bluey credits",
+                "name": "Bluey balance",
                 "quantity": "1",
                 "base_price_money": {
                     "amount": amount_cents,
@@ -555,7 +1099,7 @@ fn build_square_payment_link_body(
         "pre_populated_data": {
             "buyer_email": customer_email
         },
-        "payment_note": "Bluey credit reload"
+        "payment_note": "Bluey balance reload"
     })
 }
 
@@ -612,11 +1156,11 @@ async fn square_checkout(
     let access_token = square
         .access_token
         .as_deref()
-        .ok_or_else(|| square_missing("Square billing not configured"))?;
+        .ok_or_else(|| square_missing("Checkout is unavailable right now."))?;
     let location_id = square
         .location_id
         .as_deref()
-        .ok_or_else(|| square_missing("Square location not configured"))?;
+        .ok_or_else(|| square_missing("Checkout is unavailable right now."))?;
 
     let account_id_hash = cue_core::account_id_hash_prefix(&account.id);
     tracing::info!(
@@ -652,7 +1196,7 @@ async fn square_checkout(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
-                    error: "billing provider unavailable; please retry".into(),
+                    error: "Checkout is unavailable right now. Please retry.".into(),
                 }),
             )
         })?;
@@ -672,7 +1216,7 @@ async fn square_checkout(
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ApiError {
-                error: "billing checkout failed; please retry".into(),
+                error: "Checkout could not start. Please retry.".into(),
             }),
         ));
     }
@@ -688,7 +1232,7 @@ async fn square_checkout(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
-                    error: "Square checkout response missing url".into(),
+                    error: "Checkout did not return a link. Please retry.".into(),
                 }),
             )
         })?
@@ -1834,7 +2378,7 @@ async fn stripe_portal(
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiError {
-                error: "billing not configured".into(),
+                error: "Billing tools are unavailable right now.".into(),
             }),
         )
     })?;
@@ -1842,7 +2386,7 @@ async fn stripe_portal(
         (
             StatusCode::BAD_REQUEST,
             Json(ApiError {
-                error: "no Stripe customer on file; complete a reload first".into(),
+                error: "Complete a reload before opening billing tools.".into(),
             }),
         )
     })?;
@@ -1862,7 +2406,7 @@ async fn stripe_portal(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
-                    error: "billing provider unavailable; please retry".into(),
+                    error: "Checkout is unavailable right now. Please retry.".into(),
                 }),
             )
         })?;

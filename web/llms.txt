@@ -24,15 +24,17 @@ and document-heavy work sessions.
 - Managed AI routing for quick, coding, screen, research, and deep answers.
 - Status events that show when Bluey is reading screen context, attached docs,
   saved memory, or managed web sources.
-- Credits model: start free, then add account credits for paid AI models,
+- Balance model: start free, then add account balance for paid AI models,
   speech transcription, screen analysis, and saved-session search.
+- Usage estimates are approximate because transcript, screen, files, saved
+  context, and answer depth can change the route and balance use.
 
 ## Trust And Safety
 
 - Bluey should be used only for work context the user is authorized to capture,
   upload, or analyze.
 - Capture and listening are tied to visible user controls.
-- Provider API keys for managed cloud requests stay server-side.
+- Managed cloud credentials are not stored in the desktop app.
 - Account-scoped saved sessions support export and deletion workflows.
 - Bluey should not be described as a way to bypass rules, proctoring, security
   controls, or consent requirements.
