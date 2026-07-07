@@ -34,6 +34,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let squareCardSetupId = '';
     let squareCardContainerId = '';
     let squareCardSetupPromise = null;
+    let squareCardAttached = false;
     let refreshAccountTokenPromise = null;
     let currentAccountEmail = '';
     let currentAccountIsAdmin = false;
@@ -1651,11 +1652,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }
         const payments = window.Square.payments(me.square_application_id, me.square_location_id);
         container.replaceChildren();
+        squareCardAttached = false;
         squareCard = await payments.card();
         squareCardEnvironment = environment;
         squareCardSetupId = setupId;
         squareCardContainerId = containerId;
         await squareCard.attach(`#${containerId}`);
+        squareCardAttached = true;
       })().finally(() => {
         squareCardSetupPromise = null;
       });
@@ -1818,6 +1821,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         throw new Error('Minimum reload is $15.');
       }
       return amount;
+    }
+
+    function normalizeReloadAmountInput(inputId) {
+      const input = document.getElementById(inputId);
+      if (!input) return;
+      const amount = dollarsToCents(input.value || centsToDollars(MANUAL_RELOAD_AMOUNT_CENTS));
+      if (!Number.isFinite(amount) || amount < MANUAL_RELOAD_MIN_CENTS) {
+        input.value = centsToDollars(MANUAL_RELOAD_MIN_CENTS);
+      }
     }
 
     function setReloadButtonsBusy(busy) {
@@ -1992,12 +2004,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         squareCardEnvironment = '';
         squareCardSetupId = '';
         squareCardContainerId = '';
+        squareCardAttached = false;
       }
     }
 
     async function saveSquareCard(options = {}) {
       const button = document.getElementById(options.buttonId || 'saveSquareCardButton');
-      if (!squareCard) {
+      if (!squareCard || !squareCardAttached) {
         throw new Error('Card form is still loading. Try again in a moment.');
       }
       const previous = button?.textContent || 'Save card';
@@ -2006,7 +2019,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         button.textContent = 'Saving...';
       }
       try {
-        const result = await squareCard.tokenize();
+        let result;
+        try {
+          result = await squareCard.tokenize();
+        } catch (error) {
+          const message = String(error?.message || '');
+          if (/not been attached|must be attached|attach/i.test(message)) {
+            throw new Error('Card form is still loading. Try again in a moment.');
+          }
+          throw error;
+        }
         if (result.status !== 'OK') {
           const details = (result.errors || []).map((error) => error.message).filter(Boolean).join(' ');
           throw new Error(details || 'Card could not be saved.');
@@ -2129,10 +2151,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       try {
         const amount = readManualReloadCents('modalReloadAmount');
         if (reloadRule) reloadRule.textContent = `${money(amount)} adds ${money(amount)} credits after Square confirms payment.`;
-        if (checkoutButton) checkoutButton.textContent = `Continue to Square checkout`;
+        if (checkoutButton) {
+          checkoutButton.textContent = `Continue to Square checkout`;
+          checkoutButton.disabled = false;
+        }
       } catch (error) {
         if (reloadRule) reloadRule.textContent = error.message;
-        if (checkoutButton) checkoutButton.textContent = 'Continue to Square checkout';
+        if (checkoutButton) {
+          checkoutButton.textContent = 'Continue to Square checkout';
+          checkoutButton.disabled = true;
+        }
       }
       updateReloadAmountPresets();
 
@@ -2191,16 +2219,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       syncReloadSetupFromDashboard();
       reloadSetupMessage('');
       dialog.hidden = false;
-      const shouldOpenCard = Boolean(document.getElementById('modalAutoReloadToggle')?.checked)
-        && !latestAccountForBilling?.auto_topup_available
-        && canUseSquareCardSetup(latestAccountForBilling);
-      if (shouldOpenCard) {
-        setTimeout(() => {
-          openReloadSetupCard().catch((error) => reloadSetupMessage(error.message, 'error'));
-        }, 0);
-      } else {
-        setTimeout(() => amount?.focus(), 0);
-      }
+      setTimeout(() => amount?.focus(), 0);
     }
 
     async function openReloadSetupCard() {
@@ -2261,6 +2280,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function startReloadFromSetup() {
+      try {
+        readManualReloadCents('modalReloadAmount');
+      } catch (error) {
+        reloadSetupMessage(error.message, 'error');
+        document.getElementById('modalReloadAmount')?.focus();
+        updateReloadSetupDraftCopy();
+        return false;
+      }
       const autoReloadSelected = Boolean(document.getElementById('modalAutoReloadToggle')?.checked);
       const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
       const canSaveSquareCard = canUseSquareCardSetup(latestAccountForBilling);
@@ -3215,7 +3242,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('manualReloadAmount')?.addEventListener('input', () => {
         updateManualReloadDraftCopy();
       });
+      document.getElementById('manualReloadAmount')?.addEventListener('blur', () => {
+        normalizeReloadAmountInput('manualReloadAmount');
+        updateManualReloadDraftCopy();
+      });
       document.getElementById('modalReloadAmount')?.addEventListener('input', () => {
+        updateReloadSetupDraftCopy();
+      });
+      document.getElementById('modalReloadAmount')?.addEventListener('blur', () => {
+        normalizeReloadAmountInput('modalReloadAmount');
         updateReloadSetupDraftCopy();
       });
       document.querySelectorAll('[data-reload-amount]').forEach((button) => {

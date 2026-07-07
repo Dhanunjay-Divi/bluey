@@ -6965,28 +6965,50 @@
     }
 
     #accountApp .reload-setup-modal {
-      width: min(720px, calc(100vw - 36px));
+      width: min(680px, calc(100vw - 36px));
       border-color: rgba(99, 216, 255, .30);
-      border-radius: 18px;
-      padding: 1.15rem;
+      border-radius: 16px;
+      padding: 1rem;
       background: #101010;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-head {
+      margin-bottom: .9rem;
+    }
+
+    #accountApp .reload-setup-modal h2 {
+      font-size: 1.35rem;
+      line-height: 1.05;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-head p {
+      max-width: 32rem;
+      margin-top: .45rem;
+      font-size: .8rem;
+      line-height: 1.38;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-close {
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
     }
 
     #accountApp .reload-setup-grid {
       display: grid;
-      grid-template-columns: minmax(0, .95fr) minmax(0, 1.05fr);
-      gap: .85rem;
-      align-items: stretch;
+      grid-template-columns: minmax(0, .9fr) minmax(0, 1fr);
+      gap: .7rem;
+      align-items: start;
     }
 
     #accountApp .reload-setup-panel {
       display: grid;
       align-content: start;
-      gap: .75rem;
+      gap: .62rem;
       min-width: 0;
-      padding: .95rem;
+      padding: .82rem;
       border: 1px solid #242424;
-      border-radius: 12px;
+      border-radius: 10px;
       background: #0a0a0a;
     }
 
@@ -7000,13 +7022,13 @@
     #accountApp .reload-amount-presets {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: .4rem;
+      gap: .35rem;
     }
 
     #accountApp .reload-amount-presets button {
-      min-height: 36px;
+      min-height: 34px;
       border: 1px solid rgba(255, 255, 255, .12);
-      border-radius: 10px;
+      border-radius: 8px;
       background: #111;
       color: #d7d7d7;
       font: inherit;
@@ -7037,7 +7059,8 @@
     }
 
     #accountApp .reload-setup-panel .manual-reload-input {
-      min-height: 44px;
+      min-height: 40px;
+      border-radius: 9px;
     }
 
     #accountApp .reload-setup-panel > p,
@@ -7064,10 +7087,10 @@
     #accountApp .reload-setup-footer {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
-      gap: .85rem;
+      gap: .75rem;
       align-items: center;
-      margin-top: .85rem;
-      padding-top: .85rem;
+      margin-top: .75rem;
+      padding-top: .75rem;
       border-top: 1px solid rgba(255, 255, 255, .08);
     }
 
@@ -7079,16 +7102,42 @@
     }
 
     #accountApp .reload-setup-footer .account-button.primary {
-      min-height: 42px;
-      border-radius: 10px;
+      min-height: 40px;
+      border-radius: 9px;
       white-space: nowrap;
     }
 
     #accountApp .reload-setup-square-card {
       width: 100%;
       margin: 0;
-      padding: .75rem;
+      padding: .68rem;
       border-radius: 10px;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-message {
+      margin-top: .65rem;
+      padding: .56rem .68rem;
+      border: 1px solid rgba(99, 216, 255, .18);
+      border-radius: 9px;
+      background: rgba(99, 216, 255, .055);
+      color: #9fb4be;
+      font-size: .74rem;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-message:empty {
+      display: none;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-message[data-tone="error"] {
+      border-color: rgba(255, 116, 125, .28);
+      background: rgba(255, 116, 125, .075);
+      color: #ff8b94;
+    }
+
+    #accountApp .reload-setup-modal .account-modal-message[data-tone="success"] {
+      border-color: rgba(105, 240, 143, .24);
+      background: rgba(105, 240, 143, .075);
+      color: #9df5b2;
     }
 
     html[data-bluey-theme="light"] #productSite.page {
@@ -7157,6 +7206,24 @@
 
     html[data-bluey-theme="light"] #accountApp .reload-setup-footer {
       border-top-color: #dceaf2;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-modal .account-modal-message {
+      border-color: #cfe3ef;
+      background: #eff9ff;
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-modal .account-modal-message[data-tone="error"] {
+      border-color: rgba(211, 58, 71, .24);
+      background: #fff1f2;
+      color: #ba2434;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-modal .account-modal-message[data-tone="success"] {
+      border-color: rgba(16, 144, 84, .22);
+      background: #effcf4;
+      color: #147447;
     }
 
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload.is-setup-default .auto-reload-head h3 {
