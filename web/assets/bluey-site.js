@@ -49,6 +49,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const LEGACY_AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 1000;
     const LEGACY_AUTO_RELOAD_DEFAULT_AMOUNT_CENTS = 3000;
     const MANUAL_RELOAD_MIN_CENTS = 1500;
+    const MANUAL_RELOAD_MAX_CENTS = 50000;
     const MANUAL_RELOAD_AMOUNT_CENTS = 1500;
     let captchaConfigPromise = null;
     let captchaConfig = { provider: null, site_key: null };
@@ -75,6 +76,84 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const dollars = Number(value);
       if (!Number.isFinite(dollars)) return NaN;
       return Math.round(dollars * 100);
+    }
+
+    function cleanDollarInput(value) {
+      const raw = String(value || '');
+      const numeric = raw.replace(/[^\d.]/g, '');
+      const parts = numeric.split('.');
+      if (parts.length <= 1) return parts[0] || '';
+      return `${parts[0]}.${parts.slice(1).join('')}`;
+    }
+
+    function billingMoneyFieldLimits(inputId) {
+      if (inputId === 'manualReloadAmount' || inputId === 'modalReloadAmount') {
+        return {
+          minCents: MANUAL_RELOAD_MIN_CENTS,
+          maxCents: MANUAL_RELOAD_MAX_CENTS,
+          fallbackCents: MANUAL_RELOAD_AMOUNT_CENTS,
+        };
+      }
+      if (inputId === 'autoReloadThreshold' || inputId === 'modalAutoReloadThreshold') {
+        return {
+          minCents: 100,
+          maxCents: 5000,
+          fallbackCents: AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS,
+        };
+      }
+      if (inputId === 'autoReloadAmount' || inputId === 'modalAutoReloadAmount') {
+        return {
+          minCents: AUTO_RELOAD_MIN_CENTS,
+          maxCents: AUTO_RELOAD_MAX_CENTS,
+          fallbackCents: AUTO_RELOAD_DEFAULT_AMOUNT_CENTS,
+        };
+      }
+      return null;
+    }
+
+    function clampCents(value, minCents, maxCents) {
+      return Math.max(minCents, Math.min(maxCents, value));
+    }
+
+    function normalizeBillingMoneyInput(inputId) {
+      const input = document.getElementById(inputId);
+      const limits = billingMoneyFieldLimits(inputId);
+      if (!input || !limits) return;
+      const cleaned = cleanDollarInput(input.value);
+      let cents = dollarsToCents(cleaned || centsToDollars(limits.fallbackCents));
+      if (!Number.isFinite(cents)) cents = limits.fallbackCents;
+      input.value = centsToDollars(clampCents(cents, limits.minCents, limits.maxCents));
+    }
+
+    function installBillingMoneyInputGuards() {
+      [
+        'manualReloadAmount',
+        'modalReloadAmount',
+        'autoReloadThreshold',
+        'autoReloadAmount',
+        'modalAutoReloadThreshold',
+        'modalAutoReloadAmount',
+      ].forEach((inputId) => {
+        const input = document.getElementById(inputId);
+        if (!input || input.dataset.billingMoneyGuard === '1') return;
+        input.dataset.billingMoneyGuard = '1';
+        input.addEventListener('beforeinput', (event) => {
+          if (event.data && /[eE+-]/.test(event.data)) event.preventDefault();
+        });
+        input.addEventListener('keydown', (event) => {
+          if (['e', 'E', '+', '-'].includes(event.key)) event.preventDefault();
+        });
+        input.addEventListener('paste', (event) => {
+          event.preventDefault();
+          const pasted = event.clipboardData?.getData('text') || '';
+          input.value = cleanDollarInput(pasted);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        input.addEventListener('input', () => {
+          const cleaned = cleanDollarInput(input.value);
+          if (input.value !== cleaned) input.value = cleaned;
+        });
+      });
     }
 
     function accountToken() {
@@ -1820,16 +1899,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         input?.focus();
         throw new Error('Minimum reload is $15.');
       }
+      if (amount > MANUAL_RELOAD_MAX_CENTS) {
+        input?.focus();
+        throw new Error('Maximum reload is $500.');
+      }
       return amount;
     }
 
     function normalizeReloadAmountInput(inputId) {
-      const input = document.getElementById(inputId);
-      if (!input) return;
-      const amount = dollarsToCents(input.value || centsToDollars(MANUAL_RELOAD_AMOUNT_CENTS));
-      if (!Number.isFinite(amount) || amount < MANUAL_RELOAD_MIN_CENTS) {
-        input.value = centsToDollars(MANUAL_RELOAD_MIN_CENTS);
-      }
+      normalizeBillingMoneyInput(inputId);
     }
 
     function setReloadButtonsBusy(busy) {
@@ -3144,6 +3222,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         .then(() => refreshSignupCaptcha())
         .catch(() => {});
       initDashboardTabs();
+      installBillingMoneyInputGuards();
 
       document.getElementById('accountForm').addEventListener('submit', (event) => {
         event.preventDefault();
@@ -3243,12 +3322,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         document.getElementById(id)?.addEventListener('input', () => {
           updateAutoReloadDraftCopy();
         });
+        document.getElementById(id)?.addEventListener('blur', () => {
+          normalizeBillingMoneyInput(id);
+          updateAutoReloadDraftCopy();
+        });
       });
       document.getElementById('modalAutoReloadToggle')?.addEventListener('change', () => {
         updateReloadSetupDraftCopy();
       });
       ['modalAutoReloadThreshold', 'modalAutoReloadAmount'].forEach((id) => {
         document.getElementById(id)?.addEventListener('input', () => {
+          updateReloadSetupDraftCopy();
+        });
+        document.getElementById(id)?.addEventListener('blur', () => {
+          normalizeBillingMoneyInput(id);
           updateReloadSetupDraftCopy();
         });
       });
