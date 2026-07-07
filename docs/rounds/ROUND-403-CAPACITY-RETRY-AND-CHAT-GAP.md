@@ -47,6 +47,14 @@ Fix the production rough edges seen in live Bluey testing:
 - `git diff --check`
   - Passed
 
+## Deployment
+
+- Backend deployed to the production droplet.
+- Live health now reports commit `91826642e5548e35ff59d23a8c8aff73914ed21c`.
+- Production DB backup completed before binary swap:
+  - `/var/backups/bluey-api/hourly/bluey-postgres-20260707T023615Z.pgdump`
+- macOS overlay source/build is verified, but not published into downloadable desktop binaries in this pass because the Bluey release signing key was not available locally or on the droplet. Do not publish unsigned `latest.json` over the signed live manifest.
+
 ## Notes
 
 - Windows does not use the same multi-card AppKit feed stack, so the chat-gap patch is macOS-specific.
