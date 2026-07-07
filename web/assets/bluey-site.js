@@ -42,6 +42,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let accountSignOutInProgress = false;
     let accountAuthEpoch = 0;
     let latestAccountForBilling = null;
+    let confirmActionResolve = null;
     const AUTO_RELOAD_MIN_CENTS = 1500;
     const AUTO_RELOAD_MAX_CENTS = 50000;
     const AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 500;
@@ -1591,6 +1592,42 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (dialog) dialog.hidden = true;
       if (form) form.reset();
       changePasswordMessage('');
+    }
+
+    function closeConfirmActionDialog(result = false) {
+      const dialog = document.getElementById('confirmActionDialog');
+      if (dialog) dialog.hidden = true;
+      if (confirmActionResolve) {
+        const resolve = confirmActionResolve;
+        confirmActionResolve = null;
+        resolve(Boolean(result));
+      }
+    }
+
+    function confirmAction(options = {}) {
+      const dialog = document.getElementById('confirmActionDialog');
+      const title = document.getElementById('confirmActionTitle');
+      const message = document.getElementById('confirmActionMessage');
+      const note = document.getElementById('confirmActionNote');
+      const confirm = document.getElementById('confirmActionConfirm');
+      const cancel = document.getElementById('confirmActionCancel');
+      if (!dialog || !title || !message || !note || !confirm) {
+        return Promise.resolve(false);
+      }
+      if (confirmActionResolve) closeConfirmActionDialog(false);
+      title.textContent = options.title || 'Confirm action';
+      message.textContent = options.message || 'This action needs confirmation.';
+      note.textContent = options.note || 'Saved sessions stay in Session History.';
+      note.hidden = !note.textContent;
+      confirm.textContent = options.confirmText || 'Confirm';
+      confirm.classList.toggle('danger', options.tone !== 'primary');
+      confirm.classList.toggle('primary', options.tone === 'primary');
+      if (cancel) cancel.textContent = options.cancelText || 'Cancel';
+      dialog.hidden = false;
+      setTimeout(() => cancel?.focus(), 0);
+      return new Promise((resolve) => {
+        confirmActionResolve = resolve;
+      });
     }
 
     function openChangePasswordDialog() {
@@ -3592,10 +3629,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           renderAdminAbuse({}, `Could not load trial abuse events: ${error.message}`);
         });
       });
-      document.getElementById('removeAllDevicesButton')?.addEventListener('click', () => {
+      document.getElementById('removeAllDevicesButton')?.addEventListener('click', async () => {
         const button = document.getElementById('removeAllDevicesButton');
         if (!button || button.disabled) return;
-        if (!window.confirm('Remove all linked computers and sign Bluey out on those desktops?')) return;
+        const confirmed = await confirmAction({
+          title: 'Remove all computers?',
+          message: 'Bluey will sign out on every linked desktop for this account.',
+          note: 'Saved chats stay in Session History. You can connect a desktop again with its Bluey code.',
+          confirmText: 'Remove all',
+        });
+        if (!confirmed) return;
         const previous = button.textContent;
         button.disabled = true;
         button.textContent = 'Removing...';
@@ -3610,11 +3653,17 @@ if (!window.__BLUEY_SITE_BOOTED__) {
             button.textContent = previous;
           });
       });
-      document.getElementById('linkedDevicesList')?.addEventListener('click', (event) => {
+      document.getElementById('linkedDevicesList')?.addEventListener('click', async (event) => {
         const button = event.target.closest('button[data-device-id]');
         if (!button) return;
         const label = button.dataset.deviceLabel || 'this computer';
-        if (!window.confirm(`Remove ${label} and sign Bluey out on that desktop?`)) return;
+        const confirmed = await confirmAction({
+          title: `Remove ${label}?`,
+          message: 'Bluey will sign out on that desktop.',
+          note: 'Saved chats stay in Session History. You can connect this desktop again from the Bluey host overlay.',
+          confirmText: 'Remove desktop',
+        });
+        if (!confirmed) return;
         const previous = button.textContent;
         button.disabled = true;
         button.textContent = 'Removing...';
@@ -3642,6 +3691,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('changePasswordCancelX')?.addEventListener('click', resetChangePasswordDialog);
       document.getElementById('changePasswordDialog')?.addEventListener('click', (event) => {
         if (event.target?.id === 'changePasswordDialog') resetChangePasswordDialog();
+      });
+      document.getElementById('confirmActionCancel')?.addEventListener('click', () => closeConfirmActionDialog(false));
+      document.getElementById('confirmActionCancelX')?.addEventListener('click', () => closeConfirmActionDialog(false));
+      document.getElementById('confirmActionConfirm')?.addEventListener('click', () => closeConfirmActionDialog(true));
+      document.getElementById('confirmActionDialog')?.addEventListener('click', (event) => {
+        if (event.target?.id === 'confirmActionDialog') closeConfirmActionDialog(false);
+      });
+      document.addEventListener('keydown', (event) => {
+        const dialog = document.getElementById('confirmActionDialog');
+        if (event.key === 'Escape' && dialog && !dialog.hidden) closeConfirmActionDialog(false);
       });
       document.querySelectorAll('[data-delete-account-button], #deleteAccountButton').forEach((button) => {
         if (button.dataset.deleteAccountReady === '1') return;

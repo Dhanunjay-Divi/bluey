@@ -2544,6 +2544,14 @@
       box-shadow: 0 28px 90px rgba(0, 0, 0, .58);
     }
 
+    #accountApp .account-modal.confirm-action-modal {
+      width: min(460px, 100%);
+      border-color: rgba(99, 216, 255, .28);
+      border-radius: 18px;
+      padding: 22px;
+      background: linear-gradient(180deg, rgba(12, 17, 20, .98), rgba(7, 9, 11, .98));
+    }
+
     #accountApp .account-modal-head {
       display: flex;
       align-items: flex-start;
@@ -2564,6 +2572,37 @@
       color: #aebdc4;
       font-size: 14px;
       line-height: 1.45;
+    }
+
+    #accountApp .confirm-action-modal h2 {
+      font-size: 1.34rem;
+      letter-spacing: 0;
+    }
+
+    #accountApp .confirm-action-modal p {
+      max-width: 23rem;
+    }
+
+    #accountApp .confirm-action-note {
+      margin: 14px 0 4px;
+      padding: 12px 13px;
+      border: 1px solid rgba(99, 216, 255, .18);
+      border-radius: 12px;
+      background: rgba(99, 216, 255, .055);
+      color: #a8bdc8;
+      font-size: .82rem;
+      line-height: 1.45;
+    }
+
+    #accountApp .confirm-action-actions {
+      margin-top: 16px;
+    }
+
+    #accountApp .confirm-action-actions .account-button {
+      min-height: 40px;
+      padding: .56rem 1rem;
+      font-size: .86rem;
+      font-weight: 850;
     }
 
     #accountApp .account-modal.password-modal {
@@ -5351,6 +5390,11 @@
       box-shadow: 0 28px 90px rgba(40, 82, 110, .22);
     }
 
+    html[data-bluey-theme="light"] #accountApp .account-modal.confirm-action-modal {
+      border-color: #cae7f4;
+      background: #ffffff;
+    }
+
     html[data-bluey-theme="light"] #accountApp .account-modal.password-modal {
       border-color: #dce4ea;
       background: #ffffff;
@@ -5364,6 +5408,12 @@
     html[data-bluey-theme="light"] #accountApp .account-modal p,
     html[data-bluey-theme="light"] #accountApp .account-modal-form label,
     html[data-bluey-theme="light"] #accountApp .account-modal-message {
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .confirm-action-note {
+      border-color: #d8edf6;
+      background: #f4fbff;
       color: #5f7281;
     }
 

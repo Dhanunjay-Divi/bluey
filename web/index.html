@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070714"
+    href="/assets/bluey-site.css?v=2026070715"
   >
   <script type="application/ld+json">
   {
@@ -821,6 +821,22 @@
           </div>
         </section>
       </div>
+      <div class="account-modal-backdrop" id="confirmActionDialog" hidden>
+        <section class="account-modal confirm-action-modal" role="dialog" aria-modal="true" aria-labelledby="confirmActionTitle" aria-describedby="confirmActionMessage">
+          <div class="account-modal-head">
+            <div>
+              <h2 id="confirmActionTitle">Confirm action</h2>
+              <p id="confirmActionMessage">This action needs confirmation.</p>
+            </div>
+            <button class="account-modal-close" id="confirmActionCancelX" type="button" aria-label="Close confirmation dialog">×</button>
+          </div>
+          <div class="confirm-action-note" id="confirmActionNote">Saved sessions stay in Session History.</div>
+          <div class="account-modal-actions confirm-action-actions">
+            <button class="account-button ghost" id="confirmActionCancel" type="button">Cancel</button>
+            <button class="account-button danger" id="confirmActionConfirm" type="button">Confirm</button>
+          </div>
+        </section>
+      </div>
       <div class="page-footer-links">
         Reach us at <a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><a class="instagram-link" href="https://www.instagram.com/bluey.sh" target="_blank" rel="noopener noreferrer" aria-label="Bluey on Instagram"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none"><rect x="3.5" y="3.5" width="17" height="17" rx="5" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="4.2" stroke="currentColor" stroke-width="2"/><circle cx="17.3" cy="6.8" r="1.15" fill="currentColor"/></svg>@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Built with open source technology</span><span class="dot">&middot;</span><a href="/terms">Terms</a><span class="dot">&middot;</span><a href="/privacy">Privacy</a>
       </div>
@@ -1129,7 +1145,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070714"
+    src="/assets/bluey-site.js?v=2026070715"
   ></script>
 </body>
 </html>
