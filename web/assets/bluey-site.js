@@ -43,6 +43,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let accountAuthEpoch = 0;
     let latestAccountForBilling = null;
     let confirmActionResolve = null;
+    let lastLinkedComputerCount = 0;
     const AUTO_RELOAD_MIN_CENTS = 1500;
     const AUTO_RELOAD_MAX_CENTS = 50000;
     const AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 500;
@@ -243,6 +244,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         .toUpperCase()
         .replace(/[^A-Z0-9-]/g, '')
         .slice(0, 32);
+    }
+
+    function wait(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
     function rememberPendingDeviceCode(code) {
@@ -1279,7 +1284,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         if (accountToken()) {
           body.append(
             codeEl,
-            `. This moves only that desktop to ${currentAccountEmail || 'this Bluey account'} so it uses this account's shared balance.`
+            `. This connects only that desktop to ${currentAccountEmail || 'this Bluey account'} so it uses this account's shared balance.`
           );
         } else {
           body.append(
@@ -1297,17 +1302,21 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           const button = document.createElement('button');
           button.type = 'button';
           button.className = 'account-button secondary compact device-primary-action';
-          button.textContent = 'Move desktop';
-          button.setAttribute('aria-label', `Move desktop Bluey using code ${code}`);
+          button.textContent = 'Connect desktop';
+          button.setAttribute('aria-label', `Connect Bluey desktop using code ${code}`);
           button.addEventListener('click', () => {
+            const previousCount = lastLinkedComputerCount;
             button.disabled = true;
             button.textContent = 'Connecting...';
             sessionStorage.setItem(`bluey_device_confirmed_${code}`, '1');
             approvePendingDevice()
-              .then(() => loadAccount())
+              .then(async () => {
+                renderDeviceLinkHint();
+                await waitForLinkedDesktop({ previousCount });
+              })
               .catch((error) => {
                 button.disabled = false;
-                button.textContent = 'Move desktop';
+                button.textContent = 'Connect desktop';
                 accountMessage(`Desktop link failed: ${error.message}`);
               });
             });
@@ -1337,7 +1346,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const storageKey = `bluey_device_approved_${code}`;
       if (sessionStorage.getItem(storageKey) === '1') return true;
       if (sessionStorage.getItem(`bluey_device_confirmed_${code}`) !== '1') {
-        accountMessage('Press Move desktop to finish Bluey login.');
+        accountMessage('Press Connect desktop to finish Bluey login.');
         return false;
       }
       accountMessage('Connecting this account to the desktop app...');
@@ -1346,7 +1355,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         body: JSON.stringify({ user_code: code }),
       });
       sessionStorage.setItem(storageKey, '1');
-      accountMessage('Desktop linked. Return to Bluey; it will finish automatically.');
+      accountMessage('Bluey desktop approved. Waiting for it to appear below...');
       return true;
     }
 
@@ -2750,12 +2759,31 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return lastTime ? 'Linked' : 'Offline';
     }
 
+    function linkedComputersFromPayload(payload) {
+      const devices = Array.isArray(payload?.devices) ? payload.devices : [];
+      return devices.filter((device) => !isBrowserDevice(device));
+    }
+
+    function renderLinkedDevicesConnecting(message = 'Waiting for Bluey desktop to appear...') {
+      const list = document.getElementById('linkedDevicesList');
+      if (!list) return;
+      list.replaceChildren();
+      const countLabel = document.getElementById('linkedDeviceCount');
+      const removeAllButton = document.getElementById('removeAllDevicesButton');
+      if (countLabel) countLabel.textContent = 'Connecting desktop';
+      if (removeAllButton) removeAllButton.disabled = true;
+      const empty = document.createElement('div');
+      empty.className = 'device-empty device-empty-loading';
+      empty.textContent = message;
+      list.append(empty);
+    }
+
     function renderLinkedDevices(payload, message = '') {
       const list = document.getElementById('linkedDevicesList');
       if (!list) return;
       list.replaceChildren();
-      const devices = Array.isArray(payload?.devices) ? payload.devices : [];
-      const computers = devices.filter((device) => !isBrowserDevice(device));
+      const computers = linkedComputersFromPayload(payload);
+      lastLinkedComputerCount = computers.length;
       const countLabel = document.getElementById('linkedDeviceCount');
       const removeAllButton = document.getElementById('removeAllDevicesButton');
       if (countLabel) {
@@ -2818,6 +2846,30 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const devices = await apiJson('/account/devices');
       renderLinkedDevices(devices);
       return devices;
+    }
+
+    async function waitForLinkedDesktop(options = {}) {
+      const previousCount = Number.isFinite(options.previousCount)
+        ? options.previousCount
+        : lastLinkedComputerCount;
+      renderLinkedDevicesConnecting('Connecting Bluey desktop...');
+      let latest = null;
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        if (attempt > 0) await wait(700);
+        latest = await apiJson('/account/devices');
+        const computers = linkedComputersFromPayload(latest);
+        if (computers.length > previousCount || (previousCount === 0 && computers.length > 0)) {
+          renderLinkedDevices(latest);
+          accountMessage('Bluey desktop connected.', false, 'success');
+          return latest;
+        }
+        renderLinkedDevicesConnecting(attempt < 3
+          ? 'Waiting for Bluey desktop to check in...'
+          : 'Still waiting for Bluey desktop. Keep the host overlay open.');
+      }
+      renderLinkedDevices(latest || { devices: [] }, 'Bluey approved the connection. Waiting for the desktop to check in; press Refresh if it does not appear in a moment.');
+      accountMessage('Bluey approved the desktop. It should appear here in a moment.', false, 'success');
+      return latest;
     }
 
     async function revokeLinkedDevice(deviceId, label) {
@@ -3310,15 +3362,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         if (isAdmin && normalizeDashboardTabName(window.location.hash) === 'admin') {
           setDashboardTab('admin');
         }
-        void linkedDevicesPromise;
         void sessionsPromise;
         accountMessage(new URLSearchParams(location.search).get('reload') === 'success'
           ? 'Payment complete. If the balance still looks old, press Refresh balance in a moment.'
           : '');
         openAccountActionFromHash();
         try {
+          const code = pendingDeviceCode();
+          const alreadyApproved = code && sessionStorage.getItem(`bluey_device_approved_${code}`) === '1';
+          const linkedDevicesResult = await linkedDevicesPromise;
+          const previousCount = linkedComputersFromPayload(linkedDevicesResult).length;
           const approved = await approvePendingDevice();
-          if (!approved) await openDesktopDeepLinkIfNeeded();
+          if (approved && (!alreadyApproved || previousCount === 0)) {
+            await waitForLinkedDesktop({ previousCount });
+          } else if (!approved) {
+            await openDesktopDeepLinkIfNeeded();
+          }
         } catch (error) {
           accountMessage(`Account signed in, but desktop handoff failed: ${error.message}`);
         }

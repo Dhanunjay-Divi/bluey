@@ -5439,6 +5439,12 @@
       color: #087ca6;
     }
 
+    html[data-bluey-theme="light"] #accountApp .device-empty-loading {
+      border-color: rgba(39, 151, 208, .18);
+      background: #f5fbff;
+      color: #087ca6;
+    }
+
     html[data-bluey-theme="light"] #accountApp .account-modal-form input {
       border-color: #d8e8f0;
       background: #fafdff;
@@ -7319,6 +7325,27 @@
       text-align: center;
     }
 
+    #accountApp .device-empty-loading {
+      border-style: solid;
+      border-color: rgba(99, 216, 255, .18);
+      background: rgba(99, 216, 255, .035);
+      color: #9fdff2;
+      font-weight: 750;
+    }
+
+    #accountApp .device-empty-loading::before {
+      content: "";
+      display: inline-block;
+      width: .5rem;
+      height: .5rem;
+      margin-right: .45rem;
+      border-radius: 999px;
+      background: #63d8ff;
+      box-shadow: 0 0 0 0 rgba(99, 216, 255, .34);
+      animation: blueyCueDot 1.7s ease-out infinite;
+      vertical-align: .08em;
+    }
+
     @keyframes blueyConnectWave {
       0%,
       42% {
@@ -7370,6 +7397,7 @@
     @media (prefers-reduced-motion: reduce) {
       #accountApp #dashboardTabComputers .device-connect-section.is-action-needed::before,
       #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-action-cue::before,
+      #accountApp .device-empty-loading::before,
       #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-primary-action,
       #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-primary-action::after {
         animation: none;
