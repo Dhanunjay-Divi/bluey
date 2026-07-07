@@ -65,6 +65,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let pendingTrialButton = null;
     const DEVICE_LINK_TTL_MS = 10 * 60 * 1000;
     const DEVICE_LINK_STORAGE_KEY = 'bluey_pending_device_code';
+    const AUTO_RELOAD_SETUP_OPT_OUT_PREFIX = 'bluey_auto_reload_setup_opt_out:';
     const ACCESS_TOKEN_KEY = 'bluey_access_token';
     const REFRESH_TOKEN_KEY = 'bluey_refresh_token';
     const AUTH_PERSISTENCE_KEY = 'bluey_auth_persistence';
@@ -248,6 +249,26 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function wait(ms) {
       return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function autoReloadSetupOptOutKey(me = latestAccountForBilling) {
+      const email = String(me?.email || currentAccountEmail || '').trim().toLowerCase();
+      return email ? `${AUTO_RELOAD_SETUP_OPT_OUT_PREFIX}${email}` : '';
+    }
+
+    function autoReloadSetupOptedOut(me = latestAccountForBilling) {
+      const key = autoReloadSetupOptOutKey(me);
+      return key ? localStorage.getItem(key) === '1' : false;
+    }
+
+    function setAutoReloadSetupOptOut(enabled, me = latestAccountForBilling) {
+      const key = autoReloadSetupOptOutKey(me);
+      if (!key) return;
+      if (enabled) {
+        localStorage.setItem(key, '1');
+      } else {
+        localStorage.removeItem(key);
+      }
     }
 
     function rememberPendingDeviceCode(code) {
@@ -1651,6 +1672,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
     }
 
+    function confirmAutoReloadOff() {
+      return confirmAction({
+        title: 'Turn off Auto Reload?',
+        message: 'Bluey can run out of balance during a call, interview, or long conversation if Auto Reload is off.',
+        note: 'Keep Auto Reload on to top up before the account balance gets too low. You can still add balance manually anytime.',
+        confirmText: 'Turn off',
+        cancelText: 'Keep on',
+      });
+    }
+
     function openChangePasswordDialog() {
       const dialog = document.getElementById('changePasswordDialog');
       const email = document.getElementById('changePasswordEmail');
@@ -1938,8 +1969,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const threshold = money(thresholdCents);
       const canSaveSquareCard = canUseSquareCardSetup(me);
       const hasSavedMethod = Boolean(me?.auto_topup_available);
+      const optedOutOfSetup = autoReloadSetupOptedOut(me);
 
-      const setupDefaultOn = !me?.auto_topup_enabled && canSaveSquareCard && !hasSavedMethod;
+      const setupDefaultOn = !me?.auto_topup_enabled && canSaveSquareCard && !hasSavedMethod && !optedOutOfSetup;
       const toggleChecked = Boolean(me?.auto_topup_enabled) || setupDefaultOn;
       card.classList.toggle('is-on', Boolean(me?.auto_topup_enabled));
       card.classList.toggle('is-setup-default', setupDefaultOn);
@@ -2382,7 +2414,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
       const wasEnabled = Boolean(latestAccountForBilling?.auto_topup_enabled);
       const canSaveSquareCard = canUseSquareCardSetup(latestAccountForBilling);
-      const defaultAutoReloadOn = wasEnabled || (canSaveSquareCard && !hasSavedMethod);
+      const defaultAutoReloadOn = wasEnabled
+        || (canSaveSquareCard && !hasSavedMethod && !autoReloadSetupOptedOut(latestAccountForBilling));
 
       if (modalAmount) modalAmount.value = manualAmount?.value || centsToDollars(MANUAL_RELOAD_AMOUNT_CENTS);
       if (modalToggle) modalToggle.checked = defaultAutoReloadOn || Boolean(dashboardToggle?.checked);
@@ -2535,6 +2568,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const wasEnabled = Boolean(latestAccountForBilling?.auto_topup_enabled);
       const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
 
+      if (enabled) {
+        setAutoReloadSetupOptOut(false);
+      } else if (!wasEnabled && !hasSavedMethod) {
+        setAutoReloadSetupOptOut(true);
+      }
+
       if (enabled && hasSavedMethod) {
         applyReloadSetupToDashboard();
         await updateAutoReload(true);
@@ -2561,6 +2600,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
 
       const autoReloadSelected = Boolean(document.getElementById('modalAutoReloadToggle')?.checked);
+      setAutoReloadSetupOptOut(!autoReloadSelected
+        && !latestAccountForBilling?.auto_topup_enabled
+        && !latestAccountForBilling?.auto_topup_available);
       let autoReloadSettings = null;
       if (autoReloadSelected) {
         try {
@@ -3630,9 +3672,24 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           updateReloadSetupDraftCopy();
         });
       });
-      document.getElementById('autoReloadToggle')?.addEventListener('change', (event) => {
-        if (event.currentTarget?.checked && !latestAccountForBilling?.auto_topup_available) {
-          event.currentTarget.checked = Boolean(latestAccountForBilling?.auto_topup_enabled);
+      document.getElementById('autoReloadToggle')?.addEventListener('change', async (event) => {
+        const toggle = event.currentTarget;
+        if (!toggle) return;
+        if (!toggle.checked) {
+          const confirmed = await confirmAutoReloadOff();
+          if (!confirmed) {
+            toggle.checked = true;
+            updateAutoReloadDraftCopy();
+            return;
+          }
+          if (!latestAccountForBilling?.auto_topup_enabled && !latestAccountForBilling?.auto_topup_available) {
+            setAutoReloadSetupOptOut(true);
+          }
+        } else {
+          setAutoReloadSetupOptOut(false);
+        }
+        if (toggle.checked && !latestAccountForBilling?.auto_topup_available) {
+          toggle.checked = Boolean(latestAccountForBilling?.auto_topup_enabled);
           updateAutoReloadDraftCopy();
           openReloadSetupDialog();
           return;
@@ -3652,7 +3709,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           }
         });
       });
-      document.getElementById('modalAutoReloadToggle')?.addEventListener('change', () => {
+      document.getElementById('modalAutoReloadToggle')?.addEventListener('change', async (event) => {
+        const toggle = event.currentTarget;
+        if (toggle && !toggle.checked) {
+          const confirmed = await confirmAutoReloadOff();
+          if (!confirmed) {
+            toggle.checked = true;
+          } else if (!latestAccountForBilling?.auto_topup_enabled && !latestAccountForBilling?.auto_topup_available) {
+            setAutoReloadSetupOptOut(true);
+          }
+        } else if (toggle?.checked) {
+          setAutoReloadSetupOptOut(false);
+        }
         updateReloadSetupDraftCopy();
       });
       ['modalAutoReloadThreshold', 'modalAutoReloadAmount'].forEach((id) => {
@@ -3673,9 +3741,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('cancelSquareCardButton')?.addEventListener('click', () => {
         closeSquareCardSetup();
       });
-      document.getElementById('cancelAutoReloadButton')?.addEventListener('click', () => {
+      document.getElementById('cancelAutoReloadButton')?.addEventListener('click', async () => {
         const button = document.getElementById('cancelAutoReloadButton');
         if (!button || button.disabled) return;
+        const confirmed = await confirmAutoReloadOff();
+        if (!confirmed) return;
         const previous = button.textContent;
         button.disabled = true;
         button.textContent = 'Turning off...';
