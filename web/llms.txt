@@ -24,7 +24,7 @@ and document-heavy work sessions.
 - Managed AI routing for quick, coding, screen, research, and deep answers.
 - Status events that show when Bluey is reading screen context, attached docs,
   saved memory, or managed web sources.
-- Credits model: start free, then add account credits for paid AI models,
+- Balance model: start free, then add account balance for paid AI models,
   speech transcription, screen analysis, and saved-session search.
 
 ## Trust And Safety

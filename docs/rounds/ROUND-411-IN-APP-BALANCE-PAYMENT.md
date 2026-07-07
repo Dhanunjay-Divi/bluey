@@ -27,3 +27,10 @@ Validation:
 - `cargo test --manifest-path server/Cargo.toml square_pay_with_saved_card_adds_balance_and_updates_auto_reload`
 - `cargo test --manifest-path server/Cargo.toml`
 - `git diff --check`
+- Remote release build on the droplet completed from commit `a7a8da13`.
+- Live API `/health` reports commit `a7a8da13`.
+- Static web deployed to `bluey.sh` with cache key `2026070713`.
+- Live homepage references `bluey-site.css?v=2026070713` and `bluey-site.js?v=2026070713`.
+- Live JS for `2026070713` passes `node --check`.
+- Live `/billing/square/pay` returns `401` without auth, confirming the route is deployed and protected.
+- Live API warning log check showed no warning entries after restart.
