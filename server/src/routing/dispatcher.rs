@@ -117,7 +117,7 @@ fn default_capacity_cooldown_secs() -> u64 {
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
-        .unwrap_or(30)
+        .unwrap_or(2)
 }
 
 /// Normalised completion response.

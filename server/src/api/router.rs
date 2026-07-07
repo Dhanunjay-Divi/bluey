@@ -534,6 +534,16 @@ fn capacity_error(reason: &str, retry_after_secs: u64) -> (StatusCode, Json<ApiE
     )
 }
 
+fn internal_capacity_retry_delay(denied: &crate::rate_limit::CapacityDenied) -> Option<Duration> {
+    let retry_after_secs = denied.retry_after_secs.clamp(1, 2);
+    let is_account_guard = denied.reason.starts_with("account_");
+    let is_provider_capacity = denied.reason.starts_with("provider_")
+        || denied.reason.contains("provider_key")
+        || denied.reason.contains("cooling");
+    (!is_account_guard && is_provider_capacity && denied.retry_after_secs <= 2)
+        .then_some(Duration::from_secs(retry_after_secs))
+}
+
 fn release_and_capacity_error(
     pool: &crate::db::DbPool,
     account_id: &str,
@@ -4255,27 +4265,58 @@ async fn complete_stream_inner(
     let mut selected_stream: Option<routing::StreamingCompletion> = None;
     let mut selected_first_event: Option<anyhow::Result<routing::CompletionStreamEvent>> = None;
 
-    for (idx, route) in routes.iter().enumerate() {
-        let key_candidates = state.config.upstream.key_candidates(
-            route.provider,
-            &format!(
-                "llm-stream:{}:{}:{}",
-                req.request_id, route.provider, route.model
-            ),
-        );
-        if key_candidates.is_empty() {
-            last_error = Some(missing_provider_key_error(route.provider));
-            continue;
+    for capacity_sweep in 0..=1 {
+        if capacity_sweep > 0 {
+            last_error = None;
+            last_capacity = None;
+            last_failure_was_capacity = false;
+            selected_route_idx = 0;
+            selected_route = None;
+            selected_stream = None;
+            selected_first_event = None;
         }
 
-        loop {
-            let selected_key = match state
-                .provider_health
-                .choose_key(route.provider, route.model, &key_candidates)
-                .await
-            {
-                Ok(key) => key,
-                Err(denied) => {
+        for (idx, route) in routes.iter().enumerate() {
+            let key_candidates = state.config.upstream.key_candidates(
+                route.provider,
+                &format!(
+                    "llm-stream:{}:{}:{}",
+                    req.request_id, route.provider, route.model
+                ),
+            );
+            if key_candidates.is_empty() {
+                last_error = Some(missing_provider_key_error(route.provider));
+                continue;
+            }
+
+            loop {
+                let selected_key = match state
+                    .provider_health
+                    .choose_key(route.provider, route.model, &key_candidates)
+                    .await
+                {
+                    Ok(key) => key,
+                    Err(denied) => {
+                        tracing::warn!(
+                            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                            request_id = %req.request_id,
+                            provider = %route.provider,
+                            model = %route.model,
+                            retry_after_secs = denied.retry_after_secs,
+                            reason = denied.reason,
+                            "provider key pool cooling down; trying next streaming route"
+                        );
+                        last_capacity = Some(denied);
+                        last_failure_was_capacity = true;
+                        break;
+                    }
+                };
+
+                if let Err(denied) = state
+                    .rate_limiters
+                    .check_provider_llm(route.provider, route.model)
+                    .await
+                {
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                         request_id = %req.request_id,
@@ -4283,191 +4324,197 @@ async fn complete_stream_inner(
                         model = %route.model,
                         retry_after_secs = denied.retry_after_secs,
                         reason = denied.reason,
-                        "provider key pool cooling down; trying next streaming route"
+                        "provider capacity busy; trying next streaming route"
                     );
                     last_capacity = Some(denied);
                     last_failure_was_capacity = true;
                     break;
                 }
-            };
 
-            if let Err(denied) = state
-                .rate_limiters
-                .check_provider_llm(route.provider, route.model)
-                .await
-            {
-                tracing::warn!(
-                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    request_id = %req.request_id,
-                    provider = %route.provider,
-                    model = %route.model,
-                    retry_after_secs = denied.retry_after_secs,
-                    reason = denied.reason,
-                    "provider capacity busy; trying next streaming route"
+                let dispatch = routing::complete_stream_with_key(
+                    &selected_key.secret,
+                    route.provider,
+                    route.model,
+                    &provider_system,
+                    &provider_user,
+                    provider_max_tokens,
+                    req.temperature,
+                    thinking,
+                    Some(est_in),
+                    &req.image_data_urls,
                 );
-                last_capacity = Some(denied);
-                last_failure_was_capacity = true;
-                break;
-            }
 
-            let dispatch = routing::complete_stream_with_key(
-                &selected_key.secret,
-                route.provider,
-                route.model,
-                &provider_system,
-                &provider_user,
-                provider_max_tokens,
-                req.temperature,
-                thinking,
-                Some(est_in),
-                &req.image_data_urls,
-            );
-
-            match tokio::time::timeout(stream_connect_deadline, dispatch).await {
-                Ok(Ok(streaming)) => {
-                    // B2: a 2xx connection is not yet a usable stream. Wait for
-                    // the first event under a deadline. Any response (delta,
-                    // terminal Done, in-band error, or empty stream) commits
-                    // this route and is replayed through the consume loop
-                    // unchanged. Only a stall (no event within the deadline)
-                    // falls back to the next route instead of hanging.
-                    let routing::StreamingCompletion {
-                        provider: stream_provider,
-                        model: stream_model,
-                        events: mut stream_events,
-                    } = streaming;
-                    match tokio::time::timeout(first_output_deadline, stream_events.next()).await {
-                        Ok(first_event) => {
-                            selected_route_idx = idx;
-                            selected_route = Some(*route);
-                            let first_event_latency_ms = started.elapsed().as_millis() as i64;
-                            let first_event_kind = match &first_event {
-                                Some(Ok(routing::CompletionStreamEvent::Delta(_))) => "delta",
-                                Some(Ok(routing::CompletionStreamEvent::Done { .. })) => "done",
-                                Some(Err(_)) => "error",
-                                None => "end",
-                            };
-                            tracing::info!(
-                                account_id_hash = %account_id_hash,
-                                request_id = %req.request_id,
-                                request_ref = %request_ref_log,
-                                session_id = %session_id_log,
-                                session_ref = %session_ref_log,
-                                lane = %lane_log,
-                                effective_lane = %effective_lane_log,
-                                provider = %route.provider,
-                                model = %route.model,
-                                route_index = idx,
-                                was_fallback = idx > 0,
-                                first_event_latency_ms,
-                                first_event_kind,
-                                streaming = true,
-                                "managed chat route selected"
-                            );
-                            if first_event_latency_ms >= SLOW_FIRST_TOKEN_AUDIT_MS {
-                                record_answer_ops_event(
-                                    &state.pool,
-                                    &account.id,
-                                    &req.request_id,
-                                    req.session_id.as_deref(),
-                                    Some(&trace_id),
-                                    "answer_slow_first_token",
-                                    "warning",
-                                    serde_json::json!({
-                                        "lane": lane_log.as_str(),
-                                        "effective_lane": effective_lane_log.as_str(),
-                                        "provider": route.provider,
-                                        "model": route.model,
-                                        "route_index": idx,
-                                        "was_fallback": idx > 0,
-                                        "first_event_latency_ms": first_event_latency_ms,
-                                        "first_event_kind": first_event_kind,
-                                        "streaming": true
-                                    }),
+                match tokio::time::timeout(stream_connect_deadline, dispatch).await {
+                    Ok(Ok(streaming)) => {
+                        // B2: a 2xx connection is not yet a usable stream. Wait for
+                        // the first event under a deadline. Any response (delta,
+                        // terminal Done, in-band error, or empty stream) commits
+                        // this route and is replayed through the consume loop
+                        // unchanged. Only a stall (no event within the deadline)
+                        // falls back to the next route instead of hanging.
+                        let routing::StreamingCompletion {
+                            provider: stream_provider,
+                            model: stream_model,
+                            events: mut stream_events,
+                        } = streaming;
+                        match tokio::time::timeout(first_output_deadline, stream_events.next())
+                            .await
+                        {
+                            Ok(first_event) => {
+                                selected_route_idx = idx;
+                                selected_route = Some(*route);
+                                let first_event_latency_ms = started.elapsed().as_millis() as i64;
+                                let first_event_kind = match &first_event {
+                                    Some(Ok(routing::CompletionStreamEvent::Delta(_))) => "delta",
+                                    Some(Ok(routing::CompletionStreamEvent::Done { .. })) => "done",
+                                    Some(Err(_)) => "error",
+                                    None => "end",
+                                };
+                                tracing::info!(
+                                    account_id_hash = %account_id_hash,
+                                    request_id = %req.request_id,
+                                    request_ref = %request_ref_log,
+                                    session_id = %session_id_log,
+                                    session_ref = %session_ref_log,
+                                    lane = %lane_log,
+                                    effective_lane = %effective_lane_log,
+                                    provider = %route.provider,
+                                    model = %route.model,
+                                    route_index = idx,
+                                    was_fallback = idx > 0,
+                                    first_event_latency_ms,
+                                    first_event_kind,
+                                    streaming = true,
+                                    "managed chat route selected"
                                 );
+                                if first_event_latency_ms >= SLOW_FIRST_TOKEN_AUDIT_MS {
+                                    record_answer_ops_event(
+                                        &state.pool,
+                                        &account.id,
+                                        &req.request_id,
+                                        req.session_id.as_deref(),
+                                        Some(&trace_id),
+                                        "answer_slow_first_token",
+                                        "warning",
+                                        serde_json::json!({
+                                            "lane": lane_log.as_str(),
+                                            "effective_lane": effective_lane_log.as_str(),
+                                            "provider": route.provider,
+                                            "model": route.model,
+                                            "route_index": idx,
+                                            "was_fallback": idx > 0,
+                                            "first_event_latency_ms": first_event_latency_ms,
+                                            "first_event_kind": first_event_kind,
+                                            "streaming": true
+                                        }),
+                                    );
+                                }
+                                selected_first_event = first_event;
+                                selected_stream = Some(routing::StreamingCompletion {
+                                    provider: stream_provider,
+                                    model: stream_model,
+                                    events: stream_events,
+                                });
+                                break;
                             }
-                            selected_first_event = first_event;
-                            selected_stream = Some(routing::StreamingCompletion {
-                                provider: stream_provider,
-                                model: stream_model,
-                                events: stream_events,
-                            });
-                            break;
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                                    request_id = %req.request_id,
+                                    provider = %route.provider,
+                                    model = %route.model,
+                                    first_token_timeout_ms = first_output_deadline.as_millis() as u64,
+                                    "streaming first-token deadline exceeded; trying next route"
+                                );
+                                last_error = Some(anyhow::anyhow!("first-token deadline exceeded"));
+                                last_failure_was_capacity = false;
+                                break;
+                            }
                         }
-                        Err(_elapsed) => {
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
+                            let cooldown_secs = state
+                                .provider_health
+                                .record_cooldown(
+                                    route.provider,
+                                    route.model,
+                                    &selected_key.fingerprint,
+                                    retry_after_secs,
+                                )
+                                .await;
                             tracing::warn!(
                                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                                 request_id = %req.request_id,
                                 provider = %route.provider,
                                 model = %route.model,
-                                first_token_timeout_ms = first_output_deadline.as_millis() as u64,
-                                "streaming first-token deadline exceeded; trying next route"
+                                key_fingerprint = %selected_key.fingerprint,
+                                retry_after_secs = cooldown_secs,
+                                error = %e,
+                                "streaming upstream capacity response; cooled key and retrying route"
                             );
-                            last_error = Some(anyhow::anyhow!("first-token deadline exceeded"));
-                            last_failure_was_capacity = false;
-                            break;
+                            last_capacity = Some(crate::rate_limit::CapacityDenied {
+                                retry_after_secs: cooldown_secs,
+                                reason: "provider_key_cooling_down",
+                            });
+                            last_failure_was_capacity = true;
+                            continue;
                         }
-                    }
-                }
-                Ok(Err(e)) => {
-                    if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
-                        let cooldown_secs = state
-                            .provider_health
-                            .record_cooldown(
-                                route.provider,
-                                route.model,
-                                &selected_key.fingerprint,
-                                retry_after_secs,
-                            )
-                            .await;
                         tracing::warn!(
                             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                             request_id = %req.request_id,
                             provider = %route.provider,
                             model = %route.model,
-                            key_fingerprint = %selected_key.fingerprint,
-                            retry_after_secs = cooldown_secs,
                             error = %e,
-                            "streaming upstream capacity response; cooled key and retrying route"
+                            "streaming upstream dispatch failed; trying next route"
                         );
-                        last_capacity = Some(crate::rate_limit::CapacityDenied {
-                            retry_after_secs: cooldown_secs,
-                            reason: "provider_key_cooling_down",
-                        });
-                        last_failure_was_capacity = true;
-                        continue;
+                        last_error = Some(e);
+                        last_failure_was_capacity = false;
+                        break;
                     }
-                    tracing::warn!(
-                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                        request_id = %req.request_id,
-                        provider = %route.provider,
-                        model = %route.model,
-                        error = %e,
-                        "streaming upstream dispatch failed; trying next route"
-                    );
-                    last_error = Some(e);
-                    last_failure_was_capacity = false;
-                    break;
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                            request_id = %req.request_id,
+                            provider = %route.provider,
+                            model = %route.model,
+                            route_connect_timeout_ms = stream_connect_deadline.as_millis() as u64,
+                            "streaming route connect deadline exceeded; trying next route"
+                        );
+                        last_error =
+                            Some(anyhow::anyhow!("streaming route connect deadline exceeded"));
+                        last_failure_was_capacity = false;
+                        break;
+                    }
                 }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                        request_id = %req.request_id,
-                        provider = %route.provider,
-                        model = %route.model,
-                        route_connect_timeout_ms = stream_connect_deadline.as_millis() as u64,
-                        "streaming route connect deadline exceeded; trying next route"
-                    );
-                    last_error = Some(anyhow::anyhow!("streaming route connect deadline exceeded"));
-                    last_failure_was_capacity = false;
-                    break;
-                }
+            }
+
+            if selected_stream.is_some() {
+                break;
             }
         }
 
         if selected_stream.is_some() {
             break;
         }
+        if let Some(denied) = last_capacity
+            .as_ref()
+            .filter(|_| last_failure_was_capacity)
+            .and_then(internal_capacity_retry_delay)
+        {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                request_id = %req.request_id,
+                request_ref = %request_ref_log,
+                session_ref = %session_ref_log,
+                capacity_sweep,
+                wait_ms = denied.as_millis() as u64,
+                "all streaming routes briefly capacity busy; waiting before internal retry sweep"
+            );
+            tokio::time::sleep(denied).await;
+            continue;
+        }
+        break;
     }
 
     let (selected_route, streaming) = match (selected_route, selected_stream) {
@@ -5348,24 +5395,54 @@ async fn complete_inner(
     let mut selected_route: Option<&PricedRoute> = None;
     let mut selected_completion: Option<routing::Completion> = None;
 
-    for (idx, route) in routes.iter().enumerate() {
-        let key_candidates = state.config.upstream.key_candidates(
-            route.provider,
-            &format!("llm:{}:{}:{}", req.request_id, route.provider, route.model),
-        );
-        if key_candidates.is_empty() {
-            last_error = Some(missing_provider_key_error(route.provider));
-            continue;
+    for capacity_sweep in 0..=1 {
+        if capacity_sweep > 0 {
+            last_error = None;
+            last_capacity = None;
+            last_failure_was_capacity = false;
+            selected_route_idx = 0;
+            selected_route = None;
+            selected_completion = None;
         }
 
-        loop {
-            let selected_key = match state
-                .provider_health
-                .choose_key(route.provider, route.model, &key_candidates)
-                .await
-            {
-                Ok(key) => key,
-                Err(denied) => {
+        for (idx, route) in routes.iter().enumerate() {
+            let key_candidates = state.config.upstream.key_candidates(
+                route.provider,
+                &format!("llm:{}:{}:{}", req.request_id, route.provider, route.model),
+            );
+            if key_candidates.is_empty() {
+                last_error = Some(missing_provider_key_error(route.provider));
+                continue;
+            }
+
+            loop {
+                let selected_key = match state
+                    .provider_health
+                    .choose_key(route.provider, route.model, &key_candidates)
+                    .await
+                {
+                    Ok(key) => key,
+                    Err(denied) => {
+                        tracing::warn!(
+                            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                            request_id = %req.request_id,
+                            provider = %route.provider,
+                            model = %route.model,
+                            retry_after_secs = denied.retry_after_secs,
+                            reason = denied.reason,
+                            "provider key pool cooling down; trying next route"
+                        );
+                        last_capacity = Some(denied);
+                        last_failure_was_capacity = true;
+                        break;
+                    }
+                };
+
+                if let Err(denied) = state
+                    .rate_limiters
+                    .check_provider_llm(route.provider, route.model)
+                    .await
+                {
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                         request_id = %req.request_id,
@@ -5373,114 +5450,117 @@ async fn complete_inner(
                         model = %route.model,
                         retry_after_secs = denied.retry_after_secs,
                         reason = denied.reason,
-                        "provider key pool cooling down; trying next route"
+                        "provider capacity busy; trying next route"
                     );
                     last_capacity = Some(denied);
                     last_failure_was_capacity = true;
                     break;
                 }
-            };
 
-            if let Err(denied) = state
-                .rate_limiters
-                .check_provider_llm(route.provider, route.model)
+                match routing::complete_with_key(
+                    &selected_key.secret,
+                    route.provider,
+                    route.model,
+                    &provider_system,
+                    &provider_user,
+                    provider_max_tokens,
+                    req.temperature,
+                    thinking,
+                    Some(est_in),
+                    &req.image_data_urls,
+                )
                 .await
-            {
-                tracing::warn!(
-                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    request_id = %req.request_id,
-                    provider = %route.provider,
-                    model = %route.model,
-                    retry_after_secs = denied.retry_after_secs,
-                    reason = denied.reason,
-                    "provider capacity busy; trying next route"
-                );
-                last_capacity = Some(denied);
-                last_failure_was_capacity = true;
-                break;
-            }
-
-            match routing::complete_with_key(
-                &selected_key.secret,
-                route.provider,
-                route.model,
-                &provider_system,
-                &provider_user,
-                provider_max_tokens,
-                req.temperature,
-                thinking,
-                Some(est_in),
-                &req.image_data_urls,
-            )
-            .await
-            {
-                Ok(completion) => {
-                    selected_route_idx = idx;
-                    selected_route = Some(route);
-                    tracing::info!(
-                        account_id_hash = %account_id_hash,
-                        request_id = %req.request_id,
-                        request_ref = %request_ref_log,
-                        session_id = %session_id_log,
-                        session_ref = %session_ref_log,
-                        lane = %lane_log,
-                        effective_lane = %effective_lane_log,
-                        provider = %route.provider,
-                        model = %route.model,
-                        route_index = idx,
-                        was_fallback = idx > 0,
-                        streaming = false,
-                        "managed chat route selected"
-                    );
-                    selected_completion = Some(completion);
-                    break;
-                }
-                Err(e) => {
-                    if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
-                        let cooldown_secs = state
-                            .provider_health
-                            .record_cooldown(
-                                route.provider,
-                                route.model,
-                                &selected_key.fingerprint,
-                                retry_after_secs,
-                            )
-                            .await;
+                {
+                    Ok(completion) => {
+                        selected_route_idx = idx;
+                        selected_route = Some(route);
+                        tracing::info!(
+                            account_id_hash = %account_id_hash,
+                            request_id = %req.request_id,
+                            request_ref = %request_ref_log,
+                            session_id = %session_id_log,
+                            session_ref = %session_ref_log,
+                            lane = %lane_log,
+                            effective_lane = %effective_lane_log,
+                            provider = %route.provider,
+                            model = %route.model,
+                            route_index = idx,
+                            was_fallback = idx > 0,
+                            streaming = false,
+                            "managed chat route selected"
+                        );
+                        selected_completion = Some(completion);
+                        break;
+                    }
+                    Err(e) => {
+                        if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
+                            let cooldown_secs = state
+                                .provider_health
+                                .record_cooldown(
+                                    route.provider,
+                                    route.model,
+                                    &selected_key.fingerprint,
+                                    retry_after_secs,
+                                )
+                                .await;
+                            tracing::warn!(
+                                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                                request_id = %req.request_id,
+                                provider = %route.provider,
+                                model = %route.model,
+                                key_fingerprint = %selected_key.fingerprint,
+                                retry_after_secs = cooldown_secs,
+                                error = %e,
+                                "upstream capacity response; cooled key and retrying route"
+                            );
+                            last_capacity = Some(crate::rate_limit::CapacityDenied {
+                                retry_after_secs: cooldown_secs,
+                                reason: "provider_key_cooling_down",
+                            });
+                            last_failure_was_capacity = true;
+                            continue;
+                        }
                         tracing::warn!(
                             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                             request_id = %req.request_id,
                             provider = %route.provider,
                             model = %route.model,
-                            key_fingerprint = %selected_key.fingerprint,
-                            retry_after_secs = cooldown_secs,
                             error = %e,
-                            "upstream capacity response; cooled key and retrying route"
+                            "upstream dispatch failed; trying next route"
                         );
-                        last_capacity = Some(crate::rate_limit::CapacityDenied {
-                            retry_after_secs: cooldown_secs,
-                            reason: "provider_key_cooling_down",
-                        });
-                        last_failure_was_capacity = true;
-                        continue;
+                        last_error = Some(e);
+                        last_failure_was_capacity = false;
+                        break;
                     }
-                    tracing::warn!(
-                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                        request_id = %req.request_id,
-                        provider = %route.provider,
-                        model = %route.model,
-                        error = %e,
-                        "upstream dispatch failed; trying next route"
-                    );
-                    last_error = Some(e);
-                    last_failure_was_capacity = false;
-                    break;
                 }
+            }
+
+            if selected_completion.is_some() {
+                break;
             }
         }
 
         if selected_completion.is_some() {
             break;
         }
+        if let Some(denied) = last_capacity
+            .as_ref()
+            .filter(|_| last_failure_was_capacity)
+            .and_then(internal_capacity_retry_delay)
+        {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                request_id = %req.request_id,
+                request_ref = %request_ref_log,
+                session_ref = %session_ref_log,
+                capacity_sweep,
+                wait_ms = denied.as_millis() as u64,
+                "all routes briefly capacity busy; waiting before internal retry sweep"
+            );
+            tokio::time::sleep(denied).await;
+            continue;
+        }
+        break;
     }
     let elapsed = started.elapsed();
     let elapsed_ms = elapsed.as_millis() as i64;
@@ -7763,6 +7843,39 @@ mod tests {
             estimated_input_tokens: None,
             image_data_urls: Vec::new(),
         }
+    }
+
+    #[test]
+    fn internal_capacity_retry_delay_only_smooths_short_provider_capacity() {
+        let short_provider = crate::rate_limit::CapacityDenied {
+            retry_after_secs: 1,
+            reason: "provider_key_cooling_down",
+        };
+        assert_eq!(
+            internal_capacity_retry_delay(&short_provider),
+            Some(std::time::Duration::from_secs(1))
+        );
+
+        let short_provider_limiter = crate::rate_limit::CapacityDenied {
+            retry_after_secs: 2,
+            reason: "provider_openai_llm_busy",
+        };
+        assert_eq!(
+            internal_capacity_retry_delay(&short_provider_limiter),
+            Some(std::time::Duration::from_secs(2))
+        );
+
+        let long_provider = crate::rate_limit::CapacityDenied {
+            retry_after_secs: 45,
+            reason: "provider_key_cooling_down",
+        };
+        assert_eq!(internal_capacity_retry_delay(&long_provider), None);
+
+        let account_guard = crate::rate_limit::CapacityDenied {
+            retry_after_secs: 1,
+            reason: "account_llm_busy",
+        };
+        assert_eq!(internal_capacity_retry_delay(&account_guard), None);
     }
 
     #[test]

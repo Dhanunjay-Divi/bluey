@@ -2915,6 +2915,8 @@ private final class FeedView: NSView {
         stack.spacing = 8
         stack.edgeInsets = NSEdgeInsets(top: 12, left: 0, bottom: 10, right: 0)
         stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.setContentHuggingPriority(.required, for: .vertical)
+        stack.setContentCompressionResistancePriority(.required, for: .vertical)
 
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
@@ -3008,7 +3010,7 @@ private final class FeedView: NSView {
         emptyState.isHidden = true
         let view = makeCardView(card)
         stack.addArrangedSubview(view)
-        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        finishInstallingCardView(view)
         scrollToBottomIfNeeded(shouldAutoScroll)
         emitCardRendered(id: card.id)
     }
@@ -3198,7 +3200,7 @@ private final class FeedView: NSView {
         cards.append(card)
         let view = makeCardView(card)
         stack.addArrangedSubview(view)
-        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        finishInstallingCardView(view)
         scrollToBottomIfNeeded(shouldAutoScroll)
     }
 
@@ -3209,7 +3211,17 @@ private final class FeedView: NSView {
         existing.removeFromSuperview()
         let view = makeCardView(cards[idx])
         stack.insertArrangedSubview(view, at: idx)
+        finishInstallingCardView(view)
+    }
+
+    private func finishInstallingCardView(_ view: NSView) {
         view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        view.setContentHuggingPriority(.required, for: .vertical)
+        view.setContentCompressionResistancePriority(.required, for: .vertical)
+        stack.invalidateIntrinsicContentSize()
+        stack.needsLayout = true
+        stack.layoutSubtreeIfNeeded()
+        scroll.documentView?.invalidateIntrinsicContentSize()
     }
 
     private func transcriptCardSource(_ card: RenderedCard) -> String {
@@ -3374,6 +3386,8 @@ private final class FeedView: NSView {
         let signInLike = loginURL(from: card) != nil
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
+        row.setContentHuggingPriority(.required, for: .vertical)
+        row.setContentCompressionResistancePriority(.required, for: .vertical)
 
         let bubble = NSView()
         bubble.wantsLayer = true
@@ -3394,6 +3408,8 @@ private final class FeedView: NSView {
         bubble.layer?.shadowRadius = lightThemeEnabled ? 8 : 10
         bubble.layer?.shadowOffset = NSSize(width: 0, height: -4)
         bubble.translatesAutoresizingMaskIntoConstraints = false
+        bubble.setContentHuggingPriority(.required, for: .vertical)
+        bubble.setContentCompressionResistancePriority(.required, for: .vertical)
 
         let metaLabel = NSTextField(labelWithString: kindLabel(card))
         metaLabel.font = NSFont.systemFont(ofSize: 11, weight: .bold)
@@ -3419,6 +3435,11 @@ private final class FeedView: NSView {
         bodyLabel.alignment = signInURL == nil ? .left : .center
         bodyLabel.translatesAutoresizingMaskIntoConstraints = false
         bodyLabel.preferredMaxLayoutWidth = signInURL == nil ? (rightAligned ? 360 : 480) : 430
+        bodyLabel.maximumNumberOfLines = 0
+        bodyLabel.cell?.wraps = true
+        bodyLabel.cell?.isScrollable = false
+        bodyLabel.setContentHuggingPriority(.required, for: .vertical)
+        bodyLabel.setContentCompressionResistancePriority(.required, for: .vertical)
         bodyLabel.isSelectable = false
         bodyLabel.allowsEditingTextAttributes = false
         if let attributedBody = attributedChatBody(for: card, text: bodyText, rightAligned: rightAligned) {
