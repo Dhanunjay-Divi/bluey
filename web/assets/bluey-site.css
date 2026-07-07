@@ -6828,9 +6828,9 @@
 
     #accountApp #dashboardTabComputers .dashboard-device-link-hint {
       display: grid;
-      grid-template-columns: minmax(10rem, .42fr) minmax(0, 1fr);
-      gap: .28rem .8rem;
-      align-items: center;
+      grid-template-columns: minmax(9.5rem, .3fr) minmax(0, 1fr);
+      gap: .35rem .9rem;
+      align-items: start;
       margin: 0;
       padding: 0;
       border: 0;
@@ -6844,23 +6844,27 @@
 
     #accountApp #dashboardTabComputers .dashboard-device-link-hint strong {
       grid-column: 1;
+      grid-row: 1;
+      align-self: center;
       color: #f2f2f2;
       font-size: .86rem;
       font-weight: 750;
       line-height: 1.15;
     }
 
-    #accountApp #dashboardTabComputers .dashboard-device-link-hint > span {
-      grid-column: 1;
-      max-width: 18rem;
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-helper {
+      grid-column: 2;
+      grid-row: 2;
+      max-width: none;
+      margin-top: -.08rem;
       color: #838f97;
-      font-size: .72rem;
+      font-size: .68rem;
       line-height: 1.35;
     }
 
     #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-form {
       grid-column: 2;
-      grid-row: 1 / span 2;
+      grid-row: 1;
       grid-template-columns: minmax(0, 1fr) minmax(5.9rem, auto);
       gap: .45rem;
       align-self: center;
@@ -6883,9 +6887,10 @@
 
     #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-status {
       grid-column: 2;
+      grid-row: 3;
       min-height: 0;
-      margin-top: -.12rem;
-      text-align: right;
+      margin-top: -.18rem;
+      text-align: left;
       font-size: .66rem;
     }
 
@@ -7134,6 +7139,7 @@
       }
 
       #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-form,
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-helper,
       #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-status {
         grid-column: 1;
         grid-row: auto;

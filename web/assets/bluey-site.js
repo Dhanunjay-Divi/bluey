@@ -1065,6 +1065,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const title = document.createElement('strong');
         title.textContent = 'Connect Bluey desktop';
         const body = document.createElement('span');
+        body.className = 'device-code-helper';
         body.textContent = accountToken()
           ? 'Enter the code shown in the Bluey host overlay to sign that desktop into this account.'
           : 'Enter the code shown in the Bluey host overlay, then sign in to connect that desktop.';
@@ -1097,7 +1098,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           renderDeviceLinkHint();
         });
         form.append(input, button);
-        el.append(title, body, form, status);
+        el.append(title, form, body, status);
       };
 
       if (!code) {
