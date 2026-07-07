@@ -2152,13 +2152,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const amount = readManualReloadCents('modalReloadAmount');
         if (reloadRule) reloadRule.textContent = `${money(amount)} adds ${money(amount)} credits after Square confirms payment.`;
         if (checkoutButton) {
-          checkoutButton.textContent = `Continue to Square checkout`;
+          checkoutButton.textContent = 'Continue to checkout';
           checkoutButton.disabled = false;
         }
       } catch (error) {
         if (reloadRule) reloadRule.textContent = error.message;
         if (checkoutButton) {
-          checkoutButton.textContent = 'Continue to Square checkout';
+          checkoutButton.textContent = 'Continue to checkout';
           checkoutButton.disabled = true;
         }
       }
@@ -2310,9 +2310,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }
       }
 
-      reloadSetupMessage('Preparing Square checkout...');
+      reloadSetupMessage('Preparing checkout...');
       await saveReloadSetupAutoReloadIfReady();
-      reloadSetupMessage('Opening Square checkout...');
+      reloadSetupMessage('Opening checkout...');
       const opened = await startReload();
       reloadSetupMessage(opened
         ? 'Checkout opened in a new tab. Complete payment there, then return to Bluey.'
@@ -2951,7 +2951,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           billingProviderLabel.textContent = me.is_temporary
             ? 'Temporary trial'
             : me.billing_provider === 'square'
-              ? 'Square checkout'
+              ? 'Secure checkout'
               : 'No subscription';
         }
         const balanceValue = document.getElementById('balanceValue');
