@@ -51,6 +51,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const MANUAL_RELOAD_MIN_CENTS = 1500;
     const MANUAL_RELOAD_MAX_CENTS = 50000;
     const MANUAL_RELOAD_AMOUNT_CENTS = 1500;
+    const TYPICAL_ANSWER_COST_CENTS = 2.2;
     let captchaConfigPromise = null;
     let captchaConfig = { provider: null, site_key: null };
     let signupTurnstileWidgetId = null;
@@ -66,6 +67,60 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function money(cents) {
       return `$${(Number(cents || 0) / 100).toFixed(2)}`;
+    }
+
+    function shortMoney(cents) {
+      const value = Number(cents || 0) / 100;
+      return Number.isInteger(value) ? `$${value.toFixed(0)}` : `$${value.toFixed(2)}`;
+    }
+
+    function compactCount(value) {
+      const count = Math.max(0, Math.round(Number(value || 0)));
+      if (count >= 1000) return `${(count / 1000).toFixed(count >= 10000 ? 0 : 1)}k`;
+      return String(count);
+    }
+
+    function formatApproxDays(days) {
+      const value = Number(days || 0);
+      if (!Number.isFinite(value) || value <= 0) return '';
+      if (value < 1) return '<1 day';
+      if (value < 14) return `~${Math.max(1, Math.round(value))} days`;
+      if (value < 60) return `~${Math.max(2, Math.round(value / 7))} weeks`;
+      if (value < 90) return `~${Math.round(value)} days`;
+      return '90+ days';
+    }
+
+    function usageEstimate(usage, me) {
+      const periodDays = Math.max(1, Number(usage?.period_days || 7));
+      const totalCues = Math.max(0, Number(usage?.total_cues || 0));
+      const spentCents = Math.max(0, Number(usage?.total_cents_spent || 0));
+      const balanceCents = Math.max(0, Number(me?.balance_cents || 0));
+      const reloadCents = Math.max(MANUAL_RELOAD_MIN_CENTS, Number(me?.auto_topup_amount_cents || MANUAL_RELOAD_AMOUNT_CENTS));
+      const thresholdCents = Math.max(100, Number(me?.auto_topup_threshold_cents || AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS));
+      const avgCostCents = totalCues > 0 && spentCents > 0
+        ? spentCents / totalCues
+        : TYPICAL_ANSWER_COST_CENTS;
+      const answersPerReload = Math.max(1, Math.round(reloadCents / avgCostCents));
+      const typicalAnswers = Math.max(1, Math.round(MANUAL_RELOAD_AMOUNT_CENTS / TYPICAL_ANSWER_COST_CENTS));
+      const centsPerDay = spentCents > 0 ? spentCents / periodDays : 0;
+      const balanceDays = centsPerDay > 0 ? balanceCents / centsPerDay : 0;
+      const reloadDays = centsPerDay > 0 ? reloadCents / centsPerDay : 0;
+      const hasRecentPace = totalCues >= 3 && spentCents > 0;
+      return {
+        periodDays,
+        totalCues,
+        spentCents,
+        balanceCents,
+        reloadCents,
+        thresholdCents,
+        avgCostCents,
+        answersPerReload,
+        typicalAnswers,
+        balanceDays,
+        reloadDays,
+        hasRecentPace,
+        autoReloadOn: Boolean(me?.auto_topup_enabled),
+      };
     }
 
     function centsToDollars(cents) {
@@ -1638,16 +1693,48 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       recoveryMessage('Email verified. You can return to Bluey.');
     }
 
-    function renderUsage(usage) {
+    function renderUsage(usage, me = latestAccountForBilling) {
+      const estimate = usageEstimate(usage, me);
       document.getElementById('usageValue').textContent = `${usage.total_cues || 0}`;
-      document.getElementById('usageHint').textContent = `${money(usage.total_cents_spent)} in ${usage.period_days || 7} days.`;
-      document.getElementById('tierValue').textContent = usage.tier_label || '--';
-      const projectedDays = Math.round(usage.projected_days_remaining || 0);
-      const projectionLabel = (usage.projection_label || '').trim();
-      document.getElementById('projectionHint').textContent = projectionLabel
-        || (projectedDays > 0
-          ? `~${Math.min(projectedDays, 90)} days at recent pace.`
-          : 'Appears after usage.');
+      document.getElementById('usageHint').textContent = estimate.spentCents > 0
+        ? `${money(estimate.spentCents)} in ${estimate.periodDays} days · ~${money(estimate.avgCostCents)} each.`
+        : `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} usually covers about ${compactCount(estimate.typicalAnswers)} normal answers.`;
+
+      const reloadDaysCopy = formatApproxDays(estimate.reloadDays);
+      const balanceDaysCopy = formatApproxDays(estimate.balanceDays);
+      const reloadAnswerCopy = `~${compactCount(estimate.answersPerReload)} answers`;
+      document.getElementById('tierValue').textContent = estimate.hasRecentPace && reloadDaysCopy
+        ? reloadDaysCopy
+        : `~${compactCount(estimate.typicalAnswers)}`;
+      document.getElementById('projectionHint').textContent = estimate.hasRecentPace
+        ? `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} at recent pace; about ${reloadAnswerCopy}.`
+        : 'Typical text answers; screen and audio can spend faster.';
+
+      const reloadEstimateValue = document.getElementById('reloadEstimateValue');
+      const reloadEstimateHint = document.getElementById('reloadEstimateHint');
+      const autoReloadEstimateValue = document.getElementById('autoReloadEstimateValue');
+      const autoReloadEstimateHint = document.getElementById('autoReloadEstimateHint');
+      if (reloadEstimateValue) {
+        reloadEstimateValue.textContent = estimate.hasRecentPace && reloadDaysCopy
+          ? reloadDaysCopy
+          : `~${compactCount(estimate.typicalAnswers)} answers`;
+      }
+      if (reloadEstimateHint) {
+        reloadEstimateHint.textContent = estimate.hasRecentPace
+          ? `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} at recent pace; about ${reloadAnswerCopy}.`
+          : `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} is plenty for many normal text questions.`;
+      }
+      if (autoReloadEstimateValue) {
+        autoReloadEstimateValue.textContent = estimate.autoReloadOn
+          ? shortMoney(estimate.reloadCents)
+          : 'Off';
+      }
+      if (autoReloadEstimateHint) {
+        autoReloadEstimateHint.textContent = estimate.autoReloadOn
+          ? `${reloadDaysCopy || reloadAnswerCopy} each time; reloads below ${money(estimate.thresholdCents)}.`
+          : 'Optional. Turn it on to top up before balance runs out.';
+      }
+
       const list = document.getElementById('usageList');
       const rows = usage.mix || [];
       list.replaceChildren();
@@ -1816,7 +1903,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       } else if (hasSavedMethod) {
         hint.textContent = 'Off. Turn on to resume automatic reloads.';
       } else if (canSaveSquareCard) {
-        hint.textContent = 'Add credits once to set up Auto Reload.';
+        hint.textContent = 'Add balance once to set up Auto Reload.';
       } else {
         hint.textContent = me?.auto_topup_unavailable_reason || 'Unavailable';
       }
@@ -1843,13 +1930,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const autoReloadOn = Boolean(me?.auto_topup_enabled);
       const savedMethod = String(me?.saved_payment_method_label || '').trim();
       const balanceStatus = balanceCents <= 0
-        ? { label: 'Add credits', tone: 'danger' }
+        ? { label: 'Add balance', tone: 'danger' }
         : balanceCents < 500
           ? { label: 'Low', tone: 'warn' }
           : { label: 'Ready', tone: 'good' };
       const rows = [
         {
-          item: 'Credits',
+          item: 'Balance',
           detail: 'Shared account balance',
           amount: money(balanceCents),
           status: balanceStatus.label,
@@ -1897,7 +1984,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           ? `Auto Reload is active with ${savedMethod || 'a saved card'}.`
           : savedMethod
             ? 'Auto Reload is off. Your saved card stays available if you turn it back on.'
-            : 'No saved card. Add credits manually, or save a card when you enable Auto Reload.';
+            : 'No saved card. Add balance manually, or save a card when you enable Auto Reload.';
       }
     }
 
@@ -1942,7 +2029,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const settings = readAutoReloadSettings();
         rule.textContent = hasSavedMethod
           ? `Reloads ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`
-          : `Add credits once to reload ${money(settings.auto_topup_amount_cents)} when below ${money(settings.auto_topup_threshold_cents)}.`;
+          : `Add balance once to reload ${money(settings.auto_topup_amount_cents)} when below ${money(settings.auto_topup_threshold_cents)}.`;
       } catch (error) {
         rule.textContent = error.message;
       }
@@ -1994,7 +2081,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         checkoutWindow.opener = null;
         checkoutWindow.document.title = 'Opening Bluey checkout';
         checkoutWindow.document.body.style.cssText = 'margin:0;background:#050505;color:#f5f5f5;font:18px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh;';
-        checkoutWindow.document.body.textContent = `Opening checkout for ${money(amountCents)} Bluey credits...`;
+        checkoutWindow.document.body.textContent = `Opening checkout for ${money(amountCents)}...`;
       } catch {
         // Some browsers lock down the placeholder tab; navigating it still works.
       }
@@ -2015,10 +2102,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       try {
         const amount = readManualReloadCents();
         if (rule) rule.textContent = '';
-        if (overviewReloadButton) overviewReloadButton.textContent = 'Add credits';
+        if (overviewReloadButton) overviewReloadButton.textContent = 'Add balance';
       } catch (error) {
         if (rule) rule.textContent = error.message;
-        if (overviewReloadButton) overviewReloadButton.textContent = 'Add credits';
+        if (overviewReloadButton) overviewReloadButton.textContent = 'Add balance';
       }
     }
 
@@ -2033,15 +2120,28 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       const balanceCents = Number(me?.balance_cents || 0);
       if (balanceCents <= 0) {
-        return 'Add credits to start.';
+        return `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} is enough for many normal questions.`;
       }
       if (balanceCents < 100) {
-        return 'Almost out. Add credits to keep Bluey ready.';
+        return 'Almost out. Add balance to keep Bluey ready.';
       }
       if (balanceCents < 500) {
-        return 'Low balance. Add credits soon.';
+        return 'Low balance. Add more soon.';
       }
       return 'Ready for paid cloud work.';
+    }
+
+    function accountBalanceUsageHint(me, usage) {
+      if (me?.is_temporary) return accountBalanceHint(me);
+      const estimate = usageEstimate(usage, me);
+      const balanceDaysCopy = formatApproxDays(estimate.balanceDays);
+      if (estimate.balanceCents <= 0) {
+        return `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} usually covers about ${compactCount(estimate.typicalAnswers)} normal answers.`;
+      }
+      if (estimate.hasRecentPace && balanceDaysCopy) {
+        return `At recent pace, this balance lasts ${balanceDaysCopy}.`;
+      }
+      return `${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)} is plenty for many normal text questions.`;
     }
 
     async function updateAutoReload(enabled) {
@@ -2056,7 +2156,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       renderAutoReload(me);
       accountMessage(enabled
         ? `Auto Reload is on. Bluey will reload ${money(settings.auto_topup_amount_cents)} when balance drops below ${money(settings.auto_topup_threshold_cents)}.`
-        : 'Auto Reload is off. You can add credits manually whenever you need them.');
+        : 'Auto Reload is off. You can add balance manually whenever you need it.');
       return me;
     }
 
@@ -2070,7 +2170,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return;
       }
       if (enabled && !latestAccountForBilling?.auto_topup_available) {
-        throw new Error('Auto Reload needs a saved card. Use Add credits to set it up.');
+        throw new Error('Auto Reload needs a saved card. Use Add balance to set it up.');
       }
 
       await updateAutoReload(enabled);
@@ -2170,7 +2270,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         });
         renderAutoReload(me);
         if (typeof options.onSaved === 'function') options.onSaved(me);
-        accountMessage('Card saved. Auto Reload can now be saved when you want it active.');
+        accountMessage('Card saved. Auto Reload can use it when turned on.');
       } finally {
         if (button) {
           button.disabled = false;
@@ -2296,7 +2396,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           ? `Saved when you continue: reload ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`
           : canSaveSquareCard
             ? 'Add a card here, then continue to save Auto Reload.'
-            : 'Auto Reload is not available for this account yet. You can still add credits with checkout.';
+            : 'Auto Reload is not available for this account yet. You can still add balance with checkout.';
       } catch (error) {
         autoRule.textContent = error.message;
         if (cardActions) cardActions.hidden = !hasSavedMethod;
@@ -2351,9 +2451,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (document.getElementById('modalAutoReloadToggle')?.checked && latestAccountForBilling?.auto_topup_available) {
         applyReloadSetupToDashboard();
         await updateAutoReload(true);
-        reloadSetupMessage('Card saved. Auto Reload is on. Continue to checkout to add credits.', 'success');
+        reloadSetupMessage('Card saved. Auto Reload is on. Continue to checkout to add balance.', 'success');
       } else {
-        reloadSetupMessage('Card saved. Continue to checkout to add credits.', 'success');
+        reloadSetupMessage('Card saved. Continue to checkout to add balance.', 'success');
       }
     }
 
@@ -3075,7 +3175,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const summaryBalanceValue = document.getElementById('summaryBalanceValue');
         const summaryBalanceLabel = document.getElementById('summaryBalanceLabel');
         const summaryBalanceCard = summaryBalanceValue?.closest('.summary-balance-kpi');
-        if (summaryBalanceLabel) summaryBalanceLabel.textContent = isTemporaryAccount ? 'Trial time' : 'Credits balance';
+        if (summaryBalanceLabel) summaryBalanceLabel.textContent = isTemporaryAccount ? 'Trial time' : 'Balance';
         if (summaryBalanceValue) {
           summaryBalanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
           summaryBalanceCard?.classList.toggle('balance-critical', !isTemporaryAccount && me.balance_cents > 0 && me.balance_cents < 500);
@@ -3083,12 +3183,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }
         const balanceHint = document.getElementById('balanceHint');
         const summaryBalanceHint = document.getElementById('summaryBalanceHint');
-        const balanceHintText = accountBalanceHint(me);
+        const balanceHintText = accountBalanceUsageHint(me, usage);
         if (balanceHint) balanceHint.textContent = balanceHintText;
         if (summaryBalanceHint) summaryBalanceHint.textContent = balanceHintText;
         renderTemporaryAccount(me);
-        renderUsage(usage);
         renderAutoReload(me);
+        renderUsage(usage, me);
         updateManualReloadDraftCopy();
         const isAdmin = Boolean(me.is_admin);
         currentAccountIsAdmin = isAdmin;
@@ -3126,7 +3226,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       const checkoutWindow = openCheckoutPlaceholder(amountCents);
       setReloadButtonsBusy(true);
-      accountMessage(`Opening checkout for ${money(amountCents)} Bluey credits...`);
+      accountMessage(`Opening checkout for ${money(amountCents)}...`);
       try {
         const checkout = await apiJson('/billing/checkout', {
           method: 'POST',
@@ -3139,7 +3239,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         } else {
           const opened = window.open(url, '_blank', 'noopener,noreferrer');
           if (!opened) {
-            accountMessage('Checkout was blocked by the browser. Allow popups for bluey.sh, then click Add credits again.', false, 'error');
+            accountMessage('Checkout was blocked by the browser. Allow popups for bluey.sh, then click Add balance again.', false, 'error');
             return false;
           }
         }
@@ -3399,6 +3499,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       document.getElementById('changeSquareCardButton')?.addEventListener('click', () => {
         openSquareCardSetup().catch((error) => accountMessage(error.message));
+      });
+      document.getElementById('cancelSquareCardButton')?.addEventListener('click', () => {
+        closeSquareCardSetup();
       });
       document.getElementById('cancelAutoReloadButton')?.addEventListener('click', () => {
         const button = document.getElementById('cancelAutoReloadButton');

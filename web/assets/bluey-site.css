@@ -3212,10 +3212,55 @@
       justify-self: start;
     }
 
+    #accountApp .square-card-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .45rem;
+      align-items: center;
+    }
+
     #accountApp .usage-list {
       display: grid;
       gap: .5rem;
       margin: 1rem 0;
+    }
+
+    #accountApp .usage-estimate-card {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .65rem;
+      margin: .85rem 0 .75rem;
+    }
+
+    #accountApp .usage-estimate-card > div {
+      min-width: 0;
+      padding: .72rem .82rem;
+      border: 1px solid rgba(99, 216, 255, .18);
+      border-radius: 10px;
+      background: rgba(99, 216, 255, .045);
+    }
+
+    #accountApp .usage-estimate-card span,
+    #accountApp .usage-estimate-card em {
+      display: block;
+      color: #75818a;
+      font-size: .72rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .usage-estimate-card span {
+      margin-bottom: .24rem;
+      font-weight: 900;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .usage-estimate-card strong {
+      display: block;
+      margin-bottom: .2rem;
+      color: #f1f1f1;
+      font-size: 1.02rem;
+      line-height: 1.1;
     }
 
     #accountApp .usage-row,
@@ -5891,6 +5936,20 @@
       color: #5f7281;
     }
 
+    html[data-bluey-theme="light"] #accountApp .usage-estimate-card > div {
+      border-color: #dceaf2;
+      background: #f7fbff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .usage-estimate-card strong {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .usage-estimate-card span,
+    html[data-bluey-theme="light"] #accountApp .usage-estimate-card em {
+      color: #5f7281;
+    }
+
     html[data-bluey-theme="light"] #accountApp .dashboard-tabs {
       border-bottom-color: #dceaf2;
     }
@@ -5961,6 +6020,10 @@
       }
 
       #accountApp .summary-metric-grid {
+        grid-template-columns: 1fr;
+      }
+
+      #accountApp .usage-estimate-card {
         grid-template-columns: 1fr;
       }
     }
@@ -6163,8 +6226,37 @@
     #accountApp .billing-payment-card .square-card-setup {
       width: 100%;
       margin-top: 0;
-      padding: .75rem;
-      border-radius: 10px;
+      gap: .48rem;
+      max-width: 100%;
+      padding: .62rem;
+      border-radius: 9px;
+      background: rgba(255, 255, 255, .025);
+    }
+
+    #accountApp .billing-payment-card .square-card-copy {
+      gap: .08rem;
+    }
+
+    #accountApp .billing-payment-card .square-card-copy strong {
+      font-size: .76rem;
+    }
+
+    #accountApp .billing-payment-card .square-card-copy span {
+      font-size: .68rem;
+      line-height: 1.28;
+    }
+
+    #accountApp .billing-payment-card .square-card-container {
+      min-height: 38px;
+      padding: .45rem .55rem;
+      border-radius: 8px;
+    }
+
+    #accountApp .billing-payment-card .square-card-actions .account-button {
+      min-height: 31px;
+      padding: .34rem .55rem;
+      border-radius: 8px;
+      font-size: .72rem;
     }
 
     #accountApp .manual-reload-rule:empty {
