@@ -2107,20 +2107,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function renderReloadSetupCardState(me = latestAccountForBilling) {
       const cardButton = document.getElementById('reloadSetupCardButton');
-      const saveAutoButton = document.getElementById('reloadSetupSaveAutoButton');
-      if (!cardButton && !saveAutoButton) return;
+      if (!cardButton) return;
       const canSaveSquareCard = canUseSquareCardSetup(me);
       const hasSavedMethod = Boolean(me?.auto_topup_available);
 
-      if (cardButton) {
-        cardButton.disabled = !canSaveSquareCard;
-        cardButton.textContent = hasSavedMethod ? 'Change card' : 'Add card for Auto Reload';
-      }
-      if (saveAutoButton) {
-        const showSave = hasSavedMethod || Boolean(me?.auto_topup_enabled);
-        saveAutoButton.hidden = !showSave;
-        saveAutoButton.disabled = !showSave;
-      }
+      cardButton.disabled = !canSaveSquareCard;
+      cardButton.textContent = hasSavedMethod ? 'Change card' : 'Add card for Auto Reload';
     }
 
     function updateReloadAmountPresets() {
@@ -2135,7 +2127,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function updateReloadSetupDraftCopy() {
       const checkoutButton = document.getElementById('reloadSetupCheckoutButton');
       const autoRule = document.getElementById('modalAutoReloadRule');
-      const saveAutoButton = document.getElementById('reloadSetupSaveAutoButton');
       const cardButton = document.getElementById('reloadSetupCardButton');
       const cardActions = document.querySelector('#addCreditsDialog .reload-setup-card-actions');
       const toggle = document.getElementById('modalAutoReloadToggle');
@@ -2151,22 +2142,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           checkoutButton.disabled = false;
         }
       } catch (error) {
-        if (reloadRule) reloadRule.textContent = error.message;
+        if (autoRule) autoRule.textContent = error.message;
         if (checkoutButton) {
           checkoutButton.textContent = 'Continue to checkout';
           checkoutButton.disabled = true;
         }
+        updateReloadAmountPresets();
+        return;
       }
       updateReloadAmountPresets();
 
       if (!autoRule) return;
       if (!enabled) {
-        autoRule.textContent = wasEnabled ? 'Auto Reload will turn off before checkout.' : 'Off for this checkout. You can add credits manually anytime.';
+        autoRule.textContent = wasEnabled ? 'Auto Reload will turn off when you continue.' : 'Auto Reload is off for this checkout.';
         if (cardActions) cardActions.hidden = !hasSavedMethod && !wasEnabled;
-        if (saveAutoButton) {
-          saveAutoButton.hidden = !wasEnabled && !hasSavedMethod;
-          saveAutoButton.disabled = !wasEnabled;
-        }
         return;
       }
 
@@ -2175,21 +2164,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         if (cardActions) cardActions.hidden = false;
         if (cardButton) cardButton.hidden = hasSavedMethod ? false : !canSaveSquareCard;
         autoRule.textContent = hasSavedMethod
-          ? `When balance is below ${money(settings.auto_topup_threshold_cents)}, Bluey reloads ${money(settings.auto_topup_amount_cents)} from your saved card.`
+          ? `Saved when you continue: reload ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`
           : canSaveSquareCard
-            ? `Add a card here to reload ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`
+            ? 'Add a card here, then continue to save Auto Reload.'
             : 'Auto Reload is not available for this account yet. You can still add credits with checkout.';
-        if (saveAutoButton) {
-          saveAutoButton.hidden = !hasSavedMethod;
-          saveAutoButton.disabled = !hasSavedMethod;
-        }
       } catch (error) {
         autoRule.textContent = error.message;
         if (cardActions) cardActions.hidden = !hasSavedMethod;
-        if (saveAutoButton) {
-          saveAutoButton.hidden = !hasSavedMethod;
-          saveAutoButton.disabled = true;
-        }
       }
     }
 
@@ -2245,13 +2226,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       } else {
         reloadSetupMessage('Card saved. Continue to checkout to add credits.', 'success');
       }
-    }
-
-    async function saveReloadSetupAutoReload() {
-      applyReloadSetupToDashboard();
-      await saveAutoReloadSettings();
-      updateReloadSetupDraftCopy();
-      reloadSetupMessage('Auto Reload settings saved.', 'success');
     }
 
     async function saveReloadSetupAutoReloadIfReady() {
@@ -3280,9 +3254,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       document.getElementById('saveAutoReloadButton')?.addEventListener('click', () => {
         saveAutoReloadSettings().catch((error) => accountMessage(error.message));
-      });
-      document.getElementById('reloadSetupSaveAutoButton')?.addEventListener('click', () => {
-        saveReloadSetupAutoReload().catch((error) => reloadSetupMessage(error.message, 'error'));
       });
       document.getElementById('saveSquareCardButton')?.addEventListener('click', () => {
         saveSquareCard().catch((error) => accountMessage(error.message));
