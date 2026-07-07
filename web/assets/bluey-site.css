@@ -6948,6 +6948,10 @@
       gap: .75rem;
     }
 
+    #accountApp .billing-credits-grid {
+      align-items: stretch;
+    }
+
     #accountApp .billing-primary-card,
     #accountApp .billing-payment-card {
       padding: 1rem 1.05rem;
@@ -6955,11 +6959,16 @@
       background: #101010;
     }
 
+    #accountApp .billing-primary-card {
+      display: grid;
+      gap: 1rem;
+    }
+
     #accountApp .reload-setup-modal {
-      width: min(760px, calc(100vw - 36px));
+      width: min(720px, calc(100vw - 36px));
       border-color: rgba(99, 216, 255, .30);
       border-radius: 18px;
-      padding: 1.25rem;
+      padding: 1.15rem;
       background: #101010;
     }
 
@@ -6986,6 +6995,33 @@
       color: #f2f2f2;
       font-size: 1rem;
       line-height: 1.1;
+    }
+
+    #accountApp .reload-amount-presets {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: .4rem;
+    }
+
+    #accountApp .reload-amount-presets button {
+      min-height: 36px;
+      border: 1px solid rgba(255, 255, 255, .12);
+      border-radius: 10px;
+      background: #111;
+      color: #d7d7d7;
+      font: inherit;
+      font-size: .78rem;
+      font-weight: 850;
+      cursor: pointer;
+      transition: border-color .18s ease, background .18s ease, color .18s ease, box-shadow .18s ease;
+    }
+
+    #accountApp .reload-amount-presets button:hover,
+    #accountApp .reload-amount-presets button.is-active {
+      border-color: rgba(99, 216, 255, .58);
+      background: rgba(99, 216, 255, .10);
+      color: #75dcff;
+      box-shadow: 0 0 0 3px rgba(99, 216, 255, .08);
     }
 
     #accountApp .reload-setup-kicker {
@@ -7023,6 +7059,29 @@
       flex-wrap: wrap;
       gap: .5rem;
       align-items: center;
+    }
+
+    #accountApp .reload-setup-footer {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: .85rem;
+      align-items: center;
+      margin-top: .85rem;
+      padding-top: .85rem;
+      border-top: 1px solid rgba(255, 255, 255, .08);
+    }
+
+    #accountApp .reload-setup-footer p {
+      margin: 0;
+      color: #7f8b92;
+      font-size: .74rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .reload-setup-footer .account-button.primary {
+      min-height: 42px;
+      border-radius: 10px;
+      white-space: nowrap;
     }
 
     #accountApp .reload-setup-square-card {
@@ -7071,14 +7130,33 @@
       background: #f7fbff;
     }
 
+    html[data-bluey-theme="light"] #accountApp .reload-amount-presets button {
+      border-color: #d8e7f0;
+      background: #ffffff;
+      color: #53697a;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-amount-presets button:hover,
+    html[data-bluey-theme="light"] #accountApp .reload-amount-presets button.is-active {
+      border-color: rgba(8, 124, 166, .40);
+      background: #eaf8ff;
+      color: #087ca6;
+      box-shadow: 0 0 0 3px rgba(8, 124, 166, .08);
+    }
+
     html[data-bluey-theme="light"] #accountApp .reload-setup-panel h3 {
       color: #102130;
     }
 
     html[data-bluey-theme="light"] #accountApp .reload-setup-kicker,
     html[data-bluey-theme="light"] #accountApp .reload-setup-panel > p,
-    html[data-bluey-theme="light"] #accountApp .reload-setup-panel .auto-reload-rule {
+    html[data-bluey-theme="light"] #accountApp .reload-setup-panel .auto-reload-rule,
+    html[data-bluey-theme="light"] #accountApp .reload-setup-footer p {
       color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .reload-setup-footer {
+      border-top-color: #dceaf2;
     }
 
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload.is-setup-default .auto-reload-head h3 {
@@ -7129,8 +7207,13 @@
       #productSite .pricing,
       #accountApp .billing-grid,
       #accountApp .reload-setup-grid,
+      #accountApp .reload-setup-footer,
       #accountApp .dashboard-overview-card {
         grid-template-columns: 1fr;
+      }
+
+      #accountApp .reload-setup-footer .account-button.primary {
+        width: 100%;
       }
 
       #accountApp #dashboardTabComputers .dashboard-device-link-hint {
