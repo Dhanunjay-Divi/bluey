@@ -6153,11 +6153,133 @@
       justify-self: start;
     }
 
+    #accountApp .billing-payment-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .5rem;
+      align-items: center;
+    }
+
     #accountApp .billing-payment-card .square-card-setup {
       width: 100%;
       margin-top: 0;
       padding: .75rem;
       border-radius: 10px;
+    }
+
+    #accountApp .manual-reload-rule:empty {
+      display: none;
+    }
+
+    #accountApp .billing-status-card {
+      margin-top: .8rem;
+      padding: .9rem 1rem;
+      border: 1px solid #222;
+      border-radius: 10px;
+      background: #101010;
+    }
+
+    #accountApp .billing-status-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    #accountApp .billing-status-head h4 {
+      margin: 0;
+      color: #f1f1f1;
+      font-size: .98rem;
+      line-height: 1.1;
+    }
+
+    #accountApp .billing-status-head p {
+      margin: .32rem 0 0;
+      color: #858f98;
+      font-size: .78rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .billing-status-table-wrap {
+      margin-top: .72rem;
+      overflow-x: auto;
+      border-top: 1px solid rgba(255, 255, 255, .08);
+    }
+
+    #accountApp .billing-status-table {
+      width: 100%;
+      min-width: 620px;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+
+    #accountApp .billing-status-table th,
+    #accountApp .billing-status-table td {
+      padding: .62rem .45rem;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    #accountApp .billing-status-table th {
+      color: #687681;
+      font-size: .62rem;
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .billing-status-table td {
+      border-top: 1px solid rgba(255, 255, 255, .07);
+      color: #cfcfcf;
+      font-size: .78rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .billing-status-table tbody tr:first-child td {
+      border-top-color: rgba(255, 255, 255, .11);
+    }
+
+    #accountApp .billing-status-item,
+    #accountApp .billing-status-amount {
+      color: #f1f1f1;
+      font-weight: 850;
+      white-space: nowrap;
+    }
+
+    #accountApp .billing-status-detail {
+      color: #7d878e;
+    }
+
+    #accountApp .billing-status-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: .16rem .42rem;
+      border: 1px solid rgba(255, 255, 255, .10);
+      border-radius: 999px;
+      color: #9a9a9a;
+      font-size: .68rem;
+      font-weight: 900;
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    #accountApp .billing-status-badge.is-good {
+      border-color: rgba(104, 244, 157, .22);
+      background: rgba(104, 244, 157, .10);
+      color: #7df1aa;
+    }
+
+    #accountApp .billing-status-badge.is-warn {
+      border-color: rgba(255, 210, 117, .25);
+      background: rgba(255, 210, 117, .10);
+      color: #ffd277;
+    }
+
+    #accountApp .billing-status-badge.is-danger {
+      border-color: rgba(255, 116, 125, .26);
+      background: rgba(255, 116, 125, .11);
+      color: #ff858d;
     }
 
     html[data-bluey-theme="light"] #accountApp .dashboard-overview-title-row h2,
@@ -7177,6 +7299,28 @@
     html[data-bluey-theme="light"] #accountApp .reload-setup-square-card {
       border-color: #dceaf2;
       background: #f7fbff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .billing-status-card {
+      border-color: #dceaf2;
+      background: #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .billing-status-head h4,
+    html[data-bluey-theme="light"] #accountApp .billing-status-item,
+    html[data-bluey-theme="light"] #accountApp .billing-status-amount {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .billing-status-head p,
+    html[data-bluey-theme="light"] #accountApp .billing-status-detail {
+      color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .billing-status-table-wrap,
+    html[data-bluey-theme="light"] #accountApp .billing-status-table td,
+    html[data-bluey-theme="light"] #accountApp .billing-status-table tbody tr:first-child td {
+      border-color: #dceaf2;
     }
 
     html[data-bluey-theme="light"] #accountApp .reload-amount-presets button {

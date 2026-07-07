@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070710"
+    href="/assets/bluey-site.css?v=2026070711"
   >
   <script type="application/ld+json">
   {
@@ -582,16 +582,16 @@
               <section class="dashboard-section billing-section" aria-label="Credits and reload">
                 <div class="section-head">
                   <div>
-                    <h3>Credits</h3>
-                    <p>Add account balance, then let Auto Reload keep Bluey ready when your balance gets low.</p>
+                    <h3>Billing</h3>
+                    <p>Add credits, update your card, or turn Auto Reload off.</p>
                   </div>
                 </div>
                 <div class="billing-grid billing-credits-grid">
                   <div class="reload-card billing-primary-card">
                     <div>
                       <span class="reload-setup-kicker">Account wallet</span>
-                      <h3>Add credits</h3>
-                      <p>Choose an amount and continue to Square. Credits appear after payment confirms.</p>
+                      <h3>Credits</h3>
+                      <p>Add prepaid balance shared across every Bluey sign-in.</p>
                       <div class="credit-equation" aria-label="$15 reload gives $15 Bluey credits">
                         <strong>$15 minimum</strong>
                         <span>$1 paid = $1 Bluey credit</span>
@@ -607,19 +607,22 @@
                       </label>
                       <button class="account-button primary" id="reloadButton" type="button">Add credits</button>
                     </div>
-                    <p class="manual-reload-rule" id="manualReloadRule">$15 adds $15 to this Bluey account.</p>
+                    <p class="manual-reload-rule" id="manualReloadRule" aria-live="polite"></p>
                   </div>
                   <div class="reload-card billing-payment-card" id="billingPaymentCard">
                     <div class="billing-payment-head">
                       <div>
-                        <span class="reload-setup-kicker">Backup</span>
+                        <span class="reload-setup-kicker">Payment method</span>
                         <h3>Auto Reload card</h3>
-                        <p>Optional. Save a card so Bluey can top up automatically when balance is low.</p>
+                        <p>Used only when Auto Reload is on.</p>
                       </div>
-                      <span class="pill-muted" id="billingProviderLabel">No subscription</span>
+                      <span class="pill-muted" id="billingProviderLabel">Secure checkout</span>
                     </div>
                     <div class="auto-reload-method" id="autoReloadMethod">No saved card yet</div>
-                    <button class="account-button ghost compact" id="changeSquareCardButton" type="button" hidden>Save card</button>
+                    <div class="billing-payment-actions">
+                      <button class="account-button ghost compact" id="changeSquareCardButton" type="button" hidden>Save card</button>
+                      <button class="account-button danger compact" id="cancelAutoReloadButton" type="button" hidden>Cancel Auto Reload</button>
+                    </div>
                     <div class="square-card-setup" id="squareCardSetup" hidden>
                       <div class="square-card-copy">
                         <strong>Secure card form</strong>
@@ -628,6 +631,27 @@
                       <div id="squareCardContainer" class="square-card-container"></div>
                       <button class="account-button ghost compact" id="saveSquareCardButton" type="button">Save card</button>
                     </div>
+                  </div>
+                </div>
+                <div class="billing-status-card" aria-label="Billing status">
+                  <div class="billing-status-head">
+                    <div>
+                      <h4>Billing status</h4>
+                      <p id="billingStatusCopy">Prepaid wallet, card, and Auto Reload state.</p>
+                    </div>
+                  </div>
+                  <div class="billing-status-table-wrap">
+                    <table class="billing-status-table">
+                      <thead>
+                        <tr>
+                          <th scope="col">Item</th>
+                          <th scope="col">Detail</th>
+                          <th scope="col">Amount</th>
+                          <th scope="col">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody id="billingStatusRows"></tbody>
+                    </table>
                   </div>
                 </div>
               </section>
@@ -1085,7 +1109,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070710"
+    src="/assets/bluey-site.js?v=2026070711"
   ></script>
 </body>
 </html>
