@@ -1874,15 +1874,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function updateManualReloadDraftCopy() {
       const rule = document.getElementById('manualReloadRule');
       const overviewReloadButton = document.getElementById('overviewReloadButton');
-      const modalRule = document.getElementById('modalReloadRule');
       try {
         const amount = readManualReloadCents();
         if (rule) rule.textContent = `${money(amount)} adds ${money(amount)} credits.`;
-        if (modalRule) modalRule.textContent = `${money(amount)} adds ${money(amount)} credits after Square confirms payment.`;
         if (overviewReloadButton) overviewReloadButton.textContent = 'Add credits';
       } catch (error) {
         if (rule) rule.textContent = error.message;
-        if (modalRule) modalRule.textContent = error.message;
         if (overviewReloadButton) overviewReloadButton.textContent = 'Add credits';
       }
     }
@@ -2137,7 +2134,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function updateReloadSetupDraftCopy() {
       const checkoutButton = document.getElementById('reloadSetupCheckoutButton');
-      const reloadRule = document.getElementById('modalReloadRule');
       const autoRule = document.getElementById('modalAutoReloadRule');
       const saveAutoButton = document.getElementById('reloadSetupSaveAutoButton');
       const cardButton = document.getElementById('reloadSetupCardButton');
@@ -2149,8 +2145,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const canSaveSquareCard = canUseSquareCardSetup(latestAccountForBilling);
 
       try {
-        const amount = readManualReloadCents('modalReloadAmount');
-        if (reloadRule) reloadRule.textContent = `${money(amount)} adds ${money(amount)} credits after Square confirms payment.`;
+        readManualReloadCents('modalReloadAmount');
         if (checkoutButton) {
           checkoutButton.textContent = 'Continue to checkout';
           checkoutButton.disabled = false;
