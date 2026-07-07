@@ -90,6 +90,7 @@ jobs:
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-release-
 
       - name: Build daemon and CLI
+        if: matrix.os != 'windows-latest'
         env:
           BLUEY_UPDATE_PUBKEY: ${{ vars.BLUEY_UPDATE_PUBKEY }}
         shell: bash
@@ -98,6 +99,18 @@ jobs:
             echo "BLUEY_UPDATE_PUBKEY repository variable is required for release builds" >&2
             exit 1
           fi
+          cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
+
+      - name: Build daemon and CLI (Windows)
+        if: matrix.os == 'windows-latest'
+        env:
+          BLUEY_UPDATE_PUBKEY: ${{ vars.BLUEY_UPDATE_PUBKEY }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:BLUEY_UPDATE_PUBKEY)) {
+            Write-Error "BLUEY_UPDATE_PUBKEY repository variable is required for release builds"
+            exit 1
+          }
           cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
 
       - name: Build macOS dashboard app
