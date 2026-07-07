@@ -2166,6 +2166,34 @@ async fn billing_checkout_creates_square_payment_link_when_square_enabled() {
 
 #[tokio::test]
 #[serial]
+async fn billing_checkout_rejects_negative_reload_before_provider_call() {
+    set_square_billing_env();
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "square-negative-checkout@example.com", "longenoughpw").await;
+
+    let req = Request::post("/billing/checkout")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "amount_cents": -1500
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"], "minimum reload is $15");
+
+    clear_square_billing_env();
+}
+
+#[tokio::test]
+#[serial]
 async fn billing_square_webhook_credits_completed_order() {
     use base64::Engine;
     use hmac::{Hmac, Mac};
@@ -2731,6 +2759,36 @@ async fn square_auto_reload_requires_saved_card_then_enables() {
     assert_eq!(me["square_application_id"], "sandbox-app");
     assert_eq!(me["square_location_id"], "sandbox-location");
     assert_eq!(me["square_environment"], "sandbox");
+
+    let req = Request::patch("/account/billing")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "auto_topup_enabled": false,
+                "auto_topup_threshold_cents": 500,
+                "auto_topup_amount_cents": -1500
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let req = Request::patch("/account/billing")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "auto_topup_enabled": false,
+                "auto_topup_threshold_cents": -500,
+                "auto_topup_amount_cents": 1500
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let req = Request::patch("/account/billing")
         .header("authorization", format!("Bearer {access}"))

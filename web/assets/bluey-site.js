@@ -73,6 +73,30 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return Math.round(dollars * 100);
     }
 
+    function sanitizeDollarInput(input, minCents, maxCents, options = {}) {
+      if (!input) return NaN;
+      const raw = String(input.value || '').trim();
+      if (!raw) return NaN;
+      const withoutMinus = raw.replace(/-/g, '');
+      if (withoutMinus !== raw) {
+        input.value = withoutMinus;
+      }
+      const cents = dollarsToCents(input.value);
+      if (!Number.isFinite(cents)) return NaN;
+      let clamped = cents;
+      if (cents < minCents) {
+        clamped = minCents;
+      } else if (Number.isFinite(maxCents) && cents > maxCents) {
+        clamped = maxCents;
+      } else if (!options.clamp) {
+        return cents;
+      }
+      if (options.clamp || cents < minCents || cents > maxCents) {
+        input.value = centsToDollars(clamped);
+      }
+      return clamped;
+    }
+
     function accountToken() {
       return localStorage.getItem(ACCESS_TOKEN_KEY) || sessionStorage.getItem(ACCESS_TOKEN_KEY) || '';
     }
@@ -1696,8 +1720,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function readAutoReloadSettings() {
-      const threshold = dollarsToCents(document.getElementById('autoReloadThreshold')?.value || centsToDollars(AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS));
-      const amount = dollarsToCents(document.getElementById('autoReloadAmount')?.value || centsToDollars(AUTO_RELOAD_DEFAULT_AMOUNT_CENTS));
+      const thresholdInput = document.getElementById('autoReloadThreshold');
+      const amountInput = document.getElementById('autoReloadAmount');
+      const threshold = sanitizeDollarInput(
+        thresholdInput,
+        100,
+        5000,
+        { clamp: true },
+      ) || dollarsToCents(thresholdInput?.value || centsToDollars(AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS));
+      const amount = sanitizeDollarInput(
+        amountInput,
+        AUTO_RELOAD_MIN_CENTS,
+        AUTO_RELOAD_MAX_CENTS,
+        { clamp: true },
+      ) || dollarsToCents(amountInput?.value || centsToDollars(AUTO_RELOAD_DEFAULT_AMOUNT_CENTS));
       if (!Number.isFinite(threshold) || !Number.isFinite(amount)) {
         throw new Error('Enter valid Auto Reload dollar amounts.');
       }
@@ -1709,6 +1745,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       if (threshold < 100) {
         throw new Error('Auto Reload threshold must be at least $1.');
+      }
+      if (threshold > 5000) {
+        throw new Error('Auto Reload threshold can be at most $50.');
       }
       if (threshold >= amount) {
         throw new Error('Auto Reload amount must be greater than the threshold.');
@@ -1744,7 +1783,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function readManualReloadCents() {
       const input = document.getElementById('manualReloadAmount');
-      const amount = dollarsToCents(input?.value || centsToDollars(MANUAL_RELOAD_AMOUNT_CENTS));
+      const amount = sanitizeDollarInput(
+        input,
+        MANUAL_RELOAD_MIN_CENTS,
+        AUTO_RELOAD_MAX_CENTS,
+        { clamp: true },
+      ) || dollarsToCents(input?.value || centsToDollars(MANUAL_RELOAD_AMOUNT_CENTS));
       if (!Number.isFinite(amount)) {
         input?.focus();
         throw new Error('Enter a reload amount.');
@@ -1754,6 +1798,24 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         throw new Error('Minimum reload is $15.');
       }
       return amount;
+    }
+
+    function sanitizeManualReloadInput(options = {}) {
+      const input = document.getElementById('manualReloadAmount');
+      sanitizeDollarInput(input, MANUAL_RELOAD_MIN_CENTS, AUTO_RELOAD_MAX_CENTS, options);
+      updateManualReloadDraftCopy();
+    }
+
+    function sanitizeAutoReloadInput(id, options = {}) {
+      const input = document.getElementById(id);
+      const isThreshold = id === 'autoReloadThreshold';
+      sanitizeDollarInput(
+        input,
+        isThreshold ? 100 : AUTO_RELOAD_MIN_CENTS,
+        isThreshold ? 5000 : AUTO_RELOAD_MAX_CENTS,
+        options,
+      );
+      updateAutoReloadDraftCopy();
     }
 
     function setReloadButtonsBusy(busy) {
@@ -2880,16 +2942,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('refreshAccountButton')?.addEventListener('click', () => {
         loadAccount().catch((error) => accountMessage(error.message));
       });
-      document.getElementById('manualReloadAmount')?.addEventListener('input', () => {
-        updateManualReloadDraftCopy();
-      });
+      const manualReloadAmountInput = document.getElementById('manualReloadAmount');
+      manualReloadAmountInput?.addEventListener('input', () => sanitizeManualReloadInput());
+      manualReloadAmountInput?.addEventListener('change', () => sanitizeManualReloadInput({ clamp: true }));
+      manualReloadAmountInput?.addEventListener('blur', () => sanitizeManualReloadInput({ clamp: true }));
       document.getElementById('autoReloadToggle')?.addEventListener('change', () => {
         updateAutoReloadDraftCopy();
       });
       ['autoReloadThreshold', 'autoReloadAmount'].forEach((id) => {
-        document.getElementById(id)?.addEventListener('input', () => {
-          updateAutoReloadDraftCopy();
-        });
+        const input = document.getElementById(id);
+        input?.addEventListener('input', () => sanitizeAutoReloadInput(id));
+        input?.addEventListener('change', () => sanitizeAutoReloadInput(id, { clamp: true }));
+        input?.addEventListener('blur', () => sanitizeAutoReloadInput(id, { clamp: true }));
       });
       document.getElementById('saveAutoReloadButton')?.addEventListener('click', () => {
         saveAutoReloadSettings().catch((error) => accountMessage(error.message));
