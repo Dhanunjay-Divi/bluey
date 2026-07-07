@@ -29,6 +29,7 @@ env:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-14
@@ -117,10 +118,9 @@ jobs:
         if: startsWith(matrix.os, 'macos-')
         shell: bash
         run: |
-          cd crates/cue-dashboard/ui
-          npm ci
-          cd ..
+          npm ci --prefix crates/cue-dashboard/ui
           cargo install tauri-cli --version "^2.0.0" --locked
+          cd crates/cue-dashboard
           cargo tauri build --target ${{ matrix.target }} --bundles app
 
       - name: Build macOS native helpers
