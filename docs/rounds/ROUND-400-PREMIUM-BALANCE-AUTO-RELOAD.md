@@ -25,6 +25,11 @@ The dashboard balance card felt visually scattered: `$0.00` sat too far from the
   - zero-balance card showed `$0.00` near the balance copy
   - Auto Reload toggle rendered checked
   - Add Credits modal rendered Auto Reload checked by default
+- Live static checks:
+  - `https://bluey.sh/` references `bluey-site.css?v=2026070702`
+  - `https://bluey.sh/` references `bluey-site.js?v=2026070702`
+  - live JS contains the new zero-balance and Auto Reload setup copy
+  - live CSS contains the `250px` Auto Reload column and setup-default accent rules
 
 ## Current State
 
@@ -32,4 +37,4 @@ The balance/reload entry point now reads more like a premium wallet setup: add c
 
 ## Remaining QA/Gates
 
-- Deploy static web assets to `bluey.sh` and smoke `/account` after deploy.
+- Smoke with a real signed-in zero-balance account in Chrome to confirm the live account data path matches the local mocked layout.
