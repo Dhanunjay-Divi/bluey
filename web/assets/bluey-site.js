@@ -3691,7 +3691,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         if (toggle.checked && !latestAccountForBilling?.auto_topup_available) {
           toggle.checked = Boolean(latestAccountForBilling?.auto_topup_enabled);
           updateAutoReloadDraftCopy();
-          openReloadSetupDialog();
+          accountMessage(
+            latestAccountForBilling?.auto_topup_unavailable_reason || 'Use Add balance to set up Auto Reload with a card.',
+            false,
+            'error'
+          );
           return;
         }
         updateAutoReloadDraftCopy();
