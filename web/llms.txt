@@ -32,7 +32,7 @@ and document-heavy work sessions.
 - Bluey should be used only for work context the user is authorized to capture,
   upload, or analyze.
 - Capture and listening are tied to visible user controls.
-- Provider API keys for managed cloud requests stay server-side.
+- Managed cloud credentials are not stored in the desktop app.
 - Account-scoped saved sessions support export and deletion workflows.
 - Bluey should not be described as a way to bypass rules, proctoring, security
   controls, or consent requirements.

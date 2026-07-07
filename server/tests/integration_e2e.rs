@@ -2841,6 +2841,103 @@ async fn square_auto_reload_requires_saved_card_then_enables() {
 
 #[tokio::test]
 #[serial]
+async fn square_pay_with_saved_card_adds_balance_and_updates_auto_reload() {
+    set_square_billing_env();
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "square-direct-pay@example.com", "longenoughpw").await;
+
+    let account_id: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM accounts WHERE email = ?1",
+            rusqlite::params!["square-direct-pay@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    h.pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE accounts
+                SET square_customer_id = 'cus_square_direct',
+                    square_card_id = 'ccof:square_direct',
+                    square_card_brand = 'VISA',
+                    square_card_last4 = '4242'
+              WHERE id = ?1",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/v2/payments"))
+        .and(header("Square-Version", "2025-04-16"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "payment": {
+                "id": "payment_square_direct_1",
+                "status": "COMPLETED",
+                "amount_money": {"amount": 1500, "currency": "USD"},
+                "reference_id": square_reload_reference_id_for_test(&account_id),
+                "customer_id": "cus_square_direct"
+            }
+        })))
+        .expect(1)
+        .mount(&h.square)
+        .await;
+
+    let req = Request::post("/billing/square/pay")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "amount_cents": 1500,
+                "use_saved_card": true,
+                "auto_topup_enabled": true,
+                "auto_topup_threshold_cents": 500,
+                "auto_topup_amount_cents": 1500,
+                "client_request_id": "direct-pay-test-1"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["credited"], true);
+    assert_eq!(v["payment_status"], "COMPLETED");
+    assert_eq!(v["account"]["balance_cents"], 1500);
+    assert_eq!(v["account"]["auto_topup_enabled"], true);
+    assert_eq!(v["account"]["auto_topup_threshold_cents"], 500);
+    assert_eq!(v["account"]["auto_topup_amount_cents"], 1500);
+    assert_eq!(v["account"]["auto_topup_available"], true);
+    assert_eq!(
+        v["account"]["saved_payment_method_label"],
+        "VISA ending 4242"
+    );
+
+    let row: (i64, i64, i64, i64) = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT balance_cents, auto_topup_enabled, auto_topup_threshold_cents,
+                    auto_topup_amount_cents
+               FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (1500, 1, 500, 1500));
+
+    clear_square_billing_env();
+}
+
+#[tokio::test]
+#[serial]
 async fn billing_portal_400s_without_stripe_customer() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "no-cus@example.com", "longenoughpw").await;

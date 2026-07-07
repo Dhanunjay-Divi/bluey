@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070712"
+    href="/assets/bluey-site.css?v=2026070713"
   >
   <script type="application/ld+json">
   {
@@ -64,7 +64,7 @@
           "@type": "Offer",
           "price": "0",
           "priceCurrency": "USD",
-          "description": "Start free, then add account credits for paid AI models, speech transcription, screen analysis, and saved-session search."
+          "description": "Start free, then add account balance for paid AI models, speech transcription, screen analysis, and saved-session search."
         }
       },
       {
@@ -81,7 +81,7 @@
           "price": "0",
           "priceCurrency": "USD",
           "availability": "https://schema.org/InStock",
-          "description": "Start free, then add account credits for paid AI models, speech transcription, screen analysis, and saved-session search."
+          "description": "Start free, then add account balance for paid AI models, speech transcription, screen analysis, and saved-session search."
         }
       }
     ]
@@ -139,21 +139,21 @@
       <article class="policy-card" id="privacyPolicy" hidden>
         <div class="policy-updated">Last updated June 24, 2026</div>
         <h1>Privacy Policy</h1>
-        <p>Bluey is an AI work assistant that runs a desktop overlay and optional cloud services. We collect only what is needed for account login, credit reloads, AI answers, saved sessions, support, and abuse prevention.</p>
+        <p>Bluey is an AI work assistant that runs a desktop overlay and optional cloud services. We collect only what is needed for account login, balance reloads, AI answers, saved sessions, support, and abuse prevention.</p>
 
         <h2>Information We Process</h2>
         <ul>
-          <li>Account data such as email, password hash, device/session tokens, balance, reload history, and usage metadata.</li>
+          <li>Account data such as email, password hash, device/session tokens, balance, reload history, and usage records.</li>
           <li>User-approved context such as typed prompts, source-labeled transcripts, attached files, screen-analysis results, answer-style instructions, and generated responses.</li>
-          <li>Operational data such as trace IDs, error logs, provider health, IP-derived abuse controls, and support bundles. Logs are designed to avoid secrets and raw provider keys.</li>
-          <li>Payment checkout metadata from Square. Bluey does not collect, store, or proxy card numbers, CVV, or card expiration data.</li>
+          <li>Diagnostic data such as error reports, service health, abuse controls, and support bundles. Logs are designed to avoid secrets and full user content.</li>
+          <li>Payment information needed to complete reloads. Bluey does not collect or store full card numbers, CVV, or card expiration data.</li>
         </ul>
 
         <h2>How We Use Data</h2>
         <p>We use account and session data to authenticate you, answer requests, meter paid usage, save approved context, provide searchable history, show balance and cost labels, debug failures, prevent abuse, and support export or deletion requests.</p>
 
         <h2>AI Providers and Context</h2>
-        <p>When a request needs an AI model, Bluey sends only the context needed for that request: your prompt, selected transcript snippets, attached document text, screen-analysis output, saved session memory, and routing metadata such as task type and cost estimate. Speech transcription, image understanding, embedding, and answer generation may use separate providers.</p>
+        <p>When a request needs an AI model, Bluey sends only the context needed for that request: your prompt, selected transcript snippets, attached document text, screen-analysis output, saved session memory, and request details such as task type and cost estimate. Speech transcription, image understanding, embedding, and answer generation may use separate services.</p>
 
         <h2>Files, Sessions, and Memory</h2>
         <p>Documents, images, screenshots, and other files you attach are parsed into readable text where supported and are tied to the active Bluey session. When you sign in with saved-session sync on, Bluey may store the original synced file bytes, lightweight previews, extracted text, summaries, and search indexes so another signed-in device can restore the session and answer from the same context. You can turn cloud sync off in settings and keep using local sessions.</p>
@@ -162,16 +162,16 @@
         <p>Desktop capture starts only through visible user controls. You can stop listening, hide the overlay, attach or remove documents, export account data, delete your account, and clear local state.</p>
 
         <h2>Retention</h2>
-        <p>Account-credit batches remain in the ledger for accounting and expire up to 12 months (365 days) after purchase. Cloud-synced session records, transcripts, document bytes, screenshots, extracted text, summaries, and search indexes are kept for up to 12 months (365 days) from their last sync or use unless you delete them earlier. Cleanup is lazy, so expired objects may remain briefly until a sweeper, restore attempt, or maintenance pass removes them, but they are no longer intended for active product use.</p>
+        <p>Purchased balance remains in account records for accounting and expires up to 12 months (365 days) after purchase. Cloud-synced session records, transcripts, document bytes, screenshots, extracted text, summaries, and search indexes are kept for up to 12 months (365 days) from their last sync or use unless you delete them earlier. Cleanup is lazy, so expired objects may remain briefly until a maintenance pass removes them, but they are no longer intended for active product use.</p>
 
         <h2>Account Deletion</h2>
         <p>Deleting your account is permanent. It removes account records, local-device authorization records, saved cloud sessions, synced files, screenshots, transcripts, extracted text, generated answers, usage history, and related searchable indexes where deletion is technically available. Unused account balance is lost when the account is deleted, so contact support before deletion if you need a billing review.</p>
 
         <h2>Security</h2>
-        <p>Desktop account tokens are stored in Bluey's private local account profile so the app can reconnect without operating-system keychain prompts. Provider API keys stay server-side for managed cloud requests. Logs are designed for debugging and support, not for storing raw secrets or full user content.</p>
+        <p>Desktop account tokens are stored in Bluey's private local account profile so the app can reconnect without operating-system keychain prompts. Payment and AI credentials are kept outside the desktop app. Logs are designed for debugging and support, not for storing raw secrets or full user content.</p>
 
         <h2>Sharing</h2>
-        <p>We share data with infrastructure, payment, email, and AI providers only to operate Bluey. We do not sell customer data. Provider usage is governed by Bluey-managed accounts and server-side policies.</p>
+        <p>We share data with infrastructure, payment, email, and AI services only to operate Bluey. We do not sell customer data. AI usage is governed by Bluey-managed accounts and product policies.</p>
 
         <h2>Contact</h2>
         <p>For privacy, security, export, deletion, or billing questions, contact support at the address published in the product account page.</p>
@@ -182,13 +182,13 @@
         <h1>Terms of Use</h1>
         <p>These terms cover the Bluey alpha service. By creating an account, installing Bluey, or using Bluey Cloud, you agree to use the product responsibly and only where you have the right to capture, upload, or analyze the context you provide.</p>
 
-        <h2>Account Credits</h2>
+        <h2>Account Balance</h2>
         <ul>
-          <li>Bluey is not a monthly subscription by default. You reload non-transferable account credits and spend them on AI model requests, speech transcription, screen analysis, searchable history, and related cloud work.</li>
-          <li>Credits have no cash value, are not a stored-value card or gift card, are not transferable, and cannot be used outside Bluey.</li>
-          <li>Credits are valid for up to 12 months (365 days) from purchase. Bluey spends the oldest unexpired credit batch first and stops at zero so you do not accrue usage debt.</li>
-          <li>Deleting your account forfeits unused credits. Contact support before deleting if you want a billing review for unused credits.</li>
-          <li>Refund handling, payment disputes, taxes, and receipts follow the support and payment-provider process shown in your account page.</li>
+          <li>Bluey is not a monthly subscription by default. You add prepaid account balance and spend it on AI model requests, speech transcription, screen analysis, searchable history, and related cloud work.</li>
+          <li>Balance has no cash value, is not a stored-value card or gift card, is not transferable, and cannot be used outside Bluey.</li>
+          <li>Balance is valid for up to 12 months (365 days) from purchase. Bluey spends the oldest unexpired balance first and stops at zero so you do not accrue usage debt.</li>
+          <li>Deleting your account forfeits unused balance. Contact support before deleting if you want a billing review.</li>
+          <li>Refund handling, payment disputes, taxes, and receipts follow the billing support process shown in your account page.</li>
         </ul>
 
         <h2>Acceptable Use</h2>
@@ -198,16 +198,16 @@
         <p>You are responsible for the documents, transcripts, screenshots, repositories, and other context you attach or ask Bluey to analyze. Bluey should be used with consent where required, and it should not be used for hidden capture of people or information you are not allowed to process.</p>
 
         <h2>Cloud Sync and Retention</h2>
-        <p>If you sign in with cloud sync or saved sessions enabled, you authorize Bluey to store synced session metadata, transcripts, generated answers, original file or screenshot bytes, extracted text, summaries, and search indexes for restoration and answer context. These synced objects are retained for up to 12 months (365 days) from last sync or use unless you delete them earlier. Expired objects are removed lazily during cleanup, restore attempts, or maintenance passes.</p>
+        <p>If you sign in with cloud sync or saved sessions enabled, you authorize Bluey to store synced session details, transcripts, generated answers, original file or screenshot bytes, extracted text, summaries, and search indexes for restoration and answer context. These synced objects are retained for up to 12 months (365 days) from last sync or use unless you delete them earlier. Expired objects are removed lazily during cleanup, restore attempts, or maintenance passes.</p>
 
         <h2>AI Output</h2>
         <p>Bluey can help draft answers, summarize sessions, explain code, reason about systems, and organize context. AI output may be incomplete or wrong. You are responsible for reviewing generated output before relying on it, sending it, submitting it, or using it to make decisions.</p>
 
         <h2>Payments</h2>
-        <p>Square or another checkout provider may process reloads, receipts, disputes, and payment methods. Bluey records enough checkout metadata to credit your account, prevent duplicate crediting, show usage, and support refunds or account deletion.</p>
+        <p>Payment, receipts, disputes, and saved cards are managed through checkout. Bluey keeps what is needed to update your balance, show usage, and support refunds or account deletion.</p>
 
         <h2>Service Availability</h2>
-        <p>Bluey is an alpha product. AI providers, speech transcription, billing providers, networks, and local OS permissions can fail or degrade. We work to fail clearly with logs and status, but we do not guarantee uninterrupted service.</p>
+        <p>Bluey is an alpha product. AI, speech transcription, billing, networks, and local OS permissions can fail or degrade. We work to fail clearly with status and support details, but we do not guarantee uninterrupted service.</p>
 
         <h2>Changes</h2>
         <p>We may update these terms as Bluey moves from alpha to broader release. Material changes should be reflected on this page and in release notes.</p>
@@ -248,15 +248,15 @@
         </a>
         <div class="rail-command">
           <code id="railCommandLabel">bluey on</code>
-          <span id="railCommandCopy">Start Bluey from Terminal. Sign in for cloud answers, credits, and saved sessions.</span>
+          <span id="railCommandCopy">Start Bluey from Terminal. Sign in for cloud answers, balance, and saved sessions.</span>
         </div>
         <div class="rail-list">
           <span>Dashboard</span>
-          <span>Credits</span>
+          <span>Balance</span>
           <span>Sessions</span>
         </div>
         <div class="account-rail-footer">
-          <span>Credits are used for AI models, speech, screen analysis, and saved-session features.</span>
+          <span>Balance is used for AI models, speech, screen analysis, and saved-session features.</span>
           <span><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> · <a href="/docs/disguise">Controls</a></span>
         </div>
       </aside>
@@ -307,7 +307,7 @@
       <main class="account-main">
         <section class="account-hero">
           <h1>Try Bluey on desktop</h1>
-          <p>Install once, run Bluey from Terminal, then sign in when you need cloud answers, credits, or saved sessions.</p>
+          <p>Install once, run Bluey from Terminal, then sign in when you need cloud answers, balance, or saved sessions.</p>
         </section>
 
         <section class="account-grid">
@@ -318,7 +318,7 @@
             </div>
             <div class="account-message" id="accountAuthMessage"></div>
             <h2 id="accountAuthTitle">Welcome back</h2>
-            <p id="accountAuthCopy">Sign in to manage credits, saved sessions, and desktop links.</p>
+            <p id="accountAuthCopy">Sign in to manage balance, saved sessions, and desktop links.</p>
             <div class="device-link-hint" id="deviceLinkHint" hidden></div>
             <form class="account-form" id="accountForm">
               <label id="accountEmailLabel">
@@ -372,11 +372,11 @@
 
           <section class="account-card account-preview-card" id="accountPreviewCard">
             <h2>What unlocks</h2>
-            <p>Sign in adds the cloud pieces: credits, AI models, live speech, screen analysis, and saved session history.</p>
+            <p>Sign in adds the cloud pieces: balance, AI models, live speech, screen analysis, and saved session history.</p>
             <div class="preview-list">
               <div class="preview-item">
                 <div class="preview-icon">$</div>
-                <div><strong>Balance</strong><span>$15 minimum reload. Every confirmed dollar becomes account balance.</span></div>
+                <div><strong>Balance</strong><span>$15 minimum reload. Every dollar you add becomes account balance.</span></div>
               </div>
               <div class="preview-item">
                 <div class="preview-icon">AI</div>
@@ -451,11 +451,11 @@
                     <div class="auto-reload-fields" aria-label="Auto Reload rule">
                       <label>
                         <span>When below</span>
-                        <input id="autoReloadThreshold" type="number" min="1" max="50" step="1" value="5" inputmode="decimal" />
+                        <input id="autoReloadThreshold" type="text" value="5" inputmode="decimal" autocomplete="off" />
                       </label>
                       <label>
                         <span>Reload</span>
-                        <input id="autoReloadAmount" type="number" min="15" max="500" step="5" value="15" inputmode="decimal" />
+                        <input id="autoReloadAmount" type="text" value="15" inputmode="decimal" autocomplete="off" />
                       </label>
                     </div>
                     <p class="auto-reload-rule" id="autoReloadRule">When balance is below $5.00, reload $15.00.</p>
@@ -591,11 +591,11 @@
             </section>
 
             <section class="dashboard-tab-panel" id="dashboardTabBilling" role="tabpanel" aria-labelledby="dashboardTabBillingButton" data-dashboard-panel="billing" hidden>
-              <section class="dashboard-section billing-section" aria-label="Credits and reload">
+              <section class="dashboard-section billing-section" aria-label="Balance and reload">
                 <div class="section-head">
                   <div>
                     <h3>Billing</h3>
-                    <p>Add balance, update your card, or turn Auto Reload off.</p>
+                    <p>Add balance, update your card, or manage Auto Reload.</p>
                   </div>
                 </div>
                 <div class="billing-grid billing-credits-grid">
@@ -604,9 +604,9 @@
                       <span class="reload-setup-kicker">Account wallet</span>
                       <h3>Balance</h3>
                       <p>Add prepaid balance shared across every Bluey sign-in.</p>
-                      <div class="credit-equation" aria-label="$15 minimum reload. $1 paid adds $1 balance.">
+                      <div class="credit-equation" aria-label="$15 minimum reload. $1 added becomes $1 balance.">
                         <strong>$15 minimum</strong>
-                        <span>$1 paid = $1 balance</span>
+                        <span>$1 added = $1 balance</span>
                       </div>
                     </div>
                     <div class="manual-reload-panel" aria-label="Manual balance reload">
@@ -614,7 +614,7 @@
                         <span>Amount to add</span>
                         <span class="manual-reload-input">
                           <span>$</span>
-                          <input id="manualReloadAmount" type="number" min="15" max="500" step="5" value="15" inputmode="decimal" />
+                          <input id="manualReloadAmount" type="text" value="15" inputmode="decimal" autocomplete="off" />
                         </span>
                       </label>
                       <button class="account-button primary" id="reloadButton" type="button">Add balance</button>
@@ -624,7 +624,7 @@
                   <div class="reload-card billing-payment-card" id="billingPaymentCard">
                     <div class="billing-payment-head">
                       <div>
-                        <span class="reload-setup-kicker">Payment method</span>
+                        <span class="reload-setup-kicker">Card</span>
                         <h3>Auto Reload card</h3>
                         <p>Used only when Auto Reload is on.</p>
                       </div>
@@ -637,8 +637,8 @@
                     </div>
                     <div class="square-card-setup" id="squareCardSetup" hidden>
                       <div class="square-card-copy">
-                        <strong>Secure card form</strong>
-                        <span>Enter a card, then save. Bluey never sees the card number.</span>
+                        <strong>Card</strong>
+                        <span>Update the card used for Auto Reload.</span>
                       </div>
                       <div id="squareCardContainer" class="square-card-container"></div>
                       <div class="square-card-actions">
@@ -693,13 +693,13 @@
           <div class="account-modal-head">
             <div>
               <h2 id="addCreditsTitle">Add balance</h2>
-              <p>Choose an amount to add. Auto Reload is optional and can be changed anytime.</p>
+              <p>Add money once. Keep Auto Reload on to keep Bluey ready when the balance gets low.</p>
             </div>
             <button class="account-modal-close" id="addCreditsCancelX" type="button" aria-label="Close add balance dialog">×</button>
           </div>
           <div class="reload-setup-grid">
             <section class="reload-setup-panel" aria-label="One-time balance">
-              <span class="reload-setup-kicker">Step 1</span>
+              <span class="reload-setup-kicker">Balance</span>
               <h3>Amount</h3>
               <div class="reload-amount-presets" aria-label="Balance amount presets">
                 <button type="button" data-reload-amount="15">$15</button>
@@ -710,14 +710,14 @@
                 <span>Custom amount</span>
                 <span class="manual-reload-input">
                   <span>$</span>
-                  <input id="modalReloadAmount" type="number" min="15" max="500" step="5" value="15" inputmode="decimal" />
+                  <input id="modalReloadAmount" type="text" value="15" inputmode="decimal" autocomplete="off" />
                 </span>
               </label>
             </section>
             <section class="reload-setup-panel" aria-label="Auto Reload setup">
               <div class="auto-reload-head">
                 <div>
-                  <span class="reload-setup-kicker">Step 2</span>
+                  <span class="reload-setup-kicker">Optional</span>
                   <h3>Auto Reload</h3>
                 </div>
                 <label class="auto-reload-toggle" for="modalAutoReloadToggle">
@@ -728,29 +728,28 @@
               <div class="auto-reload-fields" aria-label="Auto Reload rule">
                 <label>
                   <span>When below</span>
-                  <input id="modalAutoReloadThreshold" type="number" min="1" max="50" step="1" value="5" inputmode="decimal" />
+                  <input id="modalAutoReloadThreshold" type="text" value="5" inputmode="decimal" autocomplete="off" />
                 </label>
                 <label>
                   <span>Reload</span>
-                  <input id="modalAutoReloadAmount" type="number" min="15" max="500" step="5" value="15" inputmode="decimal" />
+                  <input id="modalAutoReloadAmount" type="text" value="15" inputmode="decimal" autocomplete="off" />
                 </label>
               </div>
-              <p class="auto-reload-rule" id="modalAutoReloadRule">Auto Reload saves when you continue.</p>
+              <p class="auto-reload-rule" id="modalAutoReloadRule">Auto Reload updates when you continue.</p>
               <div class="reload-setup-card-actions">
                 <button class="account-button ghost compact" id="reloadSetupCardButton" type="button">Add card</button>
               </div>
               <div class="square-card-setup reload-setup-square-card" id="reloadSetupSquareCardSetup" hidden>
                 <div class="square-card-copy">
-                  <strong>Secure card form</strong>
-                  <span>Square handles card details. Bluey stores only the saved-card reference for future reloads.</span>
+                  <strong>Card</strong>
+                  <span>Use this card now. Keep Auto Reload on to use it for future reloads.</span>
                 </div>
                 <div id="reloadSetupSquareCardContainer" class="square-card-container"></div>
-                <button class="account-button ghost compact" id="reloadSetupSaveSquareCardButton" type="button">Save card</button>
               </div>
             </section>
           </div>
           <div class="reload-setup-footer">
-            <p>Square handles checkout and card details. Bluey updates your balance after payment is confirmed.</p>
+            <p>Adds to the shared balance on this Bluey account.</p>
             <button class="account-button primary" id="reloadSetupCheckoutButton" type="button">Continue to checkout</button>
           </div>
           <div class="account-modal-message" id="reloadSetupMessage" aria-live="polite"></div>
@@ -1042,7 +1041,7 @@
           </form>
           <div class="connect-help">Have a Bluey desktop code? Enter it to move that desktop to this account.</div>
           <div class="connect-status" id="productConnectStatus" aria-live="polite"></div>
-          <div class="hero-note">native overlay · model routing · prepaid credits · sessions save only by choice</div>
+          <div class="hero-note">native overlay · model routing · prepaid balance · sessions save only by choice</div>
         </section>
 
         <aside class="product-preview terminal-preview" aria-label="Bluey terminal preview">
@@ -1124,7 +1123,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070712"
+    src="/assets/bluey-site.js?v=2026070713"
   ></script>
 </body>
 </html>

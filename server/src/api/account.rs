@@ -524,7 +524,7 @@ fn auto_topup_capability(
             let label = account
                 .stripe_payment_method_id
                 .as_ref()
-                .map(|_| "Saved Stripe card".to_string());
+                .map(|_| "Saved card".to_string());
             if is_internal_or_test_billing_account(account) {
                 return (
                     "stripe".to_string(),
@@ -547,7 +547,7 @@ fn auto_topup_capability(
             let reason = if available {
                 None
             } else {
-                Some("Add credits once to save a card before enabling Auto Reload.".to_string())
+                Some("Add balance once to save a card before enabling Auto Reload.".to_string())
             };
             ("stripe".to_string(), available, reason, label)
         }
@@ -557,7 +557,7 @@ fn auto_topup_capability(
                 account.square_card_last4.as_deref(),
             ) {
                 (Some(brand), Some(last4)) => Some(format!("{brand} ending {last4}")),
-                _ if account.square_card_id.is_some() => Some("Saved Square card".to_string()),
+                _ if account.square_card_id.is_some() => Some("Saved card".to_string()),
                 _ => None,
             };
             if is_internal_or_test_billing_account(account) {

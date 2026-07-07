@@ -243,6 +243,10 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route("/billing/checkout", axum::routing::post(billing::checkout))
         .route("/billing/portal", axum::routing::post(billing::portal))
         .route(
+            "/billing/square/pay",
+            axum::routing::post(billing::square_pay),
+        )
+        .route(
             "/auth/password/change",
             axum::routing::post(auth_routes::password_change),
         )
