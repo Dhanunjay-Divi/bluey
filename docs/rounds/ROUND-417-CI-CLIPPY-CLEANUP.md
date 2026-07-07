@@ -14,6 +14,7 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - Added an explicit `too_many_arguments` allowance to the managed stream recovery helper because it intentionally carries provider, stream, request, timing, and failure context for recovery logging.
 - Cleaned duplicate internal-disclosure guard trimming logic in the LLM answer helper.
 - Added the missing Ubuntu ALSA development package to CI, observability, and release Linux dependency setup so audio crates can build on hosted runners.
+- Moved the Bluey CLI billing tests below production items to satisfy the Rust 1.96 `items_after_test_module` lint in the full workspace clippy pass.
 
 ## Verification
 
@@ -23,6 +24,7 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - `cargo check -p cue-daemon -p cue-cli`
 - `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
 - `cargo clippy -p cue-daemon --all-targets -- -D warnings`
+- `cargo clippy --all-targets -- -D warnings`
 
 ## Notes
 

@@ -137,68 +137,6 @@ pub async fn show_credits(client: &CloudClient) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn account_me(auto_topup_enabled: bool) -> AccountMe {
-        AccountMe {
-            id: "acct_test".to_string(),
-            email: "test@example.com".to_string(),
-            balance_cents: 482,
-            trial_seconds_remaining: 0,
-            auto_topup_enabled,
-            auto_topup_threshold_cents: 500,
-            auto_topup_amount_cents: 3000,
-            billing_provider: Some("square".to_string()),
-            auto_topup_available: None,
-            auto_topup_unavailable_reason: None,
-            saved_payment_method_label: None,
-            square_environment: Some("production".to_string()),
-            billing_restricted: Some(false),
-            billing_restriction_reason: None,
-        }
-    }
-
-    #[test]
-    fn auto_topup_label_shows_ready_saved_card() {
-        let mut me = account_me(true);
-        me.auto_topup_available = Some(true);
-        me.saved_payment_method_label = Some("Visa ending 4242".to_string());
-
-        assert_eq!(
-            auto_topup_status_label(&me),
-            "ON, $30 at <$5 (Visa ending 4242)"
-        );
-    }
-
-    #[test]
-    fn auto_topup_label_shows_setup_needed_when_enabled_without_card() {
-        let mut me = account_me(true);
-        me.auto_topup_available = Some(false);
-        me.auto_topup_unavailable_reason =
-            Some("Save a card for Auto Reload before turning this on.".to_string());
-
-        assert_eq!(
-            auto_topup_status_label(&me),
-            "ON, setup needed: Save a card for Auto Reload before turning this on."
-        );
-    }
-
-    #[test]
-    fn auto_topup_label_shows_paused_for_restricted_billing() {
-        let mut me = account_me(true);
-        me.billing_restricted = Some(true);
-        me.billing_restriction_reason =
-            Some("Billing is paused while this account is under review.".to_string());
-
-        assert_eq!(
-            auto_topup_status_label(&me),
-            "PAUSED, Billing is paused while this account is under review."
-        );
-    }
-}
-
 async fn fetch_pricing_tiers(client: &CloudClient) -> Option<cue_cloud_client::PricingTiers> {
     // /pricing/tiers is public (no auth). Use the unauthenticated GET path.
     match client
@@ -298,4 +236,66 @@ pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
         println!("Local account tokens cleared.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account_me(auto_topup_enabled: bool) -> AccountMe {
+        AccountMe {
+            id: "acct_test".to_string(),
+            email: "test@example.com".to_string(),
+            balance_cents: 482,
+            trial_seconds_remaining: 0,
+            auto_topup_enabled,
+            auto_topup_threshold_cents: 500,
+            auto_topup_amount_cents: 3000,
+            billing_provider: Some("square".to_string()),
+            auto_topup_available: None,
+            auto_topup_unavailable_reason: None,
+            saved_payment_method_label: None,
+            square_environment: Some("production".to_string()),
+            billing_restricted: Some(false),
+            billing_restriction_reason: None,
+        }
+    }
+
+    #[test]
+    fn auto_topup_label_shows_ready_saved_card() {
+        let mut me = account_me(true);
+        me.auto_topup_available = Some(true);
+        me.saved_payment_method_label = Some("Visa ending 4242".to_string());
+
+        assert_eq!(
+            auto_topup_status_label(&me),
+            "ON, $30 at <$5 (Visa ending 4242)"
+        );
+    }
+
+    #[test]
+    fn auto_topup_label_shows_setup_needed_when_enabled_without_card() {
+        let mut me = account_me(true);
+        me.auto_topup_available = Some(false);
+        me.auto_topup_unavailable_reason =
+            Some("Save a card for Auto Reload before turning this on.".to_string());
+
+        assert_eq!(
+            auto_topup_status_label(&me),
+            "ON, setup needed: Save a card for Auto Reload before turning this on."
+        );
+    }
+
+    #[test]
+    fn auto_topup_label_shows_paused_for_restricted_billing() {
+        let mut me = account_me(true);
+        me.billing_restricted = Some(true);
+        me.billing_restriction_reason =
+            Some("Billing is paused while this account is under review.".to_string());
+
+        assert_eq!(
+            auto_topup_status_label(&me),
+            "PAUSED, Billing is paused while this account is under review."
+        );
+    }
 }
