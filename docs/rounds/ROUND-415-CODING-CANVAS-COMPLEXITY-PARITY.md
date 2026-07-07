@@ -26,10 +26,26 @@ The visible chat body also still had legacy behavior that could echo code on the
 - `cargo test --manifest-path crates/cue-daemon/Cargo.toml visible_answer_body --quiet`
 - `cargo test --manifest-path crates/cue-daemon/Cargo.toml code_artifact --quiet`
 - `cargo test --manifest-path server/Cargo.toml response_artifact --quiet`
+- `cargo check -p cue-daemon -p cue-cli`
+- `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
 - `git diff --check`
 
 All focused checks passed.
 
+## Deploy
+
+- Committed core fix: `fe49e598 Fix coding canvas complexity parity`
+- Prepared release: `2e533ce1 Prepare Bluey 0.1.91 release`
+- Tagged and pushed: `v0.1.91`
+- Deployed `bluey-server` to production with commit `2e533ce1346b70b6137587da95738fe4e7f3d984`.
+- Production API health returned `status=ok`, commit `2e533ce1346b70b6137587da95738fe4e7f3d984`, and no warning/error journal entries after restart.
+- Published live downloads for:
+  - `darwin-arm64`: `bluey-0.1.91-darwin-arm64.tar.gz`
+  - `windows-x86_64`: `bluey-0.1.91-windows-x86_64.zip`
+- Verified live `latest.json` signature, installer MIME types, macOS artifact SHA/version, and Windows artifact SHA.
+
 ## Notes
 
 This fixes the final rendered/saved state. During raw token streaming, a provider can still briefly emit code text before the final artifact arrives; the finalization path now cleans that up. A deeper future improvement would be an early streaming artifact placeholder so code tokens stream directly into the right panel from the first detected code fence.
+
+The Intel macOS GitHub Actions runner for `darwin-x86_64` remained queued during this publish; the user-visible current Mac Apple Silicon and Windows artifacts were released so users do not keep pulling the older build.
