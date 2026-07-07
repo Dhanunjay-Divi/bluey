@@ -37,8 +37,12 @@ Those paths cleared account/balance state, but they did not all stop the daemon-
 - `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
 - `git diff --check`
 
-## Deploy Plan
+## Deploy
 
-- Prepare desktop release `0.1.92`.
-- Publish macOS and Windows artifacts to `https://bluey.sh`.
-- Verify live `latest.json`, signatures, installer MIME types, and artifact SHA/version.
+- Prepared desktop release `0.1.92`.
+- GitHub Actions release artifacts completed for macOS arm64 and Windows x86_64.
+- Published signed release files to `root@165.227.77.152:/var/www/bluey`.
+- Live `latest.json` now reports version `0.1.92`.
+- Verified live `latest.json` signature, installer MIME types, macOS artifact SHA/version, and Windows artifact SHA.
+- macOS arm64 SHA256: `657932d5191b038f5a7f95b47023e025bb548c791049321bbaae7424c51e7682`
+- Windows x86_64 SHA256: `98561dec5b6eb1dc757a75876e346ac8230be2d3e48c4b3adf76df3d988c1185`
