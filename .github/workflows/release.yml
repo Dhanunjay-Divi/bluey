@@ -119,7 +119,7 @@ jobs:
         shell: bash
         run: |
           npm ci --prefix crates/cue-dashboard/ui
-          cargo install tauri-cli --version "^2.0.0" --locked
+          cargo install tauri-cli --version "^2.0.0" --locked --force
           cd crates/cue-dashboard
           cargo tauri build --target ${{ matrix.target }} --bundles app
 
