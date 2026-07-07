@@ -6793,6 +6793,128 @@
       grid-template-columns: minmax(0, 1fr) auto auto;
     }
 
+    /* Round 398: keep desktop connect compact and separate from session history. */
+    #accountApp #dashboardTabComputers {
+      display: grid;
+      gap: .7rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-connect-section {
+      padding: .68rem .78rem;
+      border-color: rgba(99, 216, 255, .22);
+      background:
+        linear-gradient(135deg, rgba(99, 216, 255, .06), rgba(79, 141, 255, .018) 48%, transparent),
+        #0a0a0a;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint {
+      display: grid;
+      grid-template-columns: minmax(10rem, .42fr) minmax(0, 1fr);
+      gap: .28rem .8rem;
+      align-items: center;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint[hidden] {
+      display: none;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint strong {
+      grid-column: 1;
+      color: #f2f2f2;
+      font-size: .86rem;
+      font-weight: 750;
+      line-height: 1.15;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint > span {
+      grid-column: 1;
+      max-width: 18rem;
+      color: #838f97;
+      font-size: .72rem;
+      line-height: 1.35;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-form {
+      grid-column: 2;
+      grid-row: 1 / span 2;
+      grid-template-columns: minmax(0, 1fr) minmax(5.9rem, auto);
+      gap: .45rem;
+      align-self: center;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-form input {
+      min-height: 34px;
+      height: 34px;
+      padding: .42rem .62rem;
+      border-radius: 8px;
+      font-size: .76rem;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .account-button {
+      min-height: 34px;
+      padding: .42rem .75rem;
+      border-radius: 8px;
+      font-size: .74rem;
+    }
+
+    #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-status {
+      grid-column: 2;
+      min-height: 0;
+      margin-top: -.12rem;
+      text-align: right;
+      font-size: .66rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-section {
+      padding: .88rem .95rem;
+      border-color: #1a1a1a;
+      background: #0a0a0a;
+    }
+
+    #accountApp #dashboardTabComputers .device-section .section-head {
+      margin-bottom: .7rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-section .section-head h3 {
+      font-size: .98rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-section .section-head p {
+      font-size: .76rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-summary-bar {
+      min-height: 42px;
+      margin-bottom: .55rem;
+      padding: .5rem .6rem;
+      border-radius: 9px;
+      background: #0d0d0d;
+      font-size: .78rem;
+    }
+
+    #accountApp #dashboardTabComputers .device-summary-bar .account-button {
+      min-height: 32px;
+      padding: .4rem .65rem;
+      border-radius: 8px;
+      font-size: .72rem;
+    }
+
+    #accountApp .device-empty {
+      padding: 1rem .75rem;
+      border: 1px dashed rgba(255, 255, 255, .10);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, .015);
+      color: #666;
+      font-size: .8rem;
+      line-height: 1.4;
+      text-align: center;
+    }
+
     #accountApp .billing-section {
       background: #0a0a0a;
     }
@@ -6981,6 +7103,21 @@
       #accountApp .reload-setup-grid,
       #accountApp .dashboard-overview-card {
         grid-template-columns: 1fr;
+      }
+
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint {
+        grid-template-columns: 1fr;
+        gap: .35rem;
+      }
+
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-form,
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-status {
+        grid-column: 1;
+        grid-row: auto;
+      }
+
+      #accountApp #dashboardTabComputers .dashboard-device-link-hint .device-code-status {
+        text-align: left;
       }
 
       #productSite .pricing {

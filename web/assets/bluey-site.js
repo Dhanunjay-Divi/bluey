@@ -2379,7 +2379,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       if (!computers.length) {
         const empty = document.createElement('div');
-        empty.className = 'session-empty';
+        empty.className = 'device-empty';
         empty.textContent = message || 'No Bluey desktop connected yet. Open the host overlay and enter its code above.';
         list.append(empty);
         return;
