@@ -11,6 +11,7 @@ Continue the code-follow-up replacement release and make the Windows binary inst
 
 - Enabled `windows-latest` in `.github/workflows/release.yml` with the `x86_64-pc-windows-msvc` target.
 - Split Windows Cargo builds onto PowerShell so MSVC uses the Visual Studio linker instead of Git Bash's `link.exe`.
+- Updated the macOS dashboard build command for the current Tauri CLI so macOS packaging does not cancel the Windows matrix job.
 - Removed the `BLUEY_WINDOWS_INSTALL_PREVIEW=1` guard from `ops/install/install.ps1`.
 - Prepared desktop release `0.1.90` so macOS and Windows can be published under one signed manifest.
 

@@ -121,7 +121,7 @@ jobs:
           npm ci
           cd ..
           cargo install tauri-cli --version "^2.0.0" --locked
-          cargo tauri build --release --target ${{ matrix.target }} --bundles app
+          cargo tauri build --target ${{ matrix.target }} --bundles app
 
       - name: Build macOS native helpers
         if: startsWith(matrix.os, 'macos-')
