@@ -43,4 +43,6 @@ Make the Bluey download page more self-serve by showing overlay shortcuts and us
 - `git diff --check` passed.
 - Static markup smoke check passed for Windows install instructions, shortcut copy, and command copy buttons.
 - Local `/download` render check passed: Mac defaults, Windows selection switches labels to `Ctrl+Alt`, and Windows install command appears.
-- Pending: live `/download` verification after deploy.
+- Deployed to `https://bluey.sh` with `scripts/deploy-bluey-sh-manual.sh`.
+- Live `/download` verification passed for the shortcut section, Windows PowerShell install command, and expanded command grid.
+- Live installer/release checks passed: `latest.json` signature verified, installer MIME types remained correct, and the macOS release artifact SHA/version verified.
