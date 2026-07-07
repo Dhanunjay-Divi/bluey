@@ -33,4 +33,4 @@ Passed:
 
 ## Notes
 
-This round changes source behavior and validates the Mac overlay build. Downloadable desktop binaries still need the normal signed release/publish path before end users receive the overlay-side replacement behavior through `bluey on` updates.
+This round changes source behavior and validates the Mac overlay build. Desktop release `0.1.89` is planned for the signed release/publish path so end users receive the overlay-side replacement behavior through `bluey on` updates.
