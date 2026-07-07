@@ -223,9 +223,7 @@ fn incomplete_answer_reason(text: &str) -> Option<&'static str> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
-    let Some(last_line) = non_empty_lines.last().copied() else {
-        return None;
-    };
+    let last_line = non_empty_lines.last().copied()?;
     if is_markdown_table_separator_line(last_line) {
         return Some("unfinished_markdown_table");
     }
@@ -638,8 +636,7 @@ fn internal_disclosure_guard_text(text: &str) -> &str {
     let Some(after_label) = trimmed.strip_prefix("Question:") else {
         return trimmed;
     };
-    let after_label = after_label
-        .trim_start_matches(|ch: char| ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n');
+    let after_label = after_label.trim_start_matches([' ', '\t', '\r', '\n']);
     let end = after_label.find("\n\n").unwrap_or(after_label.len());
     after_label[..end].trim()
 }
@@ -3906,15 +3903,14 @@ fn dev_direct_vision_enabled() -> bool {
 }
 
 fn real_stt_chunk_duration_ms(configured: u32) -> u32 {
+    let fallback = if configured == cue_core::audio::DEFAULT_CHUNK_DURATION_MS {
+        500
+    } else {
+        configured
+    };
     env_first(&["BLUEY_STT_CHUNK_MS", "CUE_STT_CHUNK_MS"])
         .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or_else(|| {
-            if configured == cue_core::audio::DEFAULT_CHUNK_DURATION_MS {
-                500
-            } else {
-                configured
-            }
-        })
+        .unwrap_or(fallback)
         .clamp(500, 15_000)
 }
 
@@ -4819,7 +4815,10 @@ async fn run_relay_audio_source(
                 }
                 preface_chunks.push_back(buffer[..read].to_vec());
 
-                if startup_chunks == 1 || startup_chunks % 25 == 0 || stats.is_audible_for_stt() {
+                if startup_chunks == 1
+                    || startup_chunks.is_multiple_of(25)
+                    || stats.is_audible_for_stt()
+                {
                     info!(
                         source = %source.source,
                         stream_id = %source.stream_id,
@@ -5028,7 +5027,7 @@ async fn run_relay_audio_source(
                     }
                     audio.record_chunk(&chunk);
                 }
-                if sequence == 1 || sequence % 50 == 0 {
+                if sequence == 1 || sequence.is_multiple_of(50) {
                     info!(
                         source = %source.source,
                         stream_id = %source.stream_id,
@@ -8012,7 +8011,6 @@ fn normalized_complexity_line(line: &str) -> String {
         .trim_start_matches(['-', '*', '•'])
         .trim_start()
         .trim_matches('*')
-        .trim()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -10090,6 +10088,7 @@ async fn call_bluey_managed_provider(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn recover_managed_stream_from_cached_answer(
     managed: &BlueyManagedProvider,
     llm_request: &LlmRequest,
@@ -11714,7 +11713,7 @@ fn answer_request_from_overlay(
         provider,
         model,
         mode.as_deref(),
-        &question,
+        question,
         !visible_context_ids.is_empty(),
     ) {
         managed_provider_route(lane)
