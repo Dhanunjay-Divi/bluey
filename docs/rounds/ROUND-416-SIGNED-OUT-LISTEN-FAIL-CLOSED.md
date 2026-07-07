@@ -27,11 +27,15 @@ Those paths cleared account/balance state, but they did not all stop the daemon-
 - Routed `CloudLogout`, `mark_cloud_account_signed_out`, and balance-watch account clearing through that helper.
 - Avoided a balance-watch self-notify loop by letting the watcher apply signed-out state without clearing the watch channel again.
 - Added a focused daemon test proving an active audio session is stopped when signed-out state is applied.
+- Cleaned CI/release Linux dependency setup so Ubuntu jobs install one appindicator family and observability jobs install the Tauri/WebKit dependencies they need before clippy/test.
 
 ## Verification
 
 - `cargo test --manifest-path crates/cue-daemon/Cargo.toml signed_out_state_stops_active_audio_capture --quiet`
 - `cargo test --manifest-path crates/cue-daemon/Cargo.toml listen_auth_gate --quiet`
+- `cargo check -p cue-daemon -p cue-cli`
+- `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
+- `git diff --check`
 
 ## Deploy Plan
 
