@@ -10,6 +10,9 @@ pub mod export;
 // Decisions-ledger orchestration: stateless cheap-lane extraction every N turns.
 pub mod ledger;
 pub mod llm;
+// Cross-meeting facts memory (local bge-small embedder + supersede store).
+#[cfg(feature = "local-memory")]
+pub mod memory;
 pub mod overlay;
 pub mod secrets;
 pub mod storage;

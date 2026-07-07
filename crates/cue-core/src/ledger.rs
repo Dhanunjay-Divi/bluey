@@ -22,7 +22,9 @@ pub enum LedgerKind {
 }
 
 impl LedgerKind {
-    fn label(self) -> &'static str {
+    /// Human label ("Decision" / "Constraint" / "Owner") — used by the render
+    /// block and by the cross-meeting facts memory when indexing items.
+    pub fn label(self) -> &'static str {
         match self {
             LedgerKind::Decision => "Decision",
             LedgerKind::Constraint => "Constraint",

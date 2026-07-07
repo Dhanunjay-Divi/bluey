@@ -4,6 +4,12 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# Local ONNX embedder (bge-small via ort) — keyless, on-device semantic memory.
+# The ort native runtime is linked by the daemon's parakeet stack; this feature
+# only adds the session/tokenizer plumbing (PLAN-CONTEXT-WARMUP Appendix B/E).
+local-embed = ["dep:ort", "dep:tokenizers"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
@@ -14,6 +20,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# Pinned to the exact ort the STT stack links (see cue-transcribe) so cargo
+# unifies on ONE native ONNX runtime.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std"], optional = true }
+tokenizers = { version = "0.23", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

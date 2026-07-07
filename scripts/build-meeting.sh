@@ -33,7 +33,9 @@ cd "$ROOT"
 # Speaker diarization (cue-daemon/diarize) is OPT-IN via BLUEY_DIARIZE_BUILD=1 —
 # it links arm64 OpenBLAS (Homebrew). Diarization models (~60MB) download on
 # first run; runtime is gated by BLUEY_DIARIZE=1.
-DAEMON_FEATURES="cue-daemon/parakeet-stt"
+# parakeet-stt = on-device STT; local-memory = keyless cross-meeting facts
+# memory (local bge-small embedder — reuses the same ONNX runtime).
+DAEMON_FEATURES="cue-daemon/parakeet-stt cue-daemon/local-memory"
 if [ "${BLUEY_DIARIZE_BUILD:-0}" = "1" ]; then
   DAEMON_FEATURES="$DAEMON_FEATURES cue-daemon/diarize"
   export PKG_CONFIG_PATH="/opt/homebrew/opt/openblas/lib/pkgconfig:${PKG_CONFIG_PATH:-}"

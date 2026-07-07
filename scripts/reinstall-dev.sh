@@ -28,7 +28,8 @@ REPO="$PWD"
 TARGET="$(rustc -vV | awk '/host:/{print $2}')"
 # On-device STT lives behind this feature — a plain build ships an STT-less daemon
 # that falls through to the cloud "sign in" gate and transcribes nothing.
-DAEMON_FEATURES="cue-daemon/parakeet-stt"
+# local-memory adds the keyless cross-meeting facts memory (bge-small via ort).
+DAEMON_FEATURES="cue-daemon/parakeet-stt cue-daemon/local-memory"
 # openblas pkg-config for the diarize/daemon link.
 export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/opt/homebrew/opt/openblas/lib/pkgconfig}"
 

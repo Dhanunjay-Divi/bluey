@@ -1024,6 +1024,11 @@ pub(crate) struct Daemon {
     /// a pass is in flight don't stack overlapping drives. Cleared in the
     /// spawned task's finally-path.
     summary_inflight: std::sync::atomic::AtomicBool,
+    /// Cross-meeting facts memory (local bge-small embedder + supersede store).
+    /// `None` until the background init finishes (first run downloads the
+    /// ~35MB embedding model); every consumer treats `None` as "memory off".
+    #[cfg(feature = "local-memory")]
+    facts_memory: Mutex<Option<Arc<crate::memory::FactsMemory>>>,
     /// Monotonic generation counter bumped on every attach/detach cache flip
     /// (`refresh_overlay_agents_attached_only`). A background full-discovery
     /// tail captures this epoch at spawn time and only writes its result if the
@@ -1208,6 +1213,8 @@ pub async fn run() -> Result<()> {
         agent_cache: Mutex::new(None),
         agent_refresh_inflight: std::sync::atomic::AtomicBool::new(false),
         summary_inflight: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "local-memory")]
+        facts_memory: Mutex::new(None),
         agent_cache_epoch: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "diarize")]
         audio_retention: Mutex::new(None),
@@ -1257,6 +1264,24 @@ pub async fn run() -> Result<()> {
     // to the overlay as a system card so the app doesn't look hung on first run.
     #[cfg(feature = "parakeet-stt")]
     spawn_model_progress_forwarder(daemon.clone());
+
+    // Cross-meeting facts memory: bring the local embedder + store up in the
+    // background (first run downloads ~35MB). Failure = memory stays off; the
+    // meeting loop is unaffected.
+    #[cfg(feature = "local-memory")]
+    {
+        let daemon_mem = daemon.clone();
+        tokio::spawn(async move {
+            match crate::memory::FactsMemory::ensure(&daemon_mem.paths).await {
+                Ok(memory) => {
+                    *daemon_mem.facts_memory.lock().await = Some(Arc::new(memory));
+                }
+                Err(error) => {
+                    warn!("cross-meeting facts memory unavailable: {error:#}");
+                }
+            }
+        });
+    }
 
     let listener = TcpListener::bind(&args.addr)
         .await
@@ -6919,6 +6944,8 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     if window.trim().is_empty() {
         return;
     }
+    #[cfg(feature = "local-memory")]
+    let meeting_id = meeting.id.to_string();
     let daemon = Arc::clone(daemon);
     tokio::spawn(async move {
         // Primary: the user's own attached agent (throwaway one-shot).
@@ -6938,11 +6965,32 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
         };
         match extracted {
             Ok(Some(raw)) => {
+                // Parse+verify once so the verified items can ALSO feed the
+                // cross-meeting facts memory (long-term tier) after the merge.
+                let verified = cue_core::parse_and_verify(&raw, &window);
+                #[cfg(feature = "local-memory")]
+                let verified_texts: Vec<String> = verified
+                    .iter()
+                    .map(|item| format!("[{}] {}", item.kind.label(), item.text))
+                    .collect();
                 let (added, block) = {
                     let mut ledger = daemon.ledger.lock().await;
-                    let added = crate::ledger::ingest(&mut ledger, &raw, &window);
+                    let added = ledger.merge(verified);
                     (added, ledger.render())
                 };
+                // Index the verified facts cross-meeting (hash/similarity dedup
+                // inside the store makes re-offering merged-away items a NOOP).
+                #[cfg(feature = "local-memory")]
+                if !verified_texts.is_empty() {
+                    let memory = daemon.facts_memory.lock().await.clone();
+                    if let Some(memory) = memory {
+                        for text in &verified_texts {
+                            if let Err(error) = memory.index_fact(&meeting_id, text).await {
+                                debug!("facts memory index failed: {error:#}");
+                            }
+                        }
+                    }
+                }
                 if added > 0 {
                     debug!("ledger: +{added} item(s) added");
                     // Push the updated ledger to any dev-view WebSocket clients.
@@ -10035,15 +10083,40 @@ async fn retrieved_memory_contexts(
     meeting: &MeetingRecord,
     question: &str,
 ) -> Vec<AnswerContext> {
-    let Some(rag) = daemon.rag.as_ref() else {
-        return Vec::new();
-    };
     if question.trim().is_empty() {
         return Vec::new();
     }
 
     let current_session_id = meeting.id.to_string();
     let mut contexts = Vec::new();
+
+    // Cross-meeting facts memory (long-term tier, keyless local embeddings):
+    // recall verified facts from OTHER meetings — "what did we decide about auth
+    // last week". Independent of the OpenAI-keyed RAG below. Bounded + score-
+    // floored so semantic noise never pollutes the answer context.
+    #[cfg(feature = "local-memory")]
+    {
+        let memory = daemon.facts_memory.lock().await.clone();
+        if let Some(memory) = memory {
+            match memory.search(question, 4, Some(&current_session_id)).await {
+                Ok(hits) => {
+                    let block = crate::memory::render_hits(&hits, 0.45, 1_200);
+                    if !block.is_empty() {
+                        contexts.push(
+                            AnswerContext::new(AnswerContextKind::MeetingMemory, block)
+                                .with_title("From past meetings")
+                                .with_source("cross-meeting memory"),
+                        );
+                    }
+                }
+                Err(error) => debug!("cross-meeting memory query failed: {error:#}"),
+            }
+        }
+    }
+
+    let Some(rag) = daemon.rag.as_ref() else {
+        return contexts;
+    };
     let mut seen = std::collections::HashSet::new();
 
     match rag.query(question, 4, Some(&current_session_id)).await {

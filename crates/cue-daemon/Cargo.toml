@@ -87,6 +87,10 @@ parakeet-stt = ["dep:parakeet-rs", "parakeet-rs/ort-defaults", "parakeet-rs/sort
 # On-device speaker diarization via cue-diarize (speakrs). Off by default — pulls
 # OpenBLAS + CoreML. Build the daemon with `--features diarize` to enable.
 diarize = ["dep:cue-diarize"]
+# Cross-meeting facts memory on the local bge-small ONNX embedder (keyless,
+# on-device; PLAN-CONTEXT-WARMUP Appendix A/E). Ships in the MEETING build
+# (build-meeting.sh); pair with `parakeet-stt` (which links the ONNX runtime).
+local-memory = ["cue-rag/local-embed"]
 
 [dev-dependencies]
 # WAV reader for the on-device Parakeet inference smoke test + debug example
