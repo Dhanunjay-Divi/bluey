@@ -3013,7 +3013,7 @@ fn prompt_with_answer_plan(
             "For first-time coding or algorithm answers, start with a short spoken lead-in the user could say on a call: the core idea and why it works, in one or two natural sentences. Then use this exact scan-friendly shape when code is needed: `Approach`, then `Code`, then `Explanation`, then `Complexity`, then `Edge cases` when useful. Under Approach, give 2-4 clear bullets before the code. Under Code, give complete working code in a fenced code block with a language tag. Use the language implied by the prompt or screen; if none is specified for an interview algorithm prompt, use Python. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. For Python/LeetCode-style answers, include required imports or avoid type hints that need imports. Put each statement on its own line with correct indentation; never compress class, function, assignments, and return onto one wrapped line. Add concise comments inside non-trivial code: place a short comment above each major block and on the important decision lines that explain why that line or block exists. Do not comment every trivial assignment. For LeetCode/interview algorithm prompts, include the full class/function signature, initialization, loop/body, return value, and any sentinel/cleanup step; never provide only the inner loop or a pseudocode fragment. For data-structure interview prompts such as LRU cache, implement from first principles with a hashmap plus doubly linked list unless the user explicitly asks for a library shortcut; mention library helpers only as alternatives after the real implementation. For non-trivial code, add a short `Line notes:` block outside the code fence using `1: ...` or small `2-4: ...` notes for the important executable lines. Keep explanatory notes outside the code so copied code stays clean. Always include Time Complexity and Space Complexity explicitly. Do not give only a summary."
         }
         AnswerIntent::CodingFollowUp => {
-            "Treat this as a follow-up to existing code when relevant. Answer like you are responding live on a call: start with the direct conclusion in plain English, then explain the reason, caveat, or better option. For line-number follow-ups, use the supplied prior code artifact display line numbers as authoritative. Do not say probably, likely, or I think when the referenced line is present; if the exact line is not in context, say the exact line is not available instead of guessing. For complexity questions, say exactly which part has that complexity and whether the whole algorithm can truly be improved. For questions like \"can we make it better\", give the honest answer first, then the practical optimization if one exists. Preserve the existing artifact unless the user asks for a new one. For requested changes, use `Approach`, then `Patch` or `Changed block`, then `Explanation`, then `Complexity` if the complexity changes. Prefer the smallest safe in-place code change, changed block, or unified diff; do not replace the whole implementation unless the user asks for a full rewrite, the existing code is tiny, or a full replacement is materially safer. If the user asks to regenerate the full solution or asks for the same code in another language, include the complete fenced implementation in that language with the full wrapper/signature, not only a middle fragment. Put each statement on its own line with correct indentation and add concise comments above changed blocks and on important decision lines. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
+            "Treat this as a follow-up to existing code when relevant. Answer like you are responding live on a call: start with the direct conclusion in plain English, then explain the reason, caveat, or better option. For line-number follow-ups, use the supplied prior code artifact display line numbers as authoritative. Do not say probably, likely, or I think when the referenced line is present; if the exact line is not in context, say the exact line is not available instead of guessing. For complexity questions, say exactly which part has that complexity and whether the whole algorithm can truly be improved. For questions like \"can we make it better\", give the honest answer first, then the practical optimization if one exists. Preserve the existing artifact identity unless the user asks for a new problem, but when code is requested or changed, return the entire updated implementation as a complete fenced implementation. Do not output a patch, unified diff, changed block, or only the edited lines. The code artifact must be a full in-place replacement: include unchanged surrounding code, full class/function signature, imports when needed, initialization, body, return value, and cleanup/sentinel logic. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. Put each statement on its own line with correct indentation and add concise comments above changed blocks and on important decision lines. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
         }
         AnswerIntent::Behavioral => {
             "Answer like a polished interview coach and candidate voice: natural, first-person when appropriate, specific, and conversational. Use the supplied resume, JD, documents, transcript, and screen context to infer the role and domain, such as SDE, data engineer, BI engineer, data scientist, DevOps, security, product, or another role. First infer what the interviewer is testing, such as Dive Deep, ownership, technical depth, data quality, system judgment, prioritization, stakeholder communication, or tradeoffs, then make the response prove that signal. For resume-based introductions, self-introductions, or prompts like \"tell me about yourself\", do not compress the resume into one facts paragraph and do not ask the user what kind of long answer they want when the resume/context is already supplied. Use a speakable present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role. For introductions, give the full ready-to-say answer on the first response and aim for a 45-60 second answer unless the user explicitly asks for a shorter version. For role/domain interview questions, give a ready-to-say answer anchored only in the supplied company, project, tools, metrics, constraints, and role expectations; when useful, include a brief why-it-works or if-they-push-back recovery line. Do not defend weak story logic blindly: reframe it in a production-realistic way, such as code ownership, incident debugging, architecture tradeoffs, upstream data, ETL validation, reporting impact, stakeholder communication, or KPI definition. For interview stories, aim for a 45-90 second answer in tight paragraphs, not generic bullets, unless the user asks for notes. Do not invent metrics, employers, tools, source systems, clinical/finance details, latency windows, outcomes, or motivation beyond the supplied resume/JD/context. If exact story detail is missing, say the framing safely with phrases like \"I would frame it as...\" or \"the signal I would emphasize is...\" instead of fabricating a result. Never route resume/self-intro or interview-coaching prompts into system design just because they mention architecture or systems."
@@ -6687,7 +6687,7 @@ fn code_artifact_has_complete_code(body: &str) -> bool {
         return false;
     }
     if looks_like_patch_or_diff(code) {
-        return true;
+        return false;
     }
     if looks_like_control_flow_fragment_without_entrypoint(code) {
         return false;
@@ -8250,6 +8250,25 @@ mod tests {
     }
 
     #[test]
+    fn response_artifact_rejects_patch_or_diff_only_code() {
+        let patch = response_artifact(
+            "Patch\n\n```diff\n@@\n-    return old_value\n+    return new_value\n```\n\nExplanation\nOnly the return line changes.",
+        );
+        assert!(
+            patch.is_none(),
+            "patch-only answers should not become complete code artifacts"
+        );
+
+        let changed_block = response_artifact(
+            "Changed block\n\n```python\n- result = slow_path(nums)\n+ result = fast_path(nums)\n```\n",
+        );
+        assert!(
+            changed_block.is_none(),
+            "changed-line snippets should not become complete code artifacts"
+        );
+    }
+
+    #[test]
     fn response_artifact_keeps_complete_robot_return_code() {
         let artifact = response_artifact(
             "Approach\nTrack net displacement.\n\n```cpp\nclass Solution {\npublic:\n    bool judgeCircle(string moves) {\n        int x = 0;\n        int y = 0;\n        for (char move : moves) {\n            if (move == 'U') y++;\n            else if (move == 'D') y--;\n            else if (move == 'L') x--;\n            else if (move == 'R') x++;\n        }\n        return x == 0 && y == 0;\n    }\n};\n```\n\nComplexity\nTime Complexity: O(N)",
@@ -8953,6 +8972,11 @@ mod tests {
         assert!(system.contains("display line numbers as authoritative"));
         assert!(system.contains("Do not say probably"));
         assert!(system.contains("complete fenced implementation"));
+        assert!(system.contains("full in-place replacement"));
+        assert!(system.contains("Do not output a patch"));
+        assert!(system.contains("include unchanged surrounding code"));
+        assert!(!system.contains("Changed block"));
+        assert!(!system.contains("unified diff; do not replace"));
     }
 
     #[test]

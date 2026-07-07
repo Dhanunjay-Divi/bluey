@@ -11101,6 +11101,25 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
 
+        if shouldReplaceActiveCodeCanvas(question: question, artifact: artifact),
+           let index = activeCanvasIndex,
+           canvases.indices.contains(index) {
+            let existing = canvases[index]
+            let followupNumber = existing.followupCount + 1
+            artifact.title = existing.title
+            artifact.subtitle = canvasSubtitle(base: artifact.subtitle, followups: followupNumber)
+            artifact.followupCount = followupNumber
+            artifact.sourceQuestion = existing.sourceQuestion
+            canvases[index] = artifact
+            canvasCardAssignments[artifact.sourceCardId] = index
+            activeCanvasIndex = index
+            renderActiveCanvas()
+            emitLifecycle(
+                "canvas_replace_code_followup",
+                detail: "source_card=\(artifact.sourceCardId) index=\(index) followups=\(followupNumber) question_chars=\((question ?? "").count) question_words=\(wordCount(question)) question_intent=\(questionIntentLabel(question)) body_chars=\(artifact.content.count)")
+            return
+        }
+
         if shouldAppendCanvasFollowup(question: question, artifact: artifact),
            let index = activeCanvasIndex,
            canvases.indices.contains(index) {
@@ -11134,6 +11153,27 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         emitLifecycle(
             "canvas_new",
             detail: "source_card=\(artifact.sourceCardId) index=\(canvases.count - 1) kind=\(artifact.kind.shortTitle) title_chars=\(artifact.title.count) body_chars=\(artifact.content.count)")
+    }
+
+    private func shouldReplaceActiveCodeCanvas(question: String?, artifact: CanvasArtifact) -> Bool {
+        guard
+            artifact.kind == .code,
+            let index = activeCanvasIndex,
+            canvases.indices.contains(index),
+            canvases[index].kind == .code,
+            let question = question?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !question.isEmpty
+        else {
+            return false
+        }
+        let lower = question.lowercased()
+        if looksLikeExplicitNewCanvasQuestion(lower) {
+            return false
+        }
+        return looksLikeDirectCanvasReference(lower)
+            || looksLikeCodeCanvasFollowup(lower)
+            || looksLikeCodeLanguageReplacementFollowup(lower)
+            || sharesCanvasQuestionTerm(lower, sourceQuestion: canvases[index].sourceQuestion)
     }
 
     private func renderActiveCanvas() {
@@ -11215,6 +11255,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         let lower = question.lowercased()
         if looksLikeNewCanvasQuestion(lower) {
+            return false
+        }
+        if artifact.kind == .code {
             return false
         }
         if artifact.kind == .systemDesign && looksLikeSystemDesignCanvasAppendFollowup(lower) {
@@ -11625,6 +11668,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func looksLikeNewCanvasQuestion(_ lower: String) -> Bool {
         let trimmed = lower.trimmingCharacters(in: .whitespacesAndNewlines)
+        if looksLikeExplicitNewCanvasQuestion(trimmed) {
+            return true
+        }
+        let newQuestionSignals = [
+            "write a ",
+            "build a ",
+            "implement ",
+            "create a ",
+            "design a ",
+            "solve ",
+        ]
+        return newQuestionSignals.contains { trimmed.hasPrefix($0) }
+    }
+
+    private func looksLikeExplicitNewCanvasQuestion(_ lower: String) -> Bool {
+        let trimmed = lower.trimmingCharacters(in: .whitespacesAndNewlines)
         let newQuestionSignals = [
             "q2",
             "q3",
@@ -11653,14 +11712,43 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "different problem",
             "new question",
             "separate question",
-            "write a ",
-            "build a ",
-            "implement ",
-            "create a ",
-            "design a ",
-            "solve ",
         ]
         return newQuestionSignals.contains { trimmed.hasPrefix($0) }
+    }
+
+    private func looksLikeCodeLanguageReplacementFollowup(_ lower: String) -> Bool {
+        let languageSignals = [
+            "python code",
+            "java code",
+            "go code",
+            "golang code",
+            "typescript code",
+            "javascript code",
+            "c++ code",
+            "cpp code",
+            "c# code",
+            "rust code",
+            "swift code",
+            "kotlin code",
+            "same code in",
+            "code in python",
+            "code in java",
+            "code in go",
+            "code in golang",
+            "code in typescript",
+            "code in javascript",
+            "code in c++",
+            "code in cpp",
+            "code in c#",
+            "code in rust",
+            "code in swift",
+            "code in kotlin",
+            "convert this to",
+            "translate this to",
+            "for this",
+            "for the same",
+        ]
+        return languageSignals.contains { lower.contains($0) }
     }
 
     private func appendCanvasFollowup(
