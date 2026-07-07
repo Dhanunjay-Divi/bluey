@@ -2229,19 +2229,9 @@ async fn handle_request_inner(
             Ok(DaemonResponse::CloudStatus { status })
         }
         DaemonRequest::CloudLogout => {
-            clear_listen_account_verification(daemon).await;
-            stop_balance_polling(daemon).await;
+            apply_cloud_account_signed_out(daemon, "cloud_logout", true).await;
             let status = cloud_status_from_env(&daemon.paths);
             *daemon.cloud.lock().await = status.clone();
-            let _ =
-                send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: false }).await;
-            let _ = send_overlay(
-                daemon,
-                OverlayCommand::SetBalance {
-                    label: "Sign in".to_string(),
-                },
-            )
-            .await;
             Ok(DaemonResponse::CloudStatus { status })
         }
         DaemonRequest::CloudSyncNow => {
@@ -2413,12 +2403,28 @@ async fn restart_balance_polling(daemon: &Arc<Daemon>) {
 }
 
 async fn mark_cloud_account_signed_out(daemon: &Arc<Daemon>, reason: &'static str) {
+    apply_cloud_account_signed_out(daemon, reason, true).await;
+}
+
+async fn apply_cloud_account_signed_out(
+    daemon: &Arc<Daemon>,
+    reason: &'static str,
+    clear_balance_watch: bool,
+) {
+    let audio_session_id = daemon.audio.lock().await.session_id.clone();
     clear_listen_account_verification(daemon).await;
     stop_balance_polling(daemon).await;
-    daemon.balance_watch.clear();
+    // Also cancel a racing startup generation so a delayed audio start
+    // cannot flip the overlay back to Listening after auth is gone.
+    let _ = stop_audio_capture(daemon).await;
+    set_overlay_listening_state(daemon, ListeningState::Paused).await;
+    if clear_balance_watch {
+        daemon.balance_watch.clear();
+    }
     info!(
         reason,
-        "local Bluey account tokens cleared; overlay marked signed out"
+        audio_session_id = audio_session_id.as_deref().unwrap_or("none"),
+        "local Bluey account tokens cleared; overlay marked signed out and live audio stopped"
     );
     let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: false }).await;
     let _ = send_overlay(
@@ -2568,20 +2574,7 @@ fn spawn_overlay_balance_bridge(daemon: Arc<Daemon>) {
             match next {
                 Some(snapshot) => push_overlay_balance_snapshot(&daemon, snapshot).await,
                 None => {
-                    clear_listen_account_verification(&daemon).await;
-                    stop_balance_polling(&daemon).await;
-                    let _ = send_overlay(
-                        &daemon,
-                        OverlayCommand::SetAccountState { signed_in: false },
-                    )
-                    .await;
-                    let _ = send_overlay(
-                        &daemon,
-                        OverlayCommand::SetBalance {
-                            label: "Sign in".to_string(),
-                        },
-                    )
-                    .await;
+                    apply_cloud_account_signed_out(&daemon, "balance_watch_clear", false).await;
                 }
             }
         }
@@ -18796,6 +18789,71 @@ mod tests {
 
         assert!(err.message.contains("Sign in to Bluey before using Listen"));
         assert!(err.open_login);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn signed_out_state_stops_active_audio_capture() {
+        let base = env::temp_dir().join(format!(
+            "bluey-signed-out-audio-stop-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("runtime"),
+            state_file: base.join("runtime/state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+        paths.ensure().expect("ensure temp paths");
+        let store = MeetingStore::new(&paths).expect("meeting store");
+        let (overlay_events_tx, _overlay_events_rx) = mpsc::unbounded_channel();
+        let daemon = Arc::new(Daemon {
+            paths: paths.clone(),
+            store,
+            state: Mutex::new(DaemonState::new(0)),
+            meeting: Mutex::new(None),
+            overlay: Mutex::new(None),
+            overlay_enabled: false,
+            overlay_bin: None,
+            overlay_events_tx,
+            capture: Mutex::new(CaptureRuntime {
+                stop: None,
+                interval_secs: 12,
+            }),
+            audio: Mutex::new(AudioPipelineStatus::idle()),
+            audio_runtime: Mutex::new(AudioRuntime {
+                stop: None,
+                session_id: Some("audio-test".to_string()),
+                start_generation: 0,
+                starting: false,
+            }),
+            cloud: Mutex::new(cloud_status_from_env(&paths)),
+            cloud_login: Mutex::new(None),
+            listen_account_verified_until: Mutex::new(Some(
+                Instant::now() + Duration::from_secs(LISTEN_ACCOUNT_VERIFICATION_TTL_SECS),
+            )),
+            auto_cloud_sync_debounce: Mutex::new(None),
+            balance_poll_shutdown: Mutex::new(None),
+            balance_watch: crate::cloud::balance::BalanceWatch::default(),
+            answer_generation: AtomicU64::new(0),
+            active_answer_card: Mutex::new(None),
+            system_audio: Mutex::new(None),
+            live_transcript_tx: broadcast::channel(64).0,
+            rag_indexer: RagIndexCoordinator::from_paths(&paths),
+            overlay_session_token: "test-token".to_string(),
+            overlay_ui_state: new_shared_overlay_ui_state(),
+        });
+
+        *daemon.audio.lock().await =
+            AudioPipelineStatus::simulated("audio-test", AudioCaptureConfig::dual_default());
+
+        apply_cloud_account_signed_out(&daemon, "test_signed_out", false).await;
+
+        assert!(daemon.audio.lock().await.session_id.is_none());
+        assert!(daemon.audio_runtime.lock().await.session_id.is_none());
+        assert!(daemon.listen_account_verified_until.lock().await.is_none());
         let _ = std::fs::remove_dir_all(base);
     }
 
