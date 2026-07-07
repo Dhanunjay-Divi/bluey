@@ -8,6 +8,8 @@
 
 ## Verification
 
-- macOS artifact is built locally and verified before publish.
-- Windows artifact is built on the GitHub Actions Windows runner and downloaded before publish.
-- `latest.json` and `latest.json.sig` are verified after publish.
+- macOS arm64 and Windows x86_64 artifacts were built in GitHub Actions and downloaded before publish.
+- Release hygiene scan passed for both published artifacts.
+- `latest.json` and `latest.json.sig` were verified after publish.
+- macOS arm64 binary version smoke passed after unpacking the live artifact.
+- Windows x86_64 live artifact SHA verification passed.
