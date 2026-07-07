@@ -24,11 +24,28 @@ Bluey verification emails were arriving as plain text, while Pinky sends a brand
 
 - `cargo fmt --check`
 - `cargo test --manifest-path server/Cargo.toml mail::tests -- --nocapture`
+- `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
+- `git diff --check`
 
 ## Current State
 
-New Bluey signup verification emails should visually match Pinky's compact branded style while preserving Bluey's existing OTP behavior and text fallback.
+New Bluey signup verification emails visually match Pinky's compact branded style while preserving Bluey's existing OTP behavior and text fallback.
+
+## Production Deploy
+
+- Production API server deployed from:
+  `/opt/bluey-build-codex-round399-verification-email`
+- Production API health returned:
+  `{"status":"ok","version":"0.1.5","commit":"50e80b0a","platform":"linux-x86_64"}`
+- Installed production binary SHA:
+  `c06b98436de87975808ea8cfd33e131e414df741de6bb49f30d6b9124b111a79`
+- Previous production binary backup:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260707T043147Z`
+- `bluey-api.service`: active
+- `bluey-api.service` `NRestarts`: `0`
+- Recent warning/error logs after restart:
+  `-- No entries --`
 
 ## Remaining QA/Gates
 
-- Production API needs a backend deploy before live emails change on `bluey.sh`.
+- Send a new live signup verification code and confirm Gmail renders the branded HTML view.
