@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070701"
+    href="/assets/bluey-site.css?v=2026070702"
   >
   <script type="application/ld+json">
   {
@@ -430,7 +430,7 @@
                 <div class="dashboard-overview-title-row">
                   <div>
                     <h2 id="balanceTitle">Remaining balance</h2>
-                    <p id="balanceHint">Used for paid cloud work.</p>
+                    <p id="balanceHint">Shared across your Bluey account.</p>
                   </div>
                   <strong id="balanceValue">$--</strong>
                 </div>
@@ -444,7 +444,7 @@
                     <div class="auto-reload-head">
                       <h3>Auto Reload</h3>
                       <label class="auto-reload-toggle" for="autoReloadToggle">
-                        <input id="autoReloadToggle" type="checkbox" />
+                        <input id="autoReloadToggle" type="checkbox" checked />
                         <span></span>
                       </label>
                     </div>
@@ -459,7 +459,7 @@
                       </label>
                     </div>
                     <p class="auto-reload-rule" id="autoReloadRule">When balance is below $5.00, reload $15.00.</p>
-                    <p class="auto-reload-hint" id="autoReloadHint">Set up from Add credits.</p>
+                    <p class="auto-reload-hint" id="autoReloadHint">Ready to activate during checkout.</p>
                     <button class="account-button ghost compact auto-reload-save" id="saveAutoReloadButton" type="button">Save</button>
                   </div>
                 </div>
@@ -653,7 +653,7 @@
           <div class="account-modal-head">
             <div>
               <h2 id="addCreditsTitle">Add Bluey credits</h2>
-              <p>Choose credits, set Auto Reload if you want it, then finish payment in Square checkout.</p>
+              <p>Add credits now. Leave Auto Reload on to save a card and keep Bluey ready.</p>
             </div>
             <button class="account-modal-close" id="addCreditsCancelX" type="button" aria-label="Close add credits dialog">×</button>
           </div>
@@ -677,7 +677,7 @@
                   <h3>Auto Reload</h3>
                 </div>
                 <label class="auto-reload-toggle" for="modalAutoReloadToggle">
-                  <input id="modalAutoReloadToggle" type="checkbox" />
+                  <input id="modalAutoReloadToggle" type="checkbox" checked />
                   <span></span>
                 </label>
               </div>
@@ -691,7 +691,7 @@
                   <input id="modalAutoReloadAmount" type="number" min="15" max="500" step="5" value="15" inputmode="decimal" />
                 </label>
               </div>
-              <p class="auto-reload-rule" id="modalAutoReloadRule">Save a card here if you want automatic reloads.</p>
+              <p class="auto-reload-rule" id="modalAutoReloadRule">Save a card here to keep credits topped up automatically.</p>
               <div class="reload-setup-card-actions">
                 <button class="account-button ghost compact" id="reloadSetupCardButton" type="button">Save card for Auto Reload</button>
                 <button class="account-button ghost compact" id="reloadSetupSaveAutoButton" type="button">Save Auto Reload</button>
@@ -1077,7 +1077,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070701"
+    src="/assets/bluey-site.js?v=2026070702"
   ></script>
 </body>
 </html>

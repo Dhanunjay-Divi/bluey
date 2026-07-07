@@ -1697,8 +1697,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const canSaveSquareCard = canUseSquareCardSetup(me);
       const hasSavedMethod = Boolean(me?.auto_topup_available);
 
+      const setupDefaultOn = !me?.auto_topup_enabled && canSaveSquareCard && !hasSavedMethod;
+      const toggleChecked = Boolean(me?.auto_topup_enabled) || setupDefaultOn;
       card.classList.toggle('is-on', Boolean(me?.auto_topup_enabled));
-      toggle.checked = Boolean(me?.auto_topup_enabled);
+      card.classList.toggle('is-setup-default', setupDefaultOn);
+      toggle.checked = toggleChecked;
       toggle.disabled = false;
       if (setup.dataset.open !== '1') {
         setup.hidden = true;
@@ -1720,7 +1723,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       } else if (hasSavedMethod) {
         hint.textContent = 'Off. Turn on and click Save to enable.';
       } else if (canSaveSquareCard) {
-        hint.textContent = 'Add credits to set up a saved card for Auto Reload.';
+        hint.textContent = 'Ready to activate when you save a card during checkout.';
       } else {
         hint.textContent = me?.auto_topup_unavailable_reason || 'Unavailable';
       }
@@ -1777,7 +1780,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const wasEnabled = Boolean(latestAccountForBilling?.auto_topup_enabled);
       const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
       if (!enabled) {
-        rule.textContent = wasEnabled ? 'Click Save to turn Auto Reload off.' : 'Auto Reload is off.';
+        rule.textContent = wasEnabled ? 'Click Save to turn Auto Reload off.' : 'Auto Reload is ready when you want it.';
         if (saveButton) {
           saveButton.hidden = !wasEnabled && !hasSavedMethod;
           saveButton.disabled = !wasEnabled;
@@ -1788,7 +1791,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const settings = readAutoReloadSettings();
         rule.textContent = hasSavedMethod
           ? `When balance is below ${money(settings.auto_topup_threshold_cents)}, reload ${money(settings.auto_topup_amount_cents)}.`
-          : `Use Add credits to save a card, then reload ${money(settings.auto_topup_amount_cents)} when below ${money(settings.auto_topup_threshold_cents)}.`;
+          : `Save a card during Add credits to reload ${money(settings.auto_topup_amount_cents)} when below ${money(settings.auto_topup_threshold_cents)}.`;
         if (saveButton) {
           saveButton.hidden = !hasSavedMethod;
           saveButton.disabled = !hasSavedMethod;
@@ -1882,12 +1885,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       const balanceCents = Number(me?.balance_cents || 0);
       if (balanceCents <= 0) {
-        return 'Add credits when you need paid cloud work.';
+        return 'Add credits to start. This balance is shared across your Bluey account.';
       }
       if (balanceCents < 500) {
-        return 'Low balance. Add credits when you need more.';
+        return 'Low balance. Add credits to keep Bluey ready.';
       }
-      return 'Ready for paid cloud work.';
+      return 'Ready for paid answers, screen context, and saved sessions.';
     }
 
     async function updateAutoReload(enabled) {
@@ -2121,7 +2124,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
       if (!autoRule) return;
       if (!enabled) {
-        autoRule.textContent = wasEnabled ? 'Auto Reload will turn off after you click Save.' : 'Auto Reload is off.';
+        autoRule.textContent = wasEnabled ? 'Auto Reload will turn off after you click Save.' : 'Leave it on to keep Bluey ready after checkout.';
         if (saveAutoButton) {
           saveAutoButton.hidden = !wasEnabled && !hasSavedMethod;
           saveAutoButton.disabled = !wasEnabled;
@@ -2133,7 +2136,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const settings = readModalAutoReloadSettings();
         autoRule.textContent = hasSavedMethod
           ? `When balance is below ${money(settings.auto_topup_threshold_cents)}, reload ${money(settings.auto_topup_amount_cents)}.`
-          : `Save a card here to let Bluey reload ${money(settings.auto_topup_amount_cents)} when below ${money(settings.auto_topup_threshold_cents)}.`;
+          : `Save a card here to reload ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`;
         if (saveAutoButton) {
           saveAutoButton.hidden = !hasSavedMethod;
           saveAutoButton.disabled = !hasSavedMethod;

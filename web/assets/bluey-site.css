@@ -6605,14 +6605,16 @@
 
     #accountApp .dashboard-overview-card {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(236px, auto);
-      gap: .9rem;
+      grid-template-columns: minmax(0, 1fr) minmax(250px, auto);
+      gap: .95rem;
       align-items: center;
       margin-bottom: 1rem;
-      padding: 1.05rem 1.25rem;
-      border-color: #1a1a1a;
+      padding: 1rem 1.1rem;
+      border-color: rgba(99, 216, 255, .18);
       border-radius: 12px;
-      background: #0a0a0a;
+      background:
+        linear-gradient(135deg, rgba(99, 216, 255, .045), rgba(79, 141, 255, .015) 46%, transparent),
+        #0a0a0a;
     }
 
     #accountApp .dashboard-overview-card.balance-low {
@@ -6636,9 +6638,16 @@
     }
 
     #accountApp .dashboard-overview-title-row {
-      grid-template-columns: minmax(0, 1fr) auto;
+      display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 1rem;
+      justify-content: flex-start;
+      gap: .4rem clamp(1.15rem, 3.2vw, 2.15rem);
+    }
+
+    #accountApp .dashboard-overview-title-row > div {
+      flex: 0 1 24rem;
+      min-width: 13rem;
     }
 
     #accountApp .dashboard-overview-title-row h2 {
@@ -6658,6 +6667,7 @@
     }
 
     #accountApp .dashboard-overview-title-row #balanceValue {
+      flex: 0 0 auto;
       color: #f2f2f2;
       font-size: 1.45rem;
       letter-spacing: 0;
@@ -6676,7 +6686,7 @@
     }
 
     #accountApp .compact-auto-reload {
-      min-width: 236px;
+      min-width: 250px;
       padding: 0;
       border: 0;
       background: transparent;
@@ -6702,6 +6712,10 @@
       letter-spacing: 0;
     }
 
+    #accountApp .compact-auto-reload.is-setup-default .auto-reload-head h3 {
+      color: var(--bluey-accent);
+    }
+
     #accountApp .compact-auto-reload .auto-reload-fields {
       grid-column: 1 / -1;
       grid-template-columns: repeat(2, minmax(80px, 1fr));
@@ -6725,6 +6739,11 @@
       color: #777;
       font-size: .7rem;
       line-height: 1.35;
+    }
+
+    #accountApp .compact-auto-reload .auto-reload-hint {
+      color: #8897a1;
+      font-weight: 700;
     }
 
     #accountApp .compact-auto-reload .auto-reload-save {
@@ -7055,6 +7074,10 @@
     html[data-bluey-theme="light"] #accountApp .reload-setup-panel > p,
     html[data-bluey-theme="light"] #accountApp .reload-setup-panel .auto-reload-rule {
       color: #5f7281;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .compact-auto-reload.is-setup-default .auto-reload-head h3 {
+      color: #087ca6;
     }
 
     html[data-bluey-theme="light"] #accountApp .dashboard-tab.is-active {
