@@ -1870,6 +1870,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         && !me.billing_restricted;
     }
 
+    function paidBillingBlocked(me) {
+      return Boolean(me?.is_temporary || me?.is_admin || me?.billing_restricted);
+    }
+
     function renderAutoReload(me) {
       latestAccountForBilling = me || null;
       const card = document.getElementById('autoReloadCard');
@@ -2154,6 +2158,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const minutes = trialMinutesRemaining(me);
         return `${minutes} free minute${minutes === 1 ? '' : 's'} left. Create an account within 24 hours to keep it.`;
       }
+      if (me?.is_admin || me?.billing_restricted) {
+        return 'Internal and test accounts use admin credits. Paid checkout and Auto Reload are disabled here.';
+      }
       const balanceCents = Number(me?.balance_cents || 0);
       if (balanceCents <= 0) {
         return 'Add balance to start. Keep Auto Reload on to top up before work stops.';
@@ -2201,19 +2208,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const overviewReloadButton = document.getElementById('overviewReloadButton');
       const balanceReloadPanel = document.getElementById('balanceReloadPanel');
       const isTemporaryAccount = Boolean(me.is_temporary);
+      const isBillingBlocked = paidBillingBlocked(me);
       const trialMinutes = trialMinutesRemaining(me);
       if (balanceTitle) balanceTitle.textContent = isTemporaryAccount ? 'Trial time' : 'Remaining balance';
       if (balanceValue) {
         balanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
         balanceCard?.classList.toggle('balance-trial', isTemporaryAccount);
+        balanceCard?.classList.toggle('balance-billing-blocked', isBillingBlocked && !isTemporaryAccount);
         balanceCard?.classList.toggle('balance-critical', !isTemporaryAccount && me.balance_cents > 0 && me.balance_cents < 500);
         balanceCard?.classList.toggle('balance-low', !isTemporaryAccount && me.balance_cents >= 500 && me.balance_cents < 1000);
       }
       if (overviewReloadButton) {
-        overviewReloadButton.hidden = isTemporaryAccount;
+        overviewReloadButton.hidden = isBillingBlocked;
+        overviewReloadButton.disabled = isBillingBlocked;
       }
       if (balanceReloadPanel) {
-        balanceReloadPanel.hidden = isTemporaryAccount;
+        balanceReloadPanel.hidden = isBillingBlocked;
       }
       const summaryBalanceValue = document.getElementById('summaryBalanceValue');
       const summaryBalanceLabel = document.getElementById('summaryBalanceLabel');
@@ -2548,6 +2558,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function openReloadSetupDialog() {
       const dialog = document.getElementById('addCreditsDialog');
       const amount = document.getElementById('modalReloadAmount');
+      if (paidBillingBlocked(latestAccountForBilling)) {
+        accountMessage('Paid checkout is disabled for this account. Use Trial Ops for internal test balance changes.', false, 'error');
+        return;
+      }
       if (!dialog) {
         startReload();
         return;
@@ -3332,6 +3346,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function startReload() {
+      if (paidBillingBlocked(latestAccountForBilling)) {
+        accountMessage('Paid checkout is disabled for this account. Use Trial Ops for internal test balance changes.', false, 'error');
+        return false;
+      }
       let amountCents;
       try {
         amountCents = readManualReloadCents();

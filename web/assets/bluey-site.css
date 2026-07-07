@@ -6969,11 +6969,11 @@
 
     #accountApp .dashboard-overview-card {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(250px, auto);
-      gap: .95rem;
-      align-items: center;
+      grid-template-columns: minmax(18rem, 1fr) minmax(20rem, .82fr);
+      gap: 1.25rem;
+      align-items: start;
       margin-bottom: 1rem;
-      padding: 1rem 1.1rem;
+      padding: 1.2rem 1.35rem;
       border-color: rgba(99, 216, 255, .18);
       border-radius: 12px;
       background:
@@ -6997,21 +6997,25 @@
       background: #0a0a0a;
     }
 
+    #accountApp .dashboard-overview-card.balance-billing-blocked {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
     #accountApp .dashboard-overview-main {
-      gap: .55rem;
+      display: grid;
+      min-width: 0;
+      gap: .8rem;
     }
 
     #accountApp .dashboard-overview-title-row {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: flex-start;
-      gap: .4rem clamp(1.15rem, 3.2vw, 2.15rem);
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+      gap: .85rem;
     }
 
     #accountApp .dashboard-overview-title-row > div {
-      flex: 0 1 24rem;
-      min-width: 13rem;
+      min-width: 0;
     }
 
     #accountApp .dashboard-overview-title-row h2 {
@@ -7031,10 +7035,11 @@
     }
 
     #accountApp .dashboard-overview-title-row #balanceValue {
-      flex: 0 0 auto;
       color: #f2f2f2;
-      font-size: 1.45rem;
+      font-size: 1.55rem;
+      line-height: 1;
       letter-spacing: 0;
+      white-space: nowrap;
     }
 
     #accountApp .dashboard-overview-actions {
@@ -7046,21 +7051,28 @@
     }
 
     #accountApp .dashboard-overview-side {
-      align-content: center;
+      min-width: 0;
+      align-content: start;
+    }
+
+    #accountApp .dashboard-overview-side[hidden] {
+      display: none !important;
     }
 
     #accountApp .compact-auto-reload {
-      min-width: 250px;
-      padding: 0;
-      border: 0;
-      background: transparent;
+      min-width: 0;
+      width: 100%;
+      padding: .9rem;
+      border: 1px solid rgba(99, 216, 255, .16);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, .025);
     }
 
     #accountApp .compact-auto-reload > div {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
-      gap: .35rem .6rem;
-      align-items: center;
+      gap: .55rem .75rem;
+      align-items: start;
     }
 
     #accountApp .compact-auto-reload .auto-reload-head {
@@ -7082,8 +7094,8 @@
 
     #accountApp .compact-auto-reload .auto-reload-fields {
       grid-column: 1 / -1;
-      grid-template-columns: repeat(2, minmax(80px, 1fr));
-      gap: .45rem;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .65rem;
     }
 
     #accountApp .compact-auto-reload .auto-reload-fields label {
@@ -7093,9 +7105,9 @@
     }
 
     #accountApp .compact-auto-reload .auto-reload-fields input {
-      min-height: 32px;
-      border-radius: 7px;
-      font-size: .8rem;
+      min-height: 36px;
+      border-radius: 8px;
+      font-size: .84rem;
     }
 
     #accountApp .compact-auto-reload .auto-reload-rule,
@@ -7103,6 +7115,7 @@
       color: #777;
       font-size: .7rem;
       line-height: 1.35;
+      margin: 0;
     }
 
     #accountApp .compact-auto-reload .auto-reload-hint {
