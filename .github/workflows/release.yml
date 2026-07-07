@@ -39,6 +39,10 @@ jobs:
             target: x86_64-apple-darwin
             platform: darwin-x86_64
             swift_arch: x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+            swift_arch: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
