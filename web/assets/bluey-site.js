@@ -3038,6 +3038,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function selectDownloadPlatform(platform) {
+      const downloadApp = document.getElementById('downloadApp');
+      if (downloadApp) {
+        downloadApp.classList.toggle('platform-windows', platform === 'windows');
+        downloadApp.classList.toggle('platform-mac', platform !== 'windows');
+      }
       const cards = document.querySelectorAll('#downloadApp [data-platform-card]');
       const panels = document.querySelectorAll('#downloadApp [data-platform-instructions]');
       cards.forEach((card) => {

@@ -3879,10 +3879,127 @@
       cursor: default;
     }
 
+    #downloadApp .download-shortcuts,
     #downloadApp .commands {
       width: min(700px, 100%);
       margin: 1.35rem auto 0;
       padding: 0 2rem;
+    }
+
+    #downloadApp .download-shortcuts {
+      margin-top: 1rem;
+    }
+
+    #downloadApp .download-section-head {
+      padding: 1rem;
+      border: 1px solid #222;
+      border-bottom: 0;
+      border-radius: 12px 12px 0 0;
+      background: #111;
+    }
+
+    #downloadApp .download-section-head h2 {
+      margin: 0 0 .25rem;
+      color: #e0e0e0;
+      font-size: 1rem;
+    }
+
+    #downloadApp .download-section-head p {
+      margin: 0;
+      color: #777;
+      font-size: .78rem;
+      line-height: 1.45;
+    }
+
+    #downloadApp .download-section-head strong {
+      color: #d8f7ff;
+      font-weight: 850;
+    }
+
+    #downloadApp .shortcut-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: .45rem;
+      padding: .55rem;
+      border: 1px solid #222;
+      border-radius: 0 0 12px 12px;
+      background: #0a0a0a;
+    }
+
+    #downloadApp .shortcut-card {
+      min-width: 0;
+      display: grid;
+      gap: .45rem;
+      align-content: start;
+      padding: .7rem;
+      border: 1px solid #181818;
+      border-radius: 8px;
+      background: #080808;
+    }
+
+    #downloadApp .shortcut-card > span:last-child {
+      color: #aaa;
+      font-size: .7rem;
+      line-height: 1.35;
+      font-weight: 700;
+    }
+
+    #downloadApp .shortcut-keys,
+    #downloadApp .shortcut-platform {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: .25rem;
+    }
+
+    #downloadApp .shortcut-platform-windows {
+      display: none;
+    }
+
+    #downloadApp.platform-windows .shortcut-platform-mac {
+      display: none;
+    }
+
+    #downloadApp.platform-windows .shortcut-platform-windows {
+      display: flex;
+    }
+
+    #downloadApp .shortcut-card kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 24px;
+      padding: .18rem .45rem;
+      border: 1px solid rgba(99, 216, 255, .26);
+      border-radius: 6px;
+      background: rgba(99, 216, 255, .07);
+      color: var(--bluey-accent);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .68rem;
+      font-weight: 850;
+      line-height: 1;
+    }
+
+    #downloadApp .shortcut-notes {
+      display: grid;
+      gap: .4rem;
+      margin-top: .55rem;
+      color: #777;
+      font-size: .75rem;
+      line-height: 1.45;
+    }
+
+    #downloadApp .shortcut-notes span {
+      display: block;
+      padding: .65rem .75rem;
+      border: 1px solid rgba(99, 216, 255, .13);
+      border-radius: 8px;
+      background: rgba(99, 216, 255, .04);
+    }
+
+    #downloadApp .shortcut-notes strong {
+      color: #d8f7ff;
     }
 
     #downloadApp .platform-instructions {
@@ -4232,6 +4349,7 @@
       #downloadApp .download-hero,
       #downloadApp .download-steps-strip,
       #downloadApp .platform-grid,
+      #downloadApp .download-shortcuts,
       #downloadApp .commands {
         padding-left: 1.5rem;
         padding-right: 1.5rem;
@@ -4300,9 +4418,18 @@
 
     @media (max-width: 600px) {
       #downloadApp .download-steps-strip,
+      #downloadApp .shortcut-grid,
       #downloadApp .cmd-grid,
       #downloadApp .platform-grid {
         grid-template-columns: 1fr;
+      }
+
+      #downloadApp .download-section-head {
+        padding: .9rem;
+      }
+
+      #downloadApp .shortcut-grid {
+        padding: .45rem;
       }
 
       #downloadApp .install-command {
@@ -5046,6 +5173,7 @@
     html[data-bluey-theme="light"] #downloadApp .download-card,
     html[data-bluey-theme="light"] #downloadApp .platform-note,
     html[data-bluey-theme="light"] #downloadApp .platform-instructions,
+    html[data-bluey-theme="light"] #downloadApp .download-section-head,
     html[data-bluey-theme="light"] #downloadApp .download-note {
       border-color: #dceaf2;
       background: #ffffff;
@@ -5093,6 +5221,7 @@
     html[data-bluey-theme="light"] #downloadApp .platform-name,
     html[data-bluey-theme="light"] #downloadApp .os-icon,
     html[data-bluey-theme="light"] #downloadApp .platform-instructions h2,
+    html[data-bluey-theme="light"] #downloadApp .download-section-head h2,
     html[data-bluey-theme="light"] #downloadApp .commands h2 {
       color: #102130;
     }
@@ -5101,6 +5230,9 @@
     html[data-bluey-theme="light"] #downloadApp .download-card.coming-soon p,
     html[data-bluey-theme="light"] #downloadApp .platform-instructions > p,
     html[data-bluey-theme="light"] #downloadApp .instruction-help,
+    html[data-bluey-theme="light"] #downloadApp .download-section-head p,
+    html[data-bluey-theme="light"] #downloadApp .shortcut-card > span:last-child,
+    html[data-bluey-theme="light"] #downloadApp .shortcut-notes,
     html[data-bluey-theme="light"] #downloadApp .cmd span {
       color: #5f7281;
     }
@@ -5129,10 +5261,28 @@
     html[data-bluey-theme="light"] #accountApp .manual-reload-input,
     html[data-bluey-theme="light"] #accountApp .square-card-container,
     html[data-bluey-theme="light"] #downloadApp .install-command,
+    html[data-bluey-theme="light"] #downloadApp .shortcut-grid,
+    html[data-bluey-theme="light"] #downloadApp .shortcut-card,
     html[data-bluey-theme="light"] #downloadApp .cmd {
       border-color: #d8e8f0;
       background: #fafdff;
       color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .download-section-head strong,
+    html[data-bluey-theme="light"] #downloadApp .shortcut-notes strong {
+      color: #173447;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .shortcut-card kbd {
+      border-color: rgba(49, 146, 206, .28);
+      background: rgba(49, 146, 206, .08);
+      color: #1478af;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .shortcut-notes span {
+      border-color: rgba(49, 146, 206, .18);
+      background: rgba(49, 146, 206, .06);
     }
 
     html[data-bluey-theme="light"] #accountApp.is-guest .account-form input::placeholder {
