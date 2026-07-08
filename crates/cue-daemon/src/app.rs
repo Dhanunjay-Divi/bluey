@@ -16117,8 +16117,8 @@ fn choose_context_files_platform() -> Result<Vec<PathBuf>> {
 
     let script = r#"
 try
-  set allowedTypes to {"public.text", "public.source-code", "public.shell-script", "public.json", "public.yaml", "public.xml", "public.html", "public.css", "public.png", "public.jpeg", "com.compuserve.gif", "org.webmproject.webp", "public.heic", "public.heif", "public.bmp", "public.tiff", "com.adobe.pdf", "com.microsoft.word.doc", "org.openxmlformats.wordprocessingml.document", "com.microsoft.excel.xls", "org.openxmlformats.spreadsheetml.sheet", "public.rtf", "net.daringfireball.markdown", "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc", "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh", "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss", "pdf", "doc", "docx", "rtf", "xls", "xlsx", "xlsm", "xlsb", "ods", "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif"}
-  set pickedFiles to choose file with prompt "Choose readable text, code, PDF, DOC/DOCX, Excel/ODS, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, RTF, or image files for this Bluey session. Video, audio, apps, and certificates are skipped." of type allowedTypes with multiple selections allowed
+  set allowedTypes to {"public.text", "public.source-code", "public.shell-script", "public.json", "public.yaml", "public.xml", "public.html", "public.css", "public.png", "public.jpeg", "com.compuserve.gif", "org.webmproject.webp", "public.heic", "public.heif", "public.bmp", "public.tiff", "com.adobe.pdf", "com.microsoft.word.doc", "org.openxmlformats.wordprocessingml.document", "com.microsoft.powerpoint.ppt", "org.openxmlformats.presentationml.presentation", "com.microsoft.excel.xls", "org.openxmlformats.spreadsheetml.sheet", "public.rtf", "net.daringfireball.markdown", "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc", "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh", "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss", "pdf", "doc", "docx", "rtf", "ppt", "pptx", "xls", "xlsx", "xlsm", "xlsb", "ods", "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif"}
+  set pickedFiles to choose file with prompt "Choose readable text, code, PDF, Word, PowerPoint, Excel/ODS, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, RTF, or image files for this Bluey session. Video, audio, apps, and certificates are skipped." of type allowedTypes with multiple selections allowed
   set output to ""
   repeat with pickedFile in pickedFiles
     set output to output & POSIX path of pickedFile & linefeed
@@ -16222,7 +16222,7 @@ fn choose_context_files_platform() -> Result<Vec<PathBuf>> {
 	Add-Type -AssemblyName System.Windows.Forms
 	$dialog = New-Object System.Windows.Forms.OpenFileDialog
 	$dialog.Title = "Choose readable files for this Bluey session"
-	$dialog.Filter = "Bluey context files|*.md;*.markdown;*.txt;*.log;*.csv;*.tsv;*.rst;*.adoc;*.rs;*.swift;*.c;*.h;*.cpp;*.hpp;*.js;*.jsx;*.ts;*.tsx;*.py;*.go;*.java;*.kt;*.kts;*.cs;*.rb;*.php;*.sql;*.sh;*.ps1;*.toml;*.yaml;*.yml;*.json;*.html;*.css;*.scss;*.pdf;*.doc;*.docx;*.rtf;*.xls;*.xlsx;*.xlsm;*.xlsb;*.ods;*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.tiff;*.tif"
+	$dialog.Filter = "Bluey context files|*.md;*.markdown;*.txt;*.log;*.csv;*.tsv;*.rst;*.adoc;*.rs;*.swift;*.c;*.h;*.cpp;*.hpp;*.js;*.jsx;*.ts;*.tsx;*.py;*.go;*.java;*.kt;*.kts;*.cs;*.rb;*.php;*.sql;*.sh;*.ps1;*.toml;*.yaml;*.yml;*.json;*.html;*.css;*.scss;*.pdf;*.doc;*.docx;*.rtf;*.ppt;*.pptx;*.xls;*.xlsx;*.xlsm;*.xlsb;*.ods;*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.tiff;*.tif"
 	$dialog.Multiselect = $true
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
   $dialog.FileNames -join "`n"

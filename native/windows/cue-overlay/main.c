@@ -238,7 +238,7 @@ static void apply_capture_exclusion(HWND hwnd) {
 // whose token does not match its own per-session value.
 static char g_session_token[129] = {0}; // 128-char max + NUL
 static const wchar_t *g_supported_drop_formats =
-    L"Supported: PDF, DOC/DOCX, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images.";
+    L"Supported: PDF, Word, PowerPoint, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images. Video files are not readable context yet.";
 
 static void load_session_token(void) {
     DWORD n = GetEnvironmentVariableA(
@@ -524,7 +524,7 @@ static bool supported_drop_extension(const wchar_t *ext) {
         L"rs", L"swift", L"c", L"h", L"cpp", L"hpp", L"js", L"jsx", L"ts", L"tsx",
         L"py", L"go", L"java", L"kt", L"kts", L"cs", L"rb", L"php", L"sql", L"sh",
         L"ps1", L"toml", L"yaml", L"yml", L"json", L"html", L"css", L"scss",
-        L"pdf", L"doc", L"docx", L"rtf", L"xls", L"xlsx", L"xlsm", L"xlsb", L"ods",
+        L"pdf", L"doc", L"docx", L"rtf", L"ppt", L"pptx", L"xls", L"xlsx", L"xlsm", L"xlsb", L"ods",
         L"png", L"jpg", L"jpeg", L"gif", L"webp", L"heic", L"heif", L"bmp", L"tiff", L"tif",
     };
     for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {

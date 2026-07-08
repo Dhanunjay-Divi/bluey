@@ -6,7 +6,7 @@ private let allowedExtensions: Set<String> = [
     "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx",
     "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh",
     "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss",
-    "pdf", "doc", "docx", "rtf", "xls", "xlsx", "xlsm", "xlsb", "ods",
+    "pdf", "doc", "docx", "rtf", "ppt", "pptx", "xls", "xlsx", "xlsm", "xlsb", "ods",
     "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif",
 ]
 
@@ -30,7 +30,7 @@ private final class ContextFilePanelDelegate: NSObject, NSOpenSavePanelDelegate 
                 code: 1,
                 userInfo: [
                     NSLocalizedDescriptionKey:
-                        "Bluey can attach readable text, code, PDF, DOC/DOCX, Excel/ODS, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, RTF, or image files only."
+                        "Bluey can attach readable text, code, PDF, Word, PowerPoint, Excel/ODS, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, RTF, or image files only. Video files are not readable context yet."
                 ]
             )
         }
@@ -70,7 +70,7 @@ private final class PickerAppDelegate: NSObject, NSApplicationDelegate {
     private func runPanel() {
         let panel = NSOpenPanel()
         panel.title = "Attach files to Bluey"
-        panel.message = "Choose readable text, code, PDF/DOC, Excel/ODS, code/data files, RTF, or images. Video, audio, apps, and certificates are skipped."
+        panel.message = "Choose readable text, code, PDF/Word/PowerPoint, Excel/ODS, code/data files, RTF, or images. Video, audio, apps, and certificates are skipped."
         panel.prompt = "Attach"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false

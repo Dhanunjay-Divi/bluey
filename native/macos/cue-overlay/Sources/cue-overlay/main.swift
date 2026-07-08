@@ -311,13 +311,13 @@ private func balanceVisualTone(for label: String) -> BalanceVisualTone {
 
 private let minimumOverlayBackgroundOpacity: CGFloat = 0.18
 private let supportedDropFormatsMessage =
-    "Supported: PDF, DOC/DOCX, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images."
+    "Supported: PDF, Word, PowerPoint, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images. Video files are not readable context yet."
 private let supportedDropExtensions: Set<String> = [
     "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc",
     "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx",
     "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh",
     "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss",
-    "pdf", "doc", "docx", "rtf", "xls", "xlsx", "xlsm", "xlsb", "ods",
+    "pdf", "doc", "docx", "rtf", "ppt", "pptx", "xls", "xlsx", "xlsm", "xlsb", "ods",
     "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif",
 ]
 private let overlayLightThemeDefaultsKey = "bluey.overlay.lightTheme"
@@ -12854,7 +12854,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if let visible = liveTranscriptVisibleQuestion(from: candidate, requireMeaningful: false) {
             return visible
         }
-        return liveTranscriptAnswerPrompt()
+        return candidate
     }
 
     private func transcriptTextReadyForAnswer() -> String? {

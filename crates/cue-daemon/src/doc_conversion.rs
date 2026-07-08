@@ -16,7 +16,7 @@ const MARKITDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 const PREVIEW_CHARS: usize = 16_000;
 
 pub(crate) fn supported_context_formats_message() -> &'static str {
-    "Supported formats: PDF, DOC/DOCX, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images."
+    "Supported formats: PDF, Word, PowerPoint, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images. Video files are not readable context yet."
 }
 
 #[derive(Debug, Clone)]
@@ -46,9 +46,8 @@ pub(crate) fn classify_context_path(path: &Path) -> ContextKind {
         "rs" | "swift" | "c" | "h" | "cpp" | "hpp" | "js" | "jsx" | "ts" | "tsx" | "py" | "go"
         | "java" | "kt" | "kts" | "cs" | "rb" | "php" | "sql" | "sh" | "ps1" | "toml" | "yaml"
         | "yml" | "json" | "html" | "css" | "scss" => ContextKind::Code,
-        "pdf" | "doc" | "docx" | "rtf" | "xls" | "xlsx" | "xlsm" | "xlsb" | "ods" => {
-            ContextKind::Document
-        }
+        "pdf" | "doc" | "docx" | "rtf" | "ppt" | "pptx" | "xls" | "xlsx" | "xlsm" | "xlsb"
+        | "ods" => ContextKind::Document,
         "txt" | "log" | "csv" | "tsv" | "md" | "markdown" | "rst" | "adoc" => ContextKind::Text,
         _ => ContextKind::Other,
     }
@@ -287,6 +286,11 @@ fn extract_document_text_preview(path: &Path, size_bytes: u64) -> Result<String>
     let text = match extension.as_str() {
         "pdf" => extract_pdf_text(path)?,
         "doc" | "docx" | "rtf" => extract_word_text(path)?,
+        "ppt" | "pptx" => {
+            return Err(anyhow!(
+                "PowerPoint conversion needs the bundled MarkItDown converter"
+            ));
+        }
         "xls" | "xlsx" | "xlsm" | "xlsb" | "ods" => {
             return Err(anyhow!(
                 "spreadsheet conversion needs the bundled MarkItDown converter"
@@ -539,6 +543,7 @@ mod tests {
     fn picker_context_filter_rejects_video_and_key_material() {
         assert!(is_supported_context_file(Path::new("plan.md")));
         assert!(is_supported_context_file(Path::new("architecture.pdf")));
+        assert!(is_supported_context_file(Path::new("deck.pptx")));
         assert!(is_supported_context_file(Path::new("budget.xlsx")));
         assert!(is_supported_context_file(Path::new("forecast.xlsm")));
         assert!(is_supported_context_file(Path::new("main.rs")));
