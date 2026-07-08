@@ -25,6 +25,16 @@ import { StatusFeed } from "../components/StatusFeed";
 
 type Phase = "idle" | "detected" | "thinking" | "answering";
 
+// Canonical prompt for the manual "ask about what was just said" button — the
+// fallback when question-detection misses. The daemon's context assembly
+// already attaches the rolling summary + decisions ledger + recent transcript
+// to every ask, so this needs no extra payload: the question itself just points
+// the agent at the tail of the transcript.
+const ASK_RECENT_QUESTION =
+  "Answer the most recent question or request raised in the meeting " +
+  "transcript. If the last lines contain no question, briefly answer what " +
+  "would be most useful about what was just discussed.";
+
 export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   const client = getClient();
   // Session state (transcript, history, Q&A feed, detected question) lives in
@@ -174,6 +184,15 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
     setDetectedQ(null);
     runAsk(q);
   };
+
+  // True while an ask is streaming: the phase has left "idle" AND the newest
+  // turn hasn't received its `done` chunk yet. (`phase` alone isn't enough — it
+  // stays "answering" after a turn completes; the turn's `done` flag is what
+  // flips when streaming ends.) Used to disable the manual ask-recent button so
+  // taps can't stack asks mid-stream.
+  const lastTurn = turns.length > 0 ? turns[turns.length - 1] : undefined;
+  const askStreaming =
+    phase !== "idle" && lastTurn !== undefined && !lastTurn.answer.done;
 
   return (
     <div
@@ -327,6 +346,8 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
         placeholder="Ask a follow-up while Bluey listens…"
         contextLabel={transcript ? "live transcript · in context" : undefined}
         onSubmit={runAsk}
+        onAskRecent={() => runAsk(ASK_RECENT_QUESTION)}
+        askRecentDisabled={askStreaming}
         mode={mode}
         onModeChange={setMode}
         models={models}

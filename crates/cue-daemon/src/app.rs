@@ -1029,6 +1029,10 @@ pub(crate) struct Daemon {
     /// ~35MB embedding model); every consumer treats `None` as "memory off".
     #[cfg(feature = "local-memory")]
     facts_memory: Mutex<Option<Arc<crate::memory::FactsMemory>>>,
+    /// Stage-2 question classifier (two-stage for-me detection). `None` when
+    /// the bundled model is absent — detection stays regex-only.
+    #[cfg(feature = "local-memory")]
+    qdetect: Mutex<Option<Arc<crate::qdetect::QuestionClassifier>>>,
     /// Monotonic generation counter bumped on every attach/detach cache flip
     /// (`refresh_overlay_agents_attached_only`). A background full-discovery
     /// tail captures this epoch at spawn time and only writes its result if the
@@ -1215,6 +1219,8 @@ pub async fn run() -> Result<()> {
         summary_inflight: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "local-memory")]
         facts_memory: Mutex::new(None),
+        #[cfg(feature = "local-memory")]
+        qdetect: Mutex::new(None),
         agent_cache_epoch: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "diarize")]
         audio_retention: Mutex::new(None),
@@ -1279,6 +1285,29 @@ pub async fn run() -> Result<()> {
                 Err(error) => {
                     warn!("cross-meeting facts memory unavailable: {error:#}");
                 }
+            }
+        });
+    }
+
+    // Stage-2 question classifier: bundled model (no download), blocking load
+    // off the runtime. Absent/corrupt model = regex-only detection, never fatal.
+    #[cfg(feature = "local-memory")]
+    {
+        let daemon_q = daemon.clone();
+        tokio::spawn(async move {
+            let paths = daemon_q.paths.clone();
+            let loaded = tokio::task::spawn_blocking(move || {
+                crate::qdetect::QuestionClassifier::load_for(&paths)
+            })
+            .await;
+            match loaded {
+                Ok(Ok(classifier)) => {
+                    *daemon_q.qdetect.lock().await = Some(Arc::new(classifier));
+                }
+                Ok(Err(error)) => {
+                    debug!("question classifier off (regex-only detection): {error:#}");
+                }
+                Err(error) => warn!("question classifier load task failed: {error:#}"),
             }
         });
     }
@@ -6944,8 +6973,9 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     if window.trim().is_empty() {
         return;
     }
+    let meeting_id = meeting.id;
     #[cfg(feature = "local-memory")]
-    let meeting_id = meeting.id.to_string();
+    let meeting_id_str = meeting.id.to_string();
     let daemon = Arc::clone(daemon);
     tokio::spawn(async move {
         // Primary: the user's own attached agent (throwaway one-shot).
@@ -6973,21 +7003,77 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                     .iter()
                     .map(|item| format!("[{}] {}", item.kind.label(), item.text))
                     .collect();
-                let (added, block) = {
+                // A slow one-shot can outlive its meeting. The ledger is the
+                // CURRENT meeting's working memory (cleared on meeting end),
+                // so a late extraction from an ended meeting must not bleed
+                // into the next meeting's ledger. (Cross-meeting indexing
+                // below is unaffected — facts carry their own meeting id.)
+                let still_active = {
+                    let guard = daemon.meeting.lock().await;
+                    guard.as_ref().map(|m| m.id) == Some(meeting_id)
+                };
+                let (added, block) = if still_active {
                     let mut ledger = daemon.ledger.lock().await;
                     let added = ledger.merge(verified);
                     (added, ledger.render())
+                } else {
+                    debug!("ledger: meeting ended mid-extraction; merge discarded");
+                    (0, None)
                 };
-                // Index the verified facts cross-meeting (hash/similarity dedup
-                // inside the store makes re-offering merged-away items a NOOP).
+                // Long-term consolidation — the Mem0 update phase (Appendix
+                // E.1 phase 2): the agent decides ADD/UPDATE/DELETE/NONE for
+                // each verified fact against its most-similar existing
+                // memories; DELETE lands as a supersede. No agent, an empty
+                // neighborhood, or an unusable response → the similarity
+                // heuristic, so memory keeps working headless.
                 #[cfg(feature = "local-memory")]
                 if !verified_texts.is_empty() {
                     let memory = daemon.facts_memory.lock().await.clone();
                     if let Some(memory) = memory {
-                        for text in &verified_texts {
-                            if let Err(error) = memory.index_fact(&meeting_id, text).await {
-                                debug!("facts memory index failed: {error:#}");
+                        match memory.prepare_update(&verified_texts).await {
+                            Ok(plan) if plan.candidate_count() == 0 => {
+                                debug!("facts memory: all candidates already known");
                             }
+                            Ok(plan) => {
+                                let raw = match plan.prompt() {
+                                    Some(prompt) => {
+                                        memory_oneshot_via_agent(&daemon, prompt.to_string()).await
+                                    }
+                                    None => None,
+                                };
+                                let via_agent = raw.is_some();
+                                let report = match raw {
+                                    Some(raw) => match memory
+                                        .apply_agent_ops(&plan, &raw, &meeting_id_str)
+                                        .await
+                                    {
+                                        Ok(report) => Ok(report),
+                                        Err(error) => {
+                                            debug!(
+                                                "agent memory ops unusable ({error:#}); \
+                                                 falling back to heuristic"
+                                            );
+                                            memory.apply_heuristic(&plan, &meeting_id_str).await
+                                        }
+                                    },
+                                    None => memory.apply_heuristic(&plan, &meeting_id_str).await,
+                                };
+                                match report {
+                                    Ok(report) => debug!(
+                                        added = report.added,
+                                        updated = report.updated,
+                                        deleted = report.deleted,
+                                        none = report.none,
+                                        skipped = report.skipped,
+                                        via_agent,
+                                        "facts memory consolidated"
+                                    ),
+                                    Err(error) => {
+                                        debug!("facts memory consolidation failed: {error:#}")
+                                    }
+                                }
+                            }
+                            Err(error) => debug!("facts memory update prep failed: {error:#}"),
                         }
                     }
                 }
@@ -7054,7 +7140,19 @@ fn maybe_fire_summary(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     let current_summary = meeting.summary.clone();
     let daemon = Arc::clone(daemon);
     tokio::spawn(async move {
-        use std::sync::atomic::Ordering::SeqCst;
+        // Clear the inflight flag on EVERY exit from this task, including a
+        // panic (tokio catches task panics without unwinding into the parent
+        // — a trailing store(false) would be skipped and the stuck flag would
+        // silently disable summaries for the rest of the session).
+        struct InflightClear(Arc<Daemon>);
+        impl Drop for InflightClear {
+            fn drop(&mut self) {
+                self.0
+                    .summary_inflight
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _inflight = InflightClear(Arc::clone(&daemon));
         let prompt = crate::summary::build_prompt(current_summary.as_deref(), &window);
         match memory_oneshot_via_agent(&daemon, prompt).await {
             Some(raw) => {
@@ -7062,28 +7160,27 @@ fn maybe_fire_summary(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                 if bounded.is_empty() {
                     debug!("rolling summary pass produced no usable text; kept previous");
                 } else {
-                    // Update ONLY if the same meeting is still active, and save
-                    // OFF the meeting lock (disk writes under that lock stall
-                    // the STT sink — see the streaming-audio invariants).
+                    // Update in-memory ONLY, and only if the same meeting is
+                    // still active. Deliberately NO save_active here: segment
+                    // commits save the whole record UNDER the meeting lock, so
+                    // an off-lock save of our snapshot could clobber a newer
+                    // on-disk state (lost update). The next segment commit —
+                    // seconds away in a live meeting — or the meeting-end
+                    // archive persists this summary.
                     let updated = {
                         let mut guard = daemon.meeting.lock().await;
                         match guard.as_mut() {
                             Some(active) if active.id == meeting_id => {
+                                let chars = bounded.len();
                                 active.summary = Some(bounded);
-                                Some(active.clone())
+                                Some(chars)
                             }
                             _ => None,
                         }
                     };
-                    if let Some(meeting) = updated {
-                        if let Err(error) = daemon.store.save_active(&meeting) {
-                            warn!("rolling summary save failed: {error:#}");
-                        } else {
-                            debug!(
-                                chars = meeting.summary.as_deref().map(str::len).unwrap_or(0),
-                                "rolling summary refreshed"
-                            );
-                        }
+                    match updated {
+                        Some(chars) => debug!(chars, "rolling summary refreshed"),
+                        None => debug!("rolling summary discarded; meeting changed mid-pass"),
                     }
                 }
             }
@@ -7091,7 +7188,6 @@ fn maybe_fire_summary(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                 debug!("rolling summary pass skipped (no attached agent / drive failed)");
             }
         }
-        daemon.summary_inflight.store(false, SeqCst);
     });
 }
 
@@ -7271,7 +7367,32 @@ async fn maybe_trigger_for_me_question(daemon: &Arc<Daemon>, segment: &Transcrip
         Err(_) => return,
     };
 
-    let Some(detected) = cue_core::detect_for_me_question(segment, &settings.my_names) else {
+    // Two-stage question shape (PLAN-CONTEXT-WARMUP SET 1): the lexical check
+    // first (fast, precise), then the ONNX classifier on its REJECTS only —
+    // catching the disfluent/declarative questions regex misses. Speaker and
+    // name gating stay entirely in cue-core (`detect_for_me_question_given`).
+    let text = segment.text.trim();
+    #[allow(unused_mut)]
+    let mut question_shaped = cue_core::is_question_shaped(text);
+    #[cfg(feature = "local-memory")]
+    if !question_shaped
+        // Cheap pre-gates so we never pay inference on lines the detector or
+        // the substance guard below would discard anyway (own speech, scraps).
+        && !segment.speaker.is_me()
+        && text.chars().count() >= 12
+        && text.split_whitespace().count() >= 3
+    {
+        if let Some(classifier) = daemon.qdetect.lock().await.clone() {
+            question_shaped = classifier.classify(text).await.unwrap_or(false);
+            if question_shaped {
+                debug!(q = %text, "question shape: classifier caught a regex reject");
+            }
+        }
+    }
+
+    let Some(detected) =
+        cue_core::detect_for_me_question_given(segment, &settings.my_names, question_shaped)
+    else {
         return;
     };
 

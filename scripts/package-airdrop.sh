@@ -46,6 +46,17 @@ mkdir -p "$OUT/bin"
 # layout install.sh expects). cp -R carries the .app bundles and any dylib.
 cp -R "$STAGED"/. "$OUT/bin"/
 
+# Ship the question-detection classifier next to the daemon binary
+# (bin/models/qdetect-en — the daemon's exe-adjacent resolution path). It is
+# exported once by scripts/export-qdetect-onnx.sh; absent = the daemon falls
+# back to regex-only question detection, so packaging proceeds with a warning.
+if [[ -f "dist/models/qdetect-en/model_int8.onnx" ]]; then
+  mkdir -p "$OUT/bin/models"
+  cp -R "dist/models/qdetect-en" "$OUT/bin/models/"
+else
+  echo "package-airdrop: WARNING — dist/models/qdetect-en missing (run scripts/export-qdetect-onnx.sh); shipping regex-only question detection" >&2
+fi
+
 # Ship the AirDrop-capable installer (BLUEY_ARCHIVE local mode + ad-hoc re-sign)
 # at the tarball root so the receiver runs ./install.sh with no download.
 cp scripts/install.sh "$OUT/install.sh"

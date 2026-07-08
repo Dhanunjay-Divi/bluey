@@ -56,6 +56,11 @@ getrandom.workspace = true
 rusqlite.workspace = true
 hex = "0.4"
 sha2 = "0.10"
+# Question-detection classifier (SET 1): direct ort session + tokenizer under
+# the `local-memory` feature. Same exact ort pin as the rest of the stack so
+# cargo unifies on one native runtime.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std"], optional = true }
+tokenizers = { version = "0.23", optional = true }
 
 # On-device English STT + on-demand diarization (NVIDIA Parakeet/Nemotron +
 # Sortformer via ONNX Runtime). CPU-capable; the `ort` native lib bundles into
@@ -88,9 +93,10 @@ parakeet-stt = ["dep:parakeet-rs", "parakeet-rs/ort-defaults", "parakeet-rs/sort
 # OpenBLAS + CoreML. Build the daemon with `--features diarize` to enable.
 diarize = ["dep:cue-diarize"]
 # Cross-meeting facts memory on the local bge-small ONNX embedder (keyless,
-# on-device; PLAN-CONTEXT-WARMUP Appendix A/E). Ships in the MEETING build
+# on-device; PLAN-CONTEXT-WARMUP Appendix A/E) + the two-stage question
+# detector's ONNX classifier (SET 1). Ships in the MEETING build
 # (build-meeting.sh); pair with `parakeet-stt` (which links the ONNX runtime).
-local-memory = ["cue-rag/local-embed"]
+local-memory = ["cue-rag/local-embed", "dep:ort", "dep:tokenizers"]
 
 [dev-dependencies]
 # WAV reader for the on-device Parakeet inference smoke test + debug example

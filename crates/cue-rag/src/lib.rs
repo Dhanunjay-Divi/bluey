@@ -14,7 +14,7 @@ pub mod store;
 
 pub use chunker::{Chunk, Chunker};
 pub use embedder::{EmbeddingError, EmbeddingProvider};
-pub use facts::{AddOutcome, FactHit, FactsStore};
+pub use facts::{AddOutcome, FactHit, FactRow, FactsStore, HistoryRow};
 #[cfg(feature = "local-embed")]
 pub use local_embed::LocalBgeEmbedder;
 pub use store::{RagHit, VectorStore};

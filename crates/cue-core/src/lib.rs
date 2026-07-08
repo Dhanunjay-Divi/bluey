@@ -47,8 +47,8 @@ pub use config::{
     load_account, load_settings, save_account, save_settings, AccountConfig, CueSettings,
 };
 pub use intelligence::{
-    analyze_segment, detect_for_me_question, generate_recap, local_answer, ForMeQuestion,
-    SegmentAnalysis,
+    analyze_segment, detect_for_me_question, detect_for_me_question_given, generate_recap,
+    is_question_shaped, local_answer, ForMeQuestion, SegmentAnalysis,
 };
 pub use ipc::{DaemonRequest, DaemonResponse};
 pub use ledger::{

@@ -13,10 +13,21 @@
 //!   (the Zep temporal pattern; LongMemEval "knowledge updates" = 100% this way).
 //! - otherwise → ADD.
 //!
-//! v1 consolidation is this similarity heuristic (deliberate: no extra LLM call
-//! per fact); the extraction step is already LLM-verified. An LLM-judged
-//! ADD/UPDATE/DELETE pass is the documented follow-up if the heuristic proves
-//! too coarse in real use.
+//! Two consolidation paths share this store (PLAN-CONTEXT-WARMUP Appendix E):
+//!
+//! 1. **Agent-decided (the Mem0 paper's update phase)** — the daemon batches
+//!    new facts + the most-similar existing ones into one update-decision
+//!    prompt; the returned ADD / UPDATE / DELETE / NONE ops land here via
+//!    [`FactsStore::insert_fact`] / [`FactsStore::supersede_fact`] /
+//!    [`FactsStore::invalidate_fact`]. (mem0 v3 dropped this phase and went
+//!    additive-only — wrong for meetings, where decisions get REVERSED; we
+//!    keep the paper loop, verified against mem0 source 2026-07.)
+//! 2. **Similarity heuristic** ([`FactsStore::add_fact`]) — the fallback when
+//!    no agent is attached or its output is unusable.
+//!
+//! Every mutating op is recorded in `facts_history` (mem0's audit-log pattern:
+//! `memory_id, old_memory, new_memory, event, is_deleted, at`) — NONE is never
+//! logged, matching mem0.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -51,6 +62,26 @@ pub struct FactHit {
     pub created_at_ms: i64,
 }
 
+/// One CURRENT fact with its row id — what the update-decision phase retrieves
+/// and presents to the agent (via small display indexes, never raw ids).
+#[derive(Debug, Clone)]
+pub struct FactRow {
+    pub id: i64,
+    pub text: String,
+    pub score: f32,
+}
+
+/// One audit-trail row (mem0 history-table pattern).
+#[derive(Debug, Clone)]
+pub struct HistoryRow {
+    pub memory_id: i64,
+    pub old_memory: Option<String>,
+    pub new_memory: Option<String>,
+    pub event: String,
+    pub is_deleted: bool,
+    pub at_ms: i64,
+}
+
 /// SQLite-backed facts store. `Mutex<Connection>` — passes are short and this
 /// is shared across async tasks via `Arc`.
 pub struct FactsStore {
@@ -80,7 +111,18 @@ impl FactsStore {
                 embedding BLOB NOT NULL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_hash ON facts(hash);
-            CREATE INDEX IF NOT EXISTS idx_facts_valid ON facts(valid_to);",
+            CREATE INDEX IF NOT EXISTS idx_facts_valid ON facts(valid_to);
+            CREATE TABLE IF NOT EXISTS facts_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id INTEGER NOT NULL,
+                old_memory TEXT,
+                new_memory TEXT,
+                event TEXT NOT NULL,
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_facts_history_memory
+                ON facts_history(memory_id);",
         )
         .context("failed to run facts migrations")?;
         Ok(Self {
@@ -140,12 +182,175 @@ impl FactsStore {
             }
             _ => AddOutcome::Added,
         };
-        conn.execute(
-            "INSERT INTO facts (meeting_id, text, hash, created_at, valid_to, embedding)
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
-            params![meeting_id, text, hash, now, encode_embedding(embedding)],
-        )?;
+        let new_id = insert_row(&conn, meeting_id, text, &hash, now, embedding)?;
+        match outcome {
+            AddOutcome::Superseded { previous_id } => {
+                let old_text = fact_text(&conn, previous_id)?;
+                log_history(
+                    &conn,
+                    new_id,
+                    old_text.as_deref(),
+                    Some(text),
+                    "UPDATE",
+                    false,
+                    now,
+                )?;
+            }
+            _ => log_history(&conn, new_id, None, Some(text), "ADD", false, now)?,
+        }
         Ok(outcome)
+    }
+
+    /// ADD op (agent-decided): insert as a new current fact. `None` when the
+    /// exact-normalized text already exists (any validity) — the pre-agent
+    /// hash dedup should normally have filtered these.
+    pub fn insert_fact(
+        &self,
+        meeting_id: &str,
+        text: &str,
+        embedding: &[f32],
+    ) -> Result<Option<i64>> {
+        anyhow::ensure!(embedding.len() == self.dim, "embedding dim mismatch");
+        let text = text.trim();
+        anyhow::ensure!(!text.is_empty(), "empty fact");
+        let hash = normalized_hash(text);
+        let now = now_ms();
+        let conn = self.conn.lock().expect("facts store poisoned");
+        if hash_exists(&conn, &hash)? {
+            return Ok(None);
+        }
+        let id = insert_row(&conn, meeting_id, text, &hash, now, embedding)?;
+        log_history(&conn, id, None, Some(text), "ADD", false, now)?;
+        Ok(Some(id))
+    }
+
+    /// UPDATE op (agent-decided): the agent merged/corrected an existing fact.
+    /// Zep-style supersede — close the old row's validity window, insert the
+    /// revised text as a new current row. Returns the new row id; `None` when
+    /// `old_id` is not a current fact (already superseded by a concurrent op).
+    pub fn supersede_fact(
+        &self,
+        old_id: i64,
+        meeting_id: &str,
+        new_text: &str,
+        new_embedding: &[f32],
+    ) -> Result<Option<i64>> {
+        anyhow::ensure!(new_embedding.len() == self.dim, "embedding dim mismatch");
+        let new_text = new_text.trim();
+        anyhow::ensure!(!new_text.is_empty(), "empty fact");
+        let now = now_ms();
+        let conn = self.conn.lock().expect("facts store poisoned");
+        let closed = conn.execute(
+            "UPDATE facts SET valid_to = ?1 WHERE id = ?2 AND valid_to IS NULL",
+            params![now, old_id],
+        )?;
+        if closed == 0 {
+            return Ok(None);
+        }
+        let old_text = fact_text(&conn, old_id)?;
+        // Revised text may already exist verbatim (e.g. the agent "merged"
+        // into a fact we also hold) — the old row is closed either way; only
+        // skip the duplicate insert and log against the row holding the text.
+        let hash = normalized_hash(new_text);
+        let new_id = match id_by_hash(&conn, &hash)? {
+            Some(existing) => existing,
+            None => insert_row(&conn, meeting_id, new_text, &hash, now, new_embedding)?,
+        };
+        log_history(
+            &conn,
+            new_id,
+            old_text.as_deref(),
+            Some(new_text),
+            "UPDATE",
+            false,
+            now,
+        )?;
+        Ok(Some(new_id))
+    }
+
+    /// DELETE op (agent-decided contradiction): our supersede delta — close
+    /// the validity window, keep the row queryable in history. Returns false
+    /// when the id is not a current fact.
+    pub fn invalidate_fact(&self, id: i64) -> Result<bool> {
+        let now = now_ms();
+        let conn = self.conn.lock().expect("facts store poisoned");
+        let closed = conn.execute(
+            "UPDATE facts SET valid_to = ?1 WHERE id = ?2 AND valid_to IS NULL",
+            params![now, id],
+        )?;
+        if closed == 0 {
+            return Ok(false);
+        }
+        let old_text = fact_text(&conn, id)?;
+        log_history(&conn, id, old_text.as_deref(), None, "DELETE", true, now)?;
+        Ok(true)
+    }
+
+    /// Whether the exact-normalized text is already stored (any validity).
+    /// The update phase runs this BEFORE the agent call so already-known facts
+    /// short-circuit to NONE without costing a drive (mem0 v3's hash dedup).
+    pub fn contains_exact(&self, text: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("facts store poisoned");
+        hash_exists(&conn, &normalized_hash(text.trim()))
+    }
+
+    /// Top-`k` CURRENT facts by similarity, with row ids — the update phase's
+    /// retrieval (presented to the agent behind small display indexes).
+    pub fn similar_current(&self, embedding: &[f32], k: usize) -> Result<Vec<FactRow>> {
+        anyhow::ensure!(embedding.len() == self.dim, "embedding dim mismatch");
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().expect("facts store poisoned");
+        let mut stmt =
+            conn.prepare("SELECT id, text, embedding FROM facts WHERE valid_to IS NULL")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut out: Vec<FactRow> = Vec::new();
+        for row in rows {
+            let (id, text, blob) = row?;
+            let existing = decode_embedding(&blob);
+            if existing.len() != self.dim {
+                continue;
+            }
+            out.push(FactRow {
+                id,
+                text,
+                score: cosine(embedding, &existing),
+            });
+        }
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.truncate(k);
+        Ok(out)
+    }
+
+    /// Most recent audit rows, newest first (debug surface + tests).
+    pub fn recent_history(&self, limit: usize) -> Result<Vec<HistoryRow>> {
+        let conn = self.conn.lock().expect("facts store poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT memory_id, old_memory, new_memory, event, is_deleted, at_ms
+             FROM facts_history ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(HistoryRow {
+                memory_id: r.get(0)?,
+                old_memory: r.get(1)?,
+                new_memory: r.get(2)?,
+                event: r.get(3)?,
+                is_deleted: r.get::<_, i64>(4)? != 0,
+                at_ms: r.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Top-`k` CURRENT facts by cosine similarity, optionally excluding one
@@ -209,6 +414,66 @@ impl FactsStore {
         )?;
         Ok(n as usize)
     }
+}
+
+fn id_by_hash(conn: &Connection, hash: &str) -> Result<Option<i64>> {
+    conn.query_row("SELECT id FROM facts WHERE hash = ?1", params![hash], |r| {
+        r.get(0)
+    })
+    .optional()
+    .map_err(Into::into)
+}
+
+fn hash_exists(conn: &Connection, hash: &str) -> Result<bool> {
+    Ok(id_by_hash(conn, hash)?.is_some())
+}
+
+fn fact_text(conn: &Connection, id: i64) -> Result<Option<String>> {
+    conn.query_row("SELECT text FROM facts WHERE id = ?1", params![id], |r| {
+        r.get(0)
+    })
+    .optional()
+    .map_err(Into::into)
+}
+
+fn insert_row(
+    conn: &Connection,
+    meeting_id: &str,
+    text: &str,
+    hash: &str,
+    now: i64,
+    embedding: &[f32],
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO facts (meeting_id, text, hash, created_at, valid_to, embedding)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+        params![meeting_id, text, hash, now, encode_embedding(embedding)],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn log_history(
+    conn: &Connection,
+    memory_id: i64,
+    old_memory: Option<&str>,
+    new_memory: Option<&str>,
+    event: &str,
+    is_deleted: bool,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO facts_history (memory_id, old_memory, new_memory, event, is_deleted, at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            memory_id,
+            old_memory,
+            new_memory,
+            event,
+            is_deleted as i64,
+            now
+        ],
+    )?;
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -334,5 +599,59 @@ mod tests {
         store.add_fact("m1", "b", &[0.0, 1.0, 0.0]).unwrap();
         store.add_fact("m2", "c", &[0.0, 0.0, 1.0]).unwrap();
         assert_eq!(store.current_len().unwrap(), 3);
+    }
+
+    #[test]
+    fn agent_ops_supersede_invalidate_and_audit() {
+        let store = mem();
+        let id = store
+            .insert_fact("m1", "sla is 200ms", &[1.0, 0.0, 0.0])
+            .unwrap()
+            .expect("added");
+
+        // UPDATE: revised text replaces the old row; old stays in history.
+        let new_id = store
+            .supersede_fact(id, "m2", "sla moved to 300ms", &[0.9, 0.1, 0.0])
+            .unwrap()
+            .expect("superseded");
+        assert_ne!(new_id, id);
+        assert_eq!(store.current_len().unwrap(), 1);
+        let current = store.similar_current(&[1.0, 0.0, 0.0], 5).unwrap();
+        assert_eq!(current.len(), 1);
+        assert!(current[0].text.contains("300ms"));
+
+        // A second UPDATE against the already-closed id is a no-op.
+        assert!(store
+            .supersede_fact(id, "m2", "sla 400ms", &[0.8, 0.2, 0.0])
+            .unwrap()
+            .is_none());
+
+        // DELETE: closes the window, keeps history.
+        assert!(store.invalidate_fact(new_id).unwrap());
+        assert!(!store.invalidate_fact(new_id).unwrap(), "already closed");
+        assert_eq!(store.current_len().unwrap(), 0);
+
+        // Audit trail: ADD, UPDATE, DELETE — newest first; NONE never logged.
+        let history = store.recent_history(10).unwrap();
+        let events: Vec<&str> = history.iter().map(|h| h.event.as_str()).collect();
+        assert_eq!(events, vec!["DELETE", "UPDATE", "ADD"]);
+        assert!(history[0].is_deleted);
+        assert_eq!(history[1].old_memory.as_deref(), Some("sla is 200ms"));
+        assert_eq!(history[1].new_memory.as_deref(), Some("sla moved to 300ms"));
+    }
+
+    #[test]
+    fn insert_fact_exact_dup_is_none_and_contains_exact_sees_it() {
+        let store = mem();
+        store
+            .insert_fact("m1", "Use gRPC internally", &[1.0, 0.0, 0.0])
+            .unwrap()
+            .expect("added");
+        assert!(store
+            .insert_fact("m2", "use  grpc INTERNALLY", &[0.9, 0.1, 0.0])
+            .unwrap()
+            .is_none());
+        assert!(store.contains_exact("USE GRPC internally").unwrap());
+        assert!(!store.contains_exact("use rest externally").unwrap());
     }
 }

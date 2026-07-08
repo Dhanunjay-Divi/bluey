@@ -14,6 +14,9 @@ pub mod llm;
 #[cfg(feature = "local-memory")]
 pub mod memory;
 pub mod overlay;
+// Question-vs-statement ONNX classifier (two-stage detection, stage 2).
+#[cfg(feature = "local-memory")]
+pub mod qdetect;
 pub mod secrets;
 pub mod storage;
 pub mod stt;

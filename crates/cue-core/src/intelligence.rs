@@ -318,11 +318,27 @@ pub fn detect_for_me_question(
     segment: &TranscriptSegment,
     my_names: &[String],
 ) -> Option<ForMeQuestion> {
+    let text = segment.text.trim();
+    detect_for_me_question_given(segment, my_names, is_question(text))
+}
+
+/// [`detect_for_me_question`] with the question-shape decision INJECTED — the
+/// two-stage seam (PLAN-CONTEXT-WARMUP SET 1). The daemon's detector runs the
+/// lexical `is_question` first (fast, precise) and, on its rejects, an ONNX
+/// classifier that catches the disfluent/declarative questions regex misses
+/// ("so um do we need the flag or not", "wait is this thread safe" — measured:
+/// regex 41% recall on real meeting speech, classifier 63%+). Speaker + name
+/// gating stay identical regardless of who decided the question shape.
+pub fn detect_for_me_question_given(
+    segment: &TranscriptSegment,
+    my_names: &[String],
+    is_question_shaped: bool,
+) -> Option<ForMeQuestion> {
     if segment.speaker.is_me() {
         return None;
     }
     let text = segment.text.trim();
-    if text.is_empty() || !is_question(text) {
+    if text.is_empty() || !is_question_shaped {
         return None;
     }
 
@@ -344,6 +360,13 @@ pub fn detect_for_me_question(
         question: text.to_string(),
         matched_name,
     })
+}
+
+/// The lexical question-shape check (stage 1 of the two-stage detector): ends
+/// with `?` or starts with a wh/aux word. Public so the daemon can run it
+/// FIRST and only pay for the ONNX classifier on its rejects.
+pub fn is_question_shaped(text: &str) -> bool {
+    is_question(text)
 }
 
 /// Case-insensitive, word-boundary name match. Avoids firing on "Alexander"

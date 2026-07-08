@@ -25,31 +25,59 @@ command -v uv >/dev/null || { echo "export-qdetect: needs uv (https://docs.astra
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export UV_PYTHON_INSTALL_DIR="$WORK/py"
-uv venv --python 3.13 "$WORK/venv" >/dev/null
+# python 3.12: broadest ML wheel coverage (torch/onnx conflict on 3.13, checked).
+uv venv --python 3.12 "$WORK/venv" >/dev/null
+# Pinned to the battle-tested LEGACY exporter combo: torch>=2.9 defaults to the
+# dynamo exporter, whose opset version-conversion produced a graph that fails
+# onnx shape inference during quantization (verified 2026-07: "Inferred shape
+# and existing shape differ in dimension 0"). torch 2.6 + dynamo=False is the
+# classic path that quantize_dynamic supports reliably.
 uv pip install --python "$WORK/venv/bin/python" --quiet \
-  "optimum[exporters]" onnx onnxruntime torch transformers
+  'torch==2.6.*' 'transformers==4.*' onnx onnxruntime
 
 mkdir -p "$OUT"
 "$WORK/venv/bin/python" - "$OUT" <<'PY'
-import sys, shutil, tempfile, os
+import sys, tempfile, os
 out = sys.argv[1]
 tmp = tempfile.mkdtemp()
 
-# 1. Export fp32 ONNX via optimum.
-from optimum.exporters.onnx import main_export
-main_export(
-    "shahrukhx01/question-vs-statement-classifier",
-    output=tmp,
-    task="text-classification",
+# 1. Export fp32 ONNX via plain torch.onnx (dynamic batch/sequence axes).
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+MODEL = "shahrukhx01/question-vs-statement-classifier"
+tok = AutoTokenizer.from_pretrained(MODEL)
+pt = AutoModelForSequenceClassification.from_pretrained(MODEL)
+pt.eval()
+
+sample = tok("is this a question", return_tensors="pt")
+fp32_path = os.path.join(tmp, "model.onnx")
+torch.onnx.export(
+    pt,
+    (sample["input_ids"], sample["attention_mask"], sample["token_type_ids"]),
+    fp32_path,
+    input_names=["input_ids", "attention_mask", "token_type_ids"],
+    output_names=["logits"],
+    dynamic_axes={
+        "input_ids": {0: "batch", 1: "seq"},
+        "attention_mask": {0: "batch", 1: "seq"},
+        "token_type_ids": {0: "batch", 1: "seq"},
+        "logits": {0: "batch"},
+    },
+    opset_version=17,
+    dynamo=False,  # legacy TorchScript exporter — see pin rationale above
 )
 
 # 2. Dynamic int8 quantization (weights-only — robust for BERT classifiers).
 from onnxruntime.quantization import quantize_dynamic, QuantType
 quantize_dynamic(
-    os.path.join(tmp, "model.onnx"),
+    fp32_path,
     os.path.join(out, "model_int8.onnx"),
     weight_type=QuantType.QInt8,
 )
+# tokenizer.json for the Rust `tokenizers` crate.
+tok.save_pretrained(tmp)
+import shutil
 shutil.copy(os.path.join(tmp, "tokenizer.json"), os.path.join(out, "tokenizer.json"))
 
 # 3. PARITY CHECK: int8 ONNX must agree with the PyTorch model on labeled lines.

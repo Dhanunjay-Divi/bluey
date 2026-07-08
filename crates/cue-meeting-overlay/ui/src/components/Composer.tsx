@@ -31,11 +31,18 @@ export function Composer({
   models,
   selectedModel,
   onModelChange,
+  onAskRecent,
+  askRecentDisabled = false,
 }: {
   placeholder: string;
   contextLabel?: string;
   onSubmit: (text: string) => void;
   onMic?: () => void;
+  /** Manual "ask about what was just said" — fires the same ask pipeline as a
+   *  typed question with a canonical prompt. Omit to hide the button. */
+  onAskRecent?: () => void;
+  /** Disables the ask-recent button while an ask is already streaming. */
+  askRecentDisabled?: boolean;
   /** Daemon listening-pipeline state — drives the mic button's visual state so a
    *  connecting/failed start is never silently swallowed. */
   listenState?: ListeningState;
@@ -167,6 +174,23 @@ export function Composer({
         >
           ＋
         </button>
+        {onAskRecent && (
+          <button
+            onClick={onAskRecent}
+            disabled={askRecentDisabled}
+            aria-label="Ask about what was just said"
+            title="Ask about what was just said"
+            style={{
+              ...iconBtn,
+              fontSize: 14,
+              color: askRecentDisabled ? "var(--ink-4)" : "var(--tint-ink)",
+              cursor: askRecentDisabled ? "default" : "pointer",
+              opacity: askRecentDisabled ? 0.55 : 1,
+            }}
+          >
+            ✦
+          </button>
+        )}
         <input
           value={text}
           onChange={(e) => setText(e.target.value)}
