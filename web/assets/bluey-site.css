@@ -649,16 +649,25 @@
     }
 
     #productSite .nav-links .btn-nav {
-      background: var(--bluey-accent);
-      color: #061114;
-      padding: .45rem 1.2rem;
-      border-radius: 6px;
-      font-weight: 600;
+      display: inline-flex;
+      min-height: 32px;
+      align-items: center;
+      justify-content: center;
+      padding: 0 1rem;
+      border: 1px solid rgba(99, 216, 255, .62);
+      border-radius: 8px;
+      background: linear-gradient(135deg, #b8f2ff 0%, #63d8ff 52%, #4f8dff 100%);
+      color: #041216;
+      font-size: .86rem;
+      font-weight: 750;
+      line-height: 1;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, .20), inset 0 1px 0 rgba(255, 255, 255, .38);
     }
 
     #productSite .nav-links .btn-nav:hover {
-      background: #8ff5ff;
+      background: linear-gradient(135deg, #d7f8ff 0%, #78e4ff 52%, #65a2ff 100%);
       color: #061114;
+      box-shadow: 0 14px 30px rgba(0, 0, 0, .30), 0 0 18px rgba(99, 216, 255, .18), inset 0 1px 0 rgba(255, 255, 255, .44);
     }
 
     #productSite .nav-connect,
