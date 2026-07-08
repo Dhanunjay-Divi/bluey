@@ -3,7 +3,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Instant as StdInstant, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "macos")]
+use std::time::Instant as StdInstant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -2315,10 +2317,10 @@ $bitmap.Dispose()
     Ok(())
 }
 
-fn preview_capture(capture_path: &PathBuf) {
+fn preview_capture(_capture_path: &PathBuf) {
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open").arg(capture_path).status();
+        let _ = Command::new("open").arg(_capture_path).status();
     }
     #[cfg(target_os = "windows")]
     {
@@ -2326,7 +2328,7 @@ fn preview_capture(capture_path: &PathBuf) {
             .arg("/C")
             .arg("start")
             .arg("")
-            .arg(capture_path)
+            .arg(_capture_path)
             .status();
     }
 }

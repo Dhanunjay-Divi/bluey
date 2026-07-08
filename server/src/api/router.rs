@@ -51,45 +51,46 @@ const CODE_ARTIFACT_MIN_OUTPUT_TOKENS: u32 = 4_096;
 const CANVAS_DETAIL_MIN_OUTPUT_TOKENS: u32 = 3_072;
 const DEFAULT_CAPACITY_SHORT_WAIT_MAX_SECS: u64 = 2;
 
-fn record_answer_ops_event(
-    pool: &crate::db::DbPool,
-    account_id: &str,
-    request_id: &str,
-    session_id: Option<&str>,
-    trace_id: Option<&str>,
-    event_type: &str,
-    status: &str,
+struct AnswerOpsEvent<'a> {
+    account_id: &'a str,
+    request_id: &'a str,
+    session_id: Option<&'a str>,
+    trace_id: Option<&'a str>,
+    event_type: &'a str,
+    status: &'a str,
     metadata: serde_json::Value,
-) {
-    let mut metadata = metadata;
+}
+
+fn record_answer_ops_event(pool: &crate::db::DbPool, event: AnswerOpsEvent<'_>) {
+    let mut metadata = event.metadata;
     if let Some(object) = metadata.as_object_mut() {
-        object.insert("request_id".into(), serde_json::json!(request_id));
+        object.insert("request_id".into(), serde_json::json!(event.request_id));
         object.insert(
             "request_ref".into(),
-            serde_json::json!(short_observability_ref(Some(request_id))),
+            serde_json::json!(short_observability_ref(Some(event.request_id))),
         );
-        object.insert("session_id".into(), serde_json::json!(session_id));
+        object.insert("session_id".into(), serde_json::json!(event.session_id));
         object.insert(
             "session_ref".into(),
-            serde_json::json!(short_observability_ref(session_id)),
+            serde_json::json!(short_observability_ref(event.session_id)),
         );
-        object.insert("trace_id".into(), serde_json::json!(trace_id));
+        object.insert("trace_id".into(), serde_json::json!(event.trace_id));
     }
     if let Err(error) = ops_audit::record_event(
         pool,
         ops_audit::OpsAuditEventInput {
-            account_id_hash: Some(cue_core::account_id_hash_prefix(account_id)),
+            account_id_hash: Some(cue_core::account_id_hash_prefix(event.account_id)),
             actor_account_id_hash: None,
-            event_type: event_type.to_string(),
-            status: status.to_string(),
+            event_type: event.event_type.to_string(),
+            status: event.status.to_string(),
             metadata_json: metadata,
         },
     ) {
         tracing::warn!(
-            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
-            request_ref = %short_observability_ref(Some(request_id)),
-            session_ref = %short_observability_ref(session_id),
-            event_type,
+            account_id_hash = %cue_core::account_id_hash_prefix(event.account_id),
+            request_ref = %short_observability_ref(Some(event.request_id)),
+            session_ref = %short_observability_ref(event.session_id),
+            event_type = %event.event_type,
             error = %error,
             "failed to record redacted answer ops event"
         );
@@ -116,8 +117,7 @@ fn internal_disclosure_guard_text(text: &str) -> &str {
     let Some(after_label) = trimmed.strip_prefix("Question:") else {
         return trimmed;
     };
-    let after_label = after_label
-        .trim_start_matches(|ch: char| ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n');
+    let after_label = after_label.trim_start_matches([' ', '\t', '\r', '\n']);
     let end = after_label.find("\n\n").unwrap_or(after_label.len());
     after_label[..end].trim()
 }
@@ -533,6 +533,16 @@ fn capacity_error(reason: &str, retry_after_secs: u64) -> (StatusCode, Json<ApiE
             ..Default::default()
         }),
     )
+}
+
+fn internal_capacity_retry_delay(denied: &crate::rate_limit::CapacityDenied) -> Option<Duration> {
+    let retry_after_secs = denied.retry_after_secs.clamp(1, 2);
+    let is_account_guard = denied.reason.starts_with("account_");
+    let is_provider_capacity = denied.reason.starts_with("provider_")
+        || denied.reason.contains("provider_key")
+        || denied.reason.contains("cooling");
+    (!is_account_guard && is_provider_capacity && denied.retry_after_secs <= 2)
+        .then_some(Duration::from_secs(retry_after_secs))
 }
 
 fn release_and_capacity_error(
@@ -1170,14 +1180,7 @@ fn transcript_diagnostic_text(question: &str) -> String {
     if !lines.is_empty() {
         return lines.join("\n");
     }
-    let normalized = normalize_guardrail_text(question);
-    if is_generic_live_transcript_prompt(&normalized)
-        || looks_like_transcript_placeholder(&normalized)
-    {
-        String::new()
-    } else {
-        String::new()
-    }
+    String::new()
 }
 
 fn transcript_source_label_count(question: &str) -> usize {
@@ -1214,6 +1217,10 @@ fn answer_plan_for_request(
     let transcript_placeholder = looks_like_transcript_placeholder(&normalized);
     let has_images = !req.image_data_urls.is_empty() || requested_lane == "vision";
     let has_planning_context = !planning_context.trim().is_empty();
+    let generic_screen_capture_prompt = looks_like_generic_screen_capture_prompt(&normalized);
+    let quick_conceptual = !has_images
+        && !has_planning_context
+        && looks_like_quick_conceptual_question(&normalized, word_count);
     let follow_up = !topic_reset
         && short_question
         && contains_any(
@@ -1238,18 +1245,27 @@ fn answer_plan_for_request(
         && (looks_like_coding_question(&normalized_context) || has_code_shape(&normalized_context));
     let context_system_design =
         has_planning_context && looks_like_system_design_question(&normalized_context);
+    let context_system_design_followup = context_system_design
+        && !topic_reset
+        && looks_like_system_design_followup_question(&normalized);
+    let context_system_design_canvas_followup = context_system_design_followup
+        && looks_like_system_design_canvas_followup_question(&normalized);
     let diagram_request = looks_like_diagram_request(&normalized);
     let explicit_code_generation = looks_like_explicit_code_generation_request(&normalized);
-    let coding = ((!diagram_request || explicit_code_generation)
-        && looks_like_coding_question(&normalized))
-        || (has_images && context_coding)
-        || (generic_live_transcript_prompt && context_coding);
+    let coding = !quick_conceptual
+        && (((!diagram_request || explicit_code_generation)
+            && looks_like_coding_question(&normalized))
+            || (has_images && context_coding)
+            || (generic_screen_capture_prompt && context_coding)
+            || (generic_live_transcript_prompt && context_coding));
     let coding_followup = looks_like_coding_followup(&normalized, follow_up)
         || (has_planning_context
             && context_coding
             && looks_like_contextual_code_generation_followup(&normalized))
         || (has_images && context_coding && follow_up);
-    let simple_coding = coding && looks_like_simple_coding_question(&normalized, short_question);
+    let simple_coding = coding
+        && !(context_coding && (has_images || generic_screen_capture_prompt))
+        && looks_like_simple_coding_question(&normalized, short_question);
     let context_behavioral = generic_live_transcript_prompt
         && has_planning_context
         && !context_coding
@@ -1264,6 +1280,7 @@ fn answer_plan_for_request(
     let system_design = !behavioral
         && (diagram_request
             || looks_like_system_design_question(&normalized)
+            || context_system_design_canvas_followup
             || (generic_live_transcript_prompt && context_system_design));
     let screen = has_images
         || contains_any(
@@ -1281,7 +1298,6 @@ fn answer_plan_for_request(
             "spreadsheet",
         ],
     );
-    let generic_screen_capture_prompt = looks_like_generic_screen_capture_prompt(&normalized);
     let docs = docs_requested
         && (!generic_screen_capture_prompt
             || planning_context_has_document_signal(&normalized_context));
@@ -1336,7 +1352,8 @@ fn answer_plan_for_request(
                 ],
             ));
     let public_lookup_phrase = looks_like_public_lookup_phrase(&normalized, word_count);
-    let about_unknown = rag_matches.is_empty()
+    let about_unknown = !quick_conceptual
+        && rag_matches.is_empty()
         && !screen
         && !coding
         && !behavioral
@@ -1350,7 +1367,7 @@ fn answer_plan_for_request(
             || normalized.contains(" information about "));
     let needs_web_search =
         !screen && !coding && !behavioral && !system_design && (explicit_web || about_unknown);
-    let screen_without_image = screen && !has_images;
+    let screen_without_image = screen && !has_images && !has_planning_context;
     let has_any_attached_evidence = has_images || has_planning_context || !rag_matches.is_empty();
     let missing_context = !needs_web_search
         && rag_matches.is_empty()
@@ -1384,7 +1401,9 @@ fn answer_plan_for_request(
         AnswerIntent::Coding
     } else if screen {
         AnswerIntent::Screen
-    } else if topic_reset && short_question {
+    } else if context_system_design_followup {
+        AnswerIntent::FollowUp
+    } else if quick_conceptual || (topic_reset && short_question) {
         AnswerIntent::Quick
     } else if meeting {
         AnswerIntent::Meeting
@@ -1579,11 +1598,25 @@ fn lane_for_answer_plan(requested_lane: &str, plan: &AnswerPlan, enabled: bool) 
     if requested == "vision" {
         return "vision".to_string();
     }
+    if requested == "instant"
+        && plan.output == AnswerOutput::Compact
+        && !matches!(
+            plan.intent,
+            AnswerIntent::Coding
+                | AnswerIntent::CodingFollowUp
+                | AnswerIntent::SystemDesign
+                | AnswerIntent::Screen
+                | AnswerIntent::Research
+        )
+    {
+        return "instant".to_string();
+    }
     plan.recommended_lane.to_string()
 }
 
 fn max_tokens_for_answer_plan(requested: Option<u32>, output: AnswerOutput) -> Option<u32> {
     match output {
+        AnswerOutput::Compact => Some(requested.unwrap_or(512).min(512)),
         AnswerOutput::CodeArtifact => Some(
             requested
                 .unwrap_or(CODE_ARTIFACT_MIN_OUTPUT_TOKENS)
@@ -1963,10 +1996,8 @@ fn merge_ai_answer_plan(
     }
     let recommended_lane = default_lane_for_intent(intent);
     if let Some(lane) = payload.lane.as_deref().and_then(valid_answer_lane) {
-        if !lane_matches_intent(intent, lane) {
-            if !hard_override_applied {
-                return None;
-            }
+        if !lane_matches_intent(intent, lane) && !hard_override_applied {
+            return None;
         }
     }
     let mut needs_web_search = payload
@@ -2325,6 +2356,59 @@ fn looks_like_simple_coding_question(normalized: &str, short_question: bool) -> 
                 "function",
             ],
         )
+}
+
+fn looks_like_quick_conceptual_question(normalized: &str, word_count: usize) -> bool {
+    if word_count == 0 || word_count > 16 || normalized.chars().count() > 180 {
+        return false;
+    }
+
+    if looks_like_algorithmic_challenge_prompt(normalized)
+        || looks_like_explicit_code_generation_request(normalized)
+        || contains_any(
+            normalized,
+            &[
+                "system design",
+                "design a system",
+                "architecture",
+                "scale this",
+                "scalability",
+                "screenshot",
+                "screen context",
+                "attached",
+                "current session",
+                "current context",
+                "transcript",
+                "search web",
+                "web search",
+                "look up",
+                "latest",
+            ],
+        )
+    {
+        return false;
+    }
+
+    contains_any(
+        normalized,
+        &[
+            "difference between",
+            "compare",
+            " vs ",
+            " versus ",
+            "what is",
+            "what are",
+            "why is",
+            "why does",
+            "how does",
+            "how do",
+            "how would you approach",
+            "can you explain",
+            "explain me",
+            "explain the difference",
+            "when would",
+        ],
+    )
 }
 
 fn looks_like_coding_followup(normalized: &str, follow_up: bool) -> bool {
@@ -2744,6 +2828,25 @@ fn looks_like_system_design_question(normalized: &str) -> bool {
         normalized,
         &[
             "system design",
+            "design url shortener",
+            "design a url shortener",
+            "design an url shortener",
+            "design tinyurl",
+            "design bitly",
+            "design a rate limiter",
+            "design rate limiter",
+            "design notification system",
+            "design a notification system",
+            "design chat app",
+            "design a chat app",
+            "design messaging app",
+            "design a messaging app",
+            "design news feed",
+            "design a news feed",
+            "design pastebin",
+            "design a cache",
+            "design cache",
+            "design distributed",
             "design a system",
             "design an app",
             "design the architecture",
@@ -2759,6 +2862,148 @@ fn looks_like_system_design_question(normalized: &str) -> bool {
             "sharding",
             "replication",
             "event driven",
+        ],
+    )
+}
+
+fn looks_like_system_design_followup_question(normalized: &str) -> bool {
+    if normalized.trim().is_empty() {
+        return false;
+    }
+    let followup_signal = contains_any(
+        normalized,
+        &[
+            "this design",
+            "that design",
+            "same design",
+            "above design",
+            "previous design",
+            "current design",
+            "this architecture",
+            "that architecture",
+            "same architecture",
+            "above architecture",
+            "previous architecture",
+            "current architecture",
+            "what about",
+            "how about",
+            "what happens if",
+            "what if",
+            "where would",
+            "when would",
+            "can we",
+            "should we",
+            "why did",
+            "why do",
+            "why use",
+            "why would",
+            "explain",
+            "walk me through",
+            "continue",
+            "keep going",
+            "go on",
+            "next section",
+            "next part",
+            "expand",
+            "elaborate",
+            "add ",
+            "include ",
+            "cover ",
+            "extend ",
+        ],
+    );
+    if !followup_signal {
+        return false;
+    }
+    contains_any(
+        normalized,
+        &[
+            "design",
+            "architecture",
+            "requirement",
+            "api",
+            "gateway",
+            "service",
+            "services",
+            "endpoint",
+            "token",
+            "counter",
+            "counters",
+            "redis",
+            "data model",
+            "database",
+            "schema",
+            "cache",
+            "queue",
+            "worker",
+            "workers",
+            "event",
+            "stream",
+            "latency",
+            "throughput",
+            "scale",
+            "scaling",
+            "shard",
+            "partition",
+            "replica",
+            "region",
+            "availability",
+            "consistency",
+            "tradeoff",
+            "failure",
+            "fallback",
+            "retry",
+            "observability",
+            "metrics",
+            "logs",
+            "security",
+            "auth",
+            "rate limit",
+        ],
+    ) || contains_any(
+        normalized,
+        &[
+            "continue",
+            "keep going",
+            "go on",
+            "next section",
+            "next part",
+        ],
+    )
+}
+
+fn looks_like_system_design_canvas_followup_question(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "continue",
+            "keep going",
+            "go on",
+            "next section",
+            "next part",
+            "expand",
+            "elaborate",
+            "add ",
+            "include ",
+            "cover ",
+            "extend ",
+            "append ",
+            "update ",
+            "fill in",
+            "what about",
+            "how about",
+            "failure mode",
+            "failure modes",
+            "tradeoff",
+            "tradeoffs",
+            "scaling",
+            "scale",
+            "data model",
+            "api design",
+            "observability",
+            "security",
+            "rate limiting",
+            "rollout",
         ],
     )
 }
@@ -2840,13 +3085,13 @@ fn prompt_with_answer_plan(
             "For first-time coding or algorithm answers, start with a short spoken lead-in the user could say on a call: the core idea and why it works, in one or two natural sentences. Then use this exact scan-friendly shape when code is needed: `Approach`, then `Code`, then `Explanation`, then `Complexity`, then `Edge cases` when useful. Under Approach, give 2-4 clear bullets before the code. Under Code, give complete working code in a fenced code block with a language tag. Use the language implied by the prompt or screen; if none is specified for an interview algorithm prompt, use Python. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. For Python/LeetCode-style answers, include required imports or avoid type hints that need imports. Put each statement on its own line with correct indentation; never compress class, function, assignments, and return onto one wrapped line. Add concise comments inside non-trivial code: place a short comment above each major block and on the important decision lines that explain why that line or block exists. Do not comment every trivial assignment. For LeetCode/interview algorithm prompts, include the full class/function signature, initialization, loop/body, return value, and any sentinel/cleanup step; never provide only the inner loop or a pseudocode fragment. For data-structure interview prompts such as LRU cache, implement from first principles with a hashmap plus doubly linked list unless the user explicitly asks for a library shortcut; mention library helpers only as alternatives after the real implementation. For non-trivial code, add a short `Line notes:` block outside the code fence using `1: ...` or small `2-4: ...` notes for the important executable lines. Keep explanatory notes outside the code so copied code stays clean. Always include Time Complexity and Space Complexity explicitly. Do not give only a summary."
         }
         AnswerIntent::CodingFollowUp => {
-            "Treat this as a follow-up to existing code when relevant. Answer like you are responding live on a call: start with the direct conclusion in plain English, then explain the reason, caveat, or better option. For line-number follow-ups, use the supplied prior code artifact display line numbers as authoritative. Do not say probably, likely, or I think when the referenced line is present; if the exact line is not in context, say the exact line is not available instead of guessing. For complexity questions, say exactly which part has that complexity and whether the whole algorithm can truly be improved. For questions like \"can we make it better\", give the honest answer first, then the practical optimization if one exists. Preserve the existing artifact unless the user asks for a new one. For requested changes, use `Approach`, then `Patch` or `Changed block`, then `Explanation`, then `Complexity` if the complexity changes. Prefer the smallest safe in-place code change, changed block, or unified diff; do not replace the whole implementation unless the user asks for a full rewrite, the existing code is tiny, or a full replacement is materially safer. If the user asks to regenerate the full solution or asks for the same code in another language, include the complete fenced implementation in that language with the full wrapper/signature, not only a middle fragment. Put each statement on its own line with correct indentation and add concise comments above changed blocks and on important decision lines. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
+            "Treat this as a follow-up to existing code when relevant. Answer like you are responding live on a call: start with the direct conclusion in plain English, then explain the reason, caveat, or better option. For line-number follow-ups, use the supplied prior code artifact display line numbers as authoritative. Do not say probably, likely, or I think when the referenced line is present; if the exact line is not in context, say the exact line is not available instead of guessing. For complexity questions, say exactly which part has that complexity and whether the whole algorithm can truly be improved. For questions like \"can we make it better\", give the honest answer first, then the practical optimization if one exists. Preserve the existing artifact identity unless the user asks for a new problem, but when code is requested or changed, return the entire updated implementation as a complete fenced implementation. Do not output a patch, unified diff, changed block, or only the edited lines. The code artifact must be a full in-place replacement: include unchanged surrounding code, full class/function signature, imports when needed, initialization, body, return value, and cleanup/sentinel logic. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. Put each statement on its own line with correct indentation and add concise comments above changed blocks and on important decision lines. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
         }
         AnswerIntent::Behavioral => {
             "Answer like a polished interview coach and candidate voice: natural, first-person when appropriate, specific, and conversational. Use the supplied resume, JD, documents, transcript, and screen context to infer the role and domain, such as SDE, data engineer, BI engineer, data scientist, DevOps, security, product, or another role. First infer what the interviewer is testing, such as Dive Deep, ownership, technical depth, data quality, system judgment, prioritization, stakeholder communication, or tradeoffs, then make the response prove that signal. For resume-based introductions, self-introductions, or prompts like \"tell me about yourself\", do not compress the resume into one facts paragraph and do not ask the user what kind of long answer they want when the resume/context is already supplied. Use a speakable present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role. For introductions, give the full ready-to-say answer on the first response and aim for a 45-60 second answer unless the user explicitly asks for a shorter version. For role/domain interview questions, give a ready-to-say answer anchored only in the supplied company, project, tools, metrics, constraints, and role expectations; when useful, include a brief why-it-works or if-they-push-back recovery line. Do not defend weak story logic blindly: reframe it in a production-realistic way, such as code ownership, incident debugging, architecture tradeoffs, upstream data, ETL validation, reporting impact, stakeholder communication, or KPI definition. For interview stories, aim for a 45-90 second answer in tight paragraphs, not generic bullets, unless the user asks for notes. Do not invent metrics, employers, tools, source systems, clinical/finance details, latency windows, outcomes, or motivation beyond the supplied resume/JD/context. If exact story detail is missing, say the framing safely with phrases like \"I would frame it as...\" or \"the signal I would emphasize is...\" instead of fabricating a result. Never route resume/self-intro or interview-coaching prompts into system design just because they mention architecture or systems."
         }
         AnswerIntent::SystemDesign => {
-            "Use clear sections for requirements, architecture, data flow, tradeoffs, scaling, and failure modes. When the user asks for a diagram, pictorial representation, flowchart, sequence diagram, or visual explanation, start the canvas detail with `### Diagram` and include a compact ASCII box/arrow diagram or a fenced `mermaid` diagram with short labels. Keep it practical and avoid overexplaining obvious basics."
+            "Use clear sections for requirements, architecture, data flow, tradeoffs, scaling, and failure modes. When this is a follow-up to an existing system-design canvas, answer only the requested continuation or section; do not repeat the entire previous design, because the canvas keeps the earlier material. When the user asks for a diagram, pictorial representation, flowchart, sequence diagram, or visual explanation, start the canvas detail with `### Diagram` and include a compact ASCII box/arrow diagram or a fenced `mermaid` diagram with short labels. Keep it practical and avoid overexplaining obvious basics."
         }
         AnswerIntent::Screen => {
             "Use visible screen details first. Say when an important detail is not visible instead of inventing it."
@@ -3743,10 +3988,10 @@ fn retrieval_status_entries(
             "Using relevant conversation context...".to_string(),
         ));
     }
-    if web_search.attempted {
+    if web_search.attempted && web_search.skipped_reason.is_none() {
         statuses.push(("searching_web".to_string(), "Searching web...".to_string()));
     }
-    if web_search.sources.len() > 0 {
+    if !web_search.sources.is_empty() {
         statuses.push((
             "reading_web_sources".to_string(),
             format!("Reading {} sources...", web_search.sources.len()),
@@ -4235,8 +4480,19 @@ async fn complete_stream_inner(
     let mut selected_stream: Option<routing::StreamingCompletion> = None;
     let mut selected_first_event: Option<anyhow::Result<routing::CompletionStreamEvent>> = None;
 
-    let mut capacity_scan_retries = 0u8;
-    'streaming_route_scan: loop {
+    let mut capacity_sweeps_used = 0usize;
+    for capacity_sweep in 0..=1 {
+        capacity_sweeps_used = capacity_sweep;
+        if capacity_sweep > 0 {
+            last_error = None;
+            last_capacity = None;
+            last_failure_was_capacity = false;
+            selected_route_idx = 0;
+            selected_route = None;
+            selected_stream = None;
+            selected_first_event = None;
+        }
+
         for (idx, route) in routes.iter().enumerate() {
             let key_candidates = state.config.upstream.key_candidates(
                 route.provider,
@@ -4249,7 +4505,6 @@ async fn complete_stream_inner(
                 last_error = Some(missing_provider_key_error(route.provider));
                 continue;
             }
-
             loop {
                 let selected_key = match state
                     .provider_health
@@ -4351,23 +4606,25 @@ async fn complete_stream_inner(
                                 if first_event_latency_ms >= SLOW_FIRST_TOKEN_AUDIT_MS {
                                     record_answer_ops_event(
                                         &state.pool,
-                                        &account.id,
-                                        &req.request_id,
-                                        req.session_id.as_deref(),
-                                        Some(&trace_id),
-                                        "answer_slow_first_token",
-                                        "warning",
-                                        serde_json::json!({
-                                            "lane": lane_log.as_str(),
-                                            "effective_lane": effective_lane_log.as_str(),
-                                            "provider": route.provider,
-                                            "model": route.model,
-                                            "route_index": idx,
-                                            "was_fallback": idx > 0,
-                                            "first_event_latency_ms": first_event_latency_ms,
-                                            "first_event_kind": first_event_kind,
-                                            "streaming": true
-                                        }),
+                                        AnswerOpsEvent {
+                                            account_id: &account.id,
+                                            request_id: &req.request_id,
+                                            session_id: req.session_id.as_deref(),
+                                            trace_id: Some(&trace_id),
+                                            event_type: "answer_slow_first_token",
+                                            status: "warning",
+                                            metadata: serde_json::json!({
+                                                "lane": lane_log.as_str(),
+                                                "effective_lane": effective_lane_log.as_str(),
+                                                "provider": route.provider,
+                                                "model": route.model,
+                                                "route_index": idx,
+                                                "was_fallback": idx > 0,
+                                                "first_event_latency_ms": first_event_latency_ms,
+                                                "first_event_kind": first_event_kind,
+                                                "streaming": true
+                                            }),
+                                        },
                                     );
                                 }
                                 selected_first_event = first_event;
@@ -4458,30 +4715,22 @@ async fn complete_stream_inner(
         if selected_stream.is_some() {
             break;
         }
-        if last_failure_was_capacity && capacity_scan_retries == 0 {
-            if let Some(denied) = last_capacity.as_ref() {
-                if let Some(wait_secs) = short_capacity_wait_secs(denied.retry_after_secs) {
-                    tracing::info!(
-                        account_id_hash = %account_id_hash,
-                        request_id = %req.request_id,
-                        request_ref = %request_ref_log,
-                        session_ref = %session_ref_log,
-                        lane = %lane_log,
-                        effective_lane = %effective_lane_log,
-                        reason = denied.reason,
-                        retry_after_secs = denied.retry_after_secs,
-                        wait_secs,
-                        candidate_routes = routes.len(),
-                        streaming = true,
-                        "all streaming routes hit a short capacity window; waiting and rescanning"
-                    );
-                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-                    capacity_scan_retries += 1;
-                    last_capacity = None;
-                    last_failure_was_capacity = false;
-                    continue 'streaming_route_scan;
-                }
-            }
+        if let Some(denied) = last_capacity
+            .as_ref()
+            .filter(|_| last_failure_was_capacity)
+            .and_then(internal_capacity_retry_delay)
+        {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                request_id = %req.request_id,
+                request_ref = %request_ref_log,
+                session_ref = %session_ref_log,
+                capacity_sweep,
+                wait_ms = denied.as_millis() as u64,
+                "all streaming routes briefly capacity busy; waiting before internal retry sweep"
+            );
+            tokio::time::sleep(denied).await;
+            continue;
         }
         break;
     }
@@ -4502,27 +4751,29 @@ async fn complete_stream_inner(
                     reason = denied.reason,
                     retry_after_secs = denied.retry_after_secs,
                     candidate_routes = routes.len(),
-                    capacity_scan_retries,
+                    capacity_sweeps_used,
                     streaming = true,
                     "all streaming routes still capacity-busy after fallback scan"
                 );
                 record_answer_ops_event(
                     &state.pool,
-                    &account.id,
-                    &req.request_id,
-                    req.session_id.as_deref(),
-                    Some(&trace_id),
-                    "answer_capacity_busy",
-                    "capacity_busy",
-                    serde_json::json!({
+                    AnswerOpsEvent {
+                        account_id: &account.id,
+                        request_id: &req.request_id,
+                        session_id: req.session_id.as_deref(),
+                        trace_id: Some(&trace_id),
+                        event_type: "answer_capacity_busy",
+                        status: "capacity_busy",
+                        metadata: serde_json::json!({
                         "lane": lane_log.as_str(),
                         "effective_lane": effective_lane_log.as_str(),
                         "streaming": true,
                         "reason": denied.reason,
                         "retry_after_secs": denied.retry_after_secs,
                         "candidate_routes": routes.len(),
-                        "capacity_scan_retries": capacity_scan_retries
-                    }),
+                        "capacity_sweeps_used": capacity_sweeps_used
+                        }),
+                    },
                 );
                 return Err(capacity_error(denied.reason, denied.retry_after_secs));
             }
@@ -4537,20 +4788,22 @@ async fn complete_stream_inner(
                 );
                 record_answer_ops_event(
                     &state.pool,
-                    &account.id,
-                    &req.request_id,
-                    req.session_id.as_deref(),
-                    Some(&trace_id),
-                    "answer_failed",
-                    "upstream_error",
-                    serde_json::json!({
+                    AnswerOpsEvent {
+                        account_id: &account.id,
+                        request_id: &req.request_id,
+                        session_id: req.session_id.as_deref(),
+                        trace_id: Some(&trace_id),
+                        event_type: "answer_failed",
+                        status: "upstream_error",
+                        metadata: serde_json::json!({
                         "lane": lane_log.as_str(),
                         "effective_lane": effective_lane_log.as_str(),
                         "streaming": true,
                         "error_kind": "all_streaming_routes_failed",
                         "error_preview": truncate_chars(&e.to_string(), 180),
                         "candidate_routes": routes.len()
-                    }),
+                        }),
+                    },
                 );
             }
             return Err((
@@ -4657,17 +4910,18 @@ async fn complete_stream_inner(
                     );
                     record_answer_ops_event(
                         &state.pool,
-                        &account.id,
-                        &req.request_id,
-                        req.session_id.as_deref(),
-                        Some(&trace_id),
-                        "answer_failed",
-                        if retry_after_secs.is_some() {
+                        AnswerOpsEvent {
+                            account_id: &account.id,
+                            request_id: &req.request_id,
+                            session_id: req.session_id.as_deref(),
+                            trace_id: Some(&trace_id),
+                            event_type: "answer_failed",
+                            status: if retry_after_secs.is_some() {
                             "provider_capacity"
                         } else {
                             "upstream_stream_error"
                         },
-                        serde_json::json!({
+                            metadata: serde_json::json!({
                             "lane": lane_log.as_str(),
                             "effective_lane": effective_lane_log.as_str(),
                             "provider": streaming.provider.as_str(),
@@ -4676,7 +4930,8 @@ async fn complete_stream_inner(
                             "delivered_delta": delivered_delta,
                             "retry_after_secs": retry_after_secs,
                             "error_preview": truncate_chars(&e.to_string(), 180)
-                        }),
+                            }),
+                        },
                     );
                     let payload = if let Some(retry_after_secs) = retry_after_secs {
                         serde_json::json!({
@@ -4712,20 +4967,22 @@ async fn complete_stream_inner(
             );
             record_answer_ops_event(
                 &state.pool,
-                &account.id,
-                &req.request_id,
-                req.session_id.as_deref(),
-                Some(&trace_id),
-                "answer_failed",
-                "upstream_stream_incomplete",
-                serde_json::json!({
+                AnswerOpsEvent {
+                    account_id: &account.id,
+                    request_id: &req.request_id,
+                    session_id: req.session_id.as_deref(),
+                    trace_id: Some(&trace_id),
+                    event_type: "answer_failed",
+                    status: "upstream_stream_incomplete",
+                    metadata: serde_json::json!({
                     "lane": lane_log.as_str(),
                     "effective_lane": effective_lane_log.as_str(),
                     "provider": streaming.provider.as_str(),
                     "model": streaming.model.as_str(),
                     "streaming": true,
                     "delivered_delta": delivered_delta
-                }),
+                    }),
+                },
             );
             yield Ok(Event::default().event("error").data(
                 serde_json::json!({
@@ -4768,13 +5025,14 @@ async fn complete_stream_inner(
             );
             record_answer_ops_event(
                 &state.pool,
-                &account.id,
-                &req.request_id,
-                req.session_id.as_deref(),
-                Some(&trace_id),
-                "answer_failed",
-                "code_artifact_missing",
-                serde_json::json!({
+                AnswerOpsEvent {
+                    account_id: &account.id,
+                    request_id: &req.request_id,
+                    session_id: req.session_id.as_deref(),
+                    trace_id: Some(&trace_id),
+                    event_type: "answer_failed",
+                    status: "code_artifact_missing",
+                    metadata: serde_json::json!({
                     "lane": lane_log.as_str(),
                     "effective_lane": effective_lane_log.as_str(),
                     "provider": streaming.provider.as_str(),
@@ -4786,7 +5044,8 @@ async fn complete_stream_inner(
                     "question_hash": request_diag.question_hash,
                     "context_hash": request_diag.context_hash,
                     "context_coding_signal": request_diag.context_coding_signal
-                }),
+                    }),
+                },
             );
             let payload = serde_json::json!({
                 "error": "Bluey expected code for this answer, but the provider returned only prose. Please retry.",
@@ -5395,8 +5654,18 @@ async fn complete_inner(
     let mut selected_route: Option<&PricedRoute> = None;
     let mut selected_completion: Option<routing::Completion> = None;
 
-    let mut capacity_scan_retries = 0u8;
-    'route_scan: loop {
+    let mut capacity_sweeps_used = 0usize;
+    for capacity_sweep in 0..=1 {
+        capacity_sweeps_used = capacity_sweep;
+        if capacity_sweep > 0 {
+            last_error = None;
+            last_capacity = None;
+            last_failure_was_capacity = false;
+            selected_route_idx = 0;
+            selected_route = None;
+            selected_completion = None;
+        }
+
         for (idx, route) in routes.iter().enumerate() {
             let key_candidates = state.config.upstream.key_candidates(
                 route.provider,
@@ -5406,7 +5675,6 @@ async fn complete_inner(
                 last_error = Some(missing_provider_key_error(route.provider));
                 continue;
             }
-
             loop {
                 let selected_key = match state
                     .provider_health
@@ -5535,30 +5803,22 @@ async fn complete_inner(
         if selected_completion.is_some() {
             break;
         }
-        if last_failure_was_capacity && capacity_scan_retries == 0 {
-            if let Some(denied) = last_capacity.as_ref() {
-                if let Some(wait_secs) = short_capacity_wait_secs(denied.retry_after_secs) {
-                    tracing::info!(
-                        account_id_hash = %account_id_hash,
-                        request_id = %req.request_id,
-                        request_ref = %request_ref_log,
-                        session_ref = %session_ref_log,
-                        lane = %lane_log,
-                        effective_lane = %effective_lane_log,
-                        reason = denied.reason,
-                        retry_after_secs = denied.retry_after_secs,
-                        wait_secs,
-                        candidate_routes = routes.len(),
-                        streaming = false,
-                        "all routes hit a short capacity window; waiting and rescanning"
-                    );
-                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-                    capacity_scan_retries += 1;
-                    last_capacity = None;
-                    last_failure_was_capacity = false;
-                    continue 'route_scan;
-                }
-            }
+        if let Some(denied) = last_capacity
+            .as_ref()
+            .filter(|_| last_failure_was_capacity)
+            .and_then(internal_capacity_retry_delay)
+        {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                request_id = %req.request_id,
+                request_ref = %request_ref_log,
+                session_ref = %session_ref_log,
+                capacity_sweep,
+                wait_ms = denied.as_millis() as u64,
+                "all routes briefly capacity busy; waiting before internal retry sweep"
+            );
+            tokio::time::sleep(denied).await;
+            continue;
         }
         break;
     }
@@ -5581,27 +5841,29 @@ async fn complete_inner(
                     reason = denied.reason,
                     retry_after_secs = denied.retry_after_secs,
                     candidate_routes = routes.len(),
-                    capacity_scan_retries,
+                    capacity_sweeps_used,
                     streaming = false,
                     "all routes still capacity-busy after fallback scan"
                 );
                 record_answer_ops_event(
                     &state.pool,
-                    &account.id,
-                    &req.request_id,
-                    req.session_id.as_deref(),
-                    Some(&trace_id),
-                    "answer_capacity_busy",
-                    "capacity_busy",
-                    serde_json::json!({
+                    AnswerOpsEvent {
+                        account_id: &account.id,
+                        request_id: &req.request_id,
+                        session_id: req.session_id.as_deref(),
+                        trace_id: Some(&trace_id),
+                        event_type: "answer_capacity_busy",
+                        status: "capacity_busy",
+                        metadata: serde_json::json!({
                         "lane": lane_log.as_str(),
                         "effective_lane": effective_lane_log.as_str(),
                         "streaming": false,
                         "reason": denied.reason,
                         "retry_after_secs": denied.retry_after_secs,
                         "candidate_routes": routes.len(),
-                        "capacity_scan_retries": capacity_scan_retries
-                    }),
+                        "capacity_sweeps_used": capacity_sweeps_used
+                        }),
+                    },
                 );
                 return Err(capacity_error(denied.reason, denied.retry_after_secs));
             }
@@ -5620,20 +5882,22 @@ async fn complete_inner(
                 );
                 record_answer_ops_event(
                     &state.pool,
-                    &account.id,
-                    &req.request_id,
-                    req.session_id.as_deref(),
-                    Some(&trace_id),
-                    "answer_failed",
-                    "upstream_error",
-                    serde_json::json!({
+                    AnswerOpsEvent {
+                        account_id: &account.id,
+                        request_id: &req.request_id,
+                        session_id: req.session_id.as_deref(),
+                        trace_id: Some(&trace_id),
+                        event_type: "answer_failed",
+                        status: "upstream_error",
+                        metadata: serde_json::json!({
                         "lane": lane_log.as_str(),
                         "effective_lane": effective_lane_log.as_str(),
                         "streaming": false,
                         "error_kind": "all_routes_failed",
                         "error_preview": truncate_chars(&e.to_string(), 180),
                         "candidate_routes": routes.len()
-                    }),
+                        }),
+                    },
                 );
             }
             return Err((
@@ -5684,13 +5948,14 @@ async fn complete_inner(
         );
         record_answer_ops_event(
             &state.pool,
-            &account.id,
-            &req.request_id,
-            req.session_id.as_deref(),
-            Some(&trace_id),
-            "answer_failed",
-            "code_artifact_missing",
-            serde_json::json!({
+            AnswerOpsEvent {
+                account_id: &account.id,
+                request_id: &req.request_id,
+                session_id: req.session_id.as_deref(),
+                trace_id: Some(&trace_id),
+                event_type: "answer_failed",
+                status: "code_artifact_missing",
+                metadata: serde_json::json!({
                 "lane": lane_log.as_str(),
                 "effective_lane": effective_lane_log.as_str(),
                 "provider": comp.provider.as_str(),
@@ -5702,7 +5967,8 @@ async fn complete_inner(
                 "question_hash": request_diag.question_hash,
                 "context_hash": request_diag.context_hash,
                 "context_coding_signal": request_diag.context_coding_signal
-            }),
+                }),
+            },
         );
         return Err(code_artifact_missing_error());
     }
@@ -6552,6 +6818,11 @@ fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
     if let Some(line_notes) = line_notes {
         sections.push(format!("LINE NOTES\n----------\n{line_notes}"));
     }
+    let complexity = extract_complexity_lines(&remaining_notes);
+    if !complexity.is_empty() {
+        sections.push(format!("COMPLEXITY\n----------\n{complexity}"));
+    }
+    let remaining_notes = strip_complexity_lines(&remaining_notes);
     if !remaining_notes.is_empty() {
         sections.push(format!("NOTES\n-----\n{remaining_notes}"));
     }
@@ -6562,6 +6833,128 @@ fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
     }
 }
 
+fn extract_complexity_lines(text: &str) -> String {
+    let mut captured = Vec::new();
+    let mut fallback = Vec::new();
+    let mut in_complexity = false;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if !in_complexity {
+            if let Some(rest) = complexity_heading_remainder(line) {
+                in_complexity = true;
+                if !rest.trim().is_empty() {
+                    captured.push(rest.trim().to_string());
+                }
+                continue;
+            }
+            if is_complexity_line(line.trim()) {
+                fallback.push(line.trim().to_string());
+            }
+            continue;
+        }
+
+        if looks_like_post_complexity_heading(line) {
+            break;
+        }
+        if is_section_separator_line(line) {
+            continue;
+        }
+        captured.push(line.to_string());
+    }
+
+    let captured = trim_joined_lines(captured);
+    if !captured.is_empty() {
+        captured
+    } else {
+        trim_joined_lines(fallback)
+    }
+}
+
+fn strip_complexity_lines(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_complexity = false;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if !in_complexity {
+            if complexity_heading_remainder(line).is_some() {
+                in_complexity = true;
+                continue;
+            }
+            if is_complexity_line(line.trim()) {
+                continue;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+
+        if looks_like_post_complexity_heading(line) {
+            in_complexity = false;
+            out.push(line.to_string());
+        }
+    }
+
+    trim_joined_lines(out)
+}
+
+fn complexity_heading_remainder(line: &str) -> Option<&str> {
+    let trimmed = trim_markdown_heading(line);
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "complexity" {
+        return Some("");
+    }
+    if let Some(rest) = lower.strip_prefix("complexity:") {
+        let offset = trimmed.len().saturating_sub(rest.len());
+        return Some(trimmed[offset..].trim_start());
+    }
+    None
+}
+
+fn looks_like_post_complexity_heading(line: &str) -> bool {
+    let trimmed = trim_markdown_heading(line);
+    if trimmed.is_empty() || is_complexity_line(trimmed) {
+        return false;
+    }
+    let lower = trimmed.trim_end_matches(':').to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "notes"
+            | "line notes"
+            | "line-by-line notes"
+            | "line by line notes"
+            | "explanation"
+            | "approach"
+            | "code"
+            | "implementation"
+            | "edge cases"
+            | "examples"
+            | "walkthrough"
+            | "why this works"
+    )
+}
+
+fn is_complexity_line(line: &str) -> bool {
+    let lower = line
+        .trim()
+        .trim_start_matches(['-', '*', '•'])
+        .trim_start()
+        .trim_matches('*')
+        .trim()
+        .to_ascii_lowercase();
+    lower.contains("time complexity")
+        || lower.contains("space complexity")
+        || lower.starts_with("time:")
+        || lower.starts_with("space:")
+        || lower.starts_with("time ")
+        || lower.starts_with("space ")
+}
+
+fn is_section_separator_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '-' || ch == '=')
+}
+
 fn code_artifact_has_complete_code(body: &str) -> bool {
     let code = extract_code_section_from_canvas(body);
     let code = code.trim();
@@ -6569,7 +6962,7 @@ fn code_artifact_has_complete_code(body: &str) -> bool {
         return false;
     }
     if looks_like_patch_or_diff(code) {
-        return true;
+        return false;
     }
     if looks_like_control_flow_fragment_without_entrypoint(code) {
         return false;
@@ -7878,6 +8271,39 @@ mod tests {
     }
 
     #[test]
+    fn internal_capacity_retry_delay_only_smooths_short_provider_capacity() {
+        let short_provider = crate::rate_limit::CapacityDenied {
+            retry_after_secs: 1,
+            reason: "provider_key_cooling_down",
+        };
+        assert_eq!(
+            internal_capacity_retry_delay(&short_provider),
+            Some(std::time::Duration::from_secs(1))
+        );
+
+        let short_provider_limiter = crate::rate_limit::CapacityDenied {
+            retry_after_secs: 2,
+            reason: "provider_openai_llm_busy",
+        };
+        assert_eq!(
+            internal_capacity_retry_delay(&short_provider_limiter),
+            Some(std::time::Duration::from_secs(2))
+        );
+
+        let long_provider = crate::rate_limit::CapacityDenied {
+            retry_after_secs: 45,
+            reason: "provider_key_cooling_down",
+        };
+        assert_eq!(internal_capacity_retry_delay(&long_provider), None);
+
+        let account_guard = crate::rate_limit::CapacityDenied {
+            retry_after_secs: 1,
+            reason: "account_llm_busy",
+        };
+        assert_eq!(internal_capacity_retry_delay(&account_guard), None);
+    }
+
+    #[test]
     fn rag_retrieval_budget_default_and_override() {
         std::env::remove_var("BLUEY_RAG_RETRIEVAL_BUDGET_MS");
         assert_eq!(
@@ -8050,7 +8476,7 @@ mod tests {
     #[test]
     fn response_artifact_repairs_malformed_python_fence() {
         let artifact = response_artifact(
-            "Approach\n- Sum both choices.\n\n```pythonfrom typing import List\nclass Solution:\n    def canAliceWin(self, nums: List[int]) -> bool:\n        total = sum(nums)\n        single_sum = sum(x for x in nums if x < 10)\n        double_sum = sum(x for x in nums if 10 <= x <= 99)\n        return single_sum > total - single_sum or double_sum > total - double_sum```\nLine notes:\n1: Import List for the LeetCode signature.\n4-6: Compare each Alice choice against Bob's remaining total.\nExplanation:\nAlice only has two legal choices.",
+            "Approach\n- Sum both choices.\n\n```pythonfrom typing import List\nclass Solution:\n    def canAliceWin(self, nums: List[int]) -> bool:\n        total = sum(nums)\n        single_sum = sum(x for x in nums if x < 10)\n        double_sum = sum(x for x in nums if 10 <= x <= 99)\n        return single_sum > total - single_sum or double_sum > total - double_sum```\nLine notes:\n1: Import List for the LeetCode signature.\n4-6: Compare each Alice choice against Bob's remaining total.\nExplanation:\nAlice only has two legal choices.\nTime Complexity: O(n)\nSpace Complexity: O(1)",
         )
         .expect("code artifact");
 
@@ -8060,6 +8486,9 @@ mod tests {
         assert!(!artifact.body.contains("```"));
         assert!(artifact.body.contains("LINE NOTES\n----------"));
         assert!(artifact.body.contains("4-6: Compare each Alice choice"));
+        assert!(artifact.body.contains("COMPLEXITY\n----------"));
+        assert!(artifact.body.contains("Time Complexity: O(n)"));
+        assert!(artifact.body.contains("Space Complexity: O(1)"));
         assert!(artifact.body.contains("NOTES\n-----\nApproach"));
         assert!(artifact.body.contains("Explanation:"));
     }
@@ -8077,6 +8506,21 @@ mod tests {
         assert!(artifact.body.contains("return x == 0 && y == 0;"));
         assert!(!artifact.body.contains("cppclass"));
         assert!(!artifact.body.contains("```"));
+    }
+
+    #[test]
+    fn response_artifact_keeps_full_complexity_block() {
+        let artifact = response_artifact(
+            "I'd solve this with histogram rows.\n\n```cpp\nclass Solution {\npublic:\n    int maximalRectangle(vector<vector<char>>& matrix) {\n        return 0;\n    }\n};\n```\n\nComplexity\nTime Complexity: O(rows * cols)\nEach cell is processed once, and each histogram index is pushed and popped at most once per row.\nSpace Complexity: O(cols)\nThe heights array and stack both use space proportional to the number of columns.",
+        )
+        .expect("code artifact");
+
+        assert!(artifact.body.contains("COMPLEXITY\n----------"));
+        assert!(artifact.body.contains("Time Complexity: O(rows * cols)"));
+        assert!(artifact.body.contains("Each cell is processed once"));
+        assert!(artifact.body.contains("Space Complexity: O(cols)"));
+        assert!(artifact.body.contains("heights array and stack"));
+        assert!(!artifact.body.contains("NOTES\n-----\nComplexity"));
     }
 
     #[test]
@@ -8117,15 +8561,35 @@ mod tests {
     }
 
     #[test]
+    fn response_artifact_rejects_patch_or_diff_only_code() {
+        let patch = response_artifact(
+            "Patch\n\n```diff\n@@\n-    return old_value\n+    return new_value\n```\n\nExplanation\nOnly the return line changes.",
+        );
+        assert!(
+            patch.is_none(),
+            "patch-only answers should not become complete code artifacts"
+        );
+
+        let changed_block = response_artifact(
+            "Changed block\n\n```python\n- result = slow_path(nums)\n+ result = fast_path(nums)\n```\n",
+        );
+        assert!(
+            changed_block.is_none(),
+            "changed-line snippets should not become complete code artifacts"
+        );
+    }
+
+    #[test]
     fn response_artifact_keeps_complete_robot_return_code() {
         let artifact = response_artifact(
-            "Approach\nTrack net displacement.\n\n```cpp\nclass Solution {\npublic:\n    bool judgeCircle(string moves) {\n        int x = 0;\n        int y = 0;\n        for (char move : moves) {\n            if (move == 'U') y++;\n            else if (move == 'D') y--;\n            else if (move == 'L') x--;\n            else if (move == 'R') x++;\n        }\n        return x == 0 && y == 0;\n    }\n};\n```\n\nComplexity\nTime Complexity: O(N)",
+            "Approach\nTrack net displacement.\n\n```cpp\nclass Solution {\npublic:\n    bool judgeCircle(string moves) {\n        int x = 0;\n        int y = 0;\n        for (char move : moves) {\n            if (move == 'U') y++;\n            else if (move == 'D') y--;\n            else if (move == 'L') x--;\n            else if (move == 'R') x++;\n        }\n        return x == 0 && y == 0;\n    }\n};\n```\n\nComplexity\nTime Complexity: O(N)\nSpace Complexity: O(1)",
         )
         .expect("complete code artifact");
 
         assert_eq!(artifact.artifact_type, "code");
         assert!(artifact.body.contains("class Solution"));
         assert!(artifact.body.contains("judgeCircle"));
+        assert!(artifact.body.contains("Space Complexity: O(1)"));
     }
 
     #[test]
@@ -8691,6 +9155,91 @@ mod tests {
     }
 
     #[test]
+    fn answer_plan_short_conceptual_comparisons_use_quick_instant() {
+        let req = complete_request(
+            "Question:\nCan you explain me the difference between LRU cache and SRU?",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Quick);
+        assert_eq!(plan.output, AnswerOutput::Compact);
+        assert_eq!(plan.recommended_lane, "instant");
+        assert!(!plan.needs_memory);
+        assert!(!plan.needs_web_search);
+
+        let api =
+            complete_request("Question:\nHow do you approach API versioning in your project?");
+        let api_plan = answer_plan_for_request(&api, "balanced", &[]);
+        assert_eq!(api_plan.intent, AnswerIntent::Quick);
+        assert_eq!(api_plan.recommended_lane, "instant");
+    }
+
+    #[test]
+    fn answer_plan_round399_quick_concept_does_not_trigger_research() {
+        let req = complete_request(
+            "Question:\nCan you explain the difference between event loop and thread pool?",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Quick);
+        assert_eq!(plan.output, AnswerOutput::Compact);
+        assert_eq!(plan.recommended_lane, "instant");
+        assert!(!plan.needs_memory);
+        assert!(!plan.needs_web_search);
+    }
+
+    #[test]
+    fn answer_plan_round399_url_shortener_is_system_design() {
+        let req = complete_request("Question:\nDesign a URL shortener.");
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::SystemDesign);
+        assert_eq!(plan.output, AnswerOutput::CanvasDetail);
+        assert_eq!(plan.recommended_lane, "deep");
+        assert!(!plan.needs_web_search);
+    }
+
+    #[test]
+    fn answer_plan_system_design_section_followup_appends_canvas() {
+        let req = complete_request(
+            "Question:\nWhat about failure modes?\n\nSession context:\nPrevious system design answer:\nSystem Design\nDesign a rate limiter with an API gateway, token bucket, Redis counters, Postgres storage, queue workers, scaling, observability, and security.",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::SystemDesign);
+        assert_eq!(plan.output, AnswerOutput::CanvasDetail);
+        assert_eq!(plan.recommended_lane, "deep");
+        assert!(!plan.needs_web_search);
+
+        let (system, _user) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(system.contains("follow-up to an existing system-design canvas"));
+        assert!(system.contains("do not repeat the entire previous design"));
+    }
+
+    #[test]
+    fn answer_plan_system_design_explain_followup_stays_compact() {
+        let req = complete_request(
+            "Question:\nWhy did you choose Redis for the counters?\n\nSession context:\nPrevious system design answer:\nSystem Design\nDesign a rate limiter with an API gateway, Redis token counters, Postgres storage, queue workers, scaling, failure modes, and observability.",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::FollowUp);
+        assert_eq!(plan.output, AnswerOutput::Compact);
+        assert_eq!(plan.recommended_lane, "balanced");
+        assert!(!plan.needs_web_search);
+    }
+
+    #[test]
     fn answer_plan_algorithmic_solver_code_uses_deep_code_artifact() {
         let req = complete_request("Question:\nGive me Python code which solves Sudoku.");
 
@@ -8735,6 +9284,11 @@ mod tests {
         assert!(system.contains("display line numbers as authoritative"));
         assert!(system.contains("Do not say probably"));
         assert!(system.contains("complete fenced implementation"));
+        assert!(system.contains("full in-place replacement"));
+        assert!(system.contains("Do not output a patch"));
+        assert!(system.contains("include unchanged surrounding code"));
+        assert!(!system.contains("Changed block"));
+        assert!(!system.contains("unified diff; do not replace"));
     }
 
     #[test]
@@ -8956,6 +9510,22 @@ mod tests {
     }
 
     #[test]
+    fn answer_plan_round399_screen_context_ocr_code_without_image_is_code_artifact() {
+        let req = complete_request(
+            "Question:\nAnswer using the attached screen context.\n\nSession context:\n[Screen context from screenshot]\nYou are given an array of positive integers nums.\n\nAlice and Bob are playing a game. Alice can choose either all single-digit numbers or all double-digit numbers from nums, and the rest of the numbers are given to Bob. Alice wins if the sum of her numbers is strictly greater than the sum of Bob's numbers.\n\nReturn true if Alice can win this game, otherwise return false.",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Coding);
+        assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+        assert_eq!(plan.recommended_lane, "deep");
+        assert!(plan.needs_screen);
+        assert!(!plan.needs_docs);
+        assert!(!plan.needs_web_search);
+    }
+
+    #[test]
     fn generic_screen_template_with_image_is_not_missing_context() {
         let mut req = complete_request(
             "Question:\nAnswer using the attached screen capture, documents, and current session context.",
@@ -9040,6 +9610,25 @@ mod tests {
 
         assert_eq!(lane_for_answer_plan("balanced", &plan, false), "balanced");
         assert_eq!(lane_for_answer_plan("balanced", &plan, true), "deep");
+    }
+
+    #[test]
+    fn answer_plan_routing_preserves_requested_instant_for_compact_answers() {
+        let req =
+            complete_request("Question:\nHow do you approach API versioning in your project?");
+        let plan = answer_plan_for_request(&req, "instant", &[]);
+
+        assert_eq!(plan.output, AnswerOutput::Compact);
+        assert_eq!(lane_for_answer_plan("instant", &plan, true), "instant");
+    }
+
+    #[test]
+    fn answer_plan_routing_can_upgrade_requested_instant_for_code() {
+        let req = complete_request("Question:\nBuild me LRU cache in Python.");
+        let plan = answer_plan_for_request(&req, "instant", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Coding);
+        assert_eq!(lane_for_answer_plan("instant", &plan, true), "deep");
     }
 
     #[test]
@@ -9173,6 +9762,37 @@ mod tests {
         assert!(system.contains("Managed web search did not return usable sources"));
         assert!(system.contains("Web search is not configured yet."));
         assert!(system.contains("Do not imply web search succeeded"));
+    }
+
+    #[test]
+    fn retrieval_status_does_not_show_searching_when_search_was_skipped() {
+        let plan = AnswerPlan {
+            intent: AnswerIntent::Research,
+            output: AnswerOutput::SourceAnswer,
+            recommended_lane: "balanced",
+            confidence: 0.90,
+            interview_context: false,
+            needs_screen: false,
+            needs_docs: false,
+            needs_transcript: false,
+            needs_memory: false,
+            needs_web_search: true,
+        };
+        let web_search = WebSearchOutcome {
+            attempted: true,
+            skipped_reason: Some("provider_not_configured"),
+            ..Default::default()
+        };
+
+        let statuses = retrieval_status_entries(&plan, 0, &web_search);
+        let status_text = statuses
+            .iter()
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!status_text.contains("Searching web"));
+        assert!(status_text.contains("Web search is not configured yet."));
     }
 
     #[test]

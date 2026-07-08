@@ -27,10 +27,32 @@ Merge and release the accumulated Bluey web UI, backend, native overlay, STT, se
 
 - Cargo/native/server/web checks are run before merge.
 - Round docs are included with unique round numbers.
+- Release notes are added for `v0.1.94`.
 - Main is updated from this branch after checks pass.
 - Signed macOS release artifact and web assets are published to bluey.sh.
 - Backend server is rebuilt from the merged commit and restarted.
 - Live manifest, installer MIME, and API health are verified after deployment.
+
+## Completed Local Verification
+
+- `cargo check -p cue-cli -p cue-cloud-client -p cue-core -p cue-daemon --quiet`
+- `cargo check --manifest-path server/Cargo.toml --quiet`
+- `cargo test -p cue-daemon session_audit_bundle --quiet`
+- `cargo test -p cue-daemon conversation_sync --quiet`
+- `cargo test -p cue-daemon deepgram_ --quiet`
+- `cargo test -p cue-daemon live_stt_finalize_wait_defaults_and_clamps --quiet`
+- `cargo test -p cue-daemon macos_overlay_capture_visible_requires_dev_and_local_gates --quiet`
+- `cargo test -p cue-cli bluey_on_boot_title_reflects_signed_out_state --quiet`
+- `cargo test --manifest-path server/Cargo.toml internal_capacity_retry_delay --quiet`
+- `cargo test --manifest-path server/Cargo.toml short_capacity_wait_default_and_override --quiet`
+- `cargo test --manifest-path server/Cargo.toml deepgram_url --quiet`
+- `cargo test --manifest-path server/Cargo.toml list_sessions_hides_empty_shells_until_content_arrives --quiet`
+- `cargo test --manifest-path server/Cargo.toml tombstoned_session_does_not_resurrect_on_later_sync --quiet`
+- `node --check web/assets/bluey-site.js`
+- `native/macos/cue-overlay/build.sh`
+- `scripts/release-hygiene-scan.sh`
+- `git diff --check`
+- `cargo fmt --all --check`
 
 ## Operational Notes
 

@@ -21,7 +21,7 @@ build-daemon-release:
 
 # Tauri build runs from crates/cue-dashboard where tauri.conf.json lives.
 build-dashboard-release:
-	cd crates/cue-dashboard && cargo tauri build --release
+	cd crates/cue-dashboard && cargo tauri build
 
 build-helpers-release:
 	@for s in native/macos/*/build.sh; do [ -f "$$s" ] && bash "$$s" || true; done

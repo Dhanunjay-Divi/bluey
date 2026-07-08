@@ -44,6 +44,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let latestAccountForBilling = null;
     let confirmActionResolve = null;
     let lastLinkedComputerCount = 0;
+    let accountBalancePollTimer = null;
     const AUTO_RELOAD_MIN_CENTS = 1500;
     const AUTO_RELOAD_MAX_CENTS = 50000;
     const AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 500;
@@ -187,14 +188,30 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return Math.max(minCents, Math.min(maxCents, value));
     }
 
+    function sanitizeDollarInput(input, minCents, maxCents, options = {}) {
+      if (!input) return NaN;
+      const cleaned = cleanDollarInput(input.value);
+      if (input.value !== cleaned) input.value = cleaned;
+      if (!cleaned) return NaN;
+      const cents = dollarsToCents(cleaned);
+      if (!Number.isFinite(cents)) return NaN;
+      if (!options.clamp && cents >= minCents && (!Number.isFinite(maxCents) || cents <= maxCents)) {
+        return cents;
+      }
+      const clamped = clampCents(cents, minCents, maxCents);
+      input.value = centsToDollars(clamped);
+      return clamped;
+    }
+
     function normalizeBillingMoneyInput(inputId) {
       const input = document.getElementById(inputId);
       const limits = billingMoneyFieldLimits(inputId);
       if (!input || !limits) return;
-      const cleaned = cleanDollarInput(input.value);
-      let cents = dollarsToCents(cleaned || centsToDollars(limits.fallbackCents));
-      if (!Number.isFinite(cents)) cents = limits.fallbackCents;
-      input.value = centsToDollars(clampCents(cents, limits.minCents, limits.maxCents));
+      const cents = sanitizeDollarInput(input, limits.minCents, limits.maxCents, { clamp: true });
+      if (Number.isFinite(cents)) return;
+      let fallback = dollarsToCents(centsToDollars(limits.fallbackCents));
+      if (!Number.isFinite(fallback)) fallback = limits.fallbackCents;
+      input.value = centsToDollars(clampCents(fallback, limits.minCents, limits.maxCents));
     }
 
     function installBillingMoneyInputGuards() {
@@ -2048,6 +2065,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         && !me.billing_restricted;
     }
 
+    function paidBillingBlocked(me) {
+      return Boolean(me?.is_temporary || me?.is_admin || me?.billing_restricted);
+    }
+
     function renderAutoReload(me) {
       latestAccountForBilling = me || null;
       const card = document.getElementById('autoReloadCard');
@@ -2191,6 +2212,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function readAutoReloadSettings(options = {}) {
       const thresholdInputId = options.thresholdInputId || 'autoReloadThreshold';
       const amountInputId = options.amountInputId || 'autoReloadAmount';
+      normalizeBillingMoneyInput(thresholdInputId);
+      normalizeBillingMoneyInput(amountInputId);
       const threshold = dollarsToCents(document.getElementById(thresholdInputId)?.value || centsToDollars(AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS));
       const amount = dollarsToCents(document.getElementById(amountInputId)?.value || centsToDollars(AUTO_RELOAD_DEFAULT_AMOUNT_CENTS));
       if (!Number.isFinite(threshold) || !Number.isFinite(amount)) {
@@ -2204,6 +2227,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       if (threshold < 100) {
         throw new Error('Auto Reload threshold must be at least $1.');
+      }
+      if (threshold > 5000) {
+        throw new Error('Auto Reload threshold can be at most $50.');
       }
       if (threshold >= amount) {
         throw new Error('Auto Reload amount must be greater than the threshold.');
@@ -2237,6 +2263,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function readManualReloadCents(inputId = 'manualReloadAmount') {
       const input = document.getElementById(inputId);
+      normalizeBillingMoneyInput(inputId);
       const amount = dollarsToCents(input?.value || centsToDollars(MANUAL_RELOAD_AMOUNT_CENTS));
       if (!Number.isFinite(amount)) {
         input?.focus();
@@ -2318,6 +2345,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const minutes = trialMinutesRemaining(me);
         return `${minutes} free minute${minutes === 1 ? '' : 's'} left. Create an account within 24 hours to keep it.`;
       }
+      if (me?.is_admin || me?.billing_restricted) {
+        return 'Internal and test accounts use admin credits. Paid checkout and Auto Reload are disabled here.';
+      }
       const balanceCents = Number(me?.balance_cents || 0);
       if (balanceCents <= 0) {
         return 'Add balance to start. Keep Auto Reload on to top up before work stops.';
@@ -2342,6 +2372,87 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return `At recent pace, this balance lasts ${balanceDaysCopy}.`;
       }
       return `Approximate: ${estimate.defaultUseCopy} of light mixed use per ${shortMoney(MANUAL_RELOAD_AMOUNT_CENTS)}.`;
+    }
+
+    function renderAccountBalanceSnapshot(me, usage = null) {
+      currentAccountEmail = me.email || '';
+      const accountLabel = me.is_temporary ? 'Temporary Bluey trial' : (me.email || 'Bluey account');
+      document.querySelectorAll('[data-profile-email-label]').forEach((profileEmailLabel) => {
+        profileEmailLabel.textContent = accountLabel;
+      });
+      setRailCommand(true, accountLabel);
+      const billingProviderLabel = document.getElementById('billingProviderLabel');
+      if (billingProviderLabel) {
+        billingProviderLabel.textContent = me.is_temporary
+          ? 'Temporary trial'
+          : me.billing_provider === 'square'
+            ? 'Secure checkout'
+            : 'Prepaid wallet';
+      }
+      const balanceValue = document.getElementById('balanceValue');
+      const balanceCard = balanceValue?.closest('.balance-kpi');
+      const balanceTitle = document.getElementById('balanceTitle');
+      const overviewReloadButton = document.getElementById('overviewReloadButton');
+      const balanceReloadPanel = document.getElementById('balanceReloadPanel');
+      const isTemporaryAccount = Boolean(me.is_temporary);
+      const isBillingBlocked = paidBillingBlocked(me);
+      const trialMinutes = trialMinutesRemaining(me);
+      if (balanceTitle) balanceTitle.textContent = isTemporaryAccount ? 'Trial time' : 'Remaining balance';
+      if (balanceValue) {
+        balanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
+        balanceCard?.classList.toggle('balance-trial', isTemporaryAccount);
+        balanceCard?.classList.toggle('balance-billing-blocked', isBillingBlocked && !isTemporaryAccount);
+        balanceCard?.classList.toggle('balance-critical', !isTemporaryAccount && me.balance_cents > 0 && me.balance_cents < 500);
+        balanceCard?.classList.toggle('balance-low', !isTemporaryAccount && me.balance_cents >= 500 && me.balance_cents < 1000);
+      }
+      if (overviewReloadButton) {
+        overviewReloadButton.hidden = isBillingBlocked;
+        overviewReloadButton.disabled = isBillingBlocked;
+      }
+      if (balanceReloadPanel) {
+        balanceReloadPanel.hidden = isBillingBlocked;
+      }
+      const summaryBalanceValue = document.getElementById('summaryBalanceValue');
+      const summaryBalanceLabel = document.getElementById('summaryBalanceLabel');
+      const summaryBalanceCard = summaryBalanceValue?.closest('.summary-balance-kpi');
+      if (summaryBalanceLabel) summaryBalanceLabel.textContent = isTemporaryAccount ? 'Trial time' : 'Balance';
+      if (summaryBalanceValue) {
+        summaryBalanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
+        summaryBalanceCard?.classList.toggle('balance-critical', !isTemporaryAccount && me.balance_cents > 0 && me.balance_cents < 500);
+        summaryBalanceCard?.classList.toggle('balance-low', !isTemporaryAccount && me.balance_cents >= 500 && me.balance_cents < 1000);
+      }
+      const balanceHint = document.getElementById('balanceHint');
+      const summaryBalanceHint = document.getElementById('summaryBalanceHint');
+      const balanceHintText = usage ? accountBalanceUsageHint(me, usage) : accountBalanceHint(me);
+      if (balanceHint) balanceHint.textContent = balanceHintText;
+      if (summaryBalanceHint) summaryBalanceHint.textContent = balanceHintText;
+      renderTemporaryAccount(me);
+      renderAutoReload(me);
+      updateManualReloadDraftCopy();
+    }
+
+    function stopAccountBalancePolling() {
+      if (accountBalancePollTimer) {
+        clearInterval(accountBalancePollTimer);
+        accountBalancePollTimer = null;
+      }
+    }
+
+    function startAccountBalancePolling() {
+      stopAccountBalancePolling();
+      if (!isAccountRoute || !accountToken()) return;
+      accountBalancePollTimer = setInterval(async () => {
+        if (!accountToken() || document.hidden) return;
+        try {
+          const me = await apiJson('/account/me');
+          renderAccountBalanceSnapshot(me);
+        } catch (error) {
+          if (!accountToken()) {
+            stopAccountBalancePolling();
+            loadAccount().catch(() => {});
+          }
+        }
+      }, 10_000);
     }
 
     async function updateAutoReload(enabled) {
@@ -2696,6 +2807,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function openReloadSetupDialog() {
       const dialog = document.getElementById('addCreditsDialog');
       const amount = document.getElementById('modalReloadAmount');
+      if (paidBillingBlocked(latestAccountForBilling)) {
+        accountMessage('Paid checkout is disabled for this account. Use Trial Ops for internal test balance changes.', false, 'error');
+        return;
+      }
       if (!dialog) {
         startReload();
         return;
@@ -3554,6 +3669,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('accountDashboard').hidden = !authed;
       document.getElementById('accountRecoveryCard').hidden = true;
       if (!authed) {
+        stopAccountBalancePolling();
         currentAccountIsAdmin = false;
         adminAbuseLoaded = false;
         setAdminDashboardAvailability(false);
@@ -3593,62 +3709,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           apiJson('/account/me'),
           apiJson('/account/usage'),
         ]);
-        currentAccountEmail = me.email || '';
-        const accountLabel = me.is_temporary ? 'Temporary Bluey trial' : (me.email || 'Bluey account');
-        document.querySelectorAll('[data-profile-email-label]').forEach((profileEmailLabel) => {
-          profileEmailLabel.textContent = accountLabel;
-        });
-        setRailCommand(true, accountLabel);
-        const billingProviderLabel = document.getElementById('billingProviderLabel');
-        if (billingProviderLabel) {
-          billingProviderLabel.textContent = me.is_temporary
-            ? 'Temporary trial'
-            : me.billing_provider === 'square'
-              ? 'Secure checkout'
-              : 'Prepaid wallet';
-        }
-        const balanceValue = document.getElementById('balanceValue');
-        const balanceCard = balanceValue?.closest('.balance-kpi');
-        const balanceTitle = document.getElementById('balanceTitle');
-        const overviewReloadButton = document.getElementById('overviewReloadButton');
-        const balanceReloadPanel = document.getElementById('balanceReloadPanel');
-        const isTemporaryAccount = Boolean(me.is_temporary);
-        const isBillingRestricted = isTemporaryAccount
-          || Boolean(me.is_admin)
-          || Boolean(me.billing_restricted)
-          || /temporary|internal|test/i.test(String(me.auto_topup_unavailable_reason || ''));
-        const trialMinutes = trialMinutesRemaining(me);
-        if (balanceTitle) balanceTitle.textContent = isTemporaryAccount ? 'Trial time' : 'Remaining balance';
-        if (balanceValue) {
-          balanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
-          balanceCard?.classList.toggle('balance-trial', isTemporaryAccount);
-          balanceCard?.classList.toggle('balance-critical', !isTemporaryAccount && me.balance_cents > 0 && me.balance_cents < 500);
-          balanceCard?.classList.toggle('balance-low', !isTemporaryAccount && me.balance_cents >= 500 && me.balance_cents < 1000);
-        }
-        if (overviewReloadButton) {
-          overviewReloadButton.hidden = isBillingRestricted;
-        }
-        if (balanceReloadPanel) {
-          balanceReloadPanel.hidden = isBillingRestricted;
-        }
-        const summaryBalanceValue = document.getElementById('summaryBalanceValue');
-        const summaryBalanceLabel = document.getElementById('summaryBalanceLabel');
-        const summaryBalanceCard = summaryBalanceValue?.closest('.summary-balance-kpi');
-        if (summaryBalanceLabel) summaryBalanceLabel.textContent = isTemporaryAccount ? 'Trial time' : 'Balance';
-        if (summaryBalanceValue) {
-          summaryBalanceValue.textContent = isTemporaryAccount ? `${trialMinutes} min` : money(me.balance_cents);
-          summaryBalanceCard?.classList.toggle('balance-critical', !isTemporaryAccount && me.balance_cents > 0 && me.balance_cents < 500);
-          summaryBalanceCard?.classList.toggle('balance-low', !isTemporaryAccount && me.balance_cents >= 500 && me.balance_cents < 1000);
-        }
-        const balanceHint = document.getElementById('balanceHint');
-        const summaryBalanceHint = document.getElementById('summaryBalanceHint');
-        const balanceHintText = accountBalanceUsageHint(me, usage);
-        if (balanceHint) balanceHint.textContent = balanceHintText;
-        if (summaryBalanceHint) summaryBalanceHint.textContent = balanceHintText;
-        renderTemporaryAccount(me);
-        renderAutoReload(me);
+        renderAccountBalanceSnapshot(me, usage);
         renderUsage(usage, me);
-        updateManualReloadDraftCopy();
         const isAdmin = Boolean(me.is_admin);
         currentAccountIsAdmin = isAdmin;
         if (!isAdmin) adminAbuseLoaded = false;
@@ -3660,8 +3722,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }
         void sessionsPromise;
         accountMessage(new URLSearchParams(location.search).get('reload') === 'success'
-          ? 'Payment complete. If the balance still looks old, press Refresh balance in a moment.'
+          ? 'Checkout complete. Balance refreshes automatically while Square finishes the credit event.'
           : '');
+        startAccountBalancePolling();
         openAccountActionFromHash();
         try {
           const code = pendingDeviceCode();
@@ -3683,6 +3746,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function startReload() {
+      if (paidBillingBlocked(latestAccountForBilling)) {
+        accountMessage('Paid checkout is disabled for this account. Use Trial Ops for internal test balance changes.', false, 'error');
+        return false;
+      }
       let amountCents;
       try {
         amountCents = readManualReloadCents();
@@ -3709,7 +3776,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
             return false;
           }
         }
-        accountMessage('Checkout opened in a new tab. Complete payment there, then return here and press Refresh balance.');
+        accountMessage('Checkout opened in a new tab. Complete payment there, then return here; the balance refreshes automatically.');
         return true;
       } catch (error) {
         closeCheckoutPlaceholder(checkoutWindow);
@@ -4181,6 +4248,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function selectDownloadPlatform(platform) {
+      const downloadApp = document.getElementById('downloadApp');
+      if (downloadApp) {
+        downloadApp.classList.toggle('platform-windows', platform === 'windows');
+        downloadApp.classList.toggle('platform-mac', platform !== 'windows');
+      }
       const cards = document.querySelectorAll('#downloadApp [data-platform-card]');
       const panels = document.querySelectorAll('#downloadApp [data-platform-instructions]');
       cards.forEach((card) => {

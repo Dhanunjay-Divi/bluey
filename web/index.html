@@ -445,7 +445,7 @@
                   <button class="account-button primary compact" id="overviewReloadButton" type="button" hidden>Add balance</button>
                 </div>
               </div>
-              <div class="dashboard-overview-side" id="balanceReloadPanel">
+              <div class="dashboard-overview-side" id="balanceReloadPanel" hidden>
                 <div class="reload-card auto-reload-card compact-auto-reload" id="autoReloadCard">
                   <div>
                     <div class="auto-reload-head">
@@ -928,7 +928,7 @@
           <p>Apple Silicon build. Installs the signed <code>bluey</code> command.</p>
           <span class="download-card-action">Show terminal steps</span>
         </article>
-        <article class="download-card disabled coming-soon" aria-disabled="true">
+        <article class="download-card" data-platform-card="windows" role="button" tabindex="0" aria-label="Show Windows PowerShell install instructions" aria-controls="windowsInstallInstructions" aria-expanded="false">
           <div class="download-card-head">
             <div class="platform-name">
               <span class="os-icon" aria-hidden="true">
@@ -941,10 +941,10 @@
               </span>
               <span>Windows</span>
             </div>
-            <span class="availability soon">Coming soon</span>
+            <span class="availability">Ready</span>
           </div>
-          <p>Windows desktop builds are next in the rollout.</p>
-          <span class="download-card-action soon">Not available yet</span>
+          <p>Windows 10/11 beta. Installs the <code>bluey</code> command and desktop helper.</p>
+          <span class="download-card-action">Show PowerShell steps</span>
         </article>
         <article class="download-card disabled coming-soon" aria-disabled="true">
           <div class="download-card-head">
@@ -963,6 +963,76 @@
           <p>Linux packages are planned after the desktop builds settle.</p>
           <span class="download-card-action soon">Not available yet</span>
         </article>
+      </section>
+
+      <section class="download-shortcuts" aria-label="Bluey overlay shortcuts">
+        <div class="download-section-head">
+          <h2>Overlay shortcuts</h2>
+          <p>Use these while Bluey is open. On Mac the global modifier is <strong>Ctrl+Option</strong>; on Windows it is <strong>Ctrl+Alt</strong>.</p>
+        </div>
+        <div class="shortcut-grid">
+          <div class="shortcut-card">
+            <span class="shortcut-keys">
+              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>B</kbd></span>
+              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>B</kbd></span>
+            </span>
+            <span>Minimize to pill or restore</span>
+          </div>
+          <div class="shortcut-card">
+            <span class="shortcut-keys">
+              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>T</kbd></span>
+              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>T</kbd></span>
+            </span>
+            <span>Focus Ask text input</span>
+          </div>
+          <div class="shortcut-card">
+            <span class="shortcut-keys">
+              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>L</kbd></span>
+              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>L</kbd></span>
+            </span>
+            <span>Start or stop Listen</span>
+          </div>
+          <div class="shortcut-card">
+            <span class="shortcut-keys">
+              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>S</kbd></span>
+              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>S</kbd></span>
+            </span>
+            <span>Capture screen context</span>
+          </div>
+          <div class="shortcut-card">
+            <span class="shortcut-keys">
+              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>I</kbd></span>
+              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>I</kbd></span>
+            </span>
+            <span>Toggle click-through</span>
+          </div>
+          <div class="shortcut-card">
+            <span class="shortcut-keys">
+              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>Enter</kbd></span>
+              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Enter</kbd></span>
+            </span>
+            <span>Answer now</span>
+          </div>
+          <div class="shortcut-card">
+            <span class="shortcut-keys"><kbd>Esc</kbd></span>
+            <span>Close the active panel</span>
+          </div>
+          <div class="shortcut-card">
+            <span class="shortcut-keys"><kbd>Tab</kbd><kbd>Shift</kbd><kbd>Tab</kbd></span>
+            <span>Move between Bluey controls</span>
+          </div>
+          <div class="shortcut-card">
+            <span class="shortcut-keys">
+              <span class="shortcut-platform shortcut-platform-mac"><kbd>Option</kbd><kbd>Up</kbd><kbd>Down</kbd></span>
+              <span class="shortcut-platform shortcut-platform-windows"><kbd>Alt</kbd><kbd>Up</kbd><kbd>Down</kbd></span>
+            </span>
+            <span>Scroll answers, canvas, or history</span>
+          </div>
+        </div>
+        <div class="shortcut-notes">
+          <span><strong>Click-through off:</strong> blank Bluey space drags the window; mouse wheel scrolls the content under the pointer.</span>
+          <span><strong>Click-through on:</strong> blank clicks pass through; use global shortcuts and Bluey scroll zones.</span>
+        </div>
       </section>
 
       <section class="platform-instructions" id="macInstallInstructions" data-platform-instructions="mac" hidden>
@@ -993,20 +1063,96 @@
         <div class="instruction-help">If a code appears, sign in here and press Connect.</div>
       </section>
 
+      <section class="platform-instructions" id="windowsInstallInstructions" data-platform-instructions="windows" hidden>
+        <h2>PowerShell setup</h2>
+        <p>Copy these two commands.</p>
+        <div class="instruction-steps">
+          <div class="instruction-step">
+            <span class="instruction-num">1</span>
+            <div class="instruction-body">
+              <p>Open <strong>PowerShell</strong> and run:</p>
+              <div class="install-command" tabindex="0" role="group" aria-label="Bluey Windows install command">
+                <code>irm https://bluey.sh/install.ps1 | iex</code>
+                <button class="copy-command" type="button" data-copy="irm https://bluey.sh/install.ps1 | iex">Copy</button>
+              </div>
+            </div>
+          </div>
+          <div class="instruction-step">
+            <span class="instruction-num">2</span>
+            <div class="instruction-body">
+              <p>Start the desktop app:</p>
+              <div class="install-command" tabindex="0" role="group" aria-label="Bluey start command">
+                <code>bluey on</code>
+                <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="instruction-help">If a code appears, sign in here and press Connect.</div>
+      </section>
+
       <div class="download-note">
-        Bluey stays quiet until you ask. macOS permissions appear only for features you turn on.
+        Bluey stays quiet until you ask. Permissions appear only for features you turn on.
       </div>
 
       <section class="commands" aria-label="Bluey commands">
-        <h2>Core commands</h2>
+        <h2>Useful commands</h2>
         <div class="cmd-grid">
           <div class="cmd">
-            <div><code>bluey on</code><span>Start the Bluey overlay</span></div>
+            <div><code>bluey on</code><span>Start Bluey, check updates, and sign in if needed</span></div>
             <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
           </div>
           <div class="cmd">
             <div><code>bluey off</code><span>Stop Bluey</span></div>
             <button class="copy-command" type="button" data-copy="bluey off">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey update</code><span>Check for and install the latest build</span></div>
+            <button class="copy-command" type="button" data-copy="bluey update">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey status</code><span>Show daemon state, session ID, and overlay status</span></div>
+            <button class="copy-command" type="button" data-copy="bluey status">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey login</code><span>Link or switch this device to an account</span></div>
+            <button class="copy-command" type="button" data-copy="bluey login">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey logout</code><span>Remove this device's local sign-in</span></div>
+            <button class="copy-command" type="button" data-copy="bluey logout">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey usage</code><span>Show balance, recent usage, and tier projection</span></div>
+            <button class="copy-command" type="button" data-copy="bluey usage">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey portal</code><span>Open billing and credits in your browser</span></div>
+            <button class="copy-command" type="button" data-copy="bluey portal">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey sessions</code><span>List or inspect saved local sessions</span></div>
+            <button class="copy-command" type="button" data-copy="bluey sessions">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey doctor</code><span>Check permissions, audio, setup, and logs</span></div>
+            <button class="copy-command" type="button" data-copy="bluey doctor">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey support</code><span>Create a redacted support bundle</span></div>
+            <button class="copy-command" type="button" data-copy="bluey support">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey logs export</code><span>Export local logs with redaction</span></div>
+            <button class="copy-command" type="button" data-copy="bluey logs export">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey export</code><span>Download your account data as JSON</span></div>
+            <button class="copy-command" type="button" data-copy="bluey export">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey uninstall</code><span>Remove Bluey from this computer</span></div>
+            <button class="copy-command" type="button" data-copy="bluey uninstall">Copy</button>
           </div>
           <div class="cmd">
             <div><code>bluey help</code><span>Show the full command list</span></div>

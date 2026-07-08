@@ -29,6 +29,7 @@ env:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-14
@@ -39,6 +40,10 @@ jobs:
             target: x86_64-apple-darwin
             platform: darwin-x86_64
             swift_arch: x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+            swift_arch: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -53,8 +58,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
-            patchelf build-essential libssl-dev libayatana-appindicator3-dev libxdo-dev
+            libwebkit2gtk-4.1-dev librsvg2-dev \
+            patchelf build-essential libssl-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -86,6 +91,7 @@ jobs:
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-release-
 
       - name: Build daemon and CLI
+        if: matrix.os != 'windows-latest'
         env:
           BLUEY_UPDATE_PUBKEY: ${{ vars.BLUEY_UPDATE_PUBKEY }}
         shell: bash
@@ -96,15 +102,26 @@ jobs:
           fi
           cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
 
+      - name: Build daemon and CLI (Windows)
+        if: matrix.os == 'windows-latest'
+        env:
+          BLUEY_UPDATE_PUBKEY: ${{ vars.BLUEY_UPDATE_PUBKEY }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:BLUEY_UPDATE_PUBKEY)) {
+            Write-Error "BLUEY_UPDATE_PUBKEY repository variable is required for release builds"
+            exit 1
+          }
+          cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
+
       - name: Build macOS dashboard app
         if: startsWith(matrix.os, 'macos-')
         shell: bash
         run: |
-          cd crates/cue-dashboard/ui
-          npm ci
-          cd ..
-          cargo install tauri-cli --version "^2.0.0" --locked
-          cargo tauri build --release --target ${{ matrix.target }} --bundles app
+          npm ci --prefix crates/cue-dashboard/ui
+          cargo install tauri-cli --version "^2.0.0" --locked --force
+          cd crates/cue-dashboard
+          cargo tauri build --target ${{ matrix.target }} --bundles app
 
       - name: Build macOS native helpers
         if: startsWith(matrix.os, 'macos-')

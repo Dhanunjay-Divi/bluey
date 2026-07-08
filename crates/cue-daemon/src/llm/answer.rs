@@ -53,8 +53,7 @@ fn internal_disclosure_guard_text(text: &str) -> &str {
     let Some(after_label) = trimmed.strip_prefix("Question:") else {
         return trimmed;
     };
-    let after_label = after_label
-        .trim_start_matches(|ch: char| ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n');
+    let after_label = after_label.trim_start_matches([' ', '\t', '\r', '\n']);
     let end = after_label.find("\n\n").unwrap_or(after_label.len());
     after_label[..end].trim()
 }

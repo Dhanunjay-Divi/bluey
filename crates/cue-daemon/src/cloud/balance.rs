@@ -1,7 +1,7 @@
 //! Codex Stage 17: daemon-side balance polling.
 //!
 //! When a Bluey account token is in the local account store, this module spawns a
-//! background task that polls `/account/me` every 30s and emits a
+//! background task that polls `/account/me` every 10s and emits a
 //! `BalanceSnapshot` over a watch channel. The daemon bridges that
 //! snapshot to the native overlay with `SetBalance`, while the dashboard
 //! can also fetch a snapshot on demand.
@@ -72,7 +72,7 @@ impl BalanceWatch {
 /// retries after a backoff.
 ///
 /// Honors `BLUEY_BALANCE_POLL_SECS` env var for the poll interval
-/// (default 30s) so tests can run faster.
+/// (default 10s) so tests can run faster.
 pub fn spawn_loop(
     client: cue_cloud_client::CloudClient,
     watch_handle: BalanceWatch,
@@ -109,7 +109,7 @@ async fn run_loop_inner(
     let interval_secs: u64 = std::env::var("BLUEY_BALANCE_POLL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
+        .unwrap_or(10);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

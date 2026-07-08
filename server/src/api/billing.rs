@@ -488,13 +488,15 @@ pub async fn square_pay(
 
     let result = create_square_payment(
         &square,
-        access_token,
-        location_id,
-        &updated_account.id,
-        req.amount_cents,
-        &charge_source_id,
-        customer_id.as_deref(),
-        req.client_request_id.as_deref(),
+        SquarePaymentRequest {
+            access_token,
+            location_id,
+            account_id: &updated_account.id,
+            amount_cents: req.amount_cents,
+            source_id: &charge_source_id,
+            customer_id: customer_id.as_deref(),
+            client_request_id: req.client_request_id.as_deref(),
+        },
     )
     .await?;
 
@@ -903,28 +905,32 @@ fn build_square_payment_body(
     body
 }
 
+struct SquarePaymentRequest<'a> {
+    access_token: &'a str,
+    location_id: &'a str,
+    account_id: &'a str,
+    amount_cents: i64,
+    source_id: &'a str,
+    customer_id: Option<&'a str>,
+    client_request_id: Option<&'a str>,
+}
+
 async fn create_square_payment(
     square: &crate::config::SquareConfig,
-    access_token: &str,
-    location_id: &str,
-    account_id: &str,
-    amount_cents: i64,
-    source_id: &str,
-    customer_id: Option<&str>,
-    client_request_id: Option<&str>,
+    request: SquarePaymentRequest<'_>,
 ) -> Result<SquarePaymentResult, (StatusCode, Json<ApiError>)> {
     let body = build_square_payment_body(
-        location_id,
-        account_id,
-        amount_cents,
-        source_id,
-        customer_id,
-        client_request_id,
+        request.location_id,
+        request.account_id,
+        request.amount_cents,
+        request.source_id,
+        request.customer_id,
+        request.client_request_id,
     );
-    let account_id_hash = cue_core::account_id_hash_prefix(account_id);
+    let account_id_hash = cue_core::account_id_hash_prefix(request.account_id);
     let resp = reqwest::Client::new()
         .post(square_api_url(square, "/v2/payments"))
-        .bearer_auth(access_token)
+        .bearer_auth(request.access_token)
         .header("Square-Version", SQUARE_API_VERSION)
         .json(&body)
         .send()
@@ -932,7 +938,7 @@ async fn create_square_payment(
         .map_err(|e| {
             tracing::warn!(
                 account_id_hash = %account_id_hash,
-                amount_cents,
+                amount_cents = request.amount_cents,
                 error = %e,
                 "Square balance payment http failed"
             );
@@ -949,7 +955,7 @@ async fn create_square_payment(
     if !status.is_success() {
         tracing::warn!(
             account_id_hash = %account_id_hash,
-            amount_cents,
+            amount_cents = request.amount_cents,
             square_status = %status,
             square_body = %log_safe_square_body(&body),
             "Square balance payment failed"
@@ -972,10 +978,10 @@ async fn create_square_payment(
     })?;
     validate_square_direct_payment_response(
         payment,
-        account_id,
-        &square_reload_reference_id(account_id),
-        customer_id,
-        amount_cents,
+        request.account_id,
+        &square_reload_reference_id(request.account_id),
+        request.customer_id,
+        request.amount_cents,
     )
     .map_err(|e| {
         tracing::warn!(
@@ -1010,7 +1016,7 @@ async fn create_square_payment(
 
     tracing::info!(
         account_id_hash = %account_id_hash,
-        amount_cents,
+        amount_cents = request.amount_cents,
         square_payment_id = %payment_id,
         square_payment_status = %payment_status,
         "Square balance payment created"

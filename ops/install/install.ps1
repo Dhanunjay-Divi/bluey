@@ -31,14 +31,6 @@ $InstallRoot = if (![string]::IsNullOrWhiteSpace($env:BLUEY_INSTALL_ROOT)) {
 $BinDir = Join-Path $InstallRoot "bin"
 $Platform = "windows-x86_64"
 
-if ($env:BLUEY_WINDOWS_INSTALL_PREVIEW -ne "1") {
-    Write-Host ""
-    Write-Host "Bluey for Windows is coming soon." -ForegroundColor Cyan
-    Write-Host "The current public alpha installer is macOS-only while Windows signed artifacts finish validation." -ForegroundColor Gray
-    Write-Host "Use macOS for this alpha, or check https://bluey.sh/download for the latest status." -ForegroundColor Gray
-    exit 1
-}
-
 function Write-Step {
     param([string]$Message)
     Write-Host $Message -ForegroundColor Cyan

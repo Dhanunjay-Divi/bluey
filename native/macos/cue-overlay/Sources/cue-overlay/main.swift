@@ -2915,6 +2915,8 @@ private final class FeedView: NSView {
         stack.spacing = 8
         stack.edgeInsets = NSEdgeInsets(top: 12, left: 0, bottom: 10, right: 0)
         stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.setContentHuggingPriority(.required, for: .vertical)
+        stack.setContentCompressionResistancePriority(.required, for: .vertical)
 
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
@@ -3008,7 +3010,7 @@ private final class FeedView: NSView {
         emptyState.isHidden = true
         let view = makeCardView(card)
         stack.addArrangedSubview(view)
-        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        finishInstallingCardView(view)
         scrollToBottomIfNeeded(shouldAutoScroll)
         emitCardRendered(id: card.id)
     }
@@ -3222,7 +3224,7 @@ private final class FeedView: NSView {
         cards.append(card)
         let view = makeCardView(card)
         stack.addArrangedSubview(view)
-        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        finishInstallingCardView(view)
         scrollToBottomIfNeeded(shouldAutoScroll)
     }
 
@@ -3233,7 +3235,17 @@ private final class FeedView: NSView {
         existing.removeFromSuperview()
         let view = makeCardView(cards[idx])
         stack.insertArrangedSubview(view, at: idx)
+        finishInstallingCardView(view)
+    }
+
+    private func finishInstallingCardView(_ view: NSView) {
         view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        view.setContentHuggingPriority(.required, for: .vertical)
+        view.setContentCompressionResistancePriority(.required, for: .vertical)
+        stack.invalidateIntrinsicContentSize()
+        stack.needsLayout = true
+        stack.layoutSubtreeIfNeeded()
+        scroll.documentView?.invalidateIntrinsicContentSize()
     }
 
     private func transcriptCardSource(_ card: RenderedCard) -> String {
@@ -3398,6 +3410,8 @@ private final class FeedView: NSView {
         let signInLike = loginURL(from: card) != nil
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
+        row.setContentHuggingPriority(.required, for: .vertical)
+        row.setContentCompressionResistancePriority(.required, for: .vertical)
 
         let bubble = NSView()
         bubble.wantsLayer = true
@@ -3418,6 +3432,8 @@ private final class FeedView: NSView {
         bubble.layer?.shadowRadius = lightThemeEnabled ? 8 : 10
         bubble.layer?.shadowOffset = NSSize(width: 0, height: -4)
         bubble.translatesAutoresizingMaskIntoConstraints = false
+        bubble.setContentHuggingPriority(.required, for: .vertical)
+        bubble.setContentCompressionResistancePriority(.required, for: .vertical)
 
         let metaLabel = NSTextField(labelWithString: kindLabel(card))
         metaLabel.font = NSFont.systemFont(ofSize: 11, weight: .bold)
@@ -3445,6 +3461,11 @@ private final class FeedView: NSView {
         bodyLabel.preferredMaxLayoutWidth = signInURL == nil
             ? (answerLike ? 640 : (rightAligned ? 360 : 480))
             : 430
+        bodyLabel.maximumNumberOfLines = 0
+        bodyLabel.cell?.wraps = true
+        bodyLabel.cell?.isScrollable = false
+        bodyLabel.setContentHuggingPriority(.required, for: .vertical)
+        bodyLabel.setContentCompressionResistancePriority(.required, for: .vertical)
         bodyLabel.isSelectable = false
         bodyLabel.allowsEditingTextAttributes = false
         if let attributedBody = attributedChatBody(for: card, text: bodyText, rightAligned: rightAligned) {
@@ -5084,6 +5105,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let drawerTitleLabel: NSTextField
     let drawerSubtitleLabel: NSTextField
     let drawerCloseButton: NSButton
+    let sessionSearchField: NSTextField
     let latestSessionButton: NSButton
     let sessionScroll: NSScrollView
     let sessionStack: NSStackView
@@ -5144,6 +5166,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var lastTranscriptStripSource: String?
     private var transcriptStripShouldFollowTail = false
     private var sessionItems: [OverlaySessionItem] = []
+    private var sessionSearchQuery = ""
     private var sessionsHaveLoaded = false
     private var activeSessionId: String?
     private var activeSessionCode: String?
@@ -5275,6 +5298,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         drawerTitleLabel = NSTextField(labelWithString: "History")
         drawerSubtitleLabel = NSTextField(labelWithString: "Local recordings on this device.")
         drawerCloseButton = NSButton(title: "", target: nil, action: nil)
+        sessionSearchField = ArrowCursorTextField()
         latestSessionButton = NSButton(title: "Continue latest", target: nil, action: nil)
         sessionScroll = NSScrollView()
         sessionStack = FlippedStackView()
@@ -5405,6 +5429,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             drawerTitleLabel,
             drawerSubtitleLabel,
             drawerCloseButton,
+            sessionSearchField,
             latestSessionButton,
             sessionScroll,
             sessionStack,
@@ -5489,6 +5514,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionDrawer.addSubview(drawerTitleLabel)
         sessionDrawer.addSubview(drawerSubtitleLabel)
         sessionDrawer.addSubview(drawerCloseButton)
+        sessionDrawer.addSubview(sessionSearchField)
         sessionDrawer.addSubview(latestSessionButton)
         sessionDrawer.addSubview(sessionScroll)
         addSubview(transcriptStrip)
@@ -5646,7 +5672,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             drawerSubtitleLabel.leadingAnchor.constraint(equalTo: drawerTitleLabel.leadingAnchor),
             drawerSubtitleLabel.trailingAnchor.constraint(equalTo: drawerTitleLabel.trailingAnchor),
 
-            latestSessionButton.topAnchor.constraint(equalTo: drawerSubtitleLabel.bottomAnchor, constant: 16),
+            sessionSearchField.topAnchor.constraint(equalTo: drawerSubtitleLabel.bottomAnchor, constant: 10),
+            sessionSearchField.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
+            sessionSearchField.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
+            sessionSearchField.heightAnchor.constraint(equalToConstant: 30),
+
+            latestSessionButton.topAnchor.constraint(equalTo: sessionSearchField.bottomAnchor, constant: 10),
             latestSessionButton.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
             latestSessionButton.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
             latestSessionButton.heightAnchor.constraint(equalToConstant: 32),
@@ -5829,6 +5860,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleSaveButton.target = self
         answerStyleSaveButton.action = #selector(saveAnswerStyleClicked)
         answerStyleBox.delegate = self
+        sessionSearchField.delegate = self
         hideButton.target = self
         hideButton.action = #selector(hideClicked)
         fullSizeButton.target = self
@@ -6115,6 +6147,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             : BlueyTheme.hairline).cgColor
         drawerTitleLabel.textColor = themedTextColor
         drawerSubtitleLabel.textColor = themedDimTextColor
+        refreshSessionSearchChrome()
         answerStylePanel.layer?.backgroundColor = BlueyTheme.panelDeep
             .withAlphaComponent(materialAlpha(0.97))
             .cgColor
@@ -6145,6 +6178,32 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         feed.setLightTheme(lightThemeEnabled, opacity: backgroundOpacity)
         canvasPane.applyBackgroundOpacity(backgroundOpacity)
         needsDisplay = true
+    }
+
+    private func refreshSessionSearchChrome() {
+        let focused = sessionSearchField.currentEditor() != nil && !sessionDrawer.isHidden
+        let accent = themedAccentBorderColor
+        let fill = lightThemeEnabled
+            ? BlueyLightTheme.surfaceRaised.withAlphaComponent(lightMaterialAlpha(0.92, floor: 0.22))
+            : NSColor.white.withAlphaComponent(materialAlpha(0.055, floor: 0.018))
+        let placeholderColor = themedDimTextColor.withAlphaComponent(lightThemeEnabled ? 0.80 : 0.72)
+        sessionSearchField.backgroundColor = fill
+        sessionSearchField.textColor = themedTextColor
+        sessionSearchField.layer?.backgroundColor = fill.cgColor
+        sessionSearchField.layer?.borderWidth = focused ? 2 : 1
+        sessionSearchField.layer?.borderColor = accent
+            .withAlphaComponent(focused ? (lightThemeEnabled ? 0.98 : 0.88) : (lightThemeEnabled ? 0.46 : 0.24))
+            .cgColor
+        sessionSearchField.layer?.shadowColor = accent.cgColor
+        sessionSearchField.layer?.shadowOpacity = focused ? (lightThemeEnabled ? 0.22 : 0.28) : 0
+        sessionSearchField.layer?.shadowRadius = focused ? 8 : 0
+        sessionSearchField.layer?.shadowOffset = .zero
+        sessionSearchField.placeholderAttributedString = NSAttributedString(
+            string: "Search title or session ID",
+            attributes: [
+                .font: sessionSearchField.font ?? NSFont.systemFont(ofSize: 11.5, weight: .medium),
+                .foregroundColor: placeholderColor,
+            ])
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -7230,6 +7289,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if control === sessionSearchField {
+            if commandSelector == #selector(NSResponder.insertNewline(_:))
+                || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
+                openFirstFilteredSession()
+                return true
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                if sessionSearchQuery.isEmpty {
+                    closeSessionsClicked()
+                } else {
+                    clearSessionSearch()
+                }
+                return true
+            }
+            return false
+        }
         guard control === answerStyleBox else { return false }
         if commandSelector == #selector(NSResponder.insertNewline(_:))
             || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
@@ -7244,21 +7319,39 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func controlTextDidBeginEditing(_ obj: Notification) {
-        guard (obj.object as? NSControl) === answerStyleBox else { return }
+        guard let control = obj.object as? NSControl else { return }
+        if control === sessionSearchField {
+            applyAccentInsertionPoint(to: sessionSearchField)
+            refreshSessionSearchChrome()
+            return
+        }
+        guard control === answerStyleBox else { return }
         setAnswerStyleInputFocused(true)
         applyAccentInsertionPoint(to: answerStyleBox)
         applyAnswerStyleEditorCursor()
     }
 
     func controlTextDidChange(_ obj: Notification) {
-        guard (obj.object as? NSControl) === answerStyleBox else { return }
+        guard let control = obj.object as? NSControl else { return }
+        if control === sessionSearchField {
+            sessionSearchQuery = sessionSearchField.stringValue
+            renderSessionRows(log: false)
+            refreshSessionSearchChrome()
+            return
+        }
+        guard control === answerStyleBox else { return }
         answerStyleCaretVisible = true
         applyAccentInsertionPoint(to: answerStyleBox)
         updateAnswerStyleCaretPosition()
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
-        guard (obj.object as? NSControl) === answerStyleBox else { return }
+        guard let control = obj.object as? NSControl else { return }
+        if control === sessionSearchField {
+            refreshSessionSearchChrome()
+            return
+        }
+        guard control === answerStyleBox else { return }
         setAnswerStyleInputFocused(false)
     }
 
@@ -8411,6 +8504,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         drawerSubtitleLabel.textColor = BlueyTheme.textDim
         drawerSubtitleLabel.lineBreakMode = .byWordWrapping
         drawerSubtitleLabel.maximumNumberOfLines = 2
+        sessionSearchField.placeholderString = "Search title or session ID"
+        sessionSearchField.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        sessionSearchField.isBezeled = false
+        sessionSearchField.drawsBackground = true
+        sessionSearchField.focusRingType = .none
+        sessionSearchField.alignment = .left
+        sessionSearchField.wantsLayer = true
+        sessionSearchField.layer?.cornerRadius = 10
+        sessionSearchField.layer?.borderWidth = 1
+        sessionSearchField.layer?.masksToBounds = true
+        refreshSessionSearchChrome()
 
         sessionStack.orientation = .vertical
         sessionStack.alignment = .centerX
@@ -8604,6 +8708,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         headerLogo.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
         headerWordmark.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
         brandStack.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
+        sessionSearchField.toolTip = "Search by recording title, date, full UUID, or the short session ID shown in Bluey"
         latestSessionButton.toolTip = "Continue the latest recording"
         answerStyleSaveButton.toolTip = "Save answer style for this session"
     }
@@ -9063,6 +9168,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "session_drawer_opened",
             detail: "had_loaded=\(sessionsHaveLoaded) cached_sessions=\(sessionItems.count)"
         )
+        clearSessionSearch()
         if !sessionsHaveLoaded {
             renderSessionDrawerMessage("Loading...")
         }
@@ -10576,31 +10682,107 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionItems = sessions
         sessionsHaveLoaded = true
         renameField = nil
+        renderSessionRows()
+    }
+
+    private func filteredSessionItems() -> [OverlaySessionItem] {
+        let rawQuery = sessionSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawQuery.isEmpty else { return sessionItems }
+        let lowerQuery = rawQuery.lowercased()
+        let compactQuery = compactSessionSearchToken(rawQuery)
+        return sessionItems.filter { session in
+            let code = shortSessionCode(session.id)
+            let values = [
+                session.id,
+                code,
+                "ID \(code)",
+                session.title,
+                session.subtitle,
+            ]
+            if values.contains(where: { $0.lowercased().contains(lowerQuery) }) {
+                return true
+            }
+            guard !compactQuery.isEmpty else { return false }
+            return values.contains { compactSessionSearchToken($0).contains(compactQuery) }
+        }
+    }
+
+    private func compactSessionSearchToken(_ value: String) -> String {
+        value
+            .lowercased()
+            .unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .map { String($0) }
+            .joined()
+    }
+
+    private func sessionSearchDisplayQuery() -> String {
+        let collapsed = sessionSearchQuery
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard collapsed.count > 34 else { return collapsed }
+        return String(collapsed.prefix(31)) + "..."
+    }
+
+    private func renderSessionRows(log: Bool = true) {
         updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
         for view in sessionStack.arrangedSubviews {
             sessionStack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
 
-        if sessions.isEmpty {
-            emitLifecycle("session_drawer_sessions_rendered", detail: "session_count=0 active_count=0 context_total=0 image_total=0")
+        if sessionItems.isEmpty {
+            if log {
+                emitLifecycle("session_drawer_sessions_rendered", detail: "session_count=0 active_count=0 context_total=0 image_total=0")
+            }
             renderSessionDrawerMessage("No local saved recordings found. Synced sessions live on the web dashboard.")
+            updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
             return
         }
 
-        let activeCount = sessions.filter { $0.isActive }.count
-        let contextTotal = sessions.reduce(0) { $0 + $1.contextCount }
-        let imageTotal = sessions.reduce(0) { $0 + $1.imageCount }
-        emitLifecycle(
-            "session_drawer_sessions_rendered",
-            detail: "session_count=\(sessions.count) active_count=\(activeCount) context_total=\(contextTotal) image_total=\(imageTotal)"
-        )
-        for session in sessions {
+        let filtered = filteredSessionItems()
+        if filtered.isEmpty {
+            if log {
+                emitLifecycle(
+                    "session_drawer_search_no_results",
+                    detail: "session_count=\(sessionItems.count) query_len=\(sessionSearchQuery.count)"
+                )
+            }
+            renderSessionDrawerMessage("No sessions match \"\(sessionSearchDisplayQuery())\". Try the session ID, title, or date.")
+            updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
+            return
+        }
+
+        let activeCount = sessionItems.filter { $0.isActive }.count
+        let contextTotal = sessionItems.reduce(0) { $0 + $1.contextCount }
+        let imageTotal = sessionItems.reduce(0) { $0 + $1.imageCount }
+        if log {
+            emitLifecycle(
+                "session_drawer_sessions_rendered",
+                detail: "session_count=\(sessionItems.count) visible_count=\(filtered.count) active_count=\(activeCount) context_total=\(contextTotal) image_total=\(imageTotal)"
+            )
+        }
+        for session in filtered {
             let row = makeSessionRow(session)
             sessionStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: sessionStack.widthAnchor, constant: -2).isActive = true
         }
         updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
+    }
+
+    private func clearSessionSearch() {
+        guard !sessionSearchQuery.isEmpty || !sessionSearchField.stringValue.isEmpty else { return }
+        sessionSearchQuery = ""
+        sessionSearchField.stringValue = ""
+        renderSessionRows(log: false)
+        refreshSessionSearchChrome()
+    }
+
+    private func openFirstFilteredSession() {
+        guard let session = filteredSessionItems().first else { return }
+        sessionDrawer.isHidden = true
+        setHeaderSubtitle()
+        emitSessionOpen(id: session.id)
     }
 
     private func renderSessionDrawerMessage(_ message: String) {
@@ -10627,8 +10809,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             + 44
         let availableWidth = max(260, layoutWidth - sideInset * 2)
         let availableHeight = max(190, layoutHeight - headerClearance - bottomClearance)
-        let visibleRows = CGFloat(min(max(sessionItems.count, 1), 6))
-        let desiredHeight = 104 + visibleRows * 58
+        let renderedRows = sessionItems.isEmpty ? 1 : max(filteredSessionItems().count, 1)
+        let visibleRows = CGFloat(min(renderedRows, 6))
+        let desiredHeight = 142 + visibleRows * 58
         let drawerWidth = min(380, max(310, min(availableWidth, layoutWidth * 0.36)))
         let drawerHeight = min(availableHeight, max(220, desiredHeight))
 
@@ -11058,6 +11241,25 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
 
+        if shouldReplaceActiveCodeCanvas(question: question, artifact: artifact),
+           let index = activeCanvasIndex,
+           canvases.indices.contains(index) {
+            let existing = canvases[index]
+            let followupNumber = existing.followupCount + 1
+            artifact.title = existing.title
+            artifact.subtitle = canvasSubtitle(base: artifact.subtitle, followups: followupNumber)
+            artifact.followupCount = followupNumber
+            artifact.sourceQuestion = existing.sourceQuestion
+            canvases[index] = artifact
+            canvasCardAssignments[artifact.sourceCardId] = index
+            activeCanvasIndex = index
+            renderActiveCanvas()
+            emitLifecycle(
+                "canvas_replace_code_followup",
+                detail: "source_card=\(artifact.sourceCardId) index=\(index) followups=\(followupNumber) question_chars=\((question ?? "").count) question_words=\(wordCount(question)) question_intent=\(questionIntentLabel(question)) body_chars=\(artifact.content.count)")
+            return
+        }
+
         if shouldAppendCanvasFollowup(question: question, artifact: artifact),
            let index = activeCanvasIndex,
            canvases.indices.contains(index) {
@@ -11091,6 +11293,27 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         emitLifecycle(
             "canvas_new",
             detail: "source_card=\(artifact.sourceCardId) index=\(canvases.count - 1) kind=\(artifact.kind.shortTitle) title_chars=\(artifact.title.count) body_chars=\(artifact.content.count)")
+    }
+
+    private func shouldReplaceActiveCodeCanvas(question: String?, artifact: CanvasArtifact) -> Bool {
+        guard
+            artifact.kind == .code,
+            let index = activeCanvasIndex,
+            canvases.indices.contains(index),
+            canvases[index].kind == .code,
+            let question = question?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !question.isEmpty
+        else {
+            return false
+        }
+        let lower = question.lowercased()
+        if looksLikeExplicitNewCanvasQuestion(lower) {
+            return false
+        }
+        return looksLikeDirectCanvasReference(lower)
+            || looksLikeCodeCanvasFollowup(lower)
+            || looksLikeCodeLanguageReplacementFollowup(lower)
+            || sharesCanvasQuestionTerm(lower, sourceQuestion: canvases[index].sourceQuestion)
     }
 
     private func renderActiveCanvas() {
@@ -11174,6 +11397,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if looksLikeNewCanvasQuestion(lower) {
             return false
         }
+        if artifact.kind == .code {
+            return false
+        }
+        if artifact.kind == .systemDesign && looksLikeSystemDesignCanvasAppendFollowup(lower) {
+            return true
+        }
         if looksLikeCanvasExplanationFollowup(lower) && !looksLikeCanvasMutationFollowup(lower) {
             return false
         }
@@ -11201,6 +11430,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return false
         }
         let lower = question.lowercased()
+        if artifactKind == .systemDesign && looksLikeSystemDesignCanvasAppendFollowup(lower) {
+            return false
+        }
         if looksLikeNewCanvasQuestion(lower) || looksLikeCanvasMutationFollowup(lower) {
             return false
         }
@@ -11276,6 +11508,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "canvas",
             "workbench",
             "why did you use",
+            "why did you choose",
             "why are you using",
             "why can't we do",
             "why cant we do",
@@ -11284,6 +11517,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "explain that",
             "make it",
             "change it",
+            "continue",
+            "keep going",
+            "go on",
+            "next section",
+            "next part",
+            "what about",
+            "how about",
         ]
         return directSignals.contains { lower.contains($0) }
     }
@@ -11337,6 +11577,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let designSignals = [
             "architecture",
             "design",
+            "requirement",
+            "requirements",
             "scale",
             "scaling",
             "latency",
@@ -11346,6 +11588,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "database",
             "storage",
             "api",
+            "gateway",
+            "service",
+            "services",
+            "token",
+            "counter",
+            "counters",
+            "redis",
             "contract",
             "load balancer",
             "region",
@@ -11358,9 +11607,91 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "rollout",
             "vpc",
             "subnet",
+            "security",
+            "rate limit",
+            "rate limiting",
+            "consistency",
+            "availability",
+            "data model",
         ]
+        if looksLikeSystemDesignCanvasAppendFollowup(lower) {
+            return true
+        }
         return looksLikeCanvasExplanationFollowup(lower)
             && designSignals.contains { lower.contains($0) }
+    }
+
+    private func looksLikeSystemDesignCanvasAppendFollowup(_ lower: String) -> Bool {
+        let appendSignals = [
+            "continue",
+            "keep going",
+            "go on",
+            "next section",
+            "next part",
+            "expand",
+            "elaborate",
+            "add ",
+            "include ",
+            "cover ",
+            "extend ",
+            "append ",
+            "update ",
+            "fill in",
+            "what about",
+            "how about",
+        ]
+        guard appendSignals.contains(where: { lower.hasPrefix($0) || lower.contains(" \($0)") }) else {
+            return false
+        }
+        let designSections = [
+            "requirement",
+            "requirements",
+            "api",
+            "gateway",
+            "service",
+            "services",
+            "endpoint",
+            "token",
+            "counter",
+            "counters",
+            "redis",
+            "data model",
+            "database",
+            "schema",
+            "cache",
+            "queue",
+            "worker",
+            "workers",
+            "event",
+            "stream",
+            "latency",
+            "throughput",
+            "scale",
+            "scaling",
+            "shard",
+            "partition",
+            "replica",
+            "region",
+            "availability",
+            "consistency",
+            "tradeoff",
+            "tradeoffs",
+            "failure",
+            "failure mode",
+            "failure modes",
+            "fallback",
+            "retry",
+            "observability",
+            "metrics",
+            "logs",
+            "security",
+            "auth",
+            "rate limit",
+            "rate limiting",
+            "rollout",
+        ]
+        return designSections.contains { lower.contains($0) }
+            || ["continue", "keep going", "go on", "next section", "next part"].contains { lower.contains($0) }
     }
 
     private func sharesCanvasQuestionTerm(_ lower: String, sourceQuestion: String?) -> Bool {
@@ -11477,6 +11808,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func looksLikeNewCanvasQuestion(_ lower: String) -> Bool {
         let trimmed = lower.trimmingCharacters(in: .whitespacesAndNewlines)
+        if looksLikeExplicitNewCanvasQuestion(trimmed) {
+            return true
+        }
+        let newQuestionSignals = [
+            "write a ",
+            "build a ",
+            "implement ",
+            "create a ",
+            "design a ",
+            "solve ",
+        ]
+        return newQuestionSignals.contains { trimmed.hasPrefix($0) }
+    }
+
+    private func looksLikeExplicitNewCanvasQuestion(_ lower: String) -> Bool {
+        let trimmed = lower.trimmingCharacters(in: .whitespacesAndNewlines)
         let newQuestionSignals = [
             "q2",
             "q3",
@@ -11505,14 +11852,43 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "different problem",
             "new question",
             "separate question",
-            "write a ",
-            "build a ",
-            "implement ",
-            "create a ",
-            "design a ",
-            "solve ",
         ]
         return newQuestionSignals.contains { trimmed.hasPrefix($0) }
+    }
+
+    private func looksLikeCodeLanguageReplacementFollowup(_ lower: String) -> Bool {
+        let languageSignals = [
+            "python code",
+            "java code",
+            "go code",
+            "golang code",
+            "typescript code",
+            "javascript code",
+            "c++ code",
+            "cpp code",
+            "c# code",
+            "rust code",
+            "swift code",
+            "kotlin code",
+            "same code in",
+            "code in python",
+            "code in java",
+            "code in go",
+            "code in golang",
+            "code in typescript",
+            "code in javascript",
+            "code in c++",
+            "code in cpp",
+            "code in c#",
+            "code in rust",
+            "code in swift",
+            "code in kotlin",
+            "convert this to",
+            "translate this to",
+            "for this",
+            "for the same",
+        ]
+        return languageSignals.contains { lower.contains($0) }
     }
 
     private func appendCanvasFollowup(

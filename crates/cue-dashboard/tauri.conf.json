@@ -5,8 +5,8 @@
   "build": {
     "frontendDist": "ui/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "cd ui && npm run dev",
-    "beforeBuildCommand": "cd ui && npm run build"
+    "beforeDevCommand": "bash -lc 'cd \"${GITHUB_WORKSPACE:-$(git rev-parse --show-toplevel)}/crates/cue-dashboard/ui\" && npm run dev'",
+    "beforeBuildCommand": "bash -lc 'cd \"${GITHUB_WORKSPACE:-$(git rev-parse --show-toplevel)}/crates/cue-dashboard/ui\" && npm run build'"
   },
   "app": {
     "withGlobalTauri": true,

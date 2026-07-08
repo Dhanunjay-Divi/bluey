@@ -24,7 +24,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
             librsvg2-dev \
             patchelf \
             build-essential \
@@ -32,6 +31,7 @@ jobs:
             wget \
             file \
             libssl-dev \
+            libasound2-dev \
             libayatana-appindicator3-dev \
             libxdo-dev
 
@@ -72,6 +72,6 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          native\windows\cue-overlay\build.ps1
-          native\windows\cue-audio\build.ps1
-          native\windows\cue-whisper\build.ps1
+          Push-Location native/windows/cue-overlay; ./build.ps1; Pop-Location
+          Push-Location native/windows/cue-audio; ./build.ps1; Pop-Location
+          Push-Location native/windows/cue-whisper; ./build.ps1; Pop-Location

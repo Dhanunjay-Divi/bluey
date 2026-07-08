@@ -156,6 +156,17 @@ falsey_env() {
   esac
 }
 
+is_uint() {
+  case "$1" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+    *)
+      [ "$1" -gt 0 ]
+      ;;
+  esac
+}
+
 is_local_redis_url() {
   case "$1" in
     redis://127.0.0.1:*|redis://localhost:*|rediss://127.0.0.1:*|rediss://localhost:*|unix:*)
