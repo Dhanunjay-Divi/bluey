@@ -143,6 +143,13 @@ pub struct CloudSessionSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CloudDeletedSession {
+    pub session_id: String,
+    pub deleted_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CloudSessionBundle {
     pub session: SyncSessionRecord,
     pub transcript_segments: Vec<SyncTranscriptSegment>,
@@ -213,13 +220,37 @@ fn upsert_batch_sqlite(
                 last_active_at_ms, answer_style, metadata_json, deleted_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(account_id, session_id) DO UPDATE SET
-                title=excluded.title,
-                status=excluded.status,
+                title=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.title
+                    ELSE excluded.title
+                END,
+                status=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.status
+                    ELSE excluded.status
+                END,
                 updated_at_ms=MAX(cloud_sessions.updated_at_ms, excluded.updated_at_ms),
-                last_active_at_ms=excluded.last_active_at_ms,
-                answer_style=excluded.answer_style,
-                metadata_json=excluded.metadata_json,
-                deleted_at_ms=excluded.deleted_at_ms",
+                last_active_at_ms=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.last_active_at_ms
+                    ELSE excluded.last_active_at_ms
+                END,
+                answer_style=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.answer_style
+                    ELSE excluded.answer_style
+                END,
+                metadata_json=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.metadata_json
+                    ELSE excluded.metadata_json
+                END,
+                deleted_at_ms=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.deleted_at_ms
+                    ELSE excluded.deleted_at_ms
+                END",
             params![
                 account_id,
                 record.session_id,
@@ -425,13 +456,37 @@ fn upsert_batch_postgres(
                 last_active_at_ms, answer_style, metadata_json, deleted_at_ms
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT(account_id, session_id) DO UPDATE SET
-                title=excluded.title,
-                status=excluded.status,
+                title=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.title
+                    ELSE excluded.title
+                END,
+                status=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.status
+                    ELSE excluded.status
+                END,
                 updated_at_ms=GREATEST(cloud_sessions.updated_at_ms, excluded.updated_at_ms),
-                last_active_at_ms=excluded.last_active_at_ms,
-                answer_style=excluded.answer_style,
-                metadata_json=excluded.metadata_json,
-                deleted_at_ms=excluded.deleted_at_ms",
+                last_active_at_ms=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.last_active_at_ms
+                    ELSE excluded.last_active_at_ms
+                END,
+                answer_style=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.answer_style
+                    ELSE excluded.answer_style
+                END,
+                metadata_json=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.metadata_json
+                    ELSE excluded.metadata_json
+                END,
+                deleted_at_ms=CASE
+                    WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.deleted_at_ms
+                    ELSE excluded.deleted_at_ms
+                END",
             &[
                 &account_id,
                 &record.session_id,
@@ -679,6 +734,131 @@ pub fn list_sessions(
     })
 }
 
+pub fn list_deleted_sessions(
+    pool: &DbPool,
+    account_id: &str,
+    limit: i64,
+) -> Result<Vec<CloudDeletedSession>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => list_deleted_sessions_sqlite(pool, account_id, limit),
+        DbPool::Postgres(_) => list_deleted_sessions_postgres(pool, account_id, limit),
+    })
+}
+
+pub fn tombstone_session(pool: &DbPool, account_id: &str, session_id: &str) -> Result<()> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => tombstone_session_sqlite(pool, account_id, session_id),
+        DbPool::Postgres(_) => tombstone_session_postgres(pool, account_id, session_id),
+    })
+}
+
+fn list_deleted_sessions_sqlite(
+    pool: &DbPool,
+    account_id: &str,
+    limit: i64,
+) -> Result<Vec<CloudDeletedSession>> {
+    let conn = pool.get().context("get db conn")?;
+    let mut stmt = conn.prepare(
+        "SELECT session_id, COALESCE(deleted_at_ms, updated_at_ms), updated_at_ms
+         FROM cloud_sessions
+         WHERE account_id = ?1 AND deleted_at_ms IS NOT NULL
+         ORDER BY COALESCE(deleted_at_ms, updated_at_ms) DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![account_id, limit], |row| {
+        Ok(CloudDeletedSession {
+            session_id: row.get(0)?,
+            deleted_at_ms: row.get(1)?,
+            updated_at_ms: row.get(2)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn list_deleted_sessions_postgres(
+    pool: &DbPool,
+    account_id: &str,
+    limit: i64,
+) -> Result<Vec<CloudDeletedSession>> {
+    let mut conn = pool.get_pg().context("get postgres db conn")?;
+    let rows = conn.query(
+        "SELECT session_id, COALESCE(deleted_at_ms, updated_at_ms), updated_at_ms
+         FROM cloud_sessions
+         WHERE account_id = $1 AND deleted_at_ms IS NOT NULL
+         ORDER BY COALESCE(deleted_at_ms, updated_at_ms) DESC
+         LIMIT $2",
+        &[&account_id, &limit],
+    )?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(CloudDeletedSession {
+                session_id: row.try_get(0)?,
+                deleted_at_ms: row.try_get(1)?,
+                updated_at_ms: row.try_get(2)?,
+            })
+        })
+        .collect()
+}
+
+fn tombstone_session_sqlite(pool: &DbPool, account_id: &str, session_id: &str) -> Result<()> {
+    let conn = pool.get().context("get db conn")?;
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO cloud_sessions (
+            account_id, session_id, title, status, created_at_ms, updated_at_ms,
+            last_active_at_ms, answer_style, metadata_json, deleted_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)
+         ON CONFLICT(account_id, session_id) DO UPDATE SET
+            status='deleted',
+            updated_at_ms=MAX(cloud_sessions.updated_at_ms, excluded.updated_at_ms),
+            deleted_at_ms=COALESCE(cloud_sessions.deleted_at_ms, excluded.deleted_at_ms)",
+        params![
+            account_id,
+            session_id,
+            "Deleted session",
+            "deleted",
+            now,
+            now,
+            now,
+            "{}",
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn tombstone_session_postgres(pool: &DbPool, account_id: &str, session_id: &str) -> Result<()> {
+    let mut conn = pool.get_pg().context("get postgres db conn")?;
+    let now = now_ms();
+    let title = db_text("Deleted session");
+    let status = db_text("deleted");
+    let metadata = "{}".to_string();
+    conn.execute(
+        "INSERT INTO cloud_sessions (
+            account_id, session_id, title, status, created_at_ms, updated_at_ms,
+            last_active_at_ms, answer_style, metadata_json, deleted_at_ms
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9)
+         ON CONFLICT(account_id, session_id) DO UPDATE SET
+            status='deleted',
+            updated_at_ms=GREATEST(cloud_sessions.updated_at_ms, excluded.updated_at_ms),
+            deleted_at_ms=COALESCE(cloud_sessions.deleted_at_ms, excluded.deleted_at_ms)",
+        &[
+            &account_id,
+            &session_id,
+            &title,
+            &status,
+            &now,
+            &now,
+            &now,
+            &metadata,
+            &now,
+        ],
+    )
+    .with_context(|| format!("tombstone cloud_sessions session_id={session_id}"))?;
+    Ok(())
+}
+
 fn list_sessions_sqlite(
     pool: &DbPool,
     account_id: &str,
@@ -696,6 +876,14 @@ fn list_sessions_sqlite(
                     WHERE c.account_id = s.account_id AND c.session_id = s.session_id)
          FROM cloud_sessions s
          WHERE s.account_id = ?1 AND s.deleted_at_ms IS NULL
+           AND (
+                EXISTS (SELECT 1 FROM cloud_transcript_segments t
+                    WHERE t.account_id = s.account_id AND t.session_id = s.session_id)
+                OR EXISTS (SELECT 1 FROM cloud_cue_responses r
+                    WHERE r.account_id = s.account_id AND r.session_id = s.session_id)
+                OR EXISTS (SELECT 1 FROM cloud_context_artifacts c
+                    WHERE c.account_id = s.account_id AND c.session_id = s.session_id)
+           )
          ORDER BY s.updated_at_ms DESC
          LIMIT ?2",
     )?;
@@ -733,6 +921,14 @@ fn list_sessions_postgres(
                     WHERE c.account_id = s.account_id AND c.session_id = s.session_id)
          FROM cloud_sessions s
          WHERE s.account_id = $1 AND s.deleted_at_ms IS NULL
+           AND (
+                EXISTS (SELECT 1 FROM cloud_transcript_segments t
+                    WHERE t.account_id = s.account_id AND t.session_id = s.session_id)
+                OR EXISTS (SELECT 1 FROM cloud_cue_responses r
+                    WHERE r.account_id = s.account_id AND r.session_id = s.session_id)
+                OR EXISTS (SELECT 1 FROM cloud_context_artifacts c
+                    WHERE c.account_id = s.account_id AND c.session_id = s.session_id)
+           )
          ORDER BY s.updated_at_ms DESC
          LIMIT $2",
         &[&account_id, &limit],
@@ -1366,6 +1562,13 @@ fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
     Some(dot / (aa.sqrt() * bb.sqrt()))
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1474,5 +1677,148 @@ mod tests {
         let matches = query_rag(&pool, account_id, "cache", Some(&[1.0, 0.0]), 5).unwrap();
         assert_eq!(matches[0].chunk_id, "c1");
         assert!(matches[0].score > 0.8);
+    }
+
+    #[test]
+    fn list_sessions_hides_empty_shells_until_content_arrives() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_shell";
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                rusqlite::params![account_id, "shell@example.com", "hash"],
+            )
+            .unwrap();
+
+        let session = SyncSessionRecord {
+            session_id: "empty-session".into(),
+            title: "New recording".into(),
+            status: "active".into(),
+            created_at_ms: 1,
+            updated_at_ms: 10,
+            last_active_at_ms: Some(10),
+            answer_style: None,
+            metadata: serde_json::json!({}),
+            deleted_at_ms: None,
+        };
+        upsert_batch(&pool, account_id, &[session.clone()], &[], &[], &[], &[]).unwrap();
+
+        let sessions = list_sessions(&pool, account_id, 10).unwrap();
+        assert!(
+            sessions.is_empty(),
+            "session-only sync shells should not render as conversations"
+        );
+
+        upsert_batch(
+            &pool,
+            account_id,
+            &[session],
+            &[],
+            &[SyncCueResponseRecord {
+                response_id: "turn-1".into(),
+                session_id: "empty-session".into(),
+                kind: "answer".into(),
+                text: "Real answer".into(),
+                source_text: Some("Real question".into()),
+                ts_ms: 11,
+                provider: Some("bluey_managed".into()),
+                model: Some("balanced".into()),
+                lane: Some("balanced".into()),
+                task_type: Some("general".into()),
+                cost_cents: None,
+                balance_cents_after: None,
+                cost_label: None,
+                artifact_type: None,
+                artifact_body: None,
+                artifact_confidence: None,
+                metadata: serde_json::json!({}),
+            }],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let sessions = list_sessions(&pool, account_id, 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "empty-session");
+        assert_eq!(sessions[0].response_count, 1);
+    }
+
+    #[test]
+    fn tombstoned_session_does_not_resurrect_on_later_sync() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_delete";
+        let session_id = uuid::Uuid::new_v4().to_string();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                rusqlite::params![account_id, "delete@example.com", "hash"],
+            )
+            .unwrap();
+
+        let session = SyncSessionRecord {
+            session_id: session_id.clone(),
+            title: "Interview prep".into(),
+            status: "active".into(),
+            created_at_ms: 1,
+            updated_at_ms: 10,
+            last_active_at_ms: Some(10),
+            answer_style: None,
+            metadata: serde_json::json!({}),
+            deleted_at_ms: None,
+        };
+        let response = SyncCueResponseRecord {
+            response_id: "turn-delete-1".into(),
+            session_id: session_id.clone(),
+            kind: "answer".into(),
+            text: "Real answer".into(),
+            source_text: Some("Question".into()),
+            ts_ms: 11,
+            provider: Some("bluey_managed".into()),
+            model: Some("balanced".into()),
+            lane: Some("balanced".into()),
+            task_type: Some("general".into()),
+            cost_cents: None,
+            balance_cents_after: None,
+            cost_label: None,
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
+            metadata: serde_json::json!({}),
+        };
+        upsert_batch(
+            &pool,
+            account_id,
+            &[session.clone()],
+            &[],
+            std::slice::from_ref(&response),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(list_sessions(&pool, account_id, 10).unwrap().len(), 1);
+
+        tombstone_session(&pool, account_id, &session_id).unwrap();
+        assert!(list_sessions(&pool, account_id, 10).unwrap().is_empty());
+        let deleted_sessions = list_deleted_sessions(&pool, account_id, 10).unwrap();
+        assert_eq!(deleted_sessions.len(), 1);
+        assert_eq!(deleted_sessions[0].session_id, session_id);
+        assert!(load_session(&pool, account_id, &session_id)
+            .unwrap()
+            .is_none());
+
+        upsert_batch(&pool, account_id, &[session], &[], &[response], &[], &[]).unwrap();
+        assert!(
+            list_sessions(&pool, account_id, 10).unwrap().is_empty(),
+            "old desktop sync must not resurrect a deleted cloud session"
+        );
+        assert_eq!(
+            list_deleted_sessions(&pool, account_id, 10).unwrap().len(),
+            1
+        );
     }
 }

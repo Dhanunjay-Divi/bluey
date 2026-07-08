@@ -284,6 +284,12 @@ struct SessionsArgs {
     /// Maximum sessions to list.
     #[arg(long, default_value_t = 20)]
     limit: usize,
+    /// Explicitly tag unowned local sessions to the currently signed-in account.
+    #[arg(long)]
+    move_local_to_current_account: bool,
+    /// Required with --move-local-to-current-account.
+    #[arg(long)]
+    confirm_move_local_sessions: bool,
 }
 
 #[derive(Debug, Args)]
@@ -566,7 +572,7 @@ pub async fn cli_main() -> Result<()> {
         Commands::Uninstall(args) => cue_uninstall(args).await,
         Commands::Login(args) => cue_login(args).await,
         Commands::Account => print_account().await,
-        Commands::Sessions(args) => print_sessions(args),
+        Commands::Sessions(args) => handle_sessions(args).await,
         Commands::Settings(args) => cue_settings(args),
         Commands::Usage => bluey_usage_cmd().await,
         Commands::Credits => bluey_credits_cmd().await,
@@ -1505,6 +1511,21 @@ async fn print_account() -> Result<()> {
     Ok(())
 }
 
+async fn handle_sessions(args: SessionsArgs) -> Result<()> {
+    if args.move_local_to_current_account {
+        if !args.confirm_move_local_sessions {
+            bail!(
+                "This can make unowned local sessions visible in the current cloud account. Re-run with --confirm-move-local-sessions to consent."
+            );
+        }
+        let response =
+            request(DaemonRequest::SessionsMoveLocalToCurrentAccount { confirmed: true }).await?;
+        return print_response(response);
+    }
+
+    print_sessions(args)
+}
+
 fn print_sessions(args: SessionsArgs) -> Result<()> {
     let meetings = load_local_meetings()?;
     if args.json {
@@ -1625,6 +1646,7 @@ async fn browser_login(
     let mut account = AccountConfig::local();
     account.provider = "bluey".to_string();
     account.api_url = api_url.to_string();
+    account.cloud_account_id = Some(auth.account.id.clone());
     account.user_id = if user_id == "local-user" {
         auth.account.email.clone()
     } else {
@@ -1736,6 +1758,7 @@ fn device_login_url(verification_uri: &str, user_code: &str) -> String {
 
 fn load_local_meetings() -> Result<Vec<MeetingRecord>> {
     let paths = AppPaths::discover()?;
+    let owner_account_id = cli_current_owner_account_id(&paths);
     let mut meetings: Vec<MeetingRecord> = Vec::new();
 
     let active_path = paths.data_dir.join("active-meeting.json");
@@ -1765,8 +1788,33 @@ fn load_local_meetings() -> Result<Vec<MeetingRecord>> {
         }
     }
 
+    meetings.retain(|meeting| meeting_visible_for_cli_owner(meeting, owner_account_id.as_deref()));
     meetings.sort_by(|left, right| right.started_at.cmp(&left.started_at));
     Ok(meetings)
+}
+
+fn cli_current_owner_account_id(paths: &AppPaths) -> Option<String> {
+    let account = load_account(paths).ok().flatten()?;
+    if !account.token_configured() {
+        return None;
+    }
+    account
+        .cloud_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            let user_id = account.user_id.trim();
+            (!user_id.is_empty() && user_id != "local-user").then(|| user_id.to_string())
+        })
+}
+
+fn meeting_visible_for_cli_owner(meeting: &MeetingRecord, owner_account_id: Option<&str>) -> bool {
+    match owner_account_id {
+        Some(owner) => meeting.owner_account_id.as_deref() == Some(owner),
+        None => meeting.owner_account_id.as_deref().is_none(),
+    }
 }
 
 fn print_meeting_detail(meeting: &MeetingRecord) {

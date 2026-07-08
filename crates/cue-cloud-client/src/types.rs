@@ -363,6 +363,17 @@ pub struct ArtifactObjectResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionAuditBundleResponse {
+    pub session_id: String,
+    pub bundle_id: String,
+    pub object_key: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub content_type: String,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudSessionSummary {
     pub session_id: String,
     pub title: String,
@@ -378,8 +389,17 @@ pub struct CloudSessionSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudDeletedSession {
+    pub session_id: String,
+    pub deleted_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionListResponse {
     pub sessions: Vec<CloudSessionSummary>,
+    #[serde(default)]
+    pub deleted_sessions: Vec<CloudDeletedSession>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

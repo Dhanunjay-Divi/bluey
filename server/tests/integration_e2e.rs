@@ -1280,6 +1280,60 @@ async fn router_complete_retries_next_openai_key_on_429_without_customer_wait() 
 
 #[tokio::test]
 #[serial]
+async fn router_complete_short_waits_account_llm_burst_guard() {
+    std::env::set_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN", "60");
+    std::env::set_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN_BURST", "1");
+    let h = boot_harness_with_upstream(UpstreamKeys {
+        openai_api_key: None,
+        anthropic_api_key: Some("sk-test-anthropic".to_string()),
+        gemini_api_key: None,
+        deepseek_api_key: None,
+        zai_api_key: None,
+        deepgram_api_key: Some("dg-test".to_string()),
+        ollama_base_url: None,
+    })
+    .await;
+    std::env::remove_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN");
+    std::env::remove_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN_BURST");
+    let access = signup_and_login(&h, "account-burst-shortwait@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "burst guard answered"}],
+            "usage": {"input_tokens": 10, "output_tokens": 4}
+        })))
+        .expect(2)
+        .mount(&h.anthropic)
+        .await;
+
+    for request_id in ["account-burst-shortwait-1", "account-burst-shortwait-2"] {
+        let req = Request::post("/router/complete")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {access}"))
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "request_id": request_id,
+                    "system": "you are helpful",
+                    "user": "answer a normal technical question",
+                    "lane": "balanced"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = h.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["text"], "burst guard answered");
+        assert_eq!(v["provider"], "anthropic");
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn router_complete_reports_upstream_error_after_capacity_skip() {
     std::env::set_var("BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN", "60");
     std::env::set_var("BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN_BURST", "1");

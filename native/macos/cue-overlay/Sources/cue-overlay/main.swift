@@ -3050,6 +3050,12 @@ private final class FeedView: NSView {
         emptyState.isHidden = false
     }
 
+    func removeSignInCards() {
+        removeCards { card in
+            loginURL(from: card) != nil
+        }
+    }
+
     func forwardScrollWheel(_ event: NSEvent) {
         scroll.scrollWheel(with: event)
         updateScrollPinAfterUserInput()
@@ -3163,6 +3169,24 @@ private final class FeedView: NSView {
             stack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
+    }
+
+    private func removeCards(where shouldRemove: (RenderedCard) -> Bool) {
+        guard !cards.isEmpty else { return }
+        let shouldAutoScroll = shouldFollowIncomingContent()
+        var removedAny = false
+        for idx in cards.indices.reversed() where shouldRemove(cards[idx]) {
+            cards.remove(at: idx)
+            if stack.arrangedSubviews.indices.contains(idx) {
+                let view = stack.arrangedSubviews[idx]
+                stack.removeArrangedSubview(view)
+                view.removeFromSuperview()
+            }
+            removedAny = true
+        }
+        guard removedAny else { return }
+        emptyState.isHidden = !cards.isEmpty
+        scrollToBottomIfNeeded(shouldAutoScroll)
     }
 
     private func pushTranscriptCard(_ input: RenderedCard) {
@@ -3418,7 +3442,9 @@ private final class FeedView: NSView {
         bodyLabel.textColor = rightAligned ? NSColor.black : textColor
         bodyLabel.alignment = signInURL == nil ? .left : .center
         bodyLabel.translatesAutoresizingMaskIntoConstraints = false
-        bodyLabel.preferredMaxLayoutWidth = signInURL == nil ? (rightAligned ? 360 : 480) : 430
+        bodyLabel.preferredMaxLayoutWidth = signInURL == nil
+            ? (answerLike ? 640 : (rightAligned ? 360 : 480))
+            : 430
         bodyLabel.isSelectable = false
         bodyLabel.allowsEditingTextAttributes = false
         if let attributedBody = attributedChatBody(for: card, text: bodyText, rightAligned: rightAligned) {
@@ -3965,13 +3991,18 @@ private final class FeedView: NSView {
 
     private func attributedChatBody(for card: RenderedCard, text: String, rightAligned: Bool) -> NSAttributedString? {
         let kind = normalizedCardKind(card.kind)
+        if kind == "answer" {
+            return attributedAnswerBody(for: card, text: text)
+        }
         guard kind == "question" || kind == "transcript" else { return nil }
         let font = bodyFont(for: card)
+        let paragraph = chatParagraphStyle(answerLike: false)
         let attributed = NSMutableAttributedString(
             string: text,
             attributes: [
                 .font: font,
                 .foregroundColor: rightAligned ? NSColor.black : textColor,
+                .paragraphStyle: paragraph,
             ])
         let sourceFont = NSFont.systemFont(ofSize: font.pointSize, weight: .bold)
         let sourceColor = sourceMarkerColor(rightAligned: rightAligned)
@@ -3990,6 +4021,106 @@ private final class FeedView: NSView {
                 range: labelRange)
         }
         return attributed
+    }
+
+    private func attributedAnswerBody(for card: RenderedCard, text: String) -> NSAttributedString {
+        let displayText = skimFriendlyAnswerText(text)
+        let font = bodyFont(for: card)
+        let boldFont = NSFont.systemFont(ofSize: font.pointSize, weight: .semibold)
+        let headingFont = NSFont.systemFont(ofSize: font.pointSize + 0.2, weight: .bold)
+        let headingColor = lightThemeEnabled ? BlueyLightTheme.accent : BlueyTheme.cyan
+        let paragraph = chatParagraphStyle(answerLike: true)
+        let attributed = NSMutableAttributedString(
+            string: displayText,
+            attributes: [
+                .font: font,
+                .foregroundColor: textColor,
+                .paragraphStyle: paragraph,
+            ])
+
+        var location = 0
+        for rawLine in displayText.components(separatedBy: "\n") {
+            let lineLength = (rawLine as NSString).length
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if lineLength > 0 {
+                if isSkimSectionHeading(trimmed) {
+                    attributed.addAttributes(
+                        [
+                            .font: headingFont,
+                            .foregroundColor: headingColor,
+                        ],
+                        range: NSRange(location: location, length: lineLength))
+                } else if let prefixLength = answerEmphasisPrefixLength(in: rawLine) {
+                    attributed.addAttributes(
+                        [
+                            .font: boldFont,
+                            .foregroundColor: headingColor,
+                        ],
+                        range: NSRange(location: location, length: min(prefixLength, lineLength)))
+                }
+            }
+            location += lineLength + 1
+        }
+
+        return attributed
+    }
+
+    private func chatParagraphStyle(answerLike: Bool) -> NSParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.lineSpacing = answerLike ? 4.8 : 2.0
+        paragraph.paragraphSpacing = answerLike ? 2.5 : 1.0
+        return paragraph
+    }
+
+    private func skimFriendlyAnswerText(_ text: String) -> String {
+        var output: [String] = []
+        for line in text.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if isSkimSectionHeading(trimmed),
+                !output.isEmpty,
+                output.last?.isEmpty == false
+            {
+                output.append("")
+            }
+            output.append(line)
+        }
+        return output
+            .joined(separator: "\n")
+            .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isSkimSectionHeading(_ trimmed: String) -> Bool {
+        guard !trimmed.isEmpty, trimmed.count <= 42 else { return false }
+        let normalized = trimmed
+            .trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            .lowercased()
+        return [
+            "approach",
+            "code",
+            "implementation",
+            "explanation",
+            "complexity",
+            "edge cases",
+            "line notes",
+            "walk-through",
+            "why it works",
+            "example",
+            "examples",
+            "takeaway",
+            "recommendation",
+            "result",
+        ].contains(normalized)
+    }
+
+    private func answerEmphasisPrefixLength(in line: String) -> Int? {
+        let pattern = #"^\s*(Time Complexity|Space Complexity|Key idea|Quick answer|Assumption|Assumptions|Tradeoff|Trade-off|Why it matters|Next step|Result|Takeaway|Recommendation)\b:?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(location: 0, length: (line as NSString).length)
+        guard let match = regex.firstMatch(in: line, range: range) else { return nil }
+        return match.range.length
     }
 
     private func sourceMarkerColor(rightAligned: Bool) -> NSColor {
@@ -4916,6 +5047,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let minTranscriptQuestionWords: Int = 2
         static let autoSendCaptionSettleDelayMs: Int = 300
         static let autoSendCaptionSettleDelaySeconds: TimeInterval = 0.3
+        static let autoSendCaptionPartialSettleDelayMs: Int = 900
+        static let autoSendCaptionPartialSettleDelaySeconds: TimeInterval = 0.9
         static let clickThroughMoveHandleSize: CGFloat = 42
         static let clickThroughMoveHandleHitPadding: CGFloat = 26
     }
@@ -9240,7 +9373,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
-    private func scheduleAutoSendAfterCaptionSettle(source: String) {
+    private func scheduleAutoSendAfterCaptionSettle(source: String, final: Bool) {
         autoSendAfterStopWorkItem?.cancel()
         autoSendAfterStopWorkItem = nil
         guard autoSendStopMode.isEnabled else { return }
@@ -9248,6 +9381,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard recordingActive, autoSendListenCaptureActive else { return }
         guard hasAutoSendStopContext() else { return }
         let mode = autoSendStopMode
+        let delayMs = final
+            ? ChromeMetrics.autoSendCaptionSettleDelayMs
+            : ChromeMetrics.autoSendCaptionPartialSettleDelayMs
+        let delaySeconds = final
+            ? ChromeMetrics.autoSendCaptionSettleDelaySeconds
+            : ChromeMetrics.autoSendCaptionPartialSettleDelaySeconds
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.autoSendAfterStopWorkItem = nil
@@ -9273,10 +9412,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         autoSendAfterStopWorkItem = work
         emitLifecycle(
             "autosend_answer_scheduled",
-            detail: "mode=\(mode.rawValue) source=\(source) delay_ms=\(ChromeMetrics.autoSendCaptionSettleDelayMs) sources=\(autoSendTranscriptLinesBySource.count)"
+            detail: "mode=\(mode.rawValue) source=\(source) final=\(final) delay_ms=\(delayMs) sources=\(autoSendTranscriptLinesBySource.count)"
         )
         DispatchQueue.main.asyncAfter(
-            deadline: .now() + ChromeMetrics.autoSendCaptionSettleDelaySeconds,
+            deadline: .now() + delaySeconds,
             execute: work
         )
     }
@@ -9886,6 +10025,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     func showSignedInChromeReady() {
         signedOutGateActive = false
+        feed.removeSignInCards()
         applySignedOutGateControlState()
         refreshSessionHeaderSubtitle()
         routeBadge.stringValue = "● Ready"
@@ -12136,9 +12276,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
         rememberAutoSendTranscriptLine(source: key, body: cleanBody)
-        if final {
-            scheduleAutoSendAfterCaptionSettle(source: key)
-        }
+        scheduleAutoSendAfterCaptionSettle(source: key, final: final)
         if final {
             latestLiveTranscriptLine = nil
             latestLiveTranscriptLinesBySource.removeValue(forKey: key)

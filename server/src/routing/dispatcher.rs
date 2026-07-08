@@ -49,6 +49,7 @@ const GEMINI_LITE_MODEL: &str = "gemini-3.1-flash-lite";
 const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
 const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
 const ZAI_FLAGSHIP_MODEL: &str = "glm-5.2";
+const DEFAULT_DEEPGRAM_LANGUAGE: &str = "en-IN";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoutePolicy {
@@ -2419,9 +2420,14 @@ async fn deepgram_transcribe(
 ) -> Result<TranscribeCompletion> {
     // POST to /v1/listen?model=...&punctuate=true with the raw audio
     // bytes as the body. Deepgram accepts audio/wav, audio/mpeg, etc.
-    let default_url = format!(
-        "https://api.deepgram.com/v1/listen?model={model}&punctuate=true&smart_format=true"
+    let mut default_url = format!(
+        "https://api.deepgram.com/v1/listen?model={}&punctuate=true&smart_format=true",
+        deepgram_query_escape(model)
     );
+    if let Some(language) = deepgram_language_param() {
+        default_url.push_str("&language=");
+        default_url.push_str(&deepgram_query_escape(&language));
+    }
     let url = override_url(&default_url, "BLUEY_TEST_DEEPGRAM_URL");
     let resp = reqwest::Client::new()
         .post(&url)
@@ -2458,6 +2464,42 @@ async fn deepgram_transcribe(
         model: model.to_string(),
         duration_seconds,
     })
+}
+
+fn deepgram_language_param() -> Option<String> {
+    deepgram_language_from_value(std::env::var("BLUEY_DEEPGRAM_LANGUAGE").ok())
+}
+
+fn deepgram_language_from_value(value: Option<String>) -> Option<String> {
+    let language = value.unwrap_or_else(|| DEFAULT_DEEPGRAM_LANGUAGE.to_string());
+    let language = language.trim();
+    if language.is_empty()
+        || matches!(
+            language.to_ascii_lowercase().as_str(),
+            "auto" | "detect" | "none" | "off"
+        )
+    {
+        None
+    } else {
+        Some(language.to_string())
+    }
+}
+
+fn deepgram_query_escape(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
 }
 
 async fn openai_transcribe(
@@ -2520,6 +2562,30 @@ fn audio_filename(content_type: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deepgram_language_defaults_to_indian_english_but_can_be_overridden() {
+        assert_eq!(deepgram_language_from_value(None).as_deref(), Some("en-IN"));
+        assert_eq!(
+            deepgram_language_from_value(Some(" en-US ".to_string())).as_deref(),
+            Some("en-US")
+        );
+        assert_eq!(
+            deepgram_language_from_value(Some("en-AU".to_string())).as_deref(),
+            Some("en-AU")
+        );
+        assert_eq!(deepgram_language_from_value(Some("auto".to_string())), None);
+        assert_eq!(
+            deepgram_language_from_value(Some("detect".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn deepgram_query_escape_keeps_language_and_model_url_safe() {
+        assert_eq!(deepgram_query_escape("nova 3/test"), "nova%203%2Ftest");
+        assert_eq!(deepgram_query_escape("en-IN"), "en-IN");
+    }
 
     #[test]
     fn resolve_route_known_lanes() {

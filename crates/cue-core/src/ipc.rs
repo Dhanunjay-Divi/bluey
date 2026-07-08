@@ -87,6 +87,9 @@ pub enum DaemonRequest {
     CloudStatus,
     CloudLogin,
     CloudLogout,
+    SessionsMoveLocalToCurrentAccount {
+        confirmed: bool,
+    },
     CloudSyncNow,
     Recap,
     ActionItems,

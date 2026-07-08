@@ -79,6 +79,40 @@ Use the Analyse Screen quick chip when the important content is a browser page t
 
 Use terminal fallback capture commands when the useful context is not available as browser text.
 
+## Account Switching And Local Session Migration
+
+Cloud session history is account-scoped. If a user signs out, deletes an
+account, or links the desktop to a different account, old cloud chats should
+stay with the old account. The new account should not see the old account's
+history unless the user explicitly chooses to migrate local sessions.
+
+Current policy:
+
+- Moving a desktop to a new account changes the desktop link and billing
+  identity only. It does not automatically move chats.
+- Local cached sessions should be tagged with the account that created or
+  synced them.
+- On logout/account switch/delete, Bluey should stop listening and answering,
+  clear visible context, hide old history, and reload only sessions owned by
+  the current account.
+- Migration is explicit and CLI-only for now:
+
+```bash
+bluey sessions --move-local-to-current-account --confirm-move-local-sessions
+```
+
+Future revisit:
+
+- Make session IDs visible and searchable in overlay History and the web
+  Session History page.
+- Consider an overlay/web migration prompt only if it is safer and clearer than
+  the CLI command.
+- If UI migration is added, require an explicit checkbox and a typed
+  confirmation. The copy should explain that selected local sessions will become
+  visible in the current cloud account.
+- Never migrate sessions automatically during login, logout, account deletion,
+  or desktop relink.
+
 ## Terminal Fallbacks
 
 These remain hidden from normal help for testing, automation, diagnostics, and support:

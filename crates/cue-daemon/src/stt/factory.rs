@@ -36,6 +36,8 @@ use super::router::{
     is_local_whisper_enabled, is_openai_fallback_enabled, is_router_enabled, SttRouter,
 };
 
+const DEFAULT_DEEPGRAM_LANGUAGE: &str = "en-IN";
+
 /// Build the STT provider chain from environment configuration.
 ///
 /// Tries each enabled provider in order. If a provider's config is missing
@@ -65,10 +67,10 @@ pub async fn build_stt_chain(
         let dg_cfg = super::deepgram::DeepgramConfig {
             api_key,
             model: env_value("BLUEY_DEEPGRAM_MODEL").unwrap_or_else(|| "nova-3".into()),
-            language: env_value("BLUEY_DEEPGRAM_LANGUAGE"),
-            smart_format: env_bool("BLUEY_DEEPGRAM_SMART_FORMAT").unwrap_or(true),
-            endpointing_ms: env_optional_u32("BLUEY_DEEPGRAM_ENDPOINTING_MS", Some(200)),
-            utterance_end_ms: env_optional_u32("BLUEY_DEEPGRAM_UTTERANCE_END_MS", Some(1_000)),
+            language: deepgram_language_from_env(),
+            smart_format: env_bool("BLUEY_DEEPGRAM_SMART_FORMAT").unwrap_or(false),
+            endpointing_ms: env_optional_u32("BLUEY_DEEPGRAM_ENDPOINTING_MS", Some(10)),
+            utterance_end_ms: env_optional_u32("BLUEY_DEEPGRAM_UTTERANCE_END_MS", None),
             vad_events: env_bool("BLUEY_DEEPGRAM_VAD_EVENTS").unwrap_or(true),
             ..Default::default()
         };
@@ -170,6 +172,25 @@ fn env_optional_u32(name: &str, default: Option<u32>) -> Option<u32> {
     optional_u32_from_value(env_value(name), default)
 }
 
+fn deepgram_language_from_env() -> Option<String> {
+    deepgram_language_from_value(env_value("BLUEY_DEEPGRAM_LANGUAGE"))
+}
+
+fn deepgram_language_from_value(value: Option<String>) -> Option<String> {
+    let language = value.unwrap_or_else(|| DEFAULT_DEEPGRAM_LANGUAGE.to_string());
+    let language = language.trim();
+    if language.is_empty()
+        || matches!(
+            language.to_ascii_lowercase().as_str(),
+            "auto" | "detect" | "none" | "off"
+        )
+    {
+        None
+    } else {
+        Some(language.to_string())
+    }
+}
+
 fn optional_u32_from_value(value: Option<String>, default: Option<u32>) -> Option<u32> {
     match value
         .map(|value| value.trim().to_string())
@@ -211,5 +232,20 @@ mod tests {
             Some(200)
         );
         assert_eq!(optional_u32_from_value(None, Some(200)), Some(200));
+    }
+
+    #[test]
+    fn deepgram_language_defaults_to_indian_english_but_can_be_overridden() {
+        assert_eq!(deepgram_language_from_value(None).as_deref(), Some("en-IN"));
+        assert_eq!(
+            deepgram_language_from_value(Some(" en-US ".to_string())).as_deref(),
+            Some("en-US")
+        );
+        assert_eq!(
+            deepgram_language_from_value(Some("en-GB".to_string())).as_deref(),
+            Some("en-GB")
+        );
+        assert_eq!(deepgram_language_from_value(Some("auto".to_string())), None);
+        assert_eq!(deepgram_language_from_value(Some("off".to_string())), None);
     }
 }

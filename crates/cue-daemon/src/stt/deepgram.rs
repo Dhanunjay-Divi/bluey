@@ -103,9 +103,9 @@ impl Default for DeepgramConfig {
             interim_results: true,
             language: None,
             punctuate: true,
-            smart_format: true,
-            endpointing_ms: Some(200),
-            utterance_end_ms: Some(1_000),
+            smart_format: false,
+            endpointing_ms: Some(10),
+            utterance_end_ms: None,
             vad_events: true,
             diarize: false,
             base_url: None,
@@ -692,10 +692,10 @@ mod tests {
         assert_eq!(q.get("sample_rate").map(String::as_str), Some("16000"));
         assert_eq!(q.get("channels").map(String::as_str), Some("1"));
         assert_eq!(q.get("punctuate").map(String::as_str), Some("true"));
-        assert_eq!(q.get("smart_format").map(String::as_str), Some("true"));
-        assert_eq!(q.get("endpointing").map(String::as_str), Some("200"));
+        assert_eq!(q.get("smart_format"), None);
+        assert_eq!(q.get("endpointing").map(String::as_str), Some("10"));
         assert_eq!(q.get("interim_results").map(String::as_str), Some("true"));
-        assert_eq!(q.get("utterance_end_ms").map(String::as_str), Some("1000"));
+        assert_eq!(q.get("utterance_end_ms"), None);
         assert_eq!(q.get("vad_events").map(String::as_str), Some("true"));
     }
 
@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(q.get("interim_results"), None);
         assert_eq!(q.get("utterance_end_ms"), None);
         assert_eq!(q.get("vad_events"), None);
-        assert_eq!(q.get("endpointing").map(String::as_str), Some("200"));
+        assert_eq!(q.get("endpointing").map(String::as_str), Some("10"));
     }
 
     #[test]

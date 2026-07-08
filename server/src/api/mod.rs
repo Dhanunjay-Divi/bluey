@@ -236,8 +236,16 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
                 .get(sync::download_artifact_object)
                 .route_layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
+        .route(
+            "/sync/session-audit/:session_id/:bundle_id",
+            axum::routing::post(sync::upload_session_audit_bundle)
+                .route_layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/sync/sessions", get(sync::list_sessions))
-        .route("/sync/sessions/:session_id", get(sync::get_session))
+        .route(
+            "/sync/sessions/:session_id",
+            get(sync::get_session).delete(sync::delete_session),
+        )
         .route("/rag/query", axum::routing::post(sync::rag_query))
         .route("/usage/event", axum::routing::post(usage::ingest))
         .route("/billing/checkout", axum::routing::post(billing::checkout))

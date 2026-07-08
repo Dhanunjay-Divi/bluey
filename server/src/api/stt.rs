@@ -39,10 +39,11 @@ const MAX_SESSION_SECONDS: i64 = 20 * 60;
 const PCM16_DBFS_FLOOR: f64 = -120.0;
 const LIVE_STT_AUDIBLE_RMS_DBFS: f64 = -58.0;
 const LIVE_STT_AUDIBLE_PEAK_DBFS: f64 = -34.0;
-const DEFAULT_DEEPGRAM_ENDPOINTING_MS: u32 = 200;
-const DEFAULT_DEEPGRAM_UTTERANCE_END_MS: u32 = 1_000;
-const DEFAULT_DEEPGRAM_LANGUAGE: &str = "en-US";
+const DEFAULT_DEEPGRAM_ENDPOINTING_MS: u32 = 10;
+const DEFAULT_DEEPGRAM_UTTERANCE_END_MS: Option<u32> = None;
+const DEFAULT_DEEPGRAM_LANGUAGE: &str = "en-IN";
 const DEFAULT_DEEPGRAM_NO_DELAY: bool = true;
+const DEFAULT_DEEPGRAM_SMART_FORMAT: bool = false;
 const MAX_DEEPGRAM_KEYTERMS: usize = 64;
 const DEFAULT_DEEPGRAM_KEYTERMS: &[&str] = &[
     "LRU",
@@ -650,18 +651,26 @@ fn deepgram_realtime_url(session: &ClaimedSttSession) -> String {
         10,
         1_000,
     );
-    let utterance_end_ms = deepgram_realtime_env_u32(
+    let utterance_end_ms = deepgram_realtime_env_optional_u32(
         "BLUEY_DEEPGRAM_UTTERANCE_END_MS",
         DEFAULT_DEEPGRAM_UTTERANCE_END_MS,
         1_000,
         5_000,
     );
     let no_delay = deepgram_realtime_env_bool("BLUEY_DEEPGRAM_NO_DELAY", DEFAULT_DEEPGRAM_NO_DELAY);
+    let smart_format = deepgram_realtime_env_bool(
+        "BLUEY_DEEPGRAM_SMART_FORMAT",
+        DEFAULT_DEEPGRAM_SMART_FORMAT,
+    );
     let keyterms = deepgram_realtime_keyterms();
     let mut url = format!(
-        "{base}?model={}&encoding=linear16&sample_rate=16000&channels=1&punctuate=true&smart_format=true&interim_results=true&endpointing={endpointing_ms}&utterance_end_ms={utterance_end_ms}&vad_events=true&no_delay={no_delay}",
+        "{base}?model={}&encoding=linear16&sample_rate=16000&channels=1&punctuate=true&smart_format={smart_format}&interim_results=true&endpointing={endpointing_ms}&vad_events=true&no_delay={no_delay}",
         url_escape(&session.model),
     );
+    if let Some(utterance_end_ms) = utterance_end_ms {
+        url.push_str("&utterance_end_ms=");
+        url.push_str(&utterance_end_ms.to_string());
+    }
     let language = std::env::var("BLUEY_DEEPGRAM_LANGUAGE")
         .unwrap_or_else(|_| DEFAULT_DEEPGRAM_LANGUAGE.to_string());
     let language = language.trim();
@@ -726,6 +735,28 @@ fn deepgram_realtime_env_u32(name: &str, default: u32, min: u32, max: u32) -> u3
         .and_then(|value| value.trim().parse::<u32>().ok())
         .unwrap_or(default)
         .clamp(min, max)
+}
+
+fn deepgram_realtime_env_optional_u32(
+    name: &str,
+    default: Option<u32>,
+    min: u32,
+    max: u32,
+) -> Option<u32> {
+    let Some(value) = std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return default;
+    };
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "none" | "disabled" | "disable"
+    ) {
+        return None;
+    }
+    value.parse::<u32>().ok().map(|value| value.clamp(min, max)).or(default)
 }
 
 fn deepgram_realtime_env_bool(name: &str, default: bool) -> bool {
@@ -1009,6 +1040,9 @@ mod tests {
         let _guard = DEEPGRAM_URL_ENV_LOCK.lock().unwrap();
         std::env::remove_var("BLUEY_DEEPGRAM_LANGUAGE");
         std::env::remove_var("BLUEY_DEEPGRAM_NO_DELAY");
+        std::env::remove_var("BLUEY_DEEPGRAM_SMART_FORMAT");
+        std::env::remove_var("BLUEY_DEEPGRAM_ENDPOINTING_MS");
+        std::env::remove_var("BLUEY_DEEPGRAM_UTTERANCE_END_MS");
         std::env::remove_var("BLUEY_DEEPGRAM_DEFAULT_KEYTERMS");
         std::env::remove_var("BLUEY_DEEPGRAM_KEYTERMS");
         let session = ClaimedSttSession {
@@ -1026,15 +1060,49 @@ mod tests {
         let url = deepgram_realtime_url(&session);
         assert!(url.contains("model=nova%203%2Ftest"));
         assert!(url.contains("interim_results=true"));
-        assert!(url.contains("endpointing=200"));
-        assert!(url.contains("utterance_end_ms=1000"));
+        assert!(url.contains("endpointing=10"));
+        assert!(url.contains("smart_format=false"));
+        assert!(!url.contains("utterance_end_ms="));
         assert!(url.contains("vad_events=true"));
         assert!(url.contains("no_delay=true"));
-        assert!(url.contains("language=en-US"));
+        assert!(url.contains("language=en-IN"));
         assert!(url.contains("keyterm=LRU"));
         assert!(url.contains("keyterm=REST%20API"));
         assert!(url.contains("keyterm=CI%2FCD"));
         assert!(!url.contains("Token "));
+    }
+
+    #[test]
+    fn deepgram_url_can_enable_readability_preset() {
+        let _guard = DEEPGRAM_URL_ENV_LOCK.lock().unwrap();
+        std::env::set_var("BLUEY_DEEPGRAM_SMART_FORMAT", "true");
+        std::env::set_var("BLUEY_DEEPGRAM_ENDPOINTING_MS", "150");
+        std::env::set_var("BLUEY_DEEPGRAM_UTTERANCE_END_MS", "1000");
+        std::env::set_var("BLUEY_DEEPGRAM_DEFAULT_KEYTERMS", "0");
+        std::env::remove_var("BLUEY_DEEPGRAM_LANGUAGE");
+        std::env::remove_var("BLUEY_DEEPGRAM_KEYTERMS");
+        let session = ClaimedSttSession {
+            token: "token".into(),
+            account_id: "acct".into(),
+            bluey_session_id: "sess".into(),
+            provider: "deepgram".into(),
+            model: "nova-3".into(),
+            source: "microphone".into(),
+            max_seconds: 60,
+            expires_at_ms: now_ms() + 60_000,
+            reserved_cents: 0,
+            reserved_trial_seconds: 0,
+        };
+        let url = deepgram_realtime_url(&session);
+        assert!(url.contains("endpointing=150"));
+        assert!(url.contains("smart_format=true"));
+        assert!(url.contains("utterance_end_ms=1000"));
+        assert!(url.contains("language=en-IN"));
+        std::env::remove_var("BLUEY_DEEPGRAM_SMART_FORMAT");
+        std::env::remove_var("BLUEY_DEEPGRAM_ENDPOINTING_MS");
+        std::env::remove_var("BLUEY_DEEPGRAM_UTTERANCE_END_MS");
+        std::env::remove_var("BLUEY_DEEPGRAM_DEFAULT_KEYTERMS");
+        std::env::remove_var("BLUEY_DEEPGRAM_LANGUAGE");
     }
 
     #[test]

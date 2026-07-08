@@ -3375,12 +3375,24 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         : 'Bluey has the session record, but no conversation text has uploaded yet. Keep the desktop open, ask or answer once, then refresh.';
       detail.append(title, meta, uploadState);
 
+      const actions = document.createElement('div');
+      actions.className = 'session-actions';
       const copyId = document.createElement('button');
       copyId.className = 'account-button ghost compact';
       copyId.type = 'button';
       copyId.dataset.copy = sessionId;
       copyId.textContent = 'Copy full session ID';
-      detail.append(copyId);
+      const deleteSession = document.createElement('button');
+      deleteSession.className = 'account-button danger compact';
+      deleteSession.type = 'button';
+      deleteSession.textContent = 'Delete session';
+      deleteSession.addEventListener('click', () => {
+        deleteCloudSession(sessionId).catch((error) => {
+          accountMessage(error.message || 'Could not delete saved session.');
+        });
+      });
+      actions.append(copyId, deleteSession);
+      detail.append(actions);
 
       if (sessionMeta?.answer_style) {
         appendBundlePreview(detail, 'Answer style', sessionMeta.answer_style);
@@ -3441,6 +3453,19 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           body: [artifact.note, artifact.text_preview].filter(Boolean).join('\n\n'),
         })
       );
+    }
+
+    async function deleteCloudSession(sessionId) {
+      if (!sessionId) return;
+      const code = shortSessionId(sessionId).toUpperCase();
+      if (!window.confirm(`Delete Bluey session ${code} from this account?`)) return;
+      await apiJson(`/sync/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+      accountMessage(`Deleted session ${code}.`);
+      setCloudSessionDetail('Session deleted.');
+      const url = new URL(window.location.href);
+      url.searchParams.delete('session');
+      window.history.replaceState(null, '', url.toString());
+      await loadCloudSessions();
     }
 
     function renderAdminAbuse(payload, message = '') {

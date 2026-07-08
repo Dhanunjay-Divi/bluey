@@ -273,6 +273,8 @@ impl ConversationTurn {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingRecord {
     pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_account_id: Option<String>,
     pub title: String,
     pub started_at: String,
     pub ended_at: Option<String>,
@@ -355,6 +357,7 @@ impl MeetingRecord {
     pub fn new(title: Option<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
+            owner_account_id: None,
             title: title
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "New recording".to_string()),

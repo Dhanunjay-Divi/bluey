@@ -15,9 +15,11 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use crate::auth::AuthedAccount;
+use crate::db::diagnostic_logs::{self, DiagnosticLogChunkInput};
 use crate::db::sync::{
-    self, CloudSessionBundle, CloudSessionSummary, RagMatch, SyncContextArtifactRecord, SyncCounts,
-    SyncCueResponseRecord, SyncRagChunkRecord, SyncSessionRecord, SyncTranscriptSegment,
+    self, CloudDeletedSession, CloudSessionBundle, CloudSessionSummary, RagMatch,
+    SyncContextArtifactRecord, SyncCounts, SyncCueResponseRecord, SyncRagChunkRecord,
+    SyncSessionRecord, SyncTranscriptSegment,
 };
 use crate::object_storage::{sha256_hex, ObjectStorage};
 
@@ -50,6 +52,7 @@ pub struct SessionListQuery {
 #[derive(Debug, Serialize)]
 pub struct SessionListResponse {
     pub sessions: Vec<CloudSessionSummary>,
+    pub deleted_sessions: Vec<CloudDeletedSession>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +72,17 @@ pub struct RagQueryResponse {
 #[derive(Debug, Serialize)]
 pub struct ArtifactObjectResponse {
     pub artifact_id: String,
+    pub object_key: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub content_type: String,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionAuditBundleResponse {
+    pub session_id: String,
+    pub bundle_id: String,
     pub object_key: String,
     pub size_bytes: u64,
     pub sha256: String,
@@ -106,7 +120,12 @@ pub async fn list_sessions(
 ) -> Result<Json<SessionListResponse>, (StatusCode, String)> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let sessions = sync::list_sessions(&state.pool, &account.id, limit).map_err(internal)?;
-    Ok(Json(SessionListResponse { sessions }))
+    let deleted_sessions =
+        sync::list_deleted_sessions(&state.pool, &account.id, limit).map_err(internal)?;
+    Ok(Json(SessionListResponse {
+        sessions,
+        deleted_sessions,
+    }))
 }
 
 pub async fn get_session(
@@ -114,10 +133,30 @@ pub async fn get_session(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(session_id): Path<String>,
 ) -> Result<Json<CloudSessionBundle>, (StatusCode, String)> {
+    validate_session_id(&session_id)?;
     let bundle = sync::load_session(&state.pool, &account.id, &session_id)
         .map_err(internal)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "session not found".to_string()))?;
     Ok(Json(bundle))
+}
+
+pub async fn delete_session(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(session_id): Path<String>,
+) -> Result<Json<SyncBatchResponse>, (StatusCode, String)> {
+    validate_session_id(&session_id)?;
+    sync::tombstone_session(&state.pool, &account.id, &session_id).map_err(internal)?;
+    Ok(Json(SyncBatchResponse {
+        accepted: SyncCounts {
+            sessions: 1,
+            transcript_segments: 0,
+            cue_responses: 0,
+            context_artifacts: 0,
+            rag_chunks: 0,
+        },
+        server_time_ms: now_ms(),
+    }))
 }
 
 pub async fn rag_query(
@@ -197,6 +236,102 @@ pub async fn upload_artifact_object(
         sha256: hash,
         content_type,
         expires_at_ms: now_ms() + storage.retention_days().saturating_mul(86_400_000),
+    }))
+}
+
+pub async fn upload_session_audit_bundle(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path((session_id, bundle_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SessionAuditBundleResponse>, (StatusCode, String)> {
+    validate_session_id(&session_id)?;
+    validate_audit_bundle_id(&bundle_id)?;
+    let storage_config = state
+        .config
+        .log_storage
+        .clone()
+        .or_else(|| state.config.object_storage.clone())
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session audit storage is not configured".into(),
+            )
+        })?;
+    if body.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "audit bundle is empty".into()));
+    }
+    if body.len() > storage_config.max_object_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "audit bundle is too large".to_string(),
+        ));
+    }
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("application/json")
+        .to_string();
+    let hash = sha256_hex(&body);
+    let key = session_audit_object_key(
+        &storage_config.key_prefix,
+        &account.id,
+        &session_id,
+        &bundle_id,
+    );
+    let retention_days = storage_config.retention_days;
+    let storage = ObjectStorage::new(storage_config);
+    storage
+        .put(&key, body.clone(), &content_type)
+        .await
+        .map_err(internal)?;
+
+    let created_at_ms = now_ms();
+    let expires_at_ms = created_at_ms + retention_days.saturating_mul(86_400_000);
+    let session_code = uuid::Uuid::parse_str(&session_id)
+        .ok()
+        .map(cue_core::short_session_code);
+    diagnostic_logs::record_chunk(
+        &state.pool,
+        DiagnosticLogChunkInput {
+            id: Some(format!(
+                "session-audit:{}:{}:{}",
+                account.id, session_id, bundle_id
+            )),
+            account_id: Some(account.id.clone()),
+            workspace_id: None,
+            session_id: Some(session_id.clone()),
+            session_code,
+            kind: "session_audit_bundle".to_string(),
+            storage: "r2".to_string(),
+            object_key: Some(key.clone()),
+            local_path: None,
+            bytes: body.len() as i64,
+            sha256: Some(hash.clone()),
+            created_at_ms,
+            expires_at_ms,
+            metadata_json: serde_json::json!({
+                "bundle_id": bundle_id,
+                "content_type": content_type,
+                "schema_version": headers
+                    .get("x-bluey-audit-schema-version")
+                    .and_then(|value| value.to_str().ok()),
+            }),
+        },
+    )
+    .map_err(internal)?;
+
+    Ok(Json(SessionAuditBundleResponse {
+        session_id,
+        bundle_id,
+        object_key: key,
+        size_bytes: body.len() as u64,
+        sha256: hash,
+        content_type,
+        expires_at_ms,
     }))
 }
 
@@ -318,11 +453,50 @@ fn validate_batch(req: &SyncBatchRequest) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
+fn validate_session_id(session_id: &str) -> Result<(), (StatusCode, String)> {
+    uuid::Uuid::parse_str(session_id)
+        .map(|_| ())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid session id".to_string()))
+}
+
 fn validate_object_id(artifact_id: &str) -> Result<(), (StatusCode, String)> {
     if uuid::Uuid::parse_str(artifact_id).is_ok() {
         return Ok(());
     }
     Err((StatusCode::BAD_REQUEST, "invalid artifact id".to_string()))
+}
+
+fn validate_audit_bundle_id(bundle_id: &str) -> Result<(), (StatusCode, String)> {
+    let valid = !bundle_id.is_empty()
+        && bundle_id.len() <= 96
+        && bundle_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            "invalid audit bundle id".to_string(),
+        ))
+    }
+}
+
+fn session_audit_object_key(
+    prefix: &str,
+    account_id: &str,
+    session_id: &str,
+    bundle_id: &str,
+) -> String {
+    let prefix = prefix.trim_matches('/');
+    let date = chrono::Utc::now().format("%Y-%m-%d");
+    let suffix =
+        format!("accounts/{account_id}/date-{date}/sessions/{session_id}/audit/{bundle_id}.json");
+    if prefix.is_empty() {
+        suffix
+    } else {
+        format!("{prefix}/{suffix}")
+    }
 }
 
 fn internal(e: anyhow::Error) -> (StatusCode, String) {
@@ -429,5 +603,30 @@ mod tests {
         let err = ensure_sync_usage_allowed(&test_account(true), "rag_query").unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(err.1.contains("billing is under review"));
+    }
+
+    #[test]
+    fn audit_bundle_ids_are_path_safe() {
+        assert!(validate_audit_bundle_id("audit-ABC123-1780000000000").is_ok());
+        assert!(validate_audit_bundle_id("audit_ABC123").is_ok());
+        assert!(validate_audit_bundle_id("audit.123").is_err());
+        assert!(validate_audit_bundle_id("../audit").is_err());
+        assert!(validate_audit_bundle_id("audit/slash").is_err());
+        assert!(validate_audit_bundle_id("").is_err());
+    }
+
+    #[test]
+    fn session_audit_object_key_is_account_and_session_scoped() {
+        let key = session_audit_object_key(
+            "bluey-prod",
+            "acct_123",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "audit-ABC123-1780000000000",
+        );
+        assert!(key.starts_with("bluey-prod/accounts/acct_123/date-"));
+        assert!(key.contains(
+            "/sessions/550e8400-e29b-41d4-a716-446655440000/audit/audit-ABC123-1780000000000.json"
+        ));
+        assert!(!key.contains("//"));
     }
 }

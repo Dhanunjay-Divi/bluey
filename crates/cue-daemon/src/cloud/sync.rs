@@ -6,20 +6,23 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use cue_cloud_client::{
-    CloudClient, CloudSessionBundle, SyncBatchRequest, SyncBatchResponse,
-    SyncContextArtifactRecord, SyncCounts, SyncCueResponseRecord, SyncRagChunkRecord,
-    SyncSessionRecord, SyncTranscriptSegment,
+    CloudClient, CloudSessionBundle, SessionAuditBundleResponse, SyncBatchRequest,
+    SyncBatchResponse, SyncContextArtifactRecord, SyncCounts, SyncCueResponseRecord,
+    SyncRagChunkRecord, SyncSessionRecord, SyncTranscriptSegment,
 };
 use cue_core::{
     short_session_code, CardArtifactType, ContextArtifact, ContextKind, ContextProcessingStatus,
     ConversationTurn, CueCardArtifact, MeetingDiagnostics, MeetingRecord, Speaker,
     TranscriptSegment,
 };
-use serde_json::json;
+use serde::Serialize;
+use serde_json::{json, Value};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -30,6 +33,14 @@ const MAX_SYNC_RECORDS_PER_BATCH: usize = 450;
 const MAX_TEXT_PREVIEW_CHARS: usize = 16_000;
 const MAX_RESPONSE_CHARS: usize = 128_000;
 const MAX_OBJECT_UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
+const AUDIT_SCHEMA_VERSION: u32 = 1;
+const AUDIT_BUNDLE_CONTENT_TYPE: &str = "application/json";
+const MAX_AUDIT_BUNDLE_BYTES: usize = 25 * 1024 * 1024;
+const DEFAULT_AUDIT_LOCAL_RETENTION_DAYS: i64 = 7;
+const DEFAULT_AUDIT_LOCAL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const SESSION_AUDIT_DIR: &str = "session-audit";
+const SESSION_AUDIT_EVENTS_DIR: &str = "session-audit-events";
+const SESSION_AUDIT_UPLOADED_DIR: &str = "session-audit-uploaded";
 
 #[derive(Debug, Clone)]
 struct SyncedObjectMetadata {
@@ -40,11 +51,85 @@ struct SyncedObjectMetadata {
     expires_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct SessionAuditBundle {
+    schema_version: u32,
+    bundle_id: String,
+    session_id: String,
+    session_code: String,
+    account_id: Option<String>,
+    device_id: Option<String>,
+    generated_at_ms: i64,
+    manifest: Value,
+    events: Vec<Value>,
+    questions: Vec<Value>,
+    responses: Vec<Value>,
+    transcript: Vec<Value>,
+    context: Vec<Value>,
+    screen: Vec<Value>,
+    artifacts: Vec<Value>,
+    costs: Vec<Value>,
+    attachments: Vec<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct BuiltAuditBundle {
+    bundle: SessionAuditBundle,
+    bytes: Vec<u8>,
+    local_dir: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalSyncSummary {
     pub accepted: SyncCounts,
     pub batches: usize,
     pub server_time_ms: Option<i64>,
+}
+
+pub fn append_session_audit_event(
+    data_dir: &Path,
+    meeting: &MeetingRecord,
+    kind: &str,
+    payload: Value,
+) -> Result<()> {
+    let session_id = meeting.id.to_string();
+    let session_code = short_session_code(meeting.id);
+    let device_id = std::env::var("BLUEY_DEVICE_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let event_dir = session_audit_event_dir(data_dir, meeting.id);
+    cue_core::app_paths::create_private_dir(&event_dir)?;
+    let event_path = event_dir.join("events.jsonl");
+    let sequence = next_audit_event_sequence(&event_path).saturating_add(1);
+    let event_id = format!(
+        "{session_code}-ui-{sequence:08}-{}",
+        Uuid::new_v4().simple()
+    );
+    let record = json!({
+        "schema_version": AUDIT_SCHEMA_VERSION,
+        "event_id": event_id,
+        "session_id": session_id,
+        "session_code": session_code,
+        "account_id": meeting.owner_account_id.as_deref(),
+        "device_id": device_id.as_deref(),
+        "sequence": sequence,
+        "kind": kind,
+        "created_at_ms": current_epoch_ms(),
+        "source": "desktop_ui",
+        "payload": payload,
+    });
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&event_path)
+        .with_context(|| format!("open {}", event_path.display()))?;
+    serde_json::to_writer(&mut file, &record)
+        .with_context(|| format!("write {}", event_path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("write {}", event_path.display()))?;
+    file.flush()
+        .with_context(|| format!("flush {}", event_path.display()))?;
+    Ok(())
 }
 
 impl LocalSyncSummary {
@@ -85,11 +170,12 @@ impl LocalSyncSummary {
 pub struct CloudHydrationSummary {
     pub restored_sessions: usize,
     pub skipped_sessions: usize,
+    pub purged_deleted_sessions: usize,
 }
 
 impl CloudHydrationSummary {
     pub fn total_sessions(&self) -> usize {
-        self.restored_sessions + self.skipped_sessions
+        self.restored_sessions + self.skipped_sessions + self.purged_deleted_sessions
     }
 }
 
@@ -97,10 +183,14 @@ pub async fn sync_local_meetings(
     store: &MeetingStore,
     data_dir: &Path,
     client: &CloudClient,
+    owner_account_id: Option<&str>,
 ) -> Result<LocalSyncSummary> {
     let meetings = store
         .all_meetings()
-        .context("failed to load local sessions")?;
+        .context("failed to load local sessions")?
+        .into_iter()
+        .filter(|meeting| meeting_belongs_to_owner(meeting, owner_account_id))
+        .collect::<Vec<_>>();
     if meetings.is_empty() {
         return Ok(LocalSyncSummary::empty());
     }
@@ -120,6 +210,7 @@ pub async fn sync_local_meetings(
             .context("cloud sync batch")?;
         summary.add_response(response);
     }
+    sync_session_audit_bundles(data_dir, &meetings, &response_map, client, owner_account_id).await;
     Ok(summary)
 }
 
@@ -127,17 +218,36 @@ pub async fn hydrate_missing_cloud_meetings(
     store: &MeetingStore,
     data_dir: &Path,
     client: &CloudClient,
+    owner_account_id: Option<&str>,
     limit: i64,
 ) -> Result<CloudHydrationSummary> {
     let response = client
         .list_cloud_sessions(Some(limit.clamp(1, 200)))
         .await
         .context("list cloud sessions")?;
-    if response.sessions.is_empty() {
-        return Ok(CloudHydrationSummary::default());
+    let mut summary = CloudHydrationSummary::default();
+    for deleted in response.deleted_sessions {
+        let Ok(session_id) = Uuid::parse_str(&deleted.session_id) else {
+            summary.skipped_sessions += 1;
+            continue;
+        };
+        let Some(local_meeting) = store.load_by_id(session_id)? else {
+            continue;
+        };
+        if !meeting_should_follow_cloud_delete(&local_meeting, owner_account_id) {
+            summary.skipped_sessions += 1;
+            continue;
+        }
+        remove_bluey_owned_context_files(data_dir, &local_meeting);
+        if store.delete(session_id)? {
+            summary.purged_deleted_sessions += 1;
+        }
     }
 
-    let mut summary = CloudHydrationSummary::default();
+    if response.sessions.is_empty() {
+        return Ok(summary);
+    }
+
     for session in response.sessions {
         let Ok(session_id) = Uuid::parse_str(&session.session_id) else {
             summary.skipped_sessions += 1;
@@ -152,11 +262,116 @@ pub async fn hydrate_missing_cloud_meetings(
             .load_cloud_session(&session.session_id)
             .await
             .with_context(|| format!("load cloud session {}", session.session_id))?;
-        let meeting = meeting_from_cloud_bundle(data_dir, Some(client), bundle).await?;
+        let mut meeting = meeting_from_cloud_bundle(data_dir, Some(client), bundle).await?;
+        meeting.owner_account_id = owner_account_id.map(ToString::to_string);
         store.save_archived(&meeting)?;
         summary.restored_sessions += 1;
     }
     Ok(summary)
+}
+
+fn meeting_belongs_to_owner(meeting: &MeetingRecord, owner_account_id: Option<&str>) -> bool {
+    match owner_account_id {
+        Some(owner) => meeting.owner_account_id.as_deref() == Some(owner),
+        None => meeting.owner_account_id.as_deref().is_none(),
+    }
+}
+
+fn meeting_should_follow_cloud_delete(
+    meeting: &MeetingRecord,
+    owner_account_id: Option<&str>,
+) -> bool {
+    match owner_account_id {
+        Some(owner) => {
+            meeting.owner_account_id.as_deref() == Some(owner) || meeting.owner_account_id.is_none()
+        }
+        None => meeting.owner_account_id.is_none(),
+    }
+}
+
+fn remove_bluey_owned_context_files(data_dir: &Path, meeting: &MeetingRecord) {
+    for artifact in &meeting.context {
+        remove_bluey_owned_prepared_image(data_dir, artifact);
+        remove_bluey_owned_markdown(data_dir, artifact);
+    }
+}
+
+fn remove_bluey_owned_prepared_image(data_dir: &Path, artifact: &ContextArtifact) {
+    let path = PathBuf::from(&artifact.path);
+    let expected_name = format!("{}.jpg", artifact.id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        return;
+    }
+    remove_file_under_allowed_dir(
+        data_dir,
+        data_dir.join("context-images"),
+        path,
+        artifact.id,
+        "prepared image",
+    );
+}
+
+fn remove_bluey_owned_markdown(data_dir: &Path, artifact: &ContextArtifact) {
+    let Some(markdown_path) = artifact
+        .markdown_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return;
+    };
+    let path = PathBuf::from(markdown_path);
+    let expected_name = format!("{}.md", artifact.id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        return;
+    }
+    remove_file_under_allowed_dir(
+        data_dir,
+        data_dir.join("context-markdown"),
+        path,
+        artifact.id,
+        "converted markdown",
+    );
+}
+
+fn remove_file_under_allowed_dir(
+    data_dir: &Path,
+    allowed_dir: PathBuf,
+    path: PathBuf,
+    artifact_id: Uuid,
+    kind: &'static str,
+) {
+    let path = if path.is_absolute() {
+        path
+    } else {
+        data_dir.join(path)
+    };
+    let allowed = match allowed_dir.canonicalize() {
+        Ok(dir) => dir,
+        Err(_) => allowed_dir,
+    };
+    let candidate = match path.canonicalize() {
+        Ok(path) => path,
+        Err(_) => path,
+    };
+    if !candidate.starts_with(&allowed) {
+        warn!(
+            artifact_id = %artifact_id,
+            path = %candidate.display(),
+            allowed = %allowed.display(),
+            "skipping cloud-delete cleanup outside Bluey context directory"
+        );
+        return;
+    }
+    if let Err(error) = fs::remove_file(&candidate) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                artifact_id = %artifact_id,
+                path = %candidate.display(),
+                kind,
+                "failed to remove Bluey-owned context cache file after cloud delete: {error}"
+            );
+        }
+    }
 }
 
 fn load_local_responses(
@@ -259,6 +474,785 @@ async fn upload_context_objects(
     uploaded
 }
 
+async fn sync_session_audit_bundles(
+    data_dir: &Path,
+    meetings: &[MeetingRecord],
+    response_map: &HashMap<String, Vec<crate::llm::CueResponse>>,
+    client: &CloudClient,
+    owner_account_id: Option<&str>,
+) {
+    prune_local_audit_storage(data_dir);
+    for meeting in meetings {
+        let session_id = meeting.id.to_string();
+        let responses = response_map.get(&session_id);
+        if !meeting_has_syncable_content(meeting, responses) {
+            continue;
+        }
+        let response_slice = responses.map(Vec::as_slice).unwrap_or(&[]);
+        let built = match build_local_session_audit_bundle(
+            data_dir,
+            meeting,
+            response_slice,
+            owner_account_id,
+        ) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                warn!(
+                    session_id = %meeting.id,
+                    error = %error,
+                    "session audit bundle build failed"
+                );
+                continue;
+            }
+        };
+        if built.bytes.len() > MAX_AUDIT_BUNDLE_BYTES {
+            warn!(
+                session_id = %meeting.id,
+                size_bytes = built.bytes.len(),
+                max_bytes = MAX_AUDIT_BUNDLE_BYTES,
+                "session audit bundle skipped because it is too large"
+            );
+            continue;
+        }
+        if audit_upload_marker_matches(data_dir, meeting, &built.bundle.bundle_id) {
+            if let Err(error) = fs::remove_dir_all(&built.local_dir) {
+                debug!(
+                    session_id = %meeting.id,
+                    path = %built.local_dir.display(),
+                    error = %error,
+                    "already uploaded session audit bundle could not be removed locally"
+                );
+            }
+            continue;
+        }
+        match client
+            .upload_session_audit_bundle(
+                &session_id,
+                &built.bundle.bundle_id,
+                built.bytes.clone(),
+                AUDIT_BUNDLE_CONTENT_TYPE,
+            )
+            .await
+        {
+            Ok(response) => {
+                if let Err(error) = write_audit_upload_marker(data_dir, meeting, &built, &response)
+                {
+                    debug!(
+                        session_id = %meeting.id,
+                        error = %error,
+                        "session audit upload marker write failed"
+                    );
+                }
+                if let Err(error) = fs::remove_dir_all(&built.local_dir) {
+                    warn!(
+                        session_id = %meeting.id,
+                        path = %built.local_dir.display(),
+                        error = %error,
+                        "uploaded session audit bundle could not be removed locally"
+                    );
+                }
+                if let Err(error) = remove_session_audit_event_log(data_dir, meeting.id) {
+                    debug!(
+                        session_id = %meeting.id,
+                        error = %error,
+                        "uploaded session audit event log could not be removed locally"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    session_id = %meeting.id,
+                    bundle_id = %built.bundle.bundle_id,
+                    error = %error,
+                    "session audit bundle upload failed; local retry copy remains bounded"
+                );
+            }
+        }
+    }
+    prune_local_audit_storage(data_dir);
+}
+
+fn build_local_session_audit_bundle(
+    data_dir: &Path,
+    meeting: &MeetingRecord,
+    responses: &[crate::llm::CueResponse],
+    account_id: Option<&str>,
+) -> Result<BuiltAuditBundle> {
+    let audit_root = data_dir.join(SESSION_AUDIT_DIR);
+    let local_dir = audit_root.join(meeting.id.to_string());
+    let audio_dir = local_dir.join("audio");
+    cue_core::app_paths::create_private_dir(&local_dir)?;
+    cue_core::app_paths::create_private_dir(&audio_dir)?;
+
+    let bundle = assemble_session_audit_bundle(data_dir, meeting, responses, account_id);
+    let bytes = serde_json::to_vec_pretty(&bundle).context("serialize session audit bundle")?;
+    write_json_file(&local_dir.join("manifest.json"), &bundle.manifest)?;
+    write_jsonl_file(&local_dir.join("events.jsonl"), &bundle.events)?;
+    write_jsonl_file(&local_dir.join("questions.jsonl"), &bundle.questions)?;
+    write_jsonl_file(&local_dir.join("responses.jsonl"), &bundle.responses)?;
+    write_jsonl_file(&local_dir.join("transcript.jsonl"), &bundle.transcript)?;
+    write_jsonl_file(&local_dir.join("context.jsonl"), &bundle.context)?;
+    write_jsonl_file(&local_dir.join("screen.jsonl"), &bundle.screen)?;
+    write_jsonl_file(&local_dir.join("artifacts.jsonl"), &bundle.artifacts)?;
+    write_jsonl_file(&local_dir.join("costs.jsonl"), &bundle.costs)?;
+    write_jsonl_file(&local_dir.join("attachments.jsonl"), &bundle.attachments)?;
+    write_jsonl_file(
+        &audio_dir.join("audio.jsonl"),
+        &[json!({
+            "schema_version": AUDIT_SCHEMA_VERSION,
+            "session_id": meeting.id.to_string(),
+            "session_code": short_session_code(meeting.id),
+            "kind": "audio_capture_manifest",
+            "created_at_ms": current_epoch_ms(),
+            "audio_chunk_storage": "not_present_in_this_local_record",
+            "note": "Audio chunks are uploaded through the live STT/diagnostic path when present; this manifest keeps the session audit directory shape stable.",
+        })],
+    )?;
+    write_json_file(&local_dir.join("bundle.json"), &bundle)?;
+
+    Ok(BuiltAuditBundle {
+        bundle,
+        bytes,
+        local_dir,
+    })
+}
+
+fn assemble_session_audit_bundle(
+    data_dir: &Path,
+    meeting: &MeetingRecord,
+    responses: &[crate::llm::CueResponse],
+    account_id: Option<&str>,
+) -> SessionAuditBundle {
+    let session_id = meeting.id.to_string();
+    let session_code = short_session_code(meeting.id);
+    let generated_at_ms = current_epoch_ms();
+    let event_log_fingerprint = audit_event_log_fingerprint(data_dir, meeting.id);
+    let updated_at = updated_at_ms(meeting)
+        .max(
+            event_log_fingerprint
+                .map(|(modified_ms, _)| modified_ms)
+                .unwrap_or_default(),
+        )
+        .max(
+            responses
+                .iter()
+                .map(|response| response.ts_ms as i64)
+                .max()
+                .unwrap_or_default(),
+        );
+    let event_log_size = event_log_fingerprint
+        .map(|(_, size_bytes)| size_bytes)
+        .unwrap_or(0);
+    let bundle_id = format!("audit-{session_code}-{updated_at}-{event_log_size}");
+    let device_id = std::env::var("BLUEY_DEVICE_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    let mut events = Vec::new();
+    let mut questions = Vec::new();
+    let mut response_records = Vec::new();
+    let mut transcript = Vec::new();
+    let mut context = Vec::new();
+    let mut screen = Vec::new();
+    let mut artifacts = Vec::new();
+    let mut costs = Vec::new();
+    let mut attachments = Vec::new();
+    let mut sequence = 0u64;
+    let mut seen_questions = HashSet::new();
+
+    push_audit_record(
+        &mut events,
+        &session_id,
+        &session_code,
+        account_id,
+        &device_id,
+        &mut sequence,
+        "session",
+        json!({
+            "title": meeting.title,
+            "started_at_ms": parse_ms(&meeting.started_at),
+            "ended_at_ms": meeting.ended_at.as_deref().map(parse_ms),
+            "updated_at_ms": updated_at,
+            "summary": meeting.summary,
+            "answer_style": meeting.answer_instructions,
+            "diagnostics": meeting.diagnostics,
+        }),
+    );
+
+    for segment in &meeting.transcript {
+        let payload = json!({
+            "segment_id": segment.id.to_string(),
+            "speaker": segment.speaker.to_string(),
+            "text": truncate_chars(&segment.text, MAX_TEXT_PREVIEW_CHARS),
+            "created_at_ms": parse_ms(&segment.created_at),
+            "is_final": segment.is_final,
+        });
+        push_audit_record(
+            &mut transcript,
+            &session_id,
+            &session_code,
+            account_id,
+            &device_id,
+            &mut sequence,
+            "transcript_segment",
+            payload.clone(),
+        );
+        push_audit_record(
+            &mut events,
+            &session_id,
+            &session_code,
+            account_id,
+            &device_id,
+            &mut sequence,
+            "transcript_segment",
+            json!({ "segment_id": segment.id.to_string(), "is_final": segment.is_final }),
+        );
+    }
+
+    for artifact in &meeting.context {
+        let payload = json!({
+            "artifact_id": artifact.id.to_string(),
+            "kind": artifact.kind.to_string(),
+            "title": artifact.title,
+            "note": artifact.note,
+            "path": artifact.path,
+            "size_bytes": artifact.size_bytes,
+            "text_preview": artifact.text_preview.as_deref().map(|text| truncate_chars(text, MAX_TEXT_PREVIEW_CHARS)),
+            "markdown_path": artifact.markdown_path,
+            "processing_status": artifact.processing_status.to_string(),
+            "processing_error": artifact.processing_error,
+            "created_at_ms": parse_ms(&artifact.created_at),
+        });
+        push_audit_record(
+            &mut context,
+            &session_id,
+            &session_code,
+            account_id,
+            &device_id,
+            &mut sequence,
+            "context_artifact",
+            payload.clone(),
+        );
+        push_audit_record(
+            &mut attachments,
+            &session_id,
+            &session_code,
+            account_id,
+            &device_id,
+            &mut sequence,
+            "attachment",
+            payload.clone(),
+        );
+        if matches!(artifact.kind, ContextKind::Image | ContextKind::Diagram)
+            || artifact.title.to_ascii_lowercase().contains("screen")
+        {
+            push_audit_record(
+                &mut screen,
+                &session_id,
+                &session_code,
+                account_id,
+                &device_id,
+                &mut sequence,
+                "screen_context",
+                payload.clone(),
+            );
+        }
+        push_audit_record(
+            &mut events,
+            &session_id,
+            &session_code,
+            account_id,
+            &device_id,
+            &mut sequence,
+            "context_artifact",
+            json!({ "artifact_id": artifact.id.to_string(), "kind": artifact.kind.to_string() }),
+        );
+    }
+
+    for response in responses {
+        if let Some(question) = response
+            .source_text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            let key = format!("{}:{}", response.id, question.trim());
+            if seen_questions.insert(key) {
+                push_audit_record(
+                    &mut questions,
+                    &session_id,
+                    &session_code,
+                    account_id,
+                    &device_id,
+                    &mut sequence,
+                    "question",
+                    json!({
+                        "response_id": response.id,
+                        "text": truncate_chars(question, MAX_TEXT_PREVIEW_CHARS),
+                        "created_at_ms": response.ts_ms as i64,
+                        "source": "cue_response",
+                    }),
+                );
+            }
+        }
+        push_audit_record(
+            &mut response_records,
+            &session_id,
+            &session_code,
+            account_id,
+            &device_id,
+            &mut sequence,
+            "response",
+            json!({
+                "response_id": response.id,
+                "kind": response.kind,
+                "text": truncate_chars(&response.text, MAX_RESPONSE_CHARS),
+                "created_at_ms": response.ts_ms as i64,
+                "provider": response.provider,
+                "model": response.model,
+                "cost_label": response.cost_label,
+                "artifact_type": response.artifact_type,
+                "artifact_confidence": response.artifact_confidence,
+            }),
+        );
+        push_response_cost_record(
+            &mut costs,
+            &session_id,
+            &session_code,
+            account_id,
+            &device_id,
+            &mut sequence,
+            response,
+        );
+        if response.artifact_type.is_some() || response.artifact_body.is_some() {
+            push_audit_record(
+                &mut artifacts,
+                &session_id,
+                &session_code,
+                account_id,
+                &device_id,
+                &mut sequence,
+                "response_artifact",
+                json!({
+                    "response_id": response.id,
+                    "artifact_type": response.artifact_type,
+                    "artifact_body": response.artifact_body.as_deref().map(|body| truncate_chars(body, MAX_RESPONSE_CHARS)),
+                    "artifact_confidence": response.artifact_confidence,
+                }),
+            );
+        }
+    }
+
+    for turn in &meeting.conversation {
+        let key = format!("turn:{}:{}", turn.id, turn.question.trim());
+        if !turn.question.trim().is_empty() && seen_questions.insert(key) {
+            push_audit_record(
+                &mut questions,
+                &session_id,
+                &session_code,
+                account_id,
+                &device_id,
+                &mut sequence,
+                "question",
+                json!({
+                    "turn_id": turn.id.to_string(),
+                    "text": truncate_chars(&turn.question, MAX_TEXT_PREVIEW_CHARS),
+                    "created_at_ms": parse_ms(&turn.created_at),
+                    "source": turn.source,
+                    "attachment_ids": turn.attachment_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                }),
+            );
+        }
+        push_audit_record(
+            &mut response_records,
+            &session_id,
+            &session_code,
+            account_id,
+            &device_id,
+            &mut sequence,
+            "response",
+            json!({
+                "turn_id": turn.id.to_string(),
+                "text": truncate_chars(&turn.answer, MAX_RESPONSE_CHARS),
+                "created_at_ms": parse_ms(&turn.created_at),
+                "provider": turn.provider,
+                "source": turn.source,
+                "attachment_ids": turn.attachment_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                "artifact_type": turn.artifact.as_ref().map(|artifact| cloud_artifact_type_value(artifact.artifact_type)),
+            }),
+        );
+        if let Some(artifact) = &turn.artifact {
+            push_audit_record(
+                &mut artifacts,
+                &session_id,
+                &session_code,
+                account_id,
+                &device_id,
+                &mut sequence,
+                "turn_artifact",
+                json!({
+                    "turn_id": turn.id.to_string(),
+                    "artifact_type": cloud_artifact_type_value(artifact.artifact_type),
+                    "title": artifact.title,
+                    "body": truncate_chars(&artifact.body, MAX_RESPONSE_CHARS),
+                    "confidence": artifact.confidence,
+                }),
+            );
+        }
+    }
+
+    let raw_ui_events = read_session_audit_events(data_dir, meeting.id);
+    let raw_ui_event_count = raw_ui_events.len();
+    events.extend(raw_ui_events);
+
+    let manifest = json!({
+        "schema_version": AUDIT_SCHEMA_VERSION,
+        "bundle_id": bundle_id,
+        "session_id": session_id,
+        "session_code": session_code,
+        "account_id": account_id,
+        "device_id": device_id,
+        "generated_at_ms": generated_at_ms,
+        "updated_at_ms": updated_at,
+        "record_counts": {
+            "events": events.len(),
+            "questions": questions.len(),
+            "responses": response_records.len(),
+            "transcript": transcript.len(),
+            "context": context.len(),
+            "screen": screen.len(),
+            "artifacts": artifacts.len(),
+            "costs": costs.len(),
+            "attachments": attachments.len(),
+            "raw_ui_events": raw_ui_event_count,
+        },
+        "local_retention": {
+            "uploaded_session_dirs_removed": true,
+            "failed_upload_dirs_retention_days": audit_local_retention_days(),
+            "failed_upload_root_max_bytes": audit_local_max_bytes(),
+        },
+    });
+
+    SessionAuditBundle {
+        schema_version: AUDIT_SCHEMA_VERSION,
+        bundle_id,
+        session_id,
+        session_code,
+        account_id: account_id.map(ToString::to_string),
+        device_id,
+        generated_at_ms,
+        manifest,
+        events,
+        questions,
+        responses: response_records,
+        transcript,
+        context,
+        screen,
+        artifacts,
+        costs,
+        attachments,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_audit_record(
+    records: &mut Vec<Value>,
+    session_id: &str,
+    session_code: &str,
+    account_id: Option<&str>,
+    device_id: &Option<String>,
+    sequence: &mut u64,
+    kind: &str,
+    payload: Value,
+) {
+    *sequence += 1;
+    records.push(json!({
+        "schema_version": AUDIT_SCHEMA_VERSION,
+        "event_id": format!("{session_code}-{:08}", *sequence),
+        "session_id": session_id,
+        "session_code": session_code,
+        "account_id": account_id,
+        "device_id": device_id.as_deref(),
+        "sequence": *sequence,
+        "kind": kind,
+        "created_at_ms": current_epoch_ms(),
+        "source": "desktop_sync",
+        "payload": payload,
+    }));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_response_cost_record(
+    records: &mut Vec<Value>,
+    session_id: &str,
+    session_code: &str,
+    account_id: Option<&str>,
+    device_id: &Option<String>,
+    sequence: &mut u64,
+    response: &crate::llm::CueResponse,
+) {
+    if response.cost_cents.is_none()
+        && response.balance_cents_after.is_none()
+        && response.input_tokens.is_none()
+        && response.output_tokens.is_none()
+    {
+        return;
+    }
+    push_audit_record(
+        records,
+        session_id,
+        session_code,
+        account_id,
+        device_id,
+        sequence,
+        "cost",
+        json!({
+            "response_id": response.id,
+            "provider": response.provider,
+            "model": response.model,
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "cost_cents": response.cost_cents,
+            "balance_cents_after": response.balance_cents_after,
+            "cost_label": response.cost_label,
+            "created_at_ms": response.ts_ms as i64,
+        }),
+    );
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    serde_json::to_writer_pretty(file, value)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn write_jsonl_file(path: &Path, records: &[Value]) -> Result<()> {
+    let mut file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    for record in records {
+        serde_json::to_writer(&mut file, record)
+            .with_context(|| format!("write {}", path.display()))?;
+        file.write_all(b"\n")
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn session_audit_event_dir(data_dir: &Path, session_id: Uuid) -> PathBuf {
+    data_dir
+        .join(SESSION_AUDIT_EVENTS_DIR)
+        .join(session_id.to_string())
+}
+
+fn next_audit_event_sequence(event_path: &Path) -> u64 {
+    let Ok(file) = fs::File::open(event_path) else {
+        return 0;
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(|line| line.ok())
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        .min(u64::MAX as usize) as u64
+}
+
+fn read_session_audit_events(data_dir: &Path, session_id: Uuid) -> Vec<Value> {
+    let event_path = session_audit_event_dir(data_dir, session_id).join("events.jsonl");
+    let Ok(file) = fs::File::open(&event_path) else {
+        return Vec::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(|line| line.ok())
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .collect()
+}
+
+fn audit_event_log_fingerprint(data_dir: &Path, session_id: Uuid) -> Option<(i64, u64)> {
+    let event_path = session_audit_event_dir(data_dir, session_id).join("events.jsonl");
+    let metadata = fs::metadata(&event_path).ok()?;
+    Some((metadata_modified_ms(&metadata), metadata.len()))
+}
+
+fn remove_session_audit_event_log(data_dir: &Path, session_id: Uuid) -> Result<()> {
+    let event_dir = session_audit_event_dir(data_dir, session_id);
+    if event_dir.exists() {
+        fs::remove_dir_all(&event_dir)
+            .with_context(|| format!("remove {}", event_dir.display()))?;
+    }
+    Ok(())
+}
+
+fn audit_upload_marker_matches(data_dir: &Path, meeting: &MeetingRecord, bundle_id: &str) -> bool {
+    let marker_path = data_dir
+        .join(SESSION_AUDIT_UPLOADED_DIR)
+        .join(format!("{}.json", meeting.id));
+    let Ok(contents) = fs::read_to_string(marker_path) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(&contents)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("bundle_id")
+                .and_then(Value::as_str)
+                .map(|uploaded| uploaded == bundle_id)
+        })
+        .unwrap_or(false)
+}
+
+fn write_audit_upload_marker(
+    data_dir: &Path,
+    meeting: &MeetingRecord,
+    built: &BuiltAuditBundle,
+    response: &SessionAuditBundleResponse,
+) -> Result<()> {
+    let marker_dir = data_dir.join(SESSION_AUDIT_UPLOADED_DIR);
+    cue_core::app_paths::create_private_dir(&marker_dir)?;
+    let marker_path = marker_dir.join(format!("{}.json", meeting.id));
+    write_json_file(
+        &marker_path,
+        &json!({
+            "schema_version": AUDIT_SCHEMA_VERSION,
+            "session_id": meeting.id.to_string(),
+            "session_code": short_session_code(meeting.id),
+            "bundle_id": built.bundle.bundle_id,
+            "uploaded_at_ms": current_epoch_ms(),
+            "object_key": response.object_key,
+            "size_bytes": response.size_bytes,
+            "sha256": response.sha256,
+            "expires_at_ms": response.expires_at_ms,
+        }),
+    )
+}
+
+fn prune_local_audit_storage(data_dir: &Path) {
+    prune_local_audit_root(&data_dir.join(SESSION_AUDIT_DIR));
+    prune_local_audit_root(&data_dir.join(SESSION_AUDIT_EVENTS_DIR));
+}
+
+fn prune_local_audit_root(audit_root: &Path) {
+    if !audit_root.exists() {
+        return;
+    }
+    let retention_ms = audit_local_retention_days().saturating_mul(86_400_000);
+    let cutoff_ms = current_epoch_ms().saturating_sub(retention_ms);
+    let mut entries = audit_session_dirs(audit_root);
+    for entry in &entries {
+        if entry.modified_ms <= cutoff_ms {
+            if let Err(error) = fs::remove_dir_all(&entry.path) {
+                warn!(
+                    path = %entry.path.display(),
+                    error = %error,
+                    "failed to prune expired local session audit directory"
+                );
+            }
+        }
+    }
+
+    entries = audit_session_dirs(audit_root);
+    let max_bytes = audit_local_max_bytes();
+    let mut total: u64 = entries.iter().map(|entry| entry.size_bytes).sum();
+    if total <= max_bytes {
+        return;
+    }
+    entries.sort_by_key(|entry| entry.modified_ms);
+    for entry in entries {
+        if total <= max_bytes {
+            break;
+        }
+        if let Err(error) = fs::remove_dir_all(&entry.path) {
+            warn!(
+                path = %entry.path.display(),
+                error = %error,
+                "failed to prune local session audit directory for size cap"
+            );
+            continue;
+        }
+        total = total.saturating_sub(entry.size_bytes);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuditDirEntry {
+    path: PathBuf,
+    modified_ms: i64,
+    size_bytes: u64,
+}
+
+fn audit_session_dirs(root: &Path) -> Vec<AuditDirEntry> {
+    let Ok(read_dir) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    read_dir
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = path.file_name().and_then(|value| value.to_str())?;
+            if name.starts_with('.') {
+                return None;
+            }
+            let metadata = fs::metadata(&path).ok()?;
+            Some(AuditDirEntry {
+                path,
+                modified_ms: metadata_modified_ms(&metadata),
+                size_bytes: dir_size_bytes(entry.path().as_path()),
+            })
+        })
+        .collect()
+}
+
+fn dir_size_bytes(path: &Path) -> u64 {
+    let Ok(metadata) = fs::metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    let Ok(read_dir) = fs::read_dir(path) else {
+        return 0;
+    };
+    read_dir
+        .filter_map(|entry| entry.ok())
+        .map(|entry| dir_size_bytes(&entry.path()))
+        .sum()
+}
+
+fn metadata_modified_ms(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn audit_local_retention_days() -> i64 {
+    std::env::var("BLUEY_AUDIT_LOCAL_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_AUDIT_LOCAL_RETENTION_DAYS)
+        .clamp(1, 30)
+}
+
+fn audit_local_max_bytes() -> u64 {
+    std::env::var("BLUEY_AUDIT_LOCAL_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_AUDIT_LOCAL_MAX_BYTES)
+}
+
+fn current_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 fn artifact_object_path(data_dir: &Path, artifact: &ContextArtifact) -> Option<PathBuf> {
     let restored_preview_dir = data_dir.join("cloud-restored-context");
     let candidates = std::iter::once(Some(artifact.path.as_str()))
@@ -317,6 +1311,17 @@ fn build_sync_batches(
     let mut batches = Vec::new();
 
     for meeting in meetings {
+        let session_id = meeting.id.to_string();
+        let responses = response_map.get(&session_id);
+        if !meeting_has_syncable_content(meeting, responses) {
+            debug!(
+                session_id = %meeting.id,
+                title = %meeting.title,
+                "cloud sync skipped empty local meeting shell"
+            );
+            continue;
+        }
+
         let session = session_record(meeting);
         let mut batch = SyncBatchRequest::default();
         batch.sessions.push(session.clone());
@@ -388,7 +1393,7 @@ fn build_sync_batches(
             });
         }
 
-        if let Some(responses) = response_map.get(&meeting.id.to_string()) {
+        if let Some(responses) = responses {
             for response in responses {
                 seen_response_ids.insert(response.id.clone());
                 maybe_flush(&mut batches, &mut batch, &session);
@@ -423,6 +1428,20 @@ fn build_sync_batches(
     batches
 }
 
+fn meeting_has_syncable_content(
+    meeting: &MeetingRecord,
+    responses: Option<&Vec<crate::llm::CueResponse>>,
+) -> bool {
+    !meeting.transcript.is_empty()
+        || !meeting.context.is_empty()
+        || !meeting.conversation.is_empty()
+        || responses.is_some_and(|items| !items.is_empty())
+        || meeting
+            .summary
+            .as_deref()
+            .is_some_and(|summary| !summary.trim().is_empty())
+}
+
 async fn meeting_from_cloud_bundle(
     data_dir: &Path,
     client: Option<&CloudClient>,
@@ -455,6 +1474,7 @@ async fn meeting_from_cloud_bundle(
 
     Ok(MeetingRecord {
         id,
+        owner_account_id: None,
         title: bundle.session.title,
         started_at: bundle.session.created_at_ms.to_string(),
         ended_at: if bundle.session.status == "active" {
@@ -1172,6 +2192,211 @@ mod tests {
     }
 
     #[test]
+    fn empty_meeting_shell_does_not_sync() {
+        let meeting = MeetingRecord::new(Some("New recording".into()));
+
+        let batches = build_sync_batches(&[meeting], &HashMap::new(), &HashMap::new());
+
+        assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn cue_response_only_meeting_still_syncs_session() {
+        let meeting = MeetingRecord::new(Some("Recovered chat".into()));
+        let mut response_map = HashMap::new();
+        response_map.insert(
+            meeting.id.to_string(),
+            vec![crate::llm::CueResponse::new(
+                "answer",
+                "Recovered answer".into(),
+                &meeting.id.to_string(),
+                Some("Recovered question".into()),
+            )],
+        );
+
+        let batches = build_sync_batches(&[meeting], &response_map, &HashMap::new());
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].sessions.len(), 1);
+        assert_eq!(batches[0].cue_responses.len(), 1);
+        assert_eq!(
+            batches[0].cue_responses[0].source_text.as_deref(),
+            Some("Recovered question")
+        );
+    }
+
+    #[test]
+    fn session_audit_bundle_writes_reviewable_shape_and_marker() {
+        let root = std::env::temp_dir().join(format!("bluey-audit-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("audit test root");
+
+        let mut meeting = MeetingRecord::new(Some("Audit session".into()));
+        meeting.owner_account_id = Some("acct_audit".into());
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "Explain LRU cache",
+            true,
+        ));
+        meeting.context.push(
+            ContextArtifact::new(
+                ContextKind::Image,
+                "/tmp/screen.png",
+                "Screen context",
+                Some("Captured screen".into()),
+                Some(123),
+            )
+            .with_text_preview("LRU cache coding question"),
+        );
+        meeting.conversation.push(
+            ConversationTurn::new(
+                "Explain LRU cache",
+                "Use a hashmap plus a doubly linked list.",
+                Some("manual".into()),
+                Some("bluey_managed".into()),
+            )
+            .with_artifact(Some(CueCardArtifact {
+                artifact_type: CardArtifactType::Code,
+                title: "LRU cache".into(),
+                body: "class LRUCache: pass".into(),
+                confidence: 0.94,
+            })),
+        );
+
+        let mut response = crate::llm::CueResponse::new(
+            "answer",
+            "Use a hashmap plus a doubly linked list.".into(),
+            &meeting.id.to_string(),
+            Some("Explain LRU cache".into()),
+        );
+        response.cost_cents = Some(3);
+        response.balance_cents_after = Some(1497);
+        response.provider = Some("test-provider".into());
+        response.model = Some("test-model".into());
+        response.input_tokens = Some(20);
+        response.output_tokens = Some(40);
+        response.artifact_type = Some("code".into());
+        response.artifact_body = Some("class LRUCache: pass".into());
+        response.artifact_confidence = Some(0.94);
+
+        let built =
+            build_local_session_audit_bundle(&root, &meeting, &[response], Some("acct_audit"))
+                .expect("audit bundle");
+
+        assert!(built.local_dir.join("manifest.json").is_file());
+        assert!(built.local_dir.join("events.jsonl").is_file());
+        assert!(built.local_dir.join("questions.jsonl").is_file());
+        assert!(built.local_dir.join("responses.jsonl").is_file());
+        assert!(built.local_dir.join("transcript.jsonl").is_file());
+        assert!(built.local_dir.join("context.jsonl").is_file());
+        assert!(built.local_dir.join("screen.jsonl").is_file());
+        assert!(built.local_dir.join("artifacts.jsonl").is_file());
+        assert!(built.local_dir.join("costs.jsonl").is_file());
+        assert!(built.local_dir.join("attachments.jsonl").is_file());
+        assert!(built.local_dir.join("audio/audio.jsonl").is_file());
+        assert!(!built.bundle.questions.is_empty());
+        assert!(!built.bundle.responses.is_empty());
+        assert!(!built.bundle.transcript.is_empty());
+        assert!(!built.bundle.context.is_empty());
+        assert!(!built.bundle.screen.is_empty());
+        assert!(!built.bundle.artifacts.is_empty());
+        assert!(!built.bundle.costs.is_empty());
+
+        let response = SessionAuditBundleResponse {
+            session_id: meeting.id.to_string(),
+            bundle_id: built.bundle.bundle_id.clone(),
+            object_key: "prod/logs/accounts/acct_audit/session-audit.json".into(),
+            size_bytes: built.bytes.len() as u64,
+            sha256: "abc123".into(),
+            content_type: AUDIT_BUNDLE_CONTENT_TYPE.into(),
+            expires_at_ms: current_epoch_ms() + 90 * 86_400_000,
+        };
+        write_audit_upload_marker(&root, &meeting, &built, &response).expect("write marker");
+        assert!(audit_upload_marker_matches(
+            &root,
+            &meeting,
+            &built.bundle.bundle_id
+        ));
+        assert!(!audit_upload_marker_matches(
+            &root,
+            &meeting,
+            "audit-different"
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_audit_bundle_includes_append_only_ui_events() {
+        let root = std::env::temp_dir().join(format!("bluey-audit-events-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("audit test root");
+
+        let mut meeting = MeetingRecord::new(Some("Visible glitch".into()));
+        meeting.owner_account_id = Some("acct_events".into());
+        append_session_audit_event(
+            &root,
+            &meeting,
+            "ui_answer_status",
+            json!({ "message": "Reading screen context" }),
+        )
+        .expect("append status");
+        append_session_audit_event(
+            &root,
+            &meeting,
+            "ui_answer_error",
+            json!({ "visible_message": "Bluey could not complete that answer yet." }),
+        )
+        .expect("append error");
+
+        let event_dir = session_audit_event_dir(&root, meeting.id);
+        assert!(event_dir.join("events.jsonl").is_file());
+
+        let response = crate::llm::CueResponse::new(
+            "answer",
+            "Partial answer before the visible error.".into(),
+            &meeting.id.to_string(),
+            Some("Why did it fail?".into()),
+        );
+        let built =
+            build_local_session_audit_bundle(&root, &meeting, &[response], Some("acct_events"))
+                .expect("audit bundle");
+
+        let raw_ui_events = built
+            .bundle
+            .events
+            .iter()
+            .filter(|event| {
+                event
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .is_some_and(|source| source == "desktop_ui")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(raw_ui_events.len(), 2);
+        assert!(built.bundle.events.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("ui_answer_error")
+                && event
+                    .get("payload")
+                    .and_then(|payload| payload.get("visible_message"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| message.contains("could not complete"))
+        }));
+        assert_eq!(
+            built
+                .bundle
+                .manifest
+                .get("record_counts")
+                .and_then(|counts| counts.get("raw_ui_events"))
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+
+        remove_session_audit_event_log(&root, meeting.id).expect("remove event log");
+        assert!(!event_dir.exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn conversation_sync_metadata_preserves_attachment_ids() {
         let mut meeting = MeetingRecord::new(Some("Chat".into()));
         let attachment_id = Uuid::new_v4();
@@ -1227,6 +2452,80 @@ mod tests {
             .artifact
             .as_ref()
             .is_some_and(|artifact| artifact.body.contains("fn main")));
+    }
+
+    #[test]
+    fn cloud_delete_follows_current_owner_or_legacy_unowned_cache() {
+        let mut owned = MeetingRecord::new(Some("Owned".into()));
+        owned.owner_account_id = Some("acct_current".into());
+        let mut other = MeetingRecord::new(Some("Other".into()));
+        other.owner_account_id = Some("acct_other".into());
+        let unowned = MeetingRecord::new(Some("Legacy".into()));
+
+        assert!(meeting_should_follow_cloud_delete(
+            &owned,
+            Some("acct_current")
+        ));
+        assert!(meeting_should_follow_cloud_delete(
+            &unowned,
+            Some("acct_current")
+        ));
+        assert!(!meeting_should_follow_cloud_delete(
+            &other,
+            Some("acct_current")
+        ));
+        assert!(meeting_should_follow_cloud_delete(&unowned, None));
+        assert!(!meeting_should_follow_cloud_delete(&owned, None));
+    }
+
+    #[test]
+    fn cloud_delete_cleanup_removes_only_bluey_owned_context_cache() {
+        let root = std::env::temp_dir().join(format!("bluey-cloud-delete-{}", Uuid::new_v4()));
+        let image_dir = root.join("context-images");
+        let markdown_dir = root.join("context-markdown");
+        let original_dir = root.join("originals");
+        std::fs::create_dir_all(&image_dir).expect("image dir");
+        std::fs::create_dir_all(&markdown_dir).expect("markdown dir");
+        std::fs::create_dir_all(&original_dir).expect("original dir");
+
+        let image_id = Uuid::new_v4();
+        let doc_id = Uuid::new_v4();
+        let image_path = image_dir.join(format!("{image_id}.jpg"));
+        let markdown_path = markdown_dir.join(format!("{doc_id}.md"));
+        let original_path = original_dir.join("Resume.pdf");
+        std::fs::write(&image_path, b"image").expect("write image");
+        std::fs::write(&markdown_path, b"markdown").expect("write markdown");
+        std::fs::write(&original_path, b"original").expect("write original");
+
+        let mut image = ContextArtifact::new(
+            ContextKind::Image,
+            image_path.to_string_lossy(),
+            "Screen",
+            None,
+            Some(5),
+        );
+        image.id = image_id;
+        let mut doc = ContextArtifact::new(
+            ContextKind::Document,
+            original_path.to_string_lossy(),
+            "Resume.pdf",
+            None,
+            Some(8),
+        )
+        .with_markdown_path(markdown_path.to_string_lossy());
+        doc.id = doc_id;
+
+        let mut meeting = MeetingRecord::new(Some("Cleanup".into()));
+        meeting.context.push(image);
+        meeting.context.push(doc);
+
+        remove_bluey_owned_context_files(&root, &meeting);
+
+        assert!(!image_path.exists());
+        assert!(!markdown_path.exists());
+        assert!(original_path.exists());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

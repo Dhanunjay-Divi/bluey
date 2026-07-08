@@ -11,6 +11,8 @@ use crate::clock;
 pub struct AccountConfig {
     pub provider: String,
     pub api_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_account_id: Option<String>,
     pub user_id: String,
     pub workspace_id: String,
     pub device_id: String,
@@ -26,6 +28,7 @@ impl AccountConfig {
         Self {
             provider: "local".to_string(),
             api_url: "http://127.0.0.1:8787".to_string(),
+            cloud_account_id: None,
             user_id: "local-user".to_string(),
             workspace_id: "default".to_string(),
             device_id: "local-device".to_string(),

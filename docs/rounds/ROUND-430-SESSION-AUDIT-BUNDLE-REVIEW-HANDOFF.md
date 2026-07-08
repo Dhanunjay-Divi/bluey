@@ -79,10 +79,10 @@ Implementation target for this round:
 - persist raw or chunked mic/system audio locally under `session-audit/<session_id>/audio/`
 - give every chunk a stable `audio_id`, codec/container, channel/source label, duration, and start/end timestamp
 - add `source_audio_id`, `start_ms`, `end_ms`, STT provider/model, language, and confidence/error fields to transcript records when available
-- upload internal alpha audio chunks through the same training/QA retention path used for other session data
+- upload audio chunks through the same training/QA retention path used for other synced session data
 - keep upload state visible in the audit metadata so reviewers know whether an audio chunk stayed local, uploaded, failed, or was skipped
 
-Terms and Privacy must clearly state that internal alpha session data can include voice/audio recordings or chunks used for transcription quality review, product improvement, training/tuning, routing, safeguards, and debugging, with the same 90-day retention window as synced session content.
+Terms and Privacy must clearly state that synced session data can include voice/audio recordings or chunks used for transcription quality review, product improvement, training/tuning, routing, safeguards, and debugging, with the same 90-day retention window as synced session content.
 
 ## Sync Requirements
 
@@ -134,4 +134,4 @@ Avoid internal implementation words in the UI such as backend, webhook, provider
 
 ## Status
 
-Ready for another agent to review against the runtime implementation. No deploy or runtime edits were made in this round. Companion Terms/Privacy wording is tracked in `ROUND-432-INTERNAL-ALPHA-AUDIO-TERMS.md`.
+Ready for another agent to review against the runtime implementation. No deploy or runtime edits were made in this round. Companion Terms/Privacy wording is tracked in `ROUND-432-AUDIO-RETENTION-TERMS.md`.

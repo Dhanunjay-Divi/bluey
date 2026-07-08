@@ -20,8 +20,9 @@ use crate::{
     types::{
         ArtifactObjectResponse, AuthResponse, CloudSessionBundle, EmbedBatchRequest,
         EmbedBatchResponse, EmbedRequest, EmbedResponse, InsufficientBalanceBody, RagQueryRequest,
-        RagQueryResponse, SessionListResponse, SttSessionCancelRequest, SttSessionCancelResponse,
-        SttSessionRequest, SttSessionResponse, SyncBatchRequest, SyncBatchResponse,
+        RagQueryResponse, SessionAuditBundleResponse, SessionListResponse, SttSessionCancelRequest,
+        SttSessionCancelResponse, SttSessionRequest, SttSessionResponse, SyncBatchRequest,
+        SyncBatchResponse,
     },
 };
 
@@ -247,6 +248,15 @@ impl CloudClient {
         self.auth_get(&format!("/sync/sessions/{session_id}")).await
     }
 
+    pub async fn delete_cloud_session(&self, session_id: &str) -> Result<SyncBatchResponse> {
+        self.auth_request(
+            Method::DELETE,
+            &format!("/sync/sessions/{session_id}"),
+            None::<&()>,
+        )
+        .await
+    }
+
     pub async fn upload_artifact_object(
         &self,
         artifact_id: &str,
@@ -254,6 +264,20 @@ impl CloudClient {
         content_type: &str,
     ) -> Result<ArtifactObjectResponse> {
         let path = format!("/sync/artifacts/{artifact_id}/object");
+        let resp = self
+            .send_bytes_with_auth(Method::POST, &path, bytes, content_type)
+            .await?;
+        Self::parse_or_err(resp).await
+    }
+
+    pub async fn upload_session_audit_bundle(
+        &self,
+        session_id: &str,
+        bundle_id: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<SessionAuditBundleResponse> {
+        let path = format!("/sync/session-audit/{session_id}/{bundle_id}");
         let resp = self
             .send_bytes_with_auth(Method::POST, &path, bytes, content_type)
             .await?;

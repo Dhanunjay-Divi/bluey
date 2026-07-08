@@ -140,6 +140,36 @@ impl Database {
             .context("session not found after insert")
     }
 
+    pub fn ensure_session_record(
+        &self,
+        id: Uuid,
+        title: &str,
+        created_at: i64,
+        updated_at: i64,
+    ) -> Result<()> {
+        let title = title.trim();
+        let title = if title.is_empty() {
+            "Untitled session"
+        } else {
+            title
+        };
+        let created_at = if created_at > 0 { created_at } else { now_ms() };
+        let updated_at = updated_at.max(created_at);
+        self.conn.execute(
+            "INSERT INTO sessions (id, title, status, created_at, updated_at, last_active_at)
+             VALUES (?1, ?2, 'active', ?3, ?4, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                updated_at = MAX(sessions.updated_at, excluded.updated_at),
+                last_active_at = MAX(
+                    COALESCE(sessions.last_active_at, 0),
+                    COALESCE(excluded.last_active_at, 0)
+                )",
+            params![id.to_string(), title, created_at, updated_at],
+        )?;
+        Ok(())
+    }
+
     pub fn get_session(&self, id: Uuid) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, status, created_at, updated_at, last_active_at, \
@@ -394,7 +424,23 @@ impl Database {
                 id, session_id, kind, text, source_text, ts_ms,
                 cost_cents, balance_cents_after, provider, model, input_tokens, output_tokens,
                 cost_label, artifact_type, artifact_body, artifact_confidence
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             ON CONFLICT(id) DO UPDATE SET
+                session_id = excluded.session_id,
+                kind = excluded.kind,
+                text = excluded.text,
+                source_text = excluded.source_text,
+                ts_ms = excluded.ts_ms,
+                cost_cents = excluded.cost_cents,
+                balance_cents_after = excluded.balance_cents_after,
+                provider = excluded.provider,
+                model = excluded.model,
+                input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens,
+                cost_label = excluded.cost_label,
+                artifact_type = excluded.artifact_type,
+                artifact_body = excluded.artifact_body,
+                artifact_confidence = excluded.artifact_confidence",
             params![
                 response.id,
                 response.session_id,
@@ -1255,6 +1301,61 @@ mod fts_tests {
             Some("CODE\n----\nfn main() {}")
         );
         assert_eq!(response.artifact_confidence, Some(0.95));
+    }
+
+    #[test]
+    fn cue_response_insert_is_idempotent_for_stable_turn_id() {
+        let db = test_db();
+        let session_id = Uuid::new_v4();
+        db.ensure_session_record(session_id, "Overlay chat", 1000, 1000)
+            .unwrap();
+
+        let stable_response_id = format!("turn-{}", Uuid::new_v4());
+        let session_id_string = session_id.to_string();
+        db.insert_cue_response(NewCueResponse {
+            id: &stable_response_id,
+            session_id: &session_id_string,
+            kind: "answer",
+            text: "first answer",
+            source_text: Some("question"),
+            ts_ms: 1100,
+            cost_cents: None,
+            balance_cents_after: None,
+            provider: Some("bluey_managed"),
+            model: Some("balanced"),
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            cost_label: Some("20 tokens"),
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
+        })
+        .unwrap();
+        db.insert_cue_response(NewCueResponse {
+            id: &stable_response_id,
+            session_id: &session_id_string,
+            kind: "answer",
+            text: "updated answer",
+            source_text: Some("question"),
+            ts_ms: 1200,
+            cost_cents: None,
+            balance_cents_after: None,
+            provider: Some("bluey_managed"),
+            model: Some("balanced"),
+            input_tokens: Some(11),
+            output_tokens: Some(21),
+            cost_label: Some("21 tokens"),
+            artifact_type: Some("code"),
+            artifact_body: Some("CODE\n----\nprint('ok')"),
+            artifact_confidence: Some(0.95),
+        })
+        .unwrap();
+
+        let responses = db.list_cue_responses(&session_id_string, 10).unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].id, stable_response_id);
+        assert_eq!(responses[0].text, "updated answer");
+        assert_eq!(responses[0].artifact_type.as_deref(), Some("code"));
     }
 
     #[test]

@@ -38,6 +38,7 @@ use cue_llm::{
     LlmArtifactMetadata, LlmProvider as _, LlmRequest, LlmSourceMetadata,
 };
 use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
+use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command as TokioCommand;
@@ -48,6 +49,7 @@ use tokio_tungstenite::tungstenite::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+use crate::cloud::sync::append_session_audit_event;
 use crate::doc_conversion::{
     build_markdown_preview, classify_context_path, convert_context_file_to_markdown,
     is_supported_context_file, supported_context_formats_message, write_markdown_artifact,
@@ -729,6 +731,17 @@ impl OverlayAnswerStream {
         }
         self.mark_answer_started();
         self.body.push_str(&delta);
+        record_visible_audit_event(
+            &self.daemon,
+            "ui_answer_delta",
+            json!({
+                "card_id": self.card_id.to_string(),
+                "generation_id": self.generation_id,
+                "delta": compact_snippet(&delta, 8_000),
+                "visible_body_chars": self.body.chars().count(),
+            }),
+        )
+        .await;
         self.flush(false).await
     }
 
@@ -739,6 +752,16 @@ impl OverlayAnswerStream {
         }
         self.body = message;
         self.showing_status = true;
+        record_visible_audit_event(
+            &self.daemon,
+            "ui_answer_status",
+            json!({
+                "card_id": self.card_id.to_string(),
+                "generation_id": self.generation_id,
+                "message": self.body.clone(),
+            }),
+        )
+        .await;
         self.flush(false).await
     }
 
@@ -746,6 +769,16 @@ impl OverlayAnswerStream {
         let text = sanitize_answer_text(text);
         self.body.clear();
         self.showing_status = false;
+        record_visible_audit_event(
+            &self.daemon,
+            "ui_answer_replay_text",
+            json!({
+                "card_id": self.card_id.to_string(),
+                "generation_id": self.generation_id,
+                "text": compact_snippet(&text, 64_000),
+            }),
+        )
+        .await;
         for chunk in streaming_word_chunks(&text) {
             self.mark_answer_started();
             self.body.push_str(&chunk);
@@ -820,6 +853,24 @@ impl OverlayAnswerStream {
             artifact_body_chars,
             "overlay final answer diagnostics"
         );
+        record_visible_audit_event(
+            &self.daemon,
+            "ui_answer_update_done",
+            json!({
+                "card_id": self.card_id.to_string(),
+                "generation_id": self.generation_id,
+                "final_body": compact_snippet(&self.body, 64_000),
+                "cost_label": cost_label.clone(),
+                "answer_chars": shape.chars,
+                "answer_lines": shape.lines,
+                "answer_closed_code_blocks": shape.closed_code_blocks,
+                "answer_has_unclosed_code_fence": shape.has_unclosed_code_fence,
+                "artifact_type": artifact_type,
+                "artifact_confidence_pct": artifact_confidence_pct,
+                "artifact_body_chars": artifact_body_chars,
+            }),
+        )
+        .await;
         self.flush_with_cost_label(true, cost_label).await
     }
 
@@ -1396,6 +1447,22 @@ struct CloudLoginTask {
     started_at: Instant,
 }
 
+async fn record_visible_audit_event(daemon: &Arc<Daemon>, kind: &str, payload: serde_json::Value) {
+    let meeting = daemon.meeting.lock().await.clone();
+    let Some(meeting) = meeting else {
+        return;
+    };
+    if let Err(error) = append_session_audit_event(&daemon.paths.data_dir, &meeting, kind, payload)
+    {
+        debug!(
+            session_id = %meeting.id,
+            kind,
+            error = %error,
+            "session audit event append failed"
+        );
+    }
+}
+
 struct OverlayProcess {
     child: Child,
     transport: OverlayTransport,
@@ -1415,8 +1482,20 @@ struct CaptureRuntime {
 struct AudioRuntime {
     stop: Option<oneshot::Sender<()>>,
     session_id: Option<String>,
+    finalizing_session: Option<AudioFinalizingSession>,
     start_generation: u64,
     starting: bool,
+}
+
+struct AudioFinalizingSession {
+    session_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct AudioTranscriptSession {
+    session_id: String,
+    finalizing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1518,6 +1597,7 @@ pub async fn run() -> Result<()> {
         audio_runtime: Mutex::new(AudioRuntime {
             stop: None,
             session_id: None,
+            finalizing_session: None,
             start_generation: 0,
             starting: false,
         }),
@@ -1805,7 +1885,7 @@ async fn handle_request_inner(
                     });
                 }
 
-                let meeting = MeetingRecord::new(title);
+                let meeting = new_owned_meeting(&daemon.paths, title);
                 daemon.store.save_active(&meeting)?;
                 *meeting_guard = Some(meeting.clone());
                 meeting
@@ -1879,7 +1959,10 @@ async fn handle_request_inner(
             let Some((meeting_snapshot, cards, indexed_segment)) = ({
                 let mut meeting_guard = daemon.meeting.lock().await;
                 if meeting_guard.is_none() {
-                    *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
+                    *meeting_guard = Some(new_owned_meeting(
+                        &daemon.paths,
+                        Some("New recording".to_string()),
+                    ));
                 }
 
                 let meeting = meeting_guard.as_mut().expect("meeting exists");
@@ -2148,6 +2231,16 @@ async fn handle_request_inner(
             Ok(DaemonResponse::CloudStatus { status })
         }
         DaemonRequest::CloudLogout => {
+            let _ = stop_audio_capture(daemon).await;
+            let _ = stop_screen_capture(daemon, "cloud logout").await;
+            set_overlay_listening_state(daemon, ListeningState::Paused).await;
+            {
+                let mut meeting_guard = daemon.meeting.lock().await;
+                *meeting_guard = None;
+            }
+            update_state_from_meeting(daemon, None).await?;
+            let _ = send_overlay(daemon, OverlayCommand::SetContextItems { items: vec![] }).await;
+            refresh_overlay_sessions(daemon).await;
             clear_listen_account_verification(daemon).await;
             stop_balance_polling(daemon).await;
             let status = cloud_status_from_env(&daemon.paths);
@@ -2163,6 +2256,15 @@ async fn handle_request_inner(
             .await;
             Ok(DaemonResponse::CloudStatus { status })
         }
+        DaemonRequest::SessionsMoveLocalToCurrentAccount { confirmed } => {
+            if !confirmed {
+                return Err(anyhow!(
+                    "moving local sessions requires explicit confirmation"
+                ));
+            }
+            let text = move_unowned_local_sessions_to_current_account(daemon).await?;
+            Ok(DaemonResponse::Text { text })
+        }
         DaemonRequest::CloudSyncNow => {
             let mut status = cloud_status_from_env(&daemon.paths);
             if status.sync_state == CloudSyncState::Disabled {
@@ -2174,10 +2276,12 @@ async fn handle_request_inner(
 
             let status = match build_cloud_client(&daemon.paths, Some(trace_id)) {
                 Ok(client) => {
+                    let owner_account_id = current_owner_account_id(&daemon.paths);
                     match crate::cloud::sync::sync_local_meetings(
                         &daemon.store,
                         &daemon.paths.data_dir,
                         &client,
+                        owner_account_id.as_deref(),
                     )
                     .await
                     {
@@ -2186,6 +2290,7 @@ async fn handle_request_inner(
                                 &daemon.store,
                                 &daemon.paths.data_dir,
                                 &client,
+                                owner_account_id.as_deref(),
                                 100,
                             )
                             .await
@@ -2408,13 +2513,19 @@ async fn sync_and_hydrate_cloud_meetings(
     crate::cloud::sync::CloudHydrationSummary,
 )> {
     let client = build_cloud_client(&daemon.paths, trace_id)?;
-    let upload_summary =
-        crate::cloud::sync::sync_local_meetings(&daemon.store, &daemon.paths.data_dir, &client)
-            .await?;
+    let owner_account_id = current_owner_account_id(&daemon.paths);
+    let upload_summary = crate::cloud::sync::sync_local_meetings(
+        &daemon.store,
+        &daemon.paths.data_dir,
+        &client,
+        owner_account_id.as_deref(),
+    )
+    .await?;
     let hydrate_summary = crate::cloud::sync::hydrate_missing_cloud_meetings(
         &daemon.store,
         &daemon.paths.data_dir,
         &client,
+        owner_account_id.as_deref(),
         100,
     )
     .await?;
@@ -3151,7 +3262,10 @@ async fn ensure_active_meeting_for_session(
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
+            *meeting_guard = Some(new_owned_meeting(
+                &daemon.paths,
+                Some("New recording".to_string()),
+            ));
         }
         let meeting = meeting_guard.as_ref().expect("meeting exists").clone();
         daemon.store.save_active(&meeting)?;
@@ -3178,7 +3292,10 @@ async fn record_active_session_listen_start(
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
+            *meeting_guard = Some(new_owned_meeting(
+                &daemon.paths,
+                Some("New recording".to_string()),
+            ));
         }
         let meeting = meeting_guard.as_mut().expect("meeting exists");
         meeting.diagnostics.record_listen_start(
@@ -3220,7 +3337,10 @@ async fn record_active_session_diagnostic_inner(
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
+            *meeting_guard = Some(new_owned_meeting(
+                &daemon.paths,
+                Some("New recording".to_string()),
+            ));
         }
         let meeting = meeting_guard.as_mut().expect("meeting exists");
         meeting.diagnostics.record_error(kind, clean.clone());
@@ -3257,6 +3377,7 @@ async fn start_audio_capture(
         }
         runtime.start_generation = runtime.start_generation.wrapping_add(1);
         runtime.starting = true;
+        runtime.finalizing_session = None;
         runtime.start_generation
     };
 
@@ -3344,6 +3465,7 @@ async fn start_audio_capture(
         }
         runtime.stop = Some(stop_tx);
         runtime.session_id = Some(session_id.clone());
+        runtime.finalizing_session = None;
         runtime.starting = false;
     }
     *daemon.audio.lock().await = status.clone();
@@ -3859,6 +3981,62 @@ fn live_stt_finalize_wait_ms() -> u64 {
     .and_then(|value| value.parse::<u64>().ok())
     .unwrap_or(LIVE_STT_FINALIZE_WAIT_MS)
     .clamp(100, 2_000)
+}
+
+fn is_live_caption_answer_prompt(question: &str) -> bool {
+    let q = question.trim().to_ascii_lowercase();
+    q.contains("answer the latest live captions from the current session transcript")
+        || q.contains("live captions preview")
+}
+
+async fn wait_for_live_caption_answer_transcript_settle(daemon: &Arc<Daemon>, question: &str) {
+    if !is_live_caption_answer_prompt(question) {
+        return;
+    }
+    let audio_session_id = daemon.audio.lock().await.session_id.clone();
+    let Some(audio_session_id) = audio_session_id else {
+        return;
+    };
+
+    let wait_ms = live_stt_finalize_wait_ms();
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    let quiet_after_change = Duration::from_millis(140);
+    let mut last_count = active_transcript_segment_count(daemon).await;
+    let initial_count = last_count;
+    let mut last_change_at = Instant::now();
+
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(60)).await;
+        let current_count = active_transcript_segment_count(daemon).await;
+        if current_count != last_count {
+            last_count = current_count;
+            last_change_at = Instant::now();
+        }
+        if current_count > initial_count && last_change_at.elapsed() >= quiet_after_change {
+            break;
+        }
+    }
+
+    info!(
+        audio_session_id = %audio_session_id,
+        wait_ms,
+        transcript_segments_before = initial_count,
+        transcript_segments_after = last_count,
+        "live caption answer waited for transcript settle before submit"
+    );
+}
+
+async fn active_transcript_segment_count(daemon: &Arc<Daemon>) -> usize {
+    daemon
+        .meeting
+        .lock()
+        .await
+        .as_ref()
+        .map(|meeting| meeting.transcript.len())
+        .unwrap_or(0)
 }
 
 async fn resolve_real_audio_sources(
@@ -4545,7 +4723,7 @@ async fn real_audio_relay_loop(
                 }
             }
             _ = sleep(Duration::from_secs(1)) => {
-                if daemon.audio.lock().await.session_id.as_deref() != Some(session_id.as_str()) {
+                if !active_audio_session_matches(&daemon, &session_id).await {
                     let _ = relay_stop_tx.send(true);
                     break;
                 }
@@ -4580,6 +4758,7 @@ async fn real_audio_relay_loop(
         }
     }
     let refreshed = refresh_overlay_balance(&daemon, None).await;
+    clear_finalizing_audio_session(&daemon, &session_id).await;
     info!(
         session_id = %session_id,
         completed_sources,
@@ -4588,14 +4767,7 @@ async fn real_audio_relay_loop(
         balance_refreshed = refreshed.is_some(),
         "live STT relay loop settlement refresh completed"
     );
-    if completed_sources >= source_count
-        && daemon
-            .audio
-            .lock()
-            .await
-            .session_id
-            .as_deref()
-            .is_some_and(|active| active == session_id)
+    if completed_sources >= source_count && active_audio_session_matches(&daemon, &session_id).await
     {
         let _ = stop_audio_capture(&daemon).await;
         set_overlay_listening_state(&daemon, ListeningState::Paused).await;
@@ -4869,14 +5041,14 @@ async fn run_relay_audio_source(
             preface.len() as u64,
         );
         start_ms = start_ms.saturating_add(duration_ms as u64);
+        if !active_audio_session_matches(&daemon, &session_id).await {
+            let _ = ws_tx.send(WebSocketMessage::Close(None)).await;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Ok(());
+        }
         {
             let mut audio = daemon.audio.lock().await;
-            if audio.session_id.as_deref() != Some(session_id.as_str()) {
-                let _ = ws_tx.send(WebSocketMessage::Close(None)).await;
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Ok(());
-            }
             audio.record_chunk(&chunk);
         }
         if sequence == 1 || stats.is_audible_for_stt() {
@@ -4928,11 +5100,11 @@ async fn run_relay_audio_source(
                     read as u64,
                 );
                 start_ms = start_ms.saturating_add(duration_ms as u64);
+                if !active_audio_session_matches(&daemon, &session_id).await {
+                    break;
+                }
                 {
                     let mut audio = daemon.audio.lock().await;
-                    if audio.session_id.as_deref() != Some(session_id.as_str()) {
-                        break;
-                    }
                     audio.record_chunk(&chunk);
                 }
                 if sequence == 1 || sequence % 50 == 0 {
@@ -5129,7 +5301,7 @@ async fn emit_deepgram_relay_payload(
                 warn!("live relay transcript emission failed: {error:#}");
             }
         }
-        if daemon.audio.lock().await.session_id.as_deref() != Some(session_id) {
+        if !audio_session_accepts_transcripts(daemon, session_id).await {
             break;
         }
     }
@@ -5425,9 +5597,13 @@ fn overlay_session_items(
     daemon: &Arc<Daemon>,
     active_id: Option<uuid::Uuid>,
 ) -> Result<Vec<OverlaySessionItem>> {
+    let owner_account_id = current_owner_account_id(&daemon.paths);
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
     for meeting in daemon.store.all_meetings()? {
+        if !meeting_visible_for_owner(&meeting, owner_account_id.as_deref()) {
+            continue;
+        }
         if !seen.insert(meeting.id) {
             continue;
         }
@@ -5482,6 +5658,122 @@ fn overlay_session_items(
         });
     }
     Ok(items.into_iter().take(8).collect())
+}
+
+fn current_owner_account_id(paths: &AppPaths) -> Option<String> {
+    let account = load_account(paths).ok().flatten()?;
+    if !account.token_configured() {
+        return None;
+    }
+    account
+        .cloud_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            let user_id = account.user_id.trim();
+            (!user_id.is_empty() && user_id != "local-user").then(|| user_id.to_string())
+        })
+}
+
+fn meeting_visible_for_owner(meeting: &MeetingRecord, owner_account_id: Option<&str>) -> bool {
+    match owner_account_id {
+        Some(owner) => meeting.owner_account_id.as_deref() == Some(owner),
+        None => meeting.owner_account_id.as_deref().is_none(),
+    }
+}
+
+fn tag_meeting_owner_from_paths(paths: &AppPaths, meeting: &mut MeetingRecord) {
+    if meeting
+        .owner_account_id
+        .as_deref()
+        .is_some_and(|owner| !owner.trim().is_empty())
+    {
+        return;
+    }
+    meeting.owner_account_id = current_owner_account_id(paths);
+}
+
+fn new_owned_meeting(paths: &AppPaths, title: Option<String>) -> MeetingRecord {
+    let mut meeting = MeetingRecord::new(title);
+    tag_meeting_owner_from_paths(paths, &mut meeting);
+    meeting
+}
+
+fn latest_visible_meeting(
+    store: &MeetingStore,
+    owner_account_id: Option<&str>,
+) -> Result<Option<MeetingRecord>> {
+    Ok(store
+        .all_meetings()?
+        .into_iter()
+        .find(|meeting| meeting_visible_for_owner(meeting, owner_account_id)))
+}
+
+async fn move_unowned_local_sessions_to_current_account(daemon: &Arc<Daemon>) -> Result<String> {
+    let Some(owner_account_id) = current_owner_account_id(&daemon.paths) else {
+        return Err(anyhow!(
+            "Sign in to Bluey before moving local sessions to an account."
+        ));
+    };
+
+    let active_id = daemon.store.load_active()?.map(|meeting| meeting.id);
+    let mut moved = 0usize;
+    let mut skipped_empty = 0usize;
+    let mut skipped_owned = 0usize;
+
+    for mut meeting in daemon.store.all_meetings()? {
+        if meeting
+            .owner_account_id
+            .as_deref()
+            .is_some_and(|owner| !owner.trim().is_empty())
+        {
+            skipped_owned += 1;
+            continue;
+        }
+        if !meeting_has_recording_content(&meeting) {
+            skipped_empty += 1;
+            continue;
+        }
+
+        meeting.owner_account_id = Some(owner_account_id.clone());
+        if Some(meeting.id) == active_id {
+            {
+                let mut meeting_guard = daemon.meeting.lock().await;
+                if meeting_guard
+                    .as_ref()
+                    .is_some_and(|active| active.id == meeting.id)
+                {
+                    *meeting_guard = Some(meeting.clone());
+                }
+            }
+            daemon.store.save_active(&meeting)?;
+            update_state_from_meeting(daemon, Some(&meeting)).await?;
+        } else {
+            daemon.store.save_archived(&meeting)?;
+        }
+        moved += 1;
+    }
+
+    refresh_overlay_sessions(daemon).await;
+    if moved > 0 {
+        schedule_auto_cloud_sync(daemon, "local_session_owner_migration", None).await;
+    }
+    info!(
+        owner_account_id = %owner_account_id,
+        moved,
+        skipped_empty,
+        skipped_owned,
+        "local sessions owner migration completed"
+    );
+
+    Ok(format!(
+        "Moved {moved} local session{} to this account. Skipped {skipped_empty} empty session{} and {skipped_owned} already-owned session{}.",
+        plural_s(moved),
+        plural_s(skipped_empty),
+        plural_s(skipped_owned)
+    ))
 }
 
 fn meeting_has_saved_content(meeting: &MeetingRecord) -> bool {
@@ -6330,6 +6622,7 @@ async fn run_background_cloud_login(
     let mut account = existing.unwrap_or_else(cue_core::AccountConfig::local);
     account.provider = "bluey".to_string();
     account.api_url = login.api_url;
+    account.cloud_account_id = Some(auth.account.id.clone());
     account.user_id = auth.account.email.clone();
     if account.workspace_id.trim().is_empty() || account.workspace_id == "local-workspace" {
         account.workspace_id = "default".to_string();
@@ -6376,14 +6669,52 @@ async fn run_background_cloud_login(
         cue_core::save_settings(&daemon.paths, &settings)?;
     }
 
+    clear_active_session_if_not_current_owner(&daemon).await?;
     mark_listen_account_verified(&daemon).await;
     refresh_signed_in_overlay_state(&daemon, Some(&trace_id)).await;
+    clear_background_cloud_login_if_current(&daemon, &login.flow.user_code).await;
     info!(
         source,
         balance_cents_after_login = auth.account.balance_cents,
         "Bluey desktop login completed"
     );
     Ok(())
+}
+
+async fn clear_active_session_if_not_current_owner(daemon: &Arc<Daemon>) -> Result<()> {
+    let owner_account_id = current_owner_account_id(&daemon.paths);
+    let cleared = {
+        let mut meeting_guard = daemon.meeting.lock().await;
+        if meeting_guard
+            .as_ref()
+            .is_some_and(|meeting| !meeting_visible_for_owner(meeting, owner_account_id.as_deref()))
+        {
+            *meeting_guard = None;
+            true
+        } else {
+            false
+        }
+    };
+    if cleared {
+        let _ = stop_audio_capture(daemon).await;
+        let _ = stop_screen_capture(daemon, "account switched").await;
+        set_overlay_listening_state(daemon, ListeningState::Paused).await;
+        update_state_from_meeting(daemon, None).await?;
+        let _ = send_overlay(daemon, OverlayCommand::SetContextItems { items: vec![] }).await;
+        refresh_overlay_sessions(daemon).await;
+        write_state(daemon).await?;
+    }
+    Ok(())
+}
+
+async fn clear_background_cloud_login_if_current(daemon: &Arc<Daemon>, user_code: &str) {
+    let mut login_guard = daemon.cloud_login.lock().await;
+    if login_guard
+        .as_ref()
+        .is_some_and(|task| task.user_code == user_code)
+    {
+        *login_guard = None;
+    }
 }
 
 async fn refresh_signed_in_overlay_state(daemon: &Arc<Daemon>, trace_id: Option<&str>) {
@@ -6800,21 +7131,98 @@ async fn transcribe_audio_file(
 }
 
 async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
-    let stop = {
+    let (stop, finalizing_session_id) = {
         let mut runtime = daemon.audio_runtime.lock().await;
         runtime.start_generation = runtime.start_generation.wrapping_add(1);
         runtime.starting = false;
-        runtime.session_id = None;
-        runtime.stop.take()
+        let finalizing_session_id = runtime.session_id.take();
+        if let Some(session_id) = finalizing_session_id.as_ref() {
+            runtime.finalizing_session = Some(AudioFinalizingSession {
+                session_id: session_id.clone(),
+                expires_at: Instant::now() + live_stt_tail_acceptance_window(),
+            });
+        }
+        (runtime.stop.take(), finalizing_session_id)
     };
     if let Some(stop) = stop {
         let _ = stop.send(());
+    }
+    if let Some(session_id) = finalizing_session_id {
+        info!(
+            session_id = %session_id,
+            tail_acceptance_ms = live_stt_tail_acceptance_window().as_millis() as u64,
+            "audio capture stop requested; accepting final STT tail frames briefly"
+        );
     }
 
     let mut audio = daemon.audio.lock().await;
     let status = audio.clone().stopped();
     *audio = status.clone();
     status
+}
+
+fn live_stt_tail_acceptance_window() -> Duration {
+    let settle_ms = live_stt_finalize_wait_ms().saturating_add(750).min(3_000);
+    Duration::from_millis(settle_ms)
+}
+
+async fn active_audio_session_matches(daemon: &Arc<Daemon>, session_id: &str) -> bool {
+    daemon
+        .audio_runtime
+        .lock()
+        .await
+        .session_id
+        .as_deref()
+        .is_some_and(|active| active == session_id)
+}
+
+async fn audio_transcript_session_for_segment(
+    daemon: &Arc<Daemon>,
+) -> Option<AudioTranscriptSession> {
+    let mut runtime = daemon.audio_runtime.lock().await;
+    if let Some(session_id) = runtime.session_id.clone() {
+        return Some(AudioTranscriptSession {
+            session_id,
+            finalizing: false,
+        });
+    }
+    let Some(finalizing) = runtime.finalizing_session.as_ref() else {
+        return None;
+    };
+    if Instant::now() <= finalizing.expires_at {
+        return Some(AudioTranscriptSession {
+            session_id: finalizing.session_id.clone(),
+            finalizing: true,
+        });
+    }
+    let expired_session_id = finalizing.session_id.clone();
+    runtime.finalizing_session = None;
+    debug!(
+        session_id = %expired_session_id,
+        "audio finalizing session expired; later STT tail frames will be ignored"
+    );
+    None
+}
+
+async fn audio_session_accepts_transcripts(daemon: &Arc<Daemon>, session_id: &str) -> bool {
+    audio_transcript_session_for_segment(daemon)
+        .await
+        .is_some_and(|active| active.session_id == session_id)
+}
+
+async fn clear_finalizing_audio_session(daemon: &Arc<Daemon>, session_id: &str) {
+    let mut runtime = daemon.audio_runtime.lock().await;
+    if runtime
+        .finalizing_session
+        .as_ref()
+        .is_some_and(|finalizing| finalizing.session_id == session_id)
+    {
+        runtime.finalizing_session = None;
+        debug!(
+            session_id = %session_id,
+            "audio finalizing session cleared after STT relay settlement"
+        );
+    }
 }
 
 async fn add_audio_transcript_segment(
@@ -6836,11 +7244,15 @@ async fn add_audio_transcript_segment_inner(
     segment: &cue_core::audio::SttSegmentMetadata,
     allow_session_start: bool,
 ) -> Result<bool> {
-    let audio_session_id = daemon.audio.lock().await.session_id.clone();
-    if audio_session_id.is_none() && !allow_session_start {
+    let audio_session = audio_transcript_session_for_segment(daemon).await;
+    if audio_session.is_none() && !allow_session_start {
         debug!("dropping late audio transcript segment after capture stopped");
         return Ok(false);
     }
+    let audio_session_id = audio_session
+        .as_ref()
+        .map(|session| session.session_id.clone())
+        .unwrap_or_default();
 
     let speaker = match segment.source {
         Some(AudioSourceKind::System) => Speaker::System,
@@ -6858,6 +7270,19 @@ async fn add_audio_transcript_segment_inner(
         Some(AudioSourceKind::Microphone) => "microphone",
         None => "unknown",
     };
+    if audio_session
+        .as_ref()
+        .is_some_and(|session| session.finalizing)
+    {
+        info!(
+            session_id = %audio_session_id,
+            source = source_label,
+            is_final = segment.is_final,
+            text_chars = text.chars().count(),
+            text_words = word_count(text),
+            "accepted finalizing live STT tail segment after capture stop"
+        );
+    }
     if text != raw_text {
         info!(
             source = source_label,
@@ -6880,7 +7305,7 @@ async fn add_audio_transcript_segment_inner(
         )
         .await;
         let _ = daemon.live_transcript_tx.send(LiveTranscriptEvent {
-            session_id: audio_session_id.unwrap_or_default(),
+            session_id: audio_session_id,
             source: source_label.to_string(),
             text: text.to_string(),
             is_final: false,
@@ -6893,7 +7318,10 @@ async fn add_audio_transcript_segment_inner(
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
+            *meeting_guard = Some(new_owned_meeting(
+                &daemon.paths,
+                Some("New recording".to_string()),
+            ));
         }
 
         let meeting = meeting_guard.as_mut().expect("meeting exists");
@@ -7223,12 +7651,14 @@ async fn answer_with_provider_runtime(
     if request.question.is_empty() {
         return Err(anyhow!("question cannot be empty"));
     }
+    let live_caption_answer = is_live_caption_answer_prompt(&request.question);
+    wait_for_live_caption_answer_transcript_settle(daemon, &request.question).await;
     let generation_id = next_answer_generation(daemon);
 
     let (meeting_snapshot, answer_meeting) = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            let meeting = MeetingRecord::new(Some("New recording".to_string()));
+            let meeting = new_owned_meeting(&daemon.paths, Some("New recording".to_string()));
             daemon.store.save_active(&meeting)?;
             *meeting_guard = Some(meeting);
         }
@@ -7253,7 +7683,7 @@ async fn answer_with_provider_runtime(
         (meeting.clone(), answer_meeting)
     };
 
-    if request.context.is_empty() {
+    if request.context.is_empty() || live_caption_answer {
         request.context = answer_context_for_question(
             daemon,
             &meeting_snapshot,
@@ -7289,6 +7719,20 @@ async fn answer_with_provider_runtime(
         },
     )
     .await;
+    record_visible_audit_event(
+        daemon,
+        "ui_question_card",
+        json!({
+            "request_id": request.metadata.request_id.to_string(),
+            "source": source.clone(),
+            "route": format!("{:?}", request.route),
+            "title": visible_question_title.clone(),
+            "text": compact_snippet(&visible_question, 16_000),
+            "visible_context_count": question_display_context.len(),
+            "attachment_ids": question_attachment_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        }),
+    )
+    .await;
     write_state(daemon).await?;
 
     let initial_progress = initial_answer_progress_text(&request);
@@ -7300,6 +7744,19 @@ async fn answer_with_provider_runtime(
     let mut overlay_stream =
         OverlayAnswerStream::new(Arc::clone(daemon), answer_card_id, generation_id);
     overlay_stream.push_status(initial_progress).await?;
+    record_visible_audit_event(
+        daemon,
+        "ui_answer_started",
+        json!({
+            "request_id": request.metadata.request_id.to_string(),
+            "card_id": answer_card_id.to_string(),
+            "generation_id": generation_id,
+            "progress": initial_progress,
+            "route": format!("{:?}", request.route),
+            "streaming": request.metadata.stream,
+        }),
+    )
+    .await;
     info!(
         request_id = %request.metadata.request_id,
         card_id = %answer_card_id,
@@ -7331,6 +7788,18 @@ async fn answer_with_provider_runtime(
                 );
                 record_active_session_diagnostic(daemon, "answer_error", &error_message).await;
                 let _ = overlay_stream.finish(&error_message).await;
+                record_visible_audit_event(
+                    daemon,
+                    "ui_answer_error",
+                    json!({
+                        "request_id": request.metadata.request_id.to_string(),
+                        "card_id": answer_card_id.to_string(),
+                        "generation_id": generation_id,
+                        "visible_message": error_message,
+                        "raw_error": compact_snippet(&format!("{error:#}"), 4_000),
+                    }),
+                )
+                .await;
             }
             clear_active_answer_card(daemon, generation_id, answer_card_id).await;
             return Err(error);
@@ -7411,12 +7880,27 @@ async fn answer_with_provider_runtime(
         overlay_stream.replay_text(&response.answer).await?;
     }
     let answer_start_latency_ms = overlay_stream.answer_start_latency_ms();
+    let persisted_cost_label =
+        answer_overlay_cost_label(&response.metadata, answer_start_latency_ms);
     overlay_stream
-        .finish_with_cost_label(
-            &response.answer,
-            answer_overlay_cost_label(&response.metadata, answer_start_latency_ms),
-        )
+        .finish_with_cost_label(&response.answer, persisted_cost_label.clone())
         .await?;
+    record_visible_audit_event(
+        daemon,
+        "ui_answer_finished",
+        json!({
+            "request_id": request.metadata.request_id.to_string(),
+            "card_id": answer_card_id.to_string(),
+            "generation_id": generation_id,
+            "provider": outcome.provider.display_label(),
+            "latency_ms": outcome.latency_ms,
+            "answer_start_latency_ms": answer_start_latency_ms,
+            "visible_answer": compact_snippet(&response.answer, 64_000),
+            "cost_label": persisted_cost_label.clone(),
+            "sources": outcome.sources.len(),
+        }),
+    )
+    .await;
     let still_current = is_answer_generation_current(daemon, generation_id);
     clear_active_answer_card(daemon, generation_id, answer_card_id).await;
     if !still_current {
@@ -7462,16 +7946,15 @@ async fn answer_with_provider_runtime(
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if let Some(meeting) = meeting_guard.as_mut() {
-            meeting.push_conversation_turn(
-                ConversationTurn::new(
-                    visible_question.clone(),
-                    persisted_answer.clone(),
-                    Some(source.clone()),
-                    Some(outcome.provider.display_label()),
-                )
-                .with_artifact(persisted_artifact.clone())
-                .with_attachment_ids(question_attachment_ids.clone()),
-            );
+            let conversation_turn = ConversationTurn::new(
+                visible_question.clone(),
+                persisted_answer.clone(),
+                Some(source.clone()),
+                Some(outcome.provider.display_label()),
+            )
+            .with_artifact(persisted_artifact.clone())
+            .with_attachment_ids(question_attachment_ids.clone());
+            meeting.push_conversation_turn(conversation_turn.clone());
             let used_image_context = mark_visible_image_context_used_once(
                 &daemon.paths,
                 meeting,
@@ -7481,6 +7964,20 @@ async fn answer_with_provider_runtime(
             );
             maybe_autoname_meeting(meeting, &request.question);
             daemon.store.save_active(meeting)?;
+            if let Err(error) = persist_conversation_turn_response(
+                &daemon.paths,
+                meeting,
+                &conversation_turn,
+                &response.metadata,
+                persisted_cost_label.as_deref(),
+            ) {
+                warn!(
+                    error = %error,
+                    meeting_id = %meeting.id,
+                    turn_id = %conversation_turn.id,
+                    "failed to persist overlay answer turn to local cue response db"
+                );
+            }
             let meeting_snapshot = meeting.clone();
             if !used_image_context.is_empty() {
                 index_context_artifacts_for_rag(
@@ -7500,6 +7997,75 @@ async fn answer_with_provider_runtime(
     write_state(daemon).await?;
     schedule_auto_cloud_sync(daemon, "answer_saved", None).await;
     Ok((response, events))
+}
+
+fn persist_conversation_turn_response(
+    paths: &AppPaths,
+    meeting: &MeetingRecord,
+    turn: &ConversationTurn,
+    metadata: &AnswerResponseMetadata,
+    cost_label: Option<&str>,
+) -> Result<()> {
+    let db_path = paths.data_dir.join("sessions.db");
+    let db = crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db"))?;
+    let meeting_created_at = parse_epoch_ms_i64(&meeting.started_at);
+    let turn_created_at = parse_epoch_ms_i64(&turn.created_at);
+    db.ensure_session_record(
+        meeting.id,
+        &meeting.title,
+        meeting_created_at,
+        turn_created_at,
+    )?;
+
+    let response_id = format!("turn-{}", turn.id);
+    let artifact_type = turn
+        .artifact
+        .as_ref()
+        .map(|artifact| artifact_type_label(artifact.artifact_type));
+    let artifact_body = turn
+        .artifact
+        .as_ref()
+        .map(|artifact| artifact.body.as_str());
+    let artifact_confidence = turn.artifact.as_ref().map(|artifact| artifact.confidence);
+    let usage = metadata.token_usage;
+    let cost_cents = metadata.cost_estimate.as_ref().and_then(|cost| {
+        if cost.amount > 0.0 && cost.currency.eq_ignore_ascii_case("usd") {
+            Some((cost.amount * 100.0).round() as i64)
+        } else {
+            None
+        }
+    });
+    let provider_id = metadata.provider.provider_id.to_string();
+    let model = metadata.provider.model.as_ref().map(|model| model.as_str());
+    let session_id = meeting.id.to_string();
+
+    db.insert_cue_response(crate::db::NewCueResponse {
+        id: &response_id,
+        session_id: &session_id,
+        kind: "answer",
+        text: &turn.answer,
+        source_text: Some(&turn.question),
+        ts_ms: turn_created_at,
+        cost_cents,
+        balance_cents_after: None,
+        provider: Some(provider_id.as_str()),
+        model,
+        input_tokens: usage.map(|usage| usage.input_tokens as i64),
+        output_tokens: usage.map(|usage| usage.output_tokens as i64),
+        cost_label,
+        artifact_type,
+        artifact_body,
+        artifact_confidence,
+    })?;
+    Ok(())
+}
+
+fn parse_epoch_ms_i64(value: &str) -> i64 {
+    value.trim().parse::<i64>().unwrap_or_else(|_| {
+        clock::now_epoch_ms_string()
+            .parse::<i64>()
+            .unwrap_or_default()
+    })
 }
 
 fn user_facing_answer_error(error: &anyhow::Error) -> String {
@@ -13249,7 +13815,10 @@ async fn attach_context_artifacts(
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
+            *meeting_guard = Some(new_owned_meeting(
+                &daemon.paths,
+                Some("New recording".to_string()),
+            ));
         }
 
         let meeting = meeting_guard.as_mut().expect("meeting exists");
@@ -13388,20 +13957,31 @@ async fn continue_session(
     }
 
     let outcome = {
+        let owner_account_id = current_owner_account_id(&daemon.paths);
         let mut meeting_guard = daemon.meeting.lock().await;
-        if let Some(meeting) = meeting_guard.as_ref() {
+        if let Some(meeting) = meeting_guard
+            .as_ref()
+            .filter(|meeting| meeting_visible_for_owner(meeting, owner_account_id.as_deref()))
+        {
             ContinueOutcome::Active(meeting.clone())
-        } else if let Some(mut meeting) = daemon.store.last_meeting()? {
-            maybe_autoname_meeting_from_existing(&mut meeting);
-            meeting.ended_at = None;
-            daemon.store.save_active(&meeting)?;
-            *meeting_guard = Some(meeting.clone());
-            ContinueOutcome::Restored(meeting)
         } else {
-            let meeting = MeetingRecord::new(Some("Bluey session".to_string()));
-            daemon.store.save_active(&meeting)?;
-            *meeting_guard = Some(meeting.clone());
-            ContinueOutcome::Created(meeting)
+            if meeting_guard.is_some() {
+                *meeting_guard = None;
+            }
+            if let Some(mut meeting) =
+                latest_visible_meeting(&daemon.store, owner_account_id.as_deref())?
+            {
+                maybe_autoname_meeting_from_existing(&mut meeting);
+                meeting.ended_at = None;
+                daemon.store.save_active(&meeting)?;
+                *meeting_guard = Some(meeting.clone());
+                ContinueOutcome::Restored(meeting)
+            } else {
+                let meeting = new_owned_meeting(&daemon.paths, Some("Bluey session".to_string()));
+                daemon.store.save_active(&meeting)?;
+                *meeting_guard = Some(meeting.clone());
+                ContinueOutcome::Created(meeting)
+            }
         }
     };
 
@@ -13452,6 +14032,10 @@ async fn open_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<Me
         .store
         .load_by_id(id)?
         .with_context(|| format!("session {id} not found"))?;
+    let owner_account_id = current_owner_account_id(&daemon.paths);
+    if !meeting_visible_for_owner(&selected, owner_account_id.as_deref()) {
+        anyhow::bail!("session {id} does not belong to the current account");
+    }
 
     let archived_summary = {
         let mut meeting_guard = daemon.meeting.lock().await;
@@ -13522,6 +14106,12 @@ async fn rename_meeting_session(
 
 async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<()> {
     let meeting_for_cleanup = daemon.store.load_by_id(id).ok().flatten();
+    let owner_account_id = current_owner_account_id(&daemon.paths);
+    if let Some(meeting) = meeting_for_cleanup.as_ref() {
+        if !meeting_visible_for_owner(meeting, owner_account_id.as_deref()) {
+            anyhow::bail!("session {id} does not belong to the current account");
+        }
+    }
     let is_active = {
         let meeting_guard = daemon.meeting.lock().await;
         meeting_guard
@@ -13555,6 +14145,36 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
         remove_markdown_artifact_files(&daemon.paths, &meeting.context);
     }
 
+    let mut cloud_deleted = false;
+    if owner_account_id.is_some() {
+        match build_cloud_client(&daemon.paths, None) {
+            Ok(client) => match client.delete_cloud_session(&id.to_string()).await {
+                Ok(response) => {
+                    cloud_deleted = response.accepted.sessions > 0;
+                    info!(
+                        session_id = %id,
+                        cloud_deleted,
+                        "cloud session tombstone requested after local delete"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        session_id = %id,
+                        error = %error,
+                        "cloud session tombstone failed after local delete"
+                    );
+                }
+            },
+            Err(error) => {
+                debug!(
+                    session_id = %id,
+                    error = %error,
+                    "cloud session tombstone skipped because cloud client was unavailable"
+                );
+            }
+        }
+    }
+
     daemon.rag_indexer.delete_session(id.to_string());
 
     if was_active {
@@ -13566,7 +14186,13 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
         daemon,
         CardKind::System,
         "Session deleted",
-        "The saved recording was removed from this device.",
+        if cloud_deleted {
+            "The saved recording was removed from this device and your Bluey account."
+        } else if owner_account_id.is_some() {
+            "The saved recording was removed from this device. Cloud deletion did not finish; delete again after sign-in is healthy."
+        } else {
+            "The saved recording was removed from this device."
+        },
     )
     .await;
     write_state(daemon).await
@@ -13611,7 +14237,7 @@ async fn start_new_session(
 
     let meeting = {
         let mut meeting_guard = daemon.meeting.lock().await;
-        let meeting = MeetingRecord::new(Some("Bluey session".to_string()));
+        let meeting = new_owned_meeting(&daemon.paths, Some("Bluey session".to_string()));
         daemon.store.save_active(&meeting)?;
         *meeting_guard = Some(meeting.clone());
         meeting
@@ -13642,7 +14268,10 @@ async fn set_answer_instructions(
 ) -> Result<MeetingRecord> {
     let mut meeting_guard = daemon.meeting.lock().await;
     if meeting_guard.is_none() {
-        *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
+        *meeting_guard = Some(new_owned_meeting(
+            &daemon.paths,
+            Some("New recording".to_string()),
+        ));
     }
 
     let meeting = meeting_guard.as_mut().expect("meeting exists");
@@ -13675,11 +14304,13 @@ async fn push_system_card(
 }
 
 async fn current_or_last_meeting(daemon: &Arc<Daemon>) -> Result<Option<MeetingRecord>> {
+    let owner_account_id = current_owner_account_id(&daemon.paths);
     if let Some(active) = daemon.meeting.lock().await.as_ref() {
-        Ok(Some(active.clone()))
-    } else {
-        daemon.store.last_meeting()
+        if meeting_visible_for_owner(active, owner_account_id.as_deref()) {
+            return Ok(Some(active.clone()));
+        }
     }
+    latest_visible_meeting(&daemon.store, owner_account_id.as_deref())
 }
 
 async fn push_recap_card(daemon: &Arc<Daemon>) -> Result<()> {
@@ -17383,6 +18014,18 @@ mod tests {
     }
 
     #[test]
+    fn live_caption_answer_prompt_detection_is_specific() {
+        assert!(is_live_caption_answer_prompt(
+            "Answer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context."
+        ));
+        assert!(is_live_caption_answer_prompt("Live captions preview"));
+        assert!(!is_live_caption_answer_prompt(
+            "Can you explain the difference between LRU cache and SRU?"
+        ));
+        assert!(!is_live_caption_answer_prompt("write Python code"));
+    }
+
+    #[test]
     fn real_stt_chunk_duration_defaults_to_fast_half_second_chunks() {
         std::env::remove_var("BLUEY_STT_CHUNK_MS");
         std::env::remove_var("CUE_STT_CHUNK_MS");
@@ -18398,6 +19041,19 @@ mod tests {
             "we should cache the answer.",
             true,
         ));
+    }
+
+    #[test]
+    fn meeting_visibility_is_scoped_to_current_account() {
+        let mut meeting = MeetingRecord::new(Some("Scoped".to_string()));
+
+        assert!(meeting_visible_for_owner(&meeting, None));
+        assert!(!meeting_visible_for_owner(&meeting, Some("acct-a")));
+
+        meeting.owner_account_id = Some("acct-a".to_string());
+        assert!(!meeting_visible_for_owner(&meeting, None));
+        assert!(meeting_visible_for_owner(&meeting, Some("acct-a")));
+        assert!(!meeting_visible_for_owner(&meeting, Some("acct-b")));
     }
 
     #[test]
