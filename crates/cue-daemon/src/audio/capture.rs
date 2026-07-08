@@ -265,6 +265,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn resolve_device_falls_back_to_default_when_name_not_found() {
         // With a bogus device name, resolve_input_device should fall back to default.
         let host = cpal::default_host();
@@ -277,6 +278,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn resolve_device_uses_default_when_name_is_none() {
         let host = cpal::default_host();
         let result = resolve_input_device(&host, None);
@@ -286,6 +288,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn resolve_device_uses_default_when_name_is_empty() {
         let host = cpal::default_host();
         let result = resolve_input_device(&host, Some(""));

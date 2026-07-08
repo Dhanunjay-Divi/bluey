@@ -21,12 +21,14 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - Corrected dashboard privacy-settings tests so Linux asserts the unsupported path while macOS and Windows continue to verify their launch commands.
 - Split daemon audio imports so Linux test builds can use `AudioBackend` without importing Mac/Windows-only `AudioDeviceRole`.
 - Gated the daemon keyring delete-missing test to desktop keyring platforms so headless Ubuntu CI does not fail on a missing keyring backend.
+- Marked CPAL real-device resolution tests as ignored by default, matching the existing module contract that real audio-device tests are developer-machine checks. Hosted Windows passed clippy/build but crashed below Rust with a CPAL `STATUS_ACCESS_VIOLATION` during device enumeration, so CI now keeps pure audio logic tests active and leaves physical-device probing to `cargo test --ignored` on real machines.
 
 ## Verification
 
 - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
 - `cargo test --manifest-path crates/cue-daemon/Cargo.toml signed_out_state_stops_active_audio_capture --quiet`
 - `cargo test --manifest-path crates/cue-daemon/Cargo.toml listen_auth_gate --quiet`
+- `cargo test --manifest-path crates/cue-daemon/Cargo.toml --lib audio::capture::tests --quiet`
 - `cargo check -p cue-daemon -p cue-cli`
 - `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
 - `cargo clippy -p cue-daemon --all-targets -- -D warnings`
