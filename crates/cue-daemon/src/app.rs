@@ -24,15 +24,17 @@ use cue_core::overlay_ipc::ListeningState;
 use cue_core::{
     analyze_segment, clock, generate_recap, load_account, load_settings, local_answer,
     new_trace_id, sanitize_observability_id, trace_id_from_env, AiCapabilities, AiProviderId,
-    AiProviderKind, AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend,
-    AudioCaptureConfig, AudioCaptureStatus, AudioChunkMetadata, AudioDeviceDescriptor,
-    AudioDeviceRole, AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind,
-    CloudEndpointConfig, CloudEnvironment, CloudSyncState, CloudSyncStatus, ContextArtifact,
-    ContextKind, ContextProcessingStatus, ConversationTurn, CueCard, CueCardArtifact,
-    CueCardAttachment, DaemonState, MeetingRecord, MeetingState, MemoryHit, OverlayCommand,
-    OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags, ProviderRoute,
-    ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
+    AiProviderKind, AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioCaptureConfig,
+    AudioCaptureStatus, AudioChunkMetadata, AudioDeviceDescriptor, AudioPipelineStatus,
+    AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig, CloudEnvironment,
+    CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind, ContextProcessingStatus,
+    ConversationTurn, CueCard, CueCardArtifact, CueCardAttachment, DaemonState, MeetingRecord,
+    MeetingState, MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent, OverlaySessionItem,
+    PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget, Speaker,
+    TranscriptSegment,
 };
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+use cue_core::{AudioBackend, AudioDeviceRole};
 use cue_llm::{
     bluey_managed::{BlueyManagedProvider, ManagedLane},
     LlmArtifactMetadata, LlmProvider as _, LlmRequest, LlmSourceMetadata,
@@ -1377,6 +1379,7 @@ struct RealAudioSource {
 
 #[derive(Debug, Clone)]
 enum FfmpegAudioInput {
+    #[allow(dead_code)]
     NativeHelper {
         helper_path: PathBuf,
         source_arg: String,
@@ -1481,7 +1484,7 @@ struct OverlayProcess {
 
 enum OverlayTransport {
     Stdio(ChildStdin),
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     Socket(std::os::unix::net::UnixStream),
 }
 
@@ -1549,7 +1552,7 @@ impl OverlayProcess {
                 stdin.write_all(b"\n")?;
                 stdin.flush()?;
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "macos")]
             OverlayTransport::Socket(stream) => {
                 stream.write_all(line.as_bytes())?;
                 stream.write_all(b"\n")?;
@@ -4738,6 +4741,7 @@ async fn run_relay_audio_source(
     stop_rx: &mut watch::Receiver<bool>,
     last_transcript_at: Arc<Mutex<Instant>>,
 ) -> Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let (helper_path, source_arg) = match &source.ffmpeg_input {
         FfmpegAudioInput::NativeHelper {
             helper_path,
@@ -4750,6 +4754,13 @@ async fn run_relay_audio_source(
             ));
         }
     };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let FfmpegAudioInput::NativeHelper {
+        helper_path,
+        source_arg,
+    } = &source.ffmpeg_input;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let (helper_path, source_arg) = (helper_path.clone(), source_arg.clone());
 
     let mut command = TokioCommand::new(&helper_path);
     command
@@ -6672,6 +6683,27 @@ async fn capture_transcribe_audio_chunk(
     Ok(transcript_result?)
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+async fn capture_audio_chunk_to_file(
+    runtime: &RealAudioRuntimeConfig,
+    source: &RealAudioSource,
+    chunk_path: &Path,
+) -> Result<()> {
+    let FfmpegAudioInput::NativeHelper {
+        helper_path,
+        source_arg,
+    } = &source.ffmpeg_input;
+    capture_native_audio_chunk_to_file(
+        helper_path,
+        source_arg,
+        runtime.chunk_duration_ms,
+        source.source,
+        chunk_path,
+    )
+    .await
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 async fn capture_audio_chunk_to_file(
     runtime: &RealAudioRuntimeConfig,
     source: &RealAudioSource,
@@ -6806,6 +6838,7 @@ fn wav_from_i16le_16k_mono(raw: &[u8]) -> Vec<u8> {
     wav
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn append_ffmpeg_input_args(command: &mut TokioCommand, input: &FfmpegAudioInput) {
     match input {
         FfmpegAudioInput::NativeHelper { .. } => {}
@@ -15143,6 +15176,7 @@ pub fn validate_and_decode_overlay_line(
 }
 
 fn discover_overlay_bin() -> Result<PathBuf> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let cwd = env::current_dir()?;
     #[cfg(target_os = "macos")]
     {
@@ -15659,6 +15693,7 @@ fn paste_text_into_foreground_app_platform(
     ))
 }
 
+#[cfg(target_os = "macos")]
 fn is_reasonable_bundle_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256

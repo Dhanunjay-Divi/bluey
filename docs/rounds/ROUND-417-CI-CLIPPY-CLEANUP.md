@@ -15,6 +15,7 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - Cleaned duplicate internal-disclosure guard trimming logic in the LLM answer helper.
 - Added the missing Ubuntu ALSA development package to CI, observability, and release Linux dependency setup so audio crates can build on hosted runners.
 - Moved the Bluey CLI billing tests below production items to satisfy the Rust 1.96 `items_after_test_module` lint in the full workspace clippy pass.
+- Tightened platform-specific daemon `cfg` boundaries so Linux/Windows/macOS clippy do not see impossible native-helper, overlay-socket, or paste-helper branches as unused or unreachable.
 
 ## Verification
 
