@@ -3426,6 +3426,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const overviewReloadButton = document.getElementById('overviewReloadButton');
         const balanceReloadPanel = document.getElementById('balanceReloadPanel');
         const isTemporaryAccount = Boolean(me.is_temporary);
+        const isBillingRestricted = isTemporaryAccount
+          || Boolean(me.is_admin)
+          || Boolean(me.billing_restricted)
+          || /temporary|internal|test/i.test(String(me.auto_topup_unavailable_reason || ''));
         const trialMinutes = trialMinutesRemaining(me);
         if (balanceTitle) balanceTitle.textContent = isTemporaryAccount ? 'Trial time' : 'Remaining balance';
         if (balanceValue) {
@@ -3435,10 +3439,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           balanceCard?.classList.toggle('balance-low', !isTemporaryAccount && me.balance_cents >= 500 && me.balance_cents < 1000);
         }
         if (overviewReloadButton) {
-          overviewReloadButton.hidden = isTemporaryAccount;
+          overviewReloadButton.hidden = isBillingRestricted;
         }
         if (balanceReloadPanel) {
-          balanceReloadPanel.hidden = isTemporaryAccount;
+          balanceReloadPanel.hidden = isBillingRestricted;
         }
         const summaryBalanceValue = document.getElementById('summaryBalanceValue');
         const summaryBalanceLabel = document.getElementById('summaryBalanceLabel');

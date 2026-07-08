@@ -7048,6 +7048,42 @@
       font-size: .72rem;
     }
 
+    /* Round 419: keep the account balance card from collapsing into Auto Reload. */
+    #accountApp .dashboard-overview-card.balance-kpi {
+      grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+      align-items: center;
+      gap: 1rem;
+    }
+
+    #accountApp .dashboard-overview-card.balance-kpi .dashboard-overview-main,
+    #accountApp .dashboard-overview-card.balance-kpi .dashboard-overview-side {
+      min-width: 0;
+    }
+
+    #accountApp .dashboard-overview-card.balance-kpi .dashboard-overview-title-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) max-content;
+      align-items: center;
+      gap: .45rem 1rem;
+    }
+
+    #accountApp .dashboard-overview-card.balance-kpi .dashboard-overview-title-row > div {
+      min-width: 0;
+    }
+
+    #accountApp .dashboard-overview-card.balance-kpi .dashboard-overview-title-row p {
+      overflow-wrap: anywhere;
+    }
+
+    #accountApp .dashboard-overview-card.balance-kpi #balanceValue {
+      justify-self: end;
+    }
+
+    #accountApp .dashboard-overview-card.balance-kpi .compact-auto-reload {
+      width: 100%;
+      min-width: 0;
+    }
+
     #accountApp .dashboard-tabs {
       gap: 0;
       margin: 1rem 0 1.5rem;
@@ -7764,6 +7800,14 @@
       #accountApp .reload-setup-footer,
       #accountApp .dashboard-overview-card {
         grid-template-columns: 1fr;
+      }
+
+      #accountApp .dashboard-overview-card.balance-kpi .dashboard-overview-title-row {
+        grid-template-columns: 1fr;
+      }
+
+      #accountApp .dashboard-overview-card.balance-kpi #balanceValue {
+        justify-self: start;
       }
 
       #accountApp .reload-setup-footer .account-button.primary {
