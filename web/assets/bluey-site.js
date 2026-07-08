@@ -64,6 +64,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let trialTurnstileToken = '';
     let pendingTrialButton = null;
     const DEVICE_LINK_TTL_MS = 10 * 60 * 1000;
+    const DEVICE_APPROVAL_WAIT_MS = 45 * 1000;
     const DEVICE_LINK_STORAGE_KEY = 'bluey_pending_device_code';
     const AUTO_RELOAD_SETUP_OPT_OUT_PREFIX = 'bluey_auto_reload_setup_opt_out:';
     const ACCESS_TOKEN_KEY = 'bluey_access_token';
@@ -329,13 +330,49 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return storedPendingDeviceRecord()?.code || '';
     }
 
-    function clearPendingDeviceCode(code = '') {
+    function deviceApprovalStorageKey(code) {
+      return `bluey_device_approved_${normalizeDeviceCode(code)}`;
+    }
+
+    function deviceConfirmStorageKey(code) {
+      return `bluey_device_confirmed_${normalizeDeviceCode(code)}`;
+    }
+
+    function markPendingDeviceApproved(code) {
       const normalized = normalizeDeviceCode(code);
+      if (!normalized) return;
+      try {
+        sessionStorage.setItem(deviceApprovalStorageKey(normalized), String(Date.now()));
+      } catch {
+        // Storage is optional; the server-side approval is the source of truth.
+      }
+    }
+
+    function pendingDeviceApprovedAt(code) {
+      const normalized = normalizeDeviceCode(code);
+      if (!normalized) return 0;
+      try {
+        const raw = sessionStorage.getItem(deviceApprovalStorageKey(normalized));
+        if (!raw || raw === '1') return 0;
+        const value = Number(raw);
+        return Number.isFinite(value) && value > 0 ? value : 0;
+      } catch {
+        return 0;
+      }
+    }
+
+    function isPendingDeviceApprovalFresh(code) {
+      const approvedAt = pendingDeviceApprovedAt(code);
+      return approvedAt > 0 && Date.now() - approvedAt <= DEVICE_APPROVAL_WAIT_MS;
+    }
+
+    function clearPendingDeviceCode(code = '') {
+      const normalized = normalizeDeviceCode(code) || storedPendingDeviceCode();
       try {
         sessionStorage.removeItem(DEVICE_LINK_STORAGE_KEY);
         if (normalized) {
-          sessionStorage.removeItem(`bluey_device_confirmed_${normalized}`);
-          sessionStorage.removeItem(`bluey_device_approved_${normalized}`);
+          sessionStorage.removeItem(deviceConfirmStorageKey(normalized));
+          sessionStorage.removeItem(deviceApprovalStorageKey(normalized));
         }
       } catch {
         // Storage cleanup is best-effort.
@@ -373,6 +410,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function clearAccountToken() {
+      clearPendingDeviceCode();
       localStorage.removeItem(ACCESS_TOKEN_KEY);
       localStorage.removeItem(REFRESH_TOKEN_KEY);
       localStorage.removeItem(AUTH_PERSISTENCE_KEY);
@@ -637,7 +675,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           method: 'POST',
           body: JSON.stringify({ user_code: code }),
         });
-        sessionStorage.setItem(`bluey_device_approved_${code}`, '1');
+        markPendingDeviceApproved(code);
         connectCodeStatus(statusTargetId, 'Connected. Return to Bluey desktop; it will finish automatically.', 'success');
       } catch (error) {
         if (!accountToken()) {
@@ -1334,7 +1372,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.hidden = false;
         el.replaceChildren();
         const title = document.createElement('strong');
-        const approved = sessionStorage.getItem(`bluey_device_approved_${code}`) === '1';
+        const approved = isPendingDeviceApprovalFresh(code);
         title.textContent = approved ? 'Bluey desktop is connected' : 'Finish desktop sign-in';
         const body = document.createElement('span');
         if (approved) {
@@ -1374,7 +1412,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
             const previousCount = lastLinkedComputerCount;
             button.disabled = true;
             button.textContent = 'Connecting...';
-            sessionStorage.setItem(`bluey_device_confirmed_${code}`, '1');
+            sessionStorage.setItem(deviceConfirmStorageKey(code), '1');
             approvePendingDevice()
               .then(async () => {
                 renderDeviceLinkHint();
@@ -1409,9 +1447,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     async function approvePendingDevice() {
       const code = pendingDeviceCode();
       if (!code || !accountToken()) return false;
-      const storageKey = `bluey_device_approved_${code}`;
-      if (sessionStorage.getItem(storageKey) === '1') return true;
-      if (sessionStorage.getItem(`bluey_device_confirmed_${code}`) !== '1') {
+      if (isPendingDeviceApprovalFresh(code)) return true;
+      if (pendingDeviceApprovedAt(code) > 0) {
+        clearPendingDeviceCode(code);
+        renderDeviceLinkHint();
+        return false;
+      }
+      if (sessionStorage.getItem(deviceConfirmStorageKey(code)) !== '1') {
         accountMessage('Press Connect desktop to finish Bluey login.');
         return false;
       }
@@ -1420,7 +1462,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         method: 'POST',
         body: JSON.stringify({ user_code: code }),
       });
-      sessionStorage.setItem(storageKey, '1');
+      markPendingDeviceApproved(code);
       accountMessage('Bluey desktop approved. Waiting for it to appear below...');
       return true;
     }
@@ -2873,8 +2915,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       lastLinkedComputerCount = computers.length;
       const pending = storedPendingDeviceRecord();
       if (computers.length > 0 && pending?.code) {
-        const approved = sessionStorage.getItem(`bluey_device_approved_${pending.code}`) === '1';
-        const confirmed = sessionStorage.getItem(`bluey_device_confirmed_${pending.code}`) === '1';
+        const approved = isPendingDeviceApprovalFresh(pending.code);
+        const confirmed = sessionStorage.getItem(deviceConfirmStorageKey(pending.code)) === '1';
         const staleUnconfirmed = !confirmed && Date.now() - pending.savedAt > 30 * 1000;
         if (approved || staleUnconfirmed) {
           clearPendingDeviceCode(pending.code);
@@ -3478,7 +3520,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         openAccountActionFromHash();
         try {
           const code = pendingDeviceCode();
-          const alreadyApproved = code && sessionStorage.getItem(`bluey_device_approved_${code}`) === '1';
+          const alreadyApproved = Boolean(code && isPendingDeviceApprovalFresh(code));
           const linkedDevicesResult = await linkedDevicesPromise;
           const previousCount = linkedComputersFromPayload(linkedDevicesResult).length;
           const approved = await approvePendingDevice();
