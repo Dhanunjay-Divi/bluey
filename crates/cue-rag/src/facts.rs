@@ -44,21 +44,28 @@ pub const SUPERSEDE_THRESHOLD: f32 = 0.86;
 /// What happened when a fact was offered to the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddOutcome {
-    Added,
+    Added {
+        id: i64,
+    },
     Duplicate,
-    /// The new fact replaced an older same-topic fact (old id returned; the old
-    /// row stays, with its validity window closed).
+    /// The new fact replaced an older same-topic fact (the old row stays,
+    /// with its validity window closed).
     Superseded {
         previous_id: i64,
+        id: i64,
     },
 }
 
-/// One retrieved fact.
+/// One retrieved fact. `score` is the RANKING score (hybrid-combined when the
+/// hybrid path ran, else cosine); `semantic` is always the raw cosine — the
+/// precision gate (relevance floor) applies to `semantic`, matching mem0's
+/// threshold-gates-semantic-before-fusion contract.
 #[derive(Debug, Clone)]
 pub struct FactHit {
     pub text: String,
     pub meeting_id: String,
     pub score: f32,
+    pub semantic: f32,
     pub created_at_ms: i64,
 }
 
@@ -122,9 +129,41 @@ impl FactsStore {
                 at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_facts_history_memory
-                ON facts_history(memory_id);",
+                ON facts_history(memory_id);
+            CREATE TABLE IF NOT EXISTS fact_entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                text TEXT NOT NULL,
+                normalized TEXT NOT NULL UNIQUE,
+                embedding BLOB NOT NULL,
+                linked_ids TEXT NOT NULL DEFAULT '[]'
+            );",
         )
         .context("failed to run facts migrations")?;
+        // v2 migration: hybrid retrieval needs the stemmed text per fact.
+        // ALTER is idempotent-guarded by probing the column; backfill is pure
+        // CPU (no embedder), so pre-hybrid stores upgrade transparently.
+        let has_stemmed = conn
+            .prepare("SELECT text_stemmed FROM facts LIMIT 1")
+            .is_ok();
+        if !has_stemmed {
+            conn.execute_batch("ALTER TABLE facts ADD COLUMN text_stemmed TEXT;")
+                .context("add text_stemmed column")?;
+        }
+        {
+            let pending: Vec<(i64, String)> = {
+                let mut stmt =
+                    conn.prepare("SELECT id, text FROM facts WHERE text_stemmed IS NULL")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            for (id, text) in pending {
+                conn.execute(
+                    "UPDATE facts SET text_stemmed = ?1 WHERE id = ?2",
+                    params![crate::hybrid::stem_for_bm25_joined(&text), id],
+                )?;
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             dim,
@@ -171,20 +210,20 @@ impl FactsStore {
             }
         }
 
-        let outcome = match best {
+        let superseded_id = match best {
             Some((_, score)) if score >= DUP_THRESHOLD => return Ok(AddOutcome::Duplicate),
             Some((id, score)) if score >= SUPERSEDE_THRESHOLD => {
                 conn.execute(
                     "UPDATE facts SET valid_to = ?1 WHERE id = ?2",
                     params![now, id],
                 )?;
-                AddOutcome::Superseded { previous_id: id }
+                Some(id)
             }
-            _ => AddOutcome::Added,
+            _ => None,
         };
         let new_id = insert_row(&conn, meeting_id, text, &hash, now, embedding)?;
-        match outcome {
-            AddOutcome::Superseded { previous_id } => {
+        match superseded_id {
+            Some(previous_id) => {
                 let old_text = fact_text(&conn, previous_id)?;
                 log_history(
                     &conn,
@@ -195,10 +234,17 @@ impl FactsStore {
                     false,
                     now,
                 )?;
+                relink_entity_ids(&conn, previous_id, Some(new_id))?;
+                Ok(AddOutcome::Superseded {
+                    previous_id,
+                    id: new_id,
+                })
             }
-            _ => log_history(&conn, new_id, None, Some(text), "ADD", false, now)?,
+            None => {
+                log_history(&conn, new_id, None, Some(text), "ADD", false, now)?;
+                Ok(AddOutcome::Added { id: new_id })
+            }
         }
-        Ok(outcome)
     }
 
     /// ADD op (agent-decided): insert as a new current fact. `None` when the
@@ -265,6 +311,11 @@ impl FactsStore {
             false,
             now,
         )?;
+        // Entity links follow the revision: the entity ("Checkout SLA")
+        // stays attached to the CURRENT fact. Without this, every supersede
+        // leaves a dead id in linked_ids and memory_count_weight decays with
+        // revision history instead of live linkage (review finding).
+        relink_entity_ids(&conn, old_id, Some(new_id))?;
         Ok(Some(new_id))
     }
 
@@ -283,6 +334,7 @@ impl FactsStore {
         }
         let old_text = fact_text(&conn, id)?;
         log_history(&conn, id, old_text.as_deref(), None, "DELETE", true, now)?;
+        relink_entity_ids(&conn, id, None)?;
         Ok(true)
     }
 
@@ -353,6 +405,236 @@ impl FactsStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Link one extracted entity to a fact (mem0's write-side entity store):
+    /// exact normalized-text match merges the link; else a semantic match
+    /// ≥ [`crate::hybrid::ENTITY_DEDUP_SIMILARITY`] merges; else a new entity
+    /// row is inserted.
+    pub fn upsert_entity(
+        &self,
+        entity_type: &str,
+        text: &str,
+        embedding: &[f32],
+        fact_id: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(embedding.len() == self.dim, "embedding dim mismatch");
+        let normalized = crate::hybrid::normalize_entity_text(text);
+        anyhow::ensure!(!normalized.is_empty(), "empty entity");
+        let conn = self.conn.lock().expect("facts store poisoned");
+
+        // Exact normalized match first (cheap, mem0's `_existing_entities_by_text`).
+        let exact: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, linked_ids FROM fact_entities WHERE normalized = ?1",
+                params![normalized],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let matched = match exact {
+            Some(hit) => Some(hit),
+            None => {
+                // Semantic dedup at mem0's 0.95 write-side threshold.
+                let mut stmt =
+                    conn.prepare("SELECT id, linked_ids, embedding FROM fact_entities")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?;
+                let mut best: Option<(i64, String, f32)> = None;
+                for row in rows {
+                    let (id, linked, blob) = row?;
+                    let existing = decode_embedding(&blob);
+                    if existing.len() != self.dim {
+                        continue;
+                    }
+                    let score = cosine(embedding, &existing);
+                    if score >= crate::hybrid::ENTITY_DEDUP_SIMILARITY
+                        && best.as_ref().map(|(_, _, s)| score > *s).unwrap_or(true)
+                    {
+                        best = Some((id, linked, score));
+                    }
+                }
+                best.map(|(id, linked, _)| (id, linked))
+            }
+        };
+
+        match matched {
+            Some((entity_id, linked_json)) => {
+                let mut linked: Vec<i64> = serde_json::from_str(&linked_json).unwrap_or_default();
+                if !linked.contains(&fact_id) {
+                    linked.push(fact_id);
+                    linked.sort_unstable();
+                    conn.execute(
+                        "UPDATE fact_entities SET linked_ids = ?1 WHERE id = ?2",
+                        params![serde_json::to_string(&linked)?, entity_id],
+                    )?;
+                }
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO fact_entities (entity_type, text, normalized, embedding, linked_ids)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        entity_type,
+                        text.trim(),
+                        normalized,
+                        encode_embedding(embedding),
+                        serde_json::to_string(&vec![fact_id])?
+                    ],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Entity matches for one query-entity embedding: `(similarity, stored
+    /// entity text, linked fact ids)` for every stored entity at or above
+    /// [`crate::hybrid::ENTITY_MATCH_FLOOR`] (mem0 main.py:1743-1746). The
+    /// caller applies the stricter short-entity acceptance rule (it knows
+    /// the query-side text).
+    pub fn entity_matches(&self, embedding: &[f32]) -> Result<Vec<(f32, String, Vec<i64>)>> {
+        anyhow::ensure!(embedding.len() == self.dim, "embedding dim mismatch");
+        let conn = self.conn.lock().expect("facts store poisoned");
+        let mut stmt = conn.prepare("SELECT embedding, text, linked_ids FROM fact_entities")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (blob, text, linked_json) = row?;
+            let existing = decode_embedding(&blob);
+            if existing.len() != self.dim {
+                continue;
+            }
+            let similarity = cosine(embedding, &existing);
+            if similarity < crate::hybrid::ENTITY_MATCH_FLOOR {
+                continue;
+            }
+            let linked: Vec<i64> = serde_json::from_str(&linked_json).unwrap_or_default();
+            if !linked.is_empty() {
+                out.push((similarity, text, linked));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Hybrid retrieval over CURRENT facts — the mem0 v3 `_search_vector_store`
+    /// pipeline on this store: over-fetched semantic candidates + BM25 over the
+    /// stemmed corpus (sigmoid-normalized) + entity boosts, fused by
+    /// [`crate::hybrid::score_and_rank`]. `threshold` gates the SEMANTIC score.
+    pub fn hybrid_query(
+        &self,
+        query_stemmed: &[String],
+        query_embedding: &[f32],
+        entity_boosts: &std::collections::HashMap<i64, f32>,
+        k: usize,
+        exclude_meeting: Option<&str>,
+        threshold: f32,
+    ) -> Result<Vec<FactHit>> {
+        anyhow::ensure!(query_embedding.len() == self.dim, "embedding dim mismatch");
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        struct Row {
+            id: i64,
+            meeting_id: String,
+            text: String,
+            stemmed: String,
+            created_at_ms: i64,
+            semantic: f32,
+        }
+        let rows: Vec<Row> = {
+            let conn = self.conn.lock().expect("facts store poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT id, meeting_id, text, COALESCE(text_stemmed, ''), created_at, embedding
+                 FROM facts WHERE valid_to IS NULL",
+            )?;
+            let mapped = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Vec<u8>>(5)?,
+                ))
+            })?;
+            let mut rows = Vec::new();
+            for row in mapped {
+                let (id, meeting_id, text, stemmed, created_at_ms, blob) = row?;
+                if exclude_meeting == Some(meeting_id.as_str()) {
+                    continue;
+                }
+                let embedding = decode_embedding(&blob);
+                if embedding.len() != self.dim {
+                    continue;
+                }
+                rows.push(Row {
+                    id,
+                    meeting_id,
+                    text,
+                    stemmed,
+                    created_at_ms,
+                    semantic: cosine(query_embedding, &embedding),
+                });
+            }
+            rows
+        };
+
+        // Semantic candidate pool, over-fetched (mem0: max(limit*4, 60)).
+        let mut semantic: Vec<crate::hybrid::SemanticCandidate> = rows
+            .iter()
+            .map(|r| crate::hybrid::SemanticCandidate {
+                id: r.id,
+                semantic: r.semantic,
+            })
+            .collect();
+        semantic.sort_by(|a, b| {
+            b.semantic
+                .partial_cmp(&a.semantic)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        semantic.truncate(crate::hybrid::internal_limit(k));
+
+        // BM25 over the same current corpus, sigmoid-normalized with
+        // query-length-adaptive params.
+        let raw = crate::hybrid::bm25_raw_scores(
+            query_stemmed,
+            rows.iter().map(|r| (r.id, r.stemmed.as_str())),
+        );
+        let (midpoint, steepness) = crate::hybrid::bm25_params(query_stemmed.len());
+        let bm25: std::collections::HashMap<i64, f32> = raw
+            .into_iter()
+            .map(|(id, score)| {
+                (
+                    id,
+                    crate::hybrid::normalize_bm25(score, midpoint, steepness),
+                )
+            })
+            .collect();
+
+        let ranked = crate::hybrid::score_and_rank(&semantic, &bm25, entity_boosts, threshold, k);
+        let by_id: std::collections::HashMap<i64, &Row> = rows.iter().map(|r| (r.id, r)).collect();
+        Ok(ranked
+            .into_iter()
+            .filter_map(|hit| {
+                by_id.get(&hit.id).map(|r| FactHit {
+                    text: r.text.clone(),
+                    meeting_id: r.meeting_id.clone(),
+                    score: hit.combined,
+                    semantic: hit.semantic,
+                    created_at_ms: r.created_at_ms,
+                })
+            })
+            .collect())
+    }
+
     /// Top-`k` CURRENT facts by cosine similarity, optionally excluding one
     /// meeting (the active meeting's ledger is already pinned in context —
     /// cross-meeting recall should surface OTHER meetings' facts).
@@ -388,8 +670,10 @@ impl FactsStore {
             if embedding.len() != self.dim {
                 continue;
             }
+            let score = cosine(query_embedding, &embedding);
             hits.push(FactHit {
-                score: cosine(query_embedding, &embedding),
+                score,
+                semantic: score,
                 text,
                 meeting_id,
                 created_at_ms,
@@ -445,11 +729,47 @@ fn insert_row(
     embedding: &[f32],
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO facts (meeting_id, text, hash, created_at, valid_to, embedding)
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
-        params![meeting_id, text, hash, now, encode_embedding(embedding)],
+        "INSERT INTO facts (meeting_id, text, hash, created_at, valid_to, embedding, text_stemmed)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+        params![
+            meeting_id,
+            text,
+            hash,
+            now,
+            encode_embedding(embedding),
+            crate::hybrid::stem_for_bm25_joined(text)
+        ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Rewrite `old_id` inside every entity's `linked_ids`: to `new_id` on
+/// supersede (the entity follows the current revision), removed on
+/// invalidate. Keeps `memory_count_weight` counting LIVE links only.
+fn relink_entity_ids(conn: &Connection, old_id: i64, new_id: Option<i64>) -> Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, linked_ids FROM fact_entities")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+    for (entity_id, linked_json) in rows {
+        let linked: Vec<i64> = serde_json::from_str(&linked_json).unwrap_or_default();
+        if !linked.contains(&old_id) {
+            continue;
+        }
+        let mut updated: Vec<i64> = linked.into_iter().filter(|id| *id != old_id).collect();
+        if let Some(new_id) = new_id {
+            if !updated.contains(&new_id) {
+                updated.push(new_id);
+            }
+        }
+        updated.sort_unstable();
+        conn.execute(
+            "UPDATE fact_entities SET linked_ids = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&updated)?, entity_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn log_history(
@@ -550,12 +870,12 @@ mod tests {
     #[test]
     fn exact_and_near_duplicates_are_noops() {
         let store = mem();
-        assert_eq!(
+        assert!(matches!(
             store
                 .add_fact("m1", "Use gRPC internally", &[1.0, 0.0, 0.0])
                 .unwrap(),
-            AddOutcome::Added
-        );
+            AddOutcome::Added { .. }
+        ));
         // Same text, different case/spacing → exact-hash duplicate.
         assert_eq!(
             store
@@ -638,6 +958,98 @@ mod tests {
         assert!(history[0].is_deleted);
         assert_eq!(history[1].old_memory.as_deref(), Some("sla is 200ms"));
         assert_eq!(history[1].new_memory.as_deref(), Some("sla moved to 300ms"));
+    }
+
+    #[test]
+    fn hybrid_query_fuses_bm25_with_semantic_and_gates_on_semantic() {
+        let store = mem();
+        // Two facts, semantically EQUAL versus the query embedding — only
+        // keyword overlap should separate them.
+        let a = store
+            .insert_fact("m1", "checkout latency SLA is 200ms", &[1.0, 0.0, 0.0])
+            .unwrap()
+            .unwrap();
+        store
+            .insert_fact("m1", "Dana owns the auth rollout", &[1.0, 0.0, 0.0])
+            .unwrap()
+            .unwrap();
+        // And one below the semantic gate despite perfect keywords.
+        store
+            .insert_fact("m2", "checkout latency SLA discussion", &[0.0, 1.0, 0.0])
+            .unwrap()
+            .unwrap();
+
+        let q = crate::hybrid::stem_for_bm25("checkout latency SLA");
+        let hits = store
+            .hybrid_query(&q, &[1.0, 0.0, 0.0], &Default::default(), 3, None, 0.45)
+            .unwrap();
+        // The gated row (semantic 0.0) is out even with exact keywords.
+        assert_eq!(hits.len(), 2);
+        // Keyword overlap ranks the SLA fact first; both share semantic=1.0.
+        assert!(hits[0].text.contains("200ms"), "{hits:?}");
+        assert!(hits[0].score > hits[1].score);
+        assert!((hits[0].semantic - 1.0).abs() < 1e-6);
+
+        // Entity boosts lift a linked fact.
+        let boosts = std::collections::HashMap::from([(a, 0.5f32)]);
+        let hits = store
+            .hybrid_query(&[], &[1.0, 0.0, 0.0], &boosts, 3, None, 0.45)
+            .unwrap();
+        assert!(hits[0].text.contains("200ms"));
+    }
+
+    #[test]
+    fn entity_upsert_merges_links_and_matches_by_similarity() {
+        let store = mem();
+        store
+            .upsert_entity("PROPER", "Raj Patel", &[1.0, 0.0, 0.0], 7)
+            .unwrap();
+        // Exact normalized text (case/space-insensitive) merges the link.
+        store
+            .upsert_entity("PROPER", "  raj  PATEL ", &[0.9, 0.1, 0.0], 9)
+            .unwrap();
+        // Near-identical embedding (≥0.95) merges even with different text.
+        store
+            .upsert_entity("PROPER", "R. Patel", &[0.999, 0.01, 0.0], 11)
+            .unwrap();
+        // Unrelated entity stays separate.
+        store
+            .upsert_entity("QUOTED", "payments runbook", &[0.0, 1.0, 0.0], 7)
+            .unwrap();
+
+        let matches = store.entity_matches(&[1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            matches.len(),
+            1,
+            "below-floor entities excluded: {matches:?}"
+        );
+        assert_eq!(matches[0].1, "Raj Patel");
+        assert_eq!(matches[0].2, vec![7, 9, 11]);
+    }
+
+    #[test]
+    fn entity_links_follow_supersede_and_drop_on_invalidate() {
+        let store = mem();
+        let id = store
+            .insert_fact("m1", "checkout SLA is 200ms", &[1.0, 0.0, 0.0])
+            .unwrap()
+            .unwrap();
+        store
+            .upsert_entity("PROPER", "Checkout SLA", &[0.0, 1.0, 0.0], id)
+            .unwrap();
+
+        // Supersede: the entity link moves to the NEW revision — no dead id.
+        let new_id = store
+            .supersede_fact(id, "m2", "checkout SLA moved to 300ms", &[0.9, 0.1, 0.0])
+            .unwrap()
+            .unwrap();
+        let matches = store.entity_matches(&[0.0, 1.0, 0.0]).unwrap();
+        assert_eq!(matches[0].2, vec![new_id], "link follows the revision");
+
+        // Invalidate: the link is removed entirely.
+        assert!(store.invalidate_fact(new_id).unwrap());
+        let matches = store.entity_matches(&[0.0, 1.0, 0.0]).unwrap();
+        assert!(matches.is_empty(), "no live links left: {matches:?}");
     }
 
     #[test]

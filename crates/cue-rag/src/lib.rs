@@ -8,6 +8,8 @@ pub mod chunker;
 pub mod embedder;
 // Cross-meeting facts memory (long-term tier): extracted facts + supersede.
 pub mod facts;
+// Hybrid retrieval scoring (mem0 v3 search port: BM25 + entity boost fusion).
+pub mod hybrid;
 #[cfg(feature = "local-embed")]
 pub mod local_embed;
 pub mod store;

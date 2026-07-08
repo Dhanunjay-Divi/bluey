@@ -162,7 +162,10 @@ impl FactsMemory {
                     };
                     let embedding = self.embedding_for(plan, text).await?;
                     match self.store.insert_fact(meeting_id, text, &embedding)? {
-                        Some(_) => report.added += 1,
+                        Some(id) => {
+                            report.added += 1;
+                            self.link_entities(id, text).await;
+                        }
                         None => report.none += 1, // exact dup — already known
                     }
                 }
@@ -181,7 +184,10 @@ impl FactsMemory {
                         .store
                         .supersede_fact(old_id, meeting_id, text, &embedding)?
                     {
-                        Some(_) => report.updated += 1,
+                        Some(id) => {
+                            report.updated += 1;
+                            self.link_entities(id, text).await;
+                        }
                         None => report.skipped += 1, // no longer current
                     }
                 }
@@ -221,12 +227,91 @@ impl FactsMemory {
                 .store
                 .add_fact(meeting_id, &candidate.text, &candidate.embedding)?
             {
-                cue_rag::AddOutcome::Added => report.added += 1,
-                cue_rag::AddOutcome::Superseded { .. } => report.updated += 1,
+                cue_rag::AddOutcome::Added { id } => {
+                    report.added += 1;
+                    self.link_entities(id, &candidate.text).await;
+                }
+                cue_rag::AddOutcome::Superseded { id, .. } => {
+                    report.updated += 1;
+                    self.link_entities(id, &candidate.text).await;
+                }
                 cue_rag::AddOutcome::Duplicate => report.none += 1,
             }
         }
         Ok(report)
+    }
+
+    /// Pure-cosine baseline search (the pre-hybrid behavior). Kept as an
+    /// eval/debug surface so retrieval changes stay MEASURED against the
+    /// baseline (see `facts_memory_real::hybrid_beats_cosine_baseline`).
+    pub async fn search_semantic_only(
+        &self,
+        question: &str,
+        k: usize,
+        exclude_meeting: Option<&str>,
+    ) -> Result<Vec<FactHit>> {
+        let embedding = self
+            .embedder
+            .embed_query(question)
+            .await
+            .map_err(|e| anyhow::anyhow!("embed query: {e}"))?;
+        self.store.query(&embedding, k, exclude_meeting)
+    }
+
+    /// Extract + embed + upsert this fact's entities into the linked entity
+    /// store (mem0's write-side entity linking, main.py phase 7). Best-effort:
+    /// entity failures must never fail the fact write itself.
+    async fn link_entities(&self, fact_id: i64, text: &str) {
+        // Our facts carry a leading "[Decision]/[Constraint]/[Owner]" kind
+        // label — strip it so the label never fuses into an entity span
+        // ("Owner Raj") or becomes an entity itself.
+        let (label, text) = match text.trim().strip_prefix('[') {
+            Some(rest) => match rest.split_once(']') {
+                Some((label, t)) => (Some(label.trim()), t.trim()),
+                None => (None, text),
+            },
+            None => (None, text),
+        };
+        let mut entities = cue_rag::hybrid::extract_entities(text);
+        // Owner facts carry the name FIRST ("Raj owns …" / "Raj — billing"),
+        // where the POS-free extractor cannot tell a sentence-initial name
+        // from a capitalized sentence opener (found by adversarial review:
+        // owner entities silently never linked). The ledger's own structure
+        // is the reliable signal — the owner name is the text before the
+        // verb/dash — so upsert it deterministically.
+        if label == Some("Owner") {
+            let name: String = text
+                .split([',', '—', '-'])
+                .next()
+                .unwrap_or(text)
+                .split_whitespace()
+                .take_while(|w| w.chars().next().is_some_and(char::is_uppercase))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if name.len() > 2
+                && !entities.iter().any(|(_, t)| {
+                    cue_rag::hybrid::normalize_entity_text(t)
+                        .contains(&cue_rag::hybrid::normalize_entity_text(&name))
+                })
+            {
+                entities.push((cue_rag::hybrid::EntityType::Proper, name));
+            }
+        }
+        for (entity_type, entity_text) in entities {
+            match self.embedder.embed(&entity_text).await {
+                Ok(embedding) => {
+                    if let Err(error) = self.store.upsert_entity(
+                        entity_type.label(),
+                        &entity_text,
+                        &embedding,
+                        fact_id,
+                    ) {
+                        debug!("entity upsert failed for {entity_text:?}: {error:#}");
+                    }
+                }
+                Err(error) => debug!("entity embed failed for {entity_text:?}: {error}"),
+            }
+        }
     }
 
     /// Embedding for an op's final text: reuse the candidate's embedding when
@@ -245,8 +330,11 @@ impl FactsMemory {
             .map_err(|e| anyhow::anyhow!("embed revised fact: {e}"))
     }
 
-    /// Cross-meeting semantic recall for a question, excluding the active
-    /// meeting (its ledger is already pinned in context).
+    /// Cross-meeting recall for a question, excluding the active meeting (its
+    /// ledger is already pinned in context). Runs the full mem0 v3 hybrid
+    /// pipeline: semantic + BM25 (sigmoid-normalized) + entity boosts, fused
+    /// by [`cue_rag::hybrid::score_and_rank`] — the relevance floor gates the
+    /// SEMANTIC score (mem0's threshold contract), fusion decides RANKING.
     pub async fn search(
         &self,
         question: &str,
@@ -258,9 +346,61 @@ impl FactsMemory {
             .embed_query(question)
             .await
             .map_err(|e| anyhow::anyhow!("embed query: {e}"))?;
-        self.store.query(&embedding, k, exclude_meeting)
+        let query_stemmed = cue_rag::hybrid::stem_for_bm25(question);
+
+        // Query-entity boosts (mem0 _compute_entity_boosts: cap 8, dedupe,
+        // match ≥0.5, boost = sim * 0.5 * count-weight, max per fact).
+        let mut boosts: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        for (_, entity_text) in cue_rag::hybrid::extract_entities(question)
+            .into_iter()
+            .take(cue_rag::hybrid::MAX_QUERY_ENTITIES)
+        {
+            let key = cue_rag::hybrid::normalize_entity_text(&entity_text);
+            if key.is_empty() || !seen.insert(key) {
+                continue;
+            }
+            // Passage mode on BOTH sides: entity↔entity matching is symmetric
+            // (the bge query prefix is tuned for question→passage, and mixing
+            // modes systematically lowers similarities — review finding).
+            let entity_embedding = match self.embedder.embed(&entity_text).await {
+                Ok(e) => e,
+                Err(error) => {
+                    debug!("entity query embed failed for {entity_text:?}: {error}");
+                    continue;
+                }
+            };
+            for (similarity, stored_text, linked) in self.store.entity_matches(&entity_embedding)? {
+                // Short/acronym entities need the stricter acceptance rule —
+                // bge-small clusters acronyms ("SLA"≈"SSO") past mem0's floor.
+                if !cue_rag::hybrid::entity_match_accepted(&entity_text, &stored_text, similarity) {
+                    continue;
+                }
+                let boost = cue_rag::hybrid::entity_boost(similarity, linked.len());
+                for fact_id in linked {
+                    boosts
+                        .entry(fact_id)
+                        .and_modify(|b| *b = b.max(boost))
+                        .or_insert(boost);
+                }
+            }
+        }
+
+        self.store.hybrid_query(
+            &query_stemmed,
+            &embedding,
+            &boosts,
+            k,
+            exclude_meeting,
+            RELEVANCE_FLOOR,
+        )
     }
 }
+
+/// Relevance floor for cross-meeting recall: gates the SEMANTIC score before
+/// fusion (mem0's threshold contract; 0.45 verified against real bge-small
+/// scores on extracted facts).
+pub const RELEVANCE_FLOOR: f32 = 0.45;
 
 /// Paper s: similar existing memories retrieved per candidate fact.
 const SIMILAR_PER_FACT: usize = 10;
@@ -472,12 +612,14 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Render cross-meeting hits as one bounded context block, oldest-last so the
-/// most relevant (highest score) leads. Empty string when no hit clears the
-/// relevance floor — semantic noise must not pollute the answer context.
-pub fn render_hits(hits: &[FactHit], min_score: f32, max_chars: usize) -> String {
+/// Render cross-meeting hits as one bounded context block, best-ranked first.
+/// The floor applies to the SEMANTIC score (hybrid-combined `score` values
+/// are normalized by the active-signal divisor and not comparable to a cosine
+/// floor); ordering follows the hits' hybrid ranking. Empty string when no
+/// hit clears the floor — noise must not pollute the answer context.
+pub fn render_hits(hits: &[FactHit], min_semantic: f32, max_chars: usize) -> String {
     let mut block = String::new();
-    for hit in hits.iter().filter(|h| h.score >= min_score) {
+    for hit in hits.iter().filter(|h| h.semantic >= min_semantic) {
         let line = format!("- {}\n", hit.text.trim());
         if block.len() + line.len() > max_chars {
             break;
@@ -545,6 +687,7 @@ Sure — here are the decisions:
             text: text.to_string(),
             meeting_id: "m".to_string(),
             score,
+            semantic: score,
             created_at_ms: 0,
         }
     }

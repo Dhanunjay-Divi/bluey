@@ -12,7 +12,19 @@
 
 use cue_daemon::memory::FactsMemory;
 
-async fn memory_in(tag: &str) -> (FactsMemory, std::path::PathBuf) {
+/// `BLUEY_DATA_DIR` is process-global env; parallel test threads racing
+/// `set_var` → `AppPaths::discover` could cross-contaminate stores. Each test
+/// holds this for its whole body (hence returned to the caller).
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+async fn memory_in(
+    tag: &str,
+) -> (
+    FactsMemory,
+    std::path::PathBuf,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Isolated data dir so the test never touches the user's real store.
     let tmp = std::env::temp_dir().join(format!("bluey-facts-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("tmp dir");
@@ -23,7 +35,7 @@ async fn memory_in(tag: &str) -> (FactsMemory, std::path::PathBuf) {
     let memory = FactsMemory::ensure(&paths)
         .await
         .expect("facts memory must come up with the real model");
-    (memory, tmp)
+    (memory, tmp, guard)
 }
 
 /// Consolidate via the heuristic path (what the daemon does with no agent):
@@ -40,7 +52,7 @@ async fn seed(memory: &FactsMemory, meeting_id: &str, texts: &[&str]) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "downloads the real embedding model (network, ~35MB first run)"]
 async fn real_model_indexes_and_recalls_meeting_facts() {
-    let (memory, tmp) = memory_in("recall").await;
+    let (memory, tmp, _env) = memory_in("recall").await;
 
     // Consolidate REAL extracted-fact shaped items from two meetings.
     seed(
@@ -84,10 +96,142 @@ async fn real_model_indexes_and_recalls_meeting_facts() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// MEASURED retrieval eval: the hybrid pipeline (BM25 + entity boosts, the
+/// mem0 v3 search port) against the pure-cosine baseline on a meeting-shaped
+/// fact set — real embedder, labeled queries, hit@1 reported side by side.
+/// The asserted gate is NO REGRESSION (hybrid >= cosine on hit@1); the
+/// per-query table printed by the test is the evidence for where each
+/// signal wins or ties.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the real embedding model (network, ~35MB first run)"]
+async fn hybrid_beats_cosine_baseline() {
+    let (memory, tmp, _env) = memory_in("eval").await;
+
+    let facts: &[(&str, &str)] = &[
+        (
+            "m1",
+            "[Decision] Shard the database by tenant id, not by region",
+        ),
+        (
+            "m1",
+            "[Constraint] Checkout endpoint p99 latency must stay under 200ms",
+        ),
+        ("m1", "[Owner] Raj owns the payments service migration"),
+        ("m1", "[Decision] Freeze production deployments on Fridays"),
+        (
+            "m2",
+            "[Owner] Dana owns the authentication rollout including SSO",
+        ),
+        ("m2", "[Decision] Ticket CUE-142 moves to the next sprint"),
+        (
+            "m2",
+            "[Constraint] The enterprise contract requires SOC2 compliance by Q4",
+        ),
+        (
+            "m2",
+            "[Decision] Use gRPC for internal service calls, REST for the public API",
+        ),
+        ("m2", "[Owner] Priya owns the billing rewrite kickoff"),
+        (
+            "m3",
+            "[Decision] Adopt feature flags for the checkout redesign",
+        ),
+        (
+            "m3",
+            "[Constraint] The mobile app must keep supporting iOS 16",
+        ),
+        (
+            "m3",
+            "[Owner] Marco owns the incident postmortem for the June outage",
+        ),
+        (
+            "m3",
+            "[Decision] Move the analytics pipeline from Spark to DuckDB",
+        ),
+        (
+            "m3",
+            "[Constraint] Vendor spend must stay under 40k per quarter",
+        ),
+        ("m3", "[Decision] The retro moves to Friday mornings"),
+    ];
+    for (meeting, text) in facts {
+        seed(&memory, meeting, &[text]).await;
+    }
+
+    // (query, substring the TOP hit must contain)
+    let queries: &[(&str, &str)] = &[
+        // Paraphrase (semantic strength — hybrid must not regress these).
+        ("how did we decide to split up the db", "tenant id"),
+        ("who is responsible for auth", "Dana"),
+        (
+            "what did we agree about deploying at the end of the week",
+            "Freeze",
+        ),
+        // Keyword / identifier (BM25 strength).
+        ("what happened to CUE-142", "CUE-142"),
+        ("checkout latency SLA number", "200ms"),
+        ("SOC2 deadline", "SOC2"),
+        // Entity (boost strength).
+        ("what is Raj working on", "Raj"),
+        ("what does Marco own", "Marco"),
+        ("Priya's project", "Priya"),
+        // Mixed.
+        ("Spark replacement decision", "DuckDB"),
+        ("iOS support constraint", "iOS 16"),
+        ("gRPC vs REST decision", "gRPC"),
+    ];
+
+    let (mut cosine_hits, mut hybrid_hits) = (0usize, 0usize);
+    println!("\n{:<48} {:>8} {:>8}", "query", "cosine", "hybrid");
+    for (query, expected) in queries {
+        let baseline = memory
+            .search_semantic_only(query, 3, None)
+            .await
+            .expect("baseline");
+        let hybrid = memory.search(query, 3, None).await.expect("hybrid");
+        let c = baseline
+            .first()
+            .map(|h| h.text.contains(expected))
+            .unwrap_or(false);
+        let h = hybrid
+            .first()
+            .map(|h| h.text.contains(expected))
+            .unwrap_or(false);
+        cosine_hits += c as usize;
+        hybrid_hits += h as usize;
+        println!(
+            "{query:<48} {:>8} {:>8}",
+            if c { "hit" } else { "MISS" },
+            if h { "hit" } else { "MISS" }
+        );
+        if !h {
+            for hit in &hybrid {
+                println!(
+                    "    hybrid: combined={:.3} semantic={:.3}  {}",
+                    hit.score, hit.semantic, hit.text
+                );
+            }
+            let ents = cue_rag::hybrid::extract_entities(query);
+            println!("    query entities: {ents:?}");
+        }
+    }
+    println!(
+        "hit@1: cosine {cosine_hits}/{} vs hybrid {hybrid_hits}/{}",
+        queries.len(),
+        queries.len()
+    );
+    assert!(
+        hybrid_hits >= cosine_hits,
+        "hybrid must never regress the baseline: {hybrid_hits} < {cosine_hits}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the real embedding model AND the claude CLI (drives a real one-shot)"]
 async fn real_agent_update_phase_supersedes_reversed_decision() {
-    let (memory, tmp) = memory_in("update").await;
+    let (memory, tmp, _env) = memory_in("update").await;
 
     // Meeting A established two facts.
     seed(

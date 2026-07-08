@@ -24,6 +24,11 @@ tracing.workspace = true
 # unifies on ONE native ONNX runtime.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std"], optional = true }
 tokenizers = { version = "0.23", optional = true }
+# Hybrid retrieval (the mem0 v3 search port): Snowball stemming stands in for
+# spaCy lemmatization (same role, consistent across index+query), regex powers
+# the POS-free entity extractor.
+regex = "1"
+rust-stemmers = "1.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

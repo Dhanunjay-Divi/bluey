@@ -10221,7 +10221,8 @@ async fn retrieved_memory_contexts(
         if let Some(memory) = memory {
             match memory.search(question, 4, Some(&current_session_id)).await {
                 Ok(hits) => {
-                    let block = crate::memory::render_hits(&hits, 0.45, 1_200);
+                    let block =
+                        crate::memory::render_hits(&hits, crate::memory::RELEVANCE_FLOOR, 1_200);
                     if !block.is_empty() {
                         contexts.push(
                             AnswerContext::new(AnswerContextKind::MeetingMemory, block)
