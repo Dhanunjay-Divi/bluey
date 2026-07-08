@@ -69,6 +69,10 @@ mod tests {
         assert_eq!(load_test(provider).unwrap(), None);
     }
 
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "windows")),
+        ignore = "requires a desktop keyring backend"
+    )]
     #[test]
     fn delete_nonexistent_is_ok() {
         assert!(delete_test("nonexistent_provider_xyz").is_ok());

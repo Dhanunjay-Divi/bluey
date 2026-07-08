@@ -20,6 +20,7 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - Gated the CLI macOS permission-probe timer import and made the screen-capture preview argument platform-neutral so Ubuntu clippy does not see Mac/Windows-only code as unused.
 - Corrected dashboard privacy-settings tests so Linux asserts the unsupported path while macOS and Windows continue to verify their launch commands.
 - Split daemon audio imports so Linux test builds can use `AudioBackend` without importing Mac/Windows-only `AudioDeviceRole`.
+- Gated the daemon keyring delete-missing test to desktop keyring platforms so headless Ubuntu CI does not fail on a missing keyring backend.
 
 ## Verification
 
