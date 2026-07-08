@@ -19,6 +19,7 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - Marked the ffmpeg runtime path as intentionally unused on Linux because chunked desktop audio capture only reads it on macOS and Windows.
 - Gated the CLI macOS permission-probe timer import and made the screen-capture preview argument platform-neutral so Ubuntu clippy does not see Mac/Windows-only code as unused.
 - Corrected dashboard privacy-settings tests so Linux asserts the unsupported path while macOS and Windows continue to verify their launch commands.
+- Split daemon audio imports so Linux test builds can use `AudioBackend` without importing Mac/Windows-only `AudioDeviceRole`.
 
 ## Verification
 

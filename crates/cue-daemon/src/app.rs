@@ -21,6 +21,10 @@ use cue_core::app_paths::AppPaths;
 use cue_core::audio::{AudioPlatformCapability, AudioRuntimeMode};
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::overlay_ipc::ListeningState;
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+use cue_core::AudioBackend;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use cue_core::AudioDeviceRole;
 use cue_core::{
     analyze_segment, clock, generate_recap, load_account, load_settings, local_answer,
     new_trace_id, sanitize_observability_id, trace_id_from_env, AiCapabilities, AiProviderId,
@@ -33,8 +37,6 @@ use cue_core::{
     PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget, Speaker,
     TranscriptSegment,
 };
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-use cue_core::{AudioBackend, AudioDeviceRole};
 use cue_llm::{
     bluey_managed::{BlueyManagedProvider, ManagedLane},
     LlmArtifactMetadata, LlmProvider as _, LlmRequest, LlmSourceMetadata,
