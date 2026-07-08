@@ -72,6 +72,6 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          native\windows\cue-overlay\build.ps1
-          native\windows\cue-audio\build.ps1
-          native\windows\cue-whisper\build.ps1
+          Push-Location native/windows/cue-overlay; ./build.ps1; Pop-Location
+          Push-Location native/windows/cue-audio; ./build.ps1; Pop-Location
+          Push-Location native/windows/cue-whisper; ./build.ps1; Pop-Location

@@ -22,6 +22,7 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - Split daemon audio imports so Linux test builds can use `AudioBackend` without importing Mac/Windows-only `AudioDeviceRole`.
 - Gated the daemon keyring delete-missing test to desktop keyring platforms so headless Ubuntu CI does not fail on a missing keyring backend.
 - Marked CPAL real-device resolution tests as ignored by default, matching the existing module contract that real audio-device tests are developer-machine checks. Hosted Windows passed clippy/build but crashed below Rust with a CPAL `STATUS_ACCESS_VIOLATION` during device enumeration, so CI now keeps pure audio logic tests active and leaves physical-device probing to `cargo test --ignored` on real machines.
+- Aligned CI's Windows native-helper build step with the release workflow by wrapping each helper script in `Push-Location`/`Pop-Location`. The overlay helper intentionally changes to its script directory, so invoking the next helper through a repo-root relative path was fragile in PowerShell.
 
 ## Verification
 
@@ -33,6 +34,7 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
 - `cargo clippy -p cue-daemon --all-targets -- -D warnings`
 - `cargo clippy --all-targets -- -D warnings`
+- Hosted CI showed macOS and Ubuntu passing, Windows Rust formatting/clippy/build/test passing, and only the native-helper packaging step failing before the PowerShell path fix above.
 
 ## Notes
 
