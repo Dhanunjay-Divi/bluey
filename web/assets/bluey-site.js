@@ -251,6 +251,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
+    function clearDeviceCodeUrlParams() {
+      const params = new URLSearchParams(location.search);
+      if (!params.has('user_code') && !params.has('device_code')) return;
+      try {
+        params.delete('user_code');
+        params.delete('device_code');
+        const query = params.toString();
+        const nextUrl = `${location.pathname}${query ? `?${query}` : ''}${location.hash || ''}`;
+        history.replaceState(history.state, '', nextUrl);
+      } catch {
+        // If history is unavailable, the stored handoff expiry still prevents stale prompts.
+      }
+    }
+
     function autoReloadSetupOptOutKey(me = latestAccountForBilling) {
       const email = String(me?.email || currentAccountEmail || '').trim().toLowerCase();
       return email ? `${AUTO_RELOAD_SETUP_OPT_OUT_PREFIX}${email}` : '';
@@ -274,31 +288,59 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function rememberPendingDeviceCode(code) {
       if (!code) return;
       try {
+        let savedAt = Date.now();
+        const raw = sessionStorage.getItem(DEVICE_LINK_STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          const existingCode = normalizeDeviceCode(parsed?.code);
+          const existingSavedAt = Number(parsed?.saved_at || 0);
+          if (existingCode === code && existingSavedAt) {
+            savedAt = existingSavedAt;
+          }
+        }
         sessionStorage.setItem(DEVICE_LINK_STORAGE_KEY, JSON.stringify({
           code,
-          saved_at: Date.now(),
+          saved_at: savedAt,
         }));
       } catch {
         // Browser storage can be disabled; the query-param path still works.
       }
     }
 
-    function storedPendingDeviceCode() {
+    function storedPendingDeviceRecord() {
       try {
         const raw = sessionStorage.getItem(DEVICE_LINK_STORAGE_KEY);
-        if (!raw) return '';
+        if (!raw) return null;
         const parsed = JSON.parse(raw);
         const code = normalizeDeviceCode(parsed?.code);
         const savedAt = Number(parsed?.saved_at || 0);
         if (!code || !savedAt || Date.now() - savedAt > DEVICE_LINK_TTL_MS) {
           sessionStorage.removeItem(DEVICE_LINK_STORAGE_KEY);
-          return '';
+          return null;
         }
-        return code;
+        return { code, savedAt };
       } catch {
         sessionStorage.removeItem(DEVICE_LINK_STORAGE_KEY);
-        return '';
+        return null;
       }
+    }
+
+    function storedPendingDeviceCode() {
+      return storedPendingDeviceRecord()?.code || '';
+    }
+
+    function clearPendingDeviceCode(code = '') {
+      const normalized = normalizeDeviceCode(code);
+      try {
+        sessionStorage.removeItem(DEVICE_LINK_STORAGE_KEY);
+        if (normalized) {
+          sessionStorage.removeItem(`bluey_device_confirmed_${normalized}`);
+          sessionStorage.removeItem(`bluey_device_approved_${normalized}`);
+        }
+      } catch {
+        // Storage cleanup is best-effort.
+      }
+      clearDeviceCodeUrlParams();
     }
 
     function pendingDeviceCode() {
@@ -306,6 +348,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const code = normalizeDeviceCode(params.get('user_code') || params.get('device_code') || '');
       if (code) {
         rememberPendingDeviceCode(code);
+        clearDeviceCodeUrlParams();
         return code;
       }
       return storedPendingDeviceCode();
@@ -1281,7 +1324,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       };
 
       if (!code) {
-        if (accountToken() && dashboardHint) renderCodeEntry(dashboardHint);
+        if (accountToken() && dashboardHint && lastLinkedComputerCount === 0) {
+          renderCodeEntry(dashboardHint);
+        }
         return;
       }
 
@@ -2826,6 +2871,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       list.replaceChildren();
       const computers = linkedComputersFromPayload(payload);
       lastLinkedComputerCount = computers.length;
+      const pending = storedPendingDeviceRecord();
+      if (computers.length > 0 && pending?.code) {
+        const approved = sessionStorage.getItem(`bluey_device_approved_${pending.code}`) === '1';
+        const confirmed = sessionStorage.getItem(`bluey_device_confirmed_${pending.code}`) === '1';
+        const staleUnconfirmed = !confirmed && Date.now() - pending.savedAt > 30 * 1000;
+        if (approved || staleUnconfirmed) {
+          clearPendingDeviceCode(pending.code);
+          setTimeout(renderDeviceLinkHint, 0);
+        }
+      } else {
+        setTimeout(renderDeviceLinkHint, 0);
+      }
       const countLabel = document.getElementById('linkedDeviceCount');
       const removeAllButton = document.getElementById('removeAllDevicesButton');
       if (countLabel) {
@@ -2894,14 +2951,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const previousCount = Number.isFinite(options.previousCount)
         ? options.previousCount
         : lastLinkedComputerCount;
+      const handoffCode = pendingDeviceCode();
       renderLinkedDevicesConnecting('Connecting Bluey desktop...');
       let latest = null;
       for (let attempt = 0; attempt < 8; attempt += 1) {
         if (attempt > 0) await wait(700);
         latest = await apiJson('/account/devices');
         const computers = linkedComputersFromPayload(latest);
-        if (computers.length > previousCount || (previousCount === 0 && computers.length > 0)) {
+        const hasConnectedDesktop = computers.length > previousCount
+          || (previousCount === 0 && computers.length > 0)
+          || (Boolean(handoffCode) && computers.length > 0);
+        if (hasConnectedDesktop) {
           renderLinkedDevices(latest);
+          clearPendingDeviceCode(handoffCode);
+          renderDeviceLinkHint();
           accountMessage('Bluey desktop connected.', false, 'success');
           return latest;
         }
