@@ -7109,19 +7109,9 @@
       grid-template-columns: minmax(0, 1fr) auto;
     }
 
-    /* Round 423: make session history honest when only session records have uploaded. */
+    /* Round 423: keep session history focused on readable saved conversations. */
     #accountApp a.account-button {
       text-decoration: none;
-    }
-
-    #accountApp .session-sync-banner {
-      padding: .66rem .78rem;
-      border: 1px solid rgba(255, 189, 99, .22);
-      border-radius: 10px;
-      background: rgba(255, 189, 99, .055);
-      color: #b9ab8f;
-      font-size: .78rem;
-      line-height: 1.4;
     }
 
     #accountApp .session-row {
@@ -7150,23 +7140,6 @@
     #accountApp .session-actions .account-button {
       min-width: 5.25rem;
       white-space: nowrap;
-    }
-
-    #accountApp .session-open-disabled,
-    #accountApp .session-open-disabled:disabled {
-      cursor: default;
-      opacity: .48;
-      border-color: rgba(255, 255, 255, .13);
-      color: #858585;
-      background: rgba(255, 255, 255, .025);
-      box-shadow: none;
-    }
-
-    #accountApp .session-row-empty {
-      border-color: rgba(255, 255, 255, .08);
-      background:
-        linear-gradient(135deg, rgba(255, 189, 99, .028), transparent 48%),
-        #101010;
     }
 
     /* Round 398: keep desktop connect compact and separate from session history. */
@@ -7780,26 +7753,6 @@
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-rule,
     html[data-bluey-theme="light"] #accountApp .compact-auto-reload .auto-reload-hint {
       color: #5f7281;
-    }
-
-    html[data-bluey-theme="light"] #accountApp .session-sync-banner {
-      border-color: rgba(176, 121, 24, .24);
-      background: rgba(255, 247, 228, .82);
-      color: #7a6a4d;
-    }
-
-    html[data-bluey-theme="light"] #accountApp .session-row-empty {
-      border-color: rgba(176, 121, 24, .15);
-      background:
-        linear-gradient(135deg, rgba(255, 247, 228, .72), rgba(255, 255, 255, 0) 54%),
-        #ffffff;
-    }
-
-    html[data-bluey-theme="light"] #accountApp .session-open-disabled,
-    html[data-bluey-theme="light"] #accountApp .session-open-disabled:disabled {
-      border-color: #d9e2e8;
-      color: #81909a;
-      background: #f8fbfd;
     }
 
     html[data-bluey-theme="light"] #accountApp .reload-setup-modal {

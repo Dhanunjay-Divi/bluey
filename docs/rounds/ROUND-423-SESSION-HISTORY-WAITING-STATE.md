@@ -7,10 +7,9 @@
 
 ## Changes
 - Updated Session History copy to say saved desktop chats appear after transcript or answer upload.
-- Added a waiting banner when every listed session is still record-only.
-- Changed empty session rows from active "Open tab" links to disabled "Waiting" buttons.
+- Collapsed record-only sessions into one empty-state message instead of listing unreadable rows.
 - Kept "Open" only for sessions that have uploaded transcript, answer, or context content.
-- Tightened row layout, action spacing, link styling, and light-theme waiting states.
+- Tightened row layout, action spacing, link styling, and light-theme behavior.
 
 ## Files
 - `web/index.html`
