@@ -212,6 +212,17 @@ pub fn parse_and_verify(raw: &str, window: &str) -> Vec<LedgerItem> {
     };
 
     let window_norm = normalize(window);
+    // Live STT emits short finals, so one spoken sentence often spans several
+    // `Label: text` window lines — a verbatim quote of the full sentence then
+    // never matches window_norm (the interleaved labels break containment).
+    // Verify against the label-stripped content too: the quote must still be
+    // verbatim TRANSCRIPT content, we just stop segmentation artifacts from
+    // rejecting real items (found live, VoxConverse E2E 2026-07).
+    let window_content_norm = normalize(&strip_speaker_labels(window));
+    let verified = |quote: &str| {
+        let q = normalize(quote);
+        window_norm.contains(&q) || window_content_norm.contains(&q)
+    };
     let mut out = Vec::new();
 
     let mut push_statement = |kind: LedgerKind, s: RawStatement| {
@@ -221,7 +232,7 @@ pub fn parse_and_verify(raw: &str, window: &str) -> Vec<LedgerItem> {
             return;
         }
         // The guarantee: quote must literally appear in the transcript.
-        if !window_norm.contains(&normalize(quote)) {
+        if !verified(quote) {
             return;
         }
         let speaker = verify_speaker(s.speaker, window);
@@ -246,7 +257,7 @@ pub fn parse_and_verify(raw: &str, window: &str) -> Vec<LedgerItem> {
         if quote.is_empty() || owner.is_empty() {
             continue;
         }
-        if !window_norm.contains(&normalize(quote)) {
+        if !verified(quote) {
             continue;
         }
         let text = if task.is_empty() {
@@ -327,9 +338,57 @@ fn normalize(s: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Drop the leading `Label: ` from each window line (the window renders one
+/// STT segment per line as `System: text` / `Speaker 1: text`), yielding the
+/// bare spoken content so quotes spanning segment boundaries can verify.
+/// Conservative: only a short label before the FIRST `: ` is stripped.
+fn strip_speaker_labels(window: &str) -> String {
+    window
+        .lines()
+        .map(|line| match line.split_once(": ") {
+            Some((label, rest)) if label.len() <= 24 && !label.contains(':') => rest,
+            _ => line,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_spanning_choppy_stt_segments_still_verifies() {
+        // Live STT emits short finals: ONE spoken sentence lands as several
+        // `System:` window lines. The quote below is verbatim spoken content
+        // but never a substring of the labeled window — the label-stripped
+        // check must admit it (found live in the VoxConverse E2E).
+        let window = "\
+System: we decided to shard the
+System: database by tenant
+System: I D instead of by region";
+        let raw = r#"{
+          "decisions": [{
+            "quote": "we decided to shard the database by tenant I D instead of by region",
+            "text": "Shard the database by tenant ID, not by region"
+          }],
+          "constraints": [],
+          "owners": []
+        }"#;
+        let items = parse_and_verify(raw, window);
+        assert_eq!(items.len(), 1, "cross-segment quote must verify");
+
+        // Fabrication is still rejected — content not in the window dies.
+        let fabricated = r#"{
+          "decisions": [{
+            "quote": "we will migrate everything to kafka next week",
+            "text": "Migrate to kafka"
+          }],
+          "constraints": [],
+          "owners": []
+        }"#;
+        assert!(parse_and_verify(fabricated, window).is_empty());
+    }
 
     const WINDOW: &str = "\
 Speaker 1: Okay so for the Q3 launch, I think we should go with the phased rollout instead of the big-bang release.
