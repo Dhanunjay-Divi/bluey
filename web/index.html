@@ -641,17 +641,6 @@
                       <button class="account-button ghost compact" id="changeSquareCardButton" type="button" hidden>Save card</button>
                       <button class="account-button danger compact" id="cancelAutoReloadButton" type="button" hidden>Cancel Auto Reload</button>
                     </div>
-                    <div class="square-card-setup" id="squareCardSetup" hidden>
-                      <div class="square-card-copy">
-                        <strong>Card</strong>
-                        <span>Update the card used for Auto Reload.</span>
-                      </div>
-                      <div id="squareCardContainer" class="square-card-container"></div>
-                      <div class="square-card-actions">
-                        <button class="account-button ghost compact" id="saveSquareCardButton" type="button">Save card</button>
-                        <button class="account-button ghost compact" id="cancelSquareCardButton" type="button">Cancel</button>
-                      </div>
-                    </div>
                   </div>
                 </div>
                 <div class="billing-status-card" aria-label="Billing status">
@@ -759,6 +748,25 @@
             <button class="account-button primary" id="reloadSetupCheckoutButton" type="button">Continue to checkout</button>
           </div>
           <div class="account-modal-message" id="reloadSetupMessage" aria-live="polite"></div>
+        </section>
+      </div>
+      <div class="account-modal-backdrop" id="updateCardDialog" hidden>
+        <section class="account-modal card-update-modal" role="dialog" aria-modal="true" aria-labelledby="updateCardTitle">
+          <div class="account-modal-head">
+            <div>
+              <h2 id="updateCardTitle">Update card</h2>
+              <p>Replace the card used for Auto Reload.</p>
+            </div>
+            <button class="account-modal-close" id="updateCardCancelX" type="button" aria-label="Close update card dialog">×</button>
+          </div>
+          <div class="square-card-setup card-update-setup" id="updateCardSquareCardSetup">
+            <div id="updateCardSquareCardContainer" class="square-card-container"></div>
+          </div>
+          <div class="account-modal-actions card-update-actions">
+            <button class="account-button primary" id="updateCardSaveButton" type="button">Update card</button>
+            <button class="account-button ghost" id="updateCardCancel" type="button">Cancel</button>
+          </div>
+          <div class="account-modal-message" id="updateCardMessage" aria-live="polite"></div>
         </section>
       </div>
       <div class="account-modal-backdrop" id="changePasswordDialog" hidden>

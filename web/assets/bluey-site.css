@@ -6301,42 +6301,6 @@
       align-items: center;
     }
 
-    #accountApp .billing-payment-card .square-card-setup {
-      width: 100%;
-      margin-top: 0;
-      gap: .48rem;
-      max-width: 100%;
-      padding: .62rem;
-      border-radius: 9px;
-      background: rgba(255, 255, 255, .025);
-    }
-
-    #accountApp .billing-payment-card .square-card-copy {
-      gap: .08rem;
-    }
-
-    #accountApp .billing-payment-card .square-card-copy strong {
-      font-size: .76rem;
-    }
-
-    #accountApp .billing-payment-card .square-card-copy span {
-      font-size: .68rem;
-      line-height: 1.28;
-    }
-
-    #accountApp .billing-payment-card .square-card-container {
-      min-height: 38px;
-      padding: .45rem .55rem;
-      border-radius: 8px;
-    }
-
-    #accountApp .billing-payment-card .square-card-actions .account-button {
-      min-height: 31px;
-      padding: .34rem .55rem;
-      border-radius: 8px;
-      font-size: .72rem;
-    }
-
     #accountApp .manual-reload-rule:empty {
       display: none;
     }
@@ -7641,6 +7605,90 @@
       color: #9df5b2;
     }
 
+    #accountApp .card-update-modal {
+      width: min(430px, calc(100vw - 36px));
+      padding: .95rem;
+      border-color: rgba(99, 216, 255, .30);
+      border-radius: 16px;
+      background: #101010;
+    }
+
+    #accountApp .card-update-modal .account-modal-head {
+      margin-bottom: .75rem;
+    }
+
+    #accountApp .card-update-modal h2 {
+      font-size: 1.22rem;
+      line-height: 1.05;
+    }
+
+    #accountApp .card-update-modal .account-modal-head p {
+      max-width: 18rem;
+      margin-top: .35rem;
+      font-size: .78rem;
+      line-height: 1.38;
+    }
+
+    #accountApp .card-update-modal .account-modal-close {
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+    }
+
+    #accountApp .card-update-setup {
+      width: 100%;
+      margin: 0;
+      padding: .72rem;
+      border-radius: 10px;
+      background: #0a0a0a;
+    }
+
+    #accountApp .card-update-setup .square-card-container {
+      min-height: 44px;
+      padding: .65rem .75rem;
+      border-radius: 9px;
+    }
+
+    #accountApp .card-update-actions {
+      justify-content: flex-start;
+      gap: .55rem;
+      margin-top: .8rem;
+    }
+
+    #accountApp .card-update-actions .account-button {
+      min-height: 40px;
+      border-radius: 9px;
+      padding: .58rem .82rem;
+      font-size: .78rem;
+    }
+
+    #accountApp .card-update-modal .account-modal-message {
+      margin-top: .65rem;
+      padding: .54rem .65rem;
+      border: 1px solid rgba(99, 216, 255, .18);
+      border-radius: 9px;
+      background: rgba(99, 216, 255, .055);
+      color: #9fb4be;
+      font-size: .72rem;
+      line-height: 1.35;
+    }
+
+    #accountApp .card-update-modal .account-modal-message:empty {
+      display: none;
+    }
+
+    #accountApp .card-update-modal .account-modal-message[data-tone="error"] {
+      border-color: rgba(255, 116, 125, .28);
+      background: rgba(255, 116, 125, .075);
+      color: #ff8b94;
+    }
+
+    #accountApp .card-update-modal .account-modal-message[data-tone="success"] {
+      border-color: rgba(105, 240, 143, .24);
+      background: rgba(105, 240, 143, .075);
+      color: #9df5b2;
+    }
+
     html[data-bluey-theme="light"] #productSite.page {
       overflow: hidden;
     }
@@ -7672,6 +7720,21 @@
     html[data-bluey-theme="light"] #accountApp .reload-setup-modal {
       border-color: #cfe3ef;
       background: #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .card-update-modal {
+      border-color: #cfe3ef;
+      background: #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .card-update-setup {
+      background: #f9fcfe;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .card-update-modal .account-modal-message {
+      border-color: #d8edf6;
+      background: #f4fbff;
+      color: #5f7281;
     }
 
     html[data-bluey-theme="light"] #accountApp .reload-setup-panel,

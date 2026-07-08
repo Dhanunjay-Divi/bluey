@@ -2035,14 +2035,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const hint = document.getElementById('autoReloadHint');
       const method = document.getElementById('autoReloadMethod');
       const toggle = document.getElementById('autoReloadToggle');
-      const setup = document.getElementById('squareCardSetup');
-      const saveButton = document.getElementById('saveSquareCardButton');
       const changeCardButton = document.getElementById('changeSquareCardButton');
       const cancelAutoReloadButton = document.getElementById('cancelAutoReloadButton');
       const billingProviderLabel = document.getElementById('billingProviderLabel');
       const thresholdInput = document.getElementById('autoReloadThreshold');
       const amountInput = document.getElementById('autoReloadAmount');
-      if (!card || !hint || !method || !toggle || !setup) return;
+      if (!card || !hint || !method || !toggle) return;
 
       let amountCents = Number(me?.auto_topup_amount_cents || AUTO_RELOAD_DEFAULT_AMOUNT_CENTS);
       let thresholdCents = Number(me?.auto_topup_threshold_cents || AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS);
@@ -2064,15 +2062,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       card.classList.toggle('is-setup-default', setupDefaultOn);
       toggle.checked = toggleChecked;
       toggle.disabled = false;
-      if (setup.dataset.open !== '1') {
-        setup.hidden = true;
-      }
-      if (saveButton) {
-        saveButton.disabled = !canSaveSquareCard;
-        saveButton.textContent = hasSavedMethod ? 'Update card' : 'Save card';
-      }
       if (changeCardButton) {
-        changeCardButton.hidden = !canSaveSquareCard || setup.dataset.open === '1';
+        changeCardButton.hidden = !canSaveSquareCard;
         changeCardButton.disabled = !canSaveSquareCard;
         changeCardButton.textContent = hasSavedMethod ? 'Update card' : 'Save card';
       }
@@ -2368,7 +2359,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function openSquareCardSetup(options = {}) {
-      const button = document.getElementById(options.buttonId || 'changeSquareCardButton');
+      const button = options.buttonId === null
+        ? null
+        : document.getElementById(options.buttonId || 'changeSquareCardButton');
       const setupId = options.setupId || 'squareCardSetup';
       const containerId = options.containerId || 'squareCardContainer';
       const setup = document.getElementById(setupId);
@@ -2385,7 +2378,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       try {
         await setupSquareCard(latestAccountForBilling, { setupId, containerId });
-        if (button) button.hidden = true;
+        if (button && options.hideButtonOnAttach !== false) button.hidden = true;
       } finally {
         if (button) {
           button.disabled = false;
@@ -2472,6 +2465,61 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           button.textContent = previous;
         }
       }
+    }
+
+    function updateCardMessage(text, tone = '') {
+      const el = document.getElementById('updateCardMessage');
+      if (!el) return;
+      el.textContent = text || '';
+      el.dataset.tone = tone || '';
+    }
+
+    function resetUpdateCardDialog() {
+      const dialog = document.getElementById('updateCardDialog');
+      if (dialog) dialog.hidden = true;
+      updateCardMessage('');
+      closeSquareCardSetup({
+        setupId: 'updateCardSquareCardSetup',
+        containerId: 'updateCardSquareCardContainer',
+        changeButtonId: 'changeSquareCardButton',
+      });
+    }
+
+    async function openUpdateCardDialog() {
+      if (!canUseSquareCardSetup(latestAccountForBilling)) {
+        accountMessage(latestAccountForBilling?.auto_topup_unavailable_reason || 'Card updates are unavailable for this account.', false, 'error');
+        return;
+      }
+      const dialog = document.getElementById('updateCardDialog');
+      const setup = document.getElementById('updateCardSquareCardSetup');
+      if (!dialog || !setup) return;
+
+      dialog.hidden = false;
+      setup.hidden = false;
+      setup.dataset.open = '1';
+      updateCardMessage('Loading secure card form...');
+      await openSquareCardSetup({
+        buttonId: null,
+        setupId: 'updateCardSquareCardSetup',
+        containerId: 'updateCardSquareCardContainer',
+        hideButtonOnAttach: false,
+      });
+      updateCardMessage('');
+      setTimeout(() => document.getElementById('updateCardSaveButton')?.focus(), 0);
+    }
+
+    async function saveUpdateCard() {
+      await saveSquareCard({
+        buttonId: 'updateCardSaveButton',
+        setupId: 'updateCardSquareCardSetup',
+        containerId: 'updateCardSquareCardContainer',
+        changeButtonId: 'changeSquareCardButton',
+        onSaved: () => {
+          const dialog = document.getElementById('updateCardDialog');
+          if (dialog) dialog.hidden = true;
+          updateCardMessage('');
+        },
+      });
     }
 
     function reloadSetupMessage(text, tone = '') {
@@ -3845,14 +3893,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           updateReloadSetupDraftCopy();
         });
       });
-      document.getElementById('saveSquareCardButton')?.addEventListener('click', () => {
-        saveSquareCard().catch((error) => accountMessage(error.message));
-      });
       document.getElementById('changeSquareCardButton')?.addEventListener('click', () => {
-        openSquareCardSetup().catch((error) => accountMessage(error.message));
+        openUpdateCardDialog().catch((error) => updateCardMessage(error.message, 'error'));
       });
-      document.getElementById('cancelSquareCardButton')?.addEventListener('click', () => {
-        closeSquareCardSetup();
+      document.getElementById('updateCardSaveButton')?.addEventListener('click', () => {
+        saveUpdateCard().catch((error) => updateCardMessage(error.message, 'error'));
+      });
+      document.getElementById('updateCardCancel')?.addEventListener('click', resetUpdateCardDialog);
+      document.getElementById('updateCardCancelX')?.addEventListener('click', resetUpdateCardDialog);
+      document.getElementById('updateCardDialog')?.addEventListener('click', (event) => {
+        if (event.target?.id === 'updateCardDialog') resetUpdateCardDialog();
       });
       document.getElementById('cancelAutoReloadButton')?.addEventListener('click', async () => {
         const button = document.getElementById('cancelAutoReloadButton');
