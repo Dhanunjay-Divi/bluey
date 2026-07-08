@@ -7053,6 +7053,31 @@
       min-width: 0;
     }
 
+    #accountApp .dashboard-overview-card.balance-kpi .compact-auto-reload .auto-reload-rule,
+    #accountApp .dashboard-overview-card.balance-kpi .compact-auto-reload .auto-reload-hint {
+      overflow-wrap: anywhere;
+    }
+
+    @media (max-width: 980px) {
+      #accountApp .dashboard-overview-card.balance-kpi {
+        grid-template-columns: 1fr;
+      }
+
+      #accountApp .dashboard-overview-card.balance-kpi .dashboard-overview-title-row {
+        grid-template-columns: minmax(0, 1fr) auto;
+      }
+    }
+
+    @media (max-width: 620px) {
+      #accountApp .dashboard-overview-card.balance-kpi .dashboard-overview-title-row {
+        grid-template-columns: 1fr;
+      }
+
+      #accountApp .dashboard-overview-card.balance-kpi #balanceValue {
+        justify-self: start;
+      }
+    }
+
     #accountApp .dashboard-tabs {
       gap: 0;
       margin: 1rem 0 1.5rem;

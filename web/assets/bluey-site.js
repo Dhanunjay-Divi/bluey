@@ -1097,6 +1097,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       el.dataset.tone = tone || '';
     }
 
+    function friendlyBillingMessage(message, fallback = 'Billing is unavailable for this account right now.') {
+      const value = String(message || '').trim();
+      if (!value) return fallback;
+      if (/temporary|internal|test account|test accounts|paid checkout|payment methods?|auto reload|card saving/i.test(value)) {
+        return 'This account cannot add balance yet. Sign into a regular Bluey account to continue.';
+      }
+      if (/checkout is unavailable|checkout could not start/i.test(value)) {
+        return 'Checkout is unavailable right now. Try again in a moment.';
+      }
+      return value;
+    }
+
     function requireSignupTerms() {
       const terms = document.getElementById('signupTerms');
       if (!terms || terms.checked) return true;
@@ -1468,7 +1480,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function openDesktopDeepLinkIfNeeded() {
-      if (!['/login', '/link'].includes(currentPath) || pendingDeviceCode() || !accountToken()) return false;
+      if (currentPath !== '/link' || pendingDeviceCode() || !accountToken()) return false;
       if (sessionStorage.getItem('bluey_desktop_deep_link_started') === '1') return false;
       accountMessage('Opening Bluey desktop...');
       const link = await apiJson('/auth/link/mint', {
@@ -1476,6 +1488,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         body: JSON.stringify({}),
       });
       sessionStorage.setItem('bluey_desktop_deep_link_started', '1');
+      if (!link?.deep_link_url) {
+        accountMessage('Bluey desktop link is unavailable right now. The web dashboard is ready.');
+        return false;
+      }
       window.location.href = link.deep_link_url;
       accountMessage('Bluey should open now. If it does not, make sure the desktop app is installed, then run bluey on.');
       return true;
@@ -1496,6 +1512,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         body: JSON.stringify({ email, password }),
       });
       setAccountToken(auth, remember);
+      if (currentPath === '/login' && !pendingDeviceCode()) {
+        history.replaceState(history.state, '', '/account');
+      }
       accountMessage('', true);
       await loadAccount();
     }
@@ -2086,14 +2105,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       } else if (canSaveSquareCard) {
         hint.textContent = 'Add balance once and keep Auto Reload on to save a card.';
       } else {
-        hint.textContent = me?.auto_topup_unavailable_reason || 'Unavailable';
+        hint.textContent = friendlyBillingMessage(me?.auto_topup_unavailable_reason);
       }
 
       method.textContent = me?.saved_payment_method_label
         ? `Saved card: ${me.saved_payment_method_label}`
         : canSaveSquareCard
           ? 'No saved card.'
-          : me?.auto_topup_unavailable_reason || 'Card saving unavailable.';
+          : friendlyBillingMessage(me?.auto_topup_unavailable_reason, 'Card saving is unavailable for this account.');
       updateAutoReloadDraftCopy();
       renderBillingStatus(me);
       renderReloadSetupCardState(me);
@@ -2487,7 +2506,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     async function openUpdateCardDialog() {
       if (!canUseSquareCardSetup(latestAccountForBilling)) {
-        accountMessage(latestAccountForBilling?.auto_topup_unavailable_reason || 'Card updates are unavailable for this account.', false, 'error');
+        accountMessage(
+          friendlyBillingMessage(latestAccountForBilling?.auto_topup_unavailable_reason, 'Card updates are unavailable for this account.'),
+          false,
+          'error'
+        );
         return;
       }
       const dialog = document.getElementById('updateCardDialog');
@@ -2809,7 +2832,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         accountMessage(message, false, result?.credited ? 'success' : '');
         return true;
       } catch (error) {
-        reloadSetupMessage(error.message || 'Could not add balance. Try again.', 'error');
+        reloadSetupMessage(friendlyBillingMessage(error.message, 'Could not add balance. Try again.'), 'error');
         return false;
       } finally {
         setReloadButtonsBusy(false);
@@ -3163,10 +3186,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function sessionUploadCounts(session) {
+      const transcriptItems = firstArray(session?.transcript_segments, session?.transcript, session?.transcripts);
+      const responseItems = firstArray(session?.cue_responses, session?.responses, session?.answers, session?.conversation, session?.messages);
+      const contextItems = firstArray(session?.context_artifacts, session?.context, session?.context_items, session?.files);
       return {
-        transcript: Number(session?.transcript_count || 0),
-        responses: Number(session?.response_count || 0),
-        context: Number(session?.context_count || 0),
+        transcript: Number(session?.transcript_count || transcriptItems.length || 0),
+        responses: Number(session?.response_count || session?.answer_count || responseItems.length || 0),
+        context: Number(session?.context_count || contextItems.length || 0),
       };
     }
 
@@ -3278,6 +3304,40 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       detail.append(section);
     }
 
+    function firstArray(...values) {
+      for (const value of values) {
+        if (Array.isArray(value)) return value;
+      }
+      return [];
+    }
+
+    function normalizeTranscriptSegments(bundle) {
+      return firstArray(bundle?.transcript_segments, bundle?.transcript, bundle?.transcripts)
+        .map((segment) => {
+          if (typeof segment === 'string') return { text: segment };
+          return segment && typeof segment === 'object' ? segment : null;
+        })
+        .filter(Boolean);
+    }
+
+    function normalizeCueResponses(bundle) {
+      return firstArray(bundle?.cue_responses, bundle?.responses, bundle?.answers, bundle?.conversation, bundle?.messages)
+        .map((answer) => {
+          if (typeof answer === 'string') return { text: answer };
+          return answer && typeof answer === 'object' ? answer : null;
+        })
+        .filter(Boolean);
+    }
+
+    function normalizeContextArtifacts(bundle) {
+      return firstArray(bundle?.context_artifacts, bundle?.context, bundle?.context_items, bundle?.files)
+        .map((artifact) => {
+          if (typeof artifact === 'string') return { text_preview: artifact };
+          return artifact && typeof artifact === 'object' ? artifact : null;
+        })
+        .filter(Boolean);
+    }
+
     async function loadCloudSessions() {
       const sessions = await apiJson('/sync/sessions?limit=8');
       renderCloudSessions(sessions);
@@ -3292,13 +3352,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!detail) return;
       detail.hidden = false;
       detail.replaceChildren();
-      const transcriptSegments = Array.isArray(bundle.transcript_segments) ? bundle.transcript_segments : [];
-      const cueResponses = Array.isArray(bundle.cue_responses) ? bundle.cue_responses : [];
-      const contextArtifacts = Array.isArray(bundle.context_artifacts) ? bundle.context_artifacts : [];
+      const sessionMeta = bundle.session || bundle;
+      const transcriptSegments = normalizeTranscriptSegments(bundle);
+      const cueResponses = normalizeCueResponses(bundle);
+      const contextArtifacts = normalizeContextArtifacts(bundle);
       const hasUploadedContent = transcriptSegments.length > 0 || cueResponses.length > 0 || contextArtifacts.length > 0;
 
       const title = document.createElement('strong');
-      title.textContent = bundle.session?.title || `Session ${shortSessionId(sessionId)}`;
+      title.textContent = sessionMeta?.title || `Session ${shortSessionId(sessionId)}`;
       const meta = document.createElement('span');
       const sessionCode = shortSessionId(sessionId).toUpperCase();
       meta.textContent = [
@@ -3321,10 +3382,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       copyId.textContent = 'Copy full session ID';
       detail.append(copyId);
 
-      if (bundle.session?.answer_style) {
-        appendBundlePreview(detail, 'Answer style', bundle.session.answer_style);
+      if (sessionMeta?.answer_style) {
+        appendBundlePreview(detail, 'Answer style', sessionMeta.answer_style);
       }
-      appendBundlePreview(detail, 'Diagnostics', diagnosticsText(bundle.session?.metadata));
+      appendBundlePreview(detail, 'Diagnostics', diagnosticsText(sessionMeta?.metadata));
       appendSessionBundleSection(
         detail,
         'Conversation',
@@ -3588,8 +3649,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           } else if (!approved) {
             await openDesktopDeepLinkIfNeeded();
           }
-        } catch (error) {
-          accountMessage(`Account signed in, but desktop handoff failed: ${error.message}`);
+        } catch {
+          accountMessage('Bluey signed in. If the desktop is waiting for this account, use Connect desktop below.');
         }
       } finally {
         if (refreshButton) refreshButton.disabled = false;
@@ -3627,12 +3688,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return true;
       } catch (error) {
         closeCheckoutPlaceholder(checkoutWindow);
-        const message = String(error?.message || 'Could not open checkout.');
-        if (/checkout is unavailable|checkout could not start/i.test(message)) {
-          accountMessage('Checkout is unavailable right now. Please retry in a moment.', false, 'error');
-        } else {
-          accountMessage(message, false, 'error');
-        }
+        accountMessage(friendlyBillingMessage(error?.message, 'Could not open checkout.'), false, 'error');
         return false;
       } finally {
         setReloadButtonsBusy(false);
@@ -3809,7 +3865,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         openReloadSetupDialog();
       });
       document.getElementById('reloadSetupCheckoutButton')?.addEventListener('click', () => {
-        startReloadFromSetup().catch((error) => reloadSetupMessage(error.message, 'error'));
+        startReloadFromSetup().catch((error) => {
+          reloadSetupMessage(friendlyBillingMessage(error.message, 'Could not add balance. Try again.'), 'error');
+        });
       });
       document.getElementById('addCreditsCancelX')?.addEventListener('click', resetReloadSetupDialog);
       document.getElementById('addCreditsDialog')?.addEventListener('click', (event) => {
@@ -3860,14 +3918,19 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           toggle.checked = Boolean(latestAccountForBilling?.auto_topup_enabled);
           updateAutoReloadDraftCopy();
           accountMessage(
-            latestAccountForBilling?.auto_topup_unavailable_reason || 'Use Add balance to set up Auto Reload with a card.',
+            friendlyBillingMessage(
+              latestAccountForBilling?.auto_topup_unavailable_reason,
+              'Use Add balance to set up Auto Reload with a card.'
+            ),
             false,
             'error'
           );
           return;
         }
         updateAutoReloadDraftCopy();
-        saveDashboardAutoReloadSettings().catch((error) => accountMessage(error.message, false, 'error'));
+        saveDashboardAutoReloadSettings().catch((error) => {
+          accountMessage(friendlyBillingMessage(error.message), false, 'error');
+        });
       });
       ['autoReloadThreshold', 'autoReloadAmount'].forEach((id) => {
         document.getElementById(id)?.addEventListener('input', () => {
@@ -3924,7 +3987,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         button.disabled = true;
         button.textContent = 'Turning off...';
         updateAutoReload(false).catch((error) => {
-          accountMessage(error.message, false, 'error');
+          accountMessage(friendlyBillingMessage(error.message), false, 'error');
         }).finally(() => {
           button.disabled = false;
           button.textContent = previous;
