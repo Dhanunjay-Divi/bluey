@@ -18,6 +18,7 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - Tightened platform-specific daemon `cfg` boundaries so Linux/Windows/macOS clippy do not see impossible native-helper, overlay-socket, or paste-helper branches as unused or unreachable.
 - Marked the ffmpeg runtime path as intentionally unused on Linux because chunked desktop audio capture only reads it on macOS and Windows.
 - Gated the CLI macOS permission-probe timer import and made the screen-capture preview argument platform-neutral so Ubuntu clippy does not see Mac/Windows-only code as unused.
+- Corrected dashboard privacy-settings tests so Linux asserts the unsupported path while macOS and Windows continue to verify their launch commands.
 
 ## Verification
 

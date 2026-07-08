@@ -999,36 +999,50 @@ mod tests {
     #[test]
     fn test_privacy_settings_command_microphone() {
         let result = privacy_settings_command("microphone");
-        assert!(result.is_ok());
-        let (program, args) = result.unwrap();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            assert_eq!(program, "open");
-            assert_eq!(args.len(), 1);
-            assert!(args[0].contains("Privacy_Microphone"));
+            assert!(result.is_ok());
+            let (program, args) = result.unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(program, "open");
+                assert_eq!(args.len(), 1);
+                assert!(args[0].contains("Privacy_Microphone"));
+            }
+            #[cfg(target_os = "windows")]
+            {
+                assert_eq!(program, "cmd");
+                assert!(args.contains(&"ms-settings:privacy-microphone".to_string()));
+            }
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            assert_eq!(program, "cmd");
-            assert!(args.contains(&"ms-settings:privacy-microphone".to_string()));
+            assert!(result.is_err());
         }
     }
 
     #[test]
     fn test_privacy_settings_command_system() {
         let result = privacy_settings_command("system");
-        assert!(result.is_ok());
-        let (program, args) = result.unwrap();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            assert_eq!(program, "open");
-            assert_eq!(args.len(), 1);
-            assert!(args[0].contains("Privacy_ScreenCapture"));
+            assert!(result.is_ok());
+            let (program, args) = result.unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(program, "open");
+                assert_eq!(args.len(), 1);
+                assert!(args[0].contains("Privacy_ScreenCapture"));
+            }
+            #[cfg(target_os = "windows")]
+            {
+                assert_eq!(program, "cmd");
+                assert!(args.contains(&"ms-settings:privacy-microphone".to_string()));
+            }
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            assert_eq!(program, "cmd");
-            assert!(args.contains(&"ms-settings:privacy-microphone".to_string()));
+            assert!(result.is_err());
         }
     }
 
