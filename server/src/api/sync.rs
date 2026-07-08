@@ -230,9 +230,9 @@ pub async fn download_artifact_object(
     let storage = ObjectStorage::new(storage_config);
     if !storage.key_belongs_to_account(key, &account.id) {
         tracing::warn!(
-            account_id = %account.id,
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
             artifact_id = %artifact_id,
-            object_key = %key,
+            object_key_hash = %sha256_hex(key.as_bytes()),
             "rejecting cross-account artifact object key"
         );
         return Err((
