@@ -1352,6 +1352,7 @@ struct ChatUsage {
 
 #[derive(Debug, Clone)]
 struct RealAudioRuntimeConfig {
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     ffmpeg_path: Option<PathBuf>,
     stt_endpoint: String,
     stt_api_key: String,
