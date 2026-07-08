@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Live-memory concurrency fixes (adversarial review findings).** (1) The
+  rolling-summary inflight guard now clears via a Drop guard, so a panic
+  anywhere in the pass can no longer leave the flag stuck true and silently
+  disable summaries for the session. (2) The summary task no longer calls
+  `save_active` off the meeting lock — segment commits save the whole record
+  UNDER the lock, so the off-lock save could clobber newer transcript segments
+  on disk (lost update); persistence now piggybacks on the next segment commit
+  or the meeting-end archive. (3) A slow ledger extraction that outlives its
+  meeting no longer merges into the NEXT meeting's ledger (meeting-id guard);
+  cross-meeting fact indexing is unaffected since facts carry their own
+  meeting id.
 - **Installer: "Apple could not verify" Gatekeeper popup on AirDropped/downloaded
   builds.** `libopenblas.0.dylib` (the diarization dylib the daemon loads at
   startup) ships read-only from Homebrew, and macOS `xattr -d` cannot remove the
@@ -20,6 +31,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the actual cure for the daemon-spawned subprocesses.
 
 ### Added
+- **Mem0-in-Rust: the full two-phase memory pipeline (PLAN-CONTEXT-WARMUP
+  Appendix E).** Phase 1 (extraction via the attached agent's throwaway
+  one-shot, quote-verified) now feeds phase 2 — an agent-decided
+  ADD/UPDATE/DELETE/NONE consolidation pass ported near-verbatim from the Mem0
+  paper's update prompt, with the source-verified hardening tricks from mem0
+  v3 (integer display-id indirection so the agent can never hallucinate store
+  ids, exact-hash dedup BEFORE the agent call, empty-neighborhood fast-path
+  that skips the drive entirely). DELETE lands as a Zep-style SUPERSEDE
+  (validity window closed, row kept queryable) because meeting decisions get
+  REVERSED, not erased. Every mutating op is recorded in a `facts_history`
+  audit table (mem0's history-log pattern). No agent attached / unusable
+  output → the cosine-similarity heuristic, so memory works headless.
+  Real-model + real-`claude -p` integration test verifies a reversed decision
+  is superseded end-to-end.
+- **Two-stage question detection (SET 1).** The lexical `is_question` check
+  now has an ONNX stage 2: `shahrukhx01/question-vs-statement-classifier`
+  (int8, ~11MB) runs via `ort` on regex REJECTS only, catching the disfluent
+  questions real meeting speech is full of ("so um do we need the flag or
+  not"). The model is exported once by `scripts/export-qdetect-onnx.sh` (with
+  an int8-vs-pytorch parity gate) and ships in the AirDrop tarball next to the
+  daemon (`bin/models/qdetect-en`); absent model → regex-only detection, never
+  fatal. Speaker/name gating is unchanged and stays in cue-core
+  (`detect_for_me_question_given` seam).
+- **Manual "ask about what was just said" button (SET 3).** A one-tap button
+  in the meeting overlay composer fires a canonical ask through the EXACT
+  pipeline typed questions use — the daemon already attaches the rolling
+  summary + decisions ledger + recent transcript to every ask, so the answer
+  is grounded with no typing. The escape hatch for when detection misses.
 - **One-click install for a missing agent CLI.** When the attached agent's CLI
   isn't on PATH (e.g. `copilot`) but has a vetted install recipe, Bluey now shows
   an Install / Not now card in the Ask screen instead of only telling you to
