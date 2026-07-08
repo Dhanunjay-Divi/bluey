@@ -50,45 +50,46 @@ const SLOW_FIRST_TOKEN_AUDIT_MS: i64 = 8_000;
 const CODE_ARTIFACT_MIN_OUTPUT_TOKENS: u32 = 4_096;
 const CANVAS_DETAIL_MIN_OUTPUT_TOKENS: u32 = 3_072;
 
-fn record_answer_ops_event(
-    pool: &crate::db::DbPool,
-    account_id: &str,
-    request_id: &str,
-    session_id: Option<&str>,
-    trace_id: Option<&str>,
-    event_type: &str,
-    status: &str,
+struct AnswerOpsEvent<'a> {
+    account_id: &'a str,
+    request_id: &'a str,
+    session_id: Option<&'a str>,
+    trace_id: Option<&'a str>,
+    event_type: &'a str,
+    status: &'a str,
     metadata: serde_json::Value,
-) {
-    let mut metadata = metadata;
+}
+
+fn record_answer_ops_event(pool: &crate::db::DbPool, event: AnswerOpsEvent<'_>) {
+    let mut metadata = event.metadata;
     if let Some(object) = metadata.as_object_mut() {
-        object.insert("request_id".into(), serde_json::json!(request_id));
+        object.insert("request_id".into(), serde_json::json!(event.request_id));
         object.insert(
             "request_ref".into(),
-            serde_json::json!(short_observability_ref(Some(request_id))),
+            serde_json::json!(short_observability_ref(Some(event.request_id))),
         );
-        object.insert("session_id".into(), serde_json::json!(session_id));
+        object.insert("session_id".into(), serde_json::json!(event.session_id));
         object.insert(
             "session_ref".into(),
-            serde_json::json!(short_observability_ref(session_id)),
+            serde_json::json!(short_observability_ref(event.session_id)),
         );
-        object.insert("trace_id".into(), serde_json::json!(trace_id));
+        object.insert("trace_id".into(), serde_json::json!(event.trace_id));
     }
     if let Err(error) = ops_audit::record_event(
         pool,
         ops_audit::OpsAuditEventInput {
-            account_id_hash: Some(cue_core::account_id_hash_prefix(account_id)),
+            account_id_hash: Some(cue_core::account_id_hash_prefix(event.account_id)),
             actor_account_id_hash: None,
-            event_type: event_type.to_string(),
-            status: status.to_string(),
+            event_type: event.event_type.to_string(),
+            status: event.status.to_string(),
             metadata_json: metadata,
         },
     ) {
         tracing::warn!(
-            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
-            request_ref = %short_observability_ref(Some(request_id)),
-            session_ref = %short_observability_ref(session_id),
-            event_type,
+            account_id_hash = %cue_core::account_id_hash_prefix(event.account_id),
+            request_ref = %short_observability_ref(Some(event.request_id)),
+            session_ref = %short_observability_ref(event.session_id),
+            event_type = %event.event_type,
             error = %error,
             "failed to record redacted answer ops event"
         );
@@ -115,8 +116,7 @@ fn internal_disclosure_guard_text(text: &str) -> &str {
     let Some(after_label) = trimmed.strip_prefix("Question:") else {
         return trimmed;
     };
-    let after_label = after_label
-        .trim_start_matches(|ch: char| ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n');
+    let after_label = after_label.trim_start_matches([' ', '\t', '\r', '\n']);
     let end = after_label.find("\n\n").unwrap_or(after_label.len());
     after_label[..end].trim()
 }
@@ -1097,14 +1097,7 @@ fn transcript_diagnostic_text(question: &str) -> String {
     if !lines.is_empty() {
         return lines.join("\n");
     }
-    let normalized = normalize_guardrail_text(question);
-    if is_generic_live_transcript_prompt(&normalized)
-        || looks_like_transcript_placeholder(&normalized)
-    {
-        String::new()
-    } else {
-        String::new()
-    }
+    String::new()
 }
 
 fn transcript_source_label_count(question: &str) -> usize {
@@ -1327,9 +1320,7 @@ fn answer_plan_for_request(
         AnswerIntent::Screen
     } else if context_system_design_followup {
         AnswerIntent::FollowUp
-    } else if quick_conceptual {
-        AnswerIntent::Quick
-    } else if topic_reset && short_question {
+    } else if quick_conceptual || (topic_reset && short_question) {
         AnswerIntent::Quick
     } else if meeting {
         AnswerIntent::Meeting
@@ -1922,10 +1913,8 @@ fn merge_ai_answer_plan(
     }
     let recommended_lane = default_lane_for_intent(intent);
     if let Some(lane) = payload.lane.as_deref().and_then(valid_answer_lane) {
-        if !lane_matches_intent(intent, lane) {
-            if !hard_override_applied {
-                return None;
-            }
+        if !lane_matches_intent(intent, lane) && !hard_override_applied {
+            return None;
         }
     }
     let mut needs_web_search = payload
@@ -3919,7 +3908,7 @@ fn retrieval_status_entries(
     if web_search.attempted && web_search.skipped_reason.is_none() {
         statuses.push(("searching_web".to_string(), "Searching web...".to_string()));
     }
-    if web_search.sources.len() > 0 {
+    if !web_search.sources.is_empty() {
         statuses.push((
             "reading_web_sources".to_string(),
             format!("Reading {} sources...", web_search.sources.len()),
@@ -4540,13 +4529,14 @@ async fn complete_stream_inner(
                                 if first_event_latency_ms >= SLOW_FIRST_TOKEN_AUDIT_MS {
                                     record_answer_ops_event(
                                         &state.pool,
-                                        &account.id,
-                                        &req.request_id,
-                                        req.session_id.as_deref(),
-                                        Some(&trace_id),
-                                        "answer_slow_first_token",
-                                        "warning",
-                                        serde_json::json!({
+                                        AnswerOpsEvent {
+                                            account_id: &account.id,
+                                            request_id: &req.request_id,
+                                            session_id: req.session_id.as_deref(),
+                                            trace_id: Some(&trace_id),
+                                            event_type: "answer_slow_first_token",
+                                            status: "warning",
+                                            metadata: serde_json::json!({
                                             "lane": lane_log.as_str(),
                                             "effective_lane": effective_lane_log.as_str(),
                                             "provider": route.provider,
@@ -4556,7 +4546,8 @@ async fn complete_stream_inner(
                                             "first_event_latency_ms": first_event_latency_ms,
                                             "first_event_kind": first_event_kind,
                                             "streaming": true
-                                        }),
+                                            }),
+                                        },
                                     );
                                 }
                                 selected_first_event = first_event;
@@ -4686,20 +4677,22 @@ async fn complete_stream_inner(
                 );
                 record_answer_ops_event(
                     &state.pool,
-                    &account.id,
-                    &req.request_id,
-                    req.session_id.as_deref(),
-                    Some(&trace_id),
-                    "answer_failed",
-                    "upstream_error",
-                    serde_json::json!({
+                    AnswerOpsEvent {
+                        account_id: &account.id,
+                        request_id: &req.request_id,
+                        session_id: req.session_id.as_deref(),
+                        trace_id: Some(&trace_id),
+                        event_type: "answer_failed",
+                        status: "upstream_error",
+                        metadata: serde_json::json!({
                         "lane": lane_log.as_str(),
                         "effective_lane": effective_lane_log.as_str(),
                         "streaming": true,
                         "error_kind": "all_streaming_routes_failed",
                         "error_preview": truncate_chars(&e.to_string(), 180),
                         "candidate_routes": routes.len()
-                    }),
+                        }),
+                    },
                 );
             }
             return Err((
@@ -4806,17 +4799,18 @@ async fn complete_stream_inner(
                     );
                     record_answer_ops_event(
                         &state.pool,
-                        &account.id,
-                        &req.request_id,
-                        req.session_id.as_deref(),
-                        Some(&trace_id),
-                        "answer_failed",
-                        if retry_after_secs.is_some() {
+                        AnswerOpsEvent {
+                            account_id: &account.id,
+                            request_id: &req.request_id,
+                            session_id: req.session_id.as_deref(),
+                            trace_id: Some(&trace_id),
+                            event_type: "answer_failed",
+                            status: if retry_after_secs.is_some() {
                             "provider_capacity"
                         } else {
                             "upstream_stream_error"
                         },
-                        serde_json::json!({
+                            metadata: serde_json::json!({
                             "lane": lane_log.as_str(),
                             "effective_lane": effective_lane_log.as_str(),
                             "provider": streaming.provider.as_str(),
@@ -4825,7 +4819,8 @@ async fn complete_stream_inner(
                             "delivered_delta": delivered_delta,
                             "retry_after_secs": retry_after_secs,
                             "error_preview": truncate_chars(&e.to_string(), 180)
-                        }),
+                            }),
+                        },
                     );
                     let payload = if let Some(retry_after_secs) = retry_after_secs {
                         serde_json::json!({
@@ -4861,20 +4856,22 @@ async fn complete_stream_inner(
             );
             record_answer_ops_event(
                 &state.pool,
-                &account.id,
-                &req.request_id,
-                req.session_id.as_deref(),
-                Some(&trace_id),
-                "answer_failed",
-                "upstream_stream_incomplete",
-                serde_json::json!({
+                AnswerOpsEvent {
+                    account_id: &account.id,
+                    request_id: &req.request_id,
+                    session_id: req.session_id.as_deref(),
+                    trace_id: Some(&trace_id),
+                    event_type: "answer_failed",
+                    status: "upstream_stream_incomplete",
+                    metadata: serde_json::json!({
                     "lane": lane_log.as_str(),
                     "effective_lane": effective_lane_log.as_str(),
                     "provider": streaming.provider.as_str(),
                     "model": streaming.model.as_str(),
                     "streaming": true,
                     "delivered_delta": delivered_delta
-                }),
+                    }),
+                },
             );
             yield Ok(Event::default().event("error").data(
                 serde_json::json!({
@@ -4917,13 +4914,14 @@ async fn complete_stream_inner(
             );
             record_answer_ops_event(
                 &state.pool,
-                &account.id,
-                &req.request_id,
-                req.session_id.as_deref(),
-                Some(&trace_id),
-                "answer_failed",
-                "code_artifact_missing",
-                serde_json::json!({
+                AnswerOpsEvent {
+                    account_id: &account.id,
+                    request_id: &req.request_id,
+                    session_id: req.session_id.as_deref(),
+                    trace_id: Some(&trace_id),
+                    event_type: "answer_failed",
+                    status: "code_artifact_missing",
+                    metadata: serde_json::json!({
                     "lane": lane_log.as_str(),
                     "effective_lane": effective_lane_log.as_str(),
                     "provider": streaming.provider.as_str(),
@@ -4935,7 +4933,8 @@ async fn complete_stream_inner(
                     "question_hash": request_diag.question_hash,
                     "context_hash": request_diag.context_hash,
                     "context_coding_signal": request_diag.context_coding_signal
-                }),
+                    }),
+                },
             );
             let payload = serde_json::json!({
                 "error": "Bluey expected code for this answer, but the provider returned only prose. Please retry.",
@@ -5738,20 +5737,22 @@ async fn complete_inner(
                 );
                 record_answer_ops_event(
                     &state.pool,
-                    &account.id,
-                    &req.request_id,
-                    req.session_id.as_deref(),
-                    Some(&trace_id),
-                    "answer_failed",
-                    "upstream_error",
-                    serde_json::json!({
+                    AnswerOpsEvent {
+                        account_id: &account.id,
+                        request_id: &req.request_id,
+                        session_id: req.session_id.as_deref(),
+                        trace_id: Some(&trace_id),
+                        event_type: "answer_failed",
+                        status: "upstream_error",
+                        metadata: serde_json::json!({
                         "lane": lane_log.as_str(),
                         "effective_lane": effective_lane_log.as_str(),
                         "streaming": false,
                         "error_kind": "all_routes_failed",
                         "error_preview": truncate_chars(&e.to_string(), 180),
                         "candidate_routes": routes.len()
-                    }),
+                        }),
+                    },
                 );
             }
             return Err((
@@ -5802,13 +5803,14 @@ async fn complete_inner(
         );
         record_answer_ops_event(
             &state.pool,
-            &account.id,
-            &req.request_id,
-            req.session_id.as_deref(),
-            Some(&trace_id),
-            "answer_failed",
-            "code_artifact_missing",
-            serde_json::json!({
+            AnswerOpsEvent {
+                account_id: &account.id,
+                request_id: &req.request_id,
+                session_id: req.session_id.as_deref(),
+                trace_id: Some(&trace_id),
+                event_type: "answer_failed",
+                status: "code_artifact_missing",
+                metadata: serde_json::json!({
                 "lane": lane_log.as_str(),
                 "effective_lane": effective_lane_log.as_str(),
                 "provider": comp.provider.as_str(),
@@ -5820,7 +5822,8 @@ async fn complete_inner(
                 "question_hash": request_diag.question_hash,
                 "context_hash": request_diag.context_hash,
                 "context_coding_signal": request_diag.context_coding_signal
-            }),
+                }),
+            },
         );
         return Err(code_artifact_missing_error());
     }

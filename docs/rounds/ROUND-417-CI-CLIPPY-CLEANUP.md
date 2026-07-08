@@ -23,6 +23,7 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - Gated the daemon keyring delete-missing test to desktop keyring platforms so headless Ubuntu CI does not fail on a missing keyring backend.
 - Marked CPAL real-device resolution tests as ignored by default, matching the existing module contract that real audio-device tests are developer-machine checks. Hosted Windows passed clippy/build but crashed below Rust with a CPAL `STATUS_ACCESS_VIOLATION` during device enumeration, so CI now keeps pure audio logic tests active and leaves physical-device probing to `cargo test --ignored` on real machines.
 - Aligned CI's Windows native-helper build step with the release workflow by wrapping each helper script in `Push-Location`/`Pop-Location`. The overlay helper intentionally changes to its script directory, so invoking the next helper through a repo-root relative path was fragile in PowerShell.
+- Cleaned the server observability clippy gate after the hosted policy workflow started checking `server/Cargo.toml --all-targets`: grouped answer ops audit metadata into `AnswerOpsEvent`, grouped Square direct-payment inputs into `SquarePaymentRequest`, grouped balance credit inputs into `CreditWithSourceInput`, simplified duplicated AnswerPlan branches, and fixed small transcript/STT/source-count lint suggestions.
 
 ## Verification
 
@@ -34,7 +35,12 @@ Keep the Bluey 0.1.92 sign-out/listen fail-closed release clean in CI after GitH
 - `cargo check --manifest-path server/Cargo.toml --bin bluey-server`
 - `cargo clippy -p cue-daemon --all-targets -- -D warnings`
 - `cargo clippy --all-targets -- -D warnings`
-- Hosted CI showed macOS and Ubuntu passing, Windows Rust formatting/clippy/build/test passing, and only the native-helper packaging step failing before the PowerShell path fix above.
+- `cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings`
+- `cargo test --manifest-path server/Cargo.toml balance_ledger_records_credit_debit_and_request_evidence --quiet`
+- `cargo test --manifest-path server/Cargo.toml credit_idempotent_on_same_processor_payment_id --quiet`
+- `git diff --check`
+- Hosted CI run `28913153344` passed macOS, Ubuntu, and Windows after the PowerShell path fix.
+- Observability Policy run `28913153374` exposed the stricter server clippy failures above; local server clippy is now clean and the next pushed run should exercise the policy gate itself.
 
 ## Notes
 

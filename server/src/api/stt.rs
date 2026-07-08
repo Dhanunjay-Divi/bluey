@@ -483,7 +483,9 @@ async fn run_deepgram_relay(
                                     first_audible_after_ms = Some(started.elapsed().as_millis());
                                 }
                             }
-                            if forwarded_audio_chunks == 1 || forwarded_audio_chunks % 50 == 0 {
+                            if forwarded_audio_chunks == 1
+                                || forwarded_audio_chunks.is_multiple_of(50)
+                            {
                                 tracing::info!(
                                     account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
                                     source = %session.source,
@@ -777,7 +779,7 @@ impl DeepgramRelayFrameStats {
                 }
                 if self.transcript_frames == 1
                     || self.transcript_frames == 5
-                    || self.transcript_frames % 25 == 0
+                    || self.transcript_frames.is_multiple_of(25)
                     || inspection.is_final
                 {
                     tracing::info!(

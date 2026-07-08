@@ -294,20 +294,21 @@ pub(crate) fn consume_credit_batches_pg_tx(
     Ok(())
 }
 
-fn credit_with_source_id(
-    pool: &DbPool,
-    account_id: &str,
+struct CreditWithSourceInput<'a> {
+    account_id: &'a str,
     amount_cents: i64,
-    credit_source_id: &str,
-    event_type: &str,
-    reason: Option<&str>,
-    provider: Option<&str>,
-    processor_payment_id: Option<&str>,
-) -> Result<bool> {
-    if amount_cents <= 0 {
+    credit_source_id: &'a str,
+    event_type: &'a str,
+    reason: Option<&'a str>,
+    provider: Option<&'a str>,
+    processor_payment_id: Option<&'a str>,
+}
+
+fn credit_with_source_id(pool: &DbPool, input: CreditWithSourceInput<'_>) -> Result<bool> {
+    if input.amount_cents <= 0 {
         anyhow::bail!("amount_cents must be positive");
     }
-    let credit_source_id = credit_source_id.trim();
+    let credit_source_id = input.credit_source_id.trim();
     if credit_source_id.is_empty() {
         anyhow::bail!("credit_source_id must be non-empty");
     }
@@ -317,7 +318,7 @@ fn credit_with_source_id(
             let tx = conn.transaction()?;
             let balance_before: i64 = tx.query_row(
                 "SELECT balance_cents FROM accounts WHERE id = ?1",
-                params![account_id],
+                params![input.account_id],
                 |r| r.get(0),
             )?;
 
@@ -350,8 +351,8 @@ fn credit_with_source_id(
                  VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
                 params![
                     batch_id,
-                    account_id,
-                    amount_cents,
+                    input.account_id,
+                    input.amount_cents,
                     expires_at,
                     credit_source_id
                 ],
@@ -359,19 +360,19 @@ fn credit_with_source_id(
 
             tx.execute(
                 "UPDATE accounts SET balance_cents = balance_cents + ?1 WHERE id = ?2",
-                params![amount_cents, account_id],
+                params![input.amount_cents, input.account_id],
             )?;
             insert_balance_ledger_sqlite_tx(
                 &tx,
                 BalanceLedgerEntry {
-                    account_id,
-                    event_type,
-                    amount_cents,
+                    account_id: input.account_id,
+                    event_type: input.event_type,
+                    amount_cents: input.amount_cents,
                     balance_cents_before: balance_before,
-                    balance_cents_after: balance_before + amount_cents,
-                    reason,
-                    provider,
-                    processor_payment_id,
+                    balance_cents_after: balance_before + input.amount_cents,
+                    reason: input.reason,
+                    provider: input.provider,
+                    processor_payment_id: input.processor_payment_id,
                     source_id: Some(credit_source_id),
                     idempotency_key: Some(credit_source_id),
                     request_id: None,
@@ -388,7 +389,7 @@ fn credit_with_source_id(
             let balance_before: i64 = tx
                 .query_one(
                     "SELECT balance_cents FROM accounts WHERE id = $1",
-                    &[&account_id],
+                    &[&input.account_id],
                 )?
                 .try_get(0)?;
 
@@ -412,8 +413,8 @@ fn credit_with_source_id(
                  VALUES ($1, $2, $3, $3, $4, $5)",
                 &[
                     &batch_id,
-                    &account_id,
-                    &amount_cents,
+                    &input.account_id,
+                    &input.amount_cents,
                     &expires_at,
                     &credit_source_id,
                 ],
@@ -421,19 +422,19 @@ fn credit_with_source_id(
 
             tx.execute(
                 "UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2",
-                &[&amount_cents, &account_id],
+                &[&input.amount_cents, &input.account_id],
             )?;
             insert_balance_ledger_pg_tx(
                 &mut tx,
                 BalanceLedgerEntry {
-                    account_id,
-                    event_type,
-                    amount_cents,
+                    account_id: input.account_id,
+                    event_type: input.event_type,
+                    amount_cents: input.amount_cents,
                     balance_cents_before: balance_before,
-                    balance_cents_after: balance_before + amount_cents,
-                    reason,
-                    provider,
-                    processor_payment_id,
+                    balance_cents_after: balance_before + input.amount_cents,
+                    reason: input.reason,
+                    provider: input.provider,
+                    processor_payment_id: input.processor_payment_id,
                     source_id: Some(credit_source_id),
                     idempotency_key: Some(credit_source_id),
                     request_id: None,
@@ -469,13 +470,15 @@ pub fn credit_processor_payment(
         let source_id = format!("{provider}:{processor_payment_id}");
         credit_with_source_id(
             pool,
-            account_id,
-            amount_cents,
-            &source_id,
-            "processor_payment_credit",
-            Some("processor_confirmed_payment"),
-            Some(&provider),
-            Some(processor_payment_id),
+            CreditWithSourceInput {
+                account_id,
+                amount_cents,
+                credit_source_id: &source_id,
+                event_type: "processor_payment_credit",
+                reason: Some("processor_confirmed_payment"),
+                provider: Some(&provider),
+                processor_payment_id: Some(processor_payment_id),
+            },
         )
     })
 }
@@ -498,13 +501,15 @@ pub fn credit_internal(
         let source_id = format!("internal:{reason}:{}", uuid::Uuid::new_v4());
         credit_with_source_id(
             pool,
-            account_id,
-            amount_cents,
-            &source_id,
-            "internal_credit",
-            Some(reason),
-            None,
-            None,
+            CreditWithSourceInput {
+                account_id,
+                amount_cents,
+                credit_source_id: &source_id,
+                event_type: "internal_credit",
+                reason: Some(reason),
+                provider: None,
+                processor_payment_id: None,
+            },
         )
     })
 }
@@ -908,6 +913,17 @@ pub fn sweep_expired(pool: &DbPool) -> Result<i64> {
 mod tests {
     use super::*;
 
+    type LedgerTestRow = (
+        String,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
     fn temp_pool() -> DbPool {
         let path = std::env::temp_dir().join(format!("bluey-bal-{}.db", uuid::Uuid::new_v4()));
         let pool = crate::db::open_pool(&path).unwrap();
@@ -1038,16 +1054,7 @@ mod tests {
         assert!(deduct_for_request(&pool, &id, 175, "llm", "req-ledger").unwrap());
 
         let conn = pool.get().unwrap();
-        let rows: Vec<(
-            String,
-            i64,
-            i64,
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        )> = conn
+        let rows: Vec<LedgerTestRow> = conn
             .prepare(
                 "SELECT event_type, amount_cents, balance_cents_before,
                         balance_cents_after, provider, processor_payment_id,
