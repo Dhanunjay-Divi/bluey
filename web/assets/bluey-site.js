@@ -3094,26 +3094,35 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!sessions.length) {
         const empty = document.createElement('div');
         empty.className = 'session-empty';
-        empty.textContent = 'No uploaded desktop sessions yet. Sign in from Bluey desktop, then refresh after a chat or transcript syncs.';
+        empty.textContent = 'No saved desktop chats yet. Connected desktop conversations appear here after transcript or answer upload.';
         list.append(empty);
         return;
+      }
+
+      if (!sessions.some(sessionHasUploadedContent)) {
+        const hint = document.createElement('div');
+        hint.className = 'session-sync-banner';
+        hint.textContent = 'Session records are here. Conversation text appears after the desktop uploads transcript or answers.';
+        list.append(hint);
       }
 
       for (const session of sessions) {
         const counts = sessionUploadCounts(session);
         const hasContent = sessionHasUploadedContent(session);
+        const timeLabel = formatSessionTime(session.updated_at_ms || session.last_active_at_ms);
         const row = document.createElement('article');
         row.className = `session-row${hasContent ? '' : ' session-row-empty'}`;
 
         const body = document.createElement('div');
+        body.className = 'session-row-body';
         const title = document.createElement('strong');
         title.className = 'session-title';
         title.textContent = session.title || `Session ${shortSessionId(session.session_id)}`;
         const meta = document.createElement('span');
         meta.className = 'session-meta';
         meta.textContent = hasContent
-          ? `${session.status || 'uploaded'} - ${formatSessionTime(session.updated_at_ms || session.last_active_at_ms)}`
-          : `Session record uploaded - no chat transcript or Bluey answers yet - ${formatSessionTime(session.updated_at_ms || session.last_active_at_ms)}`;
+          ? `Conversation uploaded - ${timeLabel}`
+          : `Waiting for transcript or answers - ${timeLabel}`;
         const chips = document.createElement('div');
         chips.className = 'session-upload-chips';
         for (const chipText of sessionUploadChipLabels(counts)) {
@@ -3124,24 +3133,37 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }
         body.append(title, meta, chips);
 
+        const actions = document.createElement('div');
+        actions.className = 'session-actions';
         const copyId = document.createElement('button');
         copyId.className = 'account-button ghost compact';
         copyId.type = 'button';
         copyId.dataset.copy = session.session_id || '';
         copyId.textContent = 'Copy ID';
+        actions.append(copyId);
 
-        const link = document.createElement('a');
-        link.className = 'account-button ghost';
-        link.href = accountSessionHref(session.session_id);
-        link.target = '_blank';
-        link.rel = 'noopener';
-        link.dataset.sessionId = session.session_id || '';
-        link.setAttribute('aria-label', `Open ${session.title || 'uploaded session'} in a new tab`);
-        link.title = hasContent
-          ? 'Open uploaded conversation in a new tab'
-          : 'Open upload status in a new tab';
-        link.textContent = 'Open tab';
-        row.append(body, copyId, link);
+        if (hasContent) {
+          const link = document.createElement('a');
+          link.className = 'account-button ghost compact session-open-link';
+          link.href = accountSessionHref(session.session_id);
+          link.target = '_blank';
+          link.rel = 'noopener';
+          link.dataset.sessionId = session.session_id || '';
+          link.setAttribute('aria-label', `Open ${session.title || 'uploaded session'} in a new tab`);
+          link.title = 'Open uploaded conversation in a new tab';
+          link.textContent = 'Open';
+          actions.append(link);
+        } else {
+          const waiting = document.createElement('button');
+          waiting.className = 'account-button ghost compact session-open-disabled';
+          waiting.type = 'button';
+          waiting.disabled = true;
+          waiting.title = 'No uploaded conversation yet.';
+          waiting.textContent = 'Waiting';
+          actions.append(waiting);
+        }
+
+        row.append(body, actions);
         list.append(row);
       }
     }
@@ -3166,7 +3188,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function sessionUploadChipLabels(counts) {
       if (!counts.transcript && !counts.responses && !counts.context) {
-        return ['No chat uploaded yet'];
+        return ['No conversation uploaded yet'];
       }
       return [
         counts.responses ? countLabel(counts.responses, 'chat turn') : '',
@@ -3300,7 +3322,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       uploadState.className = `session-upload-state${hasUploadedContent ? '' : ' is-empty'}`;
       uploadState.textContent = hasUploadedContent
         ? 'Uploaded from Bluey desktop. This is view-only on web for now.'
-        : 'Only the session record has uploaded so far. No local chat transcript, Bluey answers, or context have arrived for this session yet.';
+        : 'Bluey has the session record, but no conversation text has uploaded yet. Keep the desktop open, ask or answer once, then refresh.';
       detail.append(title, meta, uploadState);
 
       const copyId = document.createElement('button');
