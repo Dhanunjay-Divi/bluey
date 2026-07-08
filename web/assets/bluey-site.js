@@ -2567,7 +2567,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         amountCents = readManualReloadCents('modalReloadAmount');
         if (checkoutButton) {
           checkoutButton.textContent = canUseCard
-            ? `Add ${money(amountCents)}${enabled ? ' + Auto Reload' : ''}`
+            ? `Add ${money(amountCents)}`
             : 'Continue to checkout';
           checkoutButton.disabled = false;
         }
