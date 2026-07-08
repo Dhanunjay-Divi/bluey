@@ -72,6 +72,7 @@ const LIVE_STT_AUDIBLE_PEAK_DBFS: f64 = -34.0;
 const LIVE_STT_PREFACE_CHUNKS: usize = 8;
 const LIVE_STT_STARTUP_WARMUP_MS: u128 = 250;
 const LIVE_STT_FINALIZE_WAIT_MS: u64 = 850;
+const LIVE_STT_INTERIM_CONTEXT_MAX_AGE_MS: u64 = 10_000;
 const LIVE_STT_SILENCE_NOTICE_MS: u128 = 8_000;
 const PCM16_DBFS_FLOOR: f64 = -120.0;
 
@@ -1478,6 +1479,11 @@ pub struct LiveTranscriptEvent {
     pub ts_ms: u64,
 }
 
+async fn publish_live_transcript_event(daemon: &Arc<Daemon>, event: LiveTranscriptEvent) {
+    *daemon.last_live_transcript.lock().await = Some(event.clone());
+    let _ = daemon.live_transcript_tx.send(event);
+}
+
 struct Daemon {
     paths: AppPaths,
     store: MeetingStore,
@@ -1500,6 +1506,7 @@ struct Daemon {
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
     live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
+    last_live_transcript: Mutex<Option<LiveTranscriptEvent>>,
     rag_indexer: RagIndexCoordinator,
     /// Per-session token issued at boot. Native overlay must echo this in
     /// every event; mismatched / missing token -> event dropped.
@@ -1695,6 +1702,7 @@ pub async fn run() -> Result<()> {
         active_answer_card: Mutex::new(None),
         system_audio: Mutex::new(None),
         live_transcript_tx: broadcast::channel(64).0,
+        last_live_transcript: Mutex::new(None),
         rag_indexer,
         overlay_session_token: crate::overlay::generate_session_token()
             .context("failed to generate overlay session token")?,
@@ -3376,6 +3384,7 @@ async fn record_active_session_listen_start(
     audio_session_id: &str,
     stt_provider: Option<&str>,
 ) -> Result<MeetingRecord> {
+    *daemon.last_live_transcript.lock().await = None;
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
@@ -4123,6 +4132,30 @@ async fn active_transcript_segment_count(daemon: &Arc<Daemon>) -> usize {
         .as_ref()
         .map(|meeting| meeting.transcript.len())
         .unwrap_or(0)
+}
+
+async fn recent_interim_live_transcript_context(daemon: &Arc<Daemon>) -> Option<AnswerContext> {
+    let audio_session_id = daemon.audio.lock().await.session_id.clone()?;
+    let event = daemon.last_live_transcript.lock().await.clone()?;
+    if event.is_final || event.session_id != audio_session_id {
+        return None;
+    }
+    let text = event.text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let now_ms = clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0);
+    if now_ms.saturating_sub(event.ts_ms) > LIVE_STT_INTERIM_CONTEXT_MAX_AGE_MS {
+        return None;
+    }
+
+    Some(
+        AnswerContext::transcript(format!(
+            "Latest live caption interim, captured before final STT arrived:\n{text}"
+        ))
+        .with_title("Latest live caption")
+        .with_source("live captions interim"),
+    )
 }
 
 async fn resolve_real_audio_sources(
@@ -6157,7 +6190,7 @@ fn overlay_history_cards_for_meeting(meeting: &MeetingRecord) -> Vec<CueCard> {
     }
 
     if cards.is_empty() {
-        let transcript = meeting.last_transcript_text_bounded(40, 6_000);
+        let transcript = overlay_history_transcript_fallback(meeting, 40, 6_000);
         if !transcript.trim().is_empty() {
             cards.push(
                 CueCard::new(CardKind::System, "Transcript", transcript)
@@ -6200,6 +6233,87 @@ fn overlay_history_cards_for_meeting(meeting: &MeetingRecord) -> Vec<CueCard> {
         "overlay history cards rebuilt"
     );
     cards
+}
+
+fn overlay_history_transcript_fallback(
+    meeting: &MeetingRecord,
+    count: usize,
+    max_chars: usize,
+) -> String {
+    if count == 0 || max_chars == 0 {
+        return String::new();
+    }
+
+    let start = meeting.transcript.len().saturating_sub(count);
+    let mut groups: Vec<(Speaker, String)> = Vec::new();
+    for segment in &meeting.transcript[start..] {
+        let text = segment
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.is_empty() {
+            continue;
+        }
+        match groups.last_mut() {
+            Some((speaker, body)) if *speaker == segment.speaker => {
+                if !body.is_empty() {
+                    body.push(' ');
+                }
+                body.push_str(&text);
+            }
+            _ => groups.push((segment.speaker, text)),
+        }
+    }
+
+    let single_speaker = groups.len() <= 1;
+    let mut paragraphs = Vec::new();
+    for (speaker, body) in groups {
+        let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        if body.is_empty() {
+            continue;
+        }
+        if single_speaker {
+            paragraphs.push(body);
+        } else {
+            paragraphs.push(format!(
+                "{}: {}",
+                history_transcript_speaker_label(speaker),
+                body
+            ));
+        }
+    }
+
+    let joined = paragraphs.join("\n\n");
+    compact_transcript_display_tail(&joined, max_chars)
+}
+
+fn history_transcript_speaker_label(speaker: Speaker) -> &'static str {
+    match speaker {
+        Speaker::User => "User",
+        Speaker::System => "System",
+        Speaker::Other => "Speaker",
+        Speaker::Unknown => "Transcript",
+    }
+}
+
+fn compact_transcript_display_tail(text: &str, max_chars: usize) -> String {
+    let clean = text.trim();
+    if clean.chars().count() <= max_chars {
+        return clean.to_string();
+    }
+
+    let tail = clean
+        .chars()
+        .rev()
+        .take(max_chars.saturating_sub(4))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+        .trim_start()
+        .to_string();
+    format!("... {tail}")
 }
 
 fn history_question_card_attachments(
@@ -7490,14 +7604,18 @@ async fn add_audio_transcript_segment_inner(
             },
         )
         .await;
-        let _ = daemon.live_transcript_tx.send(LiveTranscriptEvent {
-            session_id: audio_session_id,
-            source: source_label.to_string(),
-            text: text.to_string(),
-            is_final: false,
-            speaker: None,
-            ts_ms: clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0),
-        });
+        publish_live_transcript_event(
+            daemon,
+            LiveTranscriptEvent {
+                session_id: audio_session_id,
+                source: source_label.to_string(),
+                text: text.to_string(),
+                is_final: false,
+                speaker: None,
+                ts_ms: clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0),
+            },
+        )
+        .await;
         return Ok(false);
     }
 
@@ -7565,14 +7683,18 @@ async fn add_audio_transcript_segment_inner(
         .last()
         .and_then(|s| s.created_at.parse::<u64>().ok())
         .unwrap_or(0);
-    let _ = daemon.live_transcript_tx.send(LiveTranscriptEvent {
-        session_id: meeting_snapshot.id.to_string(),
-        source: source_label.to_string(),
-        text: text.to_string(),
-        is_final: segment.is_final,
-        speaker: None,
-        ts_ms,
-    });
+    publish_live_transcript_event(
+        daemon,
+        LiveTranscriptEvent {
+            session_id: meeting_snapshot.id.to_string(),
+            source: source_label.to_string(),
+            text: text.to_string(),
+            is_final: segment.is_final,
+            speaker: None,
+            ts_ms,
+        },
+    )
+    .await;
 
     if segment.is_final {
         index_transcript_for_rag(daemon, meeting_snapshot.id.to_string(), text.to_string());
@@ -7880,6 +8002,11 @@ async fn answer_with_provider_runtime(
             &request.metadata.visible_context_ids,
         )
         .await;
+    }
+    if live_caption_answer {
+        if let Some(interim_context) = recent_interim_live_transcript_context(daemon).await {
+            request.context.push(interim_context);
+        }
     }
     promote_request_to_vision_for_screen_context(&daemon.paths, &mut request);
     let context_prepare_ms = elapsed_ms(context_started_at);
@@ -8309,6 +8436,12 @@ fn user_facing_answer_error(error: &anyhow::Error) -> String {
     }
     if is_payload_too_large_error(&lower) {
         return "That answer had too much attached screen context for one request. Remove one screenshot or retry with a smaller capture; Bluey will still use any saved text previews it has.".to_string();
+    }
+    if lower.contains("code_artifact_missing")
+        || lower.contains("expected code for this answer")
+        || lower.contains("provider returned only prose")
+    {
+        return "Bluey expected a code panel for that answer, but the provider returned prose only. Ask for the full code again and Bluey will try another route.".to_string();
     }
     if lower.contains("insufficient_quota")
         || lower.contains("quota")
@@ -16762,6 +16895,36 @@ mod tests {
     }
 
     #[test]
+    fn overlay_history_transcript_fallback_merges_spoken_segments() {
+        let mut meeting = MeetingRecord::new(Some("Rental agency".to_string()));
+        for text in [
+            "Hey. How's it",
+            "going?",
+            "So",
+            "today, let's discuss about",
+            "think we have a rental car agency",
+            "and we need to know",
+            "which is the best location to start our new",
+            "rental agency.",
+        ] {
+            meeting
+                .transcript
+                .push(TranscriptSegment::new(Speaker::User, text, true));
+        }
+
+        let cards = overlay_history_cards_for_meeting(&meeting);
+        assert_eq!(cards.len(), 1);
+        assert!(matches!(cards[0].kind, CardKind::System));
+        assert_eq!(cards[0].title, "Transcript");
+        assert!(!cards[0].body.contains("user:"));
+        assert!(!cards[0].body.contains('\n'));
+        assert!(cards[0]
+            .body
+            .contains("Hey. How's it going? So today, let's discuss"));
+        assert!(cards[0].body.contains("rental agency."));
+    }
+
+    #[test]
     fn overlay_history_cards_restore_code_artifact_button() {
         let mut meeting = MeetingRecord::new(Some("Code".to_string()));
         let artifact = CueCardArtifact {
@@ -18898,6 +19061,19 @@ mod tests {
     }
 
     #[test]
+    fn user_facing_answer_error_names_missing_code_artifact_before_capacity() {
+        let error = anyhow!(
+            "bluey_managed/balanced request failed: capacity busy: retry after 1s (code_artifact_missing)"
+        );
+
+        let message = user_facing_answer_error(&error);
+
+        assert!(message.contains("code panel"));
+        assert!(message.contains("try another route"));
+        assert!(!message.contains("Capacity busy"));
+    }
+
+    #[test]
     fn user_facing_answer_error_keeps_capacity_retry_hint() {
         let error = anyhow!("capacity busy: retry after 17s (provider_capacity)");
 
@@ -19522,6 +19698,7 @@ mod tests {
             active_answer_card: Mutex::new(None),
             system_audio: Mutex::new(None),
             live_transcript_tx: broadcast::channel(64).0,
+            last_live_transcript: Mutex::new(None),
             rag_indexer: RagIndexCoordinator::from_paths(&paths),
             overlay_session_token: "test-token".to_string(),
             overlay_ui_state: new_shared_overlay_ui_state(),

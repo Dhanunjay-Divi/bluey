@@ -669,6 +669,23 @@ fn upsert_batch_postgres(
         let text = db_text(&record.text);
         let embedding_model = db_opt_text(&record.embedding_model);
         let content_hash = db_opt_text(&record.content_hash);
+        let chunk_index = i32::try_from(record.chunk_index).with_context(|| {
+            format!(
+                "cloud_rag_chunks chunk_index out of range chunk_id={} value={}",
+                record.chunk_id, record.chunk_index
+            )
+        })?;
+        let token_count = record
+            .token_count
+            .map(|value| {
+                i32::try_from(value).with_context(|| {
+                    format!(
+                        "cloud_rag_chunks token_count out of range chunk_id={} value={}",
+                        record.chunk_id, value
+                    )
+                })
+            })
+            .transpose()?;
         tx.execute(
             "INSERT INTO cloud_rag_chunks (
                 account_id, chunk_id, session_id, source_kind, source_id, chunk_index,
@@ -694,12 +711,12 @@ fn upsert_batch_postgres(
                 &record.session_id,
                 &source_kind,
                 &source_id,
-                &record.chunk_index,
+                &chunk_index,
                 &text,
                 &embedding_json,
                 &embedding_vector,
                 &embedding_model,
-                &record.token_count,
+                &token_count,
                 &content_hash,
                 &record.updated_at_ms,
                 &metadata,

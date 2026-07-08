@@ -858,9 +858,15 @@ async fn cue_on(args: OnArgs) -> Result<()> {
             url: bluey_signin_url(),
         }
     };
+    let overlay_was_hidden = matches!(
+        request(DaemonRequest::Status).await,
+        Ok(DaemonResponse::Status { state }) if !state.overlay_visible
+    );
     // The native overlay orders the branded pill front when the child process
     // starts. Do not send OverlayShow here: in the current protocol it expands
-    // the full feed, while `bluey on` should launch pill-first.
+    // the full feed, while `bluey on` should launch pill-first. If an existing
+    // overlay was collapsed/hidden, though, make it visible again so `bluey on`
+    // never leaves the user with a running daemon and no Bluey on screen.
     let boot = request(DaemonRequest::OverlayBoot {
         title: bluey_on_boot_title(&auth_state).to_string(),
         lines: bluey_on_boot_lines(&auth_state),
@@ -870,6 +876,9 @@ async fn cue_on(args: OnArgs) -> Result<()> {
 
     match boot {
         Ok(DaemonResponse::Ok) => {
+            if overlay_was_hidden {
+                let _ = request(DaemonRequest::OverlayShow).await;
+            }
             if should_start_login {
                 match request(DaemonRequest::CloudLogin).await {
                     Ok(DaemonResponse::Text { text }) => println!("{text}"),

@@ -5006,7 +5006,6 @@ async fn complete_stream_inner(
         }
         let artifact = response_artifact_for_output(&text, answer_plan.output);
         if code_artifact_missing_for_plan(&answer_plan, artifact.as_ref()) {
-            idempotency_guard.mark_failed_now();
             tracing::warn!(
                 account_id_hash = %account_id_hash,
                 request_id = %req.request_id,
@@ -5021,7 +5020,7 @@ async fn complete_stream_inner(
                 answer_output = %answer_plan.output.as_str(),
                 text_chars = text.chars().count(),
                 streaming = true,
-                "code artifact expected but missing before billing"
+                "code artifact expected but missing after streaming; preserving streamed answer"
             );
             record_answer_ops_event(
                 &state.pool,
@@ -5030,8 +5029,8 @@ async fn complete_stream_inner(
                     request_id: &req.request_id,
                     session_id: req.session_id.as_deref(),
                     trace_id: Some(&trace_id),
-                    event_type: "answer_failed",
-                    status: "code_artifact_missing",
+                    event_type: "answer_warning",
+                    status: "code_artifact_missing_stream_preserved",
                     metadata: serde_json::json!({
                     "lane": lane_log.as_str(),
                     "effective_lane": effective_lane_log.as_str(),
@@ -5047,13 +5046,6 @@ async fn complete_stream_inner(
                     }),
                 },
             );
-            let payload = serde_json::json!({
-                "error": "Bluey expected code for this answer, but the provider returned only prose. Please retry.",
-                "reason": "code_artifact_missing",
-                "retry_after_secs": 1,
-            });
-            yield Ok(Event::default().event("error").data(payload.to_string()));
-            return;
         }
         let elapsed_ms = started.elapsed().as_millis() as i64;
         let (llm_bluey_cost, llm_customer_cost) = pricing::compute_cost(
