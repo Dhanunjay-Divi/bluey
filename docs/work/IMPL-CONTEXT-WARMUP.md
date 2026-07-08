@@ -105,6 +105,45 @@
     not the facts store; tune window sizing / extraction prompting against a
     meeting-shaped eval alongside the LongMemEval run.
 
+### Hybrid retrieval — the mem0 v3 search port (follow-up build, 2026-07-08)
+- Motivation: an honest source audit (5-reader workflow over mem0 HEAD
+  22f70d5) showed our read path was cosine-only while mem0 v3 ships hybrid
+  search — BM25 + adaptive sigmoid + entity boosts. Ported exactly:
+  - `cue-rag/src/hybrid.rs`: Okapi BM25 over Snowball-stemmed fact text
+    (stemming stands in for spaCy lemmatization — same role, consistent on
+    both sides; the `-ing` original-form rule kept), mem0's
+    `get_bm25_params`/`normalize_bm25`/`score_and_rank` with PARITY TESTS
+    pinned to values from running mem0's own scoring.py, `entity_boost`
+    (`sim * 0.5 * 1/(1+0.001(n-1)²)`), and a POS-free port of the entity
+    extractor (IDENTIFIER regex, PROPER capitalized spans with connectors +
+    generic-word filters, QUOTED; spaCy-only NER/TOPIC not ported — mem0
+    without spaCy extracts nothing, so this exceeds its own fallback).
+  - `facts.rs` schema v2: `text_stemmed` column (transparent backfill
+    migration), `fact_entities` table (`normalized UNIQUE`, embedding,
+    `linked_ids` JSON), `upsert_entity` (exact-normalized → merge; semantic
+    ≥0.95 → merge; else insert), `entity_matches` (≥0.5 floor),
+    `hybrid_query` (semantic pool over-fetched at `max(k*4,60)`, BM25 over
+    the current corpus, fusion; threshold gates SEMANTIC before fusion —
+    `FactHit` now carries both `score` (combined, ranking) and `semantic`
+    (gating); `render_hits` floors on `semantic`).
+  - `memory.rs`: `link_entities` on every fact write (ledger kind label
+    stripped first), query-entity boosts in `search` (cap 8, dedup), plus
+    `search_semantic_only` kept as the measured baseline surface.
+- **Measured** (real bge-small, 15 meeting facts, 12 labeled queries):
+  hybrid hit@1 = cosine hit@1 = 11/12, zero regressions. The eval CAUGHT a
+  real defect pre-ship: bge-small clusters short acronyms ("SLA"≈"SSO"
+  cosine >0.5), so a query entity falsely boosted the wrong fact past a
+  0.763-semantic right answer. Fix (documented delta from mem0, whose
+  OpenAI-tuned floor never sees this): non-exact entity matches where
+  either side is ≤4 chars require 0.85 (`SHORT_ENTITY_MATCH_FLOOR`);
+  exact-normalized matches keep mem0's 0.5.
+- Known residual deltas from mem0 v3 search: no ANN index (O(N) scan — fine
+  at v1 scale), stale fact ids accumulate inside `linked_ids` (harmless for
+  ranking — only CURRENT rows are ranked — but they dilute
+  `memory_count_weight` over time; revisit with entity GC), and the
+  `last-10-messages` extraction-context table is not ported (our extraction
+  context is the transcript window, which serves the same role).
+
 ## Deliberate scope notes
 - Ledger kinds stay Decision/Constraint/Owner (quote-verified). News-style
   audio correctly yields zero items.

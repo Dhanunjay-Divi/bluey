@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the actual cure for the daemon-spawned subprocesses.
 
 ### Added
+- **Hybrid cross-meeting retrieval — the mem0 v3 search pipeline in Rust.**
+  Recall over the facts memory is no longer cosine-only: it now fuses
+  semantic similarity + Okapi BM25 over stemmed fact text (sigmoid-normalized
+  with mem0's query-length-adaptive params) + entity boosts from a linked
+  entity store (facts' proper names / identifiers / quoted terms, extracted
+  POS-free and linked at write time). The scoring math is pinned by parity
+  tests against values produced by RUNNING mem0's own `scoring.py`; the
+  relevance floor still gates the SEMANTIC score before fusion (mem0's
+  threshold contract), so the verified precision behavior is unchanged and
+  fusion only improves ranking. Measured on a meeting-shaped eval (real
+  bge-small): hybrid ≥ cosine baseline with zero regressions; the eval also
+  caught and fixed a real small-embedder failure mode (bge-small clusters
+  short acronyms — "SLA"≈"SSO" cleared mem0's 0.5 entity floor and falsely
+  boosted the wrong fact; non-exact short-entity matches now require 0.85).
+  Store schema v2 migrates transparently (stemmed-text backfill, new
+  `fact_entities` table).
 - **Mem0-in-Rust: the full two-phase memory pipeline (PLAN-CONTEXT-WARMUP
   Appendix E).** Phase 1 (extraction via the attached agent's throwaway
   one-shot, quote-verified) now feeds phase 2 — an agent-decided
