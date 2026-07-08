@@ -144,7 +144,7 @@
         <h2>Information We Process</h2>
         <ul>
           <li>Account data such as email, password hash, device/session tokens, balance, reload history, and usage records.</li>
-          <li>User-approved context such as typed prompts, source-labeled transcripts, attached files, screen-analysis results, answer-style instructions, and generated responses.</li>
+          <li>User-approved context such as typed prompts, source-labeled transcripts, voice/audio recordings or chunks, attached files, screen-analysis results, answer-style instructions, and generated responses.</li>
           <li>Diagnostic data such as error reports, service health, abuse controls, and support bundles. Logs are designed to avoid secrets and full user content.</li>
           <li>Payment information needed to complete reloads. Bluey does not collect or store full card numbers, CVV, or card expiration data.</li>
         </ul>
@@ -153,10 +153,10 @@
         <p>We use account and session data to authenticate you, answer requests, meter paid usage, save approved context, provide searchable history, show balance and cost labels, debug failures, prevent abuse, and support export or deletion requests.</p>
 
         <h2>Internal Alpha Training and Improvement</h2>
-        <p>During the internal alpha, Bluey may use prompts, transcripts, attached context, screen-analysis results, generated responses, feedback, and usage patterns to evaluate quality, train or tune Bluey systems, improve routing, debug product behavior, and build better safeguards. Do not submit confidential, regulated, or third-party content unless you have permission for that use.</p>
+        <p>During the internal alpha, Bluey may use prompts, transcripts, voice/audio recordings or chunks, attached context, screen-analysis results, generated responses, feedback, and usage patterns to evaluate transcription and answer quality, train or tune Bluey systems, improve routing, debug product behavior, and build better safeguards. Do not submit confidential, regulated, or third-party content unless you have permission for that use.</p>
 
         <h2>AI, Speech, and Context</h2>
-        <p>When a request needs AI, Bluey sends only the context needed for that request: your prompt, selected transcript snippets, attached document text, screen-analysis output, saved session memory, and request details such as task type and approximate cost. Bluey may route different requests through different answer, speech, image, or search paths depending on the task and selected context.</p>
+        <p>When a request needs AI or speech transcription, Bluey sends the context needed for that request: your prompt, selected transcript snippets, relevant audio chunks, attached document text, screen-analysis output, saved session memory, and request details such as task type and approximate cost. Bluey may route different requests through different answer, speech, image, or search paths depending on the task and selected context.</p>
 
         <h2>Files, Sessions, and Memory</h2>
         <p>Documents, images, screenshots, and other files you attach are parsed into readable text where supported and are tied to the active Bluey session. When you sign in with saved-session sync on, Bluey may store the original synced file bytes, lightweight previews, extracted text, summaries, and search indexes so another signed-in device can restore the session and answer from the same context. You can turn cloud sync off in settings and keep using local sessions.</p>
@@ -165,10 +165,10 @@
         <p>Desktop capture starts only through visible user controls. You can stop listening, hide the overlay, attach or remove documents, export account data, delete your account, and clear local state.</p>
 
         <h2>Retention</h2>
-        <p>Purchased balance remains in account records for accounting and expires up to 12 months (365 days) after purchase. Cloud-synced session records, transcripts, document bytes, screenshots, extracted text, summaries, generated responses, and search indexes are kept for up to 90 days from their last sync or use unless you delete them earlier. Cleanup is lazy, so expired objects may remain briefly until a maintenance pass removes them, but they are no longer intended for active product use.</p>
+        <p>Purchased balance remains in account records for accounting and expires up to 12 months (365 days) after purchase. Cloud-synced session records, transcripts, voice/audio recordings or chunks, document bytes, screenshots, extracted text, summaries, generated responses, and search indexes are kept for up to 90 days from their last sync or use unless you delete them earlier. Cleanup is lazy, so expired objects may remain briefly until a maintenance pass removes them, but they are no longer intended for active product use.</p>
 
         <h2>Account Deletion</h2>
-        <p>Deleting your account is permanent. It removes account records, local-device authorization records, saved cloud sessions, synced files, screenshots, transcripts, extracted text, generated answers, usage history, and related searchable indexes where deletion is technically available. Unused account balance is lost when the account is deleted, so contact support before deletion if you need a billing review.</p>
+        <p>Deleting your account is permanent. It removes account records, local-device authorization records, saved cloud sessions, synced files, screenshots, transcripts, voice/audio recordings or chunks, extracted text, generated answers, usage history, and related searchable indexes where deletion is technically available. Unused account balance is lost when the account is deleted, so contact support before deletion if you need a billing review.</p>
 
         <h2>Security</h2>
         <p>Desktop account tokens are stored in Bluey's private local account profile so the app can reconnect without operating-system keychain prompts. Payment and AI credentials are kept outside the desktop app. Logs are designed for debugging and support, not for storing raw secrets or full user content.</p>
@@ -199,13 +199,13 @@
         <p>You may use Bluey for your own work, meetings, documents, coding, research, and day-to-day productivity. You may not use Bluey to break laws, access data you are not authorized to access, deceive third-party assessment/security systems, harvest credentials or session cookies, or bypass platform restrictions.</p>
 
         <h2>User-Controlled Context</h2>
-        <p>You are responsible for the documents, transcripts, screenshots, repositories, and other context you attach or ask Bluey to analyze. Bluey should be used with consent where required, and it should not be used for hidden capture of people or information you are not allowed to process.</p>
+        <p>You are responsible for the documents, transcripts, voice/audio, screenshots, repositories, and other context you attach or ask Bluey to analyze. Bluey should be used with consent where required, and it should not be used for hidden capture of people or information you are not allowed to process.</p>
 
         <h2>Training and Product Improvement</h2>
-        <p>During the internal alpha, you give Bluey permission to host, process, copy, analyze, evaluate, and use submitted context and generated responses to provide the service, improve product quality, train or tune Bluey systems, improve routing, and build safeguards. You must only submit content that you have the right to provide for those purposes.</p>
+        <p>During the internal alpha, you give Bluey permission to host, process, copy, analyze, evaluate, and use submitted context, voice/audio recordings or chunks, transcripts, and generated responses to provide the service, improve transcription and answer quality, train or tune Bluey systems, improve routing, and build safeguards. You must only submit content that you have the right to provide for those purposes.</p>
 
         <h2>Cloud Sync and Retention</h2>
-        <p>If you sign in with cloud sync or saved sessions enabled, you authorize Bluey to store synced session details, transcripts, generated answers, original file or screenshot bytes, extracted text, summaries, and search indexes for restoration, answer context, and the internal alpha improvement uses described above. These synced objects are retained for up to 90 days from last sync or use unless you delete them earlier. Expired objects are removed lazily during cleanup, restore attempts, or maintenance passes.</p>
+        <p>If you sign in with cloud sync or saved sessions enabled, you authorize Bluey to store synced session details, transcripts, voice/audio recordings or chunks, generated answers, original file or screenshot bytes, extracted text, summaries, and search indexes for restoration, answer context, transcription review, and the internal alpha improvement uses described above. These synced objects are retained for up to 90 days from last sync or use unless you delete them earlier. Expired objects are removed lazily during cleanup, restore attempts, or maintenance passes.</p>
 
         <h2>AI Output</h2>
         <p>Bluey can help draft answers, summarize sessions, explain code, reason about systems, and organize context. AI output may be incomplete or wrong. You are responsible for reviewing generated output before relying on it, sending it, submitting it, or using it to make decisions.</p>

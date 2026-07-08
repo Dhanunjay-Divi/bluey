@@ -70,7 +70,19 @@ Capture these local events before cloud sync is attempted:
 - canvas/artifact output, including artifact type/body/confidence
 - cloud sync state and upload errors
 
-Raw audio and raw screen images should be local-only by default. If internal alpha training upload is enabled, it should be controlled by an explicit config flag and reflected in Terms/Privacy copy.
+## Audio/STT Quality Scope
+
+For STT quality review, the audit bundle must preserve audio evidence, not only the final transcript.
+
+Implementation target for this round:
+
+- persist raw or chunked mic/system audio locally under `session-audit/<session_id>/audio/`
+- give every chunk a stable `audio_id`, codec/container, channel/source label, duration, and start/end timestamp
+- add `source_audio_id`, `start_ms`, `end_ms`, STT provider/model, language, and confidence/error fields to transcript records when available
+- upload internal alpha audio chunks through the same training/QA retention path used for other session data
+- keep upload state visible in the audit metadata so reviewers know whether an audio chunk stayed local, uploaded, failed, or was skipped
+
+Terms and Privacy must clearly state that internal alpha session data can include voice/audio recordings or chunks used for transcription quality review, product improvement, training/tuning, routing, safeguards, and debugging, with the same 90-day retention window as synced session content.
 
 ## Sync Requirements
 
@@ -122,4 +134,4 @@ Avoid internal implementation words in the UI such as backend, webhook, provider
 
 ## Status
 
-Ready for another agent to review against the runtime implementation. No deploy, no runtime edits, and no UI changes were made in this round.
+Ready for another agent to review against the runtime implementation. No deploy or runtime edits were made in this round. Companion Terms/Privacy wording is tracked in `ROUND-432-INTERNAL-ALPHA-AUDIO-TERMS.md`.
