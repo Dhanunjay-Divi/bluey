@@ -2392,6 +2392,10 @@ async fn handle_request_inner(
                 });
             Ok(DaemonResponse::AgentConnectors { connectors })
         }
+        DaemonRequest::SourceCoverage => {
+            let sources = source_coverage(daemon).await;
+            Ok(DaemonResponse::SourceCoverage { sources })
+        }
         DaemonRequest::AgentModels { kind } => {
             // Not consent-gated (public model list). Same resolver the overlay
             // push path uses; sentinel-led + never empty on any failure.
@@ -4188,6 +4192,92 @@ async fn handle_agent_connectors_requested(daemon: &Arc<Daemon>, kind: &str) {
 
 /// Blocking core of [`handle_agent_connectors_requested`]: find the agent and
 /// read its connector config into [`AgentConnectorInfo`] DTOs (never secrets).
+/// The meeting-relevant context sources the coverage meter reports, with the
+/// connector-name patterns that mark each as connected. Names are freeform
+/// user config, so matching is substring-on-lowercase — deliberately loose
+/// (a false "connected" is caught the first time the agent actually pulls).
+const MEETING_SOURCES: &[(&str, &str, &[&str])] = &[
+    ("calendar", "Calendar", &["calendar", "gcal", "cal-"]),
+    ("slack", "Slack", &["slack"]),
+    ("email", "Email", &["mail", "gmail", "outlook"]),
+    (
+        "tickets",
+        "Tickets & PRs",
+        &["jira", "linear", "github", "gitlab", "asana", "shortcut"],
+    ),
+];
+
+/// Guided connect instruction for one missing source on one agent — the
+/// exact command the USER runs (authorization happens inside their agent;
+/// Bluey never holds credentials). Only vetted, officially-documented
+/// endpoints get a hint; everything else returns `None` until curated.
+fn connect_hint_for(agent: &AgentKind, source: &str) -> Option<String> {
+    // Official hosted MCP endpoints (vendor-documented).
+    let (name, url) = match source {
+        "tickets" => ("github", "https://api.githubcopilot.com/mcp/"),
+        _ => return None,
+    };
+    match agent {
+        AgentKind::ClaudeCode | AgentKind::ClaudeCodeApp | AgentKind::ClaudeCodeAgent => {
+            Some(format!("claude mcp add --transport http {name} {url}"))
+        }
+        AgentKind::Copilot => None, // GitHub MCP is built into copilot already
+        AgentKind::Codex => Some(format!("codex mcp add {name} --url {url}")),
+        AgentKind::Gemini | AgentKind::Cursor => Some(format!(
+            "add to mcpServers: {{ \"{name}\": {{ \"url\": \"{url}\" }} }}"
+        )),
+        _ => None,
+    }
+}
+
+/// Coverage of the meeting-relevant sources for the ATTACHED agent — the
+/// onboarding coverage meter's data. Empty when no agent is attached (the
+/// UI shows the attach gate instead).
+async fn source_coverage(daemon: &Arc<Daemon>) -> Vec<cue_core::SourceCoverageInfo> {
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    let Some(agent) = parse_attached_agent(settings.attached_agent.as_deref()) else {
+        return Vec::new();
+    };
+    let label = agent_model_label(&agent).to_string();
+    let connectors = tokio::task::spawn_blocking(move || list_agent_connectors(&label))
+        .await
+        .unwrap_or_default();
+    let names_lower: Vec<String> = connectors.iter().map(|c| c.name.to_lowercase()).collect();
+
+    let mut sources = Vec::with_capacity(MEETING_SOURCES.len() + 1);
+    for (source, label, patterns) in MEETING_SOURCES {
+        let via = names_lower
+            .iter()
+            .position(|n| patterns.iter().any(|p| n.contains(p)))
+            .map(|i| connectors[i].name.clone());
+        sources.push(cue_core::SourceCoverageInfo {
+            source: (*source).to_string(),
+            label: (*label).to_string(),
+            connected: via.is_some(),
+            connect_hint: if via.is_some() {
+                None
+            } else {
+                connect_hint_for(&agent, source)
+            },
+            via,
+        });
+    }
+    // Bluey's own memory connector: registered at warm-up, so "connected"
+    // means the registration is currently present in the agent's config.
+    let bluey = names_lower
+        .iter()
+        .position(|n| n == cue_agent_bridge::mcp_register::BLUEY_SERVER_NAME)
+        .map(|i| connectors[i].name.clone());
+    sources.push(cue_core::SourceCoverageInfo {
+        source: "bluey_memory".to_string(),
+        label: "Bluey meeting memory".to_string(),
+        connected: bluey.is_some(),
+        via: bluey,
+        connect_hint: Some("connected automatically when a meeting warms up".to_string()),
+    });
+    sources
+}
+
 fn list_agent_connectors(kind: &str) -> Vec<AgentConnectorInfo> {
     let Some(agent) = find_discovered_agent(kind) else {
         return Vec::new();

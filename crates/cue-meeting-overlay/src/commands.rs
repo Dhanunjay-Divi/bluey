@@ -76,6 +76,16 @@ pub async fn agent_connectors(link: State<'_, DaemonLink>, kind: String) -> Resu
     array_field(resp, "connectors")
 }
 
+/// Coverage of the meeting-relevant context sources for the attached agent —
+/// the onboarding coverage meter's data (calendar/slack/email/tickets +
+/// Bluey's own memory connector, each connected-or-missing with a guided
+/// connect hint).
+#[tauri::command]
+pub async fn source_coverage(link: State<'_, DaemonLink>) -> Result<Value, String> {
+    let resp = request(&link.addr, json!({ "type": "source_coverage" })).await?;
+    array_field(resp, "sources")
+}
+
 #[tauri::command]
 pub async fn set_agent_session_history(
     link: State<'_, DaemonLink>,

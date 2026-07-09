@@ -22,6 +22,21 @@ export interface AgentConnectorInfo {
   ready: boolean;
 }
 
+/** Coverage of one meeting-relevant context source for the attached agent —
+ *  the onboarding coverage meter's row ("Calendar connected via gcal-mcp";
+ *  "Slack missing — connect it in your agent"). */
+export interface SourceCoverageInfo {
+  /** Stable id: "calendar" | "slack" | "email" | "tickets" | "bluey_memory" */
+  source: string;
+  label: string;
+  connected: boolean;
+  /** Matched connector name when connected. */
+  via: string | null;
+  /** Guided connect command/snippet when missing (authorization happens in
+   *  the user's agent — Bluey never holds credentials). */
+  connectHint: string | null;
+}
+
 /** One prior session, summarized for the resume picker. */
 export interface AgentSessionSummary {
   id: string;

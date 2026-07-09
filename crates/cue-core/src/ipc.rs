@@ -4,7 +4,7 @@ use crate::{
     sanitize_observability_id, ActionItem, AgentConnectorInfo, AgentSessionSummary, AgentSummary,
     AiRuntimeStatus, AnswerRequest, AnswerResponse, AnswerStreamEvent, AudioPipelineStatus,
     CloudSyncStatus, ContextArtifact, CueCard, DaemonState, MeetingRecap, MemoryHit,
-    OverlayPosition, Speaker,
+    OverlayPosition, SourceCoverageInfo, Speaker,
 };
 
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:57321";
@@ -124,6 +124,11 @@ pub enum DaemonRequest {
     AgentConnectors {
         kind: String,
     },
+    /// Coverage of the meeting-relevant context sources (calendar / slack /
+    /// email / tickets / bluey-memory) for the ATTACHED agent — the
+    /// onboarding coverage meter's data, with guided connect hints for the
+    /// missing ones.
+    SourceCoverage,
     /// List one agent's available models (for the model picker). Not consent-
     /// gated — a model list is public. `models[0]` is always the `"auto"`
     /// sentinel.
@@ -215,6 +220,9 @@ pub enum DaemonResponse {
     },
     AgentConnectors {
         connectors: Vec<AgentConnectorInfo>,
+    },
+    SourceCoverage {
+        sources: Vec<SourceCoverageInfo>,
     },
     AgentModels {
         models: Vec<String>,

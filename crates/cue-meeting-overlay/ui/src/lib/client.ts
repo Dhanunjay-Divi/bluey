@@ -9,6 +9,7 @@
 
 import type {
   AgentConnectorInfo,
+  SourceCoverageInfo,
   AgentSessionSummary,
   AgentSummary,
   AnswerChunk,
@@ -48,6 +49,9 @@ export interface MeetingClient {
       the rest. */
   models(kind: string): Promise<string[]>;
   connectors(kind: string): Promise<AgentConnectorInfo[]>;
+  /** Meeting-relevant source coverage for the ATTACHED agent (the onboarding
+      coverage meter). Empty when no agent is attached. */
+  sourceCoverage(): Promise<SourceCoverageInfo[]>;
   setSessionHistoryConsent(enabled: boolean): Promise<void>;
 
   /** Fetch the active meeting's transcript + Q&A once, to rehydrate on mount

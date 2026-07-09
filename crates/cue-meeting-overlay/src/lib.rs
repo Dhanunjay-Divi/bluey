@@ -165,6 +165,7 @@ pub fn run() {
             commands::agent_sessions,
             commands::agent_models,
             commands::agent_connectors,
+            commands::source_coverage,
             commands::set_agent_session_history,
             commands::meeting_ask,
             commands::meeting_ask_cancel,

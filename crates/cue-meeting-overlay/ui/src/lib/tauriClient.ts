@@ -369,6 +369,25 @@ export function createTauriClient(): MeetingClient {
         return c.models;
       }),
 
+    sourceCoverage: async () => {
+      // Direct tauri command (no bus roundtrip): wire rows are snake_case.
+      type Wire = {
+        source: string;
+        label: string;
+        connected: boolean;
+        via?: string | null;
+        connect_hint?: string | null;
+      };
+      const rows = await invoke<Wire[]>("source_coverage");
+      return rows.map((r) => ({
+        source: r.source,
+        label: r.label,
+        connected: r.connected,
+        via: r.via ?? null,
+        connectHint: r.connect_hint ?? null,
+      }));
+    },
+
     connectors: (kind) =>
       request<AgentConnectorInfo[]>(
         { type: "agent_connectors_requested", kind },

@@ -22,7 +22,7 @@ pub mod pcm;
 pub mod stt;
 pub mod vad;
 
-pub use agent_ui::{AgentConnectorInfo, AgentSessionSummary, AgentSummary};
+pub use agent_ui::{AgentConnectorInfo, AgentSessionSummary, AgentSummary, SourceCoverageInfo};
 pub use ai::{
     AiCapabilities, AiCapability, AiModelId, AiProviderId, AiProviderKind, AiRuntimeStatus,
     AnswerContext, AnswerContextKind, AnswerRequest, AnswerResponse, AnswerStreamEvent, CostBudget,

@@ -48,6 +48,31 @@ pub struct AgentConnectorInfo {
     pub ready: bool,
 }
 
+/// Coverage of one meeting-relevant context SOURCE for the attached agent —
+/// the data behind the onboarding coverage meter ("your agent reaches
+/// calendar+tickets; Slack is missing — connect it"). Unlike
+/// [`AgentConnectorInfo`] (raw inherited connectors), this classifies against
+/// the sources a MEETING needs and carries the guided connect recipe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceCoverageInfo {
+    /// Stable source id: `calendar` / `slack` / `email` / `tickets` /
+    /// `bluey_memory`.
+    pub source: String,
+    /// Human label ("Calendar", "Slack", …).
+    pub label: String,
+    /// True when the attached agent can already reach this source.
+    pub connected: bool,
+    /// The matched connector's name when connected (e.g. "gcal-mcp").
+    #[serde(default)]
+    pub via: Option<String>,
+    /// Guided connect instruction for THIS agent when not connected (the
+    /// exact command or config snippet the user runs — authorization happens
+    /// in their agent; Bluey never holds credentials). `None` = no vetted
+    /// recipe yet for this agent+source.
+    #[serde(default)]
+    pub connect_hint: Option<String>,
+}
+
 /// One prior agent session, summarized for a picker (no body decode).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionSummary {

@@ -5,6 +5,7 @@
 // lists recorded meetings. The two history surfaces never share a list.
 
 import { HistoryScreen } from "./HistoryScreen";
+import { CoverageMeter } from "../components/CoverageMeter";
 import type { AgentSummary } from "../lib/types";
 
 const CAP: Record<string, { label: string; bg: string; fg: string }> = {
@@ -79,6 +80,7 @@ export function AgentsScreen({
         gap: 8,
       }}
     >
+      <CoverageMeter attachedKind={attached?.kind ?? null} />
       {agents.map((a) => {
         const cap = CAP[a.capability] ?? CAP.read_only;
         return (
