@@ -1752,9 +1752,16 @@ mod tests {
             ],
         });
         let rendered = q.render_prompt();
-        assert!(rendered.contains("User: ship friday"));
-        assert!(rendered.contains("Assistant: agreed"));
+        // Context is XML-wrapped as untrusted reference data (the
+        // cross-provider anti-false-positive shape), question last.
+        assert!(rendered.contains("<meeting_context>"));
+        assert!(rendered.contains("<user_message>ship friday</user_message>"));
+        assert!(rendered.contains("<assistant_message>agreed</assistant_message>"));
         assert!(rendered.contains("What did we decide?"));
+        assert!(
+            rendered.find("<meeting_context>").unwrap()
+                < rendered.find("What did we decide?").unwrap()
+        );
     }
 
     // ---- (a) claude stream-json parsing ---------------------------------
