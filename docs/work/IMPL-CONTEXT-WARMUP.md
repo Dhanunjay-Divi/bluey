@@ -154,3 +154,57 @@
   against a meeting-shaped eval + LongMemEval (memory-layer DoD, still open).
 - SET 4 (pre-context ingestion) and SET 5 (coverage surface) intentionally
   not started (plan order).
+
+---
+
+## The MCP-backend pivot (Batches 0–5, 2026-07-08)
+
+**The locked design:** Bluey = a local MCP server the agent PULLS meeting
+memory from; the calendar-fired warm session IS the meeting's backend
+session; no fallback LLM (the attached agent is the only answerer).
+
+- **Batch 0 — spike (all five CLIs, live):** loopback Streamable-HTTP +
+  bearer token fires headlessly with zero prompts. claude
+  `--allowed-tools "mcp__<name>"`; gemini `--allowed-mcp-server-names` +
+  `GEMINI_CLI_TRUST_WORKSPACE=true`; copilot `--allow-tool` (node≥24);
+  cursor `.cursor/mcp.json` + scriptable `mcp enable` + `--force`
+  (breadth caveat tracked); codex `mcp add --url --bearer-token-env-var`
+  (auth+list verified; call blocked only by account model limits). The
+  "GUI rows can't be backends" concern was wrong — GUI surfaces route to
+  their CLI sibling (`continuation_via`).
+- **Batch 1 — `cue-mcp`:** hand-rolled over hyper (zero new transitive
+  deps), 4 read-only tools, strict schemas + server-side caps, per-meeting
+  rotating token, Host allow-list. Acceptance: the real claude CLI answered
+  a question grounded ONLY in the fixture tools.
+- **Batch 2 — daemon as source:** `MeetingMemorySource` impl with
+  short-lock clones (never `.await` under the meeting lock — the STT sink
+  invariant), server mounted at startup, `BLUEY_MCP_PORT/TOKEN` dev hooks.
+  Acceptance: MID-MEETING the tools served the live transcript + rolling
+  summary while STT kept flowing; claude answered "what has been decided"
+  from pulls alone; bad token → 401.
+- **Batch 3 — warm session:** `mcp_register.rs` (write-side registration,
+  surgical JSON merges, corrupt-config refusal) + `WarmupStart/Stop`.
+  Acceptance: registered into the real claude config, warm brief produced
+  via bluey-memory pulls, session pinned, mid-meeting ask RESUMED the
+  warmed session and answered the reversals correctly, deregistered on
+  stop. Known follow-up: `--resume` replays prior turns into stream-json
+  (parser concatenates a stale prefix) — fix in the drive-parser pass.
+- **Batch 4 — coverage meter:** `SourceCoverage` IPC + overlay chips with
+  guided connect hints (vendor-documented endpoints only). Acceptance:
+  honest classification of the real ~/.claude.json.
+- **Batch 5 — calendar trigger:** poll + once-per-occurrence idempotency +
+  typed `WarmupOutcome` with retry-on-refusal. Acceptance deliberately
+  reproduced the trigger-before-attach race: 5 refusals, then exactly one
+  success after attach; registered/minted/pinned/deregistered verified.
+
+**Decision for Batch 6 (from live-testing feedback):** hybrid envelope —
+PUSH the small always-needed slice (rolling summary + recent transcript,
+bounded) WITH each question so the common case costs zero tool round-trips;
+PULL everything else (past meetings, decisions, deeper transcript) via the
+tools. Batch 6 therefore deletes the HEAVY push machinery (prime-once brief,
+back-history, Q&A replay, primed/delta state) and keeps one lean envelope.
+
+**Remaining:** Batch 6 (delete heavy push + hybrid envelope + ACP
+`session/new` mcp_servers injection + resume-replay parser fix), EventKit
+source behind the `calendar` feature (needs the packaged app's TCC usage
+string), tarball rebuild.

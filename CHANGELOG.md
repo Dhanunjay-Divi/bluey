@@ -31,6 +31,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the actual cure for the daemon-spawned subprocesses.
 
 ### Added
+- **The MCP-backend pivot: Bluey becomes the memory the agent PULLS from.**
+  Bluey no longer only pushes context into agent prompts — the daemon now runs
+  its OWN loopback MCP server (`cue-mcp`, hand-rolled over the already-in-graph
+  hyper: zero new transitive deps) exposing four read-only tools
+  (`get_recent_transcript`, `get_meeting_summary`, `search_meeting_decisions`,
+  `search_past_meetings`) backed by the existing stores. Security per OWASP
+  MCP: 127.0.0.1-only, Host allow-list, per-meeting rotating bearer token,
+  read-only surface (a prompt injection spoken into a meeting has no exfil
+  vector), strict schemas. Every design point was LIVE-verified first
+  (Batch-0 spike across claude/gemini/copilot/cursor/codex: all fire
+  loopback-HTTP MCP tools headlessly with zero prompts).
+- **Warm meeting-backend session.** `WarmupStart` rotates the token, registers
+  `bluey-memory` into the attached agent's own MCP config (write-side
+  `mcp_register.rs`: scriptable `mcp add` for claude/copilot/codex, surgical
+  project-JSON merge for gemini/cursor — Bluey never holds agent credentials),
+  mints the meeting, and runs a warm-up drive whose session becomes THE
+  session every in-meeting ask resumes. Live acceptance: a mid-meeting ask
+  resumed the warmed session and answered the standup's reversals from live
+  tool pulls.
+- **Calendar trigger.** A deterministic poll fires the warm backend T-minus
+  3 min, once per (event, occurrence), retrying while gates (agent not yet
+  attached) refuse — proven by deliberately reproducing the trigger-before-
+  attach race live. Env-fake source drives the full path headless
+  (`BLUEY_CALENDAR_FAKE_EVENTS`); EventKit follows behind a `calendar`
+  feature.
+- **Context-coverage meter (onboarding).** `SourceCoverage` IPC classifies the
+  attached agent's connectors against the meeting-relevant sources
+  (calendar/slack/email/tickets + bluey-memory) and the overlay's Agents tab
+  renders connected/missing chips with guided connect commands (the user
+  authorizes in THEIR agent).
 - **Hybrid cross-meeting retrieval — the mem0 v3 search pipeline in Rust.**
   Recall over the facts memory is no longer cosine-only: it now fuses
   semantic similarity + Okapi BM25 over stemmed fact text (sigmoid-normalized
