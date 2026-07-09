@@ -1033,6 +1033,10 @@ pub(crate) struct Daemon {
     /// the bundled model is absent — detection stays regex-only.
     #[cfg(feature = "local-memory")]
     qdetect: Mutex<Option<Arc<crate::qdetect::QuestionClassifier>>>,
+    /// Bluey's own MCP memory server handle (the no-push pivot: the attached
+    /// agent PULLS meeting memory through its tools). `None` when the
+    /// loopback bind failed — the daemon runs on without it.
+    mcp_server: Mutex<Option<cue_mcp::McpServerHandle>>,
     /// Monotonic generation counter bumped on every attach/detach cache flip
     /// (`refresh_overlay_agents_attached_only`). A background full-discovery
     /// tail captures this epoch at spawn time and only writes its result if the
@@ -1221,6 +1225,7 @@ pub async fn run() -> Result<()> {
         facts_memory: Mutex::new(None),
         #[cfg(feature = "local-memory")]
         qdetect: Mutex::new(None),
+        mcp_server: Mutex::new(None),
         agent_cache_epoch: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "diarize")]
         audio_retention: Mutex::new(None),
@@ -1310,6 +1315,33 @@ pub async fn run() -> Result<()> {
                 Err(error) => warn!("question classifier load task failed: {error:#}"),
             }
         });
+    }
+
+    // Bluey's own MCP memory server (the no-push pivot): mount the loopback
+    // tool surface the attached agent pulls meeting memory from. The token
+    // rotates per meeting once the warm-drive orchestrator opens sessions;
+    // this boot token gates the window before the first meeting. Fail-soft:
+    // a bind failure logs and the daemon runs without the server.
+    {
+        let source: Arc<dyn cue_mcp::MeetingMemorySource> = Arc::new(DaemonMemorySource {
+            daemon: daemon.clone(),
+        });
+        // Test hooks (same pattern as the other BLUEY_* dev hooks): pin the
+        // port/token so harnesses can register a real agent against the
+        // server. Production leaves both unset: ephemeral port, random token.
+        let boot_token = env::var("BLUEY_MCP_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let port = env::var("BLUEY_MCP_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok());
+        match cue_mcp::serve(source, boot_token, port).await {
+            Ok(handle) => {
+                *daemon.mcp_server.lock().await = Some(handle);
+            }
+            Err(error) => warn!("bluey MCP memory server unavailable: {error:#}"),
+        }
     }
 
     let listener = TcpListener::bind(&args.addr)
@@ -6953,6 +6985,109 @@ async fn memory_oneshot_via_agent(daemon: &Arc<Daemon>, prompt: String) -> Optio
                 "memory one-shot drive failed: {error}"
             );
             None
+        }
+    }
+}
+
+/// The daemon's implementation of the MCP memory surface (cue-mcp): the
+/// tool-shaped reads the attached agent PULLS instead of Bluey pushing
+/// context. Every method clones what it needs under a SHORT lock and does
+/// all rendering/IO AFTER release — an MCP tool call must never stall the
+/// serial transcript sink (the STT feed invariant).
+struct DaemonMemorySource {
+    daemon: Arc<Daemon>,
+}
+
+#[async_trait::async_trait]
+impl cue_mcp::MeetingMemorySource for DaemonMemorySource {
+    async fn recent_transcript(
+        &self,
+        max_turns: usize,
+        max_chars: usize,
+    ) -> Option<cue_mcp::TranscriptSliceOut> {
+        // Short lock: clone the record, release, render off-lock.
+        let meeting = { self.daemon.meeting.lock().await.clone() }?;
+        let total_turns = meeting.transcript.len();
+        let transcript = meeting.last_transcript_text_bounded(max_turns, max_chars);
+        Some(cue_mcp::TranscriptSliceOut {
+            turn_count: total_turns.min(max_turns) as u32,
+            truncated: total_turns > max_turns || transcript.chars().count() >= max_chars,
+            transcript,
+        })
+    }
+
+    async fn meeting_summary(&self) -> Option<cue_mcp::MeetingSummaryOut> {
+        let (title, rolling_summary) = {
+            let guard = self.daemon.meeting.lock().await;
+            let meeting = guard.as_ref()?;
+            (meeting.title.clone(), meeting.summary.clone())
+        };
+        // Separate short lock (never nested with the meeting lock).
+        let decisions: Vec<String> = {
+            let ledger = self.daemon.ledger.lock().await;
+            ledger
+                .items()
+                .iter()
+                .map(|item| format!("[{}] {}", item.kind.label(), item.text))
+                .collect()
+        };
+        Some(cue_mcp::MeetingSummaryOut {
+            title,
+            rolling_summary,
+            decisions,
+        })
+    }
+
+    async fn search_decisions(&self, query: &str, limit: usize) -> Vec<cue_mcp::FactHitOut> {
+        self.facts_hits(query, limit, false).await
+    }
+
+    async fn search_past_meetings(&self, query: &str, limit: usize) -> Vec<cue_mcp::FactHitOut> {
+        self.facts_hits(query, limit, true).await
+    }
+}
+
+impl DaemonMemorySource {
+    /// Hybrid facts search shared by the two search tools. `exclude_active`
+    /// drops the live meeting's own facts (its ledger is served whole by
+    /// `get_meeting_summary`). Fail-soft: store errors log and return empty.
+    async fn facts_hits(
+        &self,
+        query: &str,
+        limit: usize,
+        exclude_active: bool,
+    ) -> Vec<cue_mcp::FactHitOut> {
+        #[cfg(feature = "local-memory")]
+        {
+            let memory = self.daemon.facts_memory.lock().await.clone();
+            let Some(memory) = memory else {
+                return Vec::new();
+            };
+            let exclude = if exclude_active {
+                let guard = self.daemon.meeting.lock().await;
+                guard.as_ref().map(|m| m.id.to_string())
+            } else {
+                None
+            };
+            match memory.search(query, limit, exclude.as_deref()).await {
+                Ok(hits) => hits
+                    .into_iter()
+                    .map(|hit| cue_mcp::FactHitOut {
+                        text: hit.text,
+                        meeting_id: hit.meeting_id,
+                        relevance: hit.score,
+                    })
+                    .collect(),
+                Err(error) => {
+                    debug!("mcp facts search failed: {error:#}");
+                    Vec::new()
+                }
+            }
+        }
+        #[cfg(not(feature = "local-memory"))]
+        {
+            let _ = (query, limit, exclude_active);
+            Vec::new()
         }
     }
 }

@@ -1368,6 +1368,7 @@ dependencies = [
  "cue-core",
  "cue-diarize",
  "cue-llm",
+ "cue-mcp",
  "cue-rag",
  "cue-transcribe",
  "fix-path-env",

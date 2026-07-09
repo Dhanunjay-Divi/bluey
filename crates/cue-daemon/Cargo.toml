@@ -34,6 +34,9 @@ clap.workspace = true
 cue-agent-bridge = { path = "../cue-agent-bridge" }
 cue-core = { path = "../cue-core" }
 cue-llm = { path = "../cue-llm" }
+# Bluey's own MCP memory server (the no-push pivot): the daemon implements the
+# MeetingMemorySource trait and mounts the loopback tool surface at startup.
+cue-mcp = { path = "../cue-mcp" }
 cue-rag = { path = "../cue-rag" }
 # On-device streaming ASR engine — the single source of Nemotron-wrapping code.
 # Pulls parakeet-rs (with ort-defaults) via its own defaults, so linking is
