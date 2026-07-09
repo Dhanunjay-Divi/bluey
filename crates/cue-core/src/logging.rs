@@ -140,7 +140,7 @@ pub fn local_log_dir() -> PathBuf {
 
 pub fn log_file_prefix(component: &str) -> String {
     let prefix = match component {
-        "cue-daemon" | "bluey-daemon" => "daemon",
+        "cue-daemon" | "bluey-daemon" | "Terminal" | "Terminal.exe" => "daemon",
         "cue-dashboard" | "bluey-dashboard" => "dashboard",
         other => other
             .trim_start_matches("cue-")
@@ -331,6 +331,8 @@ mod tests {
     fn log_file_prefix_matches_support_tool_filters() {
         assert_eq!(log_file_prefix("cue-daemon"), "daemon-log");
         assert_eq!(log_file_prefix("bluey-daemon"), "daemon-log");
+        assert_eq!(log_file_prefix("Terminal"), "daemon-log");
+        assert_eq!(log_file_prefix("Terminal.exe"), "daemon-log");
         assert_eq!(log_file_prefix("cue-dashboard"), "dashboard-log");
         assert_eq!(log_file_prefix("cue-cloud-client"), "cloud-client-log");
     }

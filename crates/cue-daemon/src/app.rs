@@ -3902,18 +3902,23 @@ fn find_native_audio_helper() -> Option<PathBuf> {
     push_current_exe_helper_candidates(
         &mut candidates,
         &[
+            "audio-driver",
             "bluey-audio-macos",
             "cue-audio-macos",
+            "../../native/macos/cue-audio/.build/audio-driver",
             "../../native/macos/cue-audio/.build/bluey-audio-macos",
+            "../native/macos/cue-audio/.build/audio-driver",
             "../native/macos/cue-audio/.build/bluey-audio-macos",
         ],
     );
     push_installed_bluey_bin_helper_candidates(
         &mut candidates,
-        &["bluey-audio-macos", "cue-audio-macos"],
+        &["audio-driver", "bluey-audio-macos", "cue-audio-macos"],
     );
     candidates.extend([
+        PathBuf::from("native/macos/cue-audio/.build/audio-driver"),
         PathBuf::from("native/macos/cue-audio/.build/bluey-audio-macos"),
+        PathBuf::from("./audio-driver"),
         PathBuf::from("./bluey-audio-macos"),
         PathBuf::from("./cue-audio-macos"),
     ]);
@@ -3931,18 +3936,23 @@ fn find_native_audio_helper() -> Option<PathBuf> {
     push_current_exe_helper_candidates(
         &mut candidates,
         &[
+            "audio-driver.exe",
             "bluey-audio.exe",
             "cue-audio.exe",
+            "../../native/windows/cue-audio/build/audio-driver.exe",
             "../../native/windows/cue-audio/build/bluey-audio.exe",
+            "../native/windows/cue-audio/build/audio-driver.exe",
             "../native/windows/cue-audio/build/bluey-audio.exe",
         ],
     );
     push_installed_bluey_bin_helper_candidates(
         &mut candidates,
-        &["bluey-audio.exe", "cue-audio.exe"],
+        &["audio-driver.exe", "bluey-audio.exe", "cue-audio.exe"],
     );
     candidates.extend([
+        PathBuf::from("native/windows/cue-audio/build/audio-driver.exe"),
         PathBuf::from("native/windows/cue-audio/build/bluey-audio.exe"),
+        PathBuf::from("./audio-driver.exe"),
         PathBuf::from("./bluey-audio.exe"),
         PathBuf::from("./cue-audio.exe"),
     ]);
@@ -15492,7 +15502,9 @@ fn should_use_macos_socket_overlay(path: &Path) -> bool {
     }
     path.file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name == "bluey-overlay-macos" || name == "cue-overlay-macos")
+        .map(|name| {
+            name == "host-overlay" || name == "bluey-overlay-macos" || name == "cue-overlay-macos"
+        })
         .unwrap_or(false)
 }
 
@@ -15573,7 +15585,7 @@ fn macos_overlay_launch_command(
     socket_path: &Path,
     expected_token: &str,
 ) -> Command {
-    if !macos_overlay_force_raw_helper() {
+    if !macos_overlay_force_raw_helper() && !is_host_overlay_binary(resolved) {
         if let Some(app_bundle) = macos_overlay_app_bundle_for_binary(resolved) {
             return macos_overlay_open_app_command(&app_bundle, socket_path, expected_token);
         }
@@ -15585,6 +15597,14 @@ fn macos_overlay_launch_command(
         .env("BLUEY_OVERLAY_SOCKET", socket_path);
     macos_overlay_add_capture_visible_args(&mut command);
     command
+}
+
+#[cfg(target_os = "macos")]
+fn is_host_overlay_binary(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == "host-overlay")
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -15645,6 +15665,7 @@ fn macos_overlay_app_bundle_for_binary(binary: &Path) -> Option<PathBuf> {
     let dir = binary.parent()?;
     let candidates = [
         dir.join("BlueyOverlay.app"),
+        dir.join("host-overlay.app"),
         dir.join("bluey-overlay-macos.app"),
         dir.join("cue-overlay-macos.app"),
     ];
@@ -15950,6 +15971,7 @@ fn discover_overlay_bin() -> Result<PathBuf> {
         let mut candidates = Vec::new();
         if cfg!(debug_assertions) {
             candidates.extend([
+                cwd.join("native/macos/cue-overlay/.build/host-overlay"),
                 cwd.join("native/macos/cue-overlay/.build/bluey-overlay-macos"),
                 cwd.join("native/macos/cue-overlay/.build/cue-overlay-macos"),
             ]);
@@ -15966,8 +15988,10 @@ fn discover_overlay_bin() -> Result<PathBuf> {
             }
             for dir in dirs {
                 candidates.extend([
+                    dir.join("host-overlay"),
                     dir.join("bluey-overlay-macos"),
                     dir.join("cue-overlay-macos"),
+                    dir.join("bin/host-overlay"),
                     dir.join("bin/bluey-overlay-macos"),
                     dir.join("bin/cue-overlay-macos"),
                 ]);
@@ -15975,11 +15999,13 @@ fn discover_overlay_bin() -> Result<PathBuf> {
         }
         if !cfg!(debug_assertions) {
             candidates.extend([
+                cwd.join("native/macos/cue-overlay/.build/host-overlay"),
                 cwd.join("native/macos/cue-overlay/.build/bluey-overlay-macos"),
                 cwd.join("native/macos/cue-overlay/.build/cue-overlay-macos"),
             ]);
         }
         candidates.extend([
+            cwd.join("host-overlay"),
             cwd.join("bluey-overlay-macos"),
             cwd.join("cue-overlay-macos"),
         ]);
@@ -16005,16 +16031,20 @@ fn discover_overlay_bin() -> Result<PathBuf> {
             }
             for dir in dirs {
                 candidates.extend([
+                    dir.join("host-overlay.exe"),
                     dir.join("bluey-overlay.exe"),
                     dir.join("cue-overlay.exe"),
+                    dir.join("bin/host-overlay.exe"),
                     dir.join("bin/bluey-overlay.exe"),
                     dir.join("bin/cue-overlay.exe"),
                 ]);
             }
         }
         candidates.extend([
+            cwd.join("native/windows/cue-overlay/build/host-overlay.exe"),
             cwd.join("native/windows/cue-overlay/build/bluey-overlay.exe"),
             cwd.join("native/windows/cue-overlay/build/cue-overlay.exe"),
+            cwd.join("host-overlay.exe"),
             cwd.join("bluey-overlay.exe"),
             cwd.join("cue-overlay.exe"),
         ]);

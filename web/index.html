@@ -694,7 +694,7 @@
           <div class="account-modal-head">
             <div>
               <h2 id="addCreditsTitle">Add balance</h2>
-              <p>Choose an amount. Keep Auto Reload on to save a card and top up before balance gets low.</p>
+              <p>Choose an amount. This charges once now; Auto Reload only saves the card for future top-ups.</p>
             </div>
             <button class="account-modal-close" id="addCreditsCancelX" type="button" aria-label="Close add balance dialog">×</button>
           </div>
@@ -743,7 +743,7 @@
               <div class="square-card-setup reload-setup-square-card" id="reloadSetupSquareCardSetup" hidden>
                 <div class="square-card-copy">
                   <strong>Card</strong>
-                  <span>Use this card now. Keep Auto Reload on to use it for future reloads.</span>
+                  <span>One step: add balance now and save this card for future Auto Reload.</span>
                 </div>
                 <div id="reloadSetupSquareCardContainer" class="square-card-container"></div>
               </div>
@@ -991,6 +991,11 @@
           </div>
         </div>
         <div class="instruction-help">If a code appears, sign in here and press Connect.</div>
+        <div class="install-support-note">
+          <strong>Install taking longer than 5 minutes, showing any error, or Bluey not working?</strong>
+          <span>Run <code>bluey support</code> and email the generated support bundle to <a href="mailto:hello@bluey.sh">hello@bluey.sh</a>.</span>
+          <span>If that fails, run <code>bluey doctor</code> to check permissions or <code>bluey doctor --zip</code> to create the same support bundle.</span>
+        </div>
       </section>
 
       <section class="platform-instructions" id="windowsInstallInstructions" data-platform-instructions="windows" hidden>
@@ -1019,6 +1024,11 @@
           </div>
         </div>
         <div class="instruction-help">If a code appears, sign in here and press Connect.</div>
+        <div class="install-support-note">
+          <strong>Install taking longer than 5 minutes, showing any error, or Bluey not working?</strong>
+          <span>Run <code>bluey support</code> and email the generated support bundle to <a href="mailto:hello@bluey.sh">hello@bluey.sh</a>.</span>
+          <span>If that fails, run <code>bluey doctor</code> to check permissions or <code>bluey doctor --zip</code> to create the same support bundle.</span>
+        </div>
       </section>
 
       <section class="download-shortcuts" aria-label="Bluey overlay shortcuts">
@@ -1091,74 +1101,82 @@
         </div>
       </section>
 
-      <div class="download-note">
-        Bluey stays quiet until you ask. Permissions appear only for features you turn on.
-      </div>
-
       <section class="commands" aria-label="Bluey commands">
-        <h2>Useful commands</h2>
+        <div class="download-section-head">
+          <h2>Everyday commands</h2>
+          <p>Use these for normal install, updates, account balance, and support.</p>
+        </div>
         <div class="cmd-grid">
           <div class="cmd">
             <div><code>bluey on</code><span>Start Bluey, check updates, and sign in if needed</span></div>
             <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
           </div>
           <div class="cmd">
-            <div><code>bluey off</code><span>Stop Bluey</span></div>
+            <div><code>bluey off</code><span>Stop Bluey completely</span></div>
             <button class="copy-command" type="button" data-copy="bluey off">Copy</button>
           </div>
           <div class="cmd">
-            <div><code>bluey update</code><span>Check for and install the latest build</span></div>
+            <div><code>bluey update</code><span>Install the latest Bluey build</span></div>
             <button class="copy-command" type="button" data-copy="bluey update">Copy</button>
           </div>
           <div class="cmd">
-            <div><code>bluey status</code><span>Show daemon state, session ID, and overlay status</span></div>
+            <div><code>bluey status</code><span>Show Bluey state, overlay status, and current session</span></div>
             <button class="copy-command" type="button" data-copy="bluey status">Copy</button>
           </div>
           <div class="cmd">
-            <div><code>bluey login</code><span>Link or switch this device to an account</span></div>
-            <button class="copy-command" type="button" data-copy="bluey login">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey logout</code><span>Remove this device's local sign-in</span></div>
-            <button class="copy-command" type="button" data-copy="bluey logout">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey usage</code><span>Show balance, recent usage, and tier projection</span></div>
+            <div><code>bluey usage</code><span>Show balance, recent usage, and estimated spend</span></div>
             <button class="copy-command" type="button" data-copy="bluey usage">Copy</button>
           </div>
           <div class="cmd">
-            <div><code>bluey portal</code><span>Open billing and credits in your browser</span></div>
+            <div><code>bluey portal</code><span>Open billing, credits, and card settings</span></div>
             <button class="copy-command" type="button" data-copy="bluey portal">Copy</button>
           </div>
           <div class="cmd">
-            <div><code>bluey sessions</code><span>List or inspect saved local sessions</span></div>
-            <button class="copy-command" type="button" data-copy="bluey sessions">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey doctor</code><span>Check permissions, audio, setup, and logs</span></div>
-            <button class="copy-command" type="button" data-copy="bluey doctor">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey support</code><span>Create a redacted support bundle</span></div>
+            <div><code>bluey support</code><span>Create a redacted support bundle for hello@bluey.sh</span></div>
             <button class="copy-command" type="button" data-copy="bluey support">Copy</button>
           </div>
           <div class="cmd">
-            <div><code>bluey logs export</code><span>Export local logs with redaction</span></div>
-            <button class="copy-command" type="button" data-copy="bluey logs export">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey export</code><span>Download your account data as JSON</span></div>
-            <button class="copy-command" type="button" data-copy="bluey export">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey uninstall</code><span>Remove Bluey from this computer</span></div>
-            <button class="copy-command" type="button" data-copy="bluey uninstall">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey help</code><span>Show the full command list</span></div>
+            <div><code>bluey help</code><span>Show all commands</span></div>
             <button class="copy-command" type="button" data-copy="bluey help">Copy</button>
           </div>
         </div>
+        <details class="more-commands">
+          <summary>More commands</summary>
+          <div class="cmd-grid advanced">
+            <div class="cmd">
+              <div><code>bluey login</code><span>Switch or relink account</span></div>
+              <button class="copy-command" type="button" data-copy="bluey login">Copy</button>
+            </div>
+            <div class="cmd">
+              <div><code>bluey logout</code><span>Remove local sign-in from this computer</span></div>
+              <button class="copy-command" type="button" data-copy="bluey logout">Copy</button>
+            </div>
+            <div class="cmd">
+              <div><code>bluey sessions</code><span>List saved local sessions</span></div>
+              <button class="copy-command" type="button" data-copy="bluey sessions">Copy</button>
+            </div>
+            <div class="cmd">
+              <div><code>bluey doctor</code><span>Check setup, permissions, audio, API, and logs</span></div>
+              <button class="copy-command" type="button" data-copy="bluey doctor">Copy</button>
+            </div>
+            <div class="cmd">
+              <div><code>bluey doctor --zip</code><span>Create the same support zip as bluey support</span></div>
+              <button class="copy-command" type="button" data-copy="bluey doctor --zip">Copy</button>
+            </div>
+            <div class="cmd">
+              <div><code>bluey logs export</code><span>Export redacted local logs</span></div>
+              <button class="copy-command" type="button" data-copy="bluey logs export">Copy</button>
+            </div>
+            <div class="cmd">
+              <div><code>bluey export</code><span>Download account data as JSON</span></div>
+              <button class="copy-command" type="button" data-copy="bluey export">Copy</button>
+            </div>
+            <div class="cmd">
+              <div><code>bluey uninstall</code><span>Remove Bluey from this computer</span></div>
+              <button class="copy-command" type="button" data-copy="bluey uninstall">Copy</button>
+            </div>
+          </div>
+        </details>
       </section>
 
       <div class="page-footer-links">

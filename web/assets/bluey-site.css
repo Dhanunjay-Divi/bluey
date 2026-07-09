@@ -4163,6 +4163,34 @@
       text-align: center;
     }
 
+    #downloadApp .install-support-note {
+      display: grid;
+      gap: .3rem;
+      margin-top: .85rem;
+      padding: .8rem .9rem;
+      border: 1px solid rgba(99, 216, 255, .22);
+      border-radius: 10px;
+      background: rgba(99, 216, 255, .055);
+      color: #90a4b3;
+      font-size: .75rem;
+      line-height: 1.45;
+    }
+
+    #downloadApp .install-support-note strong {
+      color: #e8fbff;
+      font-size: .78rem;
+    }
+
+    #downloadApp .install-support-note code {
+      color: var(--bluey-accent);
+      font-size: .76rem;
+    }
+
+    #downloadApp .install-support-note a {
+      color: #c7f4ff;
+      font-weight: 800;
+    }
+
     @keyframes blueyInstructionIn {
       from {
         opacity: 0;
@@ -4175,10 +4203,14 @@
       }
     }
 
-    #downloadApp .commands h2 {
+    #downloadApp .commands .download-section-head {
+      margin-bottom: .75rem;
+      text-align: left;
+    }
+
+    #downloadApp .commands .download-section-head h2 {
       color: #ccc;
       font-size: 1.1rem;
-      margin-bottom: .75rem;
     }
 
     #downloadApp .cmd-grid {
@@ -4232,6 +4264,48 @@
 
     #downloadApp .cmd:hover .copy-command {
       color: #888;
+    }
+
+    #downloadApp .more-commands {
+      margin-top: .8rem;
+      border: 1px solid rgba(255, 255, 255, .08);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, .025);
+      overflow: hidden;
+    }
+
+    #downloadApp .more-commands summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: .75rem;
+      padding: .75rem .9rem;
+      color: #d9f8ff;
+      cursor: pointer;
+      font-size: .82rem;
+      font-weight: 850;
+      list-style: none;
+    }
+
+    #downloadApp .more-commands summary::-webkit-details-marker {
+      display: none;
+    }
+
+    #downloadApp .more-commands summary::after {
+      content: "+";
+      color: var(--bluey-accent);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 1rem;
+      line-height: 1;
+    }
+
+    #downloadApp .more-commands[open] summary::after {
+      content: "-";
+    }
+
+    #downloadApp .cmd-grid.advanced {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      padding: 0 .75rem .75rem;
     }
 
     #downloadApp .download-note {
@@ -5315,7 +5389,7 @@
     html[data-bluey-theme="light"] #downloadApp .os-icon,
     html[data-bluey-theme="light"] #downloadApp .platform-instructions h2,
     html[data-bluey-theme="light"] #downloadApp .download-section-head h2,
-    html[data-bluey-theme="light"] #downloadApp .commands h2 {
+    html[data-bluey-theme="light"] #downloadApp .commands .download-section-head h2 {
       color: #102130;
     }
 
@@ -5323,6 +5397,7 @@
     html[data-bluey-theme="light"] #downloadApp .download-card.coming-soon p,
     html[data-bluey-theme="light"] #downloadApp .platform-instructions > p,
     html[data-bluey-theme="light"] #downloadApp .instruction-help,
+    html[data-bluey-theme="light"] #downloadApp .install-support-note,
     html[data-bluey-theme="light"] #downloadApp .download-section-head p,
     html[data-bluey-theme="light"] #downloadApp .shortcut-card > span:last-child,
     html[data-bluey-theme="light"] #downloadApp .shortcut-notes,
@@ -5363,8 +5438,21 @@
     }
 
     html[data-bluey-theme="light"] #downloadApp .download-section-head strong,
+    html[data-bluey-theme="light"] #downloadApp .install-support-note strong,
     html[data-bluey-theme="light"] #downloadApp .shortcut-notes strong {
       color: #173447;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .install-support-note,
+    html[data-bluey-theme="light"] #downloadApp .more-commands {
+      border-color: #c8e3ee;
+      background: rgba(70, 183, 221, .08);
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .install-support-note a,
+    html[data-bluey-theme="light"] #downloadApp .install-support-note code,
+    html[data-bluey-theme="light"] #downloadApp .more-commands summary {
+      color: #08799f;
     }
 
     html[data-bluey-theme="light"] #downloadApp .shortcut-card kbd {

@@ -43,11 +43,12 @@ enum Commands {
     /// Start Bluey and open an interactive meeting session.
     #[command(hide = true)]
     Run(RunArgs),
-    /// Turn Bluey on with the overlay-first product flow.
+    /// Start Bluey, check updates, and sign in if needed.
     On(OnArgs),
-    /// Turn Bluey off.
+    /// Stop Bluey completely.
     Off,
     /// Remove Bluey from this device.
+    #[command(hide = true)]
     Uninstall(UninstallArgs),
     /// Sign in or link Bluey to a cloud account.
     #[command(hide = true)]
@@ -62,21 +63,18 @@ enum Commands {
     #[command(hide = true)]
     Settings(SettingsArgs),
     /// Show your Bluey balance, last-7-days usage, and tier projection.
-    #[command(hide = true)]
     Usage,
     /// Show your current Bluey balance and 1-year credit-validity reminder.
     /// (Per-batch expiration listing is not yet available; coming in a
     /// future release.)
     #[command(hide = true)]
     Credits,
-    /// Check for and install a Bluey desktop update.
-    #[command(hide = true)]
+    /// Install the latest Bluey desktop build.
     Update(UpdateArgs),
     /// Log out of Bluey: clear device account tokens.
     #[command(hide = true)]
     Logout,
-    /// Open the Bluey billing page in your browser to manage credits and provider-backed billing.
-    #[command(hide = true)]
+    /// Open billing, credits, and card settings in your browser.
     Portal,
     /// Export your Bluey account data as a JSON file (GDPR).
     #[command(hide = true)]
@@ -95,6 +93,9 @@ enum Commands {
         /// hashed/redacted exactly as the human-readable output is.
         #[arg(long)]
         json: bool,
+        /// Create the same redacted support zip as `bluey support`.
+        #[arg(long)]
+        zip: bool,
     },
     /// Manage Bluey logs on this device.
     #[command(hide = true)]
@@ -102,8 +103,7 @@ enum Commands {
         #[command(subcommand)]
         command: LogsCommands,
     },
-    /// Bundle bluey doctor + logs export into a single zip for support tickets.
-    #[command(hide = true)]
+    /// Create a redacted support bundle for hello@bluey.sh.
     Support {
         /// Disable redaction. By default the bundle strips bearer tokens,
         /// magic-link URLs, billing IDs, provider keys, emails, IPv4
@@ -123,8 +123,7 @@ enum Commands {
     /// Stop the Bluey daemon.
     #[command(hide = true)]
     Stop,
-    /// Show daemon status.
-    #[command(hide = true)]
+    /// Show Bluey state, overlay status, and current session.
     Status,
     /// Control the private overlay.
     #[command(hide = true)]
@@ -585,7 +584,18 @@ pub async fn cli_main() -> Result<()> {
         Commands::Portal => bluey_portal_cmd().await,
         Commands::Export => bluey_export_cmd().await,
         Commands::DeleteAccount { force } => bluey_delete_account_cmd(force).await,
-        Commands::Doctor { json } => {
+        Commands::Doctor { json, zip } => {
+            if json && zip {
+                bail!("use either `bluey doctor --json` or `bluey doctor --zip`, not both");
+            }
+            if zip {
+                crate::support::bundle(crate::support::SupportArgs {
+                    redact: true,
+                    days: 7,
+                    output: None,
+                })?;
+                return Ok(());
+            }
             if json {
                 crate::doctor::run_json()?;
             } else {
@@ -1060,15 +1070,18 @@ fn find_macos_audio_permission_helper() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = env::current_exe() {
         if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("audio-driver"));
             candidates.push(parent.join("bluey-audio-macos"));
             candidates.push(parent.join("cue-audio-macos"));
         }
     }
     if let Some(home) = env::var_os("HOME") {
         let bluey_bin = PathBuf::from(home).join(".bluey/bin");
+        candidates.push(bluey_bin.join("audio-driver"));
         candidates.push(bluey_bin.join("bluey-audio-macos"));
         candidates.push(bluey_bin.join("cue-audio-macos"));
     }
+    candidates.push(PathBuf::from("./audio-driver"));
     candidates.push(PathBuf::from("./bluey-audio-macos"));
     candidates.push(PathBuf::from("./cue-audio-macos"));
 
@@ -1357,25 +1370,56 @@ fn install_root_from_exe(exe: &Path) -> Option<PathBuf> {
 
 fn cli_links_for_uninstall() -> Vec<PathBuf> {
     let mut links = Vec::new();
+    let names = [
+        "bluey",
+        "bluey-daemon",
+        "Terminal",
+        "host-overlay",
+        "audio-driver",
+        "screen-driver",
+        "bluey-overlay-macos",
+        "cue-overlay-macos",
+        "bluey-audio-macos",
+        "cue-audio-macos",
+        "bluey-whisper-macos",
+        "cue-whisper",
+        "bluey-file-picker-macos",
+        "cue-file-picker-macos",
+    ];
     if let Some(dir) = env::var_os("BLUEY_CLI_DIR") {
         let dir = PathBuf::from(dir);
-        links.push(dir.join(format!("bluey{}", env::consts::EXE_SUFFIX)));
-        links.push(dir.join(format!("bluey-daemon{}", env::consts::EXE_SUFFIX)));
+        for name in names {
+            links.push(dir.join(format!("{name}{}", env::consts::EXE_SUFFIX)));
+        }
     }
     if let Some(home) = env::var_os("HOME") {
         let local_bin = PathBuf::from(home).join(".local/bin");
-        links.push(local_bin.join(format!("bluey{}", env::consts::EXE_SUFFIX)));
-        links.push(local_bin.join(format!("bluey-daemon{}", env::consts::EXE_SUFFIX)));
+        for name in names {
+            links.push(local_bin.join(format!("{name}{}", env::consts::EXE_SUFFIX)));
+        }
     }
     #[cfg(unix)]
     {
-        links.push(PathBuf::from("/usr/local/bin/bluey"));
-        links.push(PathBuf::from("/usr/local/bin/bluey-daemon"));
+        for name in names {
+            links.push(PathBuf::from("/usr/local/bin").join(name));
+        }
     }
     if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
         let bin = PathBuf::from(local_app_data).join("Bluey/bin");
-        links.push(bin.join("bluey.exe"));
-        links.push(bin.join("bluey-daemon.exe"));
+        for name in [
+            "bluey.exe",
+            "bluey-daemon.exe",
+            "Terminal.exe",
+            "host-overlay.exe",
+            "audio-driver.exe",
+            "screen-driver.exe",
+            "bluey-overlay.exe",
+            "cue-overlay.exe",
+            "bluey-audio.exe",
+            "cue-audio.exe",
+        ] {
+            links.push(bin.join(name));
+        }
     }
     dedup_paths(links)
 }
@@ -2679,17 +2723,30 @@ fn recorded_daemon_command_matches(command: &str, daemon_bin: Option<&Path>) -> 
         };
         return actual == *expected;
     }
-    true
+    !is_daemon_identity_executable_name(exe)
 }
 
 #[cfg(unix)]
 fn is_daemon_executable_name(path: &str) -> bool {
+    daemon_executable_match_name(path).is_some_and(|name| {
+        name == "terminal" || name == "bluey-daemon" || name == "cue-daemon"
+    })
+}
+
+#[cfg(unix)]
+fn is_daemon_identity_executable_name(path: &str) -> bool {
+    daemon_executable_match_name(path).is_some_and(|name| name == "terminal")
+}
+
+#[cfg(unix)]
+fn daemon_executable_match_name(path: &str) -> Option<String> {
     Path::new(path)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            let name = name.trim_end_matches(env::consts::EXE_SUFFIX);
-            name == "bluey-daemon" || name == "cue-daemon"
+        .map(|name| {
+            name.trim_end_matches(env::consts::EXE_SUFFIX)
+                .trim_end_matches(".exe")
+                .to_ascii_lowercase()
         })
 }
 
@@ -2792,23 +2849,29 @@ fn resolve_daemon_bin() -> Result<PathBuf> {
     }
 
     Err(anyhow!(
-        "could not find bluey-daemon in the Bluey install; reinstall with `curl -fsSL https://bluey.sh/install.sh | bash` or set BLUEY_DAEMON_BIN"
+        "could not find Bluey's daemon in the Bluey install; reinstall with `curl -fsSL https://bluey.sh/install.sh | bash` or set BLUEY_DAEMON_BIN"
     ))
 }
 
 fn resolve_daemon_bin_from_roots(roots: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     for root in roots {
-        let bluey_sibling = root.with_file_name(format!("bluey-daemon{}", env::consts::EXE_SUFFIX));
-        if bluey_sibling.exists() {
-            return Some(bluey_sibling);
-        }
-
-        let sibling = root.with_file_name(format!("cue-daemon{}", env::consts::EXE_SUFFIX));
-        if sibling.exists() {
-            return Some(sibling);
+        for name in daemon_executable_candidate_names() {
+            let sibling = root.with_file_name(name);
+            if sibling.exists() {
+                return Some(sibling);
+            }
         }
     }
     None
+}
+
+fn daemon_executable_candidate_names() -> Vec<String> {
+    let suffix = env::consts::EXE_SUFFIX;
+    vec![
+        format!("Terminal{suffix}"),
+        format!("bluey-daemon{suffix}"),
+        format!("cue-daemon{suffix}"),
+    ]
 }
 
 async fn request(message: DaemonRequest) -> Result<DaemonResponse> {
@@ -3809,6 +3872,34 @@ mod tests {
     }
 
     #[test]
+    fn resolve_daemon_bin_prefers_process_identity_sibling() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-daemon-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+
+        let bluey = bin_dir.join(format!("bluey{}", std::env::consts::EXE_SUFFIX));
+        let legacy_daemon = bin_dir.join(format!("bluey-daemon{}", std::env::consts::EXE_SUFFIX));
+        let identity_daemon = bin_dir.join(format!("Terminal{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&bluey, b"bluey").expect("write bluey");
+        fs::write(&legacy_daemon, b"bluey-daemon").expect("write legacy daemon");
+        fs::write(&identity_daemon, b"bluey-daemon").expect("write identity daemon");
+
+        assert_eq!(
+            resolve_daemon_bin_from_roots(vec![PathBuf::from("/missing/bluey"), bluey]),
+            Some(identity_daemon)
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn daemon_binary_change_check_detects_newer_installed_binary() {
         let base = std::env::temp_dir().join(format!(
             "bluey-daemon-mtime-{}-{}",
@@ -3871,16 +3962,26 @@ mod tests {
         fs::create_dir_all(&base).expect("create temp dir");
         let expected = base.join("bluey-daemon");
         let other = base.join("bluey-daemon-other");
+        let identity = base.join("Terminal");
         fs::write(&expected, b"daemon").expect("write expected daemon");
         fs::write(&other, b"daemon").expect("write other daemon");
+        fs::write(&identity, b"daemon").expect("write identity daemon");
 
         assert!(super::recorded_daemon_command_matches(
             &format!("{} --foreground", expected.display()),
             Some(&expected),
         ));
+        assert!(super::recorded_daemon_command_matches(
+            &format!("{} --foreground", identity.display()),
+            Some(&identity),
+        ));
         assert!(!super::recorded_daemon_command_matches(
             &format!("{} --foreground", other.display()),
             Some(&expected),
+        ));
+        assert!(!super::recorded_daemon_command_matches(
+            &format!("{} --foreground", identity.display()),
+            None,
         ));
 
         let _ = fs::remove_dir_all(base);

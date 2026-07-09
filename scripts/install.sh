@@ -14,6 +14,30 @@ warn() {
   printf 'bluey install warning: %s\n' "$*" >&2
 }
 
+copy_first_binary_alias() {
+  local source_dir="$1"
+  local alias_name="$2"
+  shift 2
+  local candidate
+
+  [[ -e "$source_dir/$alias_name" ]] && return 0
+  for candidate in "$@"; do
+    if [[ -x "$source_dir/$candidate" ]]; then
+      cp "$source_dir/$candidate" "$source_dir/$alias_name"
+      chmod +x "$source_dir/$alias_name"
+      return 0
+    fi
+  done
+}
+
+ensure_process_identity_aliases() {
+  local bin_path="$1"
+
+  copy_first_binary_alias "$bin_path" Terminal bluey-daemon cue-daemon
+  copy_first_binary_alias "$bin_path" host-overlay bluey-overlay-macos cue-overlay-macos
+  copy_first_binary_alias "$bin_path" audio-driver bluey-audio-macos cue-audio-macos
+}
+
 install_local_doc_tools() {
   local root="$1"
   local tools_dir="$root/tools/doc-converter"
@@ -134,7 +158,12 @@ tar -xzf "$archive" -C "$extract_dir"
 [[ -x "$extract_dir/bin/bluey-daemon" ]] || die "archive missing executable bin/bluey-daemon"
 
 cp -R "$extract_dir"/. "$target_tmp"/
+ensure_process_identity_aliases "$target_tmp/bin"
 chmod +x "$target_tmp/bin/bluey" "$target_tmp/bin/bluey-daemon"
+if [[ -f "$target_tmp/bin/Terminal" ]]; then chmod +x "$target_tmp/bin/Terminal"; fi
+if [[ -f "$target_tmp/bin/host-overlay" ]]; then chmod +x "$target_tmp/bin/host-overlay"; fi
+if [[ -f "$target_tmp/bin/audio-driver" ]]; then chmod +x "$target_tmp/bin/audio-driver"; fi
+if [[ -f "$target_tmp/bin/screen-driver" ]]; then chmod +x "$target_tmp/bin/screen-driver"; fi
 if [[ -f "$target_tmp/bin/bluey-overlay-macos" ]]; then chmod +x "$target_tmp/bin/bluey-overlay-macos"; fi
 if [[ -f "$target_tmp/bin/cue-overlay-macos" ]]; then chmod +x "$target_tmp/bin/cue-overlay-macos"; fi
 if [[ -f "$target_tmp/bin/bluey-audio-macos" ]]; then chmod +x "$target_tmp/bin/bluey-audio-macos"; fi
@@ -152,8 +181,13 @@ rm -rf "$target"
 mv "$target_tmp" "$target"
 
 ln -sfn "$target/bin/bluey" "$bin_dir/bluey"
-ln -sfn "$target/bin/bluey-daemon" "$bin_dir/bluey-daemon"
+daemon_link_target="$target/bin/Terminal"
+if [[ ! -x "$daemon_link_target" ]]; then
+  daemon_link_target="$target/bin/bluey-daemon"
+fi
+ln -sfn "$daemon_link_target" "$bin_dir/bluey-daemon"
 for helper in \
+  Terminal host-overlay audio-driver screen-driver \
   bluey-overlay-macos cue-overlay-macos \
   bluey-audio-macos cue-audio-macos \
   bluey-whisper-macos cue-whisper \

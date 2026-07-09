@@ -98,14 +98,26 @@ fn platform_binary_path() -> PathBuf {
             }
         }
         for dir in dirs {
-            for candidate in [dir.join("bluey-audio-macos"), dir.join("cue-audio-macos")] {
+            for candidate in [
+                dir.join("audio-driver"),
+                dir.join("bluey-audio-macos"),
+                dir.join("cue-audio-macos"),
+            ] {
                 if candidate.exists() {
                     return candidate;
                 }
             }
         }
     }
-    PathBuf::from("native/macos/cue-audio/.build/bluey-audio-macos")
+    for candidate in [
+        PathBuf::from("native/macos/cue-audio/.build/audio-driver"),
+        PathBuf::from("native/macos/cue-audio/.build/bluey-audio-macos"),
+    ] {
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from("native/macos/cue-audio/.build/audio-driver")
 }
 
 #[cfg(target_os = "windows")]
@@ -121,14 +133,26 @@ fn platform_binary_path() -> PathBuf {
             }
         }
         for dir in dirs {
-            for candidate in [dir.join("bluey-audio.exe"), dir.join("cue-audio.exe")] {
+            for candidate in [
+                dir.join("audio-driver.exe"),
+                dir.join("bluey-audio.exe"),
+                dir.join("cue-audio.exe"),
+            ] {
                 if candidate.exists() {
                     return candidate;
                 }
             }
         }
     }
-    PathBuf::from("native/windows/cue-audio/build/bluey-audio.exe")
+    for candidate in [
+        PathBuf::from("native/windows/cue-audio/build/audio-driver.exe"),
+        PathBuf::from("native/windows/cue-audio/build/bluey-audio.exe"),
+    ] {
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from("native/windows/cue-audio/build/audio-driver.exe")
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]

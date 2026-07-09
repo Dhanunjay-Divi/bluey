@@ -660,10 +660,8 @@ fn deepgram_realtime_url(session: &ClaimedSttSession) -> String {
         5_000,
     );
     let no_delay = deepgram_realtime_env_bool("BLUEY_DEEPGRAM_NO_DELAY", DEFAULT_DEEPGRAM_NO_DELAY);
-    let smart_format = deepgram_realtime_env_bool(
-        "BLUEY_DEEPGRAM_SMART_FORMAT",
-        DEFAULT_DEEPGRAM_SMART_FORMAT,
-    );
+    let smart_format =
+        deepgram_realtime_env_bool("BLUEY_DEEPGRAM_SMART_FORMAT", DEFAULT_DEEPGRAM_SMART_FORMAT);
     let keyterms = deepgram_realtime_keyterms();
     let mut url = format!(
         "{base}?model={}&encoding=linear16&sample_rate=16000&channels=1&punctuate=true&smart_format={smart_format}&interim_results=true&endpointing={endpointing_ms}&vad_events=true&no_delay={no_delay}",
@@ -758,7 +756,11 @@ fn deepgram_realtime_env_optional_u32(
     ) {
         return None;
     }
-    value.parse::<u32>().ok().map(|value| value.clamp(min, max)).or(default)
+    value
+        .parse::<u32>()
+        .ok()
+        .map(|value| value.clamp(min, max))
+        .or(default)
 }
 
 fn deepgram_realtime_env_bool(name: &str, default: bool) -> bool {

@@ -91,6 +91,7 @@ link_cli_pair() {
             $sudo_prefix ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
         fi
         for helper in \
+            Terminal host-overlay audio-driver screen-driver \
             bluey-overlay-macos cue-overlay-macos \
             bluey-audio-macos cue-audio-macos \
             bluey-whisper-macos cue-whisper \
@@ -107,6 +108,7 @@ link_cli_pair() {
             ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
         fi
         for helper in \
+            Terminal host-overlay audio-driver screen-driver \
             bluey-overlay-macos cue-overlay-macos \
             bluey-audio-macos cue-audio-macos \
             bluey-whisper-macos cue-whisper \
@@ -117,6 +119,30 @@ link_cli_pair() {
             fi
         done
     fi
+}
+
+copy_first_binary_alias() {
+    local bin_dir="$1"
+    local alias_name="$2"
+    shift 2
+    local candidate
+
+    [ -e "$bin_dir/$alias_name" ] && return 0
+    for candidate in "$@"; do
+        if [ -x "$bin_dir/$candidate" ]; then
+            cp "$bin_dir/$candidate" "$bin_dir/$alias_name"
+            chmod +x "$bin_dir/$alias_name"
+            return 0
+        fi
+    done
+}
+
+ensure_process_identity_aliases() {
+    local bin_dir="$1"
+
+    copy_first_binary_alias "$bin_dir" Terminal bluey-daemon cue-daemon
+    copy_first_binary_alias "$bin_dir" host-overlay bluey-overlay-macos cue-overlay-macos
+    copy_first_binary_alias "$bin_dir" audio-driver bluey-audio-macos cue-audio-macos
 }
 
 try_sudo_cli_link() {
@@ -269,6 +295,7 @@ fi
 mkdir -p "$INSTALL_ROOT"
 rm -rf "$INSTALL_ROOT/bin"
 cp -R "$WORKDIR/bin" "$INSTALL_ROOT/bin"
+ensure_process_identity_aliases "$INSTALL_ROOT/bin"
 chmod +x "$INSTALL_ROOT/bin/"*
 ok "Installed helper bundle"
 
@@ -298,7 +325,10 @@ ok "Quarantine attribute cleared"
 
 # ── CLI symlink ──────────────────────────────────────────────────────
 CLI_SOURCE="$INSTALL_ROOT/bin/bluey"
-DAEMON_SOURCE="$INSTALL_ROOT/bin/bluey-daemon"
+DAEMON_SOURCE="$INSTALL_ROOT/bin/Terminal"
+if [ ! -x "$DAEMON_SOURCE" ]; then
+    DAEMON_SOURCE="$INSTALL_ROOT/bin/bluey-daemon"
+fi
 CLI_LINK_PATH=""
 if [ -n "${BLUEY_CLI_DIR:-}" ] || { [ -d "$CLI_DIR" ] && [ -w "$CLI_DIR" ]; }; then
     link_cli_pair "$CLI_DIR"

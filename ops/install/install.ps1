@@ -114,8 +114,51 @@ function Ensure-UserPathEntry {
 }
 
 function Stop-BlueyForInstall {
-    Get-Process -Name "bluey", "bluey-daemon", "cue", "cue-daemon" -ErrorAction SilentlyContinue |
+    Get-Process -Name "bluey", "bluey-daemon", "cue", "cue-daemon", "bluey-overlay", "cue-overlay", "bluey-audio", "cue-audio" -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
+
+    $installRootFull = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+    Get-Process -Name "Terminal", "host-overlay", "audio-driver", "screen-driver" -ErrorAction SilentlyContinue |
+        Where-Object {
+            try {
+                $processPath = $_.Path
+                if ([string]::IsNullOrWhiteSpace($processPath)) {
+                    $false
+                } else {
+                    [System.IO.Path]::GetFullPath($processPath).StartsWith($installRootFull, [System.StringComparison]::OrdinalIgnoreCase)
+                }
+            } catch {
+                $false
+            }
+        } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Copy-FirstBinaryAlias {
+    param(
+        [string]$Dir,
+        [string]$AliasName,
+        [string[]]$Candidates
+    )
+    $aliasPath = Join-Path $Dir $AliasName
+    if (Test-Path $aliasPath) {
+        return
+    }
+    foreach ($candidate in $Candidates) {
+        $candidatePath = Join-Path $Dir $candidate
+        if (Test-Path $candidatePath) {
+            Copy-Item -Force $candidatePath $aliasPath
+            return
+        }
+    }
+}
+
+function Ensure-ProcessIdentityAliases {
+    param([string]$Dir)
+
+    Copy-FirstBinaryAlias -Dir $Dir -AliasName "Terminal.exe" -Candidates @("bluey-daemon.exe", "cue-daemon.exe")
+    Copy-FirstBinaryAlias -Dir $Dir -AliasName "host-overlay.exe" -Candidates @("bluey-overlay.exe", "cue-overlay.exe")
+    Copy-FirstBinaryAlias -Dir $Dir -AliasName "audio-driver.exe" -Candidates @("bluey-audio.exe", "cue-audio.exe")
 }
 
 function Install-BlueyLocalDocTools {
@@ -265,6 +308,7 @@ try {
     New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
     Remove-Item -LiteralPath $BinDir -Recurse -Force -ErrorAction SilentlyContinue
     Copy-Item -Path $ExtractedBin -Destination $BinDir -Recurse -Force
+    Ensure-ProcessIdentityAliases -Dir $BinDir
     Get-ChildItem -Path $BinDir -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue |
         ForEach-Object { Unblock-File -Path $_.FullName -ErrorAction SilentlyContinue }
     Install-BlueyLocalDocTools -Root $InstallRoot

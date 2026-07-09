@@ -33,8 +33,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let squareCardEnvironment = '';
     let squareCardSetupId = '';
     let squareCardContainerId = '';
+    let squareCardAccountKey = '';
     let squareCardSetupPromise = null;
+    let squareCardSetupKey = '';
     let squareCardAttached = false;
+    let reloadSetupCardFailed = false;
     let refreshAccountTokenPromise = null;
     let currentAccountEmail = '';
     let currentAccountIsAdmin = false;
@@ -428,6 +431,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function clearAccountToken() {
       clearPendingDeviceCode();
+      resetBillingCardState();
       localStorage.removeItem(ACCESS_TOKEN_KEY);
       localStorage.removeItem(REFRESH_TOKEN_KEY);
       localStorage.removeItem(AUTH_PERSISTENCE_KEY);
@@ -2044,6 +2048,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
     }
 
+    function billingAccountKey(me) {
+      if (!me) return '';
+      return [
+        me.id || '',
+        me.email || '',
+        me.billing_provider || '',
+        me.square_environment || '',
+        me.square_application_id || '',
+        me.square_location_id || '',
+      ].join('|');
+    }
+
+    function squareCardKey(me, setupId, containerId) {
+      return `${billingAccountKey(me)}|${setupId || ''}|${containerId || ''}`;
+    }
+
     async function setupSquareCard(me, options = {}) {
       const setupId = options.setupId || 'squareCardSetup';
       const containerId = options.containerId || 'squareCardContainer';
@@ -2052,9 +2072,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!setup || !container) return;
       if (!me?.square_application_id || !me?.square_location_id) return;
       const environment = me.square_environment || 'sandbox';
-      if (squareCard && squareCardEnvironment === environment && squareCardContainerId === containerId) return;
-      if (squareCardSetupPromise) return squareCardSetupPromise;
+      const nextCardKey = squareCardKey(me, setupId, containerId);
+      if (squareCard && squareCardAttached && squareCardAccountKey === nextCardKey) return;
+      if (squareCardSetupPromise) {
+        if (squareCardSetupKey === nextCardKey) return squareCardSetupPromise;
+        try {
+          await squareCardSetupPromise;
+        } catch {
+          // A stale setup can fail while the account or panel changes; retry below.
+        }
+      }
 
+      squareCardSetupKey = nextCardKey;
       squareCardSetupPromise = (async () => {
         if (squareCard && typeof squareCard.destroy === 'function') {
           try {
@@ -2074,10 +2103,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         squareCardEnvironment = environment;
         squareCardSetupId = setupId;
         squareCardContainerId = containerId;
+        squareCardAccountKey = nextCardKey;
         await squareCard.attach(`#${containerId}`);
         squareCardAttached = true;
       })().finally(() => {
         squareCardSetupPromise = null;
+        squareCardSetupKey = '';
       });
       return squareCardSetupPromise;
     }
@@ -2401,6 +2432,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function renderAccountBalanceSnapshot(me, usage = null) {
+      if (latestAccountForBilling && billingAccountKey(latestAccountForBilling) !== billingAccountKey(me)) {
+        resetBillingCardState();
+      }
       currentAccountEmail = me.email || '';
       const accountLabel = me.is_temporary ? 'Temporary Bluey trial' : (me.email || 'Bluey account');
       document.querySelectorAll('[data-profile-email-label]').forEach((profileEmailLabel) => {
@@ -2569,8 +2603,24 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         squareCardEnvironment = '';
         squareCardSetupId = '';
         squareCardContainerId = '';
+        squareCardAccountKey = '';
         squareCardAttached = false;
       }
+    }
+
+    function resetBillingCardState() {
+      reloadSetupCardFailed = false;
+      closeSquareCardSetup({
+        setupId: 'reloadSetupSquareCardSetup',
+        containerId: 'reloadSetupSquareCardContainer',
+        changeButtonId: 'reloadSetupCardButton',
+      });
+      closeSquareCardSetup({
+        setupId: 'updateCardSquareCardSetup',
+        containerId: 'updateCardSquareCardContainer',
+        changeButtonId: 'changeSquareCardButton',
+      });
+      latestAccountForBilling = null;
     }
 
     async function tokenizeSquareCardForm() {
@@ -2747,7 +2797,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
       cardButton.disabled = !canUseCard;
       cardButton.hidden = setup?.dataset.open === '1';
-      cardButton.textContent = hasSavedMethod ? 'Use another card' : 'Add card';
+      cardButton.textContent = reloadSetupCardFailed
+        ? 'Retry card'
+        : hasSavedMethod
+          ? 'Use another card'
+          : 'Add card';
+    }
+
+    function isReloadCardSetupOpen() {
+      const setup = document.getElementById('reloadSetupSquareCardSetup');
+      return Boolean(setup && setup.dataset.open === '1' && !setup.hidden);
+    }
+
+    function isReloadCardReady() {
+      return isReloadCardSetupOpen()
+        && squareCardAttached
+        && squareCardContainerId === 'reloadSetupSquareCardContainer';
     }
 
     function updateReloadAmountPresets() {
@@ -2768,21 +2833,40 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const enabled = Boolean(toggle?.checked);
       const wasEnabled = Boolean(latestAccountForBilling?.auto_topup_enabled);
       const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
-      const canUseCard = canUseSquareCardSetup(latestAccountForBilling);
+      const canOpenCard = canUseSquareCardSetup(latestAccountForBilling);
+      const canUseCard = canOpenCard && !reloadSetupCardFailed;
+      const cardSetupOpen = isReloadCardSetupOpen();
+      const waitingForCard = enabled
+        && canOpenCard
+        && !hasSavedMethod
+        && cardSetupOpen
+        && !isReloadCardReady()
+        && !reloadSetupCardFailed;
       let amountCents = MANUAL_RELOAD_AMOUNT_CENTS;
 
       try {
         amountCents = readManualReloadCents('modalReloadAmount');
         if (checkoutButton) {
-          checkoutButton.textContent = canUseCard
-            ? `Add ${money(amountCents)}`
-            : 'Continue to checkout';
-          checkoutButton.disabled = false;
+          if (waitingForCard) {
+            checkoutButton.textContent = 'Loading secure card...';
+            checkoutButton.disabled = true;
+          } else if (enabled && !hasSavedMethod && canUseCard) {
+            checkoutButton.textContent = cardSetupOpen
+              ? `Add ${money(amountCents)} + save card`
+              : 'Enter card to continue';
+            checkoutButton.disabled = !cardSetupOpen;
+          } else if (hasSavedMethod) {
+            checkoutButton.textContent = `Add ${money(amountCents)}`;
+            checkoutButton.disabled = false;
+          } else {
+            checkoutButton.textContent = 'Continue to Square checkout';
+            checkoutButton.disabled = false;
+          }
         }
       } catch (error) {
         if (autoRule) autoRule.textContent = error.message;
         if (checkoutButton) {
-          checkoutButton.textContent = canUseCard ? 'Add balance' : 'Continue to checkout';
+          checkoutButton.textContent = canUseCard ? 'Add balance' : 'Continue to Square checkout';
           checkoutButton.disabled = true;
         }
         updateReloadAmountPresets();
@@ -2791,17 +2875,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       updateReloadAmountPresets();
 
       if (!autoRule) return;
-      if (cardActions) cardActions.hidden = !canUseCard;
+      if (cardActions) cardActions.hidden = !canOpenCard;
       if (cardButton) {
-        cardButton.hidden = !canUseCard || document.getElementById('reloadSetupSquareCardSetup')?.dataset.open === '1';
-        cardButton.disabled = !canUseCard;
+        cardButton.hidden = !canOpenCard || document.getElementById('reloadSetupSquareCardSetup')?.dataset.open === '1';
+        cardButton.disabled = !canOpenCard;
+        cardButton.textContent = reloadSetupCardFailed
+          ? 'Retry card'
+          : hasSavedMethod
+            ? 'Use another card'
+            : 'Add card';
       }
       if (!enabled) {
         autoRule.textContent = wasEnabled
           ? 'Auto Reload turns off after this payment.'
           : hasSavedMethod
             ? 'This payment uses your saved card. Auto Reload stays off.'
-            : canUseCard
+            : canOpenCard
               ? 'Use a card once. Auto Reload stays off.'
               : 'Auto Reload is off.';
         return;
@@ -2811,18 +2900,42 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const settings = readModalAutoReloadSettings();
         autoRule.textContent = hasSavedMethod
           ? `Add ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`
+          : waitingForCard
+            ? 'Loading secure card form. This will add balance once and save the card for future Auto Reload.'
           : canUseCard
-            ? `Add a card once. Then Bluey adds ${money(settings.auto_topup_amount_cents)} when below ${money(settings.auto_topup_threshold_cents)}.`
+            ? `Add balance once and save the card. Future Auto Reload adds ${money(settings.auto_topup_amount_cents)} when below ${money(settings.auto_topup_threshold_cents)}.`
+            : reloadSetupCardFailed
+              ? 'Card setup failed. Use hosted checkout now, or retry the card form.'
             : 'Auto Reload is not available for this account yet.';
       } catch (error) {
         autoRule.textContent = error.message;
       }
     }
 
+    function handleReloadCardSetupFailure(error) {
+      reloadSetupCardFailed = true;
+      closeSquareCardSetup({
+        setupId: 'reloadSetupSquareCardSetup',
+        containerId: 'reloadSetupSquareCardContainer',
+        changeButtonId: 'reloadSetupCardButton',
+      });
+      const toggle = document.getElementById('modalAutoReloadToggle');
+      if (toggle && !latestAccountForBilling?.auto_topup_enabled && !latestAccountForBilling?.auto_topup_available) {
+        toggle.checked = false;
+      }
+      updateReloadSetupDraftCopy();
+      const raw = String(error?.message || '').trim();
+      const detail = raw && !/unexpected error occurred while using card/i.test(raw)
+        ? ` ${raw}`
+        : '';
+      reloadSetupMessage(`The secure card form could not load.${detail} You can still use hosted checkout, or retry the card form.`, 'error');
+    }
+
     function resetReloadSetupDialog() {
       const dialog = document.getElementById('addCreditsDialog');
       if (dialog) dialog.hidden = true;
       reloadSetupMessage('');
+      reloadSetupCardFailed = false;
       closeSquareCardSetup({
         setupId: 'reloadSetupSquareCardSetup',
         containerId: 'reloadSetupSquareCardContainer',
@@ -2841,16 +2954,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         startReload();
         return;
       }
+      reloadSetupCardFailed = false;
       syncReloadSetupFromDashboard();
       reloadSetupMessage('');
       dialog.hidden = false;
-      if (canUseSquareCardSetup(latestAccountForBilling) && !latestAccountForBilling?.auto_topup_available) {
-        openReloadSetupCard().catch((error) => reloadSetupMessage(error.message, 'error'));
+      if (document.getElementById('modalAutoReloadToggle')?.checked
+        && canUseSquareCardSetup(latestAccountForBilling)
+        && !latestAccountForBilling?.auto_topup_available) {
+        openReloadSetupCard().catch(handleReloadCardSetupFailure);
       }
       setTimeout(() => amount?.focus(), 0);
     }
 
     async function openReloadSetupCard() {
+      reloadSetupCardFailed = false;
+      reloadSetupMessage('Loading secure card form...');
+      updateReloadSetupDraftCopy();
       await openSquareCardSetup({
         buttonId: 'reloadSetupCardButton',
         setupId: 'reloadSetupSquareCardSetup',
@@ -2913,8 +3032,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }
       }
 
-      const canUseCard = canUseSquareCardSetup(latestAccountForBilling);
-      if (!canUseCard) {
+      const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
+      const cardSetup = document.getElementById('reloadSetupSquareCardSetup');
+      const usingCardForm = Boolean(cardSetup && cardSetup.dataset.open === '1' && !cardSetup.hidden);
+      const canOpenCard = canUseSquareCardSetup(latestAccountForBilling);
+      const shouldUseDirectCard = canOpenCard
+        && !reloadSetupCardFailed
+        && (hasSavedMethod || autoReloadSelected || usingCardForm);
+
+      if (!shouldUseDirectCard) {
         reloadSetupMessage('Opening checkout...');
         await saveReloadSetupAutoReloadIfReady();
         const opened = await startReload();
@@ -2925,19 +3051,24 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return opened;
       }
 
-      const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
-      const cardSetup = document.getElementById('reloadSetupSquareCardSetup');
-      const usingCardForm = Boolean(cardSetup && cardSetup.dataset.open === '1' && !cardSetup.hidden);
       let sourceId = '';
 
       if (!hasSavedMethod || usingCardForm) {
         if (!usingCardForm) {
           await openReloadSetupCard();
+          reloadSetupMessage('Enter your card, then click Add balance.');
+          updateReloadSetupDraftCopy();
+          return false;
+        }
+        if (!isReloadCardReady()) {
+          reloadSetupMessage('Card form is still loading. Try again in a moment.', 'error');
+          updateReloadSetupDraftCopy();
+          return false;
         }
         try {
           sourceId = await tokenizeSquareCardForm();
         } catch (error) {
-          reloadSetupMessage(error.message, 'error');
+          handleReloadCardSetupFailure(error);
           updateReloadSetupDraftCopy();
           return false;
         }
@@ -4070,9 +4201,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
             toggle.checked = true;
           } else if (!latestAccountForBilling?.auto_topup_enabled && !latestAccountForBilling?.auto_topup_available) {
             setAutoReloadSetupOptOut(true);
+            closeSquareCardSetup({
+              setupId: 'reloadSetupSquareCardSetup',
+              containerId: 'reloadSetupSquareCardContainer',
+              changeButtonId: 'reloadSetupCardButton',
+            });
           }
         } else if (toggle?.checked) {
           setAutoReloadSetupOptOut(false);
+          if (!latestAccountForBilling?.auto_topup_available
+            && canUseSquareCardSetup(latestAccountForBilling)) {
+            openReloadSetupCard().catch(handleReloadCardSetupFailure);
+          }
         }
         updateReloadSetupDraftCopy();
       });
@@ -4112,7 +4252,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         });
       });
       document.getElementById('reloadSetupCardButton')?.addEventListener('click', () => {
-        openReloadSetupCard().catch((error) => reloadSetupMessage(error.message, 'error'));
+        openReloadSetupCard().catch(handleReloadCardSetupFailure);
       });
       document.getElementById('refreshDevicesButton')?.addEventListener('click', () => {
         renderLinkedDevices({ devices: [] }, 'Loading computers...');
