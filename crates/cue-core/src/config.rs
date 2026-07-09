@@ -85,16 +85,6 @@ pub struct CueSettings {
     /// Cleared on detach.
     #[serde(default)]
     pub attached_model: Option<String>,
-    /// Agent bridge: whether the attached session has already received the HEAVY
-    /// first-turn meeting context (pre-meeting brief, saved summary, back-history
-    /// transcript, and Bluey's own Q&A). `false` on a fresh attach / new session;
-    /// set `true` after the first answered turn (in the conversation-chaining
-    /// persist). While `true`, later turns send only the always-pinned delta
-    /// (decisions ledger + recent transcript) plus the new question — never the
-    /// heavy blob again. Reset to `false` whenever `attached_session` changes to a
-    /// new id, and on detach, so a re-attached session re-primes.
-    #[serde(default)]
-    pub attached_context_primed: bool,
 
     /// Agent bridge: vendors for which the user has acknowledged the BYOT
     /// billing disclosure. Each entry is a lowercase `vendor_short` string
@@ -164,7 +154,6 @@ impl Default for CueSettings {
             attached_agent: None,
             attached_session: None,
             attached_model: None,
-            attached_context_primed: false,
             accepted_byot_vendors: Vec::new(),
             pinned_overlay_sessions: Vec::new(),
             my_names: Vec::new(),
@@ -322,6 +311,5 @@ mod tests {
         assert_eq!(settings.attached_model, None);
         // Added after this legacy config was written; must default to false
         // (unprimed → the attached session sends full context on its first turn).
-        assert!(!settings.attached_context_primed);
     }
 }

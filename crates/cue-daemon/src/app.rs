@@ -3587,24 +3587,8 @@ fn apply_attach_to_settings(
         // answered turn. A model-only re-attach (session preserved) leaves both
         // the session AND its primed state untouched.
         settings.attached_session = session;
-        settings.attached_context_primed = false;
     }
     settings.attached_model = model;
-}
-
-/// Set the `attached_context_primed` marker (send-heavy-context-once). Called
-/// after the first answered turn of an attached session so later turns send only
-/// the pinned delta. A standalone writer (not part of `apply_attach_to_settings`)
-/// because it must survive a chaining id-advance, which resets the marker via
-/// the session-changed rule — this follow-up save re-sets it.
-async fn set_attached_context_primed(daemon: &Arc<Daemon>, primed: bool) -> Result<()> {
-    let mut settings = load_settings(&daemon.paths)?;
-    if settings.attached_context_primed == primed {
-        return Ok(()); // no-op — avoid a needless write + touch
-    }
-    settings.attached_context_primed = primed;
-    settings.touch();
-    save_settings(&daemon.paths, &settings)
 }
 
 /// Stamp the ACTIVE meeting with the agent thread (session id + KIND) it is
@@ -9464,9 +9448,6 @@ async fn answer_with_agent(
                     // agent set when the session id changed above. Done as a
                     // follow-up save so it wins. Best-effort: a failure just costs
                     // one extra full-context send next turn.
-                    if let Err(error) = set_attached_context_primed(&daemon, true).await {
-                        warn!(agent = %label, error = %error, "failed to set context-primed marker");
-                    }
 
                     // Record this newly-minted session in the spawn-time ledger
                     // so a later cwd-scoped resume never depends on vendor-store
@@ -9496,9 +9477,6 @@ async fn answer_with_agent(
                     // advance, or a re-answer): no chaining persist, but this turn
                     // still delivered the heavy context — mark primed so later
                     // turns send only the delta. No-op if already primed.
-                    if let Err(error) = set_attached_context_primed(&daemon, true).await {
-                        warn!(agent = %label, error = %error, "failed to set context-primed marker");
-                    }
                     // Stamp the meeting<->agent link here TOO: a stable-id resume
                     // (the id didn't advance) still means this meeting used that
                     // thread, and this is the path the "resume a prior session via
@@ -10564,16 +10542,17 @@ async fn answer_context_for_question(
     meeting: &MeetingRecord,
     question: &str,
 ) -> Vec<AnswerContext> {
-    // Send-heavy-context-once: on turns AFTER the first of an attached session
-    // (marker set in the conversation-chaining persist), skip the brief / saved
-    // summary / back-history Q&A / artifacts and send only the always-pinned
-    // delta (decisions ledger + recent transcript). A fresh/unprimed attach gets
-    // the full package. Best-effort: a settings read failure sends the full
-    // package (safe — worst case is one redundant send, never lost context).
-    let primed = load_settings(&daemon.paths)
-        .map(|s| s.attached_context_primed)
-        .unwrap_or(false);
-    let mut context = answer_context_from_meeting_within(meeting, primed);
+    // THE HYBRID ENVELOPE (the no-push pivot, final shape): every question
+    // carries only the small always-needed slice — verified ledger + rolling
+    // summary + recent transcript + user-attached artifacts — so the common
+    // case costs zero tool round-trips. EVERYTHING else (past meetings,
+    // decision search, deeper history, RAG) the agent PULLS via the
+    // bluey-memory MCP tools when its reasoning calls for it. The old
+    // prime-once/delta state machine and its heavy first-turn package
+    // (pre-meeting brief, back-history Q&A) are gone: pre-meeting context is
+    // the warm drive's job (the agent fetches it via ITS connectors), and a
+    // resumed session already holds its own prior answers.
+    let mut context = answer_context_from_meeting_within(meeting);
 
     // LLM-verified decisions ledger (see `crate::ledger`): higher-fidelity than
     // the keyword heuristic `decisions_ledger_block`, and every item is backed by
@@ -10589,167 +10568,12 @@ async fn answer_context_for_question(
         );
     }
 
-    context.extend(retrieved_memory_contexts(daemon, meeting, question).await);
+    // Deliberately NOT pushed: cross-meeting facts + RAG hits — the agent
+    // retrieves those on demand via search_past_meetings /
+    // search_meeting_decisions (see cue-mcp). Pushing them here would both
+    // duplicate the tools and re-inflate the envelope the pivot slimmed.
+    let _ = question;
     context
-}
-
-async fn retrieved_memory_contexts(
-    daemon: &Arc<Daemon>,
-    meeting: &MeetingRecord,
-    question: &str,
-) -> Vec<AnswerContext> {
-    if question.trim().is_empty() {
-        return Vec::new();
-    }
-
-    let current_session_id = meeting.id.to_string();
-    let mut contexts = Vec::new();
-
-    // Cross-meeting facts memory (long-term tier, keyless local embeddings):
-    // recall verified facts from OTHER meetings — "what did we decide about auth
-    // last week". Independent of the OpenAI-keyed RAG below. Bounded + score-
-    // floored so semantic noise never pollutes the answer context.
-    #[cfg(feature = "local-memory")]
-    {
-        let memory = daemon.facts_memory.lock().await.clone();
-        if let Some(memory) = memory {
-            match memory.search(question, 4, Some(&current_session_id)).await {
-                Ok(hits) => {
-                    let block =
-                        crate::memory::render_hits(&hits, crate::memory::RELEVANCE_FLOOR, 1_200);
-                    if !block.is_empty() {
-                        contexts.push(
-                            AnswerContext::new(AnswerContextKind::MeetingMemory, block)
-                                .with_title("From past meetings")
-                                .with_source("cross-meeting memory"),
-                        );
-                    }
-                }
-                Err(error) => debug!("cross-meeting memory query failed: {error:#}"),
-            }
-        }
-    }
-
-    let Some(rag) = daemon.rag.as_ref() else {
-        return contexts;
-    };
-    let mut seen = std::collections::HashSet::new();
-
-    match rag.query(question, 4, Some(&current_session_id)).await {
-        Ok(hits) => {
-            for hit in hits {
-                if let Some(context) =
-                    rag_hit_to_answer_context(hit, &current_session_id, &mut seen)
-                {
-                    contexts.push(context);
-                }
-            }
-        }
-        Err(error) => {
-            debug!(
-                session_id = %current_session_id,
-                error = %error,
-                "local RAG current-session query failed"
-            );
-        }
-    }
-
-    match rag.query(question, 6, None).await {
-        Ok(hits) => {
-            for hit in hits {
-                if contexts.len() >= 8 {
-                    break;
-                }
-                if let Some(context) =
-                    rag_hit_to_answer_context(hit, &current_session_id, &mut seen)
-                {
-                    contexts.push(context);
-                }
-            }
-        }
-        Err(error) => {
-            debug!(
-                session_id = %current_session_id,
-                error = %error,
-                "local RAG global query failed"
-            );
-        }
-    }
-
-    contexts
-}
-
-fn rag_hit_to_answer_context(
-    hit: cue_rag::RagHit,
-    current_session_id: &str,
-    seen: &mut std::collections::HashSet<(String, String)>,
-) -> Option<AnswerContext> {
-    if hit.score < 0.18 || hit.chunk_text.trim().is_empty() {
-        return None;
-    }
-    let key = (hit.session_id.clone(), hit.chunk_text.clone());
-    if !seen.insert(key) {
-        return None;
-    }
-
-    let same_session = hit.session_id == current_session_id;
-    let title = if same_session {
-        "Relevant current-session memory"
-    } else {
-        "Relevant older Bluey memory"
-    };
-    let source = if same_session {
-        "local RAG · current session".to_string()
-    } else {
-        format!("local RAG · session {}", hit.session_id)
-    };
-    let content = format!("Relevance: {:.2}\n{}", hit.score, hit.chunk_text.trim());
-    Some(
-        AnswerContext::new(AnswerContextKind::MeetingMemory, content)
-            .with_title(title)
-            .with_source(source),
-    )
-}
-
-/// Map a [`MeetingRecord`] to a pre-meeting brief (master doc §4) from the
-/// signals available locally today: a real (non-default) meeting title and the
-/// titles of any context artifacts the user pre-loaded as "expect questions
-/// about these" references. Returns `None` when nothing is worth staging.
-///
-/// This is the lean seam: a future calendar connector fills the same
-/// [`cue_core::PrestageInput`] (attendees, agenda, linked tickets) and the
-/// brief grows automatically — no change here or downstream.
-fn prestage_brief_for_meeting(meeting: &MeetingRecord) -> Option<String> {
-    const MAX_REFS: usize = 30;
-
-    // The generic placeholder titles carry no signal — treat them as "no title".
-    let title = {
-        let trimmed = meeting.title.trim();
-        let is_placeholder = trimmed.is_empty()
-            || trimmed.eq_ignore_ascii_case("Ad hoc meeting")
-            || trimmed.eq_ignore_ascii_case("Ad hoc audio meeting");
-        if is_placeholder {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    };
-
-    let linked_refs: Vec<String> = meeting
-        .context
-        .iter()
-        .map(|artifact| artifact.title.trim().to_string())
-        .filter(|title| !title.is_empty())
-        .take(MAX_REFS)
-        .collect();
-
-    let input = cue_core::PrestageInput {
-        title,
-        attendees: Vec::new(),
-        agenda: Vec::new(),
-        linked_refs,
-    };
-    cue_core::build_prestage_brief(&input)
 }
 
 /// Build the pinned "decisions ledger" block (master doc §5) from the
@@ -10822,24 +10646,8 @@ fn decisions_ledger_block(meeting: &MeetingRecord) -> Option<String> {
 /// decisions and the latest transcript. `primed` is `false` for a fresh attach /
 /// new session (full package), and reset to `false` whenever the attached
 /// session changes.
-fn answer_context_from_meeting_within(meeting: &MeetingRecord, primed: bool) -> Vec<AnswerContext> {
+fn answer_context_from_meeting_within(meeting: &MeetingRecord) -> Vec<AnswerContext> {
     let mut context = Vec::new();
-
-    // Pre-meeting brief (master doc §4): a staged block that warms the package
-    // with what was known before the call — title and pre-loaded references —
-    // so the first answer is instant and even a mangled "AUTH-12" resolves
-    // because the agent already knows it is in play. Lean: built from local
-    // signals; a calendar connector later fills the same `PrestageInput`.
-    // FIRST-TURN ONLY: static pre-call context; nothing new to add on later turns.
-    if !primed {
-        if let Some(brief) = prestage_brief_for_meeting(meeting) {
-            context.push(
-                AnswerContext::new(AnswerContextKind::MeetingMemory, brief)
-                    .with_title("Pre-meeting brief")
-                    .with_source("pre-staged meeting context"),
-            );
-        }
-    }
 
     // Pinned decisions ledger (master doc §5): decisions + open commitments are
     // ALWAYS sent (every turn, primed or not), ahead of the recency-bounded
@@ -10892,24 +10700,9 @@ fn answer_context_from_meeting_within(meeting: &MeetingRecord, primed: bool) -> 
         );
     }
 
-    // FIRST-TURN ONLY: Bluey's own recent Q&A — on a resumed vendor session the
-    // agent already has the answers it gave; re-sending them every turn is the
-    // bulk of the redundant blob and echoes Bluey's own scaffolding back in.
-    if !primed {
-        let conversation = meeting.last_conversation_text(10);
-        if !conversation.trim().is_empty() {
-            context.push(
-                AnswerContext::new(AnswerContextKind::MeetingMemory, conversation)
-                    .with_title("Recent Bluey Q&A")
-                    .with_source("active session answer history"),
-            );
-        }
-    }
-
-    // FIRST-TURN ONLY: attached artifacts (files/screenshots/pages) are static
-    // grounding the resumed agent already has after the first turn; a newly
-    // attached artifact re-primes via a fresh attach, so this stays first-turn.
-    if !primed {
+    // ALWAYS: attached artifacts (files/screenshots/pages) — explicit user
+    // intent, not reachable via the memory tools; titles+notes only, bounded.
+    {
         for artifact in meeting
             .context
             .iter()
@@ -14016,24 +13809,18 @@ mod tests {
             true,
         ));
 
-        let ctx = answer_context_from_meeting_within(&meeting, false);
+        let ctx = answer_context_from_meeting_within(&meeting);
         let ledger_idx = ctx
             .iter()
             .position(|c| c.source.as_deref() == Some("meeting decisions ledger"))
             .expect("ledger block present");
-        let brief_idx = ctx
-            .iter()
-            .position(|c| c.source.as_deref() == Some("pre-staged meeting context"))
-            .expect("pre-meeting brief present");
         let transcript_idx = ctx
             .iter()
             .position(|c| c.kind == cue_core::ai::AnswerContextKind::Transcript)
             .expect("transcript present");
 
-        assert!(
-            brief_idx < transcript_idx,
-            "pre-meeting brief must precede the transcript"
-        );
+        // (The pre-meeting brief push is gone under the hybrid envelope — the
+        // warm drive owns pre-context; only the ledger's ordering is pinned.)
         assert!(
             ledger_idx < transcript_idx,
             "decisions ledger must precede the transcript"
@@ -14143,7 +13930,7 @@ mod tests {
                 .to_string(),
         );
 
-        let context = answer_context_from_meeting_within(&meeting, false);
+        let context = answer_context_from_meeting_within(&meeting);
 
         let summary = context
             .iter()
@@ -14156,62 +13943,59 @@ mod tests {
     }
 
     #[test]
-    fn primed_context_sends_only_the_pinned_delta_not_the_heavy_first_turn_blob() {
-        // A meeting with a rolling summary + brief-worthy title + Q&A. On the
-        // FIRST turn (unprimed) the heavy pieces are sent; on a PRIMED turn only
-        // the always-pinned delta is sent (decisions ledger + ROLLING SUMMARY +
-        // recent transcript — SET 0.3) — no brief, no Bluey Q&A, no artifacts.
-        let mut meeting = MeetingRecord::new(Some("System design prep".to_string()));
-        meeting.summary = Some("- discussed sharding by tenant".to_string());
-        meeting.push_conversation_turn(ConversationTurn::new(
-            "what changed?".to_string(),
-            "let me check the git state...".to_string(),
+    fn envelope_sends_only_the_lean_always_needed_slice() {
+        // The hybrid envelope (no-push pivot): every turn carries ledger +
+        // rolling summary + recent transcript + artifacts — and NOTHING else.
+        // The old heavy first-turn package (pre-meeting brief, back-history
+        // Q&A) is gone: the agent pulls history via the bluey-memory tools.
+        let mut meeting = MeetingRecord::new(Some("Platform sync".to_string()));
+        meeting.summary = Some("- shipping friday".to_string());
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            "we ship friday",
+            true,
+        ));
+        meeting.conversation.push(cue_core::ConversationTurn::new(
+            "prior question".to_string(),
+            "prior answer".to_string(),
             None,
             None,
         ));
-
-        let full = answer_context_from_meeting_within(&meeting, false);
-        let primed = answer_context_from_meeting_within(&meeting, true);
-
-        // The ROLLING SUMMARY is part of the every-turn delta (it is refreshed
-        // live and carries what scrolled out of the transcript window).
+        let envelope = answer_context_from_meeting_within(&meeting);
         assert!(
-            full.iter()
-                .any(|i| i.source.as_deref() == Some("live rolling summary")),
-            "unprimed must include the rolling summary"
-        );
-        assert!(
-            primed
+            !envelope
                 .iter()
-                .any(|i| i.source.as_deref() == Some("live rolling summary")),
-            "primed delta must ALSO carry the rolling summary (SET 0.3)"
+                .any(|i| i.source.as_deref() == Some("pre-staged meeting context")),
+            "the pre-meeting brief push is deleted (warm drive owns pre-context)"
         );
-        // Bluey's own Q&A stays FIRST-TURN ONLY (the redundant blob).
         assert!(
-            !primed
+            !envelope
                 .iter()
                 .any(|i| i.source.as_deref() == Some("active session answer history")),
-            "primed must NOT re-send Bluey's own prior Q&A (the redundant blob)"
+            "Bluey's own Q&A is never re-pushed (resumed sessions already hold it)"
         );
-        // Primed still sends strictly fewer items (brief/Q&A/artifacts dropped).
         assert!(
-            primed.len() < full.len(),
-            "primed package must be smaller than the first-turn package"
+            envelope
+                .iter()
+                .any(|i| i.source.as_deref() == Some("live rolling summary")),
+            "the rolling summary is part of the lean envelope"
+        );
+        assert!(
+            envelope
+                .iter()
+                .any(|i| i.source.as_deref() == Some("active meeting transcript")),
+            "the recent transcript is part of the lean envelope"
         );
     }
 
     #[test]
-    fn changing_attached_session_resets_the_context_primed_marker() {
-        // A primed session that gets a DIFFERENT session id (user re-attach) must
-        // re-prime; a model-only re-attach (session preserved) must NOT.
+    fn changing_attached_session_updates_settings() {
         let mut s = CueSettings {
             attached_agent: Some("claude_code".to_string()),
             attached_session: Some("sess-1".to_string()),
-            attached_context_primed: true,
             ..CueSettings::default()
         };
-
-        // Model-only re-attach (no new session) preserves session AND primed.
+        // Model-only re-attach (no new session) preserves the session.
         apply_attach_to_settings(
             &mut s,
             Some("claude_code".to_string()),
@@ -14219,12 +14003,7 @@ mod tests {
             Some("opus".to_string()),
         );
         assert_eq!(s.attached_session.as_deref(), Some("sess-1"));
-        assert!(
-            s.attached_context_primed,
-            "model-only re-attach must keep the session primed"
-        );
-
-        // Attaching a DIFFERENT session re-primes (heavy context not yet sent).
+        // A different session replaces it; detach clears it.
         apply_attach_to_settings(
             &mut s,
             Some("claude_code".to_string()),
@@ -14232,16 +14011,8 @@ mod tests {
             None,
         );
         assert_eq!(s.attached_session.as_deref(), Some("sess-2"));
-        assert!(
-            !s.attached_context_primed,
-            "a new attached session must reset primed so it re-sends heavy context"
-        );
-
-        // Detach clears the session and the marker.
-        s.attached_context_primed = true;
         apply_attach_to_settings(&mut s, None, None, None);
         assert_eq!(s.attached_session, None);
-        assert!(!s.attached_context_primed, "detach must reset primed");
     }
 
     #[test]
