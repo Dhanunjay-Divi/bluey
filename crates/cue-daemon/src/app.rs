@@ -1928,6 +1928,8 @@ async fn handle_request_inner(
             write_state(daemon).await?;
             Ok(DaemonResponse::Recap { recap })
         }
+        DaemonRequest::WarmupStart { title } => warmup_start(daemon, title).await,
+        DaemonRequest::WarmupStop => warmup_stop(daemon).await,
         DaemonRequest::TranscriptAdd {
             speaker,
             text,
@@ -7090,6 +7092,116 @@ impl DaemonMemorySource {
             Vec::new()
         }
     }
+}
+
+/// The warm-up drive's canonical prompt: the agent prepares by PULLING —
+/// its own connectors for external context, Bluey's memory tools for ours.
+/// No context blob is pushed (the pivot's contract).
+fn warmup_prompt(title: &str) -> String {
+    format!(
+        "A meeting titled \"{title}\" is starting now. You are its copilot \
+         backend for the whole meeting. Prepare: (1) if you have calendar, \
+         Slack, email, or ticket MCP connectors, pull anything relevant to \
+         this meeting from them; (2) use the bluey-memory MCP tools — \
+         search_past_meetings and search_meeting_decisions — to review \
+         related prior decisions. Then reply with a short readiness brief \
+         (max 6 lines): what you know going in, and open questions to listen \
+         for. During the meeting you will be asked questions; always ground \
+         answers by pulling the bluey-memory tools (get_recent_transcript, \
+         get_meeting_summary) rather than assuming."
+    )
+}
+
+/// `WarmupStart`: rotate the MCP token, register Bluey's memory server into
+/// the attached agent, mint the meeting (create-iff-none), and run the
+/// warm-up drive. The existing conversation-chaining persist pins the new
+/// session id, so every in-meeting ask RESUMES the warmed session — the
+/// pre-context reasoning carries through the whole meeting.
+async fn warmup_start(daemon: &Arc<Daemon>, title: Option<String>) -> Result<DaemonResponse> {
+    // Hard gate: no attached agent → no backend (there is no fallback LLM).
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    let Some(agent) = parse_attached_agent(settings.attached_agent.as_deref()) else {
+        return Ok(DaemonResponse::Text {
+            text: "No coding agent attached — attach one to enable the meeting backend."
+                .to_string(),
+        });
+    };
+
+    // Fresh per-meeting token; rotate on the running server and register.
+    let reg = {
+        let guard = daemon.mcp_server.lock().await;
+        let Some(handle) = guard.as_ref() else {
+            return Ok(DaemonResponse::Text {
+                text: "Bluey MCP memory server is not running.".to_string(),
+            });
+        };
+        let token = uuid::Uuid::new_v4().to_string();
+        handle.rotate_token(token.clone()).await;
+        cue_agent_bridge::mcp_register::BlueyServerReg {
+            url: handle.url(),
+            token,
+        }
+    };
+    let warm_cwd = daemon.paths.data_dir.join("warm");
+    tokio::fs::create_dir_all(&warm_cwd).await.ok();
+    match cue_agent_bridge::mcp_register::register_bluey_memory(&agent, &reg, &warm_cwd).await {
+        Ok(cue_agent_bridge::mcp_register::RegisterOutcome::Registered) => {}
+        Ok(cue_agent_bridge::mcp_register::RegisterOutcome::Unsupported(why)) => {
+            return Ok(DaemonResponse::Text {
+                text: format!("This agent can't host the meeting backend: {why}"),
+            });
+        }
+        Err(error) => {
+            return Ok(DaemonResponse::Text {
+                text: format!("Registering Bluey's memory server failed: {error:#}"),
+            });
+        }
+    }
+
+    // Mint the meeting iff none is active (same create path MeetingStart uses),
+    // so the warm session binds to a real MeetingRecord.
+    let meeting_title = {
+        let mut meeting_guard = daemon.meeting.lock().await;
+        match meeting_guard.as_ref() {
+            Some(active) => active.title.clone(),
+            None => {
+                let meeting = MeetingRecord::new(title);
+                daemon.store.save_active(&meeting)?;
+                let t = meeting.title.clone();
+                *meeting_guard = Some(meeting.clone());
+                drop(meeting_guard);
+                *daemon.ledger.lock().await = cue_core::LedgerState::default();
+                update_state_from_meeting(daemon, Some(&meeting)).await?;
+                t
+            }
+        }
+    };
+
+    // The warm drive runs through the EXISTING answer path, so the chaining
+    // persist pins the fresh session id (attached_session) — in-meeting asks
+    // then resume the warmed session with its pre-context reasoning intact.
+    let response = answer_question(daemon, warmup_prompt(&meeting_title), "warmup").await?;
+    Ok(DaemonResponse::Text {
+        text: response.answer,
+    })
+}
+
+/// `WarmupStop`: deregister Bluey's server from the agent and burn the token.
+/// Best-effort — the token rotation alone already invalidates stale access.
+async fn warmup_stop(daemon: &Arc<Daemon>) -> Result<DaemonResponse> {
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    if let Some(agent) = parse_attached_agent(settings.attached_agent.as_deref()) {
+        let warm_cwd = daemon.paths.data_dir.join("warm");
+        if let Err(error) =
+            cue_agent_bridge::mcp_register::deregister_bluey_memory(&agent, &warm_cwd).await
+        {
+            debug!("bluey-memory deregister failed (token is burned anyway): {error:#}");
+        }
+    }
+    if let Some(handle) = daemon.mcp_server.lock().await.as_ref() {
+        handle.rotate_token(uuid::Uuid::new_v4().to_string()).await;
+    }
+    Ok(DaemonResponse::Ok)
 }
 
 fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {

@@ -45,6 +45,16 @@ pub enum DaemonRequest {
         title: Option<String>,
     },
     MeetingEnd,
+    /// Open the WARM meeting-backend session (the no-push pivot): rotate the
+    /// MCP memory token, register Bluey's server into the attached agent, and
+    /// run the warm-up drive that becomes THE session in-meeting asks resume.
+    /// Fired by the calendar trigger; callable headless for tests.
+    WarmupStart {
+        title: Option<String>,
+    },
+    /// Close the warm backend: deregister Bluey's server from the agent and
+    /// burn the meeting's MCP token.
+    WarmupStop,
     TranscriptAdd {
         speaker: Speaker,
         text: String,
