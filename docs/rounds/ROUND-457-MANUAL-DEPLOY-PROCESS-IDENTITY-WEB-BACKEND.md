@@ -65,4 +65,103 @@ Initial result:
 
 ## Pending Live Results
 
-To be filled after deployment completes.
+Completed.
+
+## Source Commit
+
+```text
+738b237d1654a6e979c2064d2aa0b9c8910bfcfa
+```
+
+Pushed to:
+
+```text
+codex/bluey-web-ui-parallel-20260704
+```
+
+`main` was not pushed in this round to avoid triggering GitHub Actions. The production deploy used the exact commit above through the manual droplet path.
+
+## Desktop/Web Deploy
+
+Command:
+
+```bash
+BLUEY_UPDATE_PUBKEY="$(cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64)" make package-darwin-arm64
+
+BLUEY_RELEASE_SIGNING_KEY_FILE=/Users/uno/.bluey/release/bluey-release-ed25519.pem \
+PUBLISH_DO=1 \
+PUBLISH_HOST=root@165.227.77.152 \
+PUBLISH_PATH=/var/www/bluey \
+scripts/deploy-bluey-sh-manual.sh
+```
+
+Live release:
+
+- Version: `0.1.96`
+- Artifact: `https://bluey.sh/releases/v0.1.96/bluey-0.1.96-darwin-arm64.tar.gz`
+- SHA256: `b0e0c64bfb7dc416d2957a7e3ad25b36c56a069dac37850400746480b1f75f0f`
+- Live `latest.json` signature verified.
+- `install.sh` MIME: `application/x-shellscript`
+- `install.ps1` MIME: `application/x-powershell`
+- Live artifact includes:
+  - `bin/Terminal`
+  - `bin/host-overlay`
+  - `bin/audio-driver`
+  - legacy `bluey-*` helper names for transition compatibility
+- Unpacked macOS arm64 binaries report `0.1.96`.
+
+Windows note:
+
+- The Windows installer script is live.
+- A Windows binary artifact was not built in this manual macOS/droplet deploy path; the Windows package still requires the Windows/MSVC builder.
+
+## API Deploy
+
+Pre-deploy guards:
+
+- `bluey-api.service` was active before deploy.
+- Disk guard passed; `/` was 31% used before deploy.
+- Fresh Postgres backup:
+
+```text
+/var/backups/bluey-api/hourly/bluey-postgres-20260709T104252Z.pgdump
+```
+
+Build source:
+
+```text
+/opt/bluey-build-codex-round457-0.1.96
+```
+
+Runtime binary:
+
+```text
+/usr/local/bin/bluey-server
+```
+
+Binary SHA256:
+
+```text
+a34d73e8a9fcf05515a543609116d949025b75c88b28727a5bb4e476ddde180a
+```
+
+Previous binary backup:
+
+```text
+/var/backups/bluey-api/bin/bluey-server.previous-20260709T105852Z
+```
+
+Post-deploy verification:
+
+- `bluey-api.service` is `active`.
+- `NRestarts=0`.
+- Local droplet `/health` returned commit `738b237d1654a6e979c2064d2aa0b9c8910bfcfa`.
+- Public `https://bluey.sh/health` returned commit `738b237d1654a6e979c2064d2aa0b9c8910bfcfa`.
+- Recent `journalctl -u bluey-api.service --since "5 min ago" -p warning..alert` returned no entries.
+- Disk after deploy: `/` at 34% used.
+
+## Final Notes
+
+- No GitHub Actions were used.
+- No provider secrets were copied into docs.
+- The ignored `server/Cargo.lock` is not part of the committed release source; the server build generated its lock in the isolated droplet build tree.
