@@ -152,6 +152,7 @@ type OverlayCommand =
       body: string;
       done?: boolean;
       cost_label?: string | null;
+      is_error?: boolean;
     }
   | {
       type: "set_answer_status";
@@ -757,11 +758,12 @@ export function createTauriClient(): MeetingClient {
           }
 
           if (u.done) {
-            const doneChunk: AnswerChunk = { done: true };
-            // Carry the cost label through as part of the terminal signal so the
-            // UI can show real cost instead of a placeholder. The UI's
-            // AnswerChunk has no cost field, so we surface it as a final text-
-            // free done chunk; cost rendering stays the UI's concern.
+            // An error card carries the failure as its body; flag it so the UI
+            // renders a distinct retryable error state instead of styling the
+            // failure message as if it were the answer.
+            const doneChunk: AnswerChunk = u.is_error
+              ? { done: true, error: true }
+              : { done: true };
             onChunk(doneChunk);
             finish();
           }

@@ -174,6 +174,9 @@ export interface AnswerChunk {
   statusDone?: boolean;
   /** true on the terminal chunk. */
   done?: boolean;
+  /** true when the terminal body is an ERROR (provider/agent failure, policy
+   *  block), not an answer — the UI renders a retryable error state. */
+  error?: boolean;
 }
 
 /** Answer speed/depth, mapped 1:1 to the daemon's optional `mode` field on

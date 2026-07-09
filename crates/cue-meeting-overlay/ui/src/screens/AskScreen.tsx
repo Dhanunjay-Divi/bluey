@@ -188,6 +188,7 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
           draft.sources = [...draft.sources, c.source as AnswerSource];
         if (c.done) {
           draft.done = true;
+          if (c.error) draft.error = true;
           // Answer finished → return to idle so the live caption (gated on
           // phase==="idle") reappears. The answer itself persists in the feed
           // above (turns are appended, not cleared). Without this, phase stayed
@@ -318,6 +319,9 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
                   answer={turn.answer}
                   onCopy={() =>
                     navigator.clipboard?.writeText(turn.answer.text)
+                  }
+                  onRetry={
+                    turn.answer.error ? () => runAsk(turn.question) : undefined
                   }
                 />
               )}

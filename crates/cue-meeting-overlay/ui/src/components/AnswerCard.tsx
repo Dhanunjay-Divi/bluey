@@ -14,6 +14,9 @@ export interface AnswerState {
   tools: string[];
   done: boolean;
   cost?: string;
+  /** True when `text` is an ERROR (provider/agent failure, policy block), not
+   *  an answer — renders a distinct retryable error state. */
+  error?: boolean;
 }
 
 export function AnswerCard({
@@ -21,12 +24,63 @@ export function AnswerCard({
   onCopy,
   onFix,
   onSendToChat,
+  onRetry,
 }: {
   answer: AnswerState;
   onCopy?: () => void;
   onFix?: () => void;
   onSendToChat?: () => void;
+  onRetry?: () => void;
 }) {
+  // Error state: a distinct, honest, retryable card — never styled as if the
+  // failure text were the answer (the 2026 AI-UX pattern: errors recoverable,
+  // not buried in the answer bubble).
+  if (answer.error) {
+    return (
+      <div
+        style={{
+          margin: "4px 12px",
+          padding: "13px 15px",
+          borderRadius: "var(--r-lg)",
+          background: "rgba(214,83,106,.07)",
+          boxShadow: "inset 0 0 0 1px rgba(214,83,106,.28)",
+        }}
+      >
+        <div
+          style={{
+            fontSize: 10,
+            fontWeight: 680,
+            letterSpacing: ".1em",
+            color: "var(--err, #c0392b)",
+            marginBottom: 5,
+          }}
+        >
+          COULDN’T ANSWER
+        </div>
+        <div style={{ fontSize: 13, lineHeight: 1.55, color: "var(--ink-2)" }}>
+          {answer.text}
+        </div>
+        {onRetry && (
+          <button
+            onClick={onRetry}
+            style={{
+              marginTop: 10,
+              padding: "5px 12px",
+              fontSize: 12,
+              fontWeight: 600,
+              borderRadius: 999,
+              border: "1px solid rgba(214,83,106,.35)",
+              background: "transparent",
+              color: "var(--err, #c0392b)",
+              cursor: "pointer",
+            }}
+          >
+            Try again
+          </button>
+        )}
+      </div>
+    );
+  }
   return (
     <div
       style={{
@@ -34,7 +88,8 @@ export function AnswerCard({
         padding: "15px 16px 13px",
         borderRadius: "var(--r-lg)",
         background: "var(--glass-2)",
-        boxShadow: "0 10px 36px -16px rgba(60,50,140,.3), inset 0 0 0 1px rgba(255,255,255,.5)",
+        boxShadow:
+          "0 10px 36px -16px rgba(60,50,140,.3), inset 0 0 0 1px rgba(255,255,255,.5)",
         animation: "aurora-fade-in .35s ease both",
       }}
     >
@@ -51,12 +106,17 @@ export function AnswerCard({
         }}
       >
         {answer.agentLabel.toUpperCase()}
-        <span style={{ fontWeight: 430, letterSpacing: 0, color: "var(--ink-4)" }}>
+        <span
+          style={{ fontWeight: 430, letterSpacing: 0, color: "var(--ink-4)" }}
+        >
           grounded in your repo &amp; tickets
         </span>
       </div>
 
-      <div className="md-body" style={{ fontSize: 14, lineHeight: 1.62, color: "var(--ink)" }}>
+      <div
+        className="md-body"
+        style={{ fontSize: 14, lineHeight: 1.62, color: "var(--ink)" }}
+      >
         {/* Streaming UX, the ChatGPT/Claude way: render FORMATTED markdown on
             EVERY frame, not just at the end. `repairStreamingMarkdown` closes the
             single unterminated construct on the live tail (an open ``` fence, a
@@ -80,7 +140,14 @@ export function AnswerCard({
         )}
 
         {answer.sources.length > 0 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 11 }}>
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 6,
+              marginTop: 11,
+            }}
+          >
             {answer.sources.map((s, i) => (
               <SourceRow key={i} kind={s.kind} label={s.label} note={s.note} />
             ))}
@@ -89,14 +156,29 @@ export function AnswerCard({
       </div>
 
       {answer.done && (
-        <div style={{ display: "flex", alignItems: "center", gap: 7, marginTop: 12 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 7,
+            marginTop: 12,
+          }}
+        >
           <CardAction glyph="⧉" label="Copy" onClick={onCopy} />
           {/* "Fix this" only when the answer is actually a fixable diagnosis (a
               real fix handler is wired) — not on a plain conversational answer. */}
-          {onFix && <CardAction glyph="✦" label="Fix this" accent onClick={onFix} />}
-          {onSendToChat && <CardAction glyph="⤴" label="Send to chat" onClick={onSendToChat} />}
+          {onFix && (
+            <CardAction glyph="✦" label="Fix this" accent onClick={onFix} />
+          )}
+          {onSendToChat && (
+            <CardAction glyph="⤴" label="Send to chat" onClick={onSendToChat} />
+          )}
           <span style={{ flex: 1 }} />
-          {answer.cost && <span style={{ fontSize: 10.5, color: "var(--ink-4)" }}>{answer.cost}</span>}
+          {answer.cost && (
+            <span style={{ fontSize: 10.5, color: "var(--ink-4)" }}>
+              {answer.cost}
+            </span>
+          )}
         </div>
       )}
     </div>

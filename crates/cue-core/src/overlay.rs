@@ -275,6 +275,12 @@ pub enum OverlayCommand {
         cost_label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<CueCardArtifact>,
+        /// True when `body` is an ERROR (provider/agent failure, policy block),
+        /// not an answer — so the overlay renders a distinct, retryable error
+        /// state instead of styling a failure message as the answer.
+        /// `#[serde(default)]` keeps old clients back-compatible.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
     },
     /// The live status feed for an in-flight answer: the agent's real reasoning
     /// and tool/connector calls, keyed to the answer card `id`. Emitted as the

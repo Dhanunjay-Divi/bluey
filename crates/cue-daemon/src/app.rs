@@ -184,6 +184,14 @@ impl OverlayAnswerStream {
         self.finish_with_cost_label(final_body, None).await
     }
 
+    /// Finish the answer card as an ERROR: the body is a provider/agent
+    /// failure, not an answer, so the overlay renders a distinct retryable
+    /// error state instead of styling it as the answer text.
+    async fn finish_error(&mut self, message: &str) -> Result<()> {
+        self.body = message.to_string();
+        self.flush_inner(true, None, true).await
+    }
+
     async fn finish_with_cost_label(
         &mut self,
         final_body: &str,
@@ -200,6 +208,15 @@ impl OverlayAnswerStream {
     }
 
     async fn flush_with_cost_label(&self, done: bool, cost_label: Option<String>) -> Result<()> {
+        self.flush_inner(done, cost_label, false).await
+    }
+
+    async fn flush_inner(
+        &self,
+        done: bool,
+        cost_label: Option<String>,
+        is_error: bool,
+    ) -> Result<()> {
         if !is_answer_generation_current(&self.daemon, self.generation_id) {
             return Ok(());
         }
@@ -210,7 +227,9 @@ impl OverlayAnswerStream {
                 body: self.body.clone(),
                 done,
                 cost_label,
-                artifact: answer_overlay_artifact(&self.body).filter(|_| done),
+                // An error body is not an artifact-bearing answer.
+                artifact: answer_overlay_artifact(&self.body).filter(|_| done && !is_error),
+                is_error,
             },
         )
         .await;
@@ -610,6 +629,7 @@ async fn register_active_answer_card(
                     done: true,
                     cost_label: None,
                     artifact: None,
+                    is_error: false,
                 },
             )
             .await;
@@ -4701,6 +4721,7 @@ from the proposal.",
                     done: true,
                     cost_label: None,
                     artifact: None,
+                    is_error: false,
                 },
             )
             .await;
@@ -4717,6 +4738,7 @@ review your working tree."
                     done: true,
                     cost_label: None,
                     artifact: None,
+                    is_error: false,
                 },
             )
             .await;
@@ -8193,7 +8215,7 @@ async fn answer_with_provider_runtime(
         Err(error) => {
             if is_answer_generation_current(daemon, generation_id) {
                 let _ = overlay_stream
-                    .finish(&user_facing_answer_error(&error))
+                    .finish_error(&user_facing_answer_error(&error))
                     .await;
             }
             clear_active_answer_card(daemon, generation_id, answer_card_id).await;
@@ -11730,6 +11752,7 @@ fn spawn_model_progress_forwarder(daemon: Arc<Daemon>) {
                         done: true,
                         cost_label: None,
                         artifact: None,
+                        is_error: false,
                     },
                 )
                 .await;
@@ -11769,6 +11792,7 @@ fn spawn_model_progress_forwarder(daemon: Arc<Daemon>) {
                     done: false,
                     cost_label: None,
                     artifact: None,
+                    is_error: false,
                 },
             )
             .await;
