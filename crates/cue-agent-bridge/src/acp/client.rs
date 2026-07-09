@@ -407,13 +407,19 @@ async fn drive_connection(
                     //    notification (parsed into an `AnswerChunk` and pushed
                     //    to the consumer) or the terminal `StopReason`.
                     //
-                    // ECHO DEDUP: claude's ACP stream emits the answer as
-                    // incremental chunks and THEN re-emits the complete
-                    // message as one final chunk (observed live:
-                    // "" + "A" + "CP-ALPHA" then "ACP-ALPHA"). A Delta whose
-                    // text exactly equals everything accumulated since the
-                    // last message boundary is that terminal echo — dropped,
-                    // or every answer doubles.
+                    // TERMINAL-ECHO DEDUP: claude-code-acp streams the answer as
+                    // incremental AgentMessageChunks and THEN re-emits the
+                    // COMPLETE message as one final chunk — verified live
+                    // (acp_delta_probe): for a 3-sentence answer the deltas were
+                    // [s1][s2][s3] then a 4th chunk equal to s1+s2+s3, so the
+                    // naive concat doubles the whole message. The terminal echo
+                    // is ALWAYS the full text accumulated since the last message
+                    // boundary, so a Delta whose (trimmed) text equals the
+                    // (trimmed) accumulator is that echo — suppressed. A tool
+                    // call ends the assistant message, so it resets the
+                    // accumulator (a fresh message follows). Trimmed compare
+                    // absorbs trailing-whitespace drift between the incremental
+                    // tail and the echo.
                     let answer_acc = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
                     loop {
                         match session.read_update().await? {
@@ -432,15 +438,18 @@ async fn drive_connection(
                                                 let mut acc = acc.lock().expect("acc");
                                                 match &chunk {
                                                     AnswerChunk::Delta(text) => {
-                                                        let echo = !acc.is_empty()
-                                                            && text.as_str() == acc.as_str();
+                                                        // The echo is the full
+                                                        // accumulated message. A
+                                                        // single-chunk answer
+                                                        // (acc empty until now)
+                                                        // is NEVER an echo.
+                                                        let echo = !acc.trim().is_empty()
+                                                            && text.trim() == acc.trim();
                                                         if !echo {
                                                             acc.push_str(text);
                                                         }
                                                         echo
                                                     }
-                                                    // A tool call starts a new
-                                                    // assistant message.
                                                     AnswerChunk::ToolCall { .. } => {
                                                         acc.clear();
                                                         false
