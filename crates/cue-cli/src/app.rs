@@ -17,6 +17,7 @@ use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::{
     load_account, load_settings, new_trace_id, save_account, save_settings, trace_id_from_env,
     AccountConfig, ActionItem, AgentConnectorInfo, AgentSessionSummary, AgentSummary, AiProviderId,
+    SourceCoverageInfo,
     AiProviderKind, AiRuntimeStatus, AnswerRequest, AnswerResponse, AudioPipelineStatus, CardKind,
     CloudSyncStatus, ContextArtifact, CueCard, CueSettings, MeetingRecap, MeetingRecord, MemoryHit,
     OverlayPosition, ProviderRoute, ProviderSelector, Speaker, BLUEY_TRACE_ID_ENV,
@@ -3030,6 +3031,29 @@ fn print_agent_connectors(connectors: &[AgentConnectorInfo]) {
     }
 }
 
+/// Print the meeting-relevant source coverage (mirrors `print_agent_connectors`):
+/// each source connected-or-missing, with the guided connect command for gaps.
+fn print_source_coverage(sources: &[SourceCoverageInfo]) {
+    if sources.is_empty() {
+        println!("No context sources found (attach a coding agent first).");
+        return;
+    }
+    for s in sources {
+        let status = if s.connected { "connected" } else { "missing" };
+        let via = s
+            .via
+            .as_deref()
+            .map(|v| format!(" via {v}"))
+            .unwrap_or_default();
+        println!("{}  ({})  {status}{via}", s.label, s.source);
+        if !s.connected {
+            if let Some(hint) = s.connect_hint.as_deref() {
+                println!("    connect: {hint}");
+            }
+        }
+    }
+}
+
 fn print_agent_models(models: &[String]) {
     if models.is_empty() {
         println!("No models found.");
@@ -3068,6 +3092,7 @@ fn print_response(response: DaemonResponse) -> Result<()> {
         DaemonResponse::Error { message } => {
             bail!("daemon error: {message}");
         }
+        DaemonResponse::SourceCoverage { sources } => print_source_coverage(&sources),
     }
     Ok(())
 }

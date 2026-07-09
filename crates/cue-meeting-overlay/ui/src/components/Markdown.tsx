@@ -30,8 +30,14 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
   // validated below. Agents emit file:// links (to local repo files) as well as
   // http/https/mailto; matching only `https?:` left file:// links rendering as
   // raw `[text](file://…)`, which is exactly the leak the user flagged.
+  // `__bold__` is guarded to word boundaries (CommonMark forbids intraword `__`
+  // emphasis): the opener must be at start-of-string or after a non-word char,
+  // and the closer must be followed by a non-word char or end. Without this,
+  // identifiers like `mcp__perplexity__perplexity_ask`, dunder function names,
+  // and `FOO__BAR` env vars had their middle segment turned into spurious bold
+  // with the `__` markers eaten — the run-on/mangling the user flagged.
   const re =
-    /`([^`]+)`|\*\*([^*]+)\*\*|__([^_]+)__|(?:^|(?<=[^*]))\*([^*\n]+)\*|\[([^\]]+)\]\(([a-zA-Z][\w+.-]*:[^)\s]+)\)/g;
+    /`([^`]+)`|\*\*([^*]+)\*\*|(?:^|(?<=\W))__([^_]+)__(?=\W|$)|(?:^|(?<=[^*]))\*([^*\n]+)\*|\[([^\]]+)\]\(([a-zA-Z][\w+.-]*:[^)\s]+)\)/g;
   let last = 0;
   let m: RegExpExecArray | null;
   let n = 0;
@@ -103,7 +109,9 @@ function tableCells(line: string): string[] | null {
 // A separator row "| --- | :--: |" — marks the header/body boundary.
 function isTableSeparator(line: string): boolean {
   const cells = tableCells(line);
-  return !!cells && cells.length > 0 && cells.every((c) => /^:?-{1,}:?$/.test(c));
+  return (
+    !!cells && cells.length > 0 && cells.every((c) => /^:?-{1,}:?$/.test(c))
+  );
 }
 
 /** Render a markdown string as React nodes (block-level). */
@@ -117,19 +125,28 @@ export function Markdown({ source }: { source: string }): ReactNode {
   while (i < lines.length) {
     const line = lines[i];
 
-    // fenced code block -> code card
+    // fenced code block -> code card. Render as a code card ONLY when the
+    // CLOSING fence has arrived (the 2026 streaming pattern): a still-open
+    // fence mid-stream would otherwise turn ordinary prose after a lone ```
+    // into a spurious code block that never closes — the "code block where
+    // there's no code" the user flagged. Until the closing ``` lands we treat
+    // the opener as literal text so it just reads as ``` on its own line.
     const fence = line.match(/^\s*```\s*([\w+#.-]*)\s*$/);
     if (fence) {
-      const lang = fence[1] || "";
-      const buf: string[] = [];
-      i++;
-      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) {
-        buf.push(lines[i]);
-        i++;
+      let j = i + 1;
+      while (j < lines.length && !/^\s*```\s*$/.test(lines[j])) j++;
+      const closed = j < lines.length;
+      if (closed) {
+        const lang = fence[1] || "";
+        const buf = lines.slice(i + 1, j);
+        blocks.push(
+          <CodeCard key={nextKey()} lang={lang} code={buf.join("\n")} />,
+        );
+        i = j + 1; // past the closing fence
+        continue;
       }
-      i++; // skip closing fence
-      blocks.push(<CodeCard key={nextKey()} lang={lang} code={buf.join("\n")} />);
-      continue;
+      // Unclosed fence (still streaming): fall through and render this line as
+      // ordinary text; the code card materializes once the closer arrives.
     }
 
     // heading (#, ##, ###)
@@ -164,7 +181,11 @@ export function Markdown({ source }: { source: string }): ReactNode {
     }
 
     // table: a row followed by a separator row
-    if (tableCells(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+    if (
+      tableCells(line) &&
+      i + 1 < lines.length &&
+      isTableSeparator(lines[i + 1])
+    ) {
       const header = tableCells(line)!;
       i += 2; // skip header + separator
       const rows: string[][] = [];
@@ -289,7 +310,12 @@ function CodeCard({ lang, code }: { lang: string; code: string }) {
     <div className="md-codecard">
       <div className="md-cc-head">
         <span className="md-cc-lang">{lang || "code"}</span>
-        <button type="button" className="md-cc-copy" onClick={copy} aria-label="Copy code">
+        <button
+          type="button"
+          className="md-cc-copy"
+          onClick={copy}
+          aria-label="Copy code"
+        >
           ⧉ Copy
         </button>
       </div>

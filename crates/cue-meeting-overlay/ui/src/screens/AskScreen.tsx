@@ -94,13 +94,25 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   }, [agentKind, ensureModels]);
   const askRef = useRef<{ cancel(): void } | null>(null);
   const feedEndRef = useRef<HTMLDivElement>(null);
+  const feedScrollRef = useRef<HTMLDivElement>(null);
+  // Whether the user is pinned to the bottom of the feed. Same guard the
+  // caption uses: while true we auto-follow new content; once the user scrolls
+  // UP (to read the reasoning above a streaming answer) we STOP yanking them
+  // back down. Without this, the feed re-pinned to the answer's tail on every
+  // streamed token, shoving the reasoning off the top — the "reply at the
+  // bottom, thinking scrolls up" symptom.
+  const feedPinnedRef = useRef(true);
 
   // onListeningState stays HERE — listenState is view-local. (onTranscript and
   // onForMeQuestion moved to MeetingProvider as the single owner.)
   useEffect(() => client.onListeningState(setListenState), [client]);
-  // Keep the newest turn / streaming text in view as the feed grows.
+  // Follow the newest turn as the feed grows — but ONLY when pinned to the
+  // bottom, so scrolling up to read reasoning is not fought. No smooth
+  // behavior: the per-token animation read as a "snap/jump" on each chunk.
   useEffect(() => {
-    feedEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    if (feedPinnedRef.current) {
+      feedEndRef.current?.scrollIntoView({ block: "end" });
+    }
   }, [turns]);
 
   // Real connectors for the attached agent — replaces the old hardcoded
@@ -130,6 +142,9 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   const runAsk = (question: string) => {
     askRef.current?.cancel();
     setPhase("thinking");
+    // A fresh ask always follows initially (re-pin), even if the user had
+    // scrolled up while reading a prior answer.
+    feedPinnedRef.current = true;
 
     // Append a NEW turn (don't wipe prior ones). We mutate this turn's draft as
     // chunks stream, and patch the matching turn by id so earlier answers stay.
@@ -231,6 +246,15 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
       )}
 
       <div
+        ref={feedScrollRef}
+        onScroll={(e) => {
+          // Pin-to-bottom guard: while the user is at the bottom we auto-follow
+          // streaming answers; the moment they scroll UP to read the reasoning,
+          // we stop yanking them back. (Padding-tolerant threshold.)
+          const el = e.currentTarget;
+          feedPinnedRef.current =
+            el.scrollHeight - el.scrollTop - el.clientHeight < 28;
+        }}
         style={{
           flex: 1,
           minHeight: 0,
@@ -321,11 +345,13 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
 
       {/* AMBIENT CAPTION (master doc §4/§12 — "felt, not read"): a single quiet
           live line proving Bluey hears you, pinned above the composer. NOT a
-          transcript wall. Kept visible even when a question is detected — the
-          live caption reassures the user that Bluey is still hearing them (a
-          detected question used to HIDE it, which looked like transcription had
-          stopped). Only hidden while answering (the answer owns the screen). */}
-      {history.length > 0 && phase === "idle" && (
+          transcript wall. STAYS VISIBLE through the whole lifecycle — detecting
+          a question AND streaming an answer — because Bluey is still hearing
+          the room the entire time; hiding it during an answer looked like
+          transcription had stopped (the reported bug). It keeps live-updating
+          regardless of `phase` (history is fed by an independent subscription),
+          and its fixed maxHeight means it never squeezes the answer feed. */}
+      {history.length > 0 && (
         <div
           ref={captionScrollRef}
           style={captionScroll}
