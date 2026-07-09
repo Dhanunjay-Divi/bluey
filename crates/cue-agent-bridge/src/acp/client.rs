@@ -344,6 +344,7 @@ async fn drive_connection(
                     // For resume we send `session/load` directly (the builder
                     // only knows `session/new`) and re-attach a session handle
                     // to the loaded id.
+                    let resumed = resume_id.is_some();
                     let mut session = match resume_id {
                         None => cx.build_session(&cwd).block_task().start_session().await?,
                         Some(id) => {
@@ -356,6 +357,39 @@ async fn drive_connection(
                             cx.attach_session(NewSessionResponse::new(id), Default::default())?
                         }
                     };
+
+                    // REPLAY SUPPRESSION: on `session/load` the agent replays
+                    // the ENTIRE prior conversation as session/update
+                    // notifications — observed live: the prior answer arrived
+                    // as Deltas even AFTER the load response (the replay
+                    // streams in as a burst, it is not pre-buffered). Anything
+                    // arriving BEFORE `send_prompt` is by construction
+                    // history, never the new turn — drain until the channel
+                    // is quiescent (replay is a fast local burst; 400ms of
+                    // silence marks its end), bounded at 5s so a hung agent
+                    // can't stall the turn.
+                    if resumed {
+                        let drain_deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                        loop {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_millis(400),
+                                session.read_update(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_replayed)) => {
+                                    if tokio::time::Instant::now() > drain_deadline {
+                                        break;
+                                    }
+                                }
+                                // Quiet for 400ms → replay is done.
+                                Err(_) => break,
+                                // Channel error → surface via the normal pump.
+                                Ok(Err(_)) => break,
+                            }
+                        }
+                    }
 
                     // Emit Started with the (native) session id so callers can
                     // persist it for a future resume.
@@ -372,10 +406,20 @@ async fn drive_connection(
                     //    Each `SessionMessage` is either a `session/update`
                     //    notification (parsed into an `AnswerChunk` and pushed
                     //    to the consumer) or the terminal `StopReason`.
+                    //
+                    // ECHO DEDUP: claude's ACP stream emits the answer as
+                    // incremental chunks and THEN re-emits the complete
+                    // message as one final chunk (observed live:
+                    // "" + "A" + "CP-ALPHA" then "ACP-ALPHA"). A Delta whose
+                    // text exactly equals everything accumulated since the
+                    // last message boundary is that terminal echo — dropped,
+                    // or every answer doubles.
+                    let answer_acc = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
                     loop {
                         match session.read_update().await? {
                             SessionMessage::SessionMessage(dispatch) => {
                                 let tx = tx.clone();
+                                let acc = std::sync::Arc::clone(&answer_acc);
                                 // Parse the untyped dispatch as a
                                 // `SessionNotification`; non-notification or
                                 // unrecognized messages are ignored. This is the
@@ -384,7 +428,29 @@ async fn drive_connection(
                                 MatchDispatch::new(dispatch)
                                     .if_notification(move |notif: SessionNotification| async move {
                                         if let Some(chunk) = session_update_to_chunk(notif.update) {
-                                            let _ = tx.unbounded_send(chunk);
+                                            let suppress = {
+                                                let mut acc = acc.lock().expect("acc");
+                                                match &chunk {
+                                                    AnswerChunk::Delta(text) => {
+                                                        let echo = !acc.is_empty()
+                                                            && text.as_str() == acc.as_str();
+                                                        if !echo {
+                                                            acc.push_str(text);
+                                                        }
+                                                        echo
+                                                    }
+                                                    // A tool call starts a new
+                                                    // assistant message.
+                                                    AnswerChunk::ToolCall { .. } => {
+                                                        acc.clear();
+                                                        false
+                                                    }
+                                                    _ => false,
+                                                }
+                                            };
+                                            if !suppress {
+                                                let _ = tx.unbounded_send(chunk);
+                                            }
                                         }
                                         Ok(())
                                     })
