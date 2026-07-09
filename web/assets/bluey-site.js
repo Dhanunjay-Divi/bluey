@@ -963,8 +963,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (message.includes('trial') || message.includes('velocity') || message.includes('already_used') || message.includes('rate')) {
         return {
           title: 'Trial already used here',
-          copy: 'This browser or network has already used its temporary trial. Create an account to keep going.',
-          note: 'Trials are limited per browser and network so the free 15 minutes cannot be looped indefinitely.',
+          copy: 'This browser or network has already used its temporary trial window. Create an account to keep going.',
+          note: 'Trials are limited per browser on a monthly window and per network daily so free minutes cannot be looped indefinitely.',
         };
       }
       return {
@@ -1121,7 +1121,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return 'This email already used its free trial. You can still create the account, but it will start without free trial minutes.';
       }
       if (value === 'device_trial_already_used') {
-        return 'This device already used its free trial. Sign in or add credits to keep using Bluey.';
+        return 'This device already used its current free trial window. Sign in or add credits to keep using Bluey.';
       }
       if (
         value === 'ip_trial_velocity'

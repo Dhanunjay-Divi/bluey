@@ -238,7 +238,14 @@ fn signup_otp_hash(jwt_secret: &str, email: &str, otp: &str) -> String {
 }
 
 fn trial_denial_allows_account_without_trial(reason: &str) -> bool {
-    reason == "email_trial_already_used"
+    matches!(
+        reason,
+        "email_trial_already_used"
+            | "email_domain_trial_velocity"
+            | "device_trial_already_used"
+            | "ip_trial_velocity"
+            | "ip_user_agent_trial_velocity"
+    )
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -299,20 +306,8 @@ fn request_trial_identity(
     device_fingerprint: Option<&str>,
 ) -> trial_abuse::TrialAbuseSignals {
     let device = request_device_fingerprint(headers, device_fingerprint);
-    let identity = device
-        .as_deref()
-        .map(|value| format!("try-us-device:{value}"))
-        .or_else(|| {
-            request_ip(headers, peer_ip).map(|ip| {
-                format!(
-                    "try-us-ip:{ip}:{}",
-                    request_user_agent(headers).unwrap_or_default()
-                )
-            })
-        })
-        .unwrap_or_else(|| format!("try-us-random:{}", uuid::Uuid::new_v4()));
     trial_abuse::TrialAbuseSignals::from_raw(
-        &identity,
+        &format!("try-us-request:{}", uuid::Uuid::new_v4()),
         request_ip(headers, peer_ip).as_deref(),
         device.as_deref(),
         request_user_agent(headers).as_deref(),
