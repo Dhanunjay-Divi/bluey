@@ -28,6 +28,9 @@ pub mod discover;
 pub mod drive;
 pub mod fix;
 pub mod mcp_probe;
+// Write-side counterpart of `connectors`: register Bluey's OWN memory MCP
+// server into the attached agent (the no-push pivot).
+pub mod mcp_register;
 pub mod mcp_tools;
 pub mod model_resolve;
 pub mod prove;
