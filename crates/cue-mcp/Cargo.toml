@@ -1,0 +1,30 @@
+[package]
+name = "cue-mcp"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Bluey's OWN MCP server (the memory the attached agent PULLS from).
+#
+# Deliberately hand-rolled over hyper — NOT rmcp/axum. The protocol surface we
+# serve is five methods (initialize, tools/list, tools/call, ping,
+# notifications), live-verified against claude/gemini/copilot/cursor/codex
+# (Batch-0 spike, 2026-07-08). hyper/hyper-util/http-body-util are already in
+# the dependency graph via reqwest, so this adds ZERO new transitive deps —
+# the lean one-binary constraint holds.
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[dev-dependencies]
+reqwest.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
+tracing-subscriber.workspace = true
