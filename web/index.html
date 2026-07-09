@@ -26,7 +26,7 @@
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070801"
+    href="/assets/bluey-site.css?v=2026070901"
   >
   <script type="application/ld+json">
   {
@@ -965,6 +965,62 @@
         </article>
       </section>
 
+      <section class="platform-instructions" id="macInstallInstructions" data-platform-instructions="mac" hidden>
+        <h2>Terminal setup</h2>
+        <p>Copy these two commands.</p>
+        <div class="instruction-steps">
+          <div class="instruction-step">
+            <span class="instruction-num">1</span>
+            <div class="instruction-body">
+              <p>Open <strong>Terminal</strong> and run:</p>
+              <div class="install-command" tabindex="0" role="group" aria-label="Bluey install command">
+                <code>curl -fsSL https://bluey.sh/install.sh | bash</code>
+                <button class="copy-command" type="button" data-copy="curl -fsSL https://bluey.sh/install.sh | bash">Copy</button>
+              </div>
+            </div>
+          </div>
+          <div class="instruction-step">
+            <span class="instruction-num">2</span>
+            <div class="instruction-body">
+              <p>Start the desktop app:</p>
+              <div class="install-command" tabindex="0" role="group" aria-label="Bluey start command">
+                <code>bluey on</code>
+                <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="instruction-help">If a code appears, sign in here and press Connect.</div>
+      </section>
+
+      <section class="platform-instructions" id="windowsInstallInstructions" data-platform-instructions="windows" hidden>
+        <h2>PowerShell setup</h2>
+        <p>Copy these two commands.</p>
+        <div class="instruction-steps">
+          <div class="instruction-step">
+            <span class="instruction-num">1</span>
+            <div class="instruction-body">
+              <p>Open <strong>PowerShell</strong> and run:</p>
+              <div class="install-command" tabindex="0" role="group" aria-label="Bluey Windows install command">
+                <code>irm https://bluey.sh/install.ps1 | iex</code>
+                <button class="copy-command" type="button" data-copy="irm https://bluey.sh/install.ps1 | iex">Copy</button>
+              </div>
+            </div>
+          </div>
+          <div class="instruction-step">
+            <span class="instruction-num">2</span>
+            <div class="instruction-body">
+              <p>Start the desktop app:</p>
+              <div class="install-command" tabindex="0" role="group" aria-label="Bluey start command">
+                <code>bluey on</code>
+                <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="instruction-help">If a code appears, sign in here and press Connect.</div>
+      </section>
+
       <section class="download-shortcuts" aria-label="Bluey overlay shortcuts">
         <div class="download-section-head">
           <h2>Overlay shortcuts</h2>
@@ -1033,62 +1089,6 @@
           <span><strong>Click-through off:</strong> blank Bluey space drags the window; mouse wheel scrolls the content under the pointer.</span>
           <span><strong>Click-through on:</strong> blank clicks pass through; use global shortcuts and Bluey scroll zones.</span>
         </div>
-      </section>
-
-      <section class="platform-instructions" id="macInstallInstructions" data-platform-instructions="mac" hidden>
-        <h2>Terminal setup</h2>
-        <p>Copy these two commands.</p>
-        <div class="instruction-steps">
-          <div class="instruction-step">
-            <span class="instruction-num">1</span>
-            <div class="instruction-body">
-              <p>Open <strong>Terminal</strong> and run:</p>
-              <div class="install-command" tabindex="0" role="group" aria-label="Bluey install command">
-                <code>curl -fsSL https://bluey.sh/install.sh | bash</code>
-                <button class="copy-command" type="button" data-copy="curl -fsSL https://bluey.sh/install.sh | bash">Copy</button>
-              </div>
-            </div>
-          </div>
-          <div class="instruction-step">
-            <span class="instruction-num">2</span>
-            <div class="instruction-body">
-              <p>Start the desktop app:</p>
-              <div class="install-command" tabindex="0" role="group" aria-label="Bluey start command">
-                <code>bluey on</code>
-                <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="instruction-help">If a code appears, sign in here and press Connect.</div>
-      </section>
-
-      <section class="platform-instructions" id="windowsInstallInstructions" data-platform-instructions="windows" hidden>
-        <h2>PowerShell setup</h2>
-        <p>Copy these two commands.</p>
-        <div class="instruction-steps">
-          <div class="instruction-step">
-            <span class="instruction-num">1</span>
-            <div class="instruction-body">
-              <p>Open <strong>PowerShell</strong> and run:</p>
-              <div class="install-command" tabindex="0" role="group" aria-label="Bluey Windows install command">
-                <code>irm https://bluey.sh/install.ps1 | iex</code>
-                <button class="copy-command" type="button" data-copy="irm https://bluey.sh/install.ps1 | iex">Copy</button>
-              </div>
-            </div>
-          </div>
-          <div class="instruction-step">
-            <span class="instruction-num">2</span>
-            <div class="instruction-body">
-              <p>Start the desktop app:</p>
-              <div class="install-command" tabindex="0" role="group" aria-label="Bluey start command">
-                <code>bluey on</code>
-                <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="instruction-help">If a code appears, sign in here and press Connect.</div>
       </section>
 
       <div class="download-note">

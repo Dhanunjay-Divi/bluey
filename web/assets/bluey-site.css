@@ -3974,17 +3974,17 @@
 
     #downloadApp .download-shortcuts,
     #downloadApp .commands {
-      width: min(700px, 100%);
+      width: min(700px, calc(100% - 4rem));
       margin: 1.35rem auto 0;
-      padding: 0 2rem;
+      padding: 0;
     }
 
     #downloadApp .download-shortcuts {
-      margin-top: 1rem;
+      margin-top: 1.35rem;
     }
 
     #downloadApp .download-section-head {
-      padding: 1rem;
+      padding: 1rem 1.1rem;
       border: 1px solid #222;
       border-bottom: 0;
       border-radius: 12px 12px 0 0;
@@ -4076,8 +4076,8 @@
 
     #downloadApp .shortcut-notes {
       display: grid;
-      gap: .4rem;
-      margin-top: .55rem;
+      gap: .55rem;
+      margin-top: .75rem;
       color: #777;
       font-size: .75rem;
       line-height: 1.45;
@@ -4085,9 +4085,9 @@
 
     #downloadApp .shortcut-notes span {
       display: block;
-      padding: .65rem .75rem;
+      padding: .75rem 1rem;
       border: 1px solid rgba(99, 216, 255, .13);
-      border-radius: 8px;
+      border-radius: 10px;
       background: rgba(99, 216, 255, .04);
     }
 
@@ -4097,7 +4097,7 @@
 
     #downloadApp .platform-instructions {
       width: min(700px, calc(100% - 4rem));
-      margin: 1.35rem auto 0;
+      margin: 1rem auto 0;
       padding: 1rem;
       border: 1px solid #222;
       border-radius: 12px;
@@ -4239,7 +4239,7 @@
       margin: 1rem auto 0;
       padding: .85rem 1rem;
       border: 1px solid #222;
-      border-radius: 8px;
+      border-radius: 10px;
       background: #111;
       color: #888;
       text-align: center;
@@ -4441,15 +4441,15 @@
 
       #downloadApp .download-hero,
       #downloadApp .download-steps-strip,
-      #downloadApp .platform-grid,
-      #downloadApp .download-shortcuts,
-      #downloadApp .commands {
+      #downloadApp .platform-grid {
         padding-left: 1.5rem;
         padding-right: 1.5rem;
       }
 
       #downloadApp .download-note,
       #downloadApp .platform-instructions,
+      #downloadApp .download-shortcuts,
+      #downloadApp .commands,
       #policyApp .policy-card {
         width: calc(100% - 3rem);
       }
