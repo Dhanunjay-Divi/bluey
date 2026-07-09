@@ -2,6 +2,7 @@
 
 Date: 2026-07-09
 Branch: `codex/bluey-web-ui-parallel-20260704`
+Release version: `0.1.96`
 Backup thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 
 ## Goal
@@ -11,6 +12,7 @@ Deploy the current Bluey web, backend, desktop packaging, and installer changes 
 This round includes:
 
 - process identity/helper naming parity with Pinky-style installs
+- release version bump from `0.1.95` to `0.1.96` so auto-update can install the new artifact
 - download page command/support-surface polish
 - verification email polish
 - Try Us monthly device trial window changes
@@ -45,6 +47,7 @@ Initial result:
 - `git diff --check` passed
 - CLI/daemon cargo check passed
 - server cargo check passed
+- after the `0.1.96` version bump, `git diff --check`, CLI/daemon cargo check, and server cargo check passed again
 
 ## Deployment Plan
 
