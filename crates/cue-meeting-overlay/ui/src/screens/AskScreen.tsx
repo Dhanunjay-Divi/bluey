@@ -171,7 +171,14 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
         if (c.tool) draft.tools = [...draft.tools, c.tool];
         if (c.source)
           draft.sources = [...draft.sources, c.source as AnswerSource];
-        if (c.done) draft.done = true;
+        if (c.done) {
+          draft.done = true;
+          // Answer finished → return to idle so the live caption (gated on
+          // phase==="idle") reappears. The answer itself persists in the feed
+          // above (turns are appended, not cleared). Without this, phase stayed
+          // "answering" forever and the transcript vanished after the first ask.
+          setPhase("idle");
+        }
         patch();
       },
       { mode },
@@ -185,11 +192,11 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
     runAsk(q);
   };
 
-  // True while an ask is streaming: the phase has left "idle" AND the newest
-  // turn hasn't received its `done` chunk yet. (`phase` alone isn't enough — it
-  // stays "answering" after a turn completes; the turn's `done` flag is what
-  // flips when streaming ends.) Used to disable the manual ask-recent button so
-  // taps can't stack asks mid-stream.
+  // True while an ask is streaming: the newest turn exists and hasn't received
+  // its `done` chunk yet. (The turn's `done` flag is the authoritative signal;
+  // `phase` returns to "idle" the instant `done` arrives so the live caption
+  // reappears.) Used to disable the manual ask-recent button so taps can't
+  // stack asks mid-stream.
   const lastTurn = turns.length > 0 ? turns[turns.length - 1] : undefined;
   const askStreaming =
     phase !== "idle" && lastTurn !== undefined && !lastTurn.answer.done;
