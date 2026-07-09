@@ -1344,6 +1344,45 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // Calendar trigger: poll upcoming meetings and fire the warm backend at
+    // T-minus WARM_LEAD_SECS, exactly once per (event, occurrence). Source is
+    // the env fake for now (`BLUEY_CALENDAR_FAKE_EVENTS` — the same test-hook
+    // pattern as BLUEY_AUDIO_WAV_FILE, driving the FULL trigger path);
+    // EventKit lands behind a `calendar` feature once the packaged app carries
+    // the TCC usage string. Deterministic Rust owns the clock — the trigger
+    // never routes through the agent.
+    {
+        let daemon_cal = daemon.clone();
+        tokio::spawn(async move {
+            let source = crate::calendar::EnvFakeSource;
+            let mut fired = std::collections::HashSet::new();
+            let mut tick = tokio::time::interval(crate::calendar::poll_interval());
+            loop {
+                tick.tick().await;
+                use crate::calendar::CalendarSource;
+                let now = crate::calendar::now_epoch_secs();
+                let events = source.upcoming(now);
+                for event in crate::calendar::due_for_warmup(&events, &fired, now) {
+                    info!(title = %event.title, "calendar trigger: warming meeting backend");
+                    match warmup_open(&daemon_cal, Some(event.title.clone())).await {
+                        Ok(WarmupOutcome::Ready(_)) => {
+                            // Consume the once-per-occurrence key ONLY on
+                            // success — a refused open (agent not attached
+                            // yet, server down) retries every tick until the
+                            // meeting starts and the event leaves the window.
+                            fired.insert(crate::calendar::fired_key(&event));
+                            info!(title = %event.title, "warm meeting backend ready");
+                        }
+                        Ok(WarmupOutcome::Refused(reason)) => {
+                            debug!(title = %event.title, "warmup not opened yet: {reason}");
+                        }
+                        Err(error) => warn!("calendar warmup failed: {error:#}"),
+                    }
+                }
+            }
+        });
+    }
+
     let listener = TcpListener::bind(&args.addr)
         .await
         .with_context(|| format!("failed to bind Bluey daemon IPC at {}", args.addr))?;
@@ -7202,28 +7241,38 @@ fn warmup_prompt(title: &str) -> String {
     )
 }
 
-/// `WarmupStart`: rotate the MCP token, register Bluey's memory server into
-/// the attached agent, mint the meeting (create-iff-none), and run the
-/// warm-up drive. The existing conversation-chaining persist pins the new
-/// session id, so every in-meeting ask RESUMES the warmed session — the
-/// pre-context reasoning carries through the whole meeting.
-async fn warmup_start(daemon: &Arc<Daemon>, title: Option<String>) -> Result<DaemonResponse> {
+/// Outcome of a warm-open attempt. Callers MUST distinguish these: a
+/// `Refused` (gate not met yet — no agent attached, server down, unsupported
+/// agent, registration failure) must NOT consume the calendar's
+/// once-per-occurrence key, so the trigger retries until the meeting starts.
+enum WarmupOutcome {
+    /// The backend is warm; the readiness brief is attached.
+    Ready(String),
+    /// Not opened — reason attached. Retryable by the caller.
+    Refused(String),
+}
+
+/// Open the warm meeting backend: rotate the MCP token, register Bluey's
+/// memory server into the attached agent, mint the meeting (create-iff-none),
+/// and run the warm-up drive. The existing conversation-chaining persist pins
+/// the new session id, so every in-meeting ask RESUMES the warmed session —
+/// the pre-context reasoning carries through the whole meeting.
+async fn warmup_open(daemon: &Arc<Daemon>, title: Option<String>) -> Result<WarmupOutcome> {
     // Hard gate: no attached agent → no backend (there is no fallback LLM).
     let settings = load_settings(&daemon.paths).unwrap_or_default();
     let Some(agent) = parse_attached_agent(settings.attached_agent.as_deref()) else {
-        return Ok(DaemonResponse::Text {
-            text: "No coding agent attached — attach one to enable the meeting backend."
-                .to_string(),
-        });
+        return Ok(WarmupOutcome::Refused(
+            "No coding agent attached — attach one to enable the meeting backend.".to_string(),
+        ));
     };
 
     // Fresh per-meeting token; rotate on the running server and register.
     let reg = {
         let guard = daemon.mcp_server.lock().await;
         let Some(handle) = guard.as_ref() else {
-            return Ok(DaemonResponse::Text {
-                text: "Bluey MCP memory server is not running.".to_string(),
-            });
+            return Ok(WarmupOutcome::Refused(
+                "Bluey MCP memory server is not running.".to_string(),
+            ));
         };
         let token = uuid::Uuid::new_v4().to_string();
         handle.rotate_token(token.clone()).await;
@@ -7237,14 +7286,14 @@ async fn warmup_start(daemon: &Arc<Daemon>, title: Option<String>) -> Result<Dae
     match cue_agent_bridge::mcp_register::register_bluey_memory(&agent, &reg, &warm_cwd).await {
         Ok(cue_agent_bridge::mcp_register::RegisterOutcome::Registered) => {}
         Ok(cue_agent_bridge::mcp_register::RegisterOutcome::Unsupported(why)) => {
-            return Ok(DaemonResponse::Text {
-                text: format!("This agent can't host the meeting backend: {why}"),
-            });
+            return Ok(WarmupOutcome::Refused(format!(
+                "This agent can't host the meeting backend: {why}"
+            )));
         }
         Err(error) => {
-            return Ok(DaemonResponse::Text {
-                text: format!("Registering Bluey's memory server failed: {error:#}"),
-            });
+            return Ok(WarmupOutcome::Refused(format!(
+                "Registering Bluey's memory server failed: {error:#}"
+            )));
         }
     }
 
@@ -7271,9 +7320,17 @@ async fn warmup_start(daemon: &Arc<Daemon>, title: Option<String>) -> Result<Dae
     // persist pins the fresh session id (attached_session) — in-meeting asks
     // then resume the warmed session with its pre-context reasoning intact.
     let response = answer_question(daemon, warmup_prompt(&meeting_title), "warmup").await?;
-    Ok(DaemonResponse::Text {
-        text: response.answer,
-    })
+    Ok(WarmupOutcome::Ready(response.answer))
+}
+
+/// `WarmupStart` IPC surface over [`warmup_open`] (Text either way — the
+/// wire caller reads the message; the calendar loop uses the typed fn).
+async fn warmup_start(daemon: &Arc<Daemon>, title: Option<String>) -> Result<DaemonResponse> {
+    let text = match warmup_open(daemon, title).await? {
+        WarmupOutcome::Ready(brief) => brief,
+        WarmupOutcome::Refused(reason) => reason,
+    };
+    Ok(DaemonResponse::Text { text })
 }
 
 /// `WarmupStop`: deregister Bluey's server from the agent and burn the token.

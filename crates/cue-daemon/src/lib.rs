@@ -20,6 +20,8 @@ pub mod qdetect;
 pub mod secrets;
 pub mod storage;
 pub mod stt;
+// Calendar trigger: fires the warm meeting-backend drive ahead of meetings.
+pub mod calendar;
 // Rolling-summary orchestration: throwaway agent one-shot every N segments.
 pub mod summary;
 pub mod util;
