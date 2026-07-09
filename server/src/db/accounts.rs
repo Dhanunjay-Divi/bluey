@@ -214,8 +214,25 @@ impl Account {
         password_hash: &str,
         is_admin: bool,
     ) -> Result<Self> {
+        Self::create_with_admin_and_trial_seconds(
+            pool,
+            email,
+            password_hash,
+            is_admin,
+            DEFAULT_TRIAL_SECONDS,
+        )
+    }
+
+    pub fn create_with_admin_and_trial_seconds(
+        pool: &DbPool,
+        email: &str,
+        password_hash: &str,
+        is_admin: bool,
+        trial_seconds_remaining: i64,
+    ) -> Result<Self> {
         crate::db::run_blocking_db(|| {
             let id = uuid::Uuid::new_v4().to_string();
+            let trial_seconds_remaining = trial_seconds_remaining.max(0);
             match pool {
                 DbPool::Sqlite(_) => {
                     let conn = pool.get()?;
@@ -232,7 +249,7 @@ impl Account {
                             if is_admin { 1 } else { 0 },
                             DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS,
                             DEFAULT_AUTO_TOPUP_AMOUNT_CENTS,
-                            DEFAULT_TRIAL_SECONDS
+                            trial_seconds_remaining
                         ],
                     ) {
                         Ok(_) => {}
@@ -271,7 +288,7 @@ impl Account {
                             &is_admin_i32,
                             &DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS,
                             &DEFAULT_AUTO_TOPUP_AMOUNT_CENTS,
-                            &DEFAULT_TRIAL_SECONDS,
+                            &trial_seconds_remaining,
                         ],
                     ) {
                         if e.code() == Some(&SqlState::UNIQUE_VIOLATION) {
@@ -286,7 +303,7 @@ impl Account {
                 email: email.to_string(),
                 email_verified_at: None,
                 balance_cents: 0,
-                trial_seconds_remaining: DEFAULT_TRIAL_SECONDS,
+                trial_seconds_remaining,
                 is_temporary: false,
                 temporary_expires_at: None,
                 auto_topup_enabled: false,

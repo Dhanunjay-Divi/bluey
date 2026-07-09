@@ -43,6 +43,8 @@ pub struct SignupStartRequest {
 pub struct SignupStartResponse {
     pub email: String,
     pub expires_in_secs: i64,
+    pub trial_seconds: i64,
+    pub no_trial_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -233,6 +235,10 @@ fn signup_otp_hash(jwt_secret: &str, email: &str, otp: &str) -> String {
     mac.update(email.as_bytes());
     mac.update(otp.as_bytes());
     hex::encode(mac.finalize().into_bytes())
+}
+
+fn trial_denial_allows_account_without_trial(reason: &str) -> bool {
+    reason == "email_trial_already_used"
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -791,12 +797,25 @@ pub async fn signup_start(
                     &format!("trial abuse: {e}"),
                 )
             })?;
-    if !decision.allowed {
+    let no_trial_reason = if decision.allowed {
+        None
+    } else if decision
+        .reason
+        .as_deref()
+        .is_some_and(trial_denial_allows_account_without_trial)
+    {
+        decision.reason
+    } else {
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
             decision.reason.as_deref().unwrap_or("trial limit reached"),
         ));
-    }
+    };
+    let trial_seconds = if no_trial_reason.is_some() {
+        0
+    } else {
+        DEFAULT_TRIAL_SECONDS
+    };
 
     let password_hash = auth::password::hash_password(&req.password)
         .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
@@ -842,6 +861,8 @@ pub async fn signup_start(
     Ok(Json(SignupStartResponse {
         email,
         expires_in_secs: SIGNUP_OTP_TTL_SECS,
+        trial_seconds,
+        no_trial_reason,
     }))
 }
 
@@ -898,7 +919,7 @@ pub async fn signup_confirm(
     }
 
     let signals = signup_signals(&email, &headers, peer_ip, req.device_fingerprint.as_deref());
-    let grant_id = match trial_abuse::reserve_trial_grant(
+    let (grant_id, trial_seconds) = match trial_abuse::reserve_trial_grant(
         &state.pool,
         state.config.trial_abuse,
         &signals,
@@ -910,34 +931,55 @@ pub async fn signup_confirm(
             &format!("trial abuse: {e}"),
         )
     })? {
-        trial_abuse::TrialGrantReservation::Reserved { grant_id } => grant_id,
+        trial_abuse::TrialGrantReservation::Reserved { grant_id } => {
+            (Some(grant_id), DEFAULT_TRIAL_SECONDS)
+        }
         trial_abuse::TrialGrantReservation::Denied { reason } => {
-            return Err(err(StatusCode::TOO_MANY_REQUESTS, &reason));
+            if trial_denial_allows_account_without_trial(&reason) {
+                (None, 0)
+            } else {
+                return Err(err(StatusCode::TOO_MANY_REQUESTS, &reason));
+            }
         }
     };
 
     let is_admin = state.config.is_admin_email(&email);
-    let account =
-        Account::create_with_admin(&state.pool, &email, &signup_otp.password_hash, is_admin)
-            .map_err(|e| {
-                let _ = trial_abuse::release_reserved_grant(&state.pool, &grant_id);
-                if matches!(
-                    e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
-                    Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
-                ) {
-                    return err(StatusCode::CONFLICT, "email already registered");
-                }
-                err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
-            })?;
+    let account = Account::create_with_admin_and_trial_seconds(
+        &state.pool,
+        &email,
+        &signup_otp.password_hash,
+        is_admin,
+        trial_seconds,
+    )
+    .map_err(|e| {
+        if let Some(grant_id) = grant_id.as_deref() {
+            let _ = trial_abuse::release_reserved_grant(&state.pool, grant_id);
+        }
+        if matches!(
+            e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
+            Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
+        ) {
+            return err(StatusCode::CONFLICT, "email already registered");
+        }
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
+    })?;
 
     let _ = signup_otps::delete(&state.pool, &email);
     Account::mark_email_verified(&state.pool, &account.id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-    if let Err(error) = trial_abuse::attach_grant_account(&state.pool, &grant_id, &account.id) {
-        tracing::warn!(
+    if let Some(grant_id) = grant_id.as_deref() {
+        if let Err(error) = trial_abuse::attach_grant_account(&state.pool, grant_id, &account.id) {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                %error,
+                "failed to attach trial grant"
+            );
+        }
+    } else {
+        tracing::info!(
             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-            %error,
-            "failed to attach trial grant"
+            email_hash = %signals.email_hash,
+            "created account without fresh trial because email trial was already used"
         );
     }
 

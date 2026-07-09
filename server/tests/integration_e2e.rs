@@ -360,6 +360,99 @@ async fn signup_otp_email_confirms_and_marks_email_verified() {
 
 #[tokio::test]
 #[serial]
+async fn signup_after_account_delete_reuses_email_without_new_trial() {
+    let h = boot_harness().await;
+
+    let email = "delete-resignup@bluey.sh";
+    let auth = signup_with_otp(&h, email, "longenoughpw").await;
+    assert_eq!(auth["account"]["trial_seconds_remaining"], 900);
+    let access = auth["access_token"].as_str().unwrap();
+
+    let req = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_none());
+
+    Mock::given(method("POST"))
+        .and(path("/emails"))
+        .and(header("Authorization", "Bearer test-resend-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"email-otp-2"})))
+        .mount(&h.mail)
+        .await;
+
+    let start = Request::post("/auth/signup/start")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "email": email,
+                "password": "longenoughpw"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(start).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let start_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(start_body["trial_seconds"], 0);
+    assert_eq!(
+        start_body["no_trial_reason"].as_str(),
+        Some("email_trial_already_used")
+    );
+
+    let requests = h.mail.received_requests().await.unwrap();
+    let mail_body: serde_json::Value =
+        serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+    let code = extract_six_digit_code(mail_body["text"].as_str().unwrap()).unwrap();
+
+    let confirm = Request::post("/auth/signup/confirm")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "email": email,
+                "otp": code
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(confirm).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let recreated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(recreated["account"]["email"], email);
+    assert_eq!(recreated["account"]["trial_seconds_remaining"], 0);
+
+    let conn = h.pool.get().unwrap();
+    let (count, trial_seconds): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MAX(trial_seconds_remaining), 0)
+               FROM accounts
+              WHERE email = ?1",
+            rusqlite::params![email],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(trial_seconds, 0);
+}
+
+#[tokio::test]
+#[serial]
 async fn trial_start_creates_temporary_account_with_fifteen_minutes() {
     let h = boot_harness().await;
     let auth = start_trial(&h, "trial-device-create").await;

@@ -1114,6 +1114,25 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       el.dataset.tone = tone || '';
     }
 
+    function friendlyAuthMessage(message, fallback = 'Could not complete sign in. Try again.') {
+      const value = String(message || '').trim();
+      if (!value) return fallback;
+      if (value === 'email_trial_already_used') {
+        return 'This email already used its free trial. You can still create the account, but it will start without free trial minutes.';
+      }
+      if (value === 'device_trial_already_used') {
+        return 'This device already used its free trial. Sign in or add credits to keep using Bluey.';
+      }
+      if (
+        value === 'ip_trial_velocity'
+        || value === 'ip_user_agent_trial_velocity'
+        || value === 'email_domain_trial_velocity'
+      ) {
+        return 'Too many signup attempts right now. Please sign in or try again later.';
+      }
+      return value;
+    }
+
     function friendlyBillingMessage(message, fallback = 'Billing is unavailable for this account right now.') {
       const value = String(message || '').trim();
       if (!value) return fallback;
@@ -1568,7 +1587,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }),
       });
       setSignupOtpMode(true, result.email || email);
-      accountMessage('', true);
+      if (result.trial_seconds === 0 || result.no_trial_reason) {
+        accountMessage(
+          'Verification code sent. This email already used its free trial, so the account will start without free trial minutes.',
+          true
+        );
+      } else {
+        accountMessage('', true);
+      }
       document.getElementById('signupOtp')?.focus();
     }
 
@@ -3906,14 +3932,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('accountForm').addEventListener('submit', (event) => {
         event.preventDefault();
         if (accountAuthMode === 'signup') {
-          startSignupOtp().catch((error) => accountMessage(error.message, true, 'error'));
+          startSignupOtp().catch((error) => accountMessage(friendlyAuthMessage(error.message), true, 'error'));
         } else {
-          accountAuth('login').catch((error) => accountMessage(error.message, true, 'error'));
+          accountAuth('login').catch((error) => accountMessage(friendlyAuthMessage(error.message), true, 'error'));
         }
       });
       document.getElementById('createAccountButton').addEventListener('click', () => {
         if (pendingSignupEmail) {
-          startSignupOtp().catch((error) => accountMessage(error.message, true, 'error'));
+          startSignupOtp().catch((error) => accountMessage(friendlyAuthMessage(error.message), true, 'error'));
           return;
         }
         if (accountAuthMode === 'signup') {
@@ -3941,7 +3967,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         });
       });
       document.getElementById('confirmSignupButton').addEventListener('click', () => {
-        confirmSignupOtp().catch((error) => accountMessage(error.message, true, 'error'));
+        confirmSignupOtp().catch((error) => accountMessage(friendlyAuthMessage(error.message), true, 'error'));
       });
       document.getElementById('trialConvertForm')?.addEventListener('submit', (event) => {
         event.preventDefault();
