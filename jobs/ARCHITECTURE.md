@@ -44,8 +44,10 @@ testing. Multi-instance environments must use PostgreSQL.
 5. Auto-submit requires hard filters, the account threshold, and an automatable
    employer form. Restricted sites stay user-controlled handoffs.
 6. Local and cloud execution use the same typed adapter contract.
-7. Unknown required fields, CAPTCHA, 2FA, and assessments create interventions
-   instead of guessed answers.
+7. Unknown required fields and authentication challenges create interventions
+   instead of guessed answers. CAPTCHA, assessments, and phone/app 2FA preserve
+   the browser for takeover. A matching email OTP may be offered for explicit
+   approval, but its raw code is never persisted or logged.
 8. A submission receipt retains the job snapshot, exact resume, final answers,
    browser evidence, and timestamps.
 9. Public ATS discovery constructs only known HTTPS endpoints, rejects

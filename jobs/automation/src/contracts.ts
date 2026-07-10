@@ -70,6 +70,15 @@ export interface InterventionRequest {
   detail: string;
   field?: string;
   choices?: string[];
+  resolution?: InterventionResolution;
+}
+
+export interface InterventionResolution {
+  kind: "browser_takeover" | "email_otp_approval" | "answer";
+  resumeAfter: boolean;
+  expiresAt?: string;
+  provider?: "gmail" | "outlook_email";
+  messageId?: string;
 }
 
 export interface ValidationIssue {

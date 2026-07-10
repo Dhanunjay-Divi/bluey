@@ -75,6 +75,10 @@ internal pricing and margin model.
   per Career Track, and frozen into the resume and receipt.
 - Separate Gmail and Outlook mailboxes are tenant-scoped and plan-limited;
   aliases inside one mailbox do not consume another connection.
+- Email verification can match a fresh provider message to the active
+  application and offer one-click approval. Only the encrypted provider
+  message reference and expiry enter the intervention record; the OTP remains
+  ephemeral. CAPTCHA and phone/app checks remain owner-completed handoffs.
 
 ## Source provenance
 

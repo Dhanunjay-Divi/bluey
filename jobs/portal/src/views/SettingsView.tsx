@@ -6,12 +6,17 @@ import {
   Check,
   ChevronRight,
   CirclePlus,
+  ClipboardCheck,
   CreditCard,
   Mail,
+  MailCheck,
   MapPin,
+  MessageCircleQuestion,
+  MonitorUp,
   Pencil,
   Plus,
   ShieldCheck,
+  Smartphone,
   Trash2,
   UserRound,
 } from "lucide-react";
@@ -159,7 +164,16 @@ export function SettingsView({
             <label><span>Submission mode</span><div className="segmented"><button className={profile.default_submission_mode === "review_first" ? "active" : ""} onClick={() => setProfile({ ...profile, default_submission_mode: "review_first" })}>Review first</button><button className={profile.default_submission_mode === "auto_submit" ? "active" : ""} onClick={() => setProfile({ ...profile, default_submission_mode: "auto_submit" })}>Auto-submit</button></div></label>
             <label className="setting-line simple"><div><b>Review new claims</b><span>Pause before a newly proposed factual claim can enter a packet.</span></div><Toggle checked={profile.review_new_claims} onChange={(checked) => setProfile({ ...profile, review_new_claims: checked })} /></label>
             <label><span>Auto-submit match threshold</span><div className="range-field"><input type="range" min="60" max="100" step="5" value={profile.auto_submit_threshold} onChange={(event) => setProfile({ ...profile, auto_submit_threshold: Number(event.target.value) })} /><b>{profile.auto_submit_threshold}%</b></div></label>
-            <div className="pause-rules"><p>BLUEY ALWAYS PAUSES FOR</p><div>{["CAPTCHA", "2FA", "Assessments", "Unknown legal questions", "Missing required facts"].map((rule) => <span key={rule}><Check size={12} />{rule}</span>)}</div></div>
+            <div className="challenge-rules">
+              <p>CHALLENGE HANDLING</p>
+              <div>
+                <span><MonitorUp size={15} /><b>CAPTCHA</b><small>Take over, then resume</small></span>
+                <span><MailCheck size={15} /><b>Email code</b><small>One-click approval</small></span>
+                <span><Smartphone size={15} /><b>Phone or app 2FA</b><small>Take over, then resume</small></span>
+                <span><ClipboardCheck size={15} /><b>Assessment</b><small>Take over without losing progress</small></span>
+                <span><MessageCircleQuestion size={15} /><b>Required question</b><small>Answer once and remember</small></span>
+              </div>
+            </div>
           </div>
         </section>
       </div>

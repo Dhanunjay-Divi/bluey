@@ -397,6 +397,18 @@ pub struct Intervention {
     #[serde(default)]
     pub choices: Vec<String>,
     #[serde(default)]
+    pub resolution_kind: String,
+    #[serde(default)]
+    pub resume_after_resolution: bool,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub provider_message_id: String,
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub metadata: Value,
+    #[serde(default)]
     pub created_at_ms: i64,
     #[serde(default)]
     pub resolved_at_ms: Option<i64>,
@@ -597,7 +609,7 @@ fn default_pending_status() -> String {
     "pending".to_string()
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
@@ -2556,14 +2568,72 @@ pub fn save_intervention(
     intervention: &Intervention,
 ) -> Result<Intervention> {
     let mut value = intervention.clone();
+    value.kind = value.kind.trim().to_ascii_lowercase();
+    value.status = value.status.trim().to_ascii_lowercase();
+    value.resolution_kind = value.resolution_kind.trim().to_ascii_lowercase();
+    value.provider = value.provider.trim().to_ascii_lowercase();
+    if !matches!(
+        value.kind.as_str(),
+        "captcha"
+            | "two_factor"
+            | "assessment"
+            | "unknown_question"
+            | "missing_fact"
+            | "sensitive_question"
+            | "browser_takeover"
+    ) {
+        anyhow::bail!("invalid intervention kind")
+    }
+    if !matches!(
+        value.status.as_str(),
+        "open" | "approved" | "resolved" | "expired" | "cancelled"
+    ) {
+        anyhow::bail!("invalid intervention status")
+    }
+    if !matches!(
+        value.resolution_kind.as_str(),
+        "" | "browser_takeover" | "email_otp_approval" | "answer"
+    ) {
+        anyhow::bail!("invalid intervention resolution")
+    }
+    if let Some(application_id) = value.application_id.as_deref() {
+        if get_application(pool, account_id, application_id)?.is_none() {
+            anyhow::bail!("application not found")
+        }
+    }
+    if value.resolution_kind == "email_otp_approval" {
+        if value.kind != "two_factor"
+            || !matches!(value.provider.as_str(), "gmail" | "outlook_email")
+            || value.provider_message_id.trim().is_empty()
+            || value.expires_at_ms.is_none()
+        {
+            anyhow::bail!("email verification needs a provider message and expiry")
+        }
+    }
+    if value.metadata.is_null() {
+        value.metadata = json!({});
+    }
+    if contains_authentication_secret(&value.metadata) {
+        anyhow::bail!("authentication codes and credentials cannot be stored in interventions")
+    }
     if value.id.is_empty() {
         value.id = uuid::Uuid::new_v4().to_string();
     }
+    let now = now_ms();
     if value.created_at_ms == 0 {
-        value.created_at_ms = now_ms();
+        value.created_at_ms = now;
     }
-    if value.status == "resolved" && value.resolved_at_ms.is_none() {
-        value.resolved_at_ms = Some(now_ms());
+    if value.status == "open"
+        && value
+            .expires_at_ms
+            .is_some_and(|expires_at| expires_at <= now)
+    {
+        value.status = "expired".to_string();
+    }
+    if matches!(value.status.as_str(), "resolved" | "cancelled" | "expired")
+        && value.resolved_at_ms.is_none()
+    {
+        value.resolved_at_ms = Some(now);
     }
     let payload = to_json(&value, "intervention")?;
     crate::db::run_blocking_db(|| match pool {
@@ -2614,6 +2684,26 @@ pub fn save_intervention(
             Ok(value)
         }
     })
+}
+
+fn contains_authentication_secret(value: &Value) -> bool {
+    match value {
+        Value::Object(items) => items.iter().any(|(key, nested)| {
+            matches!(
+                key.trim().to_ascii_lowercase().as_str(),
+                "code"
+                    | "otp"
+                    | "one_time_code"
+                    | "password"
+                    | "access_token"
+                    | "refresh_token"
+                    | "secret"
+                    | "credential"
+            ) || contains_authentication_secret(nested)
+        }),
+        Value::Array(items) => items.iter().any(contains_authentication_secret),
+        _ => false,
+    }
 }
 
 pub fn list_application_evidence(
@@ -3879,6 +3969,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(queued.state, "queued");
+    }
+
+    #[test]
+    fn email_otp_interventions_store_only_provider_references() {
+        let pool = test_pool();
+        let intervention = Intervention {
+            id: String::new(),
+            application_id: None,
+            kind: "two_factor".to_string(),
+            status: "open".to_string(),
+            title: "Email code ready".to_string(),
+            detail: "Approve the matching code from your connected inbox.".to_string(),
+            choices: Vec::new(),
+            resolution_kind: "email_otp_approval".to_string(),
+            resume_after_resolution: true,
+            provider: "gmail".to_string(),
+            provider_message_id: "gmail-message-1".to_string(),
+            expires_at_ms: Some(now_ms() + 10 * 60 * 1_000),
+            metadata: json!({ "destination": "j•••@example.com" }),
+            created_at_ms: 0,
+            resolved_at_ms: None,
+        };
+        let saved = save_intervention(&pool, "acct-jobs", &intervention).unwrap();
+        assert_eq!(saved.provider_message_id, "gmail-message-1");
+        assert_eq!(saved.resolution_kind, "email_otp_approval");
+
+        let mut unsafe_intervention = intervention;
+        unsafe_intervention.id.clear();
+        unsafe_intervention.metadata = json!({ "otp": "824193" });
+        let error = save_intervention(&pool, "acct-jobs", &unsafe_intervention).unwrap_err();
+        assert!(error.to_string().contains("cannot be stored"));
     }
 
     #[test]

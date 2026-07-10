@@ -9,22 +9,27 @@ import {
   KeyRound,
   Laptop,
   LockKeyhole,
+  MailCheck,
   MonitorUp,
   PauseCircle,
   Play,
   ShieldCheck,
   WifiOff,
 } from "lucide-react";
-import type { JobApplication, JobsWorkspace } from "../types";
+import type { Intervention, JobApplication, JobsWorkspace } from "../types";
 import { relativeTime, titleCase } from "../lib/format";
 import { Dialog } from "../components/Dialog";
 
-export function BrowserView({ workspace, onQueueCloud, onUpdateSession }: { workspace: JobsWorkspace; onQueueCloud(application: JobApplication): Promise<void>; onUpdateSession(session: JobsWorkspace["browser_sessions"][number], status: string): Promise<void> }) {
+export function BrowserView({ workspace, onQueueCloud, onUpdateSession, onResolveIntervention }: { workspace: JobsWorkspace; onQueueCloud(application: JobApplication): Promise<void>; onUpdateSession(session: JobsWorkspace["browser_sessions"][number], status: string): Promise<void>; onResolveIntervention(intervention: Intervention, action: string): Promise<void> }) {
   const [installOpen, setInstallOpen] = useState(false);
   const [cloudOpen, setCloudOpen] = useState(false);
   const [queueing, setQueueing] = useState("");
+  const [resolving, setResolving] = useState(false);
   const active = workspace.browser_sessions.find((session) => !["complete", "failed"].includes(session.status));
   const intervention = active ? workspace.interventions.find((item) => item.application_id === active.application_id && item.status === "open") : undefined;
+  const emailCodeReady = intervention?.resolution_kind === "email_otp_approval"
+    && (!intervention.expires_at_ms || intervention.expires_at_ms > Date.now());
+  const takeoverUrl = active?.takeover_url || (active ? `bluey-jobs://takeover?session_id=${encodeURIComponent(active.id)}` : "#");
 
   return (
     <div className="view-shell browser-view">
@@ -45,7 +50,13 @@ export function BrowserView({ workspace, onQueueCloud, onUpdateSession }: { work
             <h2>{active.current_company}</h2>
             <span>{active.current_step}</span>
             {intervention && <div className="run-alert"><AlertTriangle size={17} /><div><b>{intervention.title}</b><p>{intervention.detail}</p></div></div>}
-            <div><a className="button primary" href={active.takeover_url || `bluey-jobs://takeover?session_id=${encodeURIComponent(active.id)}`}><MonitorUp size={16} />Take over</a><button className="icon-button" title={active.status === "paused" ? "Resume run" : "Pause run"} onClick={() => void onUpdateSession(active, active.status === "paused" ? "queued" : "paused")}>{active.status === "paused" ? <Play size={18} /> : <PauseCircle size={18} />}</button></div>
+            <div className="run-actions">
+              {emailCodeReady && intervention
+                ? <button className="button primary" disabled={resolving} onClick={() => { setResolving(true); void onResolveIntervention(intervention, "approve_email_otp").finally(() => setResolving(false)); }}><MailCheck size={16} />{resolving ? "Approving..." : "Use email code"}</button>
+                : <a className="button primary" href={takeoverUrl}><MonitorUp size={16} />Take over</a>}
+              {emailCodeReady && <a className="button secondary compact" href={takeoverUrl}><MonitorUp size={15} />Take over</a>}
+              <button className="icon-button" title={active.status === "paused" ? "Resume run" : "Pause run"} onClick={() => void onUpdateSession(active, active.status === "paused" ? "queued" : "paused")}>{active.status === "paused" ? <Play size={18} /> : <PauseCircle size={18} />}</button>
+            </div>
           </div>
         </section>
       )}
@@ -58,7 +69,7 @@ export function BrowserView({ workspace, onQueueCloud, onUpdateSession }: { work
         </article>
         <article className={`runner-option ${workspace.entitlement.cloud_browser ? "enabled" : "locked"}`}>
           <div className="runner-icon cloud"><Cloud /></div>
-          <div className="runner-copy"><p>CLOUD</p><h2>Background runner</h2><span>Bluey continues from an encrypted, isolated browser profile while your computer is off.</span><ul><li><Check size={14} />Runs from the application queue</li><li><Check size={14} />Pauses for CAPTCHA, 2FA, or unknown answers</li><li><Check size={14} />Stores an exact submission receipt</li></ul></div>
+          <div className="runner-copy"><p>CLOUD</p><h2>Background runner</h2><span>Bluey continues from an encrypted, isolated browser profile while your computer is off.</span><ul><li><Check size={14} />Offers one-click email-code approval</li><li><Check size={14} />Preserves CAPTCHA and account-owner handoffs</li><li><Check size={14} />Stores an exact submission receipt</li></ul></div>
           <div className="runner-action"><b>{workspace.entitlement.cloud_browser ? "Included" : "Cloud"}</b>{workspace.entitlement.cloud_browser ? <button className="button primary" onClick={() => setCloudOpen(true)}>Queue a run<ArrowRight size={16} /></button> : <a className="button secondary" href="/jobs/settings#plans">See Cloud<ArrowRight size={16} /></a>}</div>
         </article>
       </section>

@@ -9,6 +9,7 @@ import type {
   BrowserSession,
   CareerProfile,
   CareerTrack,
+  Intervention,
   JobApplication,
   JobPosting,
   JobPreferences,
@@ -423,6 +424,25 @@ export default function App() {
     setToast(status === "paused" ? "Browser run paused." : "Browser run updated.");
   }, []);
 
+  const resolveIntervention = useCallback(async (intervention: Intervention, action: string) => {
+    const saved = isPreview
+      ? {
+          ...intervention,
+          status: action === "approve_email_otp" ? "approved" : "resolved",
+          resolved_at_ms: action === "approve_email_otp" ? undefined : Date.now(),
+          metadata: { ...intervention.metadata, approved_at_ms: Date.now() },
+        }
+      : await jobsApi.resolveIntervention(intervention.id, "resolved", action);
+    setWorkspace((current) => current ? {
+      ...current,
+      interventions: current.interventions.map((item) => item.id === saved.id ? saved : item),
+      browser_sessions: current.browser_sessions.map((session) => session.application_id === saved.application_id
+        ? { ...session, status: "queued", current_step: "Resuming application", updated_at_ms: Date.now() }
+        : session),
+    } : current);
+    setToast(action === "approve_email_otp" ? "Email code approved. Bluey is resuming." : "Browser run is ready to resume.");
+  }, []);
+
   if (!isPreview && !accessToken()) return <AuthGate />;
   if (loading && !workspace) return <LoadingScreen />;
   if (!workspace) return <LoadError message={error} onRetry={refresh} />;
@@ -483,6 +503,7 @@ export default function App() {
               workspace={workspace}
               onQueueCloud={queueCloudRun}
               onUpdateSession={updateBrowserSession}
+              onResolveIntervention={resolveIntervention}
             />
           }
         />

@@ -401,6 +401,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .run-control h2 { font-size: 20px; }
 .run-control > span { color: var(--text-soft); font-size: 11px; }
 .run-control > div:last-child { margin-top: 13px; display: flex; gap: 8px; }
+.run-actions { flex-wrap: wrap; align-items: center; }
 .run-alert { width: 100%; margin-top: 13px; padding: 10px; display: flex; gap: 8px; border: 1px solid color-mix(in srgb, var(--amber) 40%, var(--border)); border-radius: 7px; background: var(--amber-soft); color: var(--amber); }
 .run-alert div { display: grid; gap: 3px; }
 .run-alert b { font-size: 10px; }
@@ -502,6 +503,14 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .pause-rules > div { display: flex; flex-wrap: wrap; gap: 6px; }
 .pause-rules span { padding: 5px 7px; display: flex; align-items: center; gap: 4px; border-radius: 4px; background: var(--surface-3); color: var(--text-soft); font-size: 9px; }
 .pause-rules svg { color: var(--green); }
+.challenge-rules { padding: 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); }
+.challenge-rules > p { margin-bottom: 9px; color: var(--muted); font-size: 9px; font-weight: 850; }
+.challenge-rules > div { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.challenge-rules span { min-width: 0; padding: 7px 8px; display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: 1px 5px; border: 1px solid color-mix(in srgb, var(--accent) 12%, var(--border)); border-radius: 5px; background: var(--surface-3); }
+.challenge-rules span:last-child { grid-column: 1 / -1; }
+.challenge-rules svg { grid-row: 1 / 3; color: var(--accent); }
+.challenge-rules b { color: var(--text); font-size: 10px; }
+.challenge-rules small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .integration-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .integration-list > div { min-height: 64px; padding: 9px 11px; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto auto; align-items: center; gap: 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); }
 .integration-icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 7px; background: var(--surface-3); color: var(--accent); }
@@ -718,6 +727,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .runner-action { grid-column: 1 / 3; }
   .adapter-list { grid-template-columns: 1fr; }
   .settings-section { padding: 14px; }
+  .challenge-rules > div { grid-template-columns: 1fr; }
+  .challenge-rules span:last-child { grid-column: auto; }
   .settings-section-title { grid-template-columns: 38px minmax(0, 1fr); }
   .settings-section-title > .button { grid-column: 1 / 3; justify-self: start; }
   .integration-list > div { grid-template-columns: 34px minmax(0, 1fr) auto; }

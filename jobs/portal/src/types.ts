@@ -200,6 +200,12 @@ export interface Intervention {
   title: string;
   detail: string;
   choices: string[];
+  resolution_kind: "browser_takeover" | "email_otp_approval" | "answer" | string;
+  resume_after_resolution: boolean;
+  provider: string;
+  provider_message_id: string;
+  expires_at_ms?: number;
+  metadata: Record<string, unknown>;
   created_at_ms: number;
   resolved_at_ms?: number;
 }

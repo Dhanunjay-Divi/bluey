@@ -555,6 +555,8 @@ pub async fn save_intervention(
 #[derive(Debug, Deserialize)]
 pub struct ResolveInterventionRequest {
     pub status: String,
+    #[serde(default)]
+    pub action: String,
 }
 
 pub async fn update_intervention(
@@ -569,7 +571,30 @@ pub async fn update_intervention(
         .find(|item| item.id == intervention_id)
         .ok_or((StatusCode::NOT_FOUND, "Intervention not found.".to_string()))?;
     let mut updated = intervention;
-    updated.status = req.status;
+    let action = req.action.trim().to_ascii_lowercase();
+    updated.status = req.status.trim().to_ascii_lowercase();
+    if action == "approve_email_otp" {
+        if updated.resolution_kind != "email_otp_approval" {
+            return bad_request("This intervention does not contain an email verification step.");
+        }
+        if updated
+            .expires_at_ms
+            .is_some_and(|expires_at| expires_at <= jobs::now_ms())
+        {
+            updated.status = "expired".to_string();
+        } else {
+            updated.status = "approved".to_string();
+            let approved_at_ms = jobs::now_ms();
+            if let Some(metadata) = updated.metadata.as_object_mut() {
+                metadata.insert(
+                    "approved_at_ms".to_string(),
+                    serde_json::json!(approved_at_ms),
+                );
+            } else {
+                updated.metadata = serde_json::json!({ "approved_at_ms": approved_at_ms });
+            }
+        }
+    }
     jobs::save_intervention(&state.pool, &account.id, &updated)
         .map(Json)
         .map_err(internal)

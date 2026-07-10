@@ -6,6 +6,7 @@ import type {
   CareerFact,
   CareerProfile,
   CareerTrack,
+  Intervention,
   JobApplication,
   JobPosting,
   JobPreferences,
@@ -157,6 +158,11 @@ export const jobsApi = {
     request<BrowserSession>("/api/jobs/browser-sessions", {
       method: "POST",
       body: JSON.stringify(session),
+    }),
+  resolveIntervention: (id: string, status: string, action = "") =>
+    request<Intervention>(`/api/jobs/interventions/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status, action }),
     }),
   saveIntegration: (integration: JobsIntegration) =>
     request<JobsIntegration>("/api/jobs/integrations", {
