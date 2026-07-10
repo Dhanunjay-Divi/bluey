@@ -1,0 +1,2 @@
+web/jobs/assets/*.js whitespace=-trailing-space
+web/jobs/assets/*.mjs whitespace=-trailing-space

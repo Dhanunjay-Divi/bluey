@@ -24,6 +24,7 @@ pub mod device_codes;
 pub mod devices;
 pub mod diagnostic_logs;
 pub mod idempotency;
+pub mod jobs;
 pub mod link_codes;
 pub mod metrics;
 pub mod ops_audit;
@@ -740,6 +741,182 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_account_devices_account_device
         ON account_devices(account_id, device_id);
     "#,
+    // 0019 - Bluey Jobs customer workspace.
+    //
+    // Jobs is intentionally isolated from the meeting/session runtime. The
+    // tenant key is present on every row, packet generation is job-specific,
+    // and packet metering is idempotent per canonical job.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_profiles (
+        account_id            TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+        profile_json          TEXT NOT NULL DEFAULT '{}',
+        onboarding_step       INTEGER NOT NULL DEFAULT 0,
+        onboarding_complete   INTEGER NOT NULL DEFAULT 0,
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS jobs_facts (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        category              TEXT NOT NULL,
+        label                 TEXT NOT NULL,
+        value_json            TEXT NOT NULL,
+        source                TEXT NOT NULL,
+        verification_status   TEXT NOT NULL DEFAULT 'unverified',
+        confirmed_at_ms       INTEGER,
+        confirmed_by          TEXT,
+        schema_version        INTEGER NOT NULL DEFAULT 1,
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_facts_account_category
+        ON jobs_facts(account_id, category, updated_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS jobs_preferences (
+        account_id            TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+        preferences_json      TEXT NOT NULL DEFAULT '{}',
+        updated_at_ms         INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS jobs_tracks (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        track_json            TEXT NOT NULL,
+        active                INTEGER NOT NULL DEFAULT 1,
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_tracks_account
+        ON jobs_tracks(account_id, active, updated_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS jobs_postings (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        canonical_key         TEXT NOT NULL,
+        posting_json          TEXT NOT NULL,
+        source                TEXT NOT NULL,
+        canonical_url         TEXT,
+        company               TEXT NOT NULL,
+        title                 TEXT NOT NULL,
+        location              TEXT,
+        match_score           INTEGER NOT NULL DEFAULT 0,
+        status                TEXT NOT NULL DEFAULT 'matched',
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL,
+        UNIQUE(account_id, canonical_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_postings_account_score
+        ON jobs_postings(account_id, status, match_score DESC, updated_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS jobs_resume_versions (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        job_id                TEXT NOT NULL,
+        version_no            INTEGER NOT NULL,
+        mode                  TEXT NOT NULL,
+        content_json          TEXT NOT NULL,
+        diff_json             TEXT NOT NULL DEFAULT '{}',
+        claim_ids_json        TEXT NOT NULL DEFAULT '[]',
+        checksum              TEXT NOT NULL,
+        created_at_ms         INTEGER NOT NULL,
+        UNIQUE(account_id, job_id, checksum),
+        FOREIGN KEY (job_id) REFERENCES jobs_postings(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_resume_versions_job
+        ON jobs_resume_versions(account_id, job_id, version_no DESC);
+
+    CREATE TABLE IF NOT EXISTS jobs_applications (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        job_id                TEXT NOT NULL,
+        resume_version_id     TEXT,
+        state                 TEXT NOT NULL DEFAULT 'matched',
+        application_json      TEXT NOT NULL DEFAULT '{}',
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL,
+        submitted_at_ms       INTEGER,
+        UNIQUE(account_id, job_id),
+        FOREIGN KEY (job_id) REFERENCES jobs_postings(id) ON DELETE CASCADE,
+        FOREIGN KEY (resume_version_id) REFERENCES jobs_resume_versions(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_applications_account_state
+        ON jobs_applications(account_id, state, updated_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS jobs_browser_sessions (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        runner                TEXT NOT NULL,
+        status                TEXT NOT NULL,
+        session_json          TEXT NOT NULL DEFAULT '{}',
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_browser_sessions_account
+        ON jobs_browser_sessions(account_id, updated_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS jobs_interventions (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        application_id        TEXT,
+        kind                  TEXT NOT NULL,
+        status                TEXT NOT NULL DEFAULT 'open',
+        intervention_json     TEXT NOT NULL DEFAULT '{}',
+        created_at_ms         INTEGER NOT NULL,
+        resolved_at_ms        INTEGER,
+        FOREIGN KEY (application_id) REFERENCES jobs_applications(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_interventions_account_status
+        ON jobs_interventions(account_id, status, created_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS jobs_integrations (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        provider              TEXT NOT NULL,
+        status                TEXT NOT NULL DEFAULT 'disconnected',
+        integration_json      TEXT NOT NULL DEFAULT '{}',
+        updated_at_ms         INTEGER NOT NULL,
+        UNIQUE(account_id, provider)
+    );
+
+    CREATE TABLE IF NOT EXISTS jobs_entitlements (
+        account_id            TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+        plan                  TEXT NOT NULL DEFAULT 'free',
+        track_limit           INTEGER NOT NULL DEFAULT 1,
+        monthly_packet_limit  INTEGER NOT NULL DEFAULT 5,
+        used_packets          INTEGER NOT NULL DEFAULT 0,
+        period_start_ms       INTEGER NOT NULL,
+        period_end_ms         INTEGER NOT NULL,
+        local_browser         INTEGER NOT NULL DEFAULT 0,
+        cloud_browser         INTEGER NOT NULL DEFAULT 0,
+        updated_at_ms         INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS jobs_run_events (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        run_id                TEXT NOT NULL,
+        event_type            TEXT NOT NULL,
+        event_json            TEXT NOT NULL DEFAULT '{}',
+        created_at_ms         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_run_events_account_run
+        ON jobs_run_events(account_id, run_id, created_at_ms ASC);
+
+    CREATE TABLE IF NOT EXISTS jobs_packet_metering (
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        job_id                TEXT NOT NULL,
+        application_id        TEXT NOT NULL,
+        metering_key          TEXT NOT NULL,
+        included              INTEGER NOT NULL,
+        amount_cents          INTEGER NOT NULL DEFAULT 0,
+        created_at_ms         INTEGER NOT NULL,
+        PRIMARY KEY (account_id, job_id),
+        UNIQUE(account_id, metering_key),
+        FOREIGN KEY (job_id) REFERENCES jobs_postings(id) ON DELETE CASCADE,
+        FOREIGN KEY (application_id) REFERENCES jobs_applications(id) ON DELETE CASCADE
+    );
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -851,6 +1028,8 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
 
 const POSTGRES_RUNTIME_SCHEMA: &str =
     include_str!("../../../infra/postgres/server-runtime/001_server_runtime_compat.sql");
+const POSTGRES_JOBS_SCHEMA: &str =
+    include_str!("../../../infra/postgres/server-runtime/002_jobs.sql");
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
     run_blocking_db(|| run_postgres_migrations_inner(pool))
@@ -889,6 +1068,15 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
         conn.batch_execute(POSTGRES_RUNTIME_SCHEMA)
             .context("refresh postgres runtime compatibility schema")?;
     }
+
+    conn.batch_execute(POSTGRES_JOBS_SCHEMA)
+        .context("apply postgres Jobs schema")?;
+    conn.execute(
+        "INSERT INTO bluey_schema_migrations(version) VALUES ($1)
+         ON CONFLICT (version) DO NOTHING",
+        &[&"002_jobs.sql"],
+    )
+    .context("record postgres Jobs migration")?;
 
     let vector_ready = conn
         .query_opt("SELECT 1 FROM pg_extension WHERE extname = 'vector'", &[])

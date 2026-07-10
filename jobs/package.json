@@ -1,0 +1,16 @@
+{
+  "name": "bluey-jobs",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "portal",
+    "automation",
+    "browser",
+    "workflows"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @bluey/jobs-automation && npm run build --workspace @bluey/jobs-browser && npm run build --workspace @bluey/jobs-workflows && npm run build --workspace @bluey/jobs-portal",
+    "test": "npm run test --workspace @bluey/jobs-automation && npm run test --workspace @bluey/jobs-portal",
+    "typecheck": "npm run typecheck --workspace @bluey/jobs-automation && npm run typecheck --workspace @bluey/jobs-browser && npm run typecheck --workspace @bluey/jobs-workflows && npm run typecheck --workspace @bluey/jobs-portal"
+  }
+}

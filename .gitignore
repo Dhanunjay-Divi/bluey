@@ -1,5 +1,6 @@
 /target/
 **/.build/
+**/node_modules/
 .DS_Store
 
 # Local reference/source snapshots used for research, not product source.

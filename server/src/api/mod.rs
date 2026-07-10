@@ -16,6 +16,7 @@ pub mod account;
 pub mod admin;
 pub mod auth_routes;
 pub mod billing;
+pub mod jobs;
 pub mod metrics;
 pub mod middleware;
 pub mod pricing;
@@ -155,6 +156,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             "/admin/support/accounts/:account_id",
             get(admin::support_account),
         )
+        .merge(jobs::admin_router())
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 
     // ---- Authenticated (Bearer JWT) -----------------------------------------
@@ -181,6 +183,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             axum::routing::patch(account::update_billing_settings),
         )
         .route("/account/usage", get(account::usage))
+        .merge(jobs::router())
         .route(
             "/router/complete",
             axum::routing::post(router::complete)
@@ -298,6 +301,28 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
     Router::new()
         .merge(public)
         .merge(protected)
+        .layer(from_fn(middleware::request_id::request_id_middleware))
+        .with_state(state)
+}
+
+/// Independently deployable Bluey Jobs API surface.
+///
+/// It validates the same Bluey bearer tokens and uses the same account and
+/// balance database, but does not expose meeting, audio, router, or sync APIs.
+pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
+    let state = AppState {
+        pool,
+        config: Arc::new(config),
+        rate_limiters: crate::rate_limit::RateLimiters::default(),
+        provider_health: crate::provider_health::ProviderHealth::default(),
+    };
+
+    Router::new()
+        .merge(jobs::router())
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ))
         .layer(from_fn(middleware::request_id::request_id_middleware))
         .with_state(state)
 }
