@@ -210,6 +210,29 @@ export interface Intervention {
   resolved_at_ms?: number;
 }
 
+export type AnswerMemoryScope = "account" | "track" | "company";
+
+export interface AnswerMemory {
+  id: string;
+  key: string;
+  question: string;
+  value: string;
+  scope: AnswerMemoryScope;
+  scope_id?: string;
+  confirmed: boolean;
+  source: "settings" | "intervention" | string;
+  created_at_ms: number;
+  updated_at_ms: number;
+  last_used_at_ms?: number;
+  use_count: number;
+}
+
+export interface InterventionResolutionResult {
+  intervention: Intervention;
+  answer_memory?: AnswerMemory;
+  application?: JobApplication;
+}
+
 export interface ApplicationEvidence {
   id: string;
   application_id: string;
@@ -282,6 +305,7 @@ export interface JobsWorkspace {
   application_evidence: ApplicationEvidence[];
   browser_sessions: BrowserSession[];
   interventions: Intervention[];
+  answer_memory: AnswerMemory[];
   integrations: JobsIntegration[];
   application_identities: ApplicationIdentity[];
   mailbox_connections: MailboxConnection[];

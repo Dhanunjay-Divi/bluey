@@ -5,6 +5,7 @@ import { accessToken, jobsApi, loginUrl } from "./api";
 import { previewWorkspace } from "./data/preview";
 import type {
   AccountSummary,
+  AnswerMemory,
   ApplicationIdentity,
   BrowserSession,
   CareerProfile,
@@ -377,6 +378,35 @@ export default function App() {
     setToast(`${connection.account_label} disconnected.`);
   }, []);
 
+  const saveAnswerMemory = useCallback(async (answer: AnswerMemory) => {
+    const now = Date.now();
+    const saved = isPreview
+      ? {
+          ...answer,
+          id: answer.id || `answer-${now}`,
+          key: normalizeAnswerKey(answer.key || answer.question),
+          confirmed: true,
+          created_at_ms: answer.created_at_ms || now,
+          updated_at_ms: now,
+        }
+      : await jobsApi.saveAnswerMemory(answer);
+    setWorkspace((current) => current ? {
+      ...current,
+      answer_memory: [saved, ...current.answer_memory.filter((item) => item.id !== saved.id && !(item.key === saved.key && item.scope === saved.scope && (item.scope_id || "") === (saved.scope_id || "")))],
+    } : current);
+    setToast("Answer saved to memory.");
+    return saved;
+  }, []);
+
+  const deleteAnswerMemory = useCallback(async (answer: AnswerMemory) => {
+    if (!isPreview) await jobsApi.deleteAnswerMemory(answer.id);
+    setWorkspace((current) => current ? {
+      ...current,
+      answer_memory: current.answer_memory.filter((item) => item.id !== answer.id),
+    } : current);
+    setToast("Saved answer removed.");
+  }, []);
+
   const queueCloudRun = useCallback(async (application: JobApplication) => {
     if (!workspace) return;
     const job = workspace.matches.find((item) => item.id === application.job_id);
@@ -424,23 +454,54 @@ export default function App() {
     setToast(status === "paused" ? "Browser run paused." : "Browser run updated.");
   }, []);
 
-  const resolveIntervention = useCallback(async (intervention: Intervention, action: string) => {
-    const saved = isPreview
+  const resolveIntervention = useCallback(async (
+    intervention: Intervention,
+    action: string,
+    resolution?: { answer?: string; remember?: boolean; scope?: string; scope_id?: string },
+  ) => {
+    const now = Date.now();
+    const result = isPreview
       ? {
-          ...intervention,
-          status: action === "approve_email_otp" ? "approved" : "resolved",
-          resolved_at_ms: action === "approve_email_otp" ? undefined : Date.now(),
-          metadata: { ...intervention.metadata, approved_at_ms: Date.now() },
+          intervention: {
+            ...intervention,
+            status: action === "approve_email_otp" ? "approved" : "resolved",
+            resolved_at_ms: action === "approve_email_otp" ? undefined : now,
+            metadata: {
+              ...intervention.metadata,
+              ...(action === "approve_email_otp" ? { approved_at_ms: now } : { answered_at_ms: now, resolved_answer: resolution?.answer }),
+            },
+          },
+          answer_memory: resolution?.remember ? {
+            id: `answer-${now}`,
+            key: normalizeAnswerKey(intervention.title),
+            question: intervention.title,
+            value: resolution.answer || "",
+            scope: (resolution.scope || "account") as AnswerMemory["scope"],
+            scope_id: resolution.scope_id,
+            confirmed: true,
+            source: "intervention",
+            created_at_ms: now,
+            updated_at_ms: now,
+            use_count: 0,
+          } : undefined,
+          application: undefined,
         }
-      : await jobsApi.resolveIntervention(intervention.id, "resolved", action);
+      : await jobsApi.resolveIntervention(intervention.id, "resolved", action, resolution);
+    const saved = result.intervention;
     setWorkspace((current) => current ? {
       ...current,
       interventions: current.interventions.map((item) => item.id === saved.id ? saved : item),
+      applications: current.applications.map((application) => application.id === saved.application_id
+        ? result.application || { ...application, state: "queued", updated_at_ms: Date.now() }
+        : application),
+      answer_memory: result.answer_memory
+        ? [result.answer_memory, ...current.answer_memory.filter((item) => item.id !== result.answer_memory?.id && !(item.key === result.answer_memory?.key && item.scope === result.answer_memory?.scope && (item.scope_id || "") === (result.answer_memory?.scope_id || "")))]
+        : current.answer_memory,
       browser_sessions: current.browser_sessions.map((session) => session.application_id === saved.application_id
         ? { ...session, status: "queued", current_step: "Resuming application", updated_at_ms: Date.now() }
         : session),
     } : current);
-    setToast(action === "approve_email_otp" ? "Email code approved. Bluey is resuming." : "Browser run is ready to resume.");
+    setToast(action === "approve_email_otp" ? "Email code approved. Bluey is resuming." : resolution?.remember ? "Answer saved. Bluey is resuming." : "Answer sent. Bluey is resuming.");
   }, []);
 
   if (!isPreview && !accessToken()) return <AuthGate />;
@@ -481,6 +542,7 @@ export default function App() {
               onUpdate={updateApplication}
               onCommit={commitApplication}
               onLoadResume={loadResumeVersion}
+              onResolveIntervention={resolveIntervention}
             />
           }
         />
@@ -524,6 +586,8 @@ export default function App() {
               onDeleteIdentity={deleteApplicationIdentity}
               onRequestMailbox={requestMailboxConnection}
               onDeleteMailbox={deleteMailboxConnection}
+              onSaveAnswerMemory={saveAnswerMemory}
+              onDeleteAnswerMemory={deleteAnswerMemory}
             />
           }
         />
@@ -554,6 +618,10 @@ function AuthGate() {
       <footer>Bluey identity, balance, and privacy controls carry into Jobs.</footer>
     </main>
   );
+}
+
+function normalizeAnswerKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
 function previewResume(workspace: JobsWorkspace, job: JobPosting, id: string, mode: string): ResumeVersion {

@@ -6,7 +6,9 @@ import type {
   CareerFact,
   CareerProfile,
   CareerTrack,
+  AnswerMemory,
   Intervention,
+  InterventionResolutionResult,
   JobApplication,
   JobPosting,
   JobPreferences,
@@ -159,11 +161,23 @@ export const jobsApi = {
       method: "POST",
       body: JSON.stringify(session),
     }),
-  resolveIntervention: (id: string, status: string, action = "") =>
-    request<Intervention>(`/api/jobs/interventions/${encodeURIComponent(id)}`, {
+  resolveIntervention: (
+    id: string,
+    status: string,
+    action = "",
+    resolution?: { answer?: string; remember?: boolean; scope?: string; scope_id?: string },
+  ) =>
+    request<InterventionResolutionResult>(`/api/jobs/interventions/${encodeURIComponent(id)}`, {
       method: "PATCH",
-      body: JSON.stringify({ status, action }),
+      body: JSON.stringify({ status, action, ...resolution }),
     }),
+  saveAnswerMemory: (answer: AnswerMemory) =>
+    request<AnswerMemory>(answer.id ? `/api/jobs/answers/${encodeURIComponent(answer.id)}` : "/api/jobs/answers", {
+      method: answer.id ? "PUT" : "POST",
+      body: JSON.stringify(answer),
+    }),
+  deleteAnswerMemory: (id: string) =>
+    request<void>(`/api/jobs/answers/${encodeURIComponent(id)}`, { method: "DELETE" }),
   saveIntegration: (integration: JobsIntegration) =>
     request<JobsIntegration>("/api/jobs/integrations", {
       method: "PUT",

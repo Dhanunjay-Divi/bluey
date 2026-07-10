@@ -279,6 +279,21 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .claim-note small { color: var(--text-soft); font-size: 10px; }
 .input-needed { margin-top: 10px; border-color: color-mix(in srgb, var(--amber) 35%, var(--border)); background: var(--amber-soft); color: var(--amber); }
 .input-needed p { color: var(--text-soft); font-size: 10px; line-height: 1.4; }
+.answer-intervention { margin-top: 10px; padding: 12px; display: grid; gap: 10px; border: 1px solid color-mix(in srgb, var(--amber) 40%, var(--border)); border-radius: 7px; background: var(--amber-soft); }
+.answer-intervention-heading { display: flex; align-items: flex-start; gap: 8px; color: var(--amber); }
+.answer-intervention-heading > div { display: grid; gap: 3px; }
+.answer-intervention-heading b { color: var(--text); font-size: 11px; }
+.answer-intervention-heading p { color: var(--text-soft); font-size: 10px; line-height: 1.4; }
+.answer-intervention textarea { width: 100%; min-height: 76px; resize: vertical; }
+.answer-memory-options { display: flex; align-items: stretch; flex-direction: column; gap: 8px; }
+.answer-memory-options > label:first-child { display: flex; align-items: center; gap: 8px; }
+.answer-memory-options input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+.answer-memory-options label > span { display: grid; gap: 2px; }
+.answer-memory-options b { color: var(--text); font-size: 10px; }
+.answer-memory-options small { color: var(--muted); font-size: 9px; }
+.answer-scope { display: flex; align-items: center; justify-content: space-between; gap: 7px; color: var(--muted); font-size: 9px; }
+.answer-scope select { min-width: 150px; height: 34px; padding: 0 28px 0 9px; }
+.answer-intervention > .button { justify-self: end; }
 .download-row { margin-top: 14px; display: flex; gap: 7px; }
 .download-row button { height: 32px; padding: 0 10px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text-soft); font-size: 11px; font-weight: 700; }
 .download-row button:disabled { cursor: not-allowed; opacity: .45; }
@@ -474,6 +489,20 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .identity-list b { font-size: 11px; }
 .identity-list p { color: var(--muted); font-size: 9px; }
 .identity-badges, .identity-actions { display: flex; align-items: center; gap: 6px; }
+.answer-memory-list { display: grid; gap: 7px; }
+.answer-memory-list > div { min-height: 70px; padding: 10px 11px; display: grid; grid-template-columns: 36px minmax(0, 1fr) 34px 34px; align-items: center; gap: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); }
+.answer-memory-mark { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 7px; background: var(--accent-soft); color: var(--accent); }
+.answer-memory-list > div > div { min-width: 0; display: grid; gap: 3px; }
+.answer-memory-list b, .answer-memory-list p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.answer-memory-list b { font-size: 11px; }
+.answer-memory-list p { color: var(--text-soft); font-size: 10px; }
+.answer-memory-list small { color: var(--muted); font-size: 9px; }
+.answer-memory-list > .answer-memory-empty { min-height: 90px; grid-template-columns: 38px minmax(0, 1fr); border-style: dashed; }
+.answer-memory-empty p { white-space: normal; }
+.answer-memory-form { padding: 18px 20px 4px; display: grid; gap: 12px; }
+.answer-memory-form label { display: grid; gap: 6px; }
+.answer-memory-form label > span { color: var(--muted); font-size: 9px; font-weight: 800; text-transform: uppercase; }
+.answer-memory-form textarea { min-height: 96px; resize: vertical; }
 .status-chip { min-height: 22px; padding: 3px 7px; display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 999px; color: var(--text-soft); font-size: 8px; font-weight: 850; }
 .status-chip.accent { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); color: var(--accent); }
 .status-chip.success { border-color: color-mix(in srgb, var(--green) 45%, var(--border)); color: var(--green); }
@@ -734,6 +763,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .integration-list > div { grid-template-columns: 34px minmax(0, 1fr) auto; }
   .integration-list .integration-state { display: none; }
   .identity-list > div { grid-template-columns: 34px minmax(0, 1fr) auto; }
+  .answer-memory-list > div { grid-template-columns: 34px minmax(0, 1fr) 32px 32px; }
   .identity-badges { grid-column: 2; justify-self: start; }
   .identity-actions { grid-column: 3; grid-row: 1 / 3; }
   .identity-summary, .connection-usage { align-items: flex-start; flex-direction: column; gap: 4px; }

@@ -26,10 +26,12 @@ export interface ApplicationAnswerProfile {
 }
 
 export interface AnswerMemoryEntry {
+  id?: string;
   key: string;
   value: string;
   scope: AnswerScope;
   scopeId?: string;
+  scope_id?: string;
   confirmed: boolean;
 }
 
@@ -145,9 +147,13 @@ export function resolveMemory(
   context: AnswerPlanningContext,
 ): AnswerMemoryEntry | undefined {
   const candidates = entries.filter((entry) => entry.confirmed && normalize(entry.key) === normalize(fieldLabel));
-  return candidates.find((entry) => entry.scope === "company" && entry.scopeId === context.companyId)
-    ?? candidates.find((entry) => entry.scope === "track" && entry.scopeId === context.trackId)
+  return candidates.find((entry) => entry.scope === "company" && memoryScopeId(entry) === context.companyId)
+    ?? candidates.find((entry) => entry.scope === "track" && memoryScopeId(entry) === context.trackId)
     ?? candidates.find((entry) => entry.scope === "account");
+}
+
+function memoryScopeId(entry: AnswerMemoryEntry): string | undefined {
+  return entry.scopeId ?? entry.scope_id;
 }
 
 function matchFactKey(label: string): string | undefined {

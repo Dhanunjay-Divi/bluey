@@ -122,6 +122,20 @@ CREATE TABLE IF NOT EXISTS jobs_interventions (
 CREATE INDEX IF NOT EXISTS idx_jobs_interventions_account_status
   ON jobs_interventions(account_id, status, created_at_ms DESC);
 
+CREATE TABLE IF NOT EXISTS jobs_answer_memory (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  scope TEXT NOT NULL,
+  scope_id TEXT NOT NULL DEFAULT '',
+  question_hash TEXT NOT NULL,
+  answer_json TEXT NOT NULL DEFAULT '{}',
+  created_at_ms BIGINT NOT NULL,
+  updated_at_ms BIGINT NOT NULL,
+  UNIQUE(account_id, scope, scope_id, question_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_answer_memory_account
+  ON jobs_answer_memory(account_id, updated_at_ms DESC);
+
 CREATE TABLE IF NOT EXISTS jobs_integrations (
   id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,

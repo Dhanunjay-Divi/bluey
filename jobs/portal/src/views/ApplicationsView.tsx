@@ -20,7 +20,7 @@ import {
   Search,
   Send,
 } from "lucide-react";
-import type { ApplicationEvidence, JobApplication, JobsWorkspace, ResumeVersion } from "../types";
+import type { ApplicationEvidence, Intervention, JobApplication, JobsWorkspace, ResumeVersion } from "../types";
 import { relativeTime, titleCase } from "../lib/format";
 import { Dialog } from "../components/Dialog";
 import { exportResumeDocx, exportResumePdf } from "../lib/documents";
@@ -31,6 +31,7 @@ interface Props {
   onUpdate(application: JobApplication, state: string): Promise<void>;
   onCommit(application: JobApplication): Promise<void>;
   onLoadResume(id: string): Promise<ResumeVersion | undefined>;
+  onResolveIntervention(intervention: Intervention, action: string, resolution?: { answer?: string; remember?: boolean; scope?: string; scope_id?: string }): Promise<void>;
 }
 
 const stateGroups = [
@@ -40,13 +41,16 @@ const stateGroups = [
   ["all", "All"],
 ] as const;
 
-export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit, onLoadResume }: Props) {
+export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit, onLoadResume, onResolveIntervention }: Props) {
   const [filter, setFilter] = useState<(typeof stateGroups)[number][0]>("active");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<JobApplication | null>(null);
   const [selectedResume, setSelectedResume] = useState<ResumeVersion | undefined>();
   const [receiptOpen, setReceiptOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [answer, setAnswer] = useState("");
+  const [rememberAnswer, setRememberAnswer] = useState(true);
+  const [answerScope, setAnswerScope] = useState<"account" | "track" | "company">("account");
   const openInterventions = workspace.interventions.filter((item) => item.status === "open");
 
   const jobs = useMemo(() => new Map(workspace.matches.map((job) => [job.id, job])), [workspace.matches]);
@@ -56,6 +60,12 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   const selectedEvidence = selected
     ? workspace.application_evidence.filter((evidence) => evidence.application_id === selected.id)
     : [];
+  const selectedIntervention = selected
+    ? workspace.interventions.find((item) => item.application_id === selected.id && item.status === "open")
+    : undefined;
+  const selectedJob = selected ? jobs.get(selected.job_id) : undefined;
+  const canAnswerIntervention = selectedIntervention?.resolution_kind === "answer"
+    && ["unknown_question", "missing_fact", "sensitive_question"].includes(selectedIntervention.kind);
   const filtered = workspace.applications.filter((application) => {
     const job = jobs.get(application.job_id);
     const textMatch = !query || `${job?.company || ""} ${job?.title || ""}`.toLowerCase().includes(query.toLowerCase());
@@ -79,6 +89,12 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
     void onLoadResume(selected.resume_version_id).then(setSelectedResume);
   }, [selected, resumeVersions, onLoadResume]);
 
+  useEffect(() => {
+    setAnswer("");
+    setRememberAnswer(selectedIntervention?.kind !== "sensitive_question");
+    setAnswerScope(selectedJob?.track_id ? "track" : "account");
+  }, [selectedIntervention?.id, selectedIntervention?.kind, selectedJob?.track_id]);
+
   const update = async (state: string) => {
     if (!selected) return;
     setBusy(true);
@@ -98,6 +114,27 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
       const filename = `bluey-${jobs.get(selected.job_id)?.company || "resume"}`;
       if (format === "pdf") await exportResumePdf(selectedResume.content, filename);
       else await exportResumeDocx(selectedResume.content, filename);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitInterventionAnswer = async () => {
+    if (!selected || !selectedIntervention || !answer.trim()) return;
+    setBusy(true);
+    try {
+      const scopeId = answerScope === "track"
+        ? selectedJob?.track_id
+        : answerScope === "company"
+          ? normalizeCompanyKey(selectedJob?.company || "")
+          : undefined;
+      await onResolveIntervention(selectedIntervention, "answer", {
+        answer: answer.trim(),
+        remember: rememberAnswer,
+        scope: answerScope,
+        scope_id: scopeId,
+      });
+      setSelected((current) => current ? { ...current, state: "queued", updated_at_ms: Date.now() } : current);
     } finally {
       setBusy(false);
     }
@@ -168,11 +205,21 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
                   <li><span>Experience</span><p>Prioritized outcomes closest to this company's requirements.</p></li>
                 </ul>
                 <div className="claim-note"><CheckCircle2 size={17} /><span><b>No unsupported claims</b><small>{selectedResume?.claim_ids.length || 0} profile facts carry provenance into this version.</small></span></div>
-                {selected.state === "needs_input" && <div className="input-needed"><AlertCircle size={17} /><div><b>Bluey needs your answer</b><p>{workspace.interventions.find((item) => item.application_id === selected.id)?.detail || "Open the browser takeover to continue."}</p></div></div>}
+                {selected.state === "needs_input" && canAnswerIntervention && selectedIntervention
+                  ? <div className="answer-intervention">
+                      <div className="answer-intervention-heading"><AlertCircle size={17} /><div><b>{selectedIntervention.title}</b><p>{selectedIntervention.detail}</p></div></div>
+                      <textarea aria-label="Application answer" value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder="Type the answer Bluey should use" rows={3} />
+                      <div className="answer-memory-options">
+                        <label><input type="checkbox" checked={rememberAnswer} onChange={(event) => setRememberAnswer(event.target.checked)} /><span><b>Remember this answer</b><small>Reuse it when the same question appears.</small></span></label>
+                        {rememberAnswer && <label className="answer-scope"><span>Use for</span><select value={answerScope} onChange={(event) => setAnswerScope(event.target.value as typeof answerScope)}><option value="account">All applications</option>{selectedJob?.track_id && <option value="track">This Career Track</option>}<option value="company">{selectedJob?.company || "This company"} only</option></select></label>}
+                      </div>
+                      <button className="button primary compact" disabled={busy || !answer.trim()} onClick={() => void submitInterventionAnswer()}>{busy ? "Saving..." : "Use answer & resume"}<ArrowRight size={15} /></button>
+                    </div>
+                  : selected.state === "needs_input" && <div className="input-needed"><AlertCircle size={17} /><div><b>Bluey needs you</b><p>{selectedIntervention?.detail || "Open the browser takeover to continue."}</p></div></div>}
                 <div className="download-row"><button disabled={busy || !selectedResume} onClick={() => void download("pdf")}><Download size={15} />PDF</button><button disabled={busy || !selectedResume} onClick={() => void download("docx")}><Download size={15} />DOCX</button></div>
               </section>
             </div>
-            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : "Approving counts this unique packet once. Retries do not double-charge."}</p><div>{selected.state === "needs_input" && <a className="button secondary" href={selectedSession?.takeover_url || `bluey-jobs://takeover?application_id=${encodeURIComponent(selected.id)}`}><MonitorUp size={16} />Take over browser</a>}{selected.state === "awaiting_review" && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve packet</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
+            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : "Approving counts this unique packet once. Retries do not double-charge."}</p><div>{selected.state === "needs_input" && !canAnswerIntervention && <a className="button secondary" href={selectedSession?.takeover_url || `bluey-jobs://takeover?application_id=${encodeURIComponent(selected.id)}`}><MonitorUp size={16} />Take over browser</a>}{selected.state === "awaiting_review" && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve packet</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
           </div>
         )}
       </Dialog>
@@ -181,6 +228,10 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
       </Dialog>
     </div>
   );
+}
+
+function normalizeCompanyKey(company: string): string {
+  return company.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
 function ReceiptView({ application, resume, evidence }: { application: JobApplication; resume?: ResumeVersion; evidence: ApplicationEvidence[] }) {

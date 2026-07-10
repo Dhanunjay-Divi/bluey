@@ -415,6 +415,31 @@ pub struct Intervention {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerMemory {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub key: String,
+    pub question: String,
+    pub value: String,
+    pub scope: String,
+    #[serde(default)]
+    pub scope_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub confirmed: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub last_used_at_ms: Option<i64>,
+    #[serde(default)]
+    pub use_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplicationEvidence {
     #[serde(default)]
     pub id: String,
@@ -530,6 +555,7 @@ pub struct JobsWorkspace {
     pub application_evidence: Vec<ApplicationEvidence>,
     pub browser_sessions: Vec<BrowserSession>,
     pub interventions: Vec<Intervention>,
+    pub answer_memory: Vec<AnswerMemory>,
     pub integrations: Vec<JobsIntegration>,
     pub application_identities: Vec<ApplicationIdentity>,
     pub mailbox_connections: Vec<MailboxConnection>,
@@ -2686,6 +2712,182 @@ pub fn save_intervention(
     })
 }
 
+pub fn normalize_answer_memory_key(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push(character);
+            pending_space = false;
+        } else {
+            pending_space = true;
+        }
+    }
+    normalized
+}
+
+pub fn list_answer_memory(pool: &DbPool, account_id: &str) -> Result<Vec<AnswerMemory>> {
+    list_payloads(
+        pool,
+        account_id,
+        "jobs_answer_memory",
+        "answer_json",
+        "updated_at_ms DESC",
+        "answer memory",
+    )
+}
+
+pub fn save_answer_memory(
+    pool: &DbPool,
+    account_id: &str,
+    answer: &AnswerMemory,
+) -> Result<AnswerMemory> {
+    let mut value = answer.clone();
+    value.question = value.question.trim().to_string();
+    value.value = value.value.trim().to_string();
+    value.scope = value.scope.trim().to_ascii_lowercase();
+    value.source = value.source.trim().to_ascii_lowercase();
+    value.key = normalize_answer_memory_key(if value.key.trim().is_empty() {
+        &value.question
+    } else {
+        &value.key
+    });
+    if value.question.is_empty() || value.key.is_empty() {
+        anyhow::bail!("enter the application question")
+    }
+    if value.value.is_empty() {
+        anyhow::bail!("enter the answer Bluey should remember")
+    }
+    if value.question.len() > 2_000 || value.value.len() > 10_000 {
+        anyhow::bail!("answer memory is too long")
+    }
+    if !matches!(value.scope.as_str(), "account" | "track" | "company") {
+        anyhow::bail!("invalid answer memory scope")
+    }
+    let scope_id = value
+        .scope_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if value.scope == "account" {
+        value.scope_id = None;
+    } else if scope_id.is_empty() {
+        anyhow::bail!("choose where this answer should be reused")
+    } else {
+        value.scope_id = Some(scope_id);
+    }
+    if value.scope == "track"
+        && !list_tracks(pool, account_id)?
+            .iter()
+            .any(|track| Some(track.id.as_str()) == value.scope_id.as_deref())
+    {
+        anyhow::bail!("career track not found")
+    }
+    if value.source.is_empty() {
+        value.source = "settings".to_string();
+    }
+    value.confirmed = true;
+
+    let existing = list_answer_memory(pool, account_id)?
+        .into_iter()
+        .find(|item| {
+            item.scope == value.scope
+                && item.scope_id.as_deref().unwrap_or_default()
+                    == value.scope_id.as_deref().unwrap_or_default()
+                && item.key == value.key
+        });
+    if let Some(existing) = existing {
+        value.id = existing.id;
+        if value.created_at_ms == 0 {
+            value.created_at_ms = existing.created_at_ms;
+        }
+        if value.last_used_at_ms.is_none() {
+            value.last_used_at_ms = existing.last_used_at_ms;
+        }
+        value.use_count = value.use_count.max(existing.use_count);
+    }
+    if value.id.is_empty() {
+        value.id = uuid::Uuid::new_v4().to_string();
+    }
+    let now = now_ms();
+    if value.created_at_ms == 0 {
+        value.created_at_ms = now;
+    }
+    value.updated_at_ms = now;
+    value.use_count = value.use_count.max(0);
+    let scope_id = value.scope_id.as_deref().unwrap_or_default().to_string();
+    let question_hash = private_lookup_hash(
+        &format!("jobs-answer-memory:{account_id}:{}:{scope_id}", value.scope),
+        &value.key,
+    )?;
+    let payload = to_json(&value, "answer memory")?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            pool.get()?.execute(
+                "INSERT INTO jobs_answer_memory (
+                    id, account_id, scope, scope_id, question_hash, answer_json,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET scope = excluded.scope,
+                    scope_id = excluded.scope_id, question_hash = excluded.question_hash,
+                    answer_json = excluded.answer_json, updated_at_ms = excluded.updated_at_ms
+                 WHERE jobs_answer_memory.account_id = excluded.account_id",
+                params![
+                    value.id,
+                    account_id,
+                    value.scope,
+                    scope_id,
+                    question_hash,
+                    payload,
+                    value.created_at_ms,
+                    value.updated_at_ms,
+                ],
+            )?;
+            Ok(value)
+        }
+        DbPool::Postgres(_) => {
+            pool.get_pg()?.execute(
+                "INSERT INTO jobs_answer_memory (
+                    id, account_id, scope, scope_id, question_hash, answer_json,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT(id) DO UPDATE SET scope = EXCLUDED.scope,
+                    scope_id = EXCLUDED.scope_id, question_hash = EXCLUDED.question_hash,
+                    answer_json = EXCLUDED.answer_json, updated_at_ms = EXCLUDED.updated_at_ms
+                 WHERE jobs_answer_memory.account_id = EXCLUDED.account_id",
+                &[
+                    &value.id,
+                    &account_id,
+                    &value.scope,
+                    &scope_id,
+                    &question_hash,
+                    &payload,
+                    &value.created_at_ms,
+                    &value.updated_at_ms,
+                ],
+            )?;
+            Ok(value)
+        }
+    })
+}
+
+pub fn delete_answer_memory(pool: &DbPool, account_id: &str, answer_id: &str) -> Result<bool> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
+            "DELETE FROM jobs_answer_memory WHERE account_id = ?1 AND id = ?2",
+            params![account_id, answer_id],
+        )? > 0),
+        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
+            "DELETE FROM jobs_answer_memory WHERE account_id = $1 AND id = $2",
+            &[&account_id, &answer_id],
+        )? > 0),
+    })
+}
+
 fn contains_authentication_secret(value: &Value) -> bool {
     match value {
         Value::Object(items) => items.iter().any(|(key, nested)| {
@@ -3825,6 +4027,7 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
         application_evidence: list_application_evidence(pool, account_id, None)?,
         browser_sessions: list_browser_sessions(pool, account_id)?,
         interventions: list_interventions(pool, account_id)?,
+        answer_memory: list_answer_memory(pool, account_id)?,
         integrations: list_integrations(pool, account_id)?,
         application_identities: list_application_identities(pool, account_id)?,
         mailbox_connections: list_mailbox_connections(pool, account_id)?,
@@ -4503,5 +4706,60 @@ mod tests {
                 .and_then(Value::as_str),
             Some("applications@example.com")
         );
+    }
+
+    #[test]
+    fn answer_memory_is_encrypted_scoped_and_idempotent() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-other', 'other@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
+        let answer = AnswerMemory {
+            id: String::new(),
+            key: String::new(),
+            question: "Why are you interested in this role?".to_string(),
+            value: "I enjoy building reliable customer workflows.".to_string(),
+            scope: "account".to_string(),
+            scope_id: None,
+            confirmed: true,
+            source: "settings".to_string(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_used_at_ms: None,
+            use_count: 0,
+        };
+        let first = save_answer_memory(&pool, "acct-jobs", &answer).unwrap();
+        let second = save_answer_memory(
+            &pool,
+            "acct-jobs",
+            &AnswerMemory {
+                value: "I build dependable products for customers.".to_string(),
+                ..answer
+            },
+        )
+        .unwrap();
+        assert_eq!(first.id, second.id);
+        let saved = list_answer_memory(&pool, "acct-jobs").unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].value, "I build dependable products for customers.");
+        assert!(list_answer_memory(&pool, "acct-other").unwrap().is_empty());
+
+        let raw: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT answer_json FROM jobs_answer_memory WHERE id = ?1",
+                params![first.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!raw.contains("dependable products"));
+        assert!(delete_answer_memory(&pool, "acct-jobs", &second.id).unwrap());
+        assert!(list_answer_memory(&pool, "acct-jobs").unwrap().is_empty());
     }
 }

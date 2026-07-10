@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   ArrowRight,
   Bot,
+  BrainCircuit,
   CalendarDays,
   Check,
   ChevronRight,
@@ -21,6 +22,7 @@ import {
   UserRound,
 } from "lucide-react";
 import type {
+  AnswerMemory,
   ApplicationIdentity,
   CareerProfile,
   CareerTrack,
@@ -46,6 +48,8 @@ interface Props {
   onDeleteIdentity(identity: ApplicationIdentity): Promise<void>;
   onRequestMailbox(connection: MailboxConnection): Promise<MailboxConnection>;
   onDeleteMailbox(connection: MailboxConnection): Promise<void>;
+  onSaveAnswerMemory(answer: AnswerMemory): Promise<AnswerMemory>;
+  onDeleteAnswerMemory(answer: AnswerMemory): Promise<void>;
 }
 
 export function SettingsView({
@@ -62,6 +66,8 @@ export function SettingsView({
   onDeleteIdentity,
   onRequestMailbox,
   onDeleteMailbox,
+  onSaveAnswerMemory,
+  onDeleteAnswerMemory,
 }: Props) {
   const [preferences, setPreferences] = useState(workspace.preferences);
   const [profile, setProfile] = useState(workspace.profile);
@@ -75,6 +81,9 @@ export function SettingsView({
   const [deletingIdentity, setDeletingIdentity] = useState<ApplicationIdentity | null>(null);
   const [mailboxOpen, setMailboxOpen] = useState(false);
   const [disconnectingMailbox, setDisconnectingMailbox] = useState<MailboxConnection | null>(null);
+  const [answerOpen, setAnswerOpen] = useState(false);
+  const [editingAnswer, setEditingAnswer] = useState<AnswerMemory | null>(null);
+  const [deletingAnswer, setDeletingAnswer] = useState<AnswerMemory | null>(null);
   const [saved, setSaved] = useState("");
   const [localError, setLocalError] = useState("");
 
@@ -178,6 +187,27 @@ export function SettingsView({
         </section>
       </div>
 
+      <section className="settings-section" id="answer-memory">
+        <div className="settings-section-title">
+          <span><BrainCircuit /></span>
+          <div>
+            <p>ANSWER MEMORY</p>
+            <h2>Answer once, reuse it carefully</h2>
+            <small>Company answers win first, then Career Track answers, then account answers.</small>
+          </div>
+          <button className="button secondary compact" onClick={() => { setEditingAnswer(null); setAnswerOpen(true); }}><Plus size={15} />Add answer</button>
+        </div>
+        <div className="answer-memory-list">
+          {workspace.answer_memory.map((item) => <div key={item.id}>
+            <span className="answer-memory-mark"><MessageCircleQuestion size={17} /></span>
+            <div><b>{item.question}</b><p>{item.value}</p><small>{answerScopeLabel(item, workspace)}{item.use_count > 0 ? ` · Used ${item.use_count} time${item.use_count === 1 ? "" : "s"}` : ""}</small></div>
+            <button className="icon-button" title="Edit saved answer" aria-label={`Edit ${item.question}`} onClick={() => { setEditingAnswer(item); setAnswerOpen(true); }}><Pencil size={15} /></button>
+            <button className="icon-button danger" title="Remove saved answer" aria-label={`Remove ${item.question}`} onClick={() => setDeletingAnswer(item)}><Trash2 size={15} /></button>
+          </div>)}
+          {workspace.answer_memory.length === 0 && <div className="answer-memory-empty"><BrainCircuit size={20} /><span><b>No saved answers yet</b><p>When an application pauses on a question, choose Remember this answer to add it here.</p></span></div>}
+        </div>
+      </section>
+
       <section className="settings-section">
         <div className="settings-section-title"><span><Mail /></span><div><p>INBOXES & CALENDARS</p><h2>Keep every application timeline current</h2><small>One inbox connection includes its aliases. Connect another slot only for a separate Gmail or Outlook mailbox.</small></div><button className="button secondary compact" onClick={() => setMailboxOpen(true)} disabled={workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length >= workspace.entitlement.connected_inbox_limit}><Plus size={15} />Connect inbox</button></div>
         <div className="connection-usage"><span><b>{workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length}</b> of {workspace.entitlement.connected_inbox_limit} inbox connections</span><span>Extra inbox slot: {money(workspace.entitlement.additional_inbox_cents)}/month</span></div>
@@ -231,6 +261,17 @@ export function SettingsView({
           setMailboxOpen(false);
         }}
       />
+      <AnswerMemoryDialog
+        open={answerOpen}
+        answer={editingAnswer}
+        tracks={workspace.tracks}
+        onClose={() => setAnswerOpen(false)}
+        onSave={async (answer) => {
+          setLocalError("");
+          await onSaveAnswerMemory(answer);
+          setAnswerOpen(false);
+        }}
+      />
       <TrackDialog
         open={trackOpen}
         track={editingTrack}
@@ -250,8 +291,74 @@ export function SettingsView({
       <ConfirmDialog open={Boolean(deletingIdentity)} title={`Remove ${deletingIdentity?.email || "application email"}?`} description="Bluey will keep existing application receipts, but this address will no longer be available for new Career Tracks." confirmLabel="Remove email" tone="danger" onClose={() => setDeletingIdentity(null)} onConfirm={() => { const identity = deletingIdentity; setDeletingIdentity(null); if (identity) void onDeleteIdentity(identity).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(disconnectingMailbox)} title={`${disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} ${disconnectingMailbox?.account_label || "inbox"}?`} description="Bluey will stop reading new application updates from this inbox. Existing application history stays in Jobs." confirmLabel={disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} tone="danger" onClose={() => setDisconnectingMailbox(null)} onConfirm={() => { const connection = disconnectingMailbox; setDisconnectingMailbox(null); if (connection) void onDeleteMailbox(connection).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingTrack)} title={`Delete ${deletingTrack?.name || "Career Track"}?`} description="This stops discovery for the track. Existing matches and applications stay in your history." confirmLabel="Delete track" tone="danger" onClose={() => setDeletingTrack(null)} onConfirm={() => { const track = deletingTrack; setDeletingTrack(null); if (track) void onDeleteTrack(track); }} />
+      <ConfirmDialog open={Boolean(deletingAnswer)} title="Remove this saved answer?" description="Bluey will ask again the next time this question appears. Existing application receipts stay unchanged." confirmLabel="Remove answer" tone="danger" onClose={() => setDeletingAnswer(null)} onConfirm={() => { const answer = deletingAnswer; setDeletingAnswer(null); if (answer) void onDeleteAnswerMemory(answer).catch(showError(setLocalError)); }} />
     </div>
   );
+}
+
+function AnswerMemoryDialog({ open, answer, tracks, onClose, onSave }: { open: boolean; answer: AnswerMemory | null; tracks: CareerTrack[]; onClose(): void; onSave(answer: AnswerMemory): Promise<void> }) {
+  const [value, setValue] = useState<AnswerMemory>(() => emptyAnswerMemory());
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (open) setValue(answer ? { ...answer } : emptyAnswerMemory());
+  }, [open, answer]);
+
+  const scopeId = value.scope === "track" ? value.scope_id || tracks[0]?.id || "" : value.scope_id || "";
+  const save = async () => {
+    if (!value.question.trim() || !value.value.trim()) return;
+    setSaving(true);
+    try {
+      await onSave({
+        ...value,
+        key: normalizeAnswerKey(value.question),
+        scope_id: value.scope === "account" ? undefined : value.scope === "company" ? normalizeCompanyKey(scopeId) : scopeId,
+        confirmed: true,
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <Dialog open={open} title={answer ? "Edit saved answer" : "Add saved answer"} description="Bluey reuses the closest confirmed answer when the same application question appears." onClose={onClose}>
+    <div className="answer-memory-form">
+      <label><span>Application question</span><input value={value.question} onChange={(event) => setValue({ ...value, question: event.target.value })} placeholder="Why are you interested in this role?" /></label>
+      <label><span>Answer</span><textarea rows={4} value={value.value} onChange={(event) => setValue({ ...value, value: event.target.value })} placeholder="Enter the answer Bluey should use" /></label>
+      <label><span>Reuse for</span><select value={value.scope} onChange={(event) => setValue({ ...value, scope: event.target.value as AnswerMemory["scope"], scope_id: undefined })}><option value="account">All applications</option>{tracks.length > 0 && <option value="track">One Career Track</option>}<option value="company">One company</option></select></label>
+      {value.scope === "track" && <label><span>Career Track</span><select value={scopeId} onChange={(event) => setValue({ ...value, scope_id: event.target.value })}>{tracks.map((track) => <option value={track.id} key={track.id}>{track.name}</option>)}</select></label>}
+      {value.scope === "company" && <label><span>Company</span><input value={scopeId.replace(/-/g, " ")} onChange={(event) => setValue({ ...value, scope_id: event.target.value })} placeholder="Company name" /></label>}
+    </div>
+    <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !value.question.trim() || !value.value.trim() || (value.scope !== "account" && !scopeId)} onClick={() => void save()}>{saving ? "Saving..." : "Save answer"}</button></div>
+  </Dialog>;
+}
+
+function emptyAnswerMemory(): AnswerMemory {
+  return {
+    id: "",
+    key: "",
+    question: "",
+    value: "",
+    scope: "account",
+    confirmed: true,
+    source: "settings",
+    created_at_ms: 0,
+    updated_at_ms: 0,
+    use_count: 0,
+  };
+}
+
+function answerScopeLabel(answer: AnswerMemory, workspace: JobsWorkspace): string {
+  if (answer.scope === "company") return `Company · ${titleCase((answer.scope_id || "Company").replace(/-/g, " "))}`;
+  if (answer.scope === "track") return `Career Track · ${workspace.tracks.find((track) => track.id === answer.scope_id)?.name || "Saved track"}`;
+  return "All applications";
+}
+
+function normalizeAnswerKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function normalizeCompanyKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
 function ApplicationEmailDialog({ open, onClose, onSave }: { open: boolean; onClose(): void; onSave(identity: ApplicationIdentity): Promise<void> }) {

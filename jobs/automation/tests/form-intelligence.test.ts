@@ -56,6 +56,14 @@ describe("application form intelligence", () => {
       .toBe("Company answer");
   });
 
+  it("accepts API-shaped answer memory without a worker-side rewrite", () => {
+    const entries: AnswerMemoryEntry[] = [
+      { id: "answer-1", key: "Why Acme?", value: "Saved company answer", scope: "company", scope_id: "acme", confirmed: true },
+    ];
+    expect(resolveMemory("why acme", entries, { trackId: "track-1", companyId: "acme", autoSubmit: false })?.value)
+      .toBe("Saved company answer");
+  });
+
   it("does not guess a required sensitive answer", () => {
     const plan = planApplicationForm(
       [{ id: "veteran", label: "Veteran status", type: "select", required: true, options: ["Yes", "No", "Decline"] }],

@@ -18,10 +18,10 @@ use crate::{
     api::AppState,
     auth::AuthedAccount,
     db::jobs::{
-        self, ApplicationEvidence, ApplicationIdentity, BrowserSession, CareerFact, CareerProfile,
-        CareerTrack, Intervention, JobApplication, JobPosting, JobPreferences, JobsEntitlement,
-        JobsIntegration, JobsWorkspace, MailboxConnection, PacketCommitResult, ResumeVersion,
-        RunEvent,
+        self, AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession, CareerFact,
+        CareerProfile, CareerTrack, Intervention, JobApplication, JobPosting, JobPreferences,
+        JobsEntitlement, JobsIntegration, JobsWorkspace, MailboxConnection, PacketCommitResult,
+        ResumeVersion, RunEvent,
     },
 };
 
@@ -75,6 +75,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/jobs/interventions/:intervention_id",
             patch(update_intervention),
+        )
+        .route(
+            "/api/jobs/answers",
+            get(answer_memory).post(save_answer_memory),
+        )
+        .route(
+            "/api/jobs/answers/:answer_id",
+            put(update_answer_memory).delete(delete_answer_memory),
         )
         .route(
             "/api/jobs/integrations",
@@ -557,6 +565,21 @@ pub struct ResolveInterventionRequest {
     pub status: String,
     #[serde(default)]
     pub action: String,
+    #[serde(default)]
+    pub answer: String,
+    #[serde(default)]
+    pub remember: bool,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub scope_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InterventionResolutionResult {
+    pub intervention: Intervention,
+    pub answer_memory: Option<AnswerMemory>,
+    pub application: Option<JobApplication>,
 }
 
 pub async fn update_intervention(
@@ -564,7 +587,7 @@ pub async fn update_intervention(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(intervention_id): Path<String>,
     Json(req): Json<ResolveInterventionRequest>,
-) -> Result<Json<Intervention>, ApiError> {
+) -> Result<Json<InterventionResolutionResult>, ApiError> {
     let intervention = jobs::list_interventions(&state.pool, &account.id)
         .map_err(internal)?
         .into_iter()
@@ -572,6 +595,7 @@ pub async fn update_intervention(
         .ok_or((StatusCode::NOT_FOUND, "Intervention not found.".to_string()))?;
     let mut updated = intervention;
     let action = req.action.trim().to_ascii_lowercase();
+    let mut remembered_answer = None;
     updated.status = req.status.trim().to_ascii_lowercase();
     if action == "approve_email_otp" {
         if updated.resolution_kind != "email_otp_approval" {
@@ -594,10 +618,127 @@ pub async fn update_intervention(
                 updated.metadata = serde_json::json!({ "approved_at_ms": approved_at_ms });
             }
         }
+    } else if action == "answer" {
+        if updated.resolution_kind != "answer"
+            || !matches!(
+                updated.kind.as_str(),
+                "unknown_question" | "missing_fact" | "sensitive_question"
+            )
+        {
+            return bad_request("This intervention is not waiting for an application answer.");
+        }
+        let answer = req.answer.trim();
+        if answer.is_empty() {
+            return bad_request("Enter the answer Bluey should use.");
+        }
+        if answer.len() > 10_000 {
+            return bad_request("That answer is too long.");
+        }
+        let answered_at_ms = jobs::now_ms();
+        let metadata = updated.metadata.as_object_mut().ok_or((
+            StatusCode::BAD_REQUEST,
+            "This intervention cannot be answered.".to_string(),
+        ))?;
+        metadata.insert("resolved_answer".to_string(), serde_json::json!(answer));
+        metadata.insert(
+            "answered_at_ms".to_string(),
+            serde_json::json!(answered_at_ms),
+        );
+        updated.status = "resolved".to_string();
+        if req.remember {
+            let memory = AnswerMemory {
+                id: String::new(),
+                key: String::new(),
+                question: updated.title.clone(),
+                value: answer.to_string(),
+                scope: if req.scope.trim().is_empty() {
+                    "account".to_string()
+                } else {
+                    req.scope.clone()
+                },
+                scope_id: req.scope_id.clone(),
+                confirmed: true,
+                source: "intervention".to_string(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                last_used_at_ms: None,
+                use_count: 0,
+            };
+            remembered_answer = Some(
+                jobs::save_answer_memory(&state.pool, &account.id, &memory)
+                    .map_err(domain_error)?,
+            );
+        }
     }
-    jobs::save_intervention(&state.pool, &account.id, &updated)
+    let resumed_application = if !action.is_empty()
+        && updated.resume_after_resolution
+        && matches!(updated.status.as_str(), "approved" | "resolved")
+    {
+        if let Some(application_id) = updated.application_id.as_deref() {
+            jobs::update_application(&state.pool, &account.id, application_id, "queued", None)
+                .map_err(domain_error)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let saved = jobs::save_intervention(&state.pool, &account.id, &updated).map_err(internal)?;
+    Ok(Json(InterventionResolutionResult {
+        intervention: saved,
+        answer_memory: remembered_answer,
+        application: resumed_application,
+    }))
+}
+
+pub async fn answer_memory(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<Vec<AnswerMemory>>, ApiError> {
+    jobs::list_answer_memory(&state.pool, &account.id)
         .map(Json)
         .map_err(internal)
+}
+
+pub async fn save_answer_memory(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(answer): Json<AnswerMemory>,
+) -> Result<Json<AnswerMemory>, ApiError> {
+    jobs::save_answer_memory(&state.pool, &account.id, &answer)
+        .map(Json)
+        .map_err(domain_error)
+}
+
+pub async fn update_answer_memory(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(answer_id): Path<String>,
+    Json(mut answer): Json<AnswerMemory>,
+) -> Result<Json<AnswerMemory>, ApiError> {
+    if !jobs::list_answer_memory(&state.pool, &account.id)
+        .map_err(internal)?
+        .iter()
+        .any(|item| item.id == answer_id)
+    {
+        return Err((StatusCode::NOT_FOUND, "Saved answer not found.".to_string()));
+    }
+    answer.id = answer_id;
+    jobs::save_answer_memory(&state.pool, &account.id, &answer)
+        .map(Json)
+        .map_err(domain_error)
+}
+
+pub async fn delete_answer_memory(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(answer_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if jobs::delete_answer_memory(&state.pool, &account.id, &answer_id).map_err(internal)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "Saved answer not found.".to_string()))
+    }
 }
 
 pub async fn integrations(
@@ -1010,6 +1151,11 @@ fn domain_error(error: anyhow::Error) -> ApiError {
         || message.contains("resume version")
         || message.contains("another job")
         || message.contains("submission confirmation")
+        || message.contains("answer memory")
+        || message.contains("application question")
+        || message.contains("answer Bluey should remember")
+        || message.contains("where this answer should be reused")
+        || message.contains("career track not found")
     {
         StatusCode::BAD_REQUEST
     } else {
