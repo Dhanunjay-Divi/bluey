@@ -960,6 +960,25 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_mailbox_connections_account
         ON jobs_mailbox_connections(account_id, status, updated_at_ms DESC);
     "#,
+    // 0021 - immutable evidence attached to each Jobs application.
+    //
+    // Resume artifacts, submission confirmations, provider email events, and
+    // interview calendar events share one tenant-scoped, idempotent ledger.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_application_evidence (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        application_id        TEXT NOT NULL REFERENCES jobs_applications(id) ON DELETE CASCADE,
+        kind                  TEXT NOT NULL,
+        provider_event_hash   TEXT NOT NULL,
+        evidence_json         TEXT NOT NULL,
+        occurred_at_ms        INTEGER NOT NULL,
+        created_at_ms         INTEGER NOT NULL,
+        UNIQUE(account_id, provider_event_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_application_evidence_application
+        ON jobs_application_evidence(account_id, application_id, occurred_at_ms DESC);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {

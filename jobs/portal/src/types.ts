@@ -99,6 +99,7 @@ export interface JobPreferences {
   excluded_titles: string[];
   daily_limit: number;
   apply_once_per_company: boolean;
+  max_posting_age_days: number;
   updated_at_ms: number;
 }
 
@@ -131,6 +132,9 @@ export interface JobPosting {
   match_score: number;
   matched_reasons: string[];
   missing_requirements: string[];
+  posted_at_ms?: number;
+  last_verified_at_ms?: number;
+  availability_status: "active" | "expired" | "unknown" | string;
   status: string;
   created_at_ms: number;
   updated_at_ms: number;
@@ -200,6 +204,22 @@ export interface Intervention {
   resolved_at_ms?: number;
 }
 
+export interface ApplicationEvidence {
+  id: string;
+  application_id: string;
+  kind: "resume" | "cover_letter" | "attachment" | "submission_confirmation" | "status_email" | "interview_event" | string;
+  label: string;
+  provider: string;
+  file_name: string;
+  media_type: string;
+  storage_key: string;
+  sha256: string;
+  resume_version_id?: string;
+  occurred_at_ms: number;
+  metadata: Record<string, unknown>;
+  created_at_ms: number;
+}
+
 export interface JobsIntegration {
   id: string;
   provider: string;
@@ -253,6 +273,7 @@ export interface JobsWorkspace {
   tracks: CareerTrack[];
   matches: JobPosting[];
   applications: JobApplication[];
+  application_evidence: ApplicationEvidence[];
   browser_sessions: BrowserSession[];
   interventions: Intervention[];
   integrations: JobsIntegration[];

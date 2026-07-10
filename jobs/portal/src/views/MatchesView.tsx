@@ -5,6 +5,7 @@ import {
   BriefcaseBusiness,
   Check,
   ChevronRight,
+  Clock3,
   ExternalLink,
   Filter,
   Link2,
@@ -16,7 +17,7 @@ import {
   Target,
 } from "lucide-react";
 import type { JobPosting, JobsWorkspace } from "../types";
-import { titleCase } from "../lib/format";
+import { relativeTime } from "../lib/format";
 import { Dialog } from "../components/Dialog";
 
 interface Props {
@@ -52,9 +53,11 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
       const matchesScore = job.match_score >= minimumScore;
       const matchesWorkplace = workplace === "all" || job.workplace.toLowerCase().includes(workplace);
       const matchesPacket = !onlyUnprepared || !preparedJobIds.has(job.id);
-      return matchesTrack && matchesQuery && matchesScore && matchesWorkplace && matchesPacket && job.status !== "skipped";
+      const isRecent = isRecentPosting(job, workspace.preferences.max_posting_age_days);
+      return matchesTrack && matchesQuery && matchesScore && matchesWorkplace && matchesPacket
+        && job.status !== "skipped" && job.availability_status === "active" && isRecent;
     });
-  }, [workspace.matches, activeTrack, query, minimumScore, workplace, onlyUnprepared, preparedJobIds]);
+  }, [workspace.matches, workspace.preferences.max_posting_age_days, activeTrack, query, minimumScore, workplace, onlyUnprepared, preparedJobIds]);
 
   const averageScore = filtered.length ? Math.round(filtered.reduce((sum, item) => sum + item.match_score, 0) / filtered.length) : 0;
   const activeFilterCount = Number(minimumScore > 0) + Number(workplace !== "all") + Number(onlyUnprepared);
@@ -73,7 +76,7 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
   return (
     <div className="view-shell matches-view">
       <section className="view-heading">
-        <div><p className="eyebrow">ACTIVE SEARCH</p><h1>Matches</h1><span>Ranked for your actual profile, locations, and Career Tracks.</span></div>
+        <div><p className="eyebrow">ACTIVE SEARCH</p><h1>Matches</h1><span>Recent openings ranked for your profile, locations, and Career Tracks.</span></div>
         <button className="button primary" onClick={() => setAddOpen(true)}><Link2 size={17} />Add a job link</button>
       </section>
 
@@ -101,10 +104,10 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
         {filtered.map((job) => (
           <button className="job-row" key={job.id} onClick={() => setSelected(job)}>
             <div className="company-mark">{job.company.slice(0, 2).toUpperCase()}</div>
-            <div className="job-main"><strong>{job.title}</strong><span>{job.company} · {titleCase(job.source.replace("_handoff", ""))}</span></div>
+            <div className="job-main"><strong>{job.title}</strong><span>{job.company} · {postingAgeLabel(job)}</span></div>
             <div className={`score score-${Math.floor(job.match_score / 10)}`}><b>{job.match_score}</b><span>%</span></div>
             <div className="job-location"><MapPin size={14} /><span>{job.location}<small>{job.workplace}</small></span></div>
-            <div className={`status-pill ${preparedJobIds.has(job.id) ? "prepared" : "new"}`}>{preparedJobIds.has(job.id) ? "Packet ready" : "New match"}</div>
+            <div className={`status-pill ${preparedJobIds.has(job.id) ? "prepared" : "new"}`}>{preparedJobIds.has(job.id) ? "Packet ready" : "Fresh"}</div>
             <ChevronRight size={18} />
           </button>
         ))}
@@ -116,7 +119,7 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
           <div className="job-detail">
             <div className="job-detail-summary">
               <div className="large-score"><b>{selected.match_score}</b><span>% match</span></div>
-              <div><span>{selected.workplace}</span><span>{selected.compensation || "Compensation not listed"}</span><a href={selected.canonical_url} target="_blank" rel="noreferrer">Original job<ExternalLink size={14} /></a></div>
+              <div><span>{selected.workplace}</span><span>{selected.compensation || "Compensation not listed"}</span><span className="freshness-note"><Clock3 size={14} />{postingAgeLabel(selected)}</span>{selected.last_verified_at_ms && <span>Checked {relativeTime(selected.last_verified_at_ms)}</span>}<a href={selected.canonical_url} target="_blank" rel="noreferrer">Original job<ExternalLink size={14} /></a></div>
             </div>
             <div className="detail-columns">
               <section><h3>Why it matched</h3><ul className="check-list">{selected.matched_reasons.map((reason) => <li key={reason}><Check size={15} />{reason}</li>)}</ul>{selected.missing_requirements.length > 0 && <><h3>Check before applying</h3><ul className="watch-list">{selected.missing_requirements.map((reason) => <li key={reason}>{reason}</li>)}</ul></>}</section>
@@ -136,6 +139,23 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
   );
 }
 
+const DAY_MS = 86_400_000;
+
+function isRecentPosting(job: JobPosting, maximumAgeDays: number): boolean {
+  const timestamp = job.posted_at_ms || job.created_at_ms;
+  if (!timestamp) return false;
+  return Date.now() - timestamp <= Math.max(1, maximumAgeDays) * DAY_MS;
+}
+
+function postingAgeLabel(job: JobPosting): string {
+  const timestamp = job.posted_at_ms || job.created_at_ms;
+  if (!timestamp) return "Recently found";
+  const ageDays = Math.max(0, Math.floor((Date.now() - timestamp) / DAY_MS));
+  if (ageDays === 0) return "Posted today";
+  if (ageDays === 1) return "Posted yesterday";
+  return `Posted ${ageDays} days ago`;
+}
+
 function AddJobDialog({ open, onClose, onSave }: { open: boolean; onClose(): void; onSave(job: JobPosting): Promise<void> }) {
   const [url, setUrl] = useState("");
   const [company, setCompany] = useState("");
@@ -151,7 +171,9 @@ function AddJobDialog({ open, onClose, onSave }: { open: boolean; onClose(): voi
         id: "", canonical_key: "", source: "pasted_link", external_id: "", company, title,
         location, workplace: location.toLowerCase().includes("remote") ? "Remote" : "Unknown",
         canonical_url: url, description, compensation: "", track_id: "", match_score: 0,
-        matched_reasons: [], missing_requirements: [], status: "matched", created_at_ms: 0, updated_at_ms: 0,
+        matched_reasons: [], missing_requirements: [], posted_at_ms: Date.now(),
+        last_verified_at_ms: Date.now(), availability_status: "active", status: "matched",
+        created_at_ms: 0, updated_at_ms: 0,
       });
       setUrl(""); setCompany(""); setTitle(""); setLocation(""); setDescription("");
     } finally { setSaving(false); }

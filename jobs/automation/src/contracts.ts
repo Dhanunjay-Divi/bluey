@@ -116,6 +116,7 @@ export interface DiscoveryQuery {
   excludedTitles?: string[];
   sources?: PublicAtsSource[];
   pageSize?: number;
+  maxPostingAgeDays?: number;
   cursor?: string;
 }
 

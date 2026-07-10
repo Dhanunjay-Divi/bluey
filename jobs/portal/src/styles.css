@@ -107,6 +107,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .mobile-nav { display: none; }
 
 .view-shell { display: grid; gap: 22px; }
+.view-shell > * { min-width: 0; }
 .view-loading { min-height: 280px; display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--muted); font-size: 12px; }
 .view-loading svg { color: var(--accent); }
 .view-heading { min-height: 74px; display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; }
@@ -283,6 +284,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .download-row button:disabled { cursor: not-allowed; opacity: .45; }
 .receipt-view { padding: 18px 20px 22px; display: grid; gap: 16px; }
 .receipt-check { min-height: 56px; padding: 12px; display: flex; align-items: center; gap: 10px; border: 1px solid color-mix(in srgb, var(--green) 45%, var(--border)); border-radius: 7px; background: var(--green-soft); color: var(--green); }
+.receipt-check.warning { border-color: color-mix(in srgb, var(--amber) 45%, var(--border)); background: color-mix(in srgb, var(--amber) 8%, var(--surface)); color: var(--amber); }
 .receipt-check span { display: grid; gap: 3px; }
 .receipt-check b { color: var(--text); font-size: 12px; }
 .receipt-check small { color: var(--text-soft); font-size: 10px; }
@@ -292,6 +294,26 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .receipt-view dt { color: var(--muted); font-size: 10px; font-weight: 800; text-transform: uppercase; }
 .receipt-view dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--text-soft); font-size: 11px; }
 .receipt-empty { color: var(--amber); font-size: 11px; }
+.receipt-evidence { display: grid; gap: 10px; }
+.receipt-section-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; }
+.receipt-section-heading p { color: var(--muted); font-size: 9px; font-weight: 850; }
+.receipt-section-heading h3 { margin-top: 3px; font-size: 13px; }
+.receipt-section-heading > span { color: var(--muted); font-size: 10px; font-weight: 750; }
+.evidence-list { border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+.evidence-row { min-height: 58px; padding: 10px 11px; display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
+.evidence-row:last-child { border-bottom: 0; }
+.evidence-icon { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 6px; background: var(--surface-2); color: var(--text-soft); }
+.evidence-icon.resume { background: var(--accent-soft); color: var(--accent); }
+.evidence-icon.submission_confirmation { background: var(--green-soft); color: var(--green); }
+.evidence-icon.status_email, .evidence-icon.interview_event { background: color-mix(in srgb, var(--accent) 9%, var(--surface)); color: var(--accent); }
+.evidence-row > div { min-width: 0; display: grid; gap: 3px; }
+.evidence-row b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.evidence-row p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-soft); font-size: 10px; }
+.evidence-row time { color: var(--muted); font-size: 9px; white-space: nowrap; }
+.evidence-empty { min-height: 68px; padding: 12px; display: flex; align-items: center; gap: 10px; color: var(--amber); }
+.evidence-empty span { display: grid; gap: 3px; }
+.evidence-empty b { color: var(--text); font-size: 11px; }
+.evidence-empty p { color: var(--text-soft); font-size: 10px; }
 
 .profile-band { min-height: 104px; padding: 16px 18px; display: grid; grid-template-columns: minmax(280px, 1.2fr) auto minmax(240px, .7fr); align-items: center; gap: 24px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .profile-identity { display: flex; align-items: center; gap: 12px; }
@@ -684,6 +706,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .dialog-actions.spread { align-items: stretch; flex-direction: column; }
   .dialog-actions.spread > div { justify-content: flex-end; }
   .receipt-view dl > div { grid-template-columns: 1fr; gap: 4px; }
+  .receipt-section-heading { align-items: start; flex-direction: column; gap: 5px; }
+  .evidence-row { grid-template-columns: 30px minmax(0, 1fr); }
+  .evidence-row time { grid-column: 2; }
   .form-grid.two { grid-template-columns: 1fr; }
   .profile-band { padding: 13px; }
   .resume-paper { min-height: 650px; padding: 28px 24px; }

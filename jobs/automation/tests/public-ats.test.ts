@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { PublicAtsDiscoveryProvider, type FetchResponse, type JobsFetch } from "../src/index.js";
+import { isRecentJob, parsePostedAt, PublicAtsDiscoveryProvider, type FetchResponse, type JobsFetch } from "../src/index.js";
 
 function response(payload: unknown, status = 200): FetchResponse {
   return {
@@ -20,6 +20,7 @@ describe("public ATS discovery", () => {
           absolute_url: "https://boards.greenhouse.io/acme/jobs/10?gh_src=test",
           location: { name: "New York, NY" },
           content: "<p>Build reliable systems &amp; tools.</p>",
+          updated_at: new Date().toISOString(),
           departments: [{ name: "Engineering" }],
         }] });
       }
@@ -29,6 +30,7 @@ describe("public ATS discovery", () => {
         hostedUrl: "https://boards.greenhouse.io/acme/jobs/10",
         categories: { location: "New York, NY", department: "Engineering" },
         descriptionPlain: "Duplicate feed entry",
+        createdAt: Date.now(),
       }]);
     });
     const provider = new PublicAtsDiscoveryProvider({ fetch: fetcher, sleep: async () => undefined });
@@ -117,6 +119,7 @@ describe("public ATS discovery", () => {
         title: "Engineer",
         absolute_url: "https://boards.greenhouse.io/acme/jobs/1",
         location: { name: "Remote" },
+        updated_at: new Date().toISOString(),
       }] }),
     });
     const page = await provider.search({
@@ -138,6 +141,7 @@ describe("public ATS discovery", () => {
           text: "Engineer",
           hostedUrl: "https://jobs.lever.co/atlas/lever-1",
           categories: { location: "Remote" },
+          createdAt: Date.now(),
         }]));
     const provider = new PublicAtsDiscoveryProvider({ fetch: fetcher, maxAttempts: 1 });
     const page = await provider.search({
@@ -163,5 +167,31 @@ describe("public ATS discovery", () => {
       sources: [{ kind: "greenhouse", boardToken: "acme" }],
     });
     expect(page.jobs).toEqual([]);
+  });
+
+  it("keeps recent postings and skips old or undated listings", async () => {
+    const provider = new PublicAtsDiscoveryProvider({
+      fetch: async () => response({ jobs: [
+        { id: "recent", title: "Engineer", absolute_url: "https://boards.greenhouse.io/acme/jobs/recent", updated_at: "3 days ago" },
+        { id: "old", title: "Engineer", absolute_url: "https://boards.greenhouse.io/acme/jobs/old", updated_at: "45 days ago" },
+        { id: "undated", title: "Engineer", absolute_url: "https://boards.greenhouse.io/acme/jobs/undated" },
+      ] }),
+    });
+    const page = await provider.search({
+      roles: [], locations: [], remotePreference: "any", excludedCompanies: [], maxPostingAgeDays: 14,
+      sources: [{ kind: "greenhouse", boardToken: "acme", company: "Acme" }],
+    });
+    expect(page.jobs.map((job) => job.externalId)).toEqual(["recent"]);
+    expect(page.warnings?.[0]).toContain("2 old or undated jobs were skipped");
+  });
+
+  it("parses ATS relative dates against a stable clock", () => {
+    const now = new Date("2026-07-10T12:00:00.000Z");
+    expect(parsePostedAt("Posted Today", now)?.toISOString()).toBe(now.toISOString());
+    expect(parsePostedAt("2 weeks ago", now)?.toISOString()).toBe("2026-06-26T12:00:00.000Z");
+    expect(isRecentJob({
+      externalId: "job", canonicalUrl: "https://example.com/job", company: "Acme", title: "Engineer",
+      location: "Remote", workplace: "remote", description: "", source: "greenhouse", postedAt: "13 days ago",
+    }, 14, now)).toBe(true);
   });
 });

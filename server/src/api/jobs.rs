@@ -18,8 +18,8 @@ use crate::{
     api::AppState,
     auth::AuthedAccount,
     db::jobs::{
-        self, ApplicationIdentity, BrowserSession, CareerFact, CareerProfile, CareerTrack,
-        Intervention, JobApplication, JobPosting, JobPreferences, JobsEntitlement,
+        self, ApplicationEvidence, ApplicationIdentity, BrowserSession, CareerFact, CareerProfile,
+        CareerTrack, Intervention, JobApplication, JobPosting, JobPreferences, JobsEntitlement,
         JobsIntegration, JobsWorkspace, MailboxConnection, PacketCommitResult, ResumeVersion,
         RunEvent,
     },
@@ -55,6 +55,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/jobs/applications/:application_id/commit",
             post(commit_application_packet),
+        )
+        .route(
+            "/api/jobs/applications/:application_id/evidence",
+            get(application_evidence).post(save_application_evidence),
         )
         .route(
             "/api/jobs/resume-versions/:resume_version_id",
@@ -414,6 +418,38 @@ pub async fn update_application(
     .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))
 }
 
+pub async fn application_evidence(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(application_id): Path<String>,
+) -> Result<Json<Vec<ApplicationEvidence>>, ApiError> {
+    if jobs::get_application(&state.pool, &account.id, &application_id)
+        .map_err(internal)?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, "Application not found.".to_string()));
+    }
+    jobs::list_application_evidence(&state.pool, &account.id, Some(&application_id))
+        .map(Json)
+        .map_err(internal)
+}
+
+pub async fn save_application_evidence(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(application_id): Path<String>,
+    Json(mut evidence): Json<ApplicationEvidence>,
+) -> Result<Json<ApplicationEvidence>, ApiError> {
+    evidence.id.clear();
+    evidence.application_id = application_id;
+    evidence.kind = evidence.kind.trim().to_ascii_lowercase();
+    evidence.provider = evidence.provider.trim().to_ascii_lowercase();
+    evidence.created_at_ms = 0;
+    jobs::save_application_evidence(&state.pool, &account.id, &evidence)
+        .map(Json)
+        .map_err(domain_error)
+}
+
 pub async fn commit_application_packet(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -608,8 +644,12 @@ pub async fn update_application_identity(
 ) -> Result<Json<ApplicationIdentity>, ApiError> {
     let mut existing = jobs::get_application_identity(&state.pool, &account.id, &identity_id)
         .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Application email not found.".to_string()))?;
-    if jobs::normalize_application_email(&requested.email).map_err(domain_error)? != existing.email {
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Application email not found.".to_string(),
+        ))?;
+    if jobs::normalize_application_email(&requested.email).map_err(domain_error)? != existing.email
+    {
         return bad_request("Add a new application email instead of changing this address.");
     }
     existing.label = requested.label.trim().chars().take(60).collect();
@@ -645,7 +685,10 @@ pub async fn resend_application_identity(
 ) -> Result<Json<ApplicationIdentity>, ApiError> {
     let identity = jobs::get_application_identity(&state.pool, &account.id, &identity_id)
         .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Application email not found.".to_string()))?;
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Application email not found.".to_string(),
+        ))?;
     send_identity_verification(&state, &account.id, &identity).await?;
     Ok(Json(identity))
 }
@@ -705,7 +748,10 @@ pub async fn remove_application_identity(
     if !jobs::delete_application_identity(&state.pool, &account.id, &identity_id)
         .map_err(domain_error)?
     {
-        return Err((StatusCode::NOT_FOUND, "Application email not found.".to_string()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Application email not found.".to_string(),
+        ));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -729,14 +775,9 @@ pub async fn request_mailbox_connection(
     connection.created_at_ms = 0;
     connection.updated_at_ms = 0;
     let provider_subject = connection.account_label.clone();
-    jobs::save_mailbox_connection(
-        &state.pool,
-        &account.id,
-        &connection,
-        &provider_subject,
-    )
-    .map(Json)
-    .map_err(domain_error)
+    jobs::save_mailbox_connection(&state.pool, &account.id, &connection, &provider_subject)
+        .map(Json)
+        .map_err(domain_error)
 }
 
 pub async fn remove_mailbox_connection(
@@ -747,7 +788,10 @@ pub async fn remove_mailbox_connection(
     if !jobs::delete_mailbox_connection(&state.pool, &account.id, &connection_id)
         .map_err(internal)?
     {
-        return Err((StatusCode::NOT_FOUND, "Connected inbox not found.".to_string()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Connected inbox not found.".to_string(),
+        ));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -919,6 +963,12 @@ fn domain_error(error: anyhow::Error) -> ApiError {
     let message = error.to_string();
     let status = if message.contains("another Bluey Jobs account") {
         StatusCode::CONFLICT
+    } else if message.contains("days old")
+        || message.contains("no longer accepting")
+        || message.contains("still open before applying")
+        || message.contains("before marking this application submitted")
+    {
+        StatusCode::CONFLICT
     } else if message.contains("limit reached") {
         StatusCode::PAYMENT_REQUIRED
     } else if message.contains("not found") {
@@ -929,6 +979,12 @@ fn domain_error(error: anyhow::Error) -> ApiError {
         || message.contains("complete email")
         || message.contains("Gmail or Outlook")
         || message.contains("wait a minute")
+        || message.contains("application evidence")
+        || message.contains("evidence needs")
+        || message.contains("resume evidence")
+        || message.contains("resume version")
+        || message.contains("another job")
+        || message.contains("submission confirmation")
     {
         StatusCode::BAD_REQUEST
     } else {

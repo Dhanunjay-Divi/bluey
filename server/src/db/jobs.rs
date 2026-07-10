@@ -225,6 +225,8 @@ pub struct JobPreferences {
     pub daily_limit: i64,
     #[serde(default)]
     pub apply_once_per_company: bool,
+    #[serde(default = "default_max_posting_age_days")]
+    pub max_posting_age_days: i64,
     #[serde(default)]
     pub updated_at_ms: i64,
 }
@@ -243,6 +245,7 @@ impl Default for JobPreferences {
             excluded_titles: Vec::new(),
             daily_limit: default_daily_limit(),
             apply_once_per_company: true,
+            max_posting_age_days: default_max_posting_age_days(),
             updated_at_ms: 0,
         }
     }
@@ -300,6 +303,12 @@ pub struct JobPosting {
     pub matched_reasons: Vec<String>,
     #[serde(default)]
     pub missing_requirements: Vec<String>,
+    #[serde(default)]
+    pub posted_at_ms: Option<i64>,
+    #[serde(default)]
+    pub last_verified_at_ms: Option<i64>,
+    #[serde(default = "default_active_availability")]
+    pub availability_status: String,
     #[serde(default = "default_match_status")]
     pub status: String,
     #[serde(default)]
@@ -394,6 +403,34 @@ pub struct Intervention {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicationEvidence {
+    #[serde(default)]
+    pub id: String,
+    pub application_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub media_type: String,
+    #[serde(default)]
+    pub storage_key: String,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub resume_version_id: Option<String>,
+    #[serde(default)]
+    pub occurred_at_ms: i64,
+    #[serde(default)]
+    pub metadata: Value,
+    #[serde(default)]
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsIntegration {
     #[serde(default)]
     pub id: String,
@@ -478,6 +515,7 @@ pub struct JobsWorkspace {
     pub tracks: Vec<CareerTrack>,
     pub matches: Vec<JobPosting>,
     pub applications: Vec<JobApplication>,
+    pub application_evidence: Vec<ApplicationEvidence>,
     pub browser_sessions: Vec<BrowserSession>,
     pub interventions: Vec<Intervention>,
     pub integrations: Vec<JobsIntegration>,
@@ -511,6 +549,10 @@ fn default_daily_limit() -> i64 {
     10
 }
 
+fn default_max_posting_age_days() -> i64 {
+    14
+}
+
 fn default_location_policy() -> String {
     "ask".to_string()
 }
@@ -533,6 +575,10 @@ fn default_true() -> bool {
 
 fn default_match_status() -> String {
     "matched".to_string()
+}
+
+fn default_active_availability() -> String {
+    "active".to_string()
 }
 
 fn default_application_state() -> String {
@@ -1043,6 +1089,7 @@ pub fn save_preferences(
 ) -> Result<JobPreferences> {
     let mut value = preferences.clone();
     value.daily_limit = value.daily_limit.clamp(1, 50);
+    value.max_posting_age_days = value.max_posting_age_days.clamp(1, 60);
     value.updated_at_ms = now_ms();
     let payload = to_json(&value, "Jobs preferences")?;
     crate::db::run_blocking_db(|| match pool {
@@ -1251,7 +1298,28 @@ pub fn upsert_posting(
     } else {
         value.status.trim().to_lowercase()
     };
+    value.availability_status = if value.availability_status.trim().is_empty() {
+        default_active_availability()
+    } else {
+        value.availability_status.trim().to_lowercase()
+    };
+    if !matches!(
+        value.availability_status.as_str(),
+        "active" | "expired" | "unknown"
+    ) {
+        anyhow::bail!("invalid job availability status")
+    }
     value.canonical_key = canonical_job_key(&value);
+    if let Some(existing) = list_postings(pool, account_id)?
+        .into_iter()
+        .find(|item| item.canonical_key == value.canonical_key)
+    {
+        value.id = existing.id;
+        value.created_at_ms = existing.created_at_ms;
+        if value.posted_at_ms.is_none() {
+            value.posted_at_ms = existing.posted_at_ms;
+        }
+    }
     if value.match_score == 0 {
         let (score, reasons, missing) = score_posting(&value, profile, preferences);
         value.match_score = score;
@@ -1261,6 +1329,9 @@ pub fn upsert_posting(
     let now = now_ms();
     if value.created_at_ms == 0 {
         value.created_at_ms = now;
+    }
+    if value.availability_status == "active" && value.last_verified_at_ms.is_none() {
+        value.last_verified_at_ms = Some(now);
     }
     value.updated_at_ms = now;
     let payload = to_json(&value, "job posting")?;
@@ -1342,6 +1413,40 @@ pub fn upsert_posting(
             parse_json(row.get(0), "job posting")
         }
     })
+}
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+const LIVE_VERIFICATION_MAX_AGE_MS: i64 = DAY_MS;
+
+pub fn posting_age_days(posting: &JobPosting, at_ms: i64) -> i64 {
+    let published_or_first_seen = posting.posted_at_ms.unwrap_or(posting.created_at_ms);
+    at_ms.saturating_sub(published_or_first_seen).max(0) / DAY_MS
+}
+
+fn ensure_posting_is_eligible(
+    posting: &JobPosting,
+    preferences: &JobPreferences,
+    require_live_verification: bool,
+) -> Result<()> {
+    if posting.availability_status != "active" {
+        anyhow::bail!("this job is no longer accepting applications")
+    }
+    let now = now_ms();
+    let age_days = posting_age_days(posting, now);
+    if age_days > preferences.max_posting_age_days {
+        anyhow::bail!(
+            "this job is {age_days} days old; your Jobs setting allows up to {} days",
+            preferences.max_posting_age_days
+        )
+    }
+    if require_live_verification
+        && posting
+            .last_verified_at_ms
+            .is_none_or(|verified_at| verified_at < now - LIVE_VERIFICATION_MAX_AGE_MS)
+    {
+        anyhow::bail!("Bluey needs to confirm this job is still open before applying")
+    }
+    Ok(())
 }
 
 fn score_posting(
@@ -1528,6 +1633,8 @@ pub fn prepare_application(
     let profile = get_profile(pool, account_id, "")?;
     let posting =
         get_posting(pool, account_id, job_id)?.ok_or_else(|| anyhow::anyhow!("job not found"))?;
+    let preferences = get_preferences(pool, account_id)?;
+    ensure_posting_is_eligible(&posting, &preferences, false)?;
     let login_email = if profile.email.trim().is_empty() {
         account_login_email(pool, account_id)?
     } else {
@@ -1544,7 +1651,9 @@ pub fn prepare_application(
         .and_then(|identity_id| identities.iter().find(|item| item.id == identity_id))
         .or_else(|| identities.iter().find(|item| item.is_default))
         .filter(|item| item.verification_status == "verified")
-        .ok_or_else(|| anyhow::anyhow!("verify an application email before preparing this packet"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("verify an application email before preparing this packet")
+        })?;
     let facts = list_facts(pool, account_id)?;
     let approved_fact_ids: Vec<String> = facts
         .iter()
@@ -1935,6 +2044,16 @@ pub fn update_application(
         return Ok(None);
     };
     validate_application_transition(&application.state, state)?;
+    if matches!(state, "queued" | "running") {
+        let posting = get_posting(pool, account_id, &application.job_id)?
+            .ok_or_else(|| anyhow::anyhow!("job not found"))?;
+        ensure_posting_is_eligible(&posting, &get_preferences(pool, account_id)?, true)?;
+    }
+    if state == "submitted"
+        && !application_submission_evidence_complete(pool, account_id, &application)?
+    {
+        anyhow::bail!("attach the exact resume used and submission confirmation before marking this application submitted")
+    }
     application.state = state.to_string();
     if let Some(mode) = submission_mode {
         if !matches!(mode, "review_first" | "auto_submit") {
@@ -2497,6 +2616,240 @@ pub fn save_intervention(
     })
 }
 
+pub fn list_application_evidence(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: Option<&str>,
+) -> Result<Vec<ApplicationEvidence>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let raws = if let Some(application_id) = application_id {
+                let mut stmt = conn.prepare(
+                    "SELECT evidence_json FROM jobs_application_evidence
+                      WHERE account_id = ?1 AND application_id = ?2
+                      ORDER BY occurred_at_ms DESC, created_at_ms DESC",
+                )?;
+                let values = stmt
+                    .query_map(params![account_id, application_id], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                values
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT evidence_json FROM jobs_application_evidence
+                      WHERE account_id = ?1
+                      ORDER BY occurred_at_ms DESC, created_at_ms DESC",
+                )?;
+                let values = stmt
+                    .query_map(params![account_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                values
+            };
+            raws.into_iter()
+                .map(|raw| parse_json(raw, "application evidence"))
+                .collect()
+        }
+        DbPool::Postgres(_) => {
+            let rows = if let Some(application_id) = application_id {
+                pool.get_pg()?.query(
+                    "SELECT evidence_json FROM jobs_application_evidence
+                      WHERE account_id = $1 AND application_id = $2
+                      ORDER BY occurred_at_ms DESC, created_at_ms DESC",
+                    &[&account_id, &application_id],
+                )?
+            } else {
+                pool.get_pg()?.query(
+                    "SELECT evidence_json FROM jobs_application_evidence
+                      WHERE account_id = $1
+                      ORDER BY occurred_at_ms DESC, created_at_ms DESC",
+                    &[&account_id],
+                )?
+            };
+            rows.into_iter()
+                .map(|row| parse_json(row.get(0), "application evidence"))
+                .collect()
+        }
+    })
+}
+
+pub fn save_application_evidence(
+    pool: &DbPool,
+    account_id: &str,
+    evidence: &ApplicationEvidence,
+) -> Result<ApplicationEvidence> {
+    let application = get_application(pool, account_id, &evidence.application_id)?
+        .ok_or_else(|| anyhow::anyhow!("application not found"))?;
+    let mut value = evidence.clone();
+    if !matches!(
+        value.kind.as_str(),
+        "resume"
+            | "cover_letter"
+            | "attachment"
+            | "submission_confirmation"
+            | "status_email"
+            | "interview_event"
+    ) {
+        anyhow::bail!("invalid application evidence kind")
+    }
+    if value.id.is_empty() {
+        value.id = uuid::Uuid::new_v4().to_string();
+    }
+    if value.occurred_at_ms == 0 {
+        value.occurred_at_ms = now_ms();
+    }
+    if value.created_at_ms == 0 {
+        value.created_at_ms = now_ms();
+    }
+    if value.metadata.is_null() {
+        value.metadata = json!({});
+    }
+
+    let idempotency_source = match value.kind.as_str() {
+        "resume" => {
+            let resume_version_id = value
+                .resume_version_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("resume evidence needs a resume version"))?;
+            if application.resume_version_id.as_deref() != Some(resume_version_id) {
+                anyhow::bail!("resume evidence does not match this application's resume")
+            }
+            let resume = get_resume_version(pool, account_id, resume_version_id)?
+                .ok_or_else(|| anyhow::anyhow!("resume version not found"))?;
+            if resume.job_id != application.job_id {
+                anyhow::bail!("resume evidence belongs to another job")
+            }
+            validate_document_evidence(&value)?;
+            format!("{}:{}", resume_version_id, value.sha256)
+        }
+        "cover_letter" | "attachment" => {
+            validate_document_evidence(&value)?;
+            format!("{}:{}", value.storage_key, value.sha256)
+        }
+        "status_email" | "interview_event" => {
+            if value.provider.trim().is_empty() {
+                anyhow::bail!("provider evidence needs a provider")
+            }
+            let external_id = value
+                .metadata
+                .get("external_id")
+                .and_then(Value::as_str)
+                .filter(|item| !item.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("provider evidence needs an external event id"))?;
+            format!("{}:{}", value.provider, external_id)
+        }
+        "submission_confirmation" => {
+            let confirmation = value
+                .metadata
+                .get("confirmation")
+                .and_then(Value::as_str)
+                .unwrap_or(value.label.as_str())
+                .trim();
+            if confirmation.is_empty() {
+                anyhow::bail!("submission confirmation cannot be empty")
+            }
+            value
+                .metadata
+                .get("external_id")
+                .and_then(Value::as_str)
+                .unwrap_or(confirmation)
+                .to_string()
+        }
+        _ => unreachable!(),
+    };
+    let provider_event_hash = private_lookup_hash(
+        &format!("application-evidence:{}:{}", value.kind, value.provider),
+        &format!("{}:{idempotency_source}", value.application_id),
+    )?;
+    let payload = to_json(&value, "application evidence")?;
+
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.execute(
+                "INSERT INTO jobs_application_evidence (
+                    id, account_id, application_id, kind, provider_event_hash,
+                    evidence_json, occurred_at_ms, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(account_id, provider_event_hash) DO NOTHING",
+                params![
+                    value.id,
+                    account_id,
+                    value.application_id,
+                    value.kind,
+                    provider_event_hash,
+                    payload,
+                    value.occurred_at_ms,
+                    value.created_at_ms,
+                ],
+            )?;
+            let raw: String = conn.query_row(
+                "SELECT evidence_json FROM jobs_application_evidence
+                  WHERE account_id = ?1 AND provider_event_hash = ?2",
+                params![account_id, provider_event_hash],
+                |row| row.get(0),
+            )?;
+            parse_json(raw, "application evidence")
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.execute(
+                "INSERT INTO jobs_application_evidence (
+                    id, account_id, application_id, kind, provider_event_hash,
+                    evidence_json, occurred_at_ms, created_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT(account_id, provider_event_hash) DO NOTHING",
+                &[
+                    &value.id,
+                    &account_id,
+                    &value.application_id,
+                    &value.kind,
+                    &provider_event_hash,
+                    &payload,
+                    &value.occurred_at_ms,
+                    &value.created_at_ms,
+                ],
+            )?;
+            let row = conn.query_one(
+                "SELECT evidence_json FROM jobs_application_evidence
+                  WHERE account_id = $1 AND provider_event_hash = $2",
+                &[&account_id, &provider_event_hash],
+            )?;
+            parse_json(row.get(0), "application evidence")
+        }
+    })
+}
+
+fn validate_document_evidence(evidence: &ApplicationEvidence) -> Result<()> {
+    if evidence.file_name.trim().is_empty() || evidence.storage_key.trim().is_empty() {
+        anyhow::bail!("document evidence needs the attached file name and storage key")
+    }
+    if evidence.sha256.len() != 64 || !evidence.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("document evidence needs a SHA-256 checksum")
+    }
+    Ok(())
+}
+
+fn application_submission_evidence_complete(
+    pool: &DbPool,
+    account_id: &str,
+    application: &JobApplication,
+) -> Result<bool> {
+    let Some(resume_version_id) = application.resume_version_id.as_deref() else {
+        return Ok(false);
+    };
+    let evidence = list_application_evidence(pool, account_id, Some(&application.id))?;
+    let matching_resume = evidence.iter().any(|item| {
+        item.kind == "resume" && item.resume_version_id.as_deref() == Some(resume_version_id)
+    });
+    let confirmation = evidence
+        .iter()
+        .any(|item| item.kind == "submission_confirmation");
+    Ok(matching_resume && confirmation)
+}
+
 pub fn list_application_identities(
     pool: &DbPool,
     account_id: &str,
@@ -2534,11 +2887,7 @@ pub fn list_application_identities(
             )?
             .into_iter()
             .map(|row| {
-                parse_application_identity_row(
-                    row.get(0),
-                    row.get(1),
-                    row.get::<_, i64>(2) != 0,
-                )
+                parse_application_identity_row(row.get(0), row.get(1), row.get::<_, i64>(2) != 0)
             })
             .collect(),
     })
@@ -2586,11 +2935,7 @@ pub fn get_application_identity(
                 &[&account_id, &identity_id],
             )?
             .map(|row| {
-                parse_application_identity_row(
-                    row.get(0),
-                    row.get(1),
-                    row.get::<_, i64>(2) != 0,
-                )
+                parse_application_identity_row(row.get(0), row.get(1), row.get::<_, i64>(2) != 0)
             })
             .transpose(),
     })
@@ -2886,7 +3231,13 @@ pub fn save_identity_verification(
                     attempts = 0, expires_at_ms = EXCLUDED.expires_at_ms,
                     created_at_ms = EXCLUDED.created_at_ms
                  WHERE jobs_identity_verifications.account_id = EXCLUDED.account_id",
-                &[&identity_id, &account_id, &otp_hash, &expires_at, &created_at],
+                &[
+                    &identity_id,
+                    &account_id,
+                    &otp_hash,
+                    &expires_at,
+                    &created_at,
+                ],
             )?;
             Ok(identity)
         }
@@ -3042,10 +3393,7 @@ pub fn delete_identity_verification(
     })
 }
 
-pub fn list_mailbox_connections(
-    pool: &DbPool,
-    account_id: &str,
-) -> Result<Vec<MailboxConnection>> {
+pub fn list_mailbox_connections(pool: &DbPool, account_id: &str) -> Result<Vec<MailboxConnection>> {
     list_payloads(
         pool,
         account_id,
@@ -3098,7 +3446,10 @@ pub fn save_mailbox_connection(
     if !matches!(value.provider.as_str(), "gmail" | "outlook") {
         anyhow::bail!("choose Gmail or Outlook")
     }
-    if !matches!(value.status.as_str(), "pending" | "connected" | "disconnected") {
+    if !matches!(
+        value.status.as_str(),
+        "pending" | "connected" | "disconnected"
+    ) {
         anyhow::bail!("invalid mailbox connection status")
     }
     value.account_label = normalize_application_email(&value.account_label)?;
@@ -3117,12 +3468,9 @@ pub fn save_mailbox_connection(
     let subject_hash = private_lookup_hash(&format!("mailbox:{}", value.provider), subject)?;
     let existing = list_mailbox_connections(pool, account_id)?;
     if value.id.is_empty() {
-        if let Some(item) = mailbox_connection_by_subject(
-            pool,
-            account_id,
-            &value.provider,
-            &subject_hash,
-        )? {
+        if let Some(item) =
+            mailbox_connection_by_subject(pool, account_id, &value.provider, &subject_hash)?
+        {
             value.id = item.id.clone();
             value.created_at_ms = item.created_at_ms;
         } else {
@@ -3222,7 +3570,12 @@ pub fn list_integrations(pool: &DbPool, account_id: &str) -> Result<Vec<JobsInte
         "provider ASC",
         "Jobs integration",
     )?;
-    integrations.retain(|item| matches!(item.provider.as_str(), "google_calendar" | "outlook_calendar"));
+    integrations.retain(|item| {
+        matches!(
+            item.provider.as_str(),
+            "google_calendar" | "outlook_calendar"
+        )
+    });
     for (provider, capabilities) in [
         ("google_calendar", vec!["interview_calendar"]),
         ("outlook_calendar", vec!["interview_calendar"]),
@@ -3379,6 +3732,7 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
         tracks: list_tracks(pool, account_id)?,
         matches: list_postings(pool, account_id)?,
         applications: list_applications(pool, account_id)?,
+        application_evidence: list_application_evidence(pool, account_id, None)?,
         browser_sessions: list_browser_sessions(pool, account_id)?,
         interventions: list_interventions(pool, account_id)?,
         integrations: list_integrations(pool, account_id)?,
@@ -3407,6 +3761,32 @@ mod tests {
         pool
     }
 
+    fn test_posting(url: &str, posted_at_ms: i64, last_verified_at_ms: i64) -> JobPosting {
+        JobPosting {
+            id: String::new(),
+            canonical_key: String::new(),
+            source: "greenhouse".to_string(),
+            external_id: url.to_string(),
+            company: "Acme".to_string(),
+            title: "Software Engineer".to_string(),
+            location: "New York, NY".to_string(),
+            workplace: "hybrid".to_string(),
+            canonical_url: url.to_string(),
+            description: "Build reliable products with Rust and TypeScript.".to_string(),
+            compensation: "$170k-$200k".to_string(),
+            track_id: String::new(),
+            match_score: 90,
+            matched_reasons: vec!["Skills fit".to_string()],
+            missing_requirements: Vec::new(),
+            posted_at_ms: Some(posted_at_ms),
+            last_verified_at_ms: Some(last_verified_at_ms),
+            availability_status: "active".to_string(),
+            status: "matched".to_string(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
     #[test]
     fn canonical_job_key_deduplicates_url_slash_and_case() {
         let a = JobPosting {
@@ -3425,6 +3805,9 @@ mod tests {
             match_score: 0,
             matched_reasons: Vec::new(),
             missing_requirements: Vec::new(),
+            posted_at_ms: Some(now_ms()),
+            last_verified_at_ms: Some(now_ms()),
+            availability_status: "active".to_string(),
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
@@ -3433,6 +3816,154 @@ mod tests {
         b.company = "ACME".to_string();
         b.canonical_url = "https://boards.example/jobs/1".to_string();
         assert_eq!(canonical_job_key(&a), canonical_job_key(&b));
+    }
+
+    #[test]
+    fn stale_jobs_cannot_produce_application_packets() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.example/jobs/stale",
+                now_ms() - 31 * DAY_MS,
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+
+        let error = prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+            .unwrap_err();
+        assert!(error.to_string().contains("days old"));
+    }
+
+    #[test]
+    fn queueing_rechecks_that_a_recent_job_is_still_open() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let mut posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.example/jobs/recheck",
+                now_ms() - 2 * DAY_MS,
+                now_ms() - 2 * DAY_MS,
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+
+        let stale_verification =
+            update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap_err();
+        assert!(stale_verification.to_string().contains("still open"));
+
+        posting.last_verified_at_ms = Some(now_ms());
+        upsert_posting(
+            &pool,
+            "acct-jobs",
+            &posting,
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let queued = update_application(&pool, "acct-jobs", &application.id, "queued", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.state, "queued");
+    }
+
+    #[test]
+    fn submitted_applications_require_exact_resume_and_confirmation_evidence() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.example/jobs/evidence",
+                now_ms() - DAY_MS,
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, resume) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap();
+        update_application(&pool, "acct-jobs", &application.id, "running", None).unwrap();
+
+        let missing =
+            update_application(&pool, "acct-jobs", &application.id, "submitted", None).unwrap_err();
+        assert!(missing.to_string().contains("exact resume"));
+
+        let resume_evidence = ApplicationEvidence {
+            id: "resume-evidence".to_string(),
+            application_id: application.id.clone(),
+            kind: "resume".to_string(),
+            label: "Resume submitted".to_string(),
+            provider: "greenhouse".to_string(),
+            file_name: "Taylor-Rivera-Acme-Software-Engineer.pdf".to_string(),
+            media_type: "application/pdf".to_string(),
+            storage_key: "jobs/application/resume.pdf".to_string(),
+            sha256: "a".repeat(64),
+            resume_version_id: Some(resume.id.clone()),
+            occurred_at_ms: now_ms(),
+            metadata: json!({ "attached_to_submission": true }),
+            created_at_ms: 0,
+        };
+        save_application_evidence(&pool, "acct-jobs", &resume_evidence).unwrap();
+        save_application_evidence(&pool, "acct-jobs", &resume_evidence).unwrap();
+        assert_eq!(
+            list_application_evidence(&pool, "acct-jobs", Some(&application.id))
+                .unwrap()
+                .iter()
+                .filter(|item| item.kind == "resume")
+                .count(),
+            1
+        );
+        assert!(
+            update_application(&pool, "acct-jobs", &application.id, "submitted", None,).is_err()
+        );
+
+        save_application_evidence(
+            &pool,
+            "acct-jobs",
+            &ApplicationEvidence {
+                id: "confirmation-evidence".to_string(),
+                application_id: application.id.clone(),
+                kind: "submission_confirmation".to_string(),
+                label: "Application received".to_string(),
+                provider: "greenhouse".to_string(),
+                file_name: String::new(),
+                media_type: String::new(),
+                storage_key: String::new(),
+                sha256: String::new(),
+                resume_version_id: None,
+                occurred_at_ms: now_ms(),
+                metadata: json!({
+                    "external_id": "greenhouse-confirmation-1",
+                    "confirmation": "Application received"
+                }),
+                created_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let submitted = update_application(&pool, "acct-jobs", &application.id, "submitted", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(submitted.state, "submitted");
     }
 
     #[test]
@@ -3462,6 +3993,9 @@ mod tests {
                 match_score: 86,
                 matched_reasons: vec!["Skills fit".to_string()],
                 missing_requirements: Vec::new(),
+                posted_at_ms: Some(now_ms()),
+                last_verified_at_ms: Some(now_ms()),
+                availability_status: "active".to_string(),
                 status: "matched".to_string(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
@@ -3505,6 +4039,9 @@ mod tests {
                 match_score: 80,
                 matched_reasons: Vec::new(),
                 missing_requirements: Vec::new(),
+                posted_at_ms: Some(now_ms()),
+                last_verified_at_ms: Some(now_ms()),
+                availability_status: "active".to_string(),
                 status: "matched".to_string(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
@@ -3548,6 +4085,9 @@ mod tests {
                 match_score: 96,
                 matched_reasons: Vec::new(),
                 missing_requirements: Vec::new(),
+                posted_at_ms: Some(now_ms()),
+                last_verified_at_ms: Some(now_ms()),
+                availability_status: "active".to_string(),
                 status: "matched".to_string(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
@@ -3609,6 +4149,9 @@ mod tests {
                 match_score: 84,
                 matched_reasons: Vec::new(),
                 missing_requirements: Vec::new(),
+                posted_at_ms: Some(now_ms()),
+                last_verified_at_ms: Some(now_ms()),
+                availability_status: "active".to_string(),
                 status: "matched".to_string(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
@@ -3656,12 +4199,8 @@ mod tests {
     #[test]
     fn application_emails_are_verified_defaultable_and_plan_limited() {
         let pool = test_pool();
-        let primary = ensure_primary_application_identity(
-            &pool,
-            "acct-jobs",
-            "jobs@example.com",
-        )
-        .unwrap();
+        let primary =
+            ensure_primary_application_identity(&pool, "acct-jobs", "jobs@example.com").unwrap();
         assert!(primary.is_default);
         assert_eq!(primary.verification_status, "verified");
 
@@ -3679,22 +4218,18 @@ mod tests {
             },
         )
         .unwrap();
-        save_identity_verification(&pool, "acct-jobs", &alternate.id, "483921", 60_000)
-            .unwrap();
-        let mut verified = verify_application_identity(
-            &pool,
-            "acct-jobs",
-            &alternate.id,
-            "483921",
-        )
-        .unwrap();
+        save_identity_verification(&pool, "acct-jobs", &alternate.id, "483921", 60_000).unwrap();
+        let mut verified =
+            verify_application_identity(&pool, "acct-jobs", &alternate.id, "483921").unwrap();
         verified.is_default = true;
         let verified = save_application_identity(&pool, "acct-jobs", &verified).unwrap();
         assert!(verified.is_default);
-        assert!(!get_application_identity(&pool, "acct-jobs", &primary.id)
-            .unwrap()
-            .unwrap()
-            .is_default);
+        assert!(
+            !get_application_identity(&pool, "acct-jobs", &primary.id)
+                .unwrap()
+                .unwrap()
+                .is_default
+        );
 
         let third = save_application_identity(
             &pool,
@@ -3780,15 +4315,9 @@ mod tests {
             },
         )
         .unwrap();
-        save_identity_verification(&pool, "acct-jobs", &alternate.id, "602314", 60_000)
-            .unwrap();
-        let alternate = verify_application_identity(
-            &pool,
-            "acct-jobs",
-            &alternate.id,
-            "602314",
-        )
-        .unwrap();
+        save_identity_verification(&pool, "acct-jobs", &alternate.id, "602314", 60_000).unwrap();
+        let alternate =
+            verify_application_identity(&pool, "acct-jobs", &alternate.id, "602314").unwrap();
         let track = upsert_track(
             &pool,
             "acct-jobs",
@@ -3825,6 +4354,9 @@ mod tests {
                 match_score: 88,
                 matched_reasons: Vec::new(),
                 missing_requirements: Vec::new(),
+                posted_at_ms: Some(now_ms()),
+                last_verified_at_ms: Some(now_ms()),
+                availability_status: "active".to_string(),
                 status: "matched".to_string(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
@@ -3833,16 +4365,14 @@ mod tests {
             &JobPreferences::default(),
         )
         .unwrap();
-        let (application, resume) = prepare_application(
-            &pool,
-            "acct-jobs",
-            &posting.id,
-            "factual",
-            "review_first",
-        )
-        .unwrap();
+        let (application, resume) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
         assert_eq!(
-            resume.content.pointer("/contact/email").and_then(Value::as_str),
+            resume
+                .content
+                .pointer("/contact/email")
+                .and_then(Value::as_str),
             Some("applications@example.com")
         );
         assert_eq!(

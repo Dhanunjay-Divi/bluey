@@ -1,5 +1,6 @@
 import type {
   AccountSummary,
+  ApplicationEvidence,
   ApplicationIdentity,
   BrowserSession,
   CareerFact,
@@ -142,6 +143,13 @@ export const jobsApi = {
   commitPacket: (id: string) =>
     request<PacketCommitResult>(`/api/jobs/applications/${encodeURIComponent(id)}/commit`, {
       method: "POST",
+    }),
+  applicationEvidence: (id: string) =>
+    request<ApplicationEvidence[]>(`/api/jobs/applications/${encodeURIComponent(id)}/evidence`),
+  saveApplicationEvidence: (id: string, evidence: ApplicationEvidence) =>
+    request<ApplicationEvidence>(`/api/jobs/applications/${encodeURIComponent(id)}/evidence`, {
+      method: "POST",
+      body: JSON.stringify(evidence),
     }),
   resumeVersion: (id: string) =>
     request<ResumeVersion>(`/api/jobs/resume-versions/${encodeURIComponent(id)}`),

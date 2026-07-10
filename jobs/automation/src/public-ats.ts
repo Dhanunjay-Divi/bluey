@@ -75,7 +75,14 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
         `All configured ATS sources failed: ${warnings.join("; ")}`,
       );
     }
-    const jobs = deduplicateJobs(pages.flat())
+    const deduplicated = deduplicateJobs(pages.flat());
+    const maximumAgeDays = clamp(query.maxPostingAgeDays ?? 14, 1, 60);
+    const recentJobs = deduplicated.filter((job) => isRecentJob(job, maximumAgeDays));
+    const staleCount = deduplicated.length - recentJobs.length;
+    if (staleCount > 0) {
+      warnings.push(`${staleCount} old or undated job${staleCount === 1 ? " was" : "s were"} skipped.`);
+    }
+    const jobs = recentJobs
       .filter((job) => job.title.length > 0 && job.canonicalUrl.length > 0)
       .filter((job) => matchesQuery(job, query));
     return {
@@ -140,6 +147,7 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
         location: asString(categories.location || item.location),
         workplace: asString(item.workplaceType),
         description: asString(item.descriptionPlain || item.description),
+        postedAt: asOptionalString(item.createdAt),
         department: asString(categories.department || categories.team),
       });
     });
@@ -402,6 +410,38 @@ function normalizeComparable(value: string): string {
 
 function normalizedValues(values: string[]): string[] {
   return values.map(normalizeComparable).filter(Boolean);
+}
+
+export function isRecentJob(job: NormalizedJob, maximumAgeDays: number, now = new Date()): boolean {
+  const postedAt = parsePostedAt(job.postedAt, now);
+  if (!postedAt) return false;
+  const ageMs = Math.max(0, now.getTime() - postedAt.getTime());
+  return ageMs <= clamp(maximumAgeDays, 1, 60) * 24 * 60 * 60 * 1_000;
+}
+
+export function parsePostedAt(value: string | undefined, now = new Date()): Date | undefined {
+  const raw = value?.trim();
+  if (!raw) return undefined;
+  if (/^\d{10,13}$/.test(raw)) {
+    const numeric = Number(raw);
+    const date = new Date(raw.length === 10 ? numeric * 1_000 : numeric);
+    return Number.isNaN(date.getTime()) ? undefined : date;
+  }
+  const normalized = raw.toLowerCase();
+  if (normalized.includes("today")) return new Date(now);
+  if (normalized.includes("yesterday")) return new Date(now.getTime() - 24 * 60 * 60 * 1_000);
+  const relative = normalized.match(/(\d+)\+?\s*(hour|day|week)s?\s*ago/);
+  if (relative) {
+    const count = Number(relative[1]);
+    const unitMs = relative[2] === "hour"
+      ? 60 * 60 * 1_000
+      : relative[2] === "week"
+        ? 7 * 24 * 60 * 60 * 1_000
+        : 24 * 60 * 60 * 1_000;
+    return new Date(now.getTime() - count * unitMs);
+  }
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

@@ -3,6 +3,7 @@ import {
   AlertCircle,
   ArrowRight,
   BriefcaseBusiness,
+  CalendarDays,
   Check,
   CheckCircle2,
   ChevronRight,
@@ -12,13 +13,14 @@ import {
   FileDiff,
   FileText,
   Inbox,
+  Mail,
   MonitorUp,
   MoreHorizontal,
   Play,
   Search,
   Send,
 } from "lucide-react";
-import type { JobApplication, JobsWorkspace, ResumeVersion } from "../types";
+import type { ApplicationEvidence, JobApplication, JobsWorkspace, ResumeVersion } from "../types";
 import { relativeTime, titleCase } from "../lib/format";
 import { Dialog } from "../components/Dialog";
 import { exportResumeDocx, exportResumePdf } from "../lib/documents";
@@ -51,6 +53,9 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   const selectedSession = selected
     ? workspace.browser_sessions.find((session) => session.application_id === selected.id)
     : undefined;
+  const selectedEvidence = selected
+    ? workspace.application_evidence.filter((evidence) => evidence.application_id === selected.id)
+    : [];
   const filtered = workspace.applications.filter((application) => {
     const job = jobs.get(application.job_id);
     const textMatch = !query || `${job?.company || ""} ${job?.title || ""}`.toLowerCase().includes(query.toLowerCase());
@@ -172,15 +177,81 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
         )}
       </Dialog>
       <Dialog open={receiptOpen} title="Submission receipt" description={selected ? `${jobs.get(selected.job_id)?.company || "Application"} · ${jobs.get(selected.job_id)?.title || ""}` : ""} onClose={() => setReceiptOpen(false)}>
-        {selected && <ReceiptView application={selected} resume={selectedResume} />}
+        {selected && <ReceiptView application={selected} resume={selectedResume} evidence={selectedEvidence} />}
       </Dialog>
     </div>
   );
 }
 
-function ReceiptView({ application, resume }: { application: JobApplication; resume?: ResumeVersion }) {
-  const entries = Object.entries(application.receipt || {});
-  return <div className="receipt-view"><div className="receipt-check"><CheckCircle2 size={22} /><span><b>Application record</b><small>{application.submitted_at_ms ? new Date(application.submitted_at_ms).toLocaleString() : "Submission time pending"}</small></span></div><dl><div><dt>Status</dt><dd>{titleCase(application.state)}</dd></div><div><dt>Resume version</dt><dd>{resume ? `v${resume.version_no} · ${titleCase(resume.mode)}` : application.resume_version_id || "Not available"}</dd></div><div><dt>Application ID</dt><dd>{application.id}</dd></div>{entries.map(([key, value]) => <div key={key}><dt>{titleCase(key)}</dt><dd>{typeof value === "string" || typeof value === "number" ? String(value) : JSON.stringify(value)}</dd></div>)}</dl>{entries.length === 0 && <p className="receipt-empty">The application is marked submitted, but no browser confirmation has been attached yet.</p>}</div>;
+function ReceiptView({ application, resume, evidence }: { application: JobApplication; resume?: ResumeVersion; evidence: ApplicationEvidence[] }) {
+  const orderedEvidence = [...evidence].sort((left, right) => right.occurred_at_ms - left.occurred_at_ms);
+  const resumeEvidence = orderedEvidence.find((item) => item.kind === "resume" && item.resume_version_id === application.resume_version_id);
+  const confirmation = orderedEvidence.find((item) => item.kind === "submission_confirmation");
+  const applicationEmail = application.receipt.application_identity && typeof application.receipt.application_identity === "object"
+    ? String((application.receipt.application_identity as Record<string, unknown>).email || "")
+    : "";
+  return (
+    <div className="receipt-view">
+      <div className={`receipt-check ${resumeEvidence && confirmation ? "verified" : "warning"}`}>
+        {resumeEvidence && confirmation ? <CheckCircle2 size={22} /> : <AlertCircle size={22} />}
+        <span><b>{resumeEvidence && confirmation ? "Submission verified" : "Evidence incomplete"}</b><small>{application.submitted_at_ms ? new Date(application.submitted_at_ms).toLocaleString() : "Submission time pending"}</small></span>
+      </div>
+      <dl>
+        <div><dt>Status</dt><dd>{titleCase(application.state)}</dd></div>
+        <div><dt>Exact resume</dt><dd>{resumeEvidence?.file_name || (resume ? `Version ${resume.version_no} · ${titleCase(resume.mode)}` : "Evidence missing")}</dd></div>
+        {applicationEmail && <div><dt>Application email</dt><dd>{applicationEmail}</dd></div>}
+        <div><dt>Application ID</dt><dd>{application.id}</dd></div>
+      </dl>
+      <section className="receipt-evidence">
+        <div className="receipt-section-heading"><div><p>EVIDENCE TRAIL</p><h3>What was sent and what happened next</h3></div><span>{orderedEvidence.length} record{orderedEvidence.length === 1 ? "" : "s"}</span></div>
+        <div className="evidence-list">
+          {orderedEvidence.map((item) => <div className="evidence-row" key={item.id}>
+            <span className={`evidence-icon ${item.kind}`}>{evidenceIcon(item.kind)}</span>
+            <div><b>{item.label || evidenceTitle(item.kind)}</b><p>{evidenceDetail(item, resume)}</p></div>
+            <time>{new Date(item.occurred_at_ms).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</time>
+          </div>)}
+          {orderedEvidence.length === 0 && <div className="evidence-empty"><AlertCircle size={18} /><span><b>No evidence attached</b><p>Bluey will not treat future applications as submitted until the exact resume and confirmation are recorded.</p></span></div>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function evidenceIcon(kind: string) {
+  if (kind === "status_email") return <Mail size={16} />;
+  if (kind === "interview_event") return <CalendarDays size={16} />;
+  if (kind === "submission_confirmation") return <CheckCircle2 size={16} />;
+  return <FileText size={16} />;
+}
+
+function evidenceTitle(kind: string): string {
+  if (kind === "resume") return "Resume attached";
+  if (kind === "status_email") return "Inbox update";
+  if (kind === "interview_event") return "Interview scheduled";
+  if (kind === "submission_confirmation") return "Application submitted";
+  return titleCase(kind);
+}
+
+function evidenceDetail(item: ApplicationEvidence, resume?: ResumeVersion): string {
+  if (item.kind === "resume") {
+    const version = resume && item.resume_version_id === resume.id ? `Resume v${resume.version_no}` : "Job-specific resume";
+    const checksum = item.sha256 ? ` · SHA-256 ${item.sha256.slice(0, 10)}…` : "";
+    return `${version}${checksum}`;
+  }
+  if (item.kind === "status_email") {
+    return `${String(item.metadata.subject || "Application status message")} · ${providerName(item.provider)}`;
+  }
+  if (item.kind === "interview_event") {
+    return providerName(item.provider);
+  }
+  if (item.kind === "submission_confirmation") {
+    return `${String(item.metadata.confirmation || "Application received")} · ${providerName(item.provider)}`;
+  }
+  return item.file_name || providerName(item.provider);
+}
+
+function providerName(provider: string): string {
+  return provider ? titleCase(provider.replaceAll("_", " ")) : "Bluey";
 }
 
 function ResumePreview({ resume }: { resume: ResumeVersion }) {
