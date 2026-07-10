@@ -132,7 +132,7 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
           <img className="brand-wordmark" src={blueyWordmark} alt="" />
           <b>jobs</b>
         </a>
-        <span>Career Profile setup</span>
+        <span>Career Profile setup · about 5 minutes</span>
         <a href="/account">Exit</a>
       </header>
 
@@ -141,8 +141,8 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
       <div className="onboarding-layout">
         <aside className="setup-steps" aria-label="Setup progress">
           <p className="eyebrow">YOUR BASELINE</p>
-          <h1>Tell Bluey what is true once.</h1>
-          <p>Every resume and answer starts here, then gets shaped for one specific job.</p>
+          <h1>Set it up once. Bluey handles the repetition.</h1>
+          <p>Your baseline becomes a separate, job-specific resume and answer set for every application.</p>
           <ol>
             {steps.map(({ label, icon: Icon }, index) => (
               <li key={label} className={index === step ? "active" : index < step ? "done" : ""}>
@@ -156,7 +156,7 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
         <section className="setup-panel">
           {step === 0 && (
             <>
-              <div className="setup-heading"><p>STEP 1 OF 6</p><h2>Start with your resume</h2><span>Bluey extracts a draft. You stay in control of the profile.</span></div>
+              <div className="setup-heading"><p>STEP 1 OF 6</p><h2>Import once, then tailor every job</h2><span>Bluey extracts a baseline profile. You review it before the first Career Track starts.</span></div>
               <input
                 ref={fileRef}
                 hidden

@@ -11,6 +11,7 @@ import {
   Link2,
   MapPin,
   Plus,
+  Radar,
   Search,
   SlidersHorizontal,
   Sparkles,
@@ -61,6 +62,16 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
 
   const averageScore = filtered.length ? Math.round(filtered.reduce((sum, item) => sum + item.match_score, 0) / filtered.length) : 0;
   const activeFilterCount = Number(minimumScore > 0) + Number(workplace !== "all") + Number(onlyUnprepared);
+  const activeTracks = workspace.tracks.filter((track) => track.active);
+  const selectedTrack = activeTrack === "all"
+    ? activeTracks[0]
+    : workspace.tracks.find((track) => track.id === activeTrack);
+  const searchTitle = activeTrack === "all" && activeTracks.length > 1
+    ? `${activeTracks.length} Career Tracks active`
+    : selectedTrack?.name || "Career Track paused";
+  const searchDetail = selectedTrack
+    ? `${selectedTrack.role} · ${selectedTrack.locations.join(" · ") || "Location not set"}`
+    : "Activate a Career Track to discover new matches.";
 
   const prepare = async () => {
     if (!selected) return;
@@ -85,6 +96,17 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
         <div><Sparkles /><span><b>{averageScore || "-"}%</b><small>average fit</small></span></div>
         <div><BriefcaseBusiness /><span><b>{workspace.applications.filter((item) => item.state === "submitted").length}</b><small>submitted</small></span></div>
         <div className="metric-action"><span><b>{Math.max(0, workspace.entitlement.monthly_packet_limit - workspace.entitlement.used_packets)}</b><small>packets left this month</small></span><Link to={`../settings${window.location.search}#plans`}>Plan details<ChevronRight size={14} /></Link></div>
+      </section>
+
+      <section className={`search-status-band ${activeTracks.length ? "active" : "paused"}`} aria-label="Active search settings">
+        <span className="search-status-icon"><Radar size={20} /></span>
+        <div className="search-status-copy"><p><i />{activeTracks.length ? "SEARCH ACTIVE" : "SEARCH PAUSED"}</p><b>{searchTitle}</b><small>{searchDetail}</small></div>
+        <dl>
+          <div><dt>Freshness</dt><dd>{workspace.preferences.max_posting_age_days} days</dd></div>
+          <div><dt>Mode</dt><dd>{workspace.profile.default_submission_mode === "auto_submit" ? `Auto at ${workspace.profile.auto_submit_threshold}%` : "Review first"}</dd></div>
+          <div><dt>Pace</dt><dd>Up to {workspace.preferences.daily_limit}/day</dd></div>
+        </dl>
+        <Link className="button secondary compact" to={`../settings${window.location.search}#tracks`}>Adjust search<ChevronRight size={14} /></Link>
       </section>
 
       <section className="track-strip" aria-label="Career Tracks">

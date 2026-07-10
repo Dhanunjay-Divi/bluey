@@ -1,6 +1,16 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
-import { AlertCircle, LoaderCircle } from "lucide-react";
+import {
+  AlertCircle,
+  ArrowRight,
+  BriefcaseBusiness,
+  Check,
+  Cloud,
+  FileText,
+  LoaderCircle,
+  Search,
+  Sparkles,
+} from "lucide-react";
 import { accessToken, jobsApi, loginUrl } from "./api";
 import { previewWorkspace } from "./data/preview";
 import type {
@@ -600,22 +610,80 @@ export default function App() {
 
 function AuthGate() {
   return (
-    <main className="auth-gate">
-      <a className="brand-lockup" href="/" aria-label="Bluey home">
-        <img className="brand-icon" src={blueyIcon} alt="" />
-        <img className="brand-wordmark" src={blueyWordmark} alt="" />
-        <b>jobs</b>
-      </a>
-      <section>
-        <p className="eyebrow">ONE PROFILE. EVERY APPLICATION.</p>
-        <h1>Your job search,<br /><span>already moving.</span></h1>
-        <p>Sign in with Bluey to build tailored resumes, review matched roles, and keep every application in one calm workspace.</p>
-        <div className="auth-actions">
-          <a className="button primary" href={loginUrl()}>Sign in to Bluey</a>
-          <a className="button secondary" href="/login?mode=signup&next=%2Fjobs">Create account</a>
+    <main className="jobs-entry">
+      <header className="entry-header">
+        <a className="brand-lockup" href="/" aria-label="Bluey home">
+          <img className="brand-icon" src={blueyIcon} alt="" />
+          <img className="brand-wordmark" src={blueyWordmark} alt="" />
+          <b>jobs</b>
+        </a>
+        <nav aria-label="Jobs overview">
+          <a href="#how-it-works">How it works</a>
+          <a href="#jobs-plans">Plans</a>
+        </nav>
+        <a className="button secondary compact" href={loginUrl()}>Sign in</a>
+      </header>
+
+      <section className="entry-hero">
+        <div className="entry-hero-copy">
+          <p className="eyebrow">BLUEY JOBS</p>
+          <h1>Every application,<br /><span>already tailored.</span></h1>
+          <p>Bluey finds recent, high-fit roles, builds a unique resume and answers for each one, then lets you review or apply in the background.</p>
+          <div className="auth-actions">
+            <a className="button primary" href="/login?mode=signup&next=%2Fjobs">Create free profile<ArrowRight size={16} /></a>
+            <a className="button secondary" href={loginUrl()}>Sign in to Bluey</a>
+          </div>
+          <div className="entry-assurances" aria-label="Bluey Jobs defaults">
+            <span><Check size={14} />Job-specific resume every time</span>
+            <span><Check size={14} />Review first by default</span>
+            <span><Check size={14} />Five free application packets</span>
+          </div>
+        </div>
+
+        <div className="entry-product-scene" aria-label="Bluey Jobs product preview">
+          <header>
+            <div><span className="live-dot" /><b>Product engineering</b><small>Career Track active</small></div>
+            <span>Review first&nbsp;&nbsp;·&nbsp;&nbsp;10 per day</span>
+          </header>
+          <div className="entry-scene-metrics">
+            <span><b>4</b><small>fresh matches</small></span>
+            <span><b>89%</b><small>average fit</small></span>
+            <span><b>3</b><small>packets ready</small></span>
+          </div>
+          <div className="entry-scene-jobs">
+            <div><i>NO</i><span><b>Senior Product Engineer</b><small>Northwind · New York, NY · Posted today</small></span><strong>94%</strong><em>Resume tailored</em></div>
+            <div><i>AR</i><span><b>Staff Frontend Engineer</b><small>Arcadia Health · Remote, US · Posted 2 days ago</small></span><strong>91%</strong><em>Ready to review</em></div>
+            <div><i>AT</i><span><b>Product Engineer, Platform</b><small>Atlas · New York, NY · Posted 5 days ago</small></span><strong>88%</strong><em>Packet ready</em></div>
+          </div>
+          <footer><Sparkles size={15} /><span>Each job keeps its own resume, answers, evidence, and submission receipt.</span></footer>
         </div>
       </section>
-      <footer>Bluey identity, balance, and privacy controls carry into Jobs.</footer>
+
+      <section className="entry-section entry-flow" id="how-it-works">
+        <div className="entry-section-heading"><p className="eyebrow">HOW IT WORKS</p><h2>Set up once. Keep the search moving.</h2><span>Bluey handles the repetitive work while keeping every decision visible.</span></div>
+        <ol>
+          <li><span><FileText /></span><div><b>Import your baseline</b><p>Add your resume, work history, education, locations, and reusable answers once.</p></div></li>
+          <li><span><Search /></span><div><b>Get recent matches</b><p>Career Tracks find roles for a specific job family and location, without mixing resume paths.</p></div></li>
+          <li><span><Sparkles /></span><div><b>Tailor every packet</b><p>Each job gets its own resume version, optional cover letter, answers, and visible changes.</p></div></li>
+          <li><span><BriefcaseBusiness /></span><div><b>Review or keep running</b><p>Submit with the local browser or let the cloud runner continue while your computer is off.</p></div></li>
+        </ol>
+      </section>
+
+      <section className="entry-section entry-plans" id="jobs-plans">
+        <div className="entry-section-heading"><p className="eyebrow">PLANS</p><h2>Start free. Add automation when it helps.</h2></div>
+        <div className="entry-plan-table">
+          <div><span><b>Free</b><small>Build your profile and review applications</small></span><strong>$0</strong><p>1 Career Track · 5 reviewed packets</p></div>
+          <div><span><b>Pro</b><small>Apply from the separate Bluey Browser</small></span><strong>$29<small>/month</small></strong><p>3 Career Tracks · 50 packets · local runner</p></div>
+          <div><span><b>Cloud</b><small>Keep applications moving in the background</small></span><strong>$49<small>/month</small></strong><p>5 Career Tracks · 100 packets · local + cloud</p></div>
+        </div>
+        <div className="entry-plan-action"><Cloud size={18} /><span>All plans keep the exact resume and answers used for every application.</span><a className="button primary" href="/login?mode=signup&next=%2Fjobs">Start free<ArrowRight size={16} /></a></div>
+      </section>
+
+      <footer className="entry-footer">
+        <span>Bluey Jobs</span>
+        <p>One Career Profile. A separate application for every job.</p>
+        <nav><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="mailto:hello@bluey.sh">Help</a></nav>
+      </footer>
     </main>
   );
 }
