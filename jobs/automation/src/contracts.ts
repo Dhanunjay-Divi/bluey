@@ -42,6 +42,9 @@ export interface NormalizedJob {
   workplace: "onsite" | "hybrid" | "remote" | "unknown";
   description: string;
   source: AtsKind;
+  postedAt?: string;
+  compensation?: string;
+  department?: string;
 }
 
 export interface ApplicationPacket {
@@ -110,12 +113,30 @@ export interface DiscoveryQuery {
   locations: string[];
   remotePreference: string;
   excludedCompanies: string[];
+  excludedTitles?: string[];
+  sources?: PublicAtsSource[];
+  pageSize?: number;
   cursor?: string;
 }
+
+export type PublicAtsSource =
+  | { kind: "greenhouse"; boardToken: string; company?: string }
+  | { kind: "lever"; site: string; company?: string }
+  | { kind: "ashby"; boardName: string; company?: string }
+  | { kind: "smartrecruiters"; companyIdentifier: string; company?: string }
+  | {
+      kind: "workday";
+      tenant: string;
+      instance: string;
+      site: string;
+      company?: string;
+      locale?: string;
+    };
 
 export interface DiscoveryPage {
   jobs: NormalizedJob[];
   nextCursor?: string;
+  warnings?: string[];
 }
 
 export interface DiscoveryProvider {

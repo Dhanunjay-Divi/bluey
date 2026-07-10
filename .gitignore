@@ -9,6 +9,7 @@ _refs/
 
 # Build and release output.
 dist/
+**/.vite/
 
 # Local visual QA screenshots.
 tmp-*.png

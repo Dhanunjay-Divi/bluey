@@ -48,6 +48,10 @@ testing. Multi-instance environments must use PostgreSQL.
    instead of guessed answers.
 8. A submission receipt retains the job snapshot, exact resume, final answers,
    browser evidence, and timestamps.
+9. Public ATS discovery constructs only known HTTPS endpoints, rejects
+   redirects, caps pages and payloads, and never accepts a caller-supplied host.
+10. Reusable answers resolve company first, then Career Track, then account;
+    Auto-submit cannot use an unconfirmed generated fact.
 
 ## High-scale deployment
 
@@ -72,9 +76,10 @@ exposing customer data or automation endpoints.
 
 ## Operational completion gates
 
-The portal, persistence model, metering, policy layer, Electron controller, and
-Temporal boundaries are implemented in this branch. Public launch still
-requires provider credentials and deployment-specific work for licensed job
-discovery, Gmail/Outlook OAuth, packaged desktop installers, deterministic ATS
-form fixtures, and the production cloud browser-pool activity. Those surfaces
-must remain labeled beta until their integration suites pass.
+The portal, persistence model, metering, policy layer, public ATS discovery,
+shared form planning, receipt model, Electron controller, and Temporal
+boundaries are implemented in this branch. Public launch still requires
+provider credentials and deployment-specific work for licensed discovery,
+Gmail/Outlook OAuth, packaged desktop installers, fixture-backed submission
+adapters, and the production cloud browser-pool activity. Those surfaces must
+remain labeled beta until their integration suites pass.

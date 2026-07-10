@@ -63,3 +63,16 @@ provider-specific release gates.
 - Overage balance deduction and its audit entry are atomic.
 - LinkedIn and Indeed are handoff-only in background policy.
 - Local and cloud runners consume the same adapter contract.
+- Public Workday, Greenhouse, Lever, Ashby, and SmartRecruiters sources share
+  host-pinned, retry-bounded discovery and canonical deduplication.
+- Form planning uses confirmed facts and company/track/account answer memory;
+  unknown required questions become interventions.
+- Every committed run can retain the exact packet and evidence in one
+  fingerprinted receipt.
+
+## Source provenance
+
+Research clones are kept under ignored `_refs/jobs-research/` directories.
+Shipped adaptations, exact source commits, authorization, and license notices
+are documented in `THIRD_PARTY_PROVENANCE.md`, `THIRD_PARTY_NOTICES.md`, and
+`OPEN_SOURCE_RESEARCH.md`.
