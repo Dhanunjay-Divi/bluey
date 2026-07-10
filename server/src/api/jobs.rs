@@ -18,9 +18,10 @@ use crate::{
     api::AppState,
     auth::AuthedAccount,
     db::jobs::{
-        self, BrowserSession, CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication,
-        JobPosting, JobPreferences, JobsEntitlement, JobsIntegration, JobsWorkspace,
-        PacketCommitResult, ResumeVersion, RunEvent,
+        self, ApplicationIdentity, BrowserSession, CareerFact, CareerProfile, CareerTrack,
+        Intervention, JobApplication, JobPosting, JobPreferences, JobsEntitlement,
+        JobsIntegration, JobsWorkspace, MailboxConnection, PacketCommitResult, ResumeVersion,
+        RunEvent,
     },
 };
 
@@ -74,6 +75,30 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/jobs/integrations",
             get(integrations).put(save_integration),
+        )
+        .route(
+            "/api/jobs/application-identities",
+            get(application_identities).post(create_application_identity),
+        )
+        .route(
+            "/api/jobs/application-identities/:identity_id",
+            put(update_application_identity).delete(remove_application_identity),
+        )
+        .route(
+            "/api/jobs/application-identities/:identity_id/verify",
+            post(verify_application_identity),
+        )
+        .route(
+            "/api/jobs/application-identities/:identity_id/resend",
+            post(resend_application_identity),
+        )
+        .route(
+            "/api/jobs/mailbox-connections",
+            get(mailbox_connections).post(request_mailbox_connection),
+        )
+        .route(
+            "/api/jobs/mailbox-connections/:connection_id",
+            delete(remove_mailbox_connection),
         )
         .route("/api/jobs/entitlements", get(entitlements))
         .route("/api/jobs/runs/:run_id/events", get(run_events))
@@ -530,9 +555,9 @@ pub async fn save_integration(
 ) -> Result<Json<JobsIntegration>, ApiError> {
     if !matches!(
         integration.provider.as_str(),
-        "gmail" | "outlook_email" | "google_calendar" | "outlook_calendar"
+        "google_calendar" | "outlook_calendar"
     ) {
-        return bad_request("Choose a supported email or calendar provider.");
+        return bad_request("Choose Google Calendar or Outlook Calendar.");
     }
     if integration.status != "disconnected" {
         return bad_request("Complete provider authorization before connecting this account.");
@@ -540,6 +565,191 @@ pub async fn save_integration(
     jobs::save_integration(&state.pool, &account.id, &integration)
         .map(Json)
         .map_err(internal)
+}
+
+const IDENTITY_OTP_TTL_MS: i64 = 10 * 60 * 1_000;
+
+pub async fn application_identities(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<Vec<ApplicationIdentity>>, ApiError> {
+    let _ = jobs::ensure_primary_application_identity(&state.pool, &account.id, &account.email)
+        .map_err(domain_error)?;
+    jobs::list_application_identities(&state.pool, &account.id)
+        .map(Json)
+        .map_err(internal)
+}
+
+pub async fn create_application_identity(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(mut identity): Json<ApplicationIdentity>,
+) -> Result<Json<ApplicationIdentity>, ApiError> {
+    identity.id.clear();
+    identity.email = jobs::normalize_application_email(&identity.email).map_err(domain_error)?;
+    identity.label = identity.label.trim().chars().take(60).collect();
+    identity.verification_status = "pending".to_string();
+    identity.is_default = false;
+    identity.created_at_ms = 0;
+    identity.updated_at_ms = 0;
+    let saved = jobs::save_application_identity(&state.pool, &account.id, &identity)
+        .map_err(domain_error)?;
+    if saved.verification_status != "verified" {
+        send_identity_verification(&state, &account.id, &saved).await?;
+    }
+    Ok(Json(saved))
+}
+
+pub async fn update_application_identity(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(identity_id): Path<String>,
+    Json(requested): Json<ApplicationIdentity>,
+) -> Result<Json<ApplicationIdentity>, ApiError> {
+    let mut existing = jobs::get_application_identity(&state.pool, &account.id, &identity_id)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Application email not found.".to_string()))?;
+    if jobs::normalize_application_email(&requested.email).map_err(domain_error)? != existing.email {
+        return bad_request("Add a new application email instead of changing this address.");
+    }
+    existing.label = requested.label.trim().chars().take(60).collect();
+    existing.is_default = requested.is_default;
+    jobs::save_application_identity(&state.pool, &account.id, &existing)
+        .map(Json)
+        .map_err(domain_error)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyIdentityRequest {
+    pub code: String,
+}
+
+pub async fn verify_application_identity(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(identity_id): Path<String>,
+    Json(req): Json<VerifyIdentityRequest>,
+) -> Result<Json<ApplicationIdentity>, ApiError> {
+    if req.code.len() != 6 || !req.code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return bad_request("Enter the 6-digit verification code.");
+    }
+    jobs::verify_application_identity(&state.pool, &account.id, &identity_id, &req.code)
+        .map(Json)
+        .map_err(domain_error)
+}
+
+pub async fn resend_application_identity(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(identity_id): Path<String>,
+) -> Result<Json<ApplicationIdentity>, ApiError> {
+    let identity = jobs::get_application_identity(&state.pool, &account.id, &identity_id)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Application email not found.".to_string()))?;
+    send_identity_verification(&state, &account.id, &identity).await?;
+    Ok(Json(identity))
+}
+
+async fn send_identity_verification(
+    state: &AppState,
+    account_id: &str,
+    identity: &ApplicationIdentity,
+) -> Result<(), ApiError> {
+    let code = random_six_digit_code();
+    jobs::save_identity_verification(
+        &state.pool,
+        account_id,
+        &identity.id,
+        &code,
+        IDENTITY_OTP_TTL_MS,
+    )
+    .map_err(domain_error)?;
+    match crate::mail::send_jobs_identity_otp(&state.config, &identity.email, &code, 10).await {
+        Ok(crate::mail::MailDelivery::Sent) => Ok(()),
+        Ok(crate::mail::MailDelivery::NotConfigured) => {
+            let _ = jobs::delete_identity_verification(&state.pool, account_id, &identity.id);
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Application email verification is temporarily unavailable.".to_string(),
+            ))
+        }
+        Err(error) => {
+            let _ = jobs::delete_identity_verification(&state.pool, account_id, &identity.id);
+            tracing::warn!(error = %error, "Bluey Jobs application email delivery failed");
+            Err((
+                StatusCode::BAD_GATEWAY,
+                "Bluey could not send the verification email. Try again.".to_string(),
+            ))
+        }
+    }
+}
+
+fn random_six_digit_code() -> String {
+    const CODE_SPACE: u32 = 1_000_000;
+    let unbiased_zone = u32::MAX - (u32::MAX % CODE_SPACE);
+    loop {
+        let mut bytes = [0u8; 4];
+        getrandom::getrandom(&mut bytes).expect("OS random source");
+        let value = u32::from_le_bytes(bytes);
+        if value < unbiased_zone {
+            return format!("{:06}", value % CODE_SPACE);
+        }
+    }
+}
+
+pub async fn remove_application_identity(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(identity_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if !jobs::delete_application_identity(&state.pool, &account.id, &identity_id)
+        .map_err(domain_error)?
+    {
+        return Err((StatusCode::NOT_FOUND, "Application email not found.".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn mailbox_connections(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<Vec<MailboxConnection>>, ApiError> {
+    jobs::list_mailbox_connections(&state.pool, &account.id)
+        .map(Json)
+        .map_err(internal)
+}
+
+pub async fn request_mailbox_connection(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(mut connection): Json<MailboxConnection>,
+) -> Result<Json<MailboxConnection>, ApiError> {
+    connection.id.clear();
+    connection.status = "pending".to_string();
+    connection.created_at_ms = 0;
+    connection.updated_at_ms = 0;
+    let provider_subject = connection.account_label.clone();
+    jobs::save_mailbox_connection(
+        &state.pool,
+        &account.id,
+        &connection,
+        &provider_subject,
+    )
+    .map(Json)
+    .map_err(domain_error)
+}
+
+pub async fn remove_mailbox_connection(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(connection_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if !jobs::delete_mailbox_connection(&state.pool, &account.id, &connection_id)
+        .map_err(internal)?
+    {
+        return Err((StatusCode::NOT_FOUND, "Connected inbox not found.".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn entitlements(
@@ -703,6 +913,28 @@ fn validation_or_internal(error: anyhow::Error, validation_message: &str) -> Api
     } else {
         internal(error)
     }
+}
+
+fn domain_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    let status = if message.contains("another Bluey Jobs account") {
+        StatusCode::CONFLICT
+    } else if message.contains("limit reached") {
+        StatusCode::PAYMENT_REQUIRED
+    } else if message.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("verification")
+        || message.contains("verify the")
+        || message.contains("choose another")
+        || message.contains("complete email")
+        || message.contains("Gmail or Outlook")
+        || message.contains("wait a minute")
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        return internal(error);
+    };
+    (status, message)
 }
 
 fn internal(error: anyhow::Error) -> ApiError {

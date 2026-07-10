@@ -5,6 +5,7 @@ import { accessToken, jobsApi, loginUrl } from "./api";
 import { previewWorkspace } from "./data/preview";
 import type {
   AccountSummary,
+  ApplicationIdentity,
   BrowserSession,
   CareerProfile,
   CareerTrack,
@@ -13,6 +14,7 @@ import type {
   JobPreferences,
   JobsIntegration,
   JobsWorkspace,
+  MailboxConnection,
   ResumeVersion,
 } from "./types";
 import { AppShell } from "./components/AppShell";
@@ -303,6 +305,77 @@ export default function App() {
     );
   }, []);
 
+  const createApplicationIdentity = useCallback(async (identity: ApplicationIdentity) => {
+    const saved = isPreview
+      ? { ...identity, id: `identity-${Date.now()}`, verification_status: "pending" as const, is_default: false, created_at_ms: Date.now(), updated_at_ms: Date.now() }
+      : await jobsApi.createApplicationIdentity(identity);
+    setWorkspace((current) => current ? {
+      ...current,
+      application_identities: [saved, ...current.application_identities.filter((item) => item.id !== saved.id)],
+    } : current);
+    setToast(`Verification sent to ${saved.email}.`);
+    return saved;
+  }, []);
+
+  const updateApplicationIdentity = useCallback(async (identity: ApplicationIdentity) => {
+    const saved = isPreview ? { ...identity, updated_at_ms: Date.now() } : await jobsApi.updateApplicationIdentity(identity);
+    setWorkspace((current) => current ? {
+      ...current,
+      application_identities: current.application_identities.map((item) => item.id === saved.id
+        ? saved
+        : saved.is_default ? { ...item, is_default: false } : item),
+    } : current);
+    setToast(saved.is_default ? `${saved.email} is now the default.` : "Application email updated.");
+    return saved;
+  }, []);
+
+  const verifyApplicationIdentity = useCallback(async (identity: ApplicationIdentity, code: string) => {
+    const saved = isPreview
+      ? { ...identity, verification_status: "verified" as const, updated_at_ms: Date.now() }
+      : await jobsApi.verifyApplicationIdentity(identity.id, code);
+    setWorkspace((current) => current ? {
+      ...current,
+      application_identities: current.application_identities.map((item) => item.id === saved.id ? saved : item),
+    } : current);
+    setToast(`${saved.email} verified.`);
+    return saved;
+  }, []);
+
+  const resendApplicationIdentity = useCallback(async (identity: ApplicationIdentity) => {
+    if (!isPreview) await jobsApi.resendApplicationIdentity(identity.id);
+    setToast(`New code sent to ${identity.email}.`);
+  }, []);
+
+  const deleteApplicationIdentity = useCallback(async (identity: ApplicationIdentity) => {
+    if (!isPreview) await jobsApi.deleteApplicationIdentity(identity.id);
+    setWorkspace((current) => current ? {
+      ...current,
+      application_identities: current.application_identities.filter((item) => item.id !== identity.id),
+    } : current);
+    setToast(`${identity.email} removed.`);
+  }, []);
+
+  const requestMailboxConnection = useCallback(async (connection: MailboxConnection) => {
+    const saved = isPreview
+      ? { ...connection, id: `mailbox-${Date.now()}`, status: "pending" as const, created_at_ms: Date.now(), updated_at_ms: Date.now() }
+      : await jobsApi.requestMailboxConnection(connection);
+    setWorkspace((current) => current ? {
+      ...current,
+      mailbox_connections: [saved, ...current.mailbox_connections.filter((item) => item.id !== saved.id)],
+    } : current);
+    setToast(`${saved.account_label} is ready for authorization.`);
+    return saved;
+  }, []);
+
+  const deleteMailboxConnection = useCallback(async (connection: MailboxConnection) => {
+    if (!isPreview) await jobsApi.deleteMailboxConnection(connection.id);
+    setWorkspace((current) => current ? {
+      ...current,
+      mailbox_connections: current.mailbox_connections.filter((item) => item.id !== connection.id),
+    } : current);
+    setToast(`${connection.account_label} disconnected.`);
+  }, []);
+
   const queueCloudRun = useCallback(async (application: JobApplication) => {
     if (!workspace) return;
     const job = workspace.matches.find((item) => item.id === application.job_id);
@@ -423,6 +496,13 @@ export default function App() {
               onSaveTrack={saveTrack}
               onDeleteTrack={deleteTrack}
               onSaveIntegration={saveIntegration}
+              onCreateIdentity={createApplicationIdentity}
+              onUpdateIdentity={updateApplicationIdentity}
+              onVerifyIdentity={verifyApplicationIdentity}
+              onResendIdentity={resendApplicationIdentity}
+              onDeleteIdentity={deleteApplicationIdentity}
+              onRequestMailbox={requestMailboxConnection}
+              onDeleteMailbox={deleteMailboxConnection}
             />
           }
         />
@@ -456,6 +536,9 @@ function AuthGate() {
 }
 
 function previewResume(workspace: JobsWorkspace, job: JobPosting, id: string, mode: string): ResumeVersion {
+  const track = workspace.tracks.find((item) => item.id === job.track_id);
+  const applicationIdentity = workspace.application_identities.find((item) => item.id === track?.application_identity_id)
+    || workspace.application_identities.find((item) => item.is_default && item.verification_status === "verified");
   return {
     id,
     job_id: job.id,
@@ -465,7 +548,7 @@ function previewResume(workspace: JobsWorkspace, job: JobPosting, id: string, mo
       target: { company: job.company, title: job.title, location: job.location },
       contact: {
         name: workspace.profile.full_name,
-        email: workspace.profile.email,
+        email: applicationIdentity?.email || workspace.profile.email,
         phone: workspace.profile.phone,
         location: workspace.profile.current_location,
       },

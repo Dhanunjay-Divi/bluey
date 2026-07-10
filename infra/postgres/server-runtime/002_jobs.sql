@@ -167,3 +167,41 @@ CREATE TABLE IF NOT EXISTS jobs_packet_metering (
   PRIMARY KEY (account_id, job_id),
   UNIQUE(account_id, metering_key)
 );
+
+CREATE TABLE IF NOT EXISTS jobs_application_identities (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  email_hash TEXT NOT NULL UNIQUE,
+  identity_json TEXT NOT NULL,
+  verification_status TEXT NOT NULL DEFAULT 'pending',
+  is_default INTEGER NOT NULL DEFAULT 0,
+  created_at_ms BIGINT NOT NULL,
+  updated_at_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_application_identities_account
+  ON jobs_application_identities(account_id, is_default DESC, updated_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS jobs_identity_verifications (
+  identity_id TEXT PRIMARY KEY REFERENCES jobs_application_identities(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  otp_hash TEXT NOT NULL,
+  attempts BIGINT NOT NULL DEFAULT 0,
+  expires_at_ms BIGINT NOT NULL,
+  created_at_ms BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_identity_verifications_expiry
+  ON jobs_identity_verifications(expires_at_ms);
+
+CREATE TABLE IF NOT EXISTS jobs_mailbox_connections (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  provider_subject_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  connection_json TEXT NOT NULL,
+  created_at_ms BIGINT NOT NULL,
+  updated_at_ms BIGINT NOT NULL,
+  UNIQUE(account_id, provider, provider_subject_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_mailbox_connections_account
+  ON jobs_mailbox_connections(account_id, status, updated_at_ms DESC);

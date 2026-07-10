@@ -11,6 +11,7 @@ use aes_gcm::{
 use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::{Datelike, TimeZone, Utc};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use rusqlite::{params, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -20,7 +21,9 @@ use sha2::{Digest, Sha256};
 use super::DbPool;
 
 pub const PACKET_OVERAGE_CENTS: i64 = 50;
+pub const ADDITIONAL_INBOX_CENTS: i64 = 400;
 const ENCRYPTED_PAYLOAD_PREFIX: &str = "bluey-jobs:v1:";
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmploymentEntry {
@@ -255,6 +258,8 @@ pub struct CareerTrack {
     pub locations: Vec<String>,
     #[serde(default)]
     pub remote_preference: String,
+    #[serde(default)]
+    pub application_identity_id: Option<String>,
     #[serde(default = "default_true")]
     pub active: bool,
     #[serde(default)]
@@ -404,6 +409,42 @@ pub struct JobsIntegration {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicationIdentity {
+    #[serde(default)]
+    pub id: String,
+    pub email: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "default_pending_status")]
+    pub verification_status: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailboxConnection {
+    #[serde(default)]
+    pub id: String,
+    pub provider: String,
+    #[serde(default = "default_pending_status")]
+    pub status: String,
+    #[serde(default)]
+    pub account_label: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsEntitlement {
     pub plan: String,
     pub track_limit: i64,
@@ -414,6 +455,10 @@ pub struct JobsEntitlement {
     pub local_browser: bool,
     pub cloud_browser: bool,
     pub overage_cents: i64,
+    pub monthly_price_cents: i64,
+    pub application_identity_limit: i64,
+    pub connected_inbox_limit: i64,
+    pub additional_inbox_cents: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,6 +481,8 @@ pub struct JobsWorkspace {
     pub browser_sessions: Vec<BrowserSession>,
     pub interventions: Vec<Intervention>,
     pub integrations: Vec<JobsIntegration>,
+    pub application_identities: Vec<ApplicationIdentity>,
+    pub mailbox_connections: Vec<MailboxConnection>,
     pub entitlement: JobsEntitlement,
 }
 
@@ -500,8 +547,109 @@ fn default_disconnected_status() -> String {
     "disconnected".to_string()
 }
 
+fn default_pending_status() -> String {
+    "pending".to_string()
+}
+
 fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JobsPlanPolicy {
+    monthly_price_cents: i64,
+    track_limit: i64,
+    packet_limit: i64,
+    application_identity_limit: i64,
+    connected_inbox_limit: i64,
+    local_browser: bool,
+    cloud_browser: bool,
+}
+
+fn plan_policy(plan: &str) -> JobsPlanPolicy {
+    match plan {
+        "pro" => JobsPlanPolicy {
+            monthly_price_cents: 2_900,
+            track_limit: 3,
+            packet_limit: 50,
+            application_identity_limit: 10,
+            connected_inbox_limit: 2,
+            local_browser: true,
+            cloud_browser: false,
+        },
+        "cloud" => JobsPlanPolicy {
+            monthly_price_cents: 4_900,
+            track_limit: 5,
+            packet_limit: 100,
+            application_identity_limit: 25,
+            connected_inbox_limit: 5,
+            local_browser: true,
+            cloud_browser: true,
+        },
+        _ => JobsPlanPolicy {
+            monthly_price_cents: 0,
+            track_limit: 1,
+            packet_limit: 5,
+            application_identity_limit: 2,
+            connected_inbox_limit: 1,
+            local_browser: false,
+            cloud_browser: false,
+        },
+    }
+}
+
+fn entitlement_with_policy(
+    plan: String,
+    track_limit: i64,
+    monthly_packet_limit: i64,
+    used_packets: i64,
+    period_start_ms: i64,
+    period_end_ms: i64,
+    local_browser: bool,
+    cloud_browser: bool,
+) -> JobsEntitlement {
+    let policy = plan_policy(&plan);
+    JobsEntitlement {
+        plan,
+        track_limit,
+        monthly_packet_limit,
+        used_packets,
+        period_start_ms,
+        period_end_ms,
+        local_browser,
+        cloud_browser,
+        overage_cents: PACKET_OVERAGE_CENTS,
+        monthly_price_cents: policy.monthly_price_cents,
+        application_identity_limit: policy.application_identity_limit,
+        connected_inbox_limit: policy.connected_inbox_limit,
+        additional_inbox_cents: ADDITIONAL_INBOX_CENTS,
+    }
+}
+
+pub fn normalize_application_email(email: &str) -> Result<String> {
+    let normalized = email.trim().to_ascii_lowercase();
+    let mut pieces = normalized.split('@');
+    let local = pieces.next().unwrap_or_default();
+    let domain = pieces.next().unwrap_or_default();
+    if local.is_empty()
+        || domain.is_empty()
+        || pieces.next().is_some()
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || !domain.contains('.')
+    {
+        anyhow::bail!("enter a complete email address")
+    }
+    Ok(normalized)
+}
+
+fn private_lookup_hash(scope: &str, value: &str) -> Result<String> {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&jobs_data_key()?)
+        .map_err(|_| anyhow::anyhow!("invalid Bluey Jobs data key"))?;
+    mac.update(scope.as_bytes());
+    mac.update(&[0]);
+    mac.update(value.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 fn parse_json<T: DeserializeOwned>(raw: String, label: &str) -> Result<T> {
@@ -953,6 +1101,13 @@ pub fn list_tracks(pool: &DbPool, account_id: &str) -> Result<Vec<CareerTrack>> 
 
 pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Result<CareerTrack> {
     let mut value = track.clone();
+    if let Some(identity_id) = value.application_identity_id.as_deref() {
+        let identity = get_application_identity(pool, account_id, identity_id)?
+            .ok_or_else(|| anyhow::anyhow!("application email not found"))?;
+        if identity.verification_status != "verified" {
+            anyhow::bail!("verify the application email before using it on a Career Track")
+        }
+    }
     if value.id.trim().is_empty() {
         value.id = uuid::Uuid::new_v4().to_string();
     }
@@ -1373,6 +1528,23 @@ pub fn prepare_application(
     let profile = get_profile(pool, account_id, "")?;
     let posting =
         get_posting(pool, account_id, job_id)?.ok_or_else(|| anyhow::anyhow!("job not found"))?;
+    let login_email = if profile.email.trim().is_empty() {
+        account_login_email(pool, account_id)?
+    } else {
+        profile.email.clone()
+    };
+    let _ = ensure_primary_application_identity(pool, account_id, &login_email)?;
+    let identities = list_application_identities(pool, account_id)?;
+    let track_identity_id = list_tracks(pool, account_id)?
+        .into_iter()
+        .find(|track| track.id == posting.track_id)
+        .and_then(|track| track.application_identity_id);
+    let application_identity = track_identity_id
+        .as_deref()
+        .and_then(|identity_id| identities.iter().find(|item| item.id == identity_id))
+        .or_else(|| identities.iter().find(|item| item.is_default))
+        .filter(|item| item.verification_status == "verified")
+        .ok_or_else(|| anyhow::anyhow!("verify an application email before preparing this packet"))?;
     let facts = list_facts(pool, account_id)?;
     let approved_fact_ids: Vec<String> = facts
         .iter()
@@ -1390,7 +1562,7 @@ pub fn prepare_application(
         },
         "contact": {
             "name": profile.full_name,
-            "email": profile.email,
+            "email": application_identity.email,
             "phone": profile.phone,
             "location": profile.current_location,
             "linkedin_url": profile.linkedin_url,
@@ -1408,6 +1580,7 @@ pub fn prepare_application(
             "fact_ids": approved_fact_ids,
             "mode": mode,
             "generated_for_job_id": posting.id,
+            "application_identity_id": application_identity.id,
         },
     });
     let diff = json!({
@@ -1462,12 +1635,35 @@ pub fn prepare_application(
     application.receipt = json!({
         "job_snapshot": posting,
         "resume_version_id": resume.id,
+        "application_identity": {
+            "id": application_identity.id,
+            "email": application_identity.email,
+            "label": application_identity.label,
+            "verified": true,
+        },
         "prepared_at_ms": now,
         "final_answers": application.answers,
         "confirmation": Value::Null,
     });
     save_application(pool, account_id, &application)?;
     Ok((application, resume))
+}
+
+fn account_login_email(pool: &DbPool, account_id: &str) -> Result<String> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => pool
+            .get()?
+            .query_row(
+                "SELECT email FROM accounts WHERE id = ?1",
+                params![account_id],
+                |row| row.get(0),
+            )
+            .context("get Bluey account email"),
+        DbPool::Postgres(_) => Ok(pool
+            .get_pg()?
+            .query_one("SELECT email FROM accounts WHERE id = $1", &[&account_id])?
+            .get(0)),
+    })
 }
 
 fn select_skills(skills: &[String], description: &str) -> Vec<String> {
@@ -1844,17 +2040,16 @@ pub fn get_entitlement(pool: &DbPool, account_id: &str) -> Result<JobsEntitlemen
                    FROM jobs_entitlements WHERE account_id = ?1",
                 params![account_id],
                 |row| {
-                    Ok(JobsEntitlement {
-                        plan: row.get(0)?,
-                        track_limit: row.get(1)?,
-                        monthly_packet_limit: row.get(2)?,
-                        used_packets: row.get(3)?,
-                        period_start_ms: row.get(4)?,
-                        period_end_ms: row.get(5)?,
-                        local_browser: row.get::<_, i64>(6)? != 0,
-                        cloud_browser: row.get::<_, i64>(7)? != 0,
-                        overage_cents: PACKET_OVERAGE_CENTS,
-                    })
+                    Ok(entitlement_with_policy(
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get::<_, i64>(6)? != 0,
+                        row.get::<_, i64>(7)? != 0,
+                    ))
                 },
             )
             .context("get Jobs entitlement")
@@ -1881,17 +2076,16 @@ pub fn get_entitlement(pool: &DbPool, account_id: &str) -> Result<JobsEntitlemen
                    FROM jobs_entitlements WHERE account_id = $1",
                 &[&account_id],
             )?;
-            Ok(JobsEntitlement {
-                plan: row.get(0),
-                track_limit: row.get(1),
-                monthly_packet_limit: row.get(2),
-                used_packets: row.get(3),
-                period_start_ms: row.get(4),
-                period_end_ms: row.get(5),
-                local_browser: row.get::<_, i64>(6) != 0,
-                cloud_browser: row.get::<_, i64>(7) != 0,
-                overage_cents: PACKET_OVERAGE_CENTS,
-            })
+            Ok(entitlement_with_policy(
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+                row.get::<_, i64>(6) != 0,
+                row.get::<_, i64>(7) != 0,
+            ))
         }
     })
 }
@@ -1901,11 +2095,11 @@ pub fn set_entitlement_plan(
     account_id: &str,
     plan: &str,
 ) -> Result<JobsEntitlement> {
-    let (track_limit, packet_limit, local_browser, cloud_browser) = match plan {
-        "pro" => (3, 50, 1, 0),
-        "cloud" => (5, 100, 1, 1),
-        _ => (1, 5, 0, 0),
-    };
+    let policy = plan_policy(plan);
+    let track_limit = policy.track_limit;
+    let packet_limit = policy.packet_limit;
+    let local_browser = i64::from(policy.local_browser);
+    let cloud_browser = i64::from(policy.cloud_browser);
     let _ = get_entitlement(pool, account_id)?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -2303,6 +2497,722 @@ pub fn save_intervention(
     })
 }
 
+pub fn list_application_identities(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Vec<ApplicationIdentity>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let mut stmt = conn.prepare(
+                "SELECT identity_json, verification_status, is_default
+                   FROM jobs_application_identities WHERE account_id = ?1
+                  ORDER BY is_default DESC, updated_at_ms DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![account_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(raw, status, is_default)| {
+                    parse_application_identity_row(raw, status, is_default)
+                })
+                .collect()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query(
+                "SELECT identity_json, verification_status, is_default
+                   FROM jobs_application_identities WHERE account_id = $1
+                  ORDER BY is_default DESC, updated_at_ms DESC",
+                &[&account_id],
+            )?
+            .into_iter()
+            .map(|row| {
+                parse_application_identity_row(
+                    row.get(0),
+                    row.get(1),
+                    row.get::<_, i64>(2) != 0,
+                )
+            })
+            .collect(),
+    })
+}
+
+fn parse_application_identity_row(
+    raw: String,
+    verification_status: String,
+    is_default: bool,
+) -> Result<ApplicationIdentity> {
+    let mut identity: ApplicationIdentity = parse_json(raw, "application identity")?;
+    identity.verification_status = verification_status;
+    identity.is_default = is_default;
+    Ok(identity)
+}
+
+pub fn get_application_identity(
+    pool: &DbPool,
+    account_id: &str,
+    identity_id: &str,
+) -> Result<Option<ApplicationIdentity>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let raw: Option<(String, String, i64)> = pool
+                .get()?
+                .query_row(
+                    "SELECT identity_json, verification_status, is_default
+                       FROM jobs_application_identities
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, identity_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            raw.map(|(value, status, is_default)| {
+                parse_application_identity_row(value, status, is_default != 0)
+            })
+            .transpose()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query_opt(
+                "SELECT identity_json, verification_status, is_default
+                   FROM jobs_application_identities
+                  WHERE account_id = $1 AND id = $2",
+                &[&account_id, &identity_id],
+            )?
+            .map(|row| {
+                parse_application_identity_row(
+                    row.get(0),
+                    row.get(1),
+                    row.get::<_, i64>(2) != 0,
+                )
+            })
+            .transpose(),
+    })
+}
+
+fn application_identity_by_hash(
+    pool: &DbPool,
+    email_hash: &str,
+) -> Result<Option<(String, ApplicationIdentity)>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let row: Option<(String, String, String, i64)> = pool
+                .get()?
+                .query_row(
+                    "SELECT account_id, identity_json, verification_status, is_default
+                       FROM jobs_application_identities
+                      WHERE email_hash = ?1",
+                    params![email_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            row.map(|(owner, raw, status, is_default)| {
+                Ok((
+                    owner,
+                    parse_application_identity_row(raw, status, is_default != 0)?,
+                ))
+            })
+            .transpose()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query_opt(
+                "SELECT account_id, identity_json, verification_status, is_default
+                   FROM jobs_application_identities
+                  WHERE email_hash = $1",
+                &[&email_hash],
+            )?
+            .map(|row| {
+                Ok((
+                    row.get(0),
+                    parse_application_identity_row(
+                        row.get(1),
+                        row.get(2),
+                        row.get::<_, i64>(3) != 0,
+                    )?,
+                ))
+            })
+            .transpose(),
+    })
+}
+
+pub fn ensure_primary_application_identity(
+    pool: &DbPool,
+    account_id: &str,
+    email: &str,
+) -> Result<ApplicationIdentity> {
+    let normalized = normalize_application_email(email)?;
+    let email_hash = private_lookup_hash("application-email", &normalized)?;
+    if let Some((owner, existing)) = application_identity_by_hash(pool, &email_hash)? {
+        if owner != account_id {
+            anyhow::bail!("this application email belongs to another Bluey Jobs account")
+        }
+        return Ok(existing);
+    }
+    let is_default = list_application_identities(pool, account_id)?.is_empty();
+    save_application_identity(
+        pool,
+        account_id,
+        &ApplicationIdentity {
+            id: String::new(),
+            email: normalized,
+            label: "Bluey login".to_string(),
+            verification_status: "verified".to_string(),
+            is_default,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+}
+
+pub fn save_application_identity(
+    pool: &DbPool,
+    account_id: &str,
+    identity: &ApplicationIdentity,
+) -> Result<ApplicationIdentity> {
+    let mut value = identity.clone();
+    value.email = normalize_application_email(&value.email)?;
+    if !matches!(value.verification_status.as_str(), "pending" | "verified") {
+        anyhow::bail!("invalid application email verification status")
+    }
+    let email_hash = private_lookup_hash("application-email", &value.email)?;
+    if let Some((owner, existing)) = application_identity_by_hash(pool, &email_hash)? {
+        if owner != account_id {
+            anyhow::bail!("this application email belongs to another Bluey Jobs account")
+        }
+        if value.id.is_empty() {
+            value.id = existing.id;
+            value.created_at_ms = existing.created_at_ms;
+            value.verification_status = existing.verification_status;
+        }
+    }
+
+    let existing = if value.id.is_empty() {
+        None
+    } else {
+        get_application_identity(pool, account_id, &value.id)?
+    };
+    if existing.is_none() {
+        let entitlement = get_entitlement(pool, account_id)?;
+        if list_application_identities(pool, account_id)?.len() as i64
+            >= entitlement.application_identity_limit
+        {
+            anyhow::bail!("application email limit reached for this Jobs plan")
+        }
+    } else if existing
+        .as_ref()
+        .is_some_and(|item| item.verification_status == "verified")
+    {
+        value.verification_status = "verified".to_string();
+    }
+    if value.id.is_empty() {
+        value.id = uuid::Uuid::new_v4().to_string();
+    }
+    let now = now_ms();
+    if value.created_at_ms == 0 {
+        value.created_at_ms = now;
+    }
+    value.updated_at_ms = now;
+    if value.is_default && value.verification_status != "verified" {
+        anyhow::bail!("verify the application email before making it the default")
+    }
+    let payload = to_json(&value, "application identity")?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if value.is_default {
+                tx.execute(
+                    "UPDATE jobs_application_identities SET is_default = 0
+                      WHERE account_id = ?1 AND id <> ?2",
+                    params![account_id, value.id],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO jobs_application_identities (
+                    id, account_id, email_hash, identity_json, verification_status,
+                    is_default, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    email_hash = excluded.email_hash,
+                    identity_json = excluded.identity_json,
+                    verification_status = excluded.verification_status,
+                    is_default = excluded.is_default,
+                    updated_at_ms = excluded.updated_at_ms
+                 WHERE jobs_application_identities.account_id = excluded.account_id",
+                params![
+                    value.id,
+                    account_id,
+                    email_hash,
+                    payload,
+                    value.verification_status,
+                    i64::from(value.is_default),
+                    value.created_at_ms,
+                    value.updated_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(value)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            if value.is_default {
+                tx.execute(
+                    "UPDATE jobs_application_identities SET is_default = 0
+                      WHERE account_id = $1 AND id <> $2",
+                    &[&account_id, &value.id],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO jobs_application_identities (
+                    id, account_id, email_hash, identity_json, verification_status,
+                    is_default, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    email_hash = EXCLUDED.email_hash,
+                    identity_json = EXCLUDED.identity_json,
+                    verification_status = EXCLUDED.verification_status,
+                    is_default = EXCLUDED.is_default,
+                    updated_at_ms = EXCLUDED.updated_at_ms
+                 WHERE jobs_application_identities.account_id = EXCLUDED.account_id",
+                &[
+                    &value.id,
+                    &account_id,
+                    &email_hash,
+                    &payload,
+                    &value.verification_status,
+                    &i64::from(value.is_default),
+                    &value.created_at_ms,
+                    &value.updated_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(value)
+        }
+    })
+}
+
+pub fn delete_application_identity(
+    pool: &DbPool,
+    account_id: &str,
+    identity_id: &str,
+) -> Result<bool> {
+    let identity = get_application_identity(pool, account_id, identity_id)?
+        .ok_or_else(|| anyhow::anyhow!("application email not found"))?;
+    if identity.is_default {
+        anyhow::bail!("choose another default application email before removing this one")
+    }
+    if list_tracks(pool, account_id)?
+        .iter()
+        .any(|track| track.application_identity_id.as_deref() == Some(identity_id))
+    {
+        anyhow::bail!("choose another email for the Career Track before removing this one")
+    }
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
+            "DELETE FROM jobs_application_identities WHERE account_id = ?1 AND id = ?2",
+            params![account_id, identity_id],
+        )? > 0),
+        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
+            "DELETE FROM jobs_application_identities WHERE account_id = $1 AND id = $2",
+            &[&account_id, &identity_id],
+        )? > 0),
+    })
+}
+
+pub fn save_identity_verification(
+    pool: &DbPool,
+    account_id: &str,
+    identity_id: &str,
+    code: &str,
+    ttl_ms: i64,
+) -> Result<ApplicationIdentity> {
+    let identity = get_application_identity(pool, account_id, identity_id)?
+        .ok_or_else(|| anyhow::anyhow!("application email not found"))?;
+    if identity.verification_status == "verified" {
+        return Ok(identity);
+    }
+    let created_at = now_ms();
+    let expires_at = created_at + ttl_ms;
+    let otp_hash = private_lookup_hash(&format!("identity-otp:{identity_id}"), code)?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let previous: Option<i64> = conn
+                .query_row(
+                    "SELECT created_at_ms FROM jobs_identity_verifications
+                      WHERE account_id = ?1 AND identity_id = ?2",
+                    params![account_id, identity_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if previous.is_some_and(|timestamp| timestamp > created_at - 60_000) {
+                anyhow::bail!("wait a minute before requesting another verification code")
+            }
+            conn.execute(
+                "INSERT INTO jobs_identity_verifications (
+                    identity_id, account_id, otp_hash, attempts, expires_at_ms, created_at_ms
+                 ) VALUES (?1, ?2, ?3, 0, ?4, ?5)
+                 ON CONFLICT(identity_id) DO UPDATE SET otp_hash = excluded.otp_hash,
+                    attempts = 0, expires_at_ms = excluded.expires_at_ms,
+                    created_at_ms = excluded.created_at_ms
+                 WHERE jobs_identity_verifications.account_id = excluded.account_id",
+                params![identity_id, account_id, otp_hash, expires_at, created_at],
+            )?;
+            Ok(identity)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let previous = conn.query_opt(
+                "SELECT created_at_ms FROM jobs_identity_verifications
+                  WHERE account_id = $1 AND identity_id = $2",
+                &[&account_id, &identity_id],
+            )?;
+            if previous.is_some_and(|row| row.get::<_, i64>(0) > created_at - 60_000) {
+                anyhow::bail!("wait a minute before requesting another verification code")
+            }
+            conn.execute(
+                "INSERT INTO jobs_identity_verifications (
+                    identity_id, account_id, otp_hash, attempts, expires_at_ms, created_at_ms
+                 ) VALUES ($1, $2, $3, 0, $4, $5)
+                 ON CONFLICT(identity_id) DO UPDATE SET otp_hash = EXCLUDED.otp_hash,
+                    attempts = 0, expires_at_ms = EXCLUDED.expires_at_ms,
+                    created_at_ms = EXCLUDED.created_at_ms
+                 WHERE jobs_identity_verifications.account_id = EXCLUDED.account_id",
+                &[&identity_id, &account_id, &otp_hash, &expires_at, &created_at],
+            )?;
+            Ok(identity)
+        }
+    })
+}
+
+fn constant_time_equal(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
+
+pub fn verify_application_identity(
+    pool: &DbPool,
+    account_id: &str,
+    identity_id: &str,
+    code: &str,
+) -> Result<ApplicationIdentity> {
+    let submitted_hash = private_lookup_hash(&format!("identity-otp:{identity_id}"), code)?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let (stored_hash, attempts, expires_at): (String, i64, i64) = tx
+                .query_row(
+                    "SELECT otp_hash, attempts, expires_at_ms FROM jobs_identity_verifications
+                      WHERE account_id = ?1 AND identity_id = ?2",
+                    params![account_id, identity_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("request a new verification code"))?;
+            if expires_at <= now_ms() {
+                anyhow::bail!("verification code expired")
+            }
+            if attempts >= 5 {
+                anyhow::bail!("too many verification attempts; request a new code")
+            }
+            if !constant_time_equal(&stored_hash, &submitted_hash) {
+                tx.execute(
+                    "UPDATE jobs_identity_verifications SET attempts = attempts + 1
+                      WHERE account_id = ?1 AND identity_id = ?2",
+                    params![account_id, identity_id],
+                )?;
+                tx.commit()?;
+                anyhow::bail!("verification code is incorrect")
+            }
+            let raw: String = tx.query_row(
+                "SELECT identity_json FROM jobs_application_identities
+                  WHERE account_id = ?1 AND id = ?2",
+                params![account_id, identity_id],
+                |row| row.get(0),
+            )?;
+            let mut identity: ApplicationIdentity = parse_json(raw, "application identity")?;
+            identity.verification_status = "verified".to_string();
+            identity.updated_at_ms = now_ms();
+            let payload = to_json(&identity, "application identity")?;
+            tx.execute(
+                "UPDATE jobs_application_identities SET verification_status = 'verified',
+                    identity_json = ?3, updated_at_ms = ?4
+                  WHERE account_id = ?1 AND id = ?2",
+                params![account_id, identity_id, payload, identity.updated_at_ms],
+            )?;
+            tx.execute(
+                "DELETE FROM jobs_identity_verifications WHERE account_id = ?1 AND identity_id = ?2",
+                params![account_id, identity_id],
+            )?;
+            tx.commit()?;
+            Ok(identity)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let row = tx
+                .query_opt(
+                    "SELECT otp_hash, attempts, expires_at_ms FROM jobs_identity_verifications
+                      WHERE account_id = $1 AND identity_id = $2 FOR UPDATE",
+                    &[&account_id, &identity_id],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("request a new verification code"))?;
+            let stored_hash: String = row.get(0);
+            let attempts: i64 = row.get(1);
+            let expires_at: i64 = row.get(2);
+            if expires_at <= now_ms() {
+                anyhow::bail!("verification code expired")
+            }
+            if attempts >= 5 {
+                anyhow::bail!("too many verification attempts; request a new code")
+            }
+            if !constant_time_equal(&stored_hash, &submitted_hash) {
+                tx.execute(
+                    "UPDATE jobs_identity_verifications SET attempts = attempts + 1
+                      WHERE account_id = $1 AND identity_id = $2",
+                    &[&account_id, &identity_id],
+                )?;
+                tx.commit()?;
+                anyhow::bail!("verification code is incorrect")
+            }
+            let raw: String = tx
+                .query_one(
+                    "SELECT identity_json FROM jobs_application_identities
+                      WHERE account_id = $1 AND id = $2",
+                    &[&account_id, &identity_id],
+                )?
+                .get(0);
+            let mut identity: ApplicationIdentity = parse_json(raw, "application identity")?;
+            identity.verification_status = "verified".to_string();
+            identity.updated_at_ms = now_ms();
+            let payload = to_json(&identity, "application identity")?;
+            tx.execute(
+                "UPDATE jobs_application_identities SET verification_status = 'verified',
+                    identity_json = $3, updated_at_ms = $4
+                  WHERE account_id = $1 AND id = $2",
+                &[&account_id, &identity_id, &payload, &identity.updated_at_ms],
+            )?;
+            tx.execute(
+                "DELETE FROM jobs_identity_verifications WHERE account_id = $1 AND identity_id = $2",
+                &[&account_id, &identity_id],
+            )?;
+            tx.commit()?;
+            Ok(identity)
+        }
+    })
+}
+
+pub fn delete_identity_verification(
+    pool: &DbPool,
+    account_id: &str,
+    identity_id: &str,
+) -> Result<()> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            pool.get()?.execute(
+                "DELETE FROM jobs_identity_verifications
+                  WHERE account_id = ?1 AND identity_id = ?2",
+                params![account_id, identity_id],
+            )?;
+            Ok(())
+        }
+        DbPool::Postgres(_) => {
+            pool.get_pg()?.execute(
+                "DELETE FROM jobs_identity_verifications
+                  WHERE account_id = $1 AND identity_id = $2",
+                &[&account_id, &identity_id],
+            )?;
+            Ok(())
+        }
+    })
+}
+
+pub fn list_mailbox_connections(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Vec<MailboxConnection>> {
+    list_payloads(
+        pool,
+        account_id,
+        "jobs_mailbox_connections",
+        "connection_json",
+        "updated_at_ms DESC",
+        "mailbox connection",
+    )
+}
+
+fn mailbox_connection_by_subject(
+    pool: &DbPool,
+    account_id: &str,
+    provider: &str,
+    subject_hash: &str,
+) -> Result<Option<MailboxConnection>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let raw: Option<String> = pool
+                .get()?
+                .query_row(
+                    "SELECT connection_json FROM jobs_mailbox_connections
+                      WHERE account_id = ?1 AND provider = ?2 AND provider_subject_hash = ?3",
+                    params![account_id, provider, subject_hash],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            raw.map(|value| parse_json(value, "mailbox connection"))
+                .transpose()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query_opt(
+                "SELECT connection_json FROM jobs_mailbox_connections
+                  WHERE account_id = $1 AND provider = $2 AND provider_subject_hash = $3",
+                &[&account_id, &provider, &subject_hash],
+            )?
+            .map(|row| parse_json(row.get(0), "mailbox connection"))
+            .transpose(),
+    })
+}
+
+pub fn save_mailbox_connection(
+    pool: &DbPool,
+    account_id: &str,
+    connection: &MailboxConnection,
+    provider_subject: &str,
+) -> Result<MailboxConnection> {
+    let mut value = connection.clone();
+    if !matches!(value.provider.as_str(), "gmail" | "outlook") {
+        anyhow::bail!("choose Gmail or Outlook")
+    }
+    if !matches!(value.status.as_str(), "pending" | "connected" | "disconnected") {
+        anyhow::bail!("invalid mailbox connection status")
+    }
+    value.account_label = normalize_application_email(&value.account_label)?;
+    value.aliases = value
+        .aliases
+        .iter()
+        .filter_map(|alias| normalize_application_email(alias).ok())
+        .collect();
+    value.aliases.sort();
+    value.aliases.dedup();
+    let subject = if provider_subject.trim().is_empty() {
+        value.account_label.as_str()
+    } else {
+        provider_subject.trim()
+    };
+    let subject_hash = private_lookup_hash(&format!("mailbox:{}", value.provider), subject)?;
+    let existing = list_mailbox_connections(pool, account_id)?;
+    if value.id.is_empty() {
+        if let Some(item) = mailbox_connection_by_subject(
+            pool,
+            account_id,
+            &value.provider,
+            &subject_hash,
+        )? {
+            value.id = item.id.clone();
+            value.created_at_ms = item.created_at_ms;
+        } else {
+            let entitlement = get_entitlement(pool, account_id)?;
+            let active_count = existing
+                .iter()
+                .filter(|item| item.status != "disconnected")
+                .count() as i64;
+            if value.status != "disconnected" && active_count >= entitlement.connected_inbox_limit {
+                anyhow::bail!("connected inbox limit reached for this Jobs plan")
+            }
+            value.id = uuid::Uuid::new_v4().to_string();
+        }
+    }
+    let now = now_ms();
+    if value.created_at_ms == 0 {
+        value.created_at_ms = now;
+    }
+    value.updated_at_ms = now;
+    if value.capabilities.is_empty() {
+        value.capabilities = vec!["status_sync".to_string(), "follow_ups".to_string()];
+    }
+    let payload = to_json(&value, "mailbox connection")?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            pool.get()?.execute(
+                "INSERT INTO jobs_mailbox_connections (
+                    id, account_id, provider, provider_subject_hash, status,
+                    connection_json, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET status = excluded.status,
+                    connection_json = excluded.connection_json,
+                    updated_at_ms = excluded.updated_at_ms
+                 WHERE jobs_mailbox_connections.account_id = excluded.account_id",
+                params![
+                    value.id,
+                    account_id,
+                    value.provider,
+                    subject_hash,
+                    value.status,
+                    payload,
+                    value.created_at_ms,
+                    value.updated_at_ms,
+                ],
+            )?;
+            Ok(value)
+        }
+        DbPool::Postgres(_) => {
+            pool.get_pg()?.execute(
+                "INSERT INTO jobs_mailbox_connections (
+                    id, account_id, provider, provider_subject_hash, status,
+                    connection_json, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT(id) DO UPDATE SET status = EXCLUDED.status,
+                    connection_json = EXCLUDED.connection_json,
+                    updated_at_ms = EXCLUDED.updated_at_ms
+                 WHERE jobs_mailbox_connections.account_id = EXCLUDED.account_id",
+                &[
+                    &value.id,
+                    &account_id,
+                    &value.provider,
+                    &subject_hash,
+                    &value.status,
+                    &payload,
+                    &value.created_at_ms,
+                    &value.updated_at_ms,
+                ],
+            )?;
+            Ok(value)
+        }
+    })
+}
+
+pub fn delete_mailbox_connection(
+    pool: &DbPool,
+    account_id: &str,
+    connection_id: &str,
+) -> Result<bool> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
+            "DELETE FROM jobs_mailbox_connections WHERE account_id = ?1 AND id = ?2",
+            params![account_id, connection_id],
+        )? > 0),
+        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
+            "DELETE FROM jobs_mailbox_connections WHERE account_id = $1 AND id = $2",
+            &[&account_id, &connection_id],
+        )? > 0),
+    })
+}
+
 pub fn list_integrations(pool: &DbPool, account_id: &str) -> Result<Vec<JobsIntegration>> {
     let mut integrations: Vec<JobsIntegration> = list_payloads(
         pool,
@@ -2312,9 +3222,8 @@ pub fn list_integrations(pool: &DbPool, account_id: &str) -> Result<Vec<JobsInte
         "provider ASC",
         "Jobs integration",
     )?;
+    integrations.retain(|item| matches!(item.provider.as_str(), "google_calendar" | "outlook_calendar"));
     for (provider, capabilities) in [
-        ("gmail", vec!["status_sync", "follow_ups"]),
-        ("outlook_email", vec!["status_sync", "follow_ups"]),
         ("google_calendar", vec!["interview_calendar"]),
         ("outlook_calendar", vec!["interview_calendar"]),
     ] {
@@ -2462,6 +3371,7 @@ pub fn list_run_events(pool: &DbPool, account_id: &str, run_id: &str) -> Result<
 }
 
 pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWorkspace> {
+    let _ = ensure_primary_application_identity(pool, account_id, email)?;
     Ok(JobsWorkspace {
         profile: get_profile(pool, account_id, email)?,
         preferences: get_preferences(pool, account_id)?,
@@ -2472,6 +3382,8 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
         browser_sessions: list_browser_sessions(pool, account_id)?,
         interventions: list_interventions(pool, account_id)?,
         integrations: list_integrations(pool, account_id)?,
+        application_identities: list_application_identities(pool, account_id)?,
+        mailbox_connections: list_mailbox_connections(pool, account_id)?,
         entitlement: get_entitlement(pool, account_id)?,
     })
 }
@@ -2739,5 +3651,206 @@ mod tests {
             .unwrap();
         assert_eq!(unchanged.state, "queued");
         assert_eq!(unchanged.submission_mode, "auto_submit");
+    }
+
+    #[test]
+    fn application_emails_are_verified_defaultable_and_plan_limited() {
+        let pool = test_pool();
+        let primary = ensure_primary_application_identity(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+        )
+        .unwrap();
+        assert!(primary.is_default);
+        assert_eq!(primary.verification_status, "verified");
+
+        let alternate = save_application_identity(
+            &pool,
+            "acct-jobs",
+            &ApplicationIdentity {
+                id: String::new(),
+                email: "career@example.com".to_string(),
+                label: "Career address".to_string(),
+                verification_status: "pending".to_string(),
+                is_default: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        save_identity_verification(&pool, "acct-jobs", &alternate.id, "483921", 60_000)
+            .unwrap();
+        let mut verified = verify_application_identity(
+            &pool,
+            "acct-jobs",
+            &alternate.id,
+            "483921",
+        )
+        .unwrap();
+        verified.is_default = true;
+        let verified = save_application_identity(&pool, "acct-jobs", &verified).unwrap();
+        assert!(verified.is_default);
+        assert!(!get_application_identity(&pool, "acct-jobs", &primary.id)
+            .unwrap()
+            .unwrap()
+            .is_default);
+
+        let third = save_application_identity(
+            &pool,
+            "acct-jobs",
+            &ApplicationIdentity {
+                id: String::new(),
+                email: "third@example.com".to_string(),
+                label: String::new(),
+                verification_status: "pending".to_string(),
+                is_default: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        );
+        assert!(third
+            .unwrap_err()
+            .to_string()
+            .contains("application email limit"));
+    }
+
+    #[test]
+    fn mailbox_connections_allow_multiple_provider_accounts_with_plan_limits() {
+        let pool = test_pool();
+        let mailbox = |email: &str| MailboxConnection {
+            id: String::new(),
+            provider: "gmail".to_string(),
+            status: "pending".to_string(),
+            account_label: email.to_string(),
+            aliases: Vec::new(),
+            capabilities: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &mailbox("jobs@example.com"),
+            "google-subject-1",
+        )
+        .unwrap();
+        let free_limit = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &mailbox("career@example.com"),
+            "google-subject-2",
+        );
+        assert!(free_limit
+            .unwrap_err()
+            .to_string()
+            .contains("connected inbox limit"));
+
+        set_entitlement_plan(&pool, "acct-jobs", "pro").unwrap();
+        save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &mailbox("career@example.com"),
+            "google-subject-2",
+        )
+        .unwrap();
+        let mailboxes = list_mailbox_connections(&pool, "acct-jobs").unwrap();
+        assert_eq!(mailboxes.len(), 2);
+        assert!(mailboxes.iter().all(|item| item.provider == "gmail"));
+    }
+
+    #[test]
+    fn career_track_email_is_frozen_into_resume_and_receipt() {
+        let pool = test_pool();
+        let mut profile = default_profile("jobs@example.com");
+        profile.full_name = "Taylor Rivera".to_string();
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        ensure_primary_application_identity(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        let alternate = save_application_identity(
+            &pool,
+            "acct-jobs",
+            &ApplicationIdentity {
+                id: String::new(),
+                email: "applications@example.com".to_string(),
+                label: "Applications".to_string(),
+                verification_status: "pending".to_string(),
+                is_default: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        save_identity_verification(&pool, "acct-jobs", &alternate.id, "602314", 60_000)
+            .unwrap();
+        let alternate = verify_application_identity(
+            &pool,
+            "acct-jobs",
+            &alternate.id,
+            "602314",
+        )
+        .unwrap();
+        let track = upsert_track(
+            &pool,
+            "acct-jobs",
+            &CareerTrack {
+                id: String::new(),
+                name: "Engineering".to_string(),
+                role: "Product Engineer".to_string(),
+                locations: vec!["New York, NY".to_string()],
+                remote_preference: "hybrid_ok".to_string(),
+                application_identity_id: Some(alternate.id.clone()),
+                active: true,
+                match_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &JobPosting {
+                id: String::new(),
+                canonical_key: String::new(),
+                source: "greenhouse".to_string(),
+                external_id: "email-test".to_string(),
+                company: "Northstar".to_string(),
+                title: "Product Engineer".to_string(),
+                location: "New York, NY".to_string(),
+                workplace: "hybrid".to_string(),
+                canonical_url: "https://example.com/jobs/email-test".to_string(),
+                description: "Product engineering".to_string(),
+                compensation: String::new(),
+                track_id: track.id,
+                match_score: 88,
+                matched_reasons: Vec::new(),
+                missing_requirements: Vec::new(),
+                status: "matched".to_string(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, resume) = prepare_application(
+            &pool,
+            "acct-jobs",
+            &posting.id,
+            "factual",
+            "review_first",
+        )
+        .unwrap();
+        assert_eq!(
+            resume.content.pointer("/contact/email").and_then(Value::as_str),
+            Some("applications@example.com")
+        );
+        assert_eq!(
+            application
+                .receipt
+                .pointer("/application_identity/email")
+                .and_then(Value::as_str),
+            Some("applications@example.com")
+        );
     }
 }

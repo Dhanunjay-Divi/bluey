@@ -1,5 +1,6 @@
 import type {
   AccountSummary,
+  ApplicationIdentity,
   BrowserSession,
   CareerFact,
   CareerProfile,
@@ -9,6 +10,7 @@ import type {
   JobPreferences,
   JobsIntegration,
   JobsWorkspace,
+  MailboxConnection,
   PacketCommitResult,
   PrepareApplicationResponse,
   ResumeVersion,
@@ -153,6 +155,34 @@ export const jobsApi = {
       method: "PUT",
       body: JSON.stringify(integration),
     }),
+  createApplicationIdentity: (identity: ApplicationIdentity) =>
+    request<ApplicationIdentity>("/api/jobs/application-identities", {
+      method: "POST",
+      body: JSON.stringify(identity),
+    }),
+  updateApplicationIdentity: (identity: ApplicationIdentity) =>
+    request<ApplicationIdentity>(`/api/jobs/application-identities/${encodeURIComponent(identity.id)}`, {
+      method: "PUT",
+      body: JSON.stringify(identity),
+    }),
+  verifyApplicationIdentity: (id: string, code: string) =>
+    request<ApplicationIdentity>(`/api/jobs/application-identities/${encodeURIComponent(id)}/verify`, {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    }),
+  resendApplicationIdentity: (id: string) =>
+    request<ApplicationIdentity>(`/api/jobs/application-identities/${encodeURIComponent(id)}/resend`, {
+      method: "POST",
+    }),
+  deleteApplicationIdentity: (id: string) =>
+    request<void>(`/api/jobs/application-identities/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  requestMailboxConnection: (connection: MailboxConnection) =>
+    request<MailboxConnection>("/api/jobs/mailbox-connections", {
+      method: "POST",
+      body: JSON.stringify(connection),
+    }),
+  deleteMailboxConnection: (id: string) =>
+    request<void>(`/api/jobs/mailbox-connections/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };
 
 export function loginUrl(): string {

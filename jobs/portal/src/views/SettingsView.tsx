@@ -15,7 +15,15 @@ import {
   Trash2,
   UserRound,
 } from "lucide-react";
-import type { CareerProfile, CareerTrack, JobPreferences, JobsIntegration, JobsWorkspace } from "../types";
+import type {
+  ApplicationIdentity,
+  CareerProfile,
+  CareerTrack,
+  JobPreferences,
+  JobsIntegration,
+  JobsWorkspace,
+  MailboxConnection,
+} from "../types";
 import { Dialog, ConfirmDialog } from "../components/Dialog";
 import { money, titleCase } from "../lib/format";
 
@@ -26,9 +34,30 @@ interface Props {
   onSaveTrack(track: CareerTrack): Promise<void>;
   onDeleteTrack(track: CareerTrack): Promise<void>;
   onSaveIntegration(integration: JobsIntegration): Promise<void>;
+  onCreateIdentity(identity: ApplicationIdentity): Promise<ApplicationIdentity>;
+  onUpdateIdentity(identity: ApplicationIdentity): Promise<ApplicationIdentity>;
+  onVerifyIdentity(identity: ApplicationIdentity, code: string): Promise<ApplicationIdentity>;
+  onResendIdentity(identity: ApplicationIdentity): Promise<void>;
+  onDeleteIdentity(identity: ApplicationIdentity): Promise<void>;
+  onRequestMailbox(connection: MailboxConnection): Promise<MailboxConnection>;
+  onDeleteMailbox(connection: MailboxConnection): Promise<void>;
 }
 
-export function SettingsView({ workspace, onSaveProfile, onSavePreferences, onSaveTrack, onDeleteTrack, onSaveIntegration }: Props) {
+export function SettingsView({
+  workspace,
+  onSaveProfile,
+  onSavePreferences,
+  onSaveTrack,
+  onDeleteTrack,
+  onSaveIntegration,
+  onCreateIdentity,
+  onUpdateIdentity,
+  onVerifyIdentity,
+  onResendIdentity,
+  onDeleteIdentity,
+  onRequestMailbox,
+  onDeleteMailbox,
+}: Props) {
   const [preferences, setPreferences] = useState(workspace.preferences);
   const [profile, setProfile] = useState(workspace.profile);
   const [trackOpen, setTrackOpen] = useState(false);
@@ -36,7 +65,13 @@ export function SettingsView({ workspace, onSaveProfile, onSavePreferences, onSa
   const [disconnecting, setDisconnecting] = useState<JobsIntegration | null>(null);
   const [connecting, setConnecting] = useState<JobsIntegration | null>(null);
   const [deletingTrack, setDeletingTrack] = useState<CareerTrack | null>(null);
+  const [identityOpen, setIdentityOpen] = useState(false);
+  const [verifyingIdentity, setVerifyingIdentity] = useState<ApplicationIdentity | null>(null);
+  const [deletingIdentity, setDeletingIdentity] = useState<ApplicationIdentity | null>(null);
+  const [mailboxOpen, setMailboxOpen] = useState(false);
+  const [disconnectingMailbox, setDisconnectingMailbox] = useState<MailboxConnection | null>(null);
   const [saved, setSaved] = useState("");
+  const [localError, setLocalError] = useState("");
 
   const saveSearchSettings = async () => {
     await Promise.all([onSavePreferences(preferences), onSaveProfile(profile)]);
@@ -47,16 +82,58 @@ export function SettingsView({ workspace, onSaveProfile, onSavePreferences, onSa
   return (
     <div className="view-shell settings-view">
       <section className="view-heading">
-        <div><p className="eyebrow">JOBS PREFERENCES</p><h1>Settings</h1><span>Career Tracks, application rules, integrations, and plan controls.</span></div>
+        <div><p className="eyebrow">JOBS PREFERENCES</p><h1>Settings</h1><span>Career Tracks, application emails, inboxes, and plan controls.</span></div>
         <button className="button primary" onClick={() => void saveSearchSettings()}>Save changes</button>
       </section>
       {saved && <div className="global-message success"><Check size={16} />{saved}</div>}
+      {localError && <div className="global-message error">{localError}</div>}
 
       <section className="settings-section" id="tracks">
         <div className="settings-section-title"><span><Bot /></span><div><p>CAREER TRACK AGENTS</p><h2>Separate searches for separate goals</h2><small>Each agent has its own role, location, and match stream.</small></div><button className="button secondary compact" onClick={() => { setEditingTrack(null); setTrackOpen(true); }} disabled={workspace.tracks.length >= workspace.entitlement.track_limit}><Plus size={15} />New track</button></div>
         <div className="track-settings-list">
           {workspace.tracks.map((track) => <button key={track.id} onClick={() => { setEditingTrack(track); setTrackOpen(true); }}><span className="agent-orbit"><Bot size={18} /></span><div><b>{track.name}</b><p>{track.role}</p><small><MapPin size={12} />{track.locations.join(" · ") || "No locations"}</small></div><span className={track.active ? "agent-state active" : "agent-state"}>{track.active ? "Active" : "Paused"}</span><ChevronRight size={17} /></button>)}
           <div className="track-limit"><span>{workspace.tracks.length} of {workspace.entitlement.track_limit} agents</span><div><i style={{ width: `${Math.min(100, workspace.tracks.length / workspace.entitlement.track_limit * 100)}%` }} /></div></div>
+        </div>
+      </section>
+
+      <section className="settings-section" id="application-emails">
+        <div className="settings-section-title">
+          <span><UserRound /></span>
+          <div>
+            <p>APPLICATION EMAILS</p>
+            <h2>Choose which address employers see</h2>
+            <small>Every Career Track can use a different verified address. Your Bluey login does not change.</small>
+          </div>
+          <button
+            className="button secondary compact"
+            onClick={() => setIdentityOpen(true)}
+            disabled={workspace.application_identities.length >= workspace.entitlement.application_identity_limit}
+          ><Plus size={15} />Add email</button>
+        </div>
+        <div className="identity-summary">
+          <span><b>{workspace.application_identities.length}</b> of {workspace.entitlement.application_identity_limit} application emails</span>
+          <span>Aliases in one inbox share a single connection slot.</span>
+        </div>
+        <div className="identity-list">
+          {workspace.application_identities.map((identity) => {
+            const trackCount = workspace.tracks.filter((track) => track.application_identity_id === identity.id).length;
+            return <div key={identity.id}>
+              <span className="identity-avatar">{identity.email.slice(0, 1).toUpperCase()}</span>
+              <div>
+                <b>{identity.email}</b>
+                <p>{identity.label || "Application email"}{trackCount ? ` · ${trackCount} Career Track${trackCount === 1 ? "" : "s"}` : ""}</p>
+              </div>
+              <div className="identity-badges">
+                {identity.is_default && <span className="status-chip accent">Default</span>}
+                <span className={`status-chip ${identity.verification_status === "verified" ? "success" : "warning"}`}>{identity.verification_status === "verified" ? "Verified" : "Verify"}</span>
+              </div>
+              <div className="identity-actions">
+                {identity.verification_status === "pending" && <button className="button secondary compact" onClick={() => setVerifyingIdentity(identity)}>Enter code</button>}
+                {!identity.is_default && identity.verification_status === "verified" && <button className="icon-button" title="Make default" aria-label={`Make ${identity.email} the default`} onClick={() => void onUpdateIdentity({ ...identity, is_default: true }).catch(showError(setLocalError))}><Check size={15} /></button>}
+                {!identity.is_default && <button className="icon-button danger" title="Remove email" aria-label={`Remove ${identity.email}`} onClick={() => setDeletingIdentity(identity)}><Trash2 size={15} /></button>}
+              </div>
+            </div>;
+          })}
         </div>
       </section>
 
@@ -86,23 +163,62 @@ export function SettingsView({ workspace, onSaveProfile, onSavePreferences, onSa
       </div>
 
       <section className="settings-section">
-        <div className="settings-section-title"><span><Mail /></span><div><p>INTEGRATIONS</p><h2>Application updates and interview calendars</h2><small>Bluey reads status signals and creates reminders after you connect an account.</small></div></div>
-        <div className="integration-list">{workspace.integrations.map((integration) => <div key={integration.provider}><span className="integration-icon">{integration.provider.includes("calendar") ? <CalendarDays /> : <Mail />}</span><div><b>{integrationName(integration.provider)}</b><p>{integration.status === "connected" ? integration.account_label : integration.capabilities.map(titleCase).join(" · ")}</p></div><span className={`integration-state ${integration.status}`}>{titleCase(integration.status)}</span>{integration.status === "connected" ? <button className="button secondary compact" onClick={() => setDisconnecting(integration)}>Disconnect</button> : <button className="button secondary compact" onClick={() => setConnecting(integration)}>Connect</button>}</div>)}</div>
+        <div className="settings-section-title"><span><Mail /></span><div><p>INBOXES & CALENDARS</p><h2>Keep every application timeline current</h2><small>One inbox connection includes its aliases. Connect another slot only for a separate Gmail or Outlook mailbox.</small></div><button className="button secondary compact" onClick={() => setMailboxOpen(true)} disabled={workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length >= workspace.entitlement.connected_inbox_limit}><Plus size={15} />Connect inbox</button></div>
+        <div className="connection-usage"><span><b>{workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length}</b> of {workspace.entitlement.connected_inbox_limit} inbox connections</span><span>Extra inbox slot: {money(workspace.entitlement.additional_inbox_cents)}/month</span></div>
+        <div className="integration-list">
+          {workspace.mailbox_connections.map((connection) => <div key={connection.id}>
+            <span className="integration-icon"><Mail /></span>
+            <div><b>{connection.account_label}</b><p>{connectionName(connection.provider)}{connection.aliases.length ? ` · ${connection.aliases.length} alias${connection.aliases.length === 1 ? "" : "es"}` : ""}</p></div>
+            <span className={`integration-state ${connection.status}`}>{titleCase(connection.status)}</span>
+            <button className="button secondary compact" onClick={() => setDisconnectingMailbox(connection)}>{connection.status === "pending" ? "Remove" : "Disconnect"}</button>
+          </div>)}
+          {workspace.integrations.map((integration) => <div key={integration.provider}><span className="integration-icon"><CalendarDays /></span><div><b>{integrationName(integration.provider)}</b><p>{integration.status === "connected" ? integration.account_label : integration.capabilities.map(titleCase).join(" · ")}</p></div><span className={`integration-state ${integration.status}`}>{titleCase(integration.status)}</span>{integration.status === "connected" ? <button className="button secondary compact" onClick={() => setDisconnecting(integration)}>Disconnect</button> : <button className="button secondary compact" onClick={() => setConnecting(integration)}>Connect</button>}</div>)}
+        </div>
       </section>
 
       <section className="settings-section" id="plans">
         <div className="settings-section-title"><span><CreditCard /></span><div><p>PLAN</p><h2>{titleCase(workspace.entitlement.plan)} Jobs</h2><small>{workspace.entitlement.used_packets} of {workspace.entitlement.monthly_packet_limit} application packets used this month.</small></div><a className="button secondary compact" href="/account#billing">Shared balance<ArrowRight size={15} /></a></div>
         <div className="plan-grid">
-          <Plan name="Free" price="$0" details="1 agent · 5 reviewed packets" active={workspace.entitlement.plan === "free"} />
-          <Plan name="Pro" price="$29" details="3 agents · Local Browser · 50 packets" active={workspace.entitlement.plan === "pro"} />
-          <Plan name="Cloud" price="$49" details="5 agents · Local + cloud · 100 packets" active={workspace.entitlement.plan === "cloud"} />
+          <Plan name="Free" price="$0" details="1 agent · 5 reviewed packets · 2 application emails · 1 inbox" active={workspace.entitlement.plan === "free"} />
+          <Plan name="Pro" price="$29" details="3 agents · 50 packets · 10 application emails · 2 inboxes · local browser" active={workspace.entitlement.plan === "pro"} />
+          <Plan name="Cloud" price="$49" details="5 agents · 100 packets · 25 application emails · 5 inboxes · local + cloud" active={workspace.entitlement.plan === "cloud"} />
         </div>
-        <p className="plan-footnote">After the monthly allowance, each additional completed packet is {money(workspace.entitlement.overage_cents)} from your shared Bluey balance. Retries and browser handoffs do not count again.</p>
+        <p className="plan-footnote">Application emails and aliases are included. Separate inboxes use connection slots; additional slots are {money(workspace.entitlement.additional_inbox_cents)}/month. After the packet allowance, each additional completed packet is {money(workspace.entitlement.overage_cents)} from your shared Bluey balance. Retries and browser handoffs do not count again.</p>
       </section>
 
+      <ApplicationEmailDialog
+        open={identityOpen}
+        onClose={() => setIdentityOpen(false)}
+        onSave={async (identity) => {
+          setLocalError("");
+          const savedIdentity = await onCreateIdentity(identity);
+          setIdentityOpen(false);
+          if (savedIdentity.verification_status === "pending") setVerifyingIdentity(savedIdentity);
+        }}
+      />
+      <VerifyIdentityDialog
+        identity={verifyingIdentity}
+        onClose={() => setVerifyingIdentity(null)}
+        onVerify={async (identity, code) => {
+          setLocalError("");
+          await onVerifyIdentity(identity, code);
+          setVerifyingIdentity(null);
+        }}
+        onResend={onResendIdentity}
+      />
+      <MailboxDialog
+        open={mailboxOpen}
+        onClose={() => setMailboxOpen(false)}
+        onSave={async (connection) => {
+          setLocalError("");
+          await onRequestMailbox(connection);
+          setMailboxOpen(false);
+        }}
+      />
       <TrackDialog
         open={trackOpen}
         track={editingTrack}
+        identities={workspace.application_identities}
         onClose={() => setTrackOpen(false)}
         onSave={async (track) => { await onSaveTrack(track); setTrackOpen(false); }}
         onDelete={(track) => { setTrackOpen(false); setDeletingTrack(track); }}
@@ -115,20 +231,112 @@ export function SettingsView({ workspace, onSaveProfile, onSavePreferences, onSa
         <div className="dialog-actions"><button className="button secondary" onClick={() => setConnecting(null)}>Not now</button><a className="button primary" href={`mailto:hello@bluey.sh?subject=${encodeURIComponent(`Bluey Jobs ${connecting ? integrationName(connecting.provider) : "integration"} beta`)}`}>Request beta access<ArrowRight size={15} /></a></div>
       </Dialog>
       <ConfirmDialog open={Boolean(disconnecting)} title={`Disconnect ${disconnecting ? integrationName(disconnecting.provider) : "integration"}?`} description="Bluey will stop syncing new status updates from this account. Existing application history stays in Jobs." confirmLabel="Disconnect" tone="danger" onClose={() => setDisconnecting(null)} onConfirm={() => { if (disconnecting) void onSaveIntegration({ ...disconnecting, status: "disconnected", account_label: "" }); setDisconnecting(null); }} />
+      <ConfirmDialog open={Boolean(deletingIdentity)} title={`Remove ${deletingIdentity?.email || "application email"}?`} description="Bluey will keep existing application receipts, but this address will no longer be available for new Career Tracks." confirmLabel="Remove email" tone="danger" onClose={() => setDeletingIdentity(null)} onConfirm={() => { const identity = deletingIdentity; setDeletingIdentity(null); if (identity) void onDeleteIdentity(identity).catch(showError(setLocalError)); }} />
+      <ConfirmDialog open={Boolean(disconnectingMailbox)} title={`${disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} ${disconnectingMailbox?.account_label || "inbox"}?`} description="Bluey will stop reading new application updates from this inbox. Existing application history stays in Jobs." confirmLabel={disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} tone="danger" onClose={() => setDisconnectingMailbox(null)} onConfirm={() => { const connection = disconnectingMailbox; setDisconnectingMailbox(null); if (connection) void onDeleteMailbox(connection).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingTrack)} title={`Delete ${deletingTrack?.name || "Career Track"}?`} description="This stops discovery for the track. Existing matches and applications stay in your history." confirmLabel="Delete track" tone="danger" onClose={() => setDeletingTrack(null)} onConfirm={() => { const track = deletingTrack; setDeletingTrack(null); if (track) void onDeleteTrack(track); }} />
     </div>
   );
 }
 
-function TrackDialog({ open, track, onClose, onSave, onDelete }: { open: boolean; track: CareerTrack | null; onClose(): void; onSave(track: CareerTrack): Promise<void>; onDelete(track: CareerTrack): void }) {
-  const [draft, setDraft] = useState<CareerTrack>(track || emptyTrack());
+function ApplicationEmailDialog({ open, onClose, onSave }: { open: boolean; onClose(): void; onSave(identity: ApplicationIdentity): Promise<void> }) {
+  const [email, setEmail] = useState("");
+  const [label, setLabel] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (open) { setEmail(""); setLabel(""); setError(""); }
+  }, [open]);
+  const submit = async () => {
+    setSaving(true);
+    setError("");
+    try {
+      await onSave({ id: "", email, label, verification_status: "pending", is_default: false, created_at_ms: 0, updated_at_ms: 0 });
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <Dialog open={open} title="Add application email" description="Use this address on resumes and application forms without changing your Bluey login." onClose={onClose}>
+    <div className="dialog-form">
+      <label><span>Email address</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="jobs@yourdomain.com" autoFocus /></label>
+      <label><span>Label</span><input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="Engineering applications" /></label>
+      <p className="field-note">Bluey sends a 6-digit code before this address can be used.</p>
+      {error && <div className="inline-error">{error}</div>}
+    </div>
+    <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !email.includes("@") || !label.trim()} onClick={() => void submit()}>{saving ? "Sending..." : "Send code"}</button></div>
+  </Dialog>;
+}
+
+function VerifyIdentityDialog({ identity, onClose, onVerify, onResend }: { identity: ApplicationIdentity | null; onClose(): void; onVerify(identity: ApplicationIdentity, code: string): Promise<void>; onResend(identity: ApplicationIdentity): Promise<void> }) {
+  const [code, setCode] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (identity) { setCode(""); setError(""); }
+  }, [identity]);
+  const verify = async () => {
+    if (!identity) return;
+    setSaving(true);
+    setError("");
+    try {
+      await onVerify(identity, code);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <Dialog open={Boolean(identity)} title="Verify application email" description={identity ? `Enter the code sent to ${identity.email}.` : ""} onClose={onClose}>
+    <div className="dialog-form verification-form">
+      <label><span>Verification code</span><input inputMode="numeric" maxLength={6} value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="000000" autoFocus /></label>
+      {error && <div className="inline-error">{error}</div>}
+      {identity && <button className="text-button" onClick={() => void onResend(identity).catch((requestError) => setError(errorMessage(requestError)))}>Send a new code</button>}
+    </div>
+    <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || code.length !== 6} onClick={() => void verify()}>{saving ? "Verifying..." : "Verify email"}</button></div>
+  </Dialog>;
+}
+
+function MailboxDialog({ open, onClose, onSave }: { open: boolean; onClose(): void; onSave(connection: MailboxConnection): Promise<void> }) {
+  const [provider, setProvider] = useState<MailboxConnection["provider"]>("gmail");
+  const [email, setEmail] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (open) { setProvider("gmail"); setEmail(""); setError(""); }
+  }, [open]);
+  const submit = async () => {
+    setSaving(true);
+    setError("");
+    try {
+      await onSave({ id: "", provider, status: "pending", account_label: email, aliases: [], capabilities: ["status_sync", "follow_ups"], created_at_ms: 0, updated_at_ms: 0 });
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <Dialog open={open} title="Connect an inbox" description="Connect each independent mailbox once. Addresses that deliver into the same inbox count as aliases." onClose={onClose}>
+    <div className="dialog-form">
+      <label><span>Provider</span><div className="segmented"><button className={provider === "gmail" ? "active" : ""} onClick={() => setProvider("gmail")}>Gmail</button><button className={provider === "outlook" ? "active" : ""} onClick={() => setProvider("outlook")}>Outlook</button></div></label>
+      <label><span>Inbox email</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@company.com" /></label>
+      <p className="field-note">Bluey uses provider authorization. Your mailbox password is never requested or stored.</p>
+      {error && <div className="inline-error">{error}</div>}
+    </div>
+    <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !email.includes("@")} onClick={() => void submit()}>{saving ? "Preparing..." : `Continue with ${provider === "gmail" ? "Gmail" : "Outlook"}`}</button></div>
+  </Dialog>;
+}
+
+function TrackDialog({ open, track, identities, onClose, onSave, onDelete }: { open: boolean; track: CareerTrack | null; identities: ApplicationIdentity[]; onClose(): void; onSave(track: CareerTrack): Promise<void>; onDelete(track: CareerTrack): void }) {
+  const defaultIdentityId = identities.find((identity) => identity.is_default && identity.verification_status === "verified")?.id;
+  const [draft, setDraft] = useState<CareerTrack>(track || emptyTrack(defaultIdentityId));
   const [saving, setSaving] = useState(false);
   useEffect(() => {
-    if (open) setDraft(track || emptyTrack());
-  }, [open, track]);
+    if (open) setDraft(track || emptyTrack(defaultIdentityId));
+  }, [open, track, defaultIdentityId]);
   const current = draft;
   const update = (next: CareerTrack) => setDraft(next);
-  return <Dialog open={open} title={track ? "Edit Career Track" : "New Career Track"} description="Give this agent one role and a clear location policy." onClose={onClose}><div className="dialog-form"><label><span>Track name</span><input value={current.name} onChange={(event) => update({ ...current, name: event.target.value })} placeholder="Product engineering" /></label><label><span>Target role</span><input value={current.role} onChange={(event) => update({ ...current, role: event.target.value })} placeholder="Senior Product Engineer" /></label><TagInput label="Locations" values={current.locations} onChange={(values) => update({ ...current, locations: values })} /><label><span>Workplace preference</span><select value={current.remote_preference} onChange={(event) => update({ ...current, remote_preference: event.target.value })}><option value="remote_or_hybrid">Remote or hybrid</option><option value="remote_only">Remote only</option><option value="hybrid_ok">Hybrid is fine</option><option value="onsite_ok">On-site is fine</option></select></label><label className="setting-line simple"><div><b>Agent active</b><span>Paused agents keep history but stop discovery.</span></div><Toggle checked={current.active} onChange={(checked) => update({ ...current, active: checked })} /></label></div><div className="dialog-actions">{track && <button className="button danger subtle" onClick={() => onDelete(track)}><Trash2 size={15} />Delete</button>}<span /><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !current.name || !current.role} onClick={() => { setSaving(true); void onSave(current).finally(() => setSaving(false)); }}>{saving ? "Saving..." : "Save track"}</button></div></Dialog>;
+  return <Dialog open={open} title={track ? "Edit Career Track" : "New Career Track"} description="Give this agent one role, location policy, and application email." onClose={onClose}><div className="dialog-form"><label><span>Track name</span><input value={current.name} onChange={(event) => update({ ...current, name: event.target.value })} placeholder="Product engineering" /></label><label><span>Target role</span><input value={current.role} onChange={(event) => update({ ...current, role: event.target.value })} placeholder="Senior Product Engineer" /></label><TagInput label="Locations" values={current.locations} onChange={(values) => update({ ...current, locations: values })} /><label><span>Workplace preference</span><select value={current.remote_preference} onChange={(event) => update({ ...current, remote_preference: event.target.value })}><option value="remote_or_hybrid">Remote or hybrid</option><option value="remote_only">Remote only</option><option value="hybrid_ok">Hybrid is fine</option><option value="onsite_ok">On-site is fine</option></select></label><label><span>Application email</span><select value={current.application_identity_id || defaultIdentityId || ""} onChange={(event) => update({ ...current, application_identity_id: event.target.value || undefined })}>{identities.filter((identity) => identity.verification_status === "verified").map((identity) => <option key={identity.id} value={identity.id}>{identity.email}{identity.is_default ? " (default)" : ""}</option>)}</select></label><label className="setting-line simple"><div><b>Agent active</b><span>Paused agents keep history but stop discovery.</span></div><Toggle checked={current.active} onChange={(checked) => update({ ...current, active: checked })} /></label></div><div className="dialog-actions">{track && <button className="button danger subtle" onClick={() => onDelete(track)}><Trash2 size={15} />Delete</button>}<span /><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !current.name || !current.role || !(current.application_identity_id || defaultIdentityId)} onClick={() => { setSaving(true); void onSave({ ...current, application_identity_id: current.application_identity_id || defaultIdentityId }).finally(() => setSaving(false)); }}>{saving ? "Saving..." : "Save track"}</button></div></Dialog>;
 }
 
 function TagInput({ label, values, onChange }: { label: string; values: string[]; onChange(values: string[]): void }) {
@@ -146,9 +354,21 @@ function Plan({ name, price, details, active }: { name: string; price: string; d
 }
 
 function integrationName(provider: string): string {
-  return ({ gmail: "Gmail", outlook_email: "Outlook Email", google_calendar: "Google Calendar", outlook_calendar: "Outlook Calendar" } as Record<string, string>)[provider] || titleCase(provider);
+  return ({ google_calendar: "Google Calendar", outlook_calendar: "Outlook Calendar" } as Record<string, string>)[provider] || titleCase(provider);
 }
 
-function emptyTrack(): CareerTrack {
-  return { id: "", name: "", role: "", locations: [], remote_preference: "remote_or_hybrid", active: true, match_count: 0, created_at_ms: 0, updated_at_ms: 0 };
+function connectionName(provider: MailboxConnection["provider"]): string {
+  return provider === "gmail" ? "Gmail inbox" : "Outlook inbox";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Bluey Jobs could not finish that request.";
+}
+
+function showError(setError: (message: string) => void): (error: unknown) => void {
+  return (error) => setError(errorMessage(error));
+}
+
+function emptyTrack(applicationIdentityId?: string): CareerTrack {
+  return { id: "", name: "", role: "", locations: [], remote_preference: "remote_or_hybrid", application_identity_id: applicationIdentityId, active: true, match_count: 0, created_at_ms: 0, updated_at_ms: 0 };
 }

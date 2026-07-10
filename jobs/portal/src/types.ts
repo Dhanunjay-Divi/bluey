@@ -108,6 +108,7 @@ export interface CareerTrack {
   role: string;
   locations: string[];
   remote_preference: string;
+  application_identity_id?: string;
   active: boolean;
   match_count: number;
   created_at_ms: number;
@@ -208,6 +209,27 @@ export interface JobsIntegration {
   updated_at_ms: number;
 }
 
+export interface ApplicationIdentity {
+  id: string;
+  email: string;
+  label: string;
+  verification_status: "pending" | "verified";
+  is_default: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface MailboxConnection {
+  id: string;
+  provider: "gmail" | "outlook";
+  status: "pending" | "connected" | "disconnected";
+  account_label: string;
+  aliases: string[];
+  capabilities: string[];
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
 export interface JobsEntitlement {
   plan: "free" | "pro" | "cloud";
   track_limit: number;
@@ -218,6 +240,10 @@ export interface JobsEntitlement {
   local_browser: boolean;
   cloud_browser: boolean;
   overage_cents: number;
+  monthly_price_cents: number;
+  application_identity_limit: number;
+  connected_inbox_limit: number;
+  additional_inbox_cents: number;
 }
 
 export interface JobsWorkspace {
@@ -230,6 +256,8 @@ export interface JobsWorkspace {
   browser_sessions: BrowserSession[];
   interventions: Intervention[];
   integrations: JobsIntegration[];
+  application_identities: ApplicationIdentity[];
+  mailbox_connections: MailboxConnection[];
   entitlement: JobsEntitlement;
 }
 

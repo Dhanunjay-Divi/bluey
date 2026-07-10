@@ -51,7 +51,9 @@ BLUEY_JOBS_BETA_ENABLED=1 BLUEY_JOBS_API_PORT=8081 cargo run --bin bluey-jobs-ap
 ```
 
 See `ARCHITECTURE.md` for service boundaries, scale targets, and the remaining
-provider-specific release gates.
+provider-specific release gates. See `MULTI_EMAIL_ARCHITECTURE.md` for
+application identities and inbox connections, and `UNIT_ECONOMICS.md` for the
+internal pricing and margin model.
 
 ## Data guarantees
 
@@ -69,6 +71,10 @@ provider-specific release gates.
   unknown required questions become interventions.
 - Every committed run can retain the exact packet and evidence in one
   fingerprinted receipt.
+- Application emails are verified independently from the Bluey login, selected
+  per Career Track, and frozen into the resume and receipt.
+- Separate Gmail and Outlook mailboxes are tenant-scoped and plan-limited;
+  aliases inside one mailbox do not consume another connection.
 
 ## Source provenance
 
