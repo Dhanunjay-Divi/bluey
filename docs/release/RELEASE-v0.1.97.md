@@ -2,7 +2,13 @@
 
 Date: 2026-07-10
 Source branch: `codex/bluey-web-ui-parallel-20260704`
-Source commit: pending release commit
+Source commit: `ba90b46f904abb0bb02771b51e9e9acb2720a66c`
+Status: rejected by the post-publish identity gate; superseded by `0.1.98`
+
+`0.1.97` is not the promoted client release. Its signed manifest was rolled
+back to `0.1.96` after the archive omitted the new `termb`, `hostovb`, and
+`adriverb` identity copies. The immutable `0.1.97` archive remains available
+for audit only and must not become `latest`.
 
 ## Summary
 
@@ -55,7 +61,8 @@ Pre-release checks include full daemon/server tests, strict formatting and
 linting, Swift typecheck/build, Windows C syntax, JavaScript syntax, shell
 syntax, release hygiene/secret scanning, package integrity, and live signed
 manifest verification. Final artifact hashes and production results are
-recorded in `ROUND-474-SIGNED-0.1.97-CONSOLIDATED-DEPLOY.md` after promotion.
+recorded in `ROUND-474-SIGNED-0.1.98-CONSOLIDATED-DEPLOY.md` with the corrective
+promotion.
 
 ## Known Gates
 
