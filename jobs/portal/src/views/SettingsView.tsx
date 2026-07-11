@@ -171,7 +171,7 @@ export function SettingsView({
           <div className="settings-form">
             <label><span>Resume mode</span><div className="segmented"><button className={profile.resume_mode === "factual" ? "active" : ""} onClick={() => setProfile({ ...profile, resume_mode: "factual" })}>Factual</button><button className={profile.resume_mode === "enhance" ? "active" : ""} onClick={() => setProfile({ ...profile, resume_mode: "enhance" })}>Enhance</button></div></label>
             <label><span>Submission mode</span><div className="segmented"><button className={profile.default_submission_mode === "review_first" ? "active" : ""} onClick={() => setProfile({ ...profile, default_submission_mode: "review_first" })}>Review first</button><button className={profile.default_submission_mode === "auto_submit" ? "active" : ""} onClick={() => setProfile({ ...profile, default_submission_mode: "auto_submit" })}>Auto-submit</button></div></label>
-            <label className="setting-line simple"><div><b>Review new claims</b><span>Pause before a newly proposed factual claim can enter a packet.</span></div><Toggle checked={profile.review_new_claims} onChange={(checked) => setProfile({ ...profile, review_new_claims: checked })} /></label>
+            <label className="setting-line simple"><div><b>Review new claims</b><span>Pause before a newly proposed factual claim can enter an application.</span></div><Toggle checked={profile.review_new_claims} onChange={(checked) => setProfile({ ...profile, review_new_claims: checked })} /></label>
             <label><span>Auto-submit match threshold</span><div className="range-field"><input type="range" min="60" max="100" step="5" value={profile.auto_submit_threshold} onChange={(event) => setProfile({ ...profile, auto_submit_threshold: Number(event.target.value) })} /><b>{profile.auto_submit_threshold}%</b></div></label>
             <div className="challenge-rules">
               <p>CHALLENGE HANDLING</p>
@@ -223,13 +223,13 @@ export function SettingsView({
       </section>
 
       <section className="settings-section" id="plans">
-        <div className="settings-section-title"><span><CreditCard /></span><div><p>PLAN</p><h2>{titleCase(workspace.entitlement.plan)} Jobs</h2><small>{workspace.entitlement.used_packets} of {workspace.entitlement.monthly_packet_limit} application packets used this month.</small></div><a className="button secondary compact" href="/account#billing">Shared balance<ArrowRight size={15} /></a></div>
+        <div className="settings-section-title"><span><CreditCard /></span><div><p>PLAN</p><h2>{titleCase(workspace.entitlement.plan)} Jobs</h2><small>{workspace.entitlement.used_packets} of {workspace.entitlement.monthly_packet_limit} included applications used this month.</small></div><a className="button secondary compact" href="/account#billing">Shared balance<ArrowRight size={15} /></a></div>
         <div className="plan-grid">
-          <Plan name="Free" price="$0" details="1 agent · 5 reviewed packets · 2 application emails · 1 inbox" active={workspace.entitlement.plan === "free"} />
-          <Plan name="Pro" price="$29" details="3 agents · 50 packets · 10 application emails · 2 inboxes · local browser" active={workspace.entitlement.plan === "pro"} />
-          <Plan name="Cloud" price="$49" details="5 agents · 100 packets · 25 application emails · 5 inboxes · local + cloud" active={workspace.entitlement.plan === "cloud"} />
+          <Plan name="Free" price="$0" details="1 agent · 5 reviewed applications · 2 application emails · 1 inbox" active={workspace.entitlement.plan === "free"} />
+          <Plan name="Pro" price="$29" details="3 agents · 50 applications · 10 application emails · 2 inboxes · local browser" active={workspace.entitlement.plan === "pro"} />
+          <Plan name="Cloud" price="$49" details="5 agents · 100 applications · 25 application emails · 5 inboxes · local + cloud" active={workspace.entitlement.plan === "cloud"} />
         </div>
-        <p className="plan-footnote">Application emails and aliases are included. Separate inboxes use connection slots; additional slots are {money(workspace.entitlement.additional_inbox_cents)}/month. After the packet allowance, each additional completed packet is {money(workspace.entitlement.overage_cents)} from your shared Bluey balance. Retries and browser handoffs do not count again.</p>
+        <p className="plan-footnote">Application emails and aliases are included. Separate inboxes use connection slots; additional slots are {money(workspace.entitlement.additional_inbox_cents)}/month. After the included applications, each additional completed application is {money(workspace.entitlement.overage_cents)} from your shared Bluey balance. Retries and browser handoffs do not count again.</p>
       </section>
 
       <ApplicationEmailDialog

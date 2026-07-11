@@ -288,7 +288,7 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
               <div className="setup-review">
                 <div><span>PROFILE</span><b>{profile.full_name}</b><small>{profile.employment.length} roles · {profile.skills.length} skills</small></div>
                 <div><span>LOCATION</span><b>{preferences.desired_locations.join(", ")}</b><small>{preferences.location_policy.replaceAll("_", " ")}</small></div>
-                <div><span>STARTING PLAN</span><b>Free</b><small>5 reviewed packets each month</small></div>
+                <div><span>STARTING PLAN</span><b>Free</b><small>5 reviewed applications each month</small></div>
               </div>
             </>
           )}

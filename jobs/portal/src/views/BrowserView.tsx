@@ -34,7 +34,7 @@ export function BrowserView({ workspace, onQueueCloud, onUpdateSession, onResolv
   return (
     <div className="view-shell browser-view">
       <section className="view-heading">
-        <div><p className="eyebrow">APPLICATION RUNNERS</p><h1>Browser</h1><span>Use the same application packet locally or in Bluey's isolated cloud runner.</span></div>
+        <div><p className="eyebrow">APPLICATION RUNNERS</p><h1>Browser</h1><span>Use the same tailored application locally or in Bluey's isolated cloud runner.</span></div>
         <div className="security-note"><ShieldCheck size={17} /><span><b>Separate and private</b><small>Your job-site sign-ins stay inside the Jobs browser.</small></span></div>
       </section>
 
@@ -81,12 +81,12 @@ export function BrowserView({ workspace, onQueueCloud, onUpdateSession, onResolv
       </section>
 
       <Dialog open={installOpen} title="Open Bluey Browser" description="A separate application profile keeps job-site sessions away from your everyday browser." onClose={() => setInstallOpen(false)}>
-        <div className="launch-steps"><div><span>1</span><p><b>Install Bluey Browser</b><small>Available for macOS and Windows during Jobs beta.</small></p><a className="button secondary compact" href="/download">Download<ExternalLink size={14} /></a></div><div><span>2</span><p><b>Sign in with Bluey</b><small>The browser links to this Jobs workspace and stores its profile locally.</small></p></div><div><span>3</span><p><b>Start from Applications</b><small>Review a packet, then choose the local runner.</small></p></div></div>
+        <div className="launch-steps"><div><span>1</span><p><b>Install Bluey Browser</b><small>Available for macOS and Windows during Jobs beta.</small></p><a className="button secondary compact" href="/download">Download<ExternalLink size={14} /></a></div><div><span>2</span><p><b>Sign in with Bluey</b><small>The browser links to this Jobs workspace and stores its profile locally.</small></p></div><div><span>3</span><p><b>Start from Applications</b><small>Review an application, then choose the local runner.</small></p></div></div>
         <div className="dialog-actions"><button className="button secondary" onClick={() => setInstallOpen(false)}>Close</button><a className="button primary" href="bluey-jobs://open"><Chrome size={16} />Open Bluey Browser</a></div>
       </Dialog>
 
-      <Dialog open={cloudOpen} title="Queue a cloud application" description="Cloud runs always start from a reviewed or Auto-submit-eligible application packet." onClose={() => setCloudOpen(false)}>
-        <div className="cloud-queue-list">{workspace.applications.filter((item) => ["awaiting_review", "queued"].includes(item.state)).map((application) => { const job = workspace.matches.find((item) => item.id === application.job_id); return <button key={application.id} disabled={Boolean(queueing)} onClick={() => { setQueueing(application.id); void onQueueCloud(application).then(() => setCloudOpen(false)).finally(() => setQueueing("")); }}><div className="company-mark">{job?.company.slice(0, 2).toUpperCase()}</div><span><b>{job?.title}</b><small>{job?.company} · {application.match_score}% match</small></span>{queueing === application.id ? <small>Queuing...</small> : <Play size={17} />}</button>; })}{workspace.applications.filter((item) => ["awaiting_review", "queued"].includes(item.state)).length === 0 && <div className="empty-state small"><KeyRound /><h3>No eligible packets</h3><p>Review a packet in Applications first.</p></div>}</div>
+      <Dialog open={cloudOpen} title="Queue a cloud application" description="Cloud runs always start from a reviewed or Auto-submit-eligible application." onClose={() => setCloudOpen(false)}>
+        <div className="cloud-queue-list">{workspace.applications.filter((item) => ["awaiting_review", "queued"].includes(item.state)).map((application) => { const job = workspace.matches.find((item) => item.id === application.job_id); return <button key={application.id} disabled={Boolean(queueing)} onClick={() => { setQueueing(application.id); void onQueueCloud(application).then(() => setCloudOpen(false)).finally(() => setQueueing("")); }}><div className="company-mark">{job?.company.slice(0, 2).toUpperCase()}</div><span><b>{job?.title}</b><small>{job?.company} · {application.match_score}% match</small></span>{queueing === application.id ? <small>Queuing...</small> : <Play size={17} />}</button>; })}{workspace.applications.filter((item) => ["awaiting_review", "queued"].includes(item.state)).length === 0 && <div className="empty-state small"><KeyRound /><h3>No eligible applications</h3><p>Review an application in Applications first.</p></div>}</div>
         <div className="dialog-actions"><button className="button secondary" onClick={() => setCloudOpen(false)}>Close</button><a className="button primary" href="/jobs/applications">Go to Applications<ArrowRight size={16} /></a></div>
       </Dialog>
     </div>

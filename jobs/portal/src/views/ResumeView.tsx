@@ -62,7 +62,7 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
       const next = inferProfileFromResume(profile, imported);
       setProfile(next);
       await onSave(next);
-      setMessage("Resume imported. Review the profile facts Bluey extracted before your next packet.");
+      setMessage("Resume imported. Review the profile facts Bluey extracted before your next application.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Resume import failed.");
     }
@@ -127,7 +127,7 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
                 const job = workspace.matches.find((item) => item.id === application.job_id);
                 return <button key={application.id} onClick={() => void openVersion(application.resume_version_id)}><FileCheck2 size={17} /><span><b>{job?.title || "Tailored resume"}</b><small>{job?.company} · {relativeTime(application.updated_at_ms)}</small></span><ChevronRight size={16} /></button>;
               })}
-              {applicationsWithResume.length === 0 && <p className="muted-copy">Build your first packet from Matches to create a tailored version.</p>}
+              {applicationsWithResume.length === 0 && <p className="muted-copy">Prepare your first application from Matches to create a tailored version.</p>}
             </div>
           </section>
         </aside>

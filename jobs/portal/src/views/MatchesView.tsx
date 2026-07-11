@@ -95,7 +95,7 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
         <div><Target /><span><b>{filtered.length}</b><small>ready matches</small></span></div>
         <div><Sparkles /><span><b>{averageScore || "-"}%</b><small>average fit</small></span></div>
         <div><BriefcaseBusiness /><span><b>{workspace.applications.filter((item) => item.state === "submitted").length}</b><small>submitted</small></span></div>
-        <div className="metric-action"><span><b>{Math.max(0, workspace.entitlement.monthly_packet_limit - workspace.entitlement.used_packets)}</b><small>packets left this month</small></span><Link to={`../settings${window.location.search}#plans`}>Plan details<ChevronRight size={14} /></Link></div>
+        <div className="metric-action"><span><b>{Math.max(0, workspace.entitlement.monthly_packet_limit - workspace.entitlement.used_packets)}</b><small>applications left this month</small></span><Link to={`../settings${window.location.search}#plans`}>Plan details<ChevronRight size={14} /></Link></div>
       </section>
 
       <section className={`search-status-band ${activeTracks.length ? "active" : "paused"}`} aria-label="Active search settings">
@@ -129,7 +129,7 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
             <div className="job-main"><strong>{job.title}</strong><span>{job.company} · {postingAgeLabel(job)}</span></div>
             <div className={`score score-${Math.floor(job.match_score / 10)}`}><b>{job.match_score}</b><span>%</span></div>
             <div className="job-location"><MapPin size={14} /><span>{job.location}<small>{job.workplace}</small></span></div>
-            <div className={`status-pill ${preparedJobIds.has(job.id) ? "prepared" : "new"}`}>{preparedJobIds.has(job.id) ? "Packet ready" : "Fresh"}</div>
+            <div className={`status-pill ${preparedJobIds.has(job.id) ? "prepared" : "new"}`}>{preparedJobIds.has(job.id) ? "Application ready" : "Fresh"}</div>
             <ChevronRight size={18} />
           </button>
         ))}
@@ -145,16 +145,16 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
             </div>
             <div className="detail-columns">
               <section><h3>Why it matched</h3><ul className="check-list">{selected.matched_reasons.map((reason) => <li key={reason}><Check size={15} />{reason}</li>)}</ul>{selected.missing_requirements.length > 0 && <><h3>Check before applying</h3><ul className="watch-list">{selected.missing_requirements.map((reason) => <li key={reason}>{reason}</li>)}</ul></>}</section>
-              <section><h3>Application packet</h3><p>Bluey creates a new resume version for this job. It will never reuse this version for another role.</p><label>Resume mode</label><div className="segmented"><button className={mode === "factual" ? "active" : ""} onClick={() => setMode("factual")}>Factual</button><button className={mode === "enhance" ? "active" : ""} onClick={() => setMode("enhance")}>Enhance</button></div><label>After preparation</label><div className="segmented"><button className={submissionMode === "review_first" ? "active" : ""} onClick={() => setSubmissionMode("review_first")}>Review first</button><button className={submissionMode === "auto_submit" ? "active" : ""} onClick={() => setSubmissionMode("auto_submit")}>Auto-submit</button></div></section>
+              <section><h3>Tailored application</h3><p>Bluey creates a new resume version for this job. It will never reuse this version for another role.</p><label>Resume mode</label><div className="segmented"><button className={mode === "factual" ? "active" : ""} onClick={() => setMode("factual")}>Factual</button><button className={mode === "enhance" ? "active" : ""} onClick={() => setMode("enhance")}>Enhance</button></div><label>After preparation</label><div className="segmented"><button className={submissionMode === "review_first" ? "active" : ""} onClick={() => setSubmissionMode("review_first")}>Review first</button><button className={submissionMode === "auto_submit" ? "active" : ""} onClick={() => setSubmissionMode("auto_submit")}>Auto-submit</button></div></section>
             </div>
-            <div className="dialog-actions spread"><p>{selected.source.includes("handoff") ? "Bluey prepares everything; you finish on this site." : "Packet preparation uses one monthly allowance."}</p><button className="button primary" disabled={busy} onClick={() => void prepare()}>{busy ? "Preparing..." : "Build application packet"}<ArrowRight size={17} /></button></div>
+            <div className="dialog-actions spread"><p>{selected.source.includes("handoff") ? "Bluey prepares everything; you finish on this site." : "This application uses one monthly allowance when completed."}</p><button className="button primary" disabled={busy} onClick={() => void prepare()}>{busy ? "Preparing..." : "Prepare application"}<ArrowRight size={17} /></button></div>
           </div>
         )}
       </Dialog>
 
       <AddJobDialog open={addOpen} onClose={() => setAddOpen(false)} onSave={async (job) => { const saved = await onAddJob(job); setAddOpen(false); setSelected(saved); }} />
       <Dialog open={filterOpen} title="Filter matches" description="Narrow this view without changing your Career Track." onClose={() => setFilterOpen(false)}>
-        <div className="dialog-form"><label><span>Minimum match score</span><div className="range-field"><input type="range" min="0" max="95" step="5" value={minimumScore} onChange={(event) => setMinimumScore(Number(event.target.value))} /><b>{minimumScore || "Any"}{minimumScore ? "%" : ""}</b></div></label><label><span>Workplace</span><select value={workplace} onChange={(event) => setWorkplace(event.target.value)}><option value="all">Any workplace</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on-site">On-site</option></select></label><label className="setting-line simple"><div><b>Only jobs without a packet</b><span>Hide applications you already prepared.</span></div><button type="button" className={`toggle ${onlyUnprepared ? "on" : ""}`} role="switch" aria-checked={onlyUnprepared} onClick={() => setOnlyUnprepared((current) => !current)}><span /></button></label></div>
+        <div className="dialog-form"><label><span>Minimum match score</span><div className="range-field"><input type="range" min="0" max="95" step="5" value={minimumScore} onChange={(event) => setMinimumScore(Number(event.target.value))} /><b>{minimumScore || "Any"}{minimumScore ? "%" : ""}</b></div></label><label><span>Workplace</span><select value={workplace} onChange={(event) => setWorkplace(event.target.value)}><option value="all">Any workplace</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on-site">On-site</option></select></label><label className="setting-line simple"><div><b>Only jobs not prepared</b><span>Hide applications you already prepared.</span></div><button type="button" className={`toggle ${onlyUnprepared ? "on" : ""}`} role="switch" aria-checked={onlyUnprepared} onClick={() => setOnlyUnprepared((current) => !current)}><span /></button></label></div>
         <div className="dialog-actions"><button className="button secondary" onClick={() => { setMinimumScore(0); setWorkplace("all"); setOnlyUnprepared(false); }}>Reset</button><button className="button primary" onClick={() => setFilterOpen(false)}>Show {filtered.length} match{filtered.length === 1 ? "" : "es"}</button></div>
       </Dialog>
     </div>

@@ -143,7 +143,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   return (
     <div className="view-shell applications-view">
       <section className="view-heading">
-        <div><p className="eyebrow">APPLICATION CONTROL</p><h1>Applications</h1><span>Every packet, browser run, intervention, and receipt in one timeline.</span></div>
+        <div><p className="eyebrow">APPLICATION CONTROL</p><h1>Applications</h1><span>Every tailored application, browser run, intervention, and receipt in one timeline.</span></div>
         <div className="heading-stat"><b>{workspace.applications.filter((item) => item.state === "submitted").length}</b><span>submitted this month</span></div>
       </section>
 
@@ -179,7 +179,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
             </button>
           );
         })}
-        {filtered.length === 0 && <div className="empty-state"><div className="empty-icon"><BriefcaseBusiness /></div><h3>No applications here</h3><p>Build a packet from Matches and it will appear in this timeline.</p></div>}
+        {filtered.length === 0 && <div className="empty-state"><div className="empty-icon"><BriefcaseBusiness /></div><h3>No applications here</h3><p>Prepare an application from Matches and it will appear in this timeline.</p></div>}
       </section>
 
       <Dialog open={Boolean(selected)} title={selected ? `${jobs.get(selected.job_id)?.title || "Application"}` : "Application"} description={selected ? `${jobs.get(selected.job_id)?.company || ""} · ${titleCase(selected.state)}` : ""} onClose={() => setSelected(null)} size="large">
@@ -187,7 +187,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
           <div className="application-detail">
             <div className="application-steps">
               {[
-                ["Packet", true],
+                ["Materials", true],
                 ["Review", !["matched", "preparing"].includes(selected.state)],
                 ["Apply", ["running", "needs_input", "submitted"].includes(selected.state)],
                 ["Receipt", selected.state === "submitted"],
@@ -219,7 +219,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
                 <div className="download-row"><button disabled={busy || !selectedResume} onClick={() => void download("pdf")}><Download size={15} />PDF</button><button disabled={busy || !selectedResume} onClick={() => void download("docx")}><Download size={15} />DOCX</button></div>
               </section>
             </div>
-            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : "Approving counts this unique packet once. Retries do not double-charge."}</p><div>{selected.state === "needs_input" && !canAnswerIntervention && <a className="button secondary" href={selectedSession?.takeover_url || `bluey-jobs://takeover?application_id=${encodeURIComponent(selected.id)}`}><MonitorUp size={16} />Take over browser</a>}{selected.state === "awaiting_review" && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve packet</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
+            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : "Approving counts this tailored application once. Retries do not double-charge."}</p><div>{selected.state === "needs_input" && !canAnswerIntervention && <a className="button secondary" href={selectedSession?.takeover_url || `bluey-jobs://takeover?application_id=${encodeURIComponent(selected.id)}`}><MonitorUp size={16} />Take over browser</a>}{selected.state === "awaiting_review" && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
           </div>
         )}
       </Dialog>
