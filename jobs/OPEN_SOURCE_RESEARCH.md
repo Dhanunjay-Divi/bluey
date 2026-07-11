@@ -11,7 +11,9 @@ The highest-value reusable capabilities were:
 1. `career-ops`: mature public ATS discovery, defensive HTTP behavior,
    pagination, normalization, dedupe, trust checks, and broad provider tests.
 2. `job-apply-plugin`: practical form-label aliases, common ATS questions,
-   document fields, and clear stop conditions for unknown required input.
+   document fields, pre-submit confirmation, and sensitive-field confirmation
+   patterns. Bluey must implement its own universal stop behavior for unknown
+   required input.
 3. `ai-job-agent`: two approval gates, answer-bank memory, status discipline,
    and exact application tracking.
 4. `proficiently-claude-skills`: one folder and artifact set per job, visible
@@ -43,6 +45,36 @@ The highest-value reusable capabilities were:
   unknown fields are skipped.
 - Every final run can produce a stable receipt with exact packet, documents,
   events, screenshots, confirmation, and fingerprint.
+
+## July 11 source-audit correction
+
+The earlier shorthand around `job-apply-plugin` was too broad. The source
+requires confirmation before submission and special handling for sensitive
+fields, but it does not provide a complete deterministic stop condition for
+every unknown required field. Bluey owns that behavior in its typed
+intervention model.
+
+The phrase "fixture-backed" also means local synthetic/provider fixtures, not
+live certification against every employer tenant. The shared executor is a
+beta foundation until the live adapter certification gate passes.
+
+## AI browser and research archive result
+
+The 10 archives under `/Users/uno/Downloads/job and AI browser` were reviewed
+as source and product references. They are most useful for source-ledger,
+query-planning, citations, provider normalization, and replayable search
+patterns. Bluey should build a separate `jobs/research` module from those
+patterns rather than copying Perplexity-style clones or private endpoint
+automation.
+
+Required research invariants:
+
+- Every source-backed claim has a source ID, content hash, retrieval time, and
+  citation span.
+- Research can improve ranking, matching, company context, and interview prep.
+- Research cannot create unconfirmed profile facts or override user filters.
+- Fetchers must block private networks, unsafe redirects, oversized responses,
+  credentials, and cookie-bearing browsing by default.
 
 ## Adapter outcome
 

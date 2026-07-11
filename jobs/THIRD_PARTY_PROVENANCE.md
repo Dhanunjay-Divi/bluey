@@ -17,9 +17,9 @@ licenses remain independently binding.
 | --- | --- | --- | --- |
 | [`GodsScion/Auto_job_applier_linkedIn`](https://github.com/GodsScion/Auto_job_applier_linkedIn) | `8d74e8ccb85b` | AGPL-3.0 | Research only in this round: browser workflow and configuration breadth. |
 | [`proficientlyjobs/proficiently-claude-skills`](https://github.com/proficientlyjobs/proficiently-claude-skills) | `9bc1f6fd7af5` | README says MIT; no top-level license file in clone | Product pattern: per-job artifact folders, JD mapping, consolidated review. No source file copied. |
-| [`Rayyan9477/AutoApply-AI-Agentic-Browser-Automation-for-Job-Search`](https://github.com/Rayyan9477/AutoApply-AI-Agentic-Browser-Automation-for-Job-Search) | `960ddc32a2f0` | No top-level license file in clone | Architecture research only. |
+| [`Rayyan9477/AutoApply-AI-Agentic-Browser-Automation-for-Job-Search`](https://github.com/Rayyan9477/AutoApply-AI-Agentic-Browser-Automation-for-Job-Search) | `960ddc32a2f0` | No top-level license file in clone | User-authorized reference. Treat as clean-room or permission-recorded source until contributor and third-party provenance is attached. |
 | [`feder-cr/jobs_applier_ai_agent_aihawk`](https://github.com/feder-cr/jobs_applier_ai_agent_aihawk) | `ab4113d453ab` | AGPL-3.0 | Research only: profile and run configuration. |
-| [`neonwatty/job-apply-plugin`](https://github.com/neonwatty/job-apply-plugin) | `4330f090ba94` | MIT | Adapted field-label matching, ATS form patterns, and pause-on-unknown behavior into `automation/src/form-intelligence.ts`. |
+| [`neonwatty/job-apply-plugin`](https://github.com/neonwatty/job-apply-plugin) | `4330f090ba94` | MIT | Adapted field-label matching, ATS form patterns, pre-submit confirmation, and sensitive-field confirmation patterns into `automation/src/form-intelligence.ts`. Bluey implements its own universal unknown-required-field intervention behavior. |
 | [`Pickle-Pixel/ApplyPilot`](https://github.com/Pickle-Pixel/ApplyPilot) | `4a8d521f67f5` | AGPL-3.0 | Product research: staged discovery, scoring, tailoring, PDF, validation, and retry pipeline. |
 | [`11844/Auto_Jobs_Applier_AIHawk`](https://github.com/11844/Auto_Jobs_Applier_AIHawk) | `1cecff373348` | Repository-specific proprietary/source-available license | Adapted product requirements only: profile breadth, filters, exclusions, one-company rules, and per-job artifacts. No source file copied in this round. |
 | [`santifer/career-ops`](https://github.com/santifer/career-ops) | `267dfb707987` | MIT | Adapted public ATS provider, host-pinning, bounded pagination, retry, normalization, dedupe, and stale-feed patterns into `automation/src/public-ats.ts`. |
@@ -28,6 +28,24 @@ licenses remain independently binding.
 The GitHub [`job-application` topic](https://github.com/topics/job-application)
 was used as a discovery index. Bluey did not treat the topic page as a license
 or clone every listed repository.
+
+## Downloaded AI/browser archives
+
+The following ZIP archives under `/Users/uno/Downloads/job and AI browser` were
+reviewed as read-only research material. They are not shipped with Bluey.
+
+| Archive | SHA-256 | Bluey decision |
+| --- | --- | --- |
+| `Vane-master.zip` | `012cad3ba1a7fb7883b67e334a2d9c0cb7777da6aa3ea001d37a9140bb0f2f80` | Reimplement useful typed model/tool contracts, role modes, query classification, and research UX patterns. |
+| `abbey-main.zip` | `d92fb07e1c7624c1187eda9e458dc6726c99e8088ee21652f641f4ae39dbd294` | Clean-room source-ledger, quality-evaluation, context-budgeting, and manifest-invalidation patterns. |
+| `search_with_lepton-main.zip` | `e7de9603d55e2028a56aa78b07ed39d33b353f24435ee58e782c51d9e0a5c7ef` | Reimplement provider normalization, source-first UX, and replayable search ideas. |
+| `rag-search-main.zip` | `e37c90f8e94c537da72d5b6e504990f84804ba92772caf0ff1ee6d4c95df737d` | Reimplement reranker and chunk/retrieve interfaces only. |
+| `clarity-ai-main.zip` | `b6a42e5efb1bdf1717b885c2c8bbfb1e5727d40ab1b63e23550e545b505a25da` | Citation interaction pattern only; verify inherited notice obligations before source reuse. |
+| `perplexideez-main.zip` | `6a7714ffaeebb9713c36da0d1363f87d59ca45f458d088a113cb1dfa331000fd` | AGPL/Perplexica-lineage style research only; clean-room patterns. |
+| `Perplexity-Clone-Python-main.zip` | `d3055bfbe9007e7057ff5f28b4684bf78e8ae3f429c19d3a54f020114506fbe7` | Minimal demo; research only. |
+| `perplexity-ai-main.zip` | `815258e25e640aa03a8a2b1d77bab2b1a59c2a8ff38b27a0bd7d8b439233e307` | Reject private-endpoint/account automation; do not use. |
+| `llm-answer-engine-main.zip` | `1584e57bc8675558a39e6f56ee3dfe9819116ea37ee830df098f0673f2b535e6` | Answer-engine layout research only. |
+| `spy-search-main.zip` | `2565a072035a14dba312827ef96157212f23813bd3ffdc084be077208dfd1a6e` | Search/archive research only. |
 
 ## Additional topic candidates reviewed
 
@@ -54,4 +72,6 @@ Required MIT copyright and permission notices are retained in
 `THIRD_PARTY_NOTICES.md`. Package-manager lock files remain the source of truth
 for runtime dependency versions; release builds must also generate dependency
 notices from the JavaScript, Rust, Electron, Playwright, and container lock
-files.
+files. The July 11 audit flagged dependency notice generation as a required
+release gate, including transitive JavaScript packages and native browser/doc
+tooling.
