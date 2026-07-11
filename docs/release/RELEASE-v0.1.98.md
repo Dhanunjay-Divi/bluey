@@ -2,7 +2,7 @@
 
 Date: 2026-07-10
 Source branch: `codex/bluey-web-ui-parallel-20260704`
-Source commit: pending corrective release commit
+Source commit: `54d4cee28faad1b9f4ecc34191e390df52969803`
 
 ## Summary
 
@@ -49,7 +49,15 @@ identities. This closes the gate that rejected `0.1.97`.
 | --- | --- |
 | macOS arm64 | Signed artifact in this release |
 | macOS Intel/universal | Source/build parity retained; publish only after the same gate passes |
-| Windows | Build on the real Windows/MSVC host and signed-manifest verification required before promotion |
+| Windows x86_64 | Signed artifact built and install-smoked on Windows 11 |
 
-Final hashes, backup paths, health identity, and signed live verification are
-recorded in `ROUND-474-SIGNED-0.1.98-CONSOLIDATED-DEPLOY.md`.
+## Published Artifacts
+
+| Platform | Bytes | SHA256 |
+| --- | ---: | --- |
+| macOS arm64 | 19969543 | `d87338fedd51c2171cd1d7c93567b20bb1c6273d78fe09ea3e515d08744930f9` |
+| Windows x86_64 | 28926550 | `19b9137eef41c32f571bda37b14773c387c58daa2291c8c3944766eb2fa56682` |
+
+The final backup paths, API binary hashes, health identity, rollback point,
+Windows install proof, and signed live verification are recorded in
+`ROUND-474-SIGNED-0.1.98-CONSOLIDATED-DEPLOY.md`.

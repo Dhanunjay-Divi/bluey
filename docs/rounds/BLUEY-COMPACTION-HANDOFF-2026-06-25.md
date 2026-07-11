@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-10 EDT
+Latest checkpoint: 2026-07-11 UTC / 2026-07-10 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,11 +30,34 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-473-USER-EXPERIENCE-SURFACE-AND-RECOVERY.md`; the next canonical Bluey round doc should start at `ROUND-474-...`.
+- Latest completed Bluey round doc is `ROUND-474-SIGNED-0.1.98-CONSOLIDATED-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-475-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
+- Round 474 completed the consolidated signed `0.1.98` release on branch
+  `codex/bluey-web-ui-parallel-20260704` without GitHub Actions:
+  - final source commit:
+    `54d4cee28faad1b9f4ecc34191e390df52969803`
+  - all root/server tests, strict Clippy, formatting, native syntax, shell, JS,
+    hygiene, whitespace, and secret gates passed
+  - a real Windows/MSVC build produced the public Windows ZIP; the public
+    PowerShell installer downloaded it on Windows 11, verified its SHA, and
+    installed all 11 required executable identities successfully
+  - the Windows 404 shown in `IMG_3783.HEIC` was caused by a missing signed
+    manifest platform/artifact and is fixed in the live `0.1.98` release
+  - macOS arm64 SHA256:
+    `d87338fedd51c2171cd1d7c93567b20bb1c6273d78fe09ea3e515d08744930f9`
+  - Windows x86_64 SHA256:
+    `19b9137eef41c32f571bda37b14773c387c58daa2291c8c3944766eb2fa56682`
+  - production API reports the final source commit, is active with
+    `NRestarts=0`, and has a verified PostgreSQL backup plus binary rollback
+  - signed manifest, installer MIME, both artifact hashes, public routes,
+    desktop web layout, and 390px mobile layout verified live
+  - `0.1.97` was rejected by the identity gate, immediately rolled back, kept
+    immutable for audit, and superseded by `0.1.98`
+  - round doc:
+    `docs/rounds/ROUND-474-SIGNED-0.1.98-CONSOLIDATED-DEPLOY.md`
 - Round 473 completed a local-only user-experience surface and recovery pass on
   branch `codex/bluey-web-ui-parallel-20260704`:
   - normal controls now expose only Auto, Quick, and Thorough while keeping

@@ -82,4 +82,79 @@ native and cross-target Windows Clippy both pass before the MSVC rebuild.
 
 ## Deployment Status
 
-Corrective signed promotion in progress.
+Signed promotion completed without GitHub Actions.
+
+### Source And Artifacts
+
+- final source commit:
+  `54d4cee28faad1b9f4ecc34191e390df52969803`
+- macOS arm64 artifact:
+  `releases/v0.1.98/bluey-0.1.98-darwin-arm64.tar.gz`
+- macOS arm64 bytes: `19969543`
+- macOS arm64 SHA256:
+  `d87338fedd51c2171cd1d7c93567b20bb1c6273d78fe09ea3e515d08744930f9`
+- Windows x86_64 artifact:
+  `releases/v0.1.98/bluey-0.1.98-windows-x86_64.zip`
+- Windows x86_64 bytes: `28926550`
+- Windows x86_64 SHA256:
+  `19b9137eef41c32f571bda37b14773c387c58daa2291c8c3944766eb2fa56682`
+
+The public signed manifest now advertises both platforms. The macOS archive
+contains `bluey-daemon`, `termb`, `Terminal`, `hostovb`, `host-overlay`,
+`adriverb`, and `audio-driver`. The Windows ZIP contains the equivalent `.exe`
+identities plus `cue-whisper.exe`; every identity alias is byte-identical to its
+canonical executable.
+
+### Windows Proof
+
+- clean MSVC strict Clippy passed on the real Windows 11 builder
+- optimized MSVC build and all native helper builds passed
+- the public `irm https://bluey.sh/install.ps1 | iex` flow was run on Windows
+  into an isolated install root
+- the installer downloaded `28,926,550` bytes and verified the signed-manifest
+  SHA before extraction
+- all 11 required installed executables were present
+- installed CLI reported `bluey 0.1.98`
+- installed daemon reported `bluey-daemon 0.1.98`
+- daemon, overlay, and audio identity hashes matched their canonical binaries
+- the temporary install root and temporary user-PATH entry were removed after
+  the smoke test
+
+This directly closes the raw HTTP 404 shown in `IMG_3783.HEIC`.
+
+### API Safety And Promotion
+
+- fresh pre-deploy PostgreSQL backup:
+  `/var/backups/bluey-api/hourly/bluey-postgres-20260711T061843Z.pgdump`
+- backup bytes: `14400009`
+- backup checksum: verified
+- previous API binary:
+  `/var/backups/bluey-api/bin/bluey-server.previous-20260711T062044Z`
+- previous API binary SHA256:
+  `68092366f5cead91e79c7c5dfdcde2e82937f207a96d4f26256ac0b5cf94df57`
+- promoted API binary SHA256:
+  `e8b87b2ffd72fd51bdbd495075a13b3c1331f69b1494f8027a5d2bab6a3daa88`
+- public `/health` reports commit:
+  `54d4cee28faad1b9f4ecc34191e390df52969803`
+- `bluey-api.service`: active, running, `NRestarts=0`
+- post-restart journal: clean startup and health traffic, with no warning/error
+  loop
+
+### Public Verification
+
+- `latest.json` signature verified after promotion
+- live version is `0.1.98`
+- macOS and Windows public artifact SHA256 values match the signed manifest
+- `install.sh` is served as `application/x-shellscript`
+- `install.ps1` is served as `application/x-powershell`
+- the Windows release is served as `application/zip`
+- the macOS archive unpacks with all aliases and both main binaries report
+  `0.1.98`
+- `/`, `/download`, `/pricing`, `/login`, `/account`, `/privacy`, `/terms`,
+  `/llms.txt`, `/sitemap.xml`, and `/robots.txt` return HTTP 200
+- live desktop and 390px mobile visual checks passed without horizontal overflow
+- production disk is 36% used with 37 GB free after the deploy
+
+`0.1.97` remains an immutable rejected audit artifact. It was superseded by
+`0.1.98`; it was never left as the signed live `latest` release after the gate
+failure.
