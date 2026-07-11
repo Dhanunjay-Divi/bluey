@@ -10,6 +10,8 @@ _refs/
 # Build and release output.
 dist/
 **/.vite/
+jobs/browser/browser-bundle/
+jobs/browser/release/
 
 # Local visual QA screenshots.
 tmp-*.png

@@ -131,6 +131,10 @@ export function AppShell({ children, account, workspace, onRefresh, preview }: P
                 </div>
                 <Link to={destination("/settings")} role="menuitem" onClick={() => setProfileOpen(false)}><Settings size={16} />Jobs settings</Link>
                 <a href="/account" role="menuitem"><WalletCards size={16} />Bluey account</a>
+                <button role="menuitem" onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}>
+                  {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+                  Use {theme === "dark" ? "light" : "dark"} theme
+                </button>
                 <button role="menuitem" onClick={signOut}><LogOut size={16} />Sign out</button>
               </div>
             )}

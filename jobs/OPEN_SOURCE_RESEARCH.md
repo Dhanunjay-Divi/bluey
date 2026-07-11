@@ -44,11 +44,13 @@ The highest-value reusable capabilities were:
 - Every final run can produce a stable receipt with exact packet, documents,
   events, screenshots, confirmation, and fingerprint.
 
-## Next adapter gate
+## Adapter outcome
 
-This round implements public discovery and the shared form-planning core. It
-does not claim that production submission adapters are complete. Workday,
-Greenhouse, Lever, Ashby, and SmartRecruiters browser adapters still need
-fixture-backed prepare/fill/validate/submit implementations using the same
-contracts for local and cloud runners. Stagehand remains a constrained fallback
-only after no deterministic adapter matches.
+Workday, Greenhouse, Lever, Ashby, and SmartRecruiters now use fixture-backed
+prepare, fill, validate, multi-step advance, challenge detection, and submit
+implementations through one shared executor. The same executor runs in local
+Bluey Browser and the cloud container. Live provider certification remains a
+release gate because employer tenants can enable custom fields and authentication
+that no repository fixture can fully represent. A semantic fallback remains
+constrained to direct employer forms and does not override explicit submission
+policy.

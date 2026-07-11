@@ -46,6 +46,9 @@ or clone every listed repository.
 | `automation/src/public-ats.ts` | `career-ops` public provider modules | Rewritten as strict TypeScript contracts; five Bluey ATS source types; HTTPS-only target construction; exact host pinning; redirect rejection; response cap; bounded retry/backoff; normalization and account-filter input. |
 | `automation/src/form-intelligence.ts` | `job-apply-plugin`, `easy-job-application-filler-extension`, `ai-job-agent` | Rewritten around Bluey Career Profile facts, three-level answer memory, verification-aware Auto-submit, document packets, and typed Intervention Inbox records. |
 | `automation/src/receipts.ts` | Per-job artifact and status patterns observed across `proficiently-claude-skills`, `ai-job-agent`, and AIHawk | Original typed immutable receipt bundle containing the exact job, resume version, final answers, confirmed claims, documents, events, screenshots, outcome, and deterministic SHA-256 fingerprint. |
+| `automation/src/standard-adapters.ts` | ATS field and stop-condition research above | Original Bluey implementation of deterministic Workday, Greenhouse, Lever, Ashby, and SmartRecruiters execution; no upstream selectors or source file copied. |
+| `automation/src/documents.ts` | Resume artifact workflow research above | Original Bluey ATS PDF materializer based on the frozen, job-specific resume record. |
+| `runner/src/*` | Browser isolation patterns reviewed across the supplied repositories | Original Bluey cloud-runner implementation with per-identity serialization and AES-256-GCM profile snapshots. |
 
 Required MIT copyright and permission notices are retained in
 `THIRD_PARTY_NOTICES.md`. Package-manager lock files remain the source of truth

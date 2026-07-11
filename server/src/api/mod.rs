@@ -140,7 +140,9 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route(
             "/auth/link/exchange",
             axum::routing::post(auth_routes::link_exchange),
-        );
+        )
+        .merge(jobs::worker_router())
+        .merge(jobs::local_runner_router());
 
     // ---- Admin-only (require_auth + require_admin) -------------------------
     let admin_only = Router::new()
@@ -317,12 +319,18 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
         provider_health: crate::provider_health::ProviderHealth::default(),
     };
 
+    let protected =
+        Router::new()
+            .merge(jobs::router())
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth::require_auth,
+            ));
+
     Router::new()
-        .merge(jobs::router())
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_auth,
-        ))
+        .merge(jobs::worker_router())
+        .merge(jobs::local_runner_router())
+        .merge(protected)
         .layer(from_fn(middleware::request_id::request_id_middleware))
         .with_state(state)
 }

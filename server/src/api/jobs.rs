@@ -13,6 +13,10 @@ use axum::{
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use subtle::ConstantTimeEq;
 
 use crate::{
     api::AppState,
@@ -55,6 +59,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/jobs/applications/:application_id/commit",
             post(commit_application_packet),
+        )
+        .route(
+            "/api/jobs/applications/:application_id/runs",
+            post(queue_application_run),
         )
         .route(
             "/api/jobs/applications/:application_id/evidence",
@@ -117,6 +125,37 @@ pub fn router() -> Router<AppState> {
         .route_layer(axum::middleware::from_fn(require_jobs_beta))
 }
 
+pub fn worker_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/jobs/internal/runs/:run_id/events",
+            post(worker_run_event),
+        )
+        .route(
+            "/api/jobs/internal/applications/:application_id/state",
+            post(worker_application_state),
+        )
+        .route(
+            "/api/jobs/internal/applications/:application_id/interventions",
+            post(worker_intervention),
+        )
+        .route(
+            "/api/jobs/internal/applications/:application_id/receipt",
+            post(worker_receipt),
+        )
+        .route_layer(axum::middleware::from_fn(require_jobs_worker))
+}
+
+pub fn local_runner_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/jobs/local-runs/:run_id/claim", post(claim_local_run))
+        .route(
+            "/api/jobs/local-runs/:run_id/result",
+            post(save_local_run_result),
+        )
+        .route_layer(axum::middleware::from_fn(require_jobs_beta))
+}
+
 pub fn admin_router() -> Router<AppState> {
     Router::new().route(
         "/admin/jobs/entitlements/:account_id",
@@ -139,6 +178,23 @@ async fn require_jobs_beta(request: Request<Body>, next: Next) -> Result<Respons
             StatusCode::NOT_FOUND,
             "Bluey Jobs beta is not enabled.".to_string(),
         ));
+    }
+    Ok(next.run(request).await)
+}
+
+async fn require_jobs_worker(request: Request<Body>, next: Next) -> Result<Response, ApiError> {
+    let expected = std::env::var("BLUEY_JOBS_WORKER_TOKEN").unwrap_or_default();
+    let supplied = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if expected.is_empty()
+        || supplied.as_bytes().len() != expected.as_bytes().len()
+        || supplied.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() != 1
+    {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
     }
     Ok(next.run(request).await)
 }
@@ -477,6 +533,291 @@ pub async fn commit_application_packet(
         })
 }
 
+#[derive(Debug, Deserialize)]
+pub struct QueueApplicationRunRequest {
+    #[serde(default = "default_cloud_runner")]
+    pub runner: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QueueApplicationRunResponse {
+    pub application: JobApplication,
+    pub browser_session: BrowserSession,
+    pub workflow_id: String,
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_url: Option<String>,
+}
+
+pub async fn queue_application_run(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(application_id): Path<String>,
+    Json(req): Json<QueueApplicationRunRequest>,
+) -> Result<Json<QueueApplicationRunResponse>, ApiError> {
+    if !matches!(req.runner.as_str(), "local" | "cloud") {
+        return bad_request("Choose the local or cloud runner.");
+    }
+    let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
+    if (req.runner == "local" && !entitlement.local_browser)
+        || (req.runner == "cloud" && !entitlement.cloud_browser)
+    {
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            "That browser runner is not included in your Jobs plan.".to_string(),
+        ));
+    }
+    let mut application = jobs::get_application(&state.pool, &account.id, &application_id)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    let posting = jobs::get_posting(&state.pool, &account.id, &application.job_id)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
+    let resume_id = application.resume_version_id.clone().ok_or((
+        StatusCode::CONFLICT,
+        "Create the tailored resume before starting this application.".to_string(),
+    ))?;
+    let resume = jobs::get_resume_version(&state.pool, &account.id, &resume_id)
+        .map_err(internal)?
+        .ok_or((
+            StatusCode::CONFLICT,
+            "Tailored resume not found.".to_string(),
+        ))?;
+    let identity = application
+        .receipt
+        .pointer("/application_identity")
+        .and_then(Value::as_object)
+        .ok_or((
+            StatusCode::CONFLICT,
+            "Choose and verify the application email before starting.".to_string(),
+        ))?;
+    let identity_id = identity
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let identity_email = identity
+        .get("email")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if identity_id.is_empty() || identity_email.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            "Choose and verify the application email before starting.".to_string(),
+        ));
+    }
+    let existing_run = if matches!(
+        application.state.as_str(),
+        "queued" | "running" | "needs_input"
+    ) {
+        if let Some(run_id) = application.run_id.clone() {
+            jobs::list_browser_sessions(&state.pool, &account.id)
+                .map_err(internal)?
+                .into_iter()
+                .find(|session| session.id == run_id)
+                .map(|session| (run_id, session))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if existing_run
+        .as_ref()
+        .is_some_and(|(_, session)| session.runner != req.runner)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "This application is already active in another runner.".to_string(),
+        ));
+    }
+    let source = ats_kind(&posting.canonical_url);
+    if req.runner == "cloud" && source == "semantic" && posting.source.ends_with("_handoff") {
+        return Err((
+            StatusCode::CONFLICT,
+            "This listing needs a reviewed browser handoff.".to_string(),
+        ));
+    }
+    let run_id = existing_run
+        .as_ref()
+        .map(|(run_id, _)| run_id.clone())
+        .unwrap_or_else(|| {
+            application_run_id(
+                &account.id,
+                &application.id,
+                &resume.id,
+                application.updated_at_ms,
+            )
+        });
+    jobs::commit_packet(&state.pool, &account.id, &application.id).map_err(domain_error)?;
+    if application.state != "queued" {
+        application = jobs::update_application(
+            &state.pool,
+            &account.id,
+            &application.id,
+            "queued",
+            Some(&application.submission_mode),
+        )
+        .map_err(domain_error)?
+        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    }
+
+    let profile = jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?;
+    let browser_profile_id = hex::encode(Sha256::digest(
+        format!("{}\0{}", account.id, identity_id).as_bytes(),
+    ));
+    let answers = execution_answers(&profile, &application, &identity_email);
+    let workflow_input = json!({
+        "accountId": account.id,
+        "applicationId": application.id,
+        "jobId": posting.id,
+        "canonicalJobKey": posting.canonical_key,
+        "packetId": resume.id,
+        "applicationIdentityId": identity_id,
+        "browserProfileId": browser_profile_id,
+        "packet": {
+            "applicationId": application.id,
+            "jobId": posting.id,
+            "resumeVersionId": resume.id,
+            "resumeContent": resume.content,
+            "coverLetterContent": application.cover_letter,
+            "answers": answers,
+            "verifiedClaimIds": resume.claim_ids,
+            "applicationIdentityId": identity_id,
+            "applicationEmail": identity_email,
+            "browserProfileId": browser_profile_id,
+        },
+        "job": {
+            "externalId": posting.external_id,
+            "canonicalUrl": posting.canonical_url,
+            "company": posting.company,
+            "title": posting.title,
+            "location": posting.location,
+            "workplace": normalized_workplace(&posting.workplace),
+            "description": posting.description,
+            "source": source,
+            "compensation": posting.compensation,
+        },
+        "runner": req.runner,
+        "url": posting.canonical_url,
+        "idempotencyKey": run_id,
+        "runId": run_id,
+        "browserSessionId": format!("{}-{}", req.runner, application.id),
+    });
+    let mut browser_session =
+        existing_run
+            .map(|(_, session)| session)
+            .unwrap_or_else(|| BrowserSession {
+                id: run_id.clone(),
+                runner: req.runner.clone(),
+                status: "queued".to_string(),
+                current_company: posting.company.clone(),
+                current_step: "Waiting for a browser".to_string(),
+                application_id: Some(application.id.clone()),
+                takeover_url: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+    browser_session = jobs::upsert_browser_session(&state.pool, &account.id, &browser_session)
+        .map_err(internal)?;
+    application = jobs::assign_application_run(&state.pool, &account.id, &application.id, &run_id)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+
+    if req.runner == "local" {
+        let ticket = if let Some(existing) =
+            jobs::get_local_run_ticket(&state.pool, &account.id, &run_id).map_err(internal)?
+        {
+            existing
+        } else {
+            let secret = random_local_run_ticket();
+            let hash = hex::encode(Sha256::digest(secret.as_bytes()));
+            jobs::save_local_run_ticket(
+                &state.pool,
+                &account.id,
+                &application.id,
+                &run_id,
+                &hash,
+                &secret,
+                workflow_input,
+                jobs::now_ms() + 24 * 60 * 60 * 1_000,
+            )
+            .map_err(internal)?
+        };
+        return Ok(Json(QueueApplicationRunResponse {
+            application,
+            browser_session,
+            workflow_id: String::new(),
+            run_id: run_id.clone(),
+            launch_url: Some(format!(
+                "bluey-jobs://run/{run_id}?ticket={}",
+                ticket.ticket_secret
+            )),
+        }));
+    }
+
+    let gateway_origin = std::env::var("BLUEY_JOBS_WORKFLOW_ORIGIN")
+        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
+    let gateway_token = std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN").unwrap_or_default();
+    if gateway_token.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The cloud runner is temporarily unavailable.".to_string(),
+        ));
+    }
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/workflows/applications",
+            gateway_origin.trim_end_matches('/')
+        ))
+        .bearer_auth(gateway_token)
+        .json(&workflow_input)
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "Bluey Jobs workflow gateway failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                "Bluey could not start the cloud application. Try again.".to_string(),
+            )
+        })?;
+    if !response.status().is_success() && response.status() != StatusCode::CONFLICT {
+        tracing::error!(status = %response.status(), "Bluey Jobs workflow gateway rejected run");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Bluey could not start the cloud application. Try again.".to_string(),
+        ));
+    }
+    let workflow_id = format!("bluey-jobs:{}:{}", account.id, run_id);
+    Ok(Json(QueueApplicationRunResponse {
+        application,
+        browser_session,
+        workflow_id,
+        run_id,
+        launch_url: None,
+    }))
+}
+
+fn application_run_id(
+    account_id: &str,
+    application_id: &str,
+    resume_version_id: &str,
+    application_updated_at_ms: i64,
+) -> String {
+    let input = format!(
+        "{}\0{}\0{}\0{}",
+        account_id, application_id, resume_version_id, application_updated_at_ms
+    );
+    hex::encode(Sha256::digest(input.as_bytes()))[..40].to_string()
+}
+
+fn random_local_run_ticket() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("OS random source");
+    hex::encode(bytes)
+}
+
 pub async fn resume_version(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -646,10 +987,16 @@ pub async fn update_intervention(
         );
         updated.status = "resolved".to_string();
         if req.remember {
+            let question = updated
+                .metadata
+                .pointer("/receipt/intervention/field")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(&updated.title);
             let memory = AnswerMemory {
                 id: String::new(),
                 key: String::new(),
-                question: updated.title.clone(),
+                question: question.to_string(),
                 value: answer.to_string(),
                 scope: if req.scope.trim().is_empty() {
                     "account".to_string()
@@ -683,12 +1030,79 @@ pub async fn update_intervention(
     } else {
         None
     };
-    let saved = jobs::save_intervention(&state.pool, &account.id, &updated).map_err(internal)?;
+    let mut saved =
+        jobs::save_intervention(&state.pool, &account.id, &updated).map_err(internal)?;
+    if let Some(application) = resumed_application.as_ref() {
+        if let Some(run_id) = application.run_id.as_deref() {
+            let field = saved
+                .metadata
+                .pointer("/receipt/intervention/field")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Err(error) =
+                signal_workflow_resume(&account.id, run_id, &action, field, req.answer.trim()).await
+            {
+                tracing::error!(error = %error.1, "Bluey Jobs workflow resume failed");
+                saved.status = "open".to_string();
+                jobs::save_intervention(&state.pool, &account.id, &saved).map_err(internal)?;
+                let _ = jobs::update_application(
+                    &state.pool,
+                    &account.id,
+                    &application.id,
+                    "needs_input",
+                    None,
+                );
+                return Err(error);
+            }
+        }
+    }
     Ok(Json(InterventionResolutionResult {
         intervention: saved,
         answer_memory: remembered_answer,
         application: resumed_application,
     }))
+}
+
+async fn signal_workflow_resume(
+    account_id: &str,
+    run_id: &str,
+    action: &str,
+    field: &str,
+    answer: &str,
+) -> Result<(), ApiError> {
+    let origin = std::env::var("BLUEY_JOBS_WORKFLOW_ORIGIN")
+        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
+    let token = std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN").unwrap_or_default();
+    if token.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The application runner is temporarily unavailable.".to_string(),
+        ));
+    }
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/workflows/applications/{}/{}/resume",
+            origin.trim_end_matches('/'),
+            account_id,
+            run_id
+        ))
+        .bearer_auth(token)
+        .json(&json!({ "action": action, "field": field, "answer": answer }))
+        .send()
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Bluey could not resume the application. Try again.".to_string(),
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Bluey could not resume the application. Try again.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn answer_memory(
@@ -999,6 +1413,535 @@ pub async fn run_events(
         .map_err(internal)
 }
 
+#[derive(Debug, Deserialize)]
+struct LocalRunAccessRequest {
+    ticket: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalRunResultRequest {
+    ticket: String,
+    receipt: Value,
+    #[serde(default, rename = "receiptBundle")]
+    receipt_bundle: Option<Value>,
+}
+
+async fn claim_local_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(req): Json<LocalRunAccessRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let hash = local_run_ticket_hash(&req.ticket)?;
+    let ticket = jobs::claim_local_run_ticket(&state.pool, &run_id, &hash)
+        .map_err(internal)?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        ))?;
+    for mut intervention in jobs::list_interventions(&state.pool, &ticket.account_id)
+        .map_err(internal)?
+        .into_iter()
+        .filter(|item| {
+            item.application_id.as_deref() == Some(ticket.application_id.as_str())
+                && item.status == "open"
+        })
+    {
+        intervention.status = "resolved".to_string();
+        intervention.resolved_at_ms = Some(jobs::now_ms());
+        jobs::save_intervention(&state.pool, &ticket.account_id, &intervention)
+            .map_err(internal)?;
+    }
+    jobs::update_application(
+        &state.pool,
+        &ticket.account_id,
+        &ticket.application_id,
+        "running",
+        None,
+    )
+    .map_err(domain_error)?
+    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    update_worker_browser_session(
+        &state,
+        &ticket.account_id,
+        &ticket.application_id,
+        "running",
+    )?;
+    jobs::save_run_event(
+        &state.pool,
+        &ticket.account_id,
+        &ticket.id,
+        "local_browser_claimed",
+        json!({ "application_id": ticket.application_id }),
+    )
+    .map_err(internal)?;
+    Ok(Json(ticket.payload))
+}
+
+async fn save_local_run_result(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(req): Json<LocalRunResultRequest>,
+) -> Result<Json<JobApplication>, ApiError> {
+    let hash = local_run_ticket_hash(&req.ticket)?;
+    let ticket = jobs::get_local_run_ticket_by_hash(&state.pool, &run_id, &hash)
+        .map_err(internal)?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        ))?;
+    if ticket.expires_at_ms <= jobs::now_ms() {
+        return Err((
+            StatusCode::GONE,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        ));
+    }
+    if matches!(ticket.status.as_str(), "complete" | "failed") {
+        return jobs::get_application(&state.pool, &ticket.account_id, &ticket.application_id)
+            .map_err(internal)?
+            .map(Json)
+            .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()));
+    }
+    let status = req
+        .receipt
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let application = match status {
+        "needs_input" => {
+            create_intervention_from_receipt(
+                &state,
+                &ticket.account_id,
+                &ticket.application_id,
+                req.receipt,
+            )?;
+            let application = jobs::update_application(
+                &state.pool,
+                &ticket.account_id,
+                &ticket.application_id,
+                "needs_input",
+                None,
+            )
+            .map_err(domain_error)?
+            .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+            update_worker_browser_session(
+                &state,
+                &ticket.account_id,
+                &ticket.application_id,
+                "needs_input",
+            )?;
+            jobs::update_local_run_ticket_status(&state.pool, &run_id, &hash, "needs_input")
+                .map_err(internal)?;
+            application
+        }
+        "submitted" => {
+            let bundle = req.receipt_bundle.ok_or((
+                StatusCode::BAD_REQUEST,
+                "The local browser did not return its submission receipt.".to_string(),
+            ))?;
+            let application = persist_submission_receipt(
+                &state,
+                &ticket.account_id,
+                &ticket.application_id,
+                bundle,
+            )?;
+            jobs::update_local_run_ticket_status(&state.pool, &run_id, &hash, "complete")
+                .map_err(internal)?;
+            application
+        }
+        "failed" => {
+            let application = jobs::update_application(
+                &state.pool,
+                &ticket.account_id,
+                &ticket.application_id,
+                "failed",
+                None,
+            )
+            .map_err(domain_error)?
+            .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+            update_worker_browser_session(
+                &state,
+                &ticket.account_id,
+                &ticket.application_id,
+                "failed",
+            )?;
+            jobs::update_local_run_ticket_status(&state.pool, &run_id, &hash, "failed")
+                .map_err(internal)?;
+            application
+        }
+        _ => return bad_request("Bluey Browser returned an invalid application result."),
+    };
+    Ok(Json(application))
+}
+
+fn local_run_ticket_hash(ticket: &str) -> Result<String, ApiError> {
+    if ticket.len() != 64 || !ticket.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Bluey Browser launch not found.".to_string(),
+        ));
+    }
+    Ok(hex::encode(Sha256::digest(ticket.as_bytes())))
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerEventRequest {
+    account_id: String,
+    #[serde(default)]
+    application_id: String,
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    body: Value,
+}
+
+async fn worker_run_event(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(req): Json<WorkerEventRequest>,
+) -> Result<Json<RunEvent>, ApiError> {
+    ensure_worker_application(&state, &req.account_id, &req.application_id)?;
+    if req.event_type.trim().is_empty() || req.event_type.len() > 80 {
+        return bad_request("Invalid run event.");
+    }
+    jobs::save_run_event(
+        &state.pool,
+        &req.account_id,
+        &run_id,
+        &req.event_type,
+        req.body,
+    )
+    .map(Json)
+    .map_err(internal)
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerStateRequest {
+    account_id: String,
+    state: String,
+}
+
+async fn worker_application_state(
+    State(state): State<AppState>,
+    Path(application_id): Path<String>,
+    Json(req): Json<WorkerStateRequest>,
+) -> Result<Json<JobApplication>, ApiError> {
+    let application = jobs::update_application(
+        &state.pool,
+        &req.account_id,
+        &application_id,
+        &req.state,
+        None,
+    )
+    .map_err(domain_error)?
+    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    update_worker_browser_session(&state, &req.account_id, &application_id, &req.state)?;
+    Ok(Json(application))
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerInterventionRequest {
+    account_id: String,
+    receipt: Value,
+}
+
+async fn worker_intervention(
+    State(state): State<AppState>,
+    Path(application_id): Path<String>,
+    Json(req): Json<WorkerInterventionRequest>,
+) -> Result<Json<Intervention>, ApiError> {
+    create_intervention_from_receipt(&state, &req.account_id, &application_id, req.receipt)
+        .map(Json)
+}
+
+fn create_intervention_from_receipt(
+    state: &AppState,
+    account_id: &str,
+    application_id: &str,
+    mut receipt: Value,
+) -> Result<Intervention, ApiError> {
+    ensure_worker_application(state, account_id, application_id)?;
+    if let Some(receipt) = receipt.as_object_mut() {
+        receipt.remove("screenshotPath");
+    }
+    let source = receipt
+        .get("intervention")
+        .and_then(Value::as_object)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Intervention details are missing.".to_string(),
+        ))?;
+    let resolution = source.get("resolution").and_then(Value::as_object);
+    let takeover_url = source
+        .get("takeoverUrl")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let intervention = Intervention {
+        id: String::new(),
+        application_id: Some(application_id.to_string()),
+        kind: string_value(source, "kind", "browser_takeover"),
+        status: "open".to_string(),
+        title: string_value(source, "title", "Application needs your input"),
+        detail: string_value(source, "detail", "Open the preserved browser to continue."),
+        choices: source
+            .get("choices")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        resolution_kind: resolution
+            .map(|value| string_value(value, "kind", "browser_takeover"))
+            .unwrap_or_else(|| "browser_takeover".to_string()),
+        resume_after_resolution: resolution
+            .and_then(|value| value.get("resumeAfter"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        provider: resolution
+            .map(|value| string_value(value, "provider", ""))
+            .unwrap_or_default(),
+        provider_message_id: String::new(),
+        expires_at_ms: None,
+        metadata: json!({ "receipt": receipt }),
+        created_at_ms: 0,
+        resolved_at_ms: None,
+    };
+    let saved =
+        jobs::save_intervention(&state.pool, account_id, &intervention).map_err(internal)?;
+    if let Some(takeover_url) = takeover_url {
+        if takeover_url.starts_with("https://") || takeover_url.starts_with("bluey-jobs://") {
+            if let Some(mut session) = jobs::list_browser_sessions(&state.pool, account_id)
+                .map_err(internal)?
+                .into_iter()
+                .find(|session| {
+                    session.application_id.as_deref() == saved.application_id.as_deref()
+                })
+            {
+                session.status = "needs_input".to_string();
+                session.current_step = saved.title.clone();
+                session.takeover_url = Some(takeover_url);
+                jobs::upsert_browser_session(&state.pool, account_id, &session)
+                    .map_err(internal)?;
+            }
+        }
+    }
+    Ok(saved)
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerReceiptRequest {
+    account_id: String,
+    receipt: Value,
+}
+
+async fn worker_receipt(
+    State(state): State<AppState>,
+    Path(application_id): Path<String>,
+    Json(req): Json<WorkerReceiptRequest>,
+) -> Result<Json<JobApplication>, ApiError> {
+    persist_submission_receipt(&state, &req.account_id, &application_id, req.receipt).map(Json)
+}
+
+fn persist_submission_receipt(
+    state: &AppState,
+    account_id: &str,
+    application_id: &str,
+    mut receipt: Value,
+) -> Result<JobApplication, ApiError> {
+    let application = jobs::get_application(&state.pool, account_id, application_id)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    if receipt.get("applicationId").and_then(Value::as_str) != Some(application_id) {
+        return bad_request("Receipt does not match this application.");
+    }
+    let result = receipt.get("result").and_then(Value::as_object).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Submission result is missing.".to_string(),
+    ))?;
+    if result.get("status").and_then(Value::as_str) != Some("submitted") {
+        return bad_request("Only a confirmed submission can create a final receipt.");
+    }
+    let confirmation = result
+        .get("confirmationText")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Application submitted")
+        .to_string();
+    let confirmation_url = result.get("confirmationUrl").cloned();
+    let submitted_at = result.get("submittedAt").cloned();
+    let resume_id = application.resume_version_id.as_deref().ok_or((
+        StatusCode::CONFLICT,
+        "The submitted resume version is missing.".to_string(),
+    ))?;
+    let resume = jobs::get_resume_version(&state.pool, account_id, resume_id)
+        .map_err(internal)?
+        .ok_or((
+            StatusCode::CONFLICT,
+            "The submitted resume version is missing.".to_string(),
+        ))?;
+    let posting = jobs::get_posting(&state.pool, account_id, &application.job_id)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
+    sanitize_receipt_storage(&mut receipt, application_id, &resume.id);
+    let provider = receipt
+        .get("adapter")
+        .and_then(Value::as_str)
+        .unwrap_or(&posting.source)
+        .to_string();
+    jobs::save_application_evidence(
+        &state.pool,
+        account_id,
+        &ApplicationEvidence {
+            id: String::new(),
+            application_id: application_id.to_string(),
+            kind: "resume".to_string(),
+            label: "Resume submitted".to_string(),
+            provider: provider.clone(),
+            file_name: format!(
+                "{}-{}-resume.pdf",
+                safe_file_part(&posting.company),
+                safe_file_part(&posting.title)
+            ),
+            media_type: "application/pdf".to_string(),
+            storage_key: format!("jobs/resume-versions/{}", resume.id),
+            sha256: resume.checksum.clone(),
+            resume_version_id: Some(resume.id.clone()),
+            occurred_at_ms: 0,
+            metadata: json!({
+                "attached_to_submission": true,
+                "receipt_id": receipt.get("receiptId"),
+                "application_identity_id": receipt.get("applicationIdentityId"),
+            }),
+            created_at_ms: 0,
+        },
+    )
+    .map_err(internal)?;
+    jobs::save_application_evidence(
+        &state.pool,
+        account_id,
+        &ApplicationEvidence {
+            id: String::new(),
+            application_id: application_id.to_string(),
+            kind: "submission_confirmation".to_string(),
+            label: confirmation,
+            provider,
+            file_name: String::new(),
+            media_type: "application/json".to_string(),
+            storage_key: format!(
+                "jobs/receipts/{}",
+                receipt
+                    .get("receiptId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&application_id)
+            ),
+            sha256: hex::encode(Sha256::digest(receipt.to_string().as_bytes())),
+            resume_version_id: Some(resume.id),
+            occurred_at_ms: 0,
+            metadata: json!({
+                "confirmation_url": confirmation_url,
+                "submitted_at": submitted_at,
+                "screenshot_keys": receipt.get("screenshotKeys"),
+            }),
+            created_at_ms: 0,
+        },
+    )
+    .map_err(internal)?;
+    jobs::replace_application_receipt(&state.pool, account_id, application_id, receipt)
+        .map_err(internal)?;
+    let application =
+        jobs::update_application(&state.pool, account_id, application_id, "submitted", None)
+            .map_err(domain_error)?
+            .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    update_worker_browser_session(state, account_id, application_id, "complete")?;
+    Ok(application)
+}
+
+fn sanitize_receipt_storage(receipt: &mut Value, application_id: &str, resume_id: &str) {
+    if let Some(documents) = receipt.get_mut("documents").and_then(Value::as_array_mut) {
+        for (index, document) in documents.iter_mut().enumerate() {
+            let Some(document) = document.as_object_mut() else {
+                continue;
+            };
+            let kind = document
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("attachment");
+            let storage_key = match kind {
+                "resume" => format!("jobs/resume-versions/{resume_id}"),
+                "cover_letter" => format!("jobs/applications/{application_id}/cover-letter"),
+                _ => format!("jobs/applications/{application_id}/attachments/{index}"),
+            };
+            document.insert("storageKey".to_string(), Value::String(storage_key));
+        }
+    }
+    if let Some(result) = receipt.get_mut("result").and_then(Value::as_object_mut) {
+        result.remove("screenshotPath");
+    }
+    if let Some(screenshots) = receipt
+        .get_mut("screenshotKeys")
+        .and_then(Value::as_array_mut)
+    {
+        screenshots.retain(|value| {
+            value
+                .as_str()
+                .is_some_and(|key| key.starts_with("jobs/") || key.starts_with("r2://"))
+        });
+    }
+}
+
+fn ensure_worker_application(
+    state: &AppState,
+    account_id: &str,
+    application_id: &str,
+) -> Result<(), ApiError> {
+    if application_id.is_empty()
+        || jobs::get_application(&state.pool, account_id, application_id)
+            .map_err(internal)?
+            .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, "Application not found.".to_string()));
+    }
+    Ok(())
+}
+
+fn update_worker_browser_session(
+    state: &AppState,
+    account_id: &str,
+    application_id: &str,
+    status: &str,
+) -> Result<(), ApiError> {
+    let session_status = match status {
+        "submitted" => "complete",
+        "needs_input" => "needs_input",
+        "failed" => "failed",
+        "running" => "running",
+        other => other,
+    };
+    if let Some(mut session) = jobs::list_browser_sessions(&state.pool, account_id)
+        .map_err(internal)?
+        .into_iter()
+        .find(|session| session.application_id.as_deref() == Some(application_id))
+    {
+        session.status = session_status.to_string();
+        session.current_step = match session_status {
+            "complete" => "Application submitted",
+            "needs_input" => "Waiting for your input",
+            "failed" => "Run stopped",
+            "running" => "Filling application",
+            _ => &session.current_step,
+        }
+        .to_string();
+        if matches!(session_status, "complete" | "failed") {
+            session.takeover_url = None;
+        }
+        jobs::upsert_browser_session(&state.pool, account_id, &session).map_err(internal)?;
+    }
+    Ok(())
+}
+
 fn validate_profile(profile: &CareerProfile) -> Result<(), ApiError> {
     if profile.onboarding_complete {
         if profile.full_name.trim().is_empty() {
@@ -1103,6 +2046,137 @@ fn apply_submission_boundary(posting: &mut JobPosting) {
             .matched_reasons
             .push("Bluey prepares this packet; you submit it on Indeed.".to_string());
     }
+}
+
+fn default_cloud_runner() -> String {
+    "cloud".to_string()
+}
+
+fn execution_answers(
+    profile: &CareerProfile,
+    application: &JobApplication,
+    application_email: &str,
+) -> BTreeMap<String, String> {
+    let mut answers = BTreeMap::new();
+    let mut names = profile.full_name.split_whitespace();
+    let first_name = names.next().unwrap_or_default();
+    let last_name = names.collect::<Vec<_>>().join(" ");
+    add_answer(&mut answers, "first_name", first_name);
+    add_answer(&mut answers, "last_name", &last_name);
+    add_answer(&mut answers, "full_name", &profile.full_name);
+    add_answer(&mut answers, "email", application_email);
+    add_answer(&mut answers, "phone", &profile.phone);
+    add_answer(&mut answers, "location", &profile.current_location);
+    add_answer(&mut answers, "address", &profile.street_address);
+    add_answer(&mut answers, "linkedin_url", &profile.linkedin_url);
+    add_answer(&mut answers, "portfolio_url", &profile.portfolio_url);
+    add_answer(
+        &mut answers,
+        "work_authorization",
+        &profile.work_authorization,
+    );
+    add_answer(
+        &mut answers,
+        "sponsorship_required",
+        match profile.sponsorship_required {
+            Some(true) => "Yes",
+            Some(false) => "No",
+            None => "",
+        },
+    );
+    add_answer(
+        &mut answers,
+        "salary_expectation",
+        &profile.salary_expectation,
+    );
+    add_answer(&mut answers, "notice_period", &profile.notice_period);
+    if let Some(reusable) = profile.reusable_answers.as_object() {
+        for (key, value) in reusable {
+            if let Some(value) = value.as_str() {
+                add_answer(&mut answers, key, value);
+            }
+        }
+    }
+    for answer in &application.answers {
+        let Some(answer) = answer.as_object() else {
+            continue;
+        };
+        let key = ["key", "question", "field", "name"]
+            .iter()
+            .find_map(|key| answer.get(*key).and_then(Value::as_str))
+            .unwrap_or_default();
+        let value = ["value", "answer"]
+            .iter()
+            .find_map(|key| answer.get(*key).and_then(Value::as_str))
+            .unwrap_or_default();
+        add_answer(&mut answers, key, value);
+    }
+    answers
+}
+
+fn add_answer(answers: &mut BTreeMap<String, String>, key: &str, value: &str) {
+    if !key.trim().is_empty() && !value.trim().is_empty() {
+        answers.insert(key.trim().to_string(), value.trim().to_string());
+    }
+}
+
+fn ats_kind(raw_url: &str) -> &'static str {
+    let host = reqwest::Url::parse(raw_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    if host.contains("myworkdayjobs.com") {
+        "workday"
+    } else if host == "boards.greenhouse.io" || host == "job-boards.greenhouse.io" {
+        "greenhouse"
+    } else if host == "jobs.lever.co" {
+        "lever"
+    } else if host == "jobs.ashbyhq.com" {
+        "ashby"
+    } else if host == "jobs.smartrecruiters.com" || host.ends_with(".smartrecruiters.com") {
+        "smartrecruiters"
+    } else {
+        "semantic"
+    }
+}
+
+fn normalized_workplace(value: &str) -> &str {
+    match value.to_ascii_lowercase().as_str() {
+        "onsite" => "onsite",
+        "hybrid" => "hybrid",
+        "remote" => "remote",
+        _ => "unknown",
+    }
+}
+
+fn string_value(source: &serde_json::Map<String, Value>, key: &str, fallback: &str) -> String {
+    source
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn safe_file_part(value: &str) -> String {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    normalized
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .chars()
+        .take(80)
+        .collect()
 }
 
 fn default_factual() -> String {

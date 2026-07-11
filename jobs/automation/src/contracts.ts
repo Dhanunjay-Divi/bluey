@@ -19,10 +19,38 @@ export type ApplicationState =
 
 export type RunnerKind = "local" | "cloud";
 
+export type FormControlKind =
+  | "text"
+  | "email"
+  | "tel"
+  | "url"
+  | "textarea"
+  | "select"
+  | "checkbox"
+  | "radio"
+  | "file"
+  | "hidden"
+  | "other";
+
+export interface FormControl {
+  selector: string;
+  kind: FormControlKind;
+  label: string;
+  name: string;
+  placeholder: string;
+  required: boolean;
+  value: string;
+  checked?: boolean;
+  options?: Array<{ label: string; value: string }>;
+}
+
 export interface BrowserPage {
   url(): string;
   title(): Promise<string>;
   locator(selector: string): BrowserLocator;
+  controls(): Promise<FormControl[]>;
+  bodyText(): Promise<string>;
+  waitForSettled(): Promise<void>;
   screenshot(options?: { fullPage?: boolean }): Promise<Uint8Array>;
 }
 
@@ -31,6 +59,11 @@ export interface BrowserLocator {
   fill(value: string): Promise<void>;
   click(): Promise<void>;
   textContent(): Promise<string | null>;
+  getAttribute(name: string): Promise<string | null>;
+  isVisible(): Promise<boolean>;
+  selectOption(value: string): Promise<void>;
+  setChecked(checked: boolean): Promise<void>;
+  setInputFiles(paths: string[]): Promise<void>;
 }
 
 export interface NormalizedJob {
@@ -51,10 +84,15 @@ export interface ApplicationPacket {
   applicationId: string;
   jobId: string;
   resumeVersionId: string;
-  resumePath: string;
+  resumePath?: string;
+  resumeContent?: Record<string, unknown>;
   coverLetterPath?: string;
+  coverLetterContent?: string;
   answers: Record<string, string>;
   verifiedClaimIds: string[];
+  applicationIdentityId?: string;
+  applicationEmail?: string;
+  browserProfileId?: string;
 }
 
 export interface InterventionRequest {
@@ -70,6 +108,7 @@ export interface InterventionRequest {
   detail: string;
   field?: string;
   choices?: string[];
+  takeoverUrl?: string;
   resolution?: InterventionResolution;
 }
 

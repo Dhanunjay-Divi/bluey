@@ -5,3 +5,8 @@ export * from "./form-intelligence.js";
 export * from "./policy.js";
 export * from "./public-ats.js";
 export * from "./receipts.js";
+export * from "./standard-adapters.js";
+export * from "./execute.js";
+export * from "./playwright-page.js";
+export * from "./documents.js";
+export * from "./network.js";

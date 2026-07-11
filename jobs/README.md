@@ -8,8 +8,9 @@ meeting overlay, audio pipeline, or native session runtime.
 
 - `portal`: React 19 customer app. Vite builds it into `web/jobs`.
 - `automation`: shared ATS, discovery, browser, receipt, and policy contracts.
-- `browser`: Electron controller for a Playwright persistent Chromium profile.
-- `workflows`: Temporal workflow and activity boundaries for cloud runs.
+- `browser`: Electron controller with one Playwright Chromium profile per verified application email.
+- `runner`: isolated cloud Chromium runner with encrypted profile snapshots.
+- `workflows`: Temporal worker and workflow-start gateway for durable cloud runs.
 - `server/src/bin/bluey-jobs-api.rs`: independently deployable Jobs API process.
 - `server/src/api/jobs.rs`: authenticated `/api/jobs/*` endpoints.
 - `server/src/db/jobs.rs`: SQLite/Postgres tenant persistence and packet metering.
@@ -37,10 +38,11 @@ npm run build --workspace @bluey/jobs-browser
 npm run start --workspace @bluey/jobs-browser
 ```
 
-The cloud worker requires `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`,
-`BLUEY_JOBS_WORKER_TOKEN`, and an enabled browser-pool activity implementation.
-The workflow deliberately returns an intervention instead of pretending to
-submit when no browser pool is configured.
+The cloud path runs three processes: the Jobs API, Temporal worker/gateway, and
+browser runner. Required configuration is documented in `OPERATIONS.md`.
+Unknown required fields and verification challenges preserve the browser and
+pause the workflow for up to 24 hours; resolving the Intervention Inbox resumes
+the same application.
 
 The release Jobs API is dark unless `BLUEY_JOBS_BETA_ENABLED=1`. Run the
 standalone service with:
@@ -69,8 +71,20 @@ internal pricing and margin model.
   host-pinned, retry-bounded discovery and canonical deduplication.
 - Form planning uses confirmed facts and company/track/account answer memory;
   unknown required questions become interventions.
-- Every committed run can retain the exact packet and evidence in one
+- Company Answer Memory overrides Career Track memory, which overrides account
+  memory; an answer set on the current application always wins.
+- Queue requests, Temporal activity retries, and intervention resumes use
+  durable idempotency keys so a completed submit action cannot run twice.
+- Local runs use encrypted, short-lived launch tickets. The custom protocol
+  never carries a long-lived Bluey token or the application packet itself.
+- Bluey Browser reports local results to the Jobs API and keeps the same visible
+  page alive while the account owner completes an intervention.
+- Browser navigation is checked at initial load and on redirects against
+  private-network and credential-bearing targets.
+- Every committed run retains the exact application bundle and evidence in one
   fingerprinted receipt.
+- Machine-local document and screenshot paths are removed before receipts enter
+  account storage.
 - Application emails are verified independently from the Bluey login, selected
   per Career Track, and frozen into the resume and receipt.
 - Separate Gmail and Outlook mailboxes are tenant-scoped and plan-limited;

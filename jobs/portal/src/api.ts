@@ -16,6 +16,7 @@ import type {
   JobsWorkspace,
   MailboxConnection,
   PacketCommitResult,
+  QueueApplicationRunResponse,
   PrepareApplicationResponse,
   ResumeVersion,
 } from "./types";
@@ -146,6 +147,11 @@ export const jobsApi = {
   commitPacket: (id: string) =>
     request<PacketCommitResult>(`/api/jobs/applications/${encodeURIComponent(id)}/commit`, {
       method: "POST",
+    }),
+  queueApplicationRun: (id: string, runner: "local" | "cloud" = "cloud") =>
+    request<QueueApplicationRunResponse>(`/api/jobs/applications/${encodeURIComponent(id)}/runs`, {
+      method: "POST",
+      body: JSON.stringify({ runner }),
     }),
   applicationEvidence: (id: string) =>
     request<ApplicationEvidence[]>(`/api/jobs/applications/${encodeURIComponent(id)}/evidence`),

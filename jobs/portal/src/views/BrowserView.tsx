@@ -20,8 +20,9 @@ import type { Intervention, JobApplication, JobsWorkspace } from "../types";
 import { relativeTime, titleCase } from "../lib/format";
 import { Dialog } from "../components/Dialog";
 
-export function BrowserView({ workspace, onQueueCloud, onUpdateSession, onResolveIntervention }: { workspace: JobsWorkspace; onQueueCloud(application: JobApplication): Promise<void>; onUpdateSession(session: JobsWorkspace["browser_sessions"][number], status: string): Promise<void>; onResolveIntervention(intervention: Intervention, action: string): Promise<void> }) {
+export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSession, onResolveIntervention }: { workspace: JobsWorkspace; onQueueLocal(application: JobApplication): Promise<void>; onQueueCloud(application: JobApplication): Promise<void>; onUpdateSession(session: JobsWorkspace["browser_sessions"][number], status: string): Promise<void>; onResolveIntervention(intervention: Intervention, action: string): Promise<void> }) {
   const [installOpen, setInstallOpen] = useState(false);
+  const [localOpen, setLocalOpen] = useState(false);
   const [cloudOpen, setCloudOpen] = useState(false);
   const [queueing, setQueueing] = useState("");
   const [resolving, setResolving] = useState(false);
@@ -65,7 +66,7 @@ export function BrowserView({ workspace, onQueueCloud, onUpdateSession, onResolv
         <article className={`runner-option ${workspace.entitlement.local_browser ? "enabled" : "locked"}`}>
           <div className="runner-icon"><Laptop /></div>
           <div className="runner-copy"><p>LOCAL</p><h2>Bluey Browser</h2><span>Applications run on your computer in a separate Jobs browser. Take over at any moment.</span><ul><li><Check size={14} />Keeps your job-site sign-ins ready</li><li><Check size={14} />Uses the same application flow as cloud</li><li><Check size={14} />Stops when your computer is off</li></ul></div>
-          <div className="runner-action"><b>{workspace.entitlement.local_browser ? "Included" : "Pro"}</b>{workspace.entitlement.local_browser ? <button className="button primary" onClick={() => setInstallOpen(true)}>Open browser<ArrowRight size={16} /></button> : <a className="button secondary" href="/jobs/settings#plans">See Pro<ArrowRight size={16} /></a>}</div>
+          <div className="runner-action"><b>{workspace.entitlement.local_browser ? "Included" : "Pro"}</b>{workspace.entitlement.local_browser ? <><button className="button primary" onClick={() => setLocalOpen(true)}>Run locally<ArrowRight size={16} /></button><button className="button secondary compact" onClick={() => setInstallOpen(true)}>Set up browser</button></> : <a className="button secondary" href="/jobs/settings#plans">See Pro<ArrowRight size={16} /></a>}</div>
         </article>
         <article className={`runner-option ${workspace.entitlement.cloud_browser ? "enabled" : "locked"}`}>
           <div className="runner-icon cloud"><Cloud /></div>
@@ -88,6 +89,11 @@ export function BrowserView({ workspace, onQueueCloud, onUpdateSession, onResolv
       <Dialog open={cloudOpen} title="Queue a cloud application" description="Cloud runs always start from a reviewed or Auto-submit-eligible application." onClose={() => setCloudOpen(false)}>
         <div className="cloud-queue-list">{workspace.applications.filter((item) => ["awaiting_review", "queued"].includes(item.state)).map((application) => { const job = workspace.matches.find((item) => item.id === application.job_id); return <button key={application.id} disabled={Boolean(queueing)} onClick={() => { setQueueing(application.id); void onQueueCloud(application).then(() => setCloudOpen(false)).finally(() => setQueueing("")); }}><div className="company-mark">{job?.company.slice(0, 2).toUpperCase()}</div><span><b>{job?.title}</b><small>{job?.company} · {application.match_score}% match</small></span>{queueing === application.id ? <small>Queuing...</small> : <Play size={17} />}</button>; })}{workspace.applications.filter((item) => ["awaiting_review", "queued"].includes(item.state)).length === 0 && <div className="empty-state small"><KeyRound /><h3>No eligible applications</h3><p>Review an application in Applications first.</p></div>}</div>
         <div className="dialog-actions"><button className="button secondary" onClick={() => setCloudOpen(false)}>Close</button><a className="button primary" href="/jobs/applications">Go to Applications<ArrowRight size={16} /></a></div>
+      </Dialog>
+
+      <Dialog open={localOpen} title="Open a local application" description="Choose a reviewed application. Bluey opens the frozen resume and answers in your isolated browser profile." onClose={() => setLocalOpen(false)}>
+        <div className="cloud-queue-list">{workspace.applications.filter((item) => ["awaiting_review", "queued"].includes(item.state)).map((application) => { const job = workspace.matches.find((item) => item.id === application.job_id); return <button key={application.id} disabled={Boolean(queueing)} onClick={() => { setQueueing(application.id); void onQueueLocal(application).then(() => setLocalOpen(false)).finally(() => setQueueing("")); }}><div className="company-mark">{job?.company.slice(0, 2).toUpperCase()}</div><span><b>{job?.title}</b><small>{job?.company} · {application.match_score}% match</small></span>{queueing === application.id ? <small>Opening...</small> : <Play size={17} />}</button>; })}{workspace.applications.filter((item) => ["awaiting_review", "queued"].includes(item.state)).length === 0 && <div className="empty-state small"><KeyRound /><h3>No eligible applications</h3><p>Review an application in Applications first.</p></div>}</div>
+        <div className="dialog-actions"><button className="button secondary" onClick={() => setLocalOpen(false)}>Close</button><button className="button secondary" onClick={() => { setLocalOpen(false); setInstallOpen(true); }}>Set up Bluey Browser</button></div>
       </Dialog>
     </div>
   );

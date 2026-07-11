@@ -993,6 +993,29 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_application_evidence_application
         ON jobs_application_evidence(account_id, application_id, occurred_at_ms DESC);
     "#,
+    // 0022 - capability-scoped local Bluey Browser launches.
+    //
+    // The website hands the desktop app a short-lived random ticket instead
+    // of putting a reusable Bluey access token or application packet in a
+    // custom-protocol URL. Packet and ticket secrets remain encrypted at rest.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_local_run_tickets (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        application_id        TEXT NOT NULL REFERENCES jobs_applications(id) ON DELETE CASCADE,
+        ticket_hash           TEXT NOT NULL UNIQUE,
+        ticket_secret         TEXT NOT NULL,
+        payload_json          TEXT NOT NULL,
+        status                TEXT NOT NULL DEFAULT 'queued',
+        expires_at_ms         INTEGER NOT NULL,
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_local_run_tickets_expiry
+        ON jobs_local_run_tickets(expires_at_ms, status);
+    CREATE INDEX IF NOT EXISTS idx_jobs_local_run_tickets_account
+        ON jobs_local_run_tickets(account_id, updated_at_ms DESC);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {

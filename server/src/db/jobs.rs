@@ -17,6 +17,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use super::DbPool;
 
@@ -542,6 +543,20 @@ pub struct RunEvent {
     pub event_type: String,
     pub event: Value,
     pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalRunTicket {
+    pub id: String,
+    pub account_id: String,
+    pub application_id: String,
+    pub ticket_hash: String,
+    pub ticket_secret: String,
+    pub payload: Value,
+    pub status: String,
+    pub expires_at_ms: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1766,6 +1781,24 @@ pub fn prepare_application(
         updated_at_ms: now,
         submitted_at_ms: None,
     });
+    let remembered_answers = answers_for_posting(pool, account_id, &posting)?;
+    for remembered in remembered_answers {
+        let key = remembered
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let already_answered = application.answers.iter().any(|answer| {
+            ["key", "question", "field", "name"].iter().any(|field| {
+                answer
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| normalize_answer_memory_key(value) == key)
+            })
+        });
+        if !already_answered {
+            application.answers.push(remembered);
+        }
+    }
     application.resume_version_id = Some(resume.id.clone());
     let auto_submit_eligible = submission_mode == "auto_submit"
         && posting.match_score >= profile.auto_submit_threshold.clamp(60, 100)
@@ -1794,6 +1827,68 @@ pub fn prepare_application(
     });
     save_application(pool, account_id, &application)?;
     Ok((application, resume))
+}
+
+fn answers_for_posting(
+    pool: &DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+) -> Result<Vec<Value>> {
+    let company_scope = normalize_company_scope(&posting.company);
+    let mut selected: BTreeMap<String, (u8, AnswerMemory)> = BTreeMap::new();
+    for answer in list_answer_memory(pool, account_id)? {
+        if !answer.confirmed {
+            continue;
+        }
+        let rank = match answer.scope.as_str() {
+            "company" if answer.scope_id.as_deref() == Some(company_scope.as_str()) => 3,
+            "track"
+                if !posting.track_id.is_empty()
+                    && answer.scope_id.as_deref() == Some(posting.track_id.as_str()) =>
+            {
+                2
+            }
+            "account" => 1,
+            _ => continue,
+        };
+        match selected.get(&answer.key) {
+            Some((existing_rank, _)) if *existing_rank >= rank => {}
+            _ => {
+                selected.insert(answer.key.clone(), (rank, answer));
+            }
+        }
+    }
+    Ok(selected
+        .into_values()
+        .map(|(_, answer)| {
+            json!({
+                "key": answer.key,
+                "question": answer.question,
+                "value": answer.value,
+                "source": "answer_memory",
+                "memory_id": answer.id,
+                "scope": answer.scope,
+                "scope_id": answer.scope_id,
+            })
+        })
+        .collect())
+}
+
+fn normalize_company_scope(company: &str) -> String {
+    let mut value = String::new();
+    let mut separator = false;
+    for character in company.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            if separator && !value.is_empty() {
+                value.push('-');
+            }
+            value.push(character);
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    value
 }
 
 fn account_login_email(pool: &DbPool, account_id: &str) -> Result<String> {
@@ -2103,6 +2198,34 @@ pub fn update_application(
     if state == "submitted" {
         application.submitted_at_ms = Some(application.updated_at_ms);
     }
+    save_application(pool, account_id, &application).map(Some)
+}
+
+pub fn assign_application_run(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> Result<Option<JobApplication>> {
+    let Some(mut application) = get_application(pool, account_id, application_id)? else {
+        return Ok(None);
+    };
+    application.run_id = Some(run_id.to_string());
+    application.updated_at_ms = now_ms();
+    save_application(pool, account_id, &application).map(Some)
+}
+
+pub fn replace_application_receipt(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    receipt: Value,
+) -> Result<Option<JobApplication>> {
+    let Some(mut application) = get_application(pool, account_id, application_id)? else {
+        return Ok(None);
+    };
+    application.receipt = receipt;
+    application.updated_at_ms = now_ms();
     save_application(pool, account_id, &application).map(Some)
 }
 
@@ -4015,6 +4138,320 @@ pub fn list_run_events(pool: &DbPool, account_id: &str, run_id: &str) -> Result<
     })
 }
 
+pub fn save_run_event(
+    pool: &DbPool,
+    account_id: &str,
+    run_id: &str,
+    event_type: &str,
+    event: Value,
+) -> Result<RunEvent> {
+    let value = RunEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        run_id: run_id.to_string(),
+        event_type: event_type.to_string(),
+        event,
+        created_at_ms: now_ms(),
+    };
+    let payload = to_json(&value.event, "Jobs run event")?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            pool.get()?.execute(
+                "INSERT INTO jobs_run_events(id, account_id, run_id, event_type, event_json, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![value.id, account_id, value.run_id, value.event_type, payload, value.created_at_ms],
+            )?;
+            Ok(value)
+        }
+        DbPool::Postgres(_) => {
+            pool.get_pg()?.execute(
+                "INSERT INTO jobs_run_events(id, account_id, run_id, event_type, event_json, created_at_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[&value.id, &account_id, &value.run_id, &value.event_type, &payload, &value.created_at_ms],
+            )?;
+            Ok(value)
+        }
+    })
+}
+
+pub fn save_local_run_ticket(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    ticket_hash: &str,
+    ticket_secret: &str,
+    payload: Value,
+    expires_at_ms: i64,
+) -> Result<LocalRunTicket> {
+    let now = now_ms();
+    let value = LocalRunTicket {
+        id: run_id.to_string(),
+        account_id: account_id.to_string(),
+        application_id: application_id.to_string(),
+        ticket_hash: ticket_hash.to_string(),
+        ticket_secret: ticket_secret.to_string(),
+        payload,
+        status: "queued".to_string(),
+        expires_at_ms,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    let encrypted_ticket = encrypt_payload(&value.ticket_secret)?;
+    let encrypted_payload = to_json(&value.payload, "Jobs local browser packet")?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            pool.get()?.execute(
+                "INSERT INTO jobs_local_run_tickets (
+                    id, account_id, application_id, ticket_hash, ticket_secret,
+                    payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                    ticket_hash = excluded.ticket_hash,
+                    ticket_secret = excluded.ticket_secret,
+                    payload_json = excluded.payload_json,
+                    status = excluded.status,
+                    expires_at_ms = excluded.expires_at_ms,
+                    updated_at_ms = excluded.updated_at_ms
+                 WHERE jobs_local_run_tickets.account_id = excluded.account_id
+                   AND jobs_local_run_tickets.application_id = excluded.application_id",
+                params![
+                    value.id,
+                    value.account_id,
+                    value.application_id,
+                    value.ticket_hash,
+                    encrypted_ticket,
+                    encrypted_payload,
+                    value.status,
+                    value.expires_at_ms,
+                    value.created_at_ms,
+                ],
+            )?;
+            Ok(value)
+        }
+        DbPool::Postgres(_) => {
+            pool.get_pg()?.execute(
+                "INSERT INTO jobs_local_run_tickets (
+                    id, account_id, application_id, ticket_hash, ticket_secret,
+                    payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+                 ON CONFLICT(id) DO UPDATE SET
+                    ticket_hash = EXCLUDED.ticket_hash,
+                    ticket_secret = EXCLUDED.ticket_secret,
+                    payload_json = EXCLUDED.payload_json,
+                    status = EXCLUDED.status,
+                    expires_at_ms = EXCLUDED.expires_at_ms,
+                    updated_at_ms = EXCLUDED.updated_at_ms
+                 WHERE jobs_local_run_tickets.account_id = EXCLUDED.account_id
+                   AND jobs_local_run_tickets.application_id = EXCLUDED.application_id",
+                &[
+                    &value.id,
+                    &value.account_id,
+                    &value.application_id,
+                    &value.ticket_hash,
+                    &encrypted_ticket,
+                    &encrypted_payload,
+                    &value.status,
+                    &value.expires_at_ms,
+                    &value.created_at_ms,
+                ],
+            )?;
+            Ok(value)
+        }
+    })
+}
+
+pub fn get_local_run_ticket(
+    pool: &DbPool,
+    account_id: &str,
+    run_id: &str,
+) -> Result<Option<LocalRunTicket>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => pool
+            .get()?
+            .query_row(
+                "SELECT id, account_id, application_id, ticket_hash, ticket_secret,
+                        payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+                   FROM jobs_local_run_tickets
+                  WHERE account_id = ?1 AND id = ?2",
+                params![account_id, run_id],
+                local_run_ticket_from_sqlite_row,
+            )
+            .optional()
+            .context("get Jobs local run ticket"),
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query_opt(
+                "SELECT id, account_id, application_id, ticket_hash, ticket_secret,
+                        payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+                   FROM jobs_local_run_tickets
+                  WHERE account_id = $1 AND id = $2",
+                &[&account_id, &run_id],
+            )?
+            .map(local_run_ticket_from_pg_row)
+            .transpose(),
+    })
+}
+
+pub fn get_local_run_ticket_by_hash(
+    pool: &DbPool,
+    run_id: &str,
+    ticket_hash: &str,
+) -> Result<Option<LocalRunTicket>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => pool
+            .get()?
+            .query_row(
+                "SELECT id, account_id, application_id, ticket_hash, ticket_secret,
+                        payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+                   FROM jobs_local_run_tickets
+                  WHERE id = ?1 AND ticket_hash = ?2",
+                params![run_id, ticket_hash],
+                local_run_ticket_from_sqlite_row,
+            )
+            .optional()
+            .context("get Jobs local run capability"),
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query_opt(
+                "SELECT id, account_id, application_id, ticket_hash, ticket_secret,
+                        payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+                   FROM jobs_local_run_tickets
+                  WHERE id = $1 AND ticket_hash = $2",
+                &[&run_id, &ticket_hash],
+            )?
+            .map(local_run_ticket_from_pg_row)
+            .transpose(),
+    })
+}
+
+pub fn claim_local_run_ticket(
+    pool: &DbPool,
+    run_id: &str,
+    ticket_hash: &str,
+) -> Result<Option<LocalRunTicket>> {
+    let now = now_ms();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let transaction = conn.transaction()?;
+            let value = transaction
+                .query_row(
+                    "SELECT id, account_id, application_id, ticket_hash, ticket_secret,
+                            payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+                       FROM jobs_local_run_tickets
+                      WHERE id = ?1 AND ticket_hash = ?2 AND expires_at_ms > ?3
+                        AND status NOT IN ('complete', 'failed')",
+                    params![run_id, ticket_hash, now],
+                    local_run_ticket_from_sqlite_row,
+                )
+                .optional()?;
+            if value.is_some() {
+                transaction.execute(
+                    "UPDATE jobs_local_run_tickets SET status = 'claimed', updated_at_ms = ?3
+                      WHERE id = ?1 AND ticket_hash = ?2",
+                    params![run_id, ticket_hash, now],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(value.map(|mut value| {
+                value.status = "claimed".to_string();
+                value.updated_at_ms = now;
+                value
+            }))
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut transaction = conn.transaction()?;
+            let value = transaction
+                .query_opt(
+                    "SELECT id, account_id, application_id, ticket_hash, ticket_secret,
+                            payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+                       FROM jobs_local_run_tickets
+                      WHERE id = $1 AND ticket_hash = $2 AND expires_at_ms > $3
+                        AND status NOT IN ('complete', 'failed')
+                      FOR UPDATE",
+                    &[&run_id, &ticket_hash, &now],
+                )?
+                .map(local_run_ticket_from_pg_row)
+                .transpose()?;
+            if value.is_some() {
+                transaction.execute(
+                    "UPDATE jobs_local_run_tickets SET status = 'claimed', updated_at_ms = $3
+                      WHERE id = $1 AND ticket_hash = $2",
+                    &[&run_id, &ticket_hash, &now],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(value.map(|mut value| {
+                value.status = "claimed".to_string();
+                value.updated_at_ms = now;
+                value
+            }))
+        }
+    })
+}
+
+pub fn update_local_run_ticket_status(
+    pool: &DbPool,
+    run_id: &str,
+    ticket_hash: &str,
+    status: &str,
+) -> Result<bool> {
+    let now = now_ms();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
+            "UPDATE jobs_local_run_tickets SET status = ?3, updated_at_ms = ?4
+              WHERE id = ?1 AND ticket_hash = ?2 AND expires_at_ms > ?4",
+            params![run_id, ticket_hash, status, now],
+        )? > 0),
+        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
+            "UPDATE jobs_local_run_tickets SET status = $3, updated_at_ms = $4
+              WHERE id = $1 AND ticket_hash = $2 AND expires_at_ms > $4",
+            &[&run_id, &ticket_hash, &status, &now],
+        )? > 0),
+    })
+}
+
+fn local_run_ticket_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalRunTicket> {
+    let encrypted_ticket: String = row.get(4)?;
+    let encrypted_payload: String = row.get(5)?;
+    let ticket_secret = decrypt_payload(&encrypted_ticket).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, error.into())
+    })?;
+    let payload = parse_json(encrypted_payload, "Jobs local browser packet").map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, error.into())
+    })?;
+    Ok(LocalRunTicket {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        application_id: row.get(2)?,
+        ticket_hash: row.get(3)?,
+        ticket_secret,
+        payload,
+        status: row.get(6)?,
+        expires_at_ms: row.get(7)?,
+        created_at_ms: row.get(8)?,
+        updated_at_ms: row.get(9)?,
+    })
+}
+
+fn local_run_ticket_from_pg_row(row: postgres::Row) -> Result<LocalRunTicket> {
+    let encrypted_ticket: String = row.get(4);
+    let encrypted_payload: String = row.get(5);
+    Ok(LocalRunTicket {
+        id: row.get(0),
+        account_id: row.get(1),
+        application_id: row.get(2),
+        ticket_hash: row.get(3),
+        ticket_secret: decrypt_payload(&encrypted_ticket)?,
+        payload: parse_json(encrypted_payload, "Jobs local browser packet")?,
+        status: row.get(6),
+        expires_at_ms: row.get(7),
+        created_at_ms: row.get(8),
+        updated_at_ms: row.get(9),
+    })
+}
+
 pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWorkspace> {
     let _ = ensure_primary_application_identity(pool, account_id, email)?;
     Ok(JobsWorkspace {
@@ -4761,5 +5198,133 @@ mod tests {
         assert!(!raw.contains("dependable products"));
         assert!(delete_answer_memory(&pool, "acct-jobs", &second.id).unwrap());
         assert!(list_answer_memory(&pool, "acct-jobs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn application_packets_reuse_answer_memory_with_company_precedence() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/answer-memory",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let base = AnswerMemory {
+            id: String::new(),
+            key: String::new(),
+            question: "Why are you interested in this role?".to_string(),
+            value: "I enjoy building reliable products.".to_string(),
+            scope: "account".to_string(),
+            scope_id: None,
+            confirmed: true,
+            source: "settings".to_string(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_used_at_ms: None,
+            use_count: 0,
+        };
+        save_answer_memory(&pool, "acct-jobs", &base).unwrap();
+        save_answer_memory(
+            &pool,
+            "acct-jobs",
+            &AnswerMemory {
+                value: "Acme's reliability work matches my experience.".to_string(),
+                scope: "company".to_string(),
+                scope_id: Some("acme".to_string()),
+                ..base
+            },
+        )
+        .unwrap();
+
+        let (application, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let remembered = application
+            .answers
+            .iter()
+            .find(|answer| {
+                answer.get("key").and_then(Value::as_str)
+                    == Some("why are you interested in this role")
+            })
+            .expect("remembered answer");
+        assert_eq!(
+            remembered.get("value").and_then(Value::as_str),
+            Some("Acme's reliability work matches my experience.")
+        );
+        assert_eq!(
+            remembered.get("scope").and_then(Value::as_str),
+            Some("company")
+        );
+    }
+
+    #[test]
+    fn local_browser_ticket_is_encrypted_scoped_and_claimable() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/local-run",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let payload = json!({ "applicationId": application.id, "answer": "private value" });
+        let saved = save_local_run_ticket(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            "local-run-1",
+            "ticket-hash",
+            "ticket-secret",
+            payload.clone(),
+            now_ms() + 60_000,
+        )
+        .unwrap();
+        assert_eq!(saved.status, "queued");
+
+        let stored: (String, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT ticket_secret, payload_json FROM jobs_local_run_tickets WHERE id = ?1",
+                params!["local-run-1"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!stored.0.contains("ticket-secret"));
+        assert!(!stored.1.contains("private value"));
+        assert!(claim_local_run_ticket(&pool, "local-run-1", "wrong-hash")
+            .unwrap()
+            .is_none());
+        let claimed = claim_local_run_ticket(&pool, "local-run-1", "ticket-hash")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.ticket_secret, "ticket-secret");
+        assert_eq!(claimed.payload, payload);
+        assert_eq!(claimed.status, "claimed");
+        assert!(
+            update_local_run_ticket_status(&pool, "local-run-1", "ticket-hash", "complete",)
+                .unwrap()
+        );
+        assert!(claim_local_run_ticket(&pool, "local-run-1", "ticket-hash")
+            .unwrap()
+            .is_none());
     }
 }

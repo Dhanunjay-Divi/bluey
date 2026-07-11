@@ -20,7 +20,7 @@ authority for login, account state, billing, and balance.
 | Document workers | Resume import, packet generation, PDF/DOCX export | CPU worker |
 | Temporal workers | Durable application, intervention, reminder, and status workflows | Task queue |
 | Local Browser | User-owned isolated Chromium profile | User machine |
-| Cloud browser pool | One encrypted, isolated Chromium session per active run | Browser container |
+| Cloud browser pool | One encrypted, identity-isolated Chromium session per active run | Browser container |
 
 ## Storage
 
@@ -78,10 +78,13 @@ exposing customer data or automation endpoints.
 
 ## Operational completion gates
 
-The portal, persistence model, metering, policy layer, public ATS discovery,
-shared form planning, receipt model, Electron controller, and Temporal
-boundaries are implemented in this branch. Public launch still requires
-provider credentials and deployment-specific work for licensed discovery,
-Gmail/Outlook OAuth, packaged desktop installers, fixture-backed submission
-adapters, and the production cloud browser-pool activity. Those surfaces must
-remain labeled beta until their integration suites pass.
+The portal, persistence model, metering, public ATS discovery, deterministic
+submission adapters, shared Playwright executor, ATS PDF materialization,
+identity-isolated Electron controller, encrypted cloud runner, durable Temporal
+workflow, interventions, and receipt persistence are implemented in this
+branch. Public launch still requires deployment credentials for licensed job
+sources and Gmail/Outlook OAuth, a production browser-takeover gateway, R2/S3
+upload credentials for receipt files, macOS signing/notarization, Windows code
+signing, and live sandbox certification with each ATS provider. Those are
+external release gates, not UI fallbacks, and supported surfaces remain beta
+until certification passes.

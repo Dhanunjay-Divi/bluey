@@ -24,12 +24,17 @@ export interface ApplicationReceiptBundle {
   runId: string;
   generatedAt: string;
   runner: "local" | "cloud";
+  applicationIdentityId?: string;
+  browserProfileId?: string;
+  adapter?: string;
+  adapterVersion?: string;
   job: NormalizedJob;
   packet: {
     jobId: string;
     resumeVersionId: string;
     answers: Record<string, string>;
     verifiedClaimIds: string[];
+    applicationEmail?: string;
   };
   documents: ReceiptDocument[];
   events: ReceiptEvent[];
@@ -43,6 +48,10 @@ export interface CreateReceiptInput {
   accountId: string;
   runId: string;
   runner: "local" | "cloud";
+  applicationIdentityId?: string;
+  browserProfileId?: string;
+  adapter?: string;
+  adapterVersion?: string;
   job: NormalizedJob;
   packet: ApplicationPacket;
   documents: ReceiptDocument[];
@@ -88,12 +97,17 @@ export function createApplicationReceipt(input: CreateReceiptInput): Application
     runId: input.runId,
     generatedAt: input.generatedAt ?? new Date().toISOString(),
     runner: input.runner,
+    applicationIdentityId: input.applicationIdentityId ?? input.packet.applicationIdentityId,
+    browserProfileId: input.browserProfileId ?? input.packet.browserProfileId,
+    adapter: input.adapter,
+    adapterVersion: input.adapterVersion,
     job: structuredClone(input.job),
     packet: {
       jobId: input.packet.jobId,
       resumeVersionId: input.packet.resumeVersionId,
       answers: sortRecord(input.packet.answers),
       verifiedClaimIds: [...input.packet.verifiedClaimIds].sort(),
+      applicationEmail: input.packet.applicationEmail,
     },
     documents: [...input.documents].sort((left, right) => left.storageKey.localeCompare(right.storageKey)),
     events: [...input.events].sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id)),

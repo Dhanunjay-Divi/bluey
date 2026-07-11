@@ -418,14 +418,14 @@ export default function App() {
     setToast("Saved answer removed.");
   }, []);
 
-  const queueCloudRun = useCallback(async (application: JobApplication) => {
+  const queueRun = useCallback(async (application: JobApplication, runner: "local" | "cloud") => {
     if (!workspace) return;
     const job = workspace.matches.find((item) => item.id === application.job_id);
     if (!job) throw new Error("That job is no longer available.");
     let updatedApplication = application;
     let session: BrowserSession = {
       id: "",
-      runner: "cloud",
+      runner,
       status: "queued",
       current_company: job.company,
       current_step: "Waiting to start",
@@ -439,16 +439,30 @@ export default function App() {
       session = { ...session, id: `run-${now}`, created_at_ms: now, updated_at_ms: now };
     } else {
       if (application.state === "awaiting_review") await commitApplication(application);
-      updatedApplication = await jobsApi.updateApplication(application.id, "queued", application.submission_mode);
-      session = await jobsApi.saveBrowserSession(session);
+      const queued = await jobsApi.queueApplicationRun(application.id, runner);
+      updatedApplication = queued.application;
+      session = queued.browser_session;
+      if (runner === "local" && queued.launch_url) window.location.assign(queued.launch_url);
     }
     setWorkspace((current) => current ? {
       ...current,
       applications: current.applications.map((item) => item.id === application.id ? updatedApplication : item),
       browser_sessions: [session, ...current.browser_sessions.filter((item) => item.id !== session.id)],
     } : current);
-    setToast(`${job.company} is queued for the cloud runner.`);
+    setToast(runner === "local"
+      ? `${job.company} is opening in Bluey Browser.`
+      : `${job.company} is queued for the cloud runner.`);
   }, [commitApplication, workspace]);
+
+  const queueCloudRun = useCallback(
+    (application: JobApplication) => queueRun(application, "cloud"),
+    [queueRun],
+  );
+
+  const queueLocalRun = useCallback(
+    (application: JobApplication) => queueRun(application, "local"),
+    [queueRun],
+  );
 
   const updateBrowserSession = useCallback(async (session: BrowserSession, status: string) => {
     const next: BrowserSession = {
@@ -574,6 +588,7 @@ export default function App() {
           element={
             <BrowserView
               workspace={workspace}
+              onQueueLocal={queueLocalRun}
               onQueueCloud={queueCloudRun}
               onUpdateSession={updateBrowserSession}
               onResolveIntervention={resolveIntervention}

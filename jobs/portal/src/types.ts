@@ -329,3 +329,11 @@ export interface PacketCommitResult {
   used_packets: number;
   monthly_packet_limit: number;
 }
+
+export interface QueueApplicationRunResponse {
+  application: JobApplication;
+  browser_session: BrowserSession;
+  workflow_id: string;
+  run_id: string;
+  launch_url?: string;
+}
