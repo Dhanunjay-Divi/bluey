@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-05 00:00 EDT
+Latest checkpoint: 2026-07-10 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,10 +30,76 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-363-TRY-US-TRIAL-PARITY.md`; the next canonical Bluey round doc should start at `ROUND-364-...`.
+- Latest completed Bluey round doc is `ROUND-473-USER-EXPERIENCE-SURFACE-AND-RECOVERY.md`; the next canonical Bluey round doc should start at `ROUND-474-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
+
+- Round 473 completed a local-only user-experience surface and recovery pass on
+  branch `codex/bluey-web-ui-parallel-20260704`:
+  - normal controls now expose only Auto, Quick, and Thorough while keeping
+    provider/model/lane details in diagnostics
+  - recoverable partial answers are preserved with Continue; pre-answer failures
+    offer Retry with a short support reference
+  - context items carry Reading/Ready/Needs-attention state
+  - macOS shows compact context names and clickable source chips
+  - coding and system-design follow-ups preserve earlier workbench versions
+  - Windows received Quick/Thorough controls, recovery actions, context readiness,
+    and clickable web-source-chip parity
+  - public web and Session History no longer expose model/provider/route jargon
+  - full daemon result: 347 passed, 0 failed, 5 intentionally ignored tests;
+    Rust formatting, Swift typecheck, Windows C syntax, JS syntax, and diff checks passed
+  - no deploy, release, GitHub Actions run, commit, or push was performed
+  - remaining gates: full Windows workbench, pre-search progress transport,
+    native visual QA, and real audio QA
+  - round doc:
+    `docs/rounds/ROUND-473-USER-EXPERIENCE-SURFACE-AND-RECOVERY.md`
+- Round 472 completed the production-backed 50-question interview baseline and
+  local AnswerPlan/latency fixes documented in
+  `docs/rounds/ROUND-472-50-QUESTION-INTERVIEW-QUALITY-EVAL.md`.
+- Round 471 completed a local-only full regression audit on branch
+  `codex/bluey-web-ui-parallel-20260704`:
+  - fixed trial-grant ownership attachment and incomplete-account cleanup
+  - fixed provider pre-output fallback and added post-first-token stream idle
+    deadlines with durable failure diagnostics
+  - fixed transcript cursor/history/countdown lifecycle regressions
+  - made failed and partial visible answers durable for session audit/sync
+  - made signed-in session deletion cloud-first and account-owner scoped
+  - made desktop linking transactional before persisting account tokens
+  - replaced per-frame STT account queries with a periodic liveness monitor
+  - distinguished deleted from restricted/expired STT accounts so reservations
+    settle correctly
+  - added abandoned STT reservation reconciliation on new session creation and
+    normal account refresh
+  - normalized relative Bluey-owned legacy companion symlinks safely
+  - strict Clippy passed for both workspaces; 280 non-network server tests and
+    335 daemon tests passed before expected sandbox-only listener denials
+  - no deploy, release, GitHub Actions run, commit, or push was performed
+  - round doc:
+    `docs/rounds/ROUND-471-END-TO-END-REGRESSION-AUDIT.md`
+- Round 470 completed a local-only answer latency/reliability pass on branch
+  `codex/bluey-web-ui-parallel-20260704`:
+  - compact managed prompt; full standalone prompt remains for direct/BYOK
+  - shared pooled provider HTTP client
+  - latency-aware instant/balanced provider tiers across OpenAI, Anthropic,
+    Gemini, DeepSeek, and Z.AI
+  - stable Gemini `gemini-3.5-flash` and fast Z.AI `glm-4.7-flashx` routes;
+    GLM-5.2 remains a deep route/fallback
+  - desktop no longer forces high reasoning for every deep request
+  - lane-specific first-event/connect deadlines and phase-level diagnostics
+  - 31 dispatcher, 90 router, 14 pricing, and 147 daemon app tests passed;
+    daemon/server clippy passed
+  - full server lib run passed 277 tests; two mail Wiremock tests were blocked
+    from binding a local port by the Codex sandbox
+  - no deploy, release, GitHub Actions run, commit, or push was performed
+  - round doc:
+    `docs/rounds/ROUND-470-END-TO-END-ANSWER-LATENCY-AND-ROUTING.md`
+- Current shared working branch is `codex/bluey-web-ui-parallel-20260704`.
+- The worktree contains substantial parallel owner/agent changes. Continue to
+  scope diffs carefully and do not revert or overwrite them.
+- Before any release, run a signed canary and measure request-to-first-text by
+  intent. Round 470 documents target SLOs and remaining adaptive-routing,
+  Redis-pooling, immediate-SSE, and runtime pgvector KNN gates.
 
 - Round 363 fixes the public Try Us flow:
   - live pre-fix smoke showed `POST /auth/trial/start` returned `404`
@@ -5904,6 +5970,62 @@ Deployment status:
 - `https://bluey.sh/health` reports commit `210a4f7559ffd13fe263b3891d75b5e93c39c9f3`.
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
+
+## Latest Round 472: 50-Question Interview Quality Evaluation
+
+Backup task id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current shared branch:
+
+```bash
+codex/bluey-web-ui-parallel-20260704
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-472-50-QUESTION-INTERVIEW-QUALITY-EVAL.md`
+
+What was completed:
+
+- Added a reusable 50-question production-backed evaluator at `scripts/bluey-interview-eval.py`.
+- Covered SDE, data engineering, data science/AI, behavioral, production scenarios, coding/follow-ups, and system-design/follow-ups using local resumes/JDs/behavioral documents plus genericized Otter-derived interview patterns.
+- Kept all raw private source text, context, answers, and per-question evidence under `tmp/bluey-interview-eval-20260710/`; none was copied into docs/git.
+- Live baseline achieved 50/50 first-attempt and final reliability.
+- Corrected deterministic quality score: 90.8/100.
+- Median/p95 first token: 2.0s/8.54s; worst first token: 38.9s.
+- Median/p90 total response: 11.0s/15.2s; worst total: 49.4s.
+- Final mix: GPT-5.5 24, DeepSeek 11, Claude Sonnet 4.6 8, GLM-5.2 7.
+- Trial covered 577 seconds; 19 cents came from the existing test balance after trial exhaustion.
+
+Main production findings:
+
+- AnswerPlan still confused behavioral/project walkthroughs, simple concepts, coding, and system-design prompts.
+- Five expected system-design artifacts were missing.
+- Long-tail deep fallback could delay first output by 16-39 seconds.
+- Server-direct visible text contained meta openers and em dashes even when daemon-side prompting discouraged them.
+- Final-provider telemetry alone does not explain time spent on cooled/failed routes before fallback.
+
+Local, undeployed fixes:
+
+- Tightened deep first-token/connect fallback budgets to 8s/15s.
+- Added deterministic visible-answer em-dash sanitization before display/storage/artifact extraction.
+- Narrowed direct-code detection and made behavioral/system-design intent win before coding.
+- Expanded interview-story and explicit system-design/follow-up rules.
+- Kept explanatory code follow-ups on balanced instead of deep.
+- Added a universal direct, first-person, natural-paragraph answer contract.
+- Added production-derived AnswerPlan and sanitizer regressions.
+
+Verification:
+
+- 96 router tests passed.
+- 294 server library tests passed.
+- Strict server clippy passed.
+- Evaluator compile, 50-case dry run, and scoped diff checks passed.
+
+Deployment status:
+
+- No deploy, release, GitHub Actions run, commit, or push was performed.
+- The next signed canary must rerun the same 50 cases before promotion; the live baseline does not validate the local fixes.
 
 ## Latest Round 347: Click-Through Scroll Routing
 

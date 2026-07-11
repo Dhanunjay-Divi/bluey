@@ -472,6 +472,10 @@
               </div>
             </section>
 
+            <section class="dashboard-section account-desktop-connect-section" aria-label="Connect Bluey desktop" hidden>
+              <div class="device-link-hint account-top-device-link-hint" id="accountTopDeviceLinkHint" hidden></div>
+            </section>
+
             <section class="dashboard-section trial-convert-section" id="trialConvertSection" aria-label="Save temporary trial as account" hidden>
               <div class="section-head">
                 <div>
@@ -521,7 +525,7 @@
             </div>
 
             <section class="dashboard-tab-panel is-active" id="dashboardTabComputers" role="tabpanel" aria-labelledby="dashboardTabComputersButton" data-dashboard-panel="computers">
-              <section class="dashboard-section device-connect-section" aria-label="Connect Bluey desktop">
+              <section class="dashboard-section device-connect-section" aria-label="Connect Bluey desktop" hidden>
                 <div class="device-link-hint dashboard-device-link-hint" id="dashboardDeviceLinkHint" hidden></div>
               </section>
               <section class="dashboard-section device-section" aria-label="Computers">
@@ -585,7 +589,7 @@
                   <div>
                     <span>$15 balance</span>
                     <strong id="reloadEstimateValue">~2-5 hrs</strong>
-                    <em id="reloadEstimateHint">Approximate light mixed use. Audio, screen, files, and deeper routes can spend faster.</em>
+                    <em id="reloadEstimateHint">Approximate light mixed use. Audio, screen, files, and more detailed answers can spend faster.</em>
                   </div>
                   <div>
                     <span>Auto Reload</span>
@@ -593,9 +597,9 @@
                     <em id="autoReloadEstimateHint">Turn it on to add balance automatically when balance is low.</em>
                   </div>
                   <div>
-                    <span>Auto routing</span>
+                    <span>Automatic answers</span>
                     <strong>Best fit</strong>
-                    <em>Bluey chooses the route for each request by task and context, so usage varies.</em>
+                    <em>Bluey adapts each answer to the task and context, so usage varies.</em>
                   </div>
                 </div>
                 <div class="usage-list" id="usageList"></div>
@@ -1241,7 +1245,7 @@
           </form>
           <div class="connect-help">Have a Bluey desktop code? Enter it to move that desktop to this account.</div>
           <div class="connect-status" id="productConnectStatus" aria-live="polite"></div>
-          <div class="hero-note">native overlay · model routing · prepaid balance · sessions save only by choice</div>
+          <div class="hero-note">native overlay · automatic task handling · prepaid balance · sessions save only by choice</div>
         </section>
 
         <aside class="product-preview terminal-preview" aria-label="Bluey terminal preview">
@@ -1313,6 +1317,11 @@
         </div>
       </div>
       <div class="trial-turnstile" id="trialTurnstile" hidden></div>
+      <label class="trial-consent" id="trialTermsRow" hidden>
+        <input type="checkbox" id="trialTermsConsent">
+        <span>I agree to the <a href="/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>.</span>
+      </label>
+      <button class="btn btn-primary trial-start" id="trialStartConfirm" type="button" hidden>Start 15-minute trial</button>
       <div class="trial-actions">
         <button class="btn btn-primary" id="trialCopyLogin" type="button">Copy login</button>
         <a class="btn btn-ghost" id="trialDownloadAction" href="/download">Download Bluey</a>

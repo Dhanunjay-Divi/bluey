@@ -18,6 +18,14 @@ DOWNLOAD_HOST="${BLUEY_DOWNLOAD_HOST:-https://bluey.sh}"
 INSTALL_ROOT="${BLUEY_INSTALL_ROOT:-$HOME/.bluey}"
 CLI_DIR="${BLUEY_CLI_DIR:-/usr/local/bin}"
 
+PUBLIC_HELPER_NAMES=(
+    hostovb host-overlay adriverb audio-driver screen-driver
+    bluey-overlay-macos cue-overlay-macos
+    bluey-audio-macos cue-audio-macos
+    bluey-whisper-macos cue-whisper
+    bluey-file-picker-macos cue-file-picker-macos
+)
+
 # ── Colors ──────────────────────────────────────────────────────────
 if [ -t 1 ]; then
     BOLD="$(tput bold 2>/dev/null || true)"
@@ -79,46 +87,58 @@ ensure_user_path_entry() {
     esac
 }
 
+run_install_command() {
+    local sudo_prefix="$1"
+    shift
+    if [ -n "$sudo_prefix" ]; then
+        "$sudo_prefix" "$@"
+    else
+        "$@"
+    fi
+}
+
+remove_bluey_legacy_terminal_link() {
+    local dir="$1"
+    local sudo_prefix="${2:-}"
+    local legacy_link="$dir/Terminal"
+    local target
+
+    [ -L "$legacy_link" ] || return 0
+    target="$(readlink "$legacy_link" 2>/dev/null || true)"
+    case "$target" in
+        /*) ;;
+        *)
+            local link_dir target_dir target_name
+            link_dir="$(cd "$(dirname "$legacy_link")" 2>/dev/null && pwd -P)" || return 0
+            target_dir="$(cd "$link_dir/$(dirname "$target")" 2>/dev/null && pwd -P)" || return 0
+            target_name="$(basename "$target")"
+            target="$target_dir/$target_name"
+            ;;
+    esac
+    case "$target" in
+        "$INSTALL_ROOT"/*|"$HOME/.bluey"/*)
+            run_install_command "$sudo_prefix" rm -f "$legacy_link"
+            ;;
+    esac
+}
+
 link_cli_pair() {
     local dir="$1"
     local sudo_prefix="${2:-}"
     local helper
 
-    if [ -n "$sudo_prefix" ]; then
-        $sudo_prefix mkdir -p "$dir"
-        $sudo_prefix ln -sf "$CLI_SOURCE" "$dir/bluey"
-        if [ -x "$DAEMON_SOURCE" ]; then
-            $sudo_prefix ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
-        fi
-        for helper in \
-            Terminal host-overlay audio-driver screen-driver \
-            bluey-overlay-macos cue-overlay-macos \
-            bluey-audio-macos cue-audio-macos \
-            bluey-whisper-macos cue-whisper \
-            bluey-file-picker-macos cue-file-picker-macos
-        do
-            if [ -x "$INSTALL_ROOT/bin/$helper" ]; then
-                $sudo_prefix ln -sf "$INSTALL_ROOT/bin/$helper" "$dir/$helper"
-            fi
-        done
-    else
-        mkdir -p "$dir"
-        ln -sf "$CLI_SOURCE" "$dir/bluey"
-        if [ -x "$DAEMON_SOURCE" ]; then
-            ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
-        fi
-        for helper in \
-            Terminal host-overlay audio-driver screen-driver \
-            bluey-overlay-macos cue-overlay-macos \
-            bluey-audio-macos cue-audio-macos \
-            bluey-whisper-macos cue-whisper \
-            bluey-file-picker-macos cue-file-picker-macos
-        do
-            if [ -x "$INSTALL_ROOT/bin/$helper" ]; then
-                ln -sf "$INSTALL_ROOT/bin/$helper" "$dir/$helper"
-            fi
-        done
+    run_install_command "$sudo_prefix" mkdir -p "$dir"
+    remove_bluey_legacy_terminal_link "$dir" "$sudo_prefix"
+    run_install_command "$sudo_prefix" ln -sf "$CLI_SOURCE" "$dir/bluey"
+    if [ -x "$DAEMON_SOURCE" ]; then
+        run_install_command "$sudo_prefix" ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
     fi
+    for helper in "${PUBLIC_HELPER_NAMES[@]}"; do
+        if [ -x "$INSTALL_ROOT/bin/$helper" ]; then
+            run_install_command "$sudo_prefix" \
+                ln -sf "$INSTALL_ROOT/bin/$helper" "$dir/$helper"
+        fi
+    done
 }
 
 copy_first_binary_alias() {
@@ -137,11 +157,30 @@ copy_first_binary_alias() {
     done
 }
 
+replace_first_binary_alias() {
+    local bin_dir="$1"
+    local alias_name="$2"
+    shift 2
+    local candidate
+
+    rm -f "$bin_dir/$alias_name"
+    for candidate in "$@"; do
+        if [ -x "$bin_dir/$candidate" ]; then
+            cp "$bin_dir/$candidate" "$bin_dir/$alias_name"
+            chmod +x "$bin_dir/$alias_name"
+            return 0
+        fi
+    done
+}
+
 ensure_process_identity_aliases() {
     local bin_dir="$1"
 
+    replace_first_binary_alias "$bin_dir" termb bluey-daemon cue-daemon
     copy_first_binary_alias "$bin_dir" Terminal bluey-daemon cue-daemon
+    copy_first_binary_alias "$bin_dir" hostovb bluey-overlay-macos cue-overlay-macos
     copy_first_binary_alias "$bin_dir" host-overlay bluey-overlay-macos cue-overlay-macos
+    copy_first_binary_alias "$bin_dir" adriverb bluey-audio-macos cue-audio-macos
     copy_first_binary_alias "$bin_dir" audio-driver bluey-audio-macos cue-audio-macos
 }
 
@@ -325,7 +364,10 @@ ok "Quarantine attribute cleared"
 
 # ── CLI symlink ──────────────────────────────────────────────────────
 CLI_SOURCE="$INSTALL_ROOT/bin/bluey"
-DAEMON_SOURCE="$INSTALL_ROOT/bin/Terminal"
+DAEMON_SOURCE="$INSTALL_ROOT/bin/termb"
+if [ ! -x "$DAEMON_SOURCE" ]; then
+    DAEMON_SOURCE="$INSTALL_ROOT/bin/Terminal"
+fi
 if [ ! -x "$DAEMON_SOURCE" ]; then
     DAEMON_SOURCE="$INSTALL_ROOT/bin/bluey-daemon"
 fi

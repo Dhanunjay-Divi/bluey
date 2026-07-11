@@ -118,7 +118,7 @@ function Stop-BlueyForInstall {
         Stop-Process -Force -ErrorAction SilentlyContinue
 
     $installRootFull = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
-    Get-Process -Name "Terminal", "host-overlay", "audio-driver", "screen-driver" -ErrorAction SilentlyContinue |
+    Get-Process -Name "termb", "Terminal", "hostovb", "host-overlay", "adriverb", "audio-driver", "screen-driver" -ErrorAction SilentlyContinue |
         Where-Object {
             try {
                 $processPath = $_.Path
@@ -153,11 +153,31 @@ function Copy-FirstBinaryAlias {
     }
 }
 
+function Replace-FirstBinaryAlias {
+    param(
+        [string]$Dir,
+        [string]$AliasName,
+        [string[]]$Candidates
+    )
+    $aliasPath = Join-Path $Dir $AliasName
+    Remove-Item -LiteralPath $aliasPath -Force -ErrorAction SilentlyContinue
+    foreach ($candidate in $Candidates) {
+        $candidatePath = Join-Path $Dir $candidate
+        if (Test-Path $candidatePath) {
+            Copy-Item -Force $candidatePath $aliasPath
+            return
+        }
+    }
+}
+
 function Ensure-ProcessIdentityAliases {
     param([string]$Dir)
 
+    Replace-FirstBinaryAlias -Dir $Dir -AliasName "termb.exe" -Candidates @("bluey-daemon.exe", "cue-daemon.exe")
     Copy-FirstBinaryAlias -Dir $Dir -AliasName "Terminal.exe" -Candidates @("bluey-daemon.exe", "cue-daemon.exe")
+    Copy-FirstBinaryAlias -Dir $Dir -AliasName "hostovb.exe" -Candidates @("bluey-overlay.exe", "cue-overlay.exe")
     Copy-FirstBinaryAlias -Dir $Dir -AliasName "host-overlay.exe" -Candidates @("bluey-overlay.exe", "cue-overlay.exe")
+    Copy-FirstBinaryAlias -Dir $Dir -AliasName "adriverb.exe" -Candidates @("bluey-audio.exe", "cue-audio.exe")
     Copy-FirstBinaryAlias -Dir $Dir -AliasName "audio-driver.exe" -Candidates @("bluey-audio.exe", "cue-audio.exe")
 }
 

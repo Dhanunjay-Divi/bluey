@@ -59,7 +59,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const MANUAL_RELOAD_AMOUNT_CENTS = 1500;
     const MIXED_USE_LOW_CENTS_PER_HOUR = 300;
     const MIXED_USE_HIGH_CENTS_PER_HOUR = 750;
-    const AUTO_ROUTING_USAGE_HINT = 'Bluey routes each request by task and context, so audio, screen, files, and deeper routes can spend faster.';
+    const AUTO_ROUTING_USAGE_HINT = 'Bluey adapts each answer to the task and context, so audio, screen, files, and more detailed answers can spend faster.';
     let captchaConfigPromise = null;
     let captchaConfig = { provider: null, site_key: null };
     let signupTurnstileWidgetId = null;
@@ -861,6 +861,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       accountActionText = 'Dashboard',
       accountActionHref = '/account',
       downloadActionText = 'Download Bluey',
+      showTerms = false,
+      startActionText = 'Start 15-minute trial',
     }) {
       const titleEl = document.getElementById('trialModalTitle');
       const copyEl = document.getElementById('trialModalCopy');
@@ -873,6 +875,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const copyButton = document.getElementById('trialCopyLogin');
       const accountAction = document.getElementById('trialAccountAction');
       const downloadAction = document.getElementById('trialDownloadAction');
+      const termsRow = document.getElementById('trialTermsRow');
+      const termsBox = document.getElementById('trialTermsConsent');
+      const startButton = document.getElementById('trialStartConfirm');
       if (titleEl) titleEl.textContent = title || 'Bluey trial';
       if (copyEl) copyEl.textContent = copy || '';
       if (emailEl) emailEl.textContent = email || '-';
@@ -890,6 +895,40 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         accountAction.setAttribute('href', accountActionHref);
       }
       if (downloadAction) downloadAction.textContent = downloadActionText;
+      if (termsRow) termsRow.hidden = !showTerms;
+      if (!showTerms && termsBox) termsBox.checked = false;
+      if (startButton) {
+        startButton.hidden = !showTerms;
+        startButton.textContent = startActionText;
+        startButton.disabled = showTerms && !termsBox?.checked;
+      }
+    }
+
+    function trialTermsAccepted() {
+      return document.getElementById('trialTermsConsent')?.checked === true;
+    }
+
+    function updateTrialStartButton() {
+      const button = document.getElementById('trialStartConfirm');
+      if (button && !button.hidden) button.disabled = !trialTermsAccepted();
+    }
+
+    function showTrialConsent(button = document.getElementById('tryUsButton')) {
+      pendingTrialButton = button || null;
+      renderTrialModal({
+        title: 'Start your 15-minute trial',
+        copy: 'Agree to Bluey Terms & Privacy before starting the limited trial. No card needed.',
+        email: '',
+        password: '',
+        expires: '',
+        note: 'Trials include 15 free minutes for cloud work and are limited per browser/device and network.',
+        canCopy: false,
+        showCredentials: false,
+        accountActionText: 'Create account',
+        accountActionHref: '/login',
+        showTerms: true,
+      });
+      setTrialModal(true);
     }
 
     function isPhoneTrialBrowser() {
@@ -957,6 +996,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           note: 'This keeps the free trial available for real users and blocks automated loops.',
         };
       }
+      if (message.includes('terms_required')) {
+        return {
+          title: 'Terms required',
+          copy: 'Agree to the Terms & Privacy before starting Try Us.',
+          note: 'No trial minutes were created and nothing was charged.',
+        };
+      }
       if (message.includes('signed in')) {
         return {
           title: 'Already signed in',
@@ -1017,7 +1063,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           trialTurnstileToken = token || '';
           const resumeButton = pendingTrialButton;
           pendingTrialButton = null;
-          if (trialTurnstileToken) startTrial(resumeButton);
+          // Re-rendering the modal for Turnstile hides and clears the checkbox.
+          // Reaching this callback already proves this attempt passed the
+          // explicit consent gate, so carry that state into the resumed call.
+          if (trialTurnstileToken) startTrial(resumeButton, true);
         },
         'expired-callback': () => {
           trialTurnstileToken = '';
@@ -1029,13 +1078,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return false;
     }
 
-    async function startTrial(button = document.getElementById('tryUsButton')) {
+    async function startTrial(
+      button = document.getElementById('tryUsButton'),
+      acceptedTerms = trialTermsAccepted(),
+    ) {
       if (accountToken() || button?.dataset.trialState === 'active') {
         showTrialStatus();
         return;
       }
       if (isPhoneTrialBrowser()) {
         showDesktopTrialRequired();
+        return;
+      }
+      if (!acceptedTerms) {
+        showTrialConsent(button);
         return;
       }
 
@@ -1050,6 +1106,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           body: JSON.stringify({
             device_fingerprint: browserTrialDeviceId(),
             turnstile_token: trialTurnstileToken || null,
+            terms_accepted: true,
           }),
         });
         resetTrialTurnstile();
@@ -1359,20 +1416,25 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function renderDeviceLinkHint() {
       const code = pendingDeviceCode();
       const authHint = document.getElementById('deviceLinkHint');
+      const topHint = document.getElementById('accountTopDeviceLinkHint');
       const dashboardHint = document.getElementById('dashboardDeviceLinkHint');
-      const targets = [authHint, dashboardHint].filter(Boolean);
+      const targets = [authHint, topHint, dashboardHint].filter(Boolean);
       if (!targets.length) return;
       for (const el of targets) {
         el.hidden = true;
         el.classList.remove('is-code-entry', 'is-awaiting-action');
-        el.closest('.device-connect-section')?.classList.remove('is-action-needed');
+        const shell = el.closest('.device-connect-section, .account-desktop-connect-section');
+        shell?.classList.remove('is-action-needed');
+        if (shell instanceof HTMLElement) shell.hidden = true;
         el.replaceChildren();
       }
 
       const renderCodeEntry = (el) => {
         el.hidden = false;
         el.classList.add('is-code-entry');
-        el.closest('.device-connect-section')?.classList.add('is-action-needed');
+        const shell = el.closest('.device-connect-section, .account-desktop-connect-section');
+        shell?.classList.add('is-action-needed');
+        if (shell instanceof HTMLElement) shell.hidden = false;
         el.replaceChildren();
         const title = document.createElement('strong');
         title.textContent = 'Connect Bluey desktop';
@@ -1414,14 +1476,17 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       };
 
       if (!code) {
-        if (accountToken() && dashboardHint && lastLinkedComputerCount === 0) {
-          renderCodeEntry(dashboardHint);
+        if (accountToken() && lastLinkedComputerCount === 0) {
+          const entryTarget = topHint || dashboardHint;
+          if (entryTarget) renderCodeEntry(entryTarget);
         }
         return;
       }
 
       const renderInto = (el) => {
         el.hidden = false;
+        const shell = el.closest('.device-connect-section, .account-desktop-connect-section');
+        if (shell instanceof HTMLElement) shell.hidden = false;
         el.replaceChildren();
         const title = document.createElement('strong');
         const approved = isPendingDeviceApprovalFresh(code);
@@ -1433,7 +1498,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           return;
         }
         el.classList.add('is-awaiting-action');
-        el.closest('.device-connect-section')?.classList.add('is-action-needed');
+        shell?.classList.add('is-action-needed');
         body.append('Terminal is waiting on code ');
         const codeEl = document.createElement('code');
         codeEl.textContent = code;
@@ -1481,15 +1546,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }
       };
       const visibleTargets = accountToken()
-        ? [dashboardHint].filter(Boolean)
+        ? [topHint || dashboardHint].filter(Boolean)
         : [authHint].filter(Boolean);
       for (const el of visibleTargets) renderInto(el);
     }
 
     function focusDesktopConnectCard() {
-      setDashboardTab('computers');
       renderDeviceLinkHint();
-      const hint = document.getElementById('dashboardDeviceLinkHint');
+      const hint = document.getElementById('accountTopDeviceLinkHint')
+        || document.getElementById('dashboardDeviceLinkHint');
       if (!hint || hint.hidden) return;
       hint.scrollIntoView({ block: 'center', behavior: 'smooth' });
       const input = hint.querySelector('input[name="user_code"]');
@@ -1549,7 +1614,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       accountMessage(mode === 'signup' ? 'Creating account...' : 'Signing in...', true);
       const auth = await apiJson(`/auth/${mode === 'signup' ? 'signup' : 'login'}`, {
         method: 'POST',
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({
+          email,
+          password,
+          ...(mode === 'signup' ? { terms_accepted: true } : {}),
+        }),
       });
       setAccountToken(auth, remember);
       if (currentPath === '/login' && !pendingDeviceCode()) {
@@ -1586,6 +1655,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         body: JSON.stringify({
           email,
           password,
+          terms_accepted: true,
           turnstile_token: turnstileToken,
           device_fingerprint: browserTrialDeviceId(),
         }),
@@ -3512,24 +3582,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       detail.append(pre);
     }
 
-    function diagnosticsText(metadata) {
-      const diagnostics = metadata?.diagnostics;
-      if (!diagnostics || typeof diagnostics !== 'object') return '';
-      const lines = [
-        `listen runs: ${diagnostics.listen_runs || 0}`,
-        `stt parse errors: ${diagnostics.stt_parse_errors || 0}`,
-        `stt provider errors: ${diagnostics.stt_provider_errors || 0}`,
-        `audio start errors: ${diagnostics.audio_start_errors || 0}`,
-        `audio source errors: ${diagnostics.audio_source_errors || 0}`,
-      ];
-      if (diagnostics.last_stt_provider) lines.push(`last provider: ${diagnostics.last_stt_provider}`);
-      if (diagnostics.last_audio_session_id) lines.push(`audio session: ${diagnostics.last_audio_session_id}`);
-      if (diagnostics.last_error_kind) lines.push(`last error: ${diagnostics.last_error_kind}`);
-      if (diagnostics.last_error_message) lines.push(String(diagnostics.last_error_message));
-      if (diagnostics.last_error_at) lines.push(`last error at: ${formatSessionTime(diagnostics.last_error_at)}`);
-      return lines.join('\n');
-    }
-
     function joinSessionMeta(values) {
       return values
         .map((value) => String(value || '').trim())
@@ -3669,7 +3721,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (sessionMeta?.answer_style) {
         appendBundlePreview(detail, 'Answer style', sessionMeta.answer_style);
       }
-      appendBundlePreview(detail, 'Diagnostics', diagnosticsText(sessionMeta?.metadata));
       appendSessionBundleSection(
         detail,
         'Conversation',
@@ -3684,7 +3735,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
             title: answer.source_text ? 'You asked' : 'Bluey answer',
             meta: joinSessionMeta([
               formatSessionTime(answer.ts_ms),
-              answer.model || answer.provider,
               answer.cost_label || (answer.cost_cents ? money(answer.cost_cents) : ''),
             ]),
             body: [
@@ -4498,8 +4548,17 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     });
 
-    document.getElementById('tryUsButton')?.addEventListener('click', () => {
-      startTrial();
+    document.getElementById('tryUsButton')?.addEventListener('click', (event) => {
+      showTrialConsent(event.currentTarget);
+    });
+
+    document.getElementById('trialTermsConsent')?.addEventListener('change', updateTrialStartButton);
+
+    document.getElementById('trialStartConfirm')?.addEventListener('click', () => {
+      startTrial(
+        pendingTrialButton || document.getElementById('tryUsButton'),
+        trialTermsAccepted(),
+      );
     });
 
     document.getElementById('trialModalClose')?.addEventListener('click', () => {

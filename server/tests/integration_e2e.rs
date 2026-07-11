@@ -281,7 +281,8 @@ async fn signup_with_otp(harness: &Harness, email: &str, password: &str) -> serd
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "email": email,
-                "password": password
+                "password": password,
+                "terms_accepted": true
             }))
             .unwrap(),
         ))
@@ -323,7 +324,8 @@ async fn start_trial(harness: &Harness, device_fingerprint: &str) -> serde_json:
         .header("user-agent", "bluey-e2e-trial")
         .body(Body::from(
             serde_json::to_vec(&json!({
-                "device_fingerprint": device_fingerprint
+                "device_fingerprint": device_fingerprint,
+                "terms_accepted": true
             }))
             .unwrap(),
         ))
@@ -356,6 +358,69 @@ async fn signup_otp_email_confirms_and_marks_email_verified() {
         )
         .unwrap();
     assert!(verified_at.is_some());
+}
+
+#[tokio::test]
+#[serial]
+async fn trial_start_requires_and_records_terms_acceptance() {
+    let h = boot_harness().await;
+
+    let req = Request::post("/auth/trial/start")
+        .header("content-type", "application/json")
+        .header("user-agent", "bluey-e2e-trial")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "device_fingerprint": "trial-device-terms-missing"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"].as_str(), Some("terms_required"));
+
+    let auth = start_trial(&h, "trial-device-terms-accepted").await;
+    let account_id = auth["account"]["id"].as_str().unwrap();
+    let conn = h.pool.get().unwrap();
+    let row: (i64, String, String, i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*),
+                    COALESCE(MIN(terms_text_hash), ''),
+                    COALESCE(MIN(privacy_text_hash), ''),
+                    SUM(CASE WHEN email_hash IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN user_agent_hash IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN retention_expires_at IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN accepted_at IS NOT NULL THEN 1 ELSE 0 END)
+               FROM legal_acceptances
+              WHERE account_id = ?1
+                AND purpose = 'trial_terms_privacy'
+                AND terms_version = '2026-07-09'
+                AND privacy_version = '2026-07-09'",
+            rusqlite::params![account_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(row.0, 1);
+    assert!(row.1.starts_with("sha256:"));
+    assert!(row.2.starts_with("sha256:"));
+    assert_eq!(row.3, 1);
+    assert_eq!(row.4, 1);
+    assert_eq!(row.5, 1);
+    assert_eq!(row.6, 1);
 }
 
 #[tokio::test]
@@ -396,7 +461,8 @@ async fn signup_after_account_delete_reuses_email_without_new_trial() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "email": email,
-                "password": "longenoughpw"
+                "password": "longenoughpw",
+                "terms_accepted": true
             }))
             .unwrap(),
         ))
@@ -491,7 +557,8 @@ async fn trial_start_creates_temporary_account_with_fifteen_minutes() {
         .header("user-agent", "bluey-e2e-trial")
         .body(Body::from(
             serde_json::to_vec(&json!({
-                "device_fingerprint": "trial-device-create"
+                "device_fingerprint": "trial-device-create",
+                "terms_accepted": true
             }))
             .unwrap(),
         ))
@@ -617,7 +684,8 @@ async fn signup_start_requires_turnstile_when_flagged() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "email": "captcha-required@example.com",
-                "password": "longenoughpw"
+                "password": "longenoughpw",
+                "terms_accepted": true
             }))
             .unwrap(),
         ))
@@ -1022,18 +1090,81 @@ async fn router_complete_stream_openai_error_frame_is_retryable() {
         ))
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 502);
     let body = axum::body::to_bytes(resp.into_body(), 128 * 1024)
         .await
         .unwrap();
-    let body = String::from_utf8(body.to_vec()).unwrap();
-    assert!(body.contains("event: error"));
-    assert!(body.contains("provider_key_cooling_down"));
-    assert!(!body.contains("event: billing"));
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], "upstream provider error; please retry");
+    assert_eq!(body["reason"], "upstream_error");
 
     let account = Account::fetch_by_email(&h.pool, email).unwrap().unwrap();
     let replay = idempotency::reserve(&h.pool, &account.id, "stream-openai-error-1").unwrap();
     assert_eq!(replay, idempotency::ReserveOutcome::FreshReservation);
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_stream_falls_back_after_pre_output_provider_error() {
+    let h = boot_harness().await;
+    let access =
+        signup_and_login(&h, "stream-pre-output-fallback@example.com", "longenoughpw").await;
+
+    let anthropic_stream = concat!(
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider overloaded\"}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(anthropic_stream),
+        )
+        .expect(1)
+        .mount(&h.anthropic)
+        .await;
+
+    let openai_stream = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Fallback answer\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(openai_stream),
+        )
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete/stream")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "stream-pre-output-fallback-1",
+                "system": "you are helpful",
+                "user": "answer reliably",
+                "lane": "balanced"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(body.contains("Fallback answer"));
+    assert!(body.contains("\"provider\":\"openai\""));
+    assert!(body.contains("event: billing"));
+    assert!(!body.contains("event: error"));
 }
 
 #[tokio::test]
@@ -1484,6 +1615,7 @@ async fn router_complete_reports_upstream_error_after_capacity_skip() {
 async fn router_complete_enforces_account_burst_before_second_upstream_hit() {
     std::env::set_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN", "60");
     std::env::set_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN_BURST", "1");
+    std::env::set_var("BLUEY_CAPACITY_SHORT_WAIT_MAX_SECS", "0");
     let h = boot_harness().await;
     std::env::remove_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN");
     std::env::remove_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN_BURST");
@@ -1525,6 +1657,7 @@ async fn router_complete_enforces_account_burst_before_second_upstream_hit() {
             assert!(v["retry_after_secs"].as_u64().unwrap_or(0) >= 1);
         }
     }
+    std::env::remove_var("BLUEY_CAPACITY_SHORT_WAIT_MAX_SECS");
 }
 
 #[tokio::test]

@@ -125,12 +125,18 @@ if [ "$PLATFORM" = "darwin-arm64" ] && file "$archive" | grep -qi 'gzip compress
         || fail "bluey CLI version mismatch"
     "$TMP_DIR/unpack/bin/bluey-daemon" --version | grep -F "bluey-daemon $version" >/dev/null \
         || fail "bluey-daemon version mismatch"
+    [ -x "$TMP_DIR/unpack/bin/termb" ] || fail "termb daemon identity missing from artifact"
+    "$TMP_DIR/unpack/bin/termb" --version | grep -F "bluey-daemon $version" >/dev/null \
+        || fail "termb daemon identity version mismatch"
     [ -x "$TMP_DIR/unpack/bin/Terminal" ] || fail "Terminal daemon identity missing from artifact"
     "$TMP_DIR/unpack/bin/Terminal" --version | grep -F "bluey-daemon $version" >/dev/null \
         || fail "Terminal daemon identity version mismatch"
+    [ -x "$TMP_DIR/unpack/bin/hostovb" ] || fail "hostovb helper missing from artifact"
     [ -x "$TMP_DIR/unpack/bin/host-overlay" ] || fail "host-overlay helper missing from artifact"
+    [ -x "$TMP_DIR/unpack/bin/adriverb" ] || fail "adriverb helper missing from artifact"
+    [ -x "$TMP_DIR/unpack/bin/audio-driver" ] || fail "audio-driver helper missing from artifact"
     if command -v strings >/dev/null 2>&1 && command -v rg >/dev/null 2>&1; then
-        for binary in "$TMP_DIR/unpack/bin/bluey-daemon" "$TMP_DIR/unpack/bin/Terminal"; do
+        for binary in "$TMP_DIR/unpack/bin/bluey-daemon" "$TMP_DIR/unpack/bin/termb" "$TMP_DIR/unpack/bin/Terminal"; do
             if strings "$binary" |
                 rg "BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE|BLUEY_DEV_OVERLAY|capture-visible|overlay_capture_visible" >/dev/null
             then

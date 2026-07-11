@@ -24,6 +24,7 @@ pub mod device_codes;
 pub mod devices;
 pub mod diagnostic_logs;
 pub mod idempotency;
+pub mod legal_acceptances;
 pub mod link_codes;
 pub mod metrics;
 pub mod ops_audit;
@@ -740,6 +741,33 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_account_devices_account_device
         ON account_devices(account_id, device_id);
     "#,
+    // 0019 - legal acceptance ledger.
+    //
+    // Product flows already require Terms/Privacy consent before signup,
+    // trial conversion, and Try Us access. This ledger records the account,
+    // purpose, policy versions, and hashed request signals so support/admin
+    // can prove consent without retaining raw IP, device, or user-agent data.
+    r#"
+    CREATE TABLE IF NOT EXISTS legal_acceptances (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        purpose               TEXT NOT NULL,
+        terms_version         TEXT NOT NULL,
+        privacy_version       TEXT NOT NULL,
+        terms_text_hash       TEXT NOT NULL DEFAULT '',
+        privacy_text_hash     TEXT NOT NULL DEFAULT '',
+        email_hash            TEXT,
+        ip_hash               TEXT,
+        user_agent_hash       TEXT,
+        device_hash           TEXT,
+        ip_user_agent_hash    TEXT,
+        metadata_json         TEXT NOT NULL DEFAULT '{}',
+        retention_expires_at  DATETIME,
+        accepted_at           DATETIME NOT NULL DEFAULT (datetime('now')),
+        created_at            DATETIME NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(account_id, purpose, terms_version, privacy_version)
+    );
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -833,12 +861,46 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     )?;
     ensure_column(&conn, "trial_grants", "email_domain_hash", "TEXT")?;
     ensure_column(&conn, "trial_abuse_events", "email_domain_hash", "TEXT")?;
+    ensure_column(
+        &conn,
+        "legal_acceptances",
+        "terms_text_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &conn,
+        "legal_acceptances",
+        "privacy_text_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(&conn, "legal_acceptances", "email_hash", "TEXT")?;
+    ensure_column(&conn, "legal_acceptances", "ip_user_agent_hash", "TEXT")?;
+    ensure_column(
+        &conn,
+        "legal_acceptances",
+        "retention_expires_at",
+        "DATETIME",
+    )?;
+    ensure_column(
+        &conn,
+        "legal_acceptances",
+        "accepted_at",
+        // SQLite rejects non-constant defaults such as datetime('now') when
+        // ALTER TABLE adds a column. New writes populate this explicitly.
+        "DATETIME",
+    )?;
     conn.execute_batch(
         r#"
         CREATE INDEX IF NOT EXISTS idx_trial_grants_email_domain
             ON trial_grants(email_domain_hash, created_at);
         CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_email_domain
             ON trial_abuse_events(email_domain_hash, created_at);
+        CREATE INDEX IF NOT EXISTS idx_legal_acceptances_account_created
+            ON legal_acceptances(account_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_legal_acceptances_purpose_created
+            ON legal_acceptances(purpose, created_at);
+        CREATE INDEX IF NOT EXISTS idx_legal_acceptances_email_created
+            ON legal_acceptances(email_hash, created_at);
         "#,
     )?;
     tracing::info!(

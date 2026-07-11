@@ -607,7 +607,7 @@
       text-decoration: none;
       font-size: 1.05rem;
       font-weight: 600;
-      letter-spacing: -.01em;
+      letter-spacing: 0;
       line-height: 1;
     }
 
@@ -1237,7 +1237,7 @@
       font-weight: 740;
       line-height: 1.05;
       margin: 0 0 .82rem;
-      letter-spacing: -.03em;
+      letter-spacing: 0;
       text-wrap: balance;
     }
 
@@ -1294,7 +1294,7 @@
       font-family: inherit;
       font-weight: 800;
       text-decoration: none;
-      letter-spacing: -.01em;
+      letter-spacing: 0;
       cursor: pointer;
       transition: transform .2s, border-color .2s, background .2s, box-shadow .2s, color .2s;
     }
@@ -1776,6 +1776,65 @@
       opacity: .55;
     }
 
+    .trial-consent {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin-top: 14px;
+      padding: 12px 14px;
+      border: 1px solid rgba(99, 216, 255, .22);
+      border-radius: 12px;
+      color: #bdd0dc;
+      background: rgba(99, 216, 255, .06);
+      font-size: .9rem;
+      line-height: 1.45;
+    }
+
+    .trial-consent[hidden] {
+      display: none;
+    }
+
+    .trial-consent input {
+      width: 18px;
+      height: 18px;
+      margin-top: 2px;
+      accent-color: #63d8ff;
+      flex: 0 0 auto;
+    }
+
+    .trial-consent a {
+      color: #72dcff;
+      font-weight: 800;
+      text-decoration: none;
+    }
+
+    .trial-start {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      min-height: 48px;
+      margin-top: 12px;
+      border: 0;
+      border-radius: 12px;
+      color: #061114;
+      background: linear-gradient(135deg, #e8fbff 0%, #63d8ff 52%, #4f8dff 100%);
+      font-family: inherit;
+      font-size: .95rem;
+      font-weight: 900;
+      cursor: pointer;
+    }
+
+    .trial-start[hidden] {
+      display: none;
+    }
+
+    .trial-start:disabled {
+      cursor: not-allowed;
+      opacity: .55;
+      filter: grayscale(.2);
+    }
+
     .trial-note {
       margin-top: 12px;
       color: #6f8291;
@@ -1800,10 +1859,15 @@
     }
 
     html[data-bluey-theme="light"] .trial-close,
-    html[data-bluey-theme="light"] .trial-field {
+    html[data-bluey-theme="light"] .trial-field,
+    html[data-bluey-theme="light"] .trial-consent {
       color: #102130;
       border-color: #dcebf3;
       background: #f6fbff;
+    }
+
+    html[data-bluey-theme="light"] .trial-consent a {
+      color: #0b83b5;
     }
 
     html[data-bluey-theme="light"] .trial-actions .btn-ghost {
@@ -2303,7 +2367,7 @@
       color: #f2f2f2;
       font-size: 1.35rem;
       line-height: 1.1;
-      letter-spacing: -.02em;
+      letter-spacing: 0;
     }
 
     #accountApp .account-hero p {
@@ -4436,7 +4500,7 @@
       color: #f2f2f2;
       font-size: 1.8rem;
       line-height: 1.12;
-      letter-spacing: -.02em;
+      letter-spacing: 0;
     }
 
     #policyApp .policy-card h2 {
@@ -5865,7 +5929,7 @@
       color: #f6fbff;
       font-size: 1.6rem;
       line-height: 1;
-      letter-spacing: -.02em;
+      letter-spacing: 0;
       white-space: nowrap;
     }
 
@@ -7427,6 +7491,154 @@
       white-space: nowrap;
     }
 
+    /* Round 458: keep desktop connection visible before the tabbed dashboard. */
+    #accountApp .account-desktop-connect-section {
+      position: relative;
+      overflow: hidden;
+      margin-top: .8rem;
+      margin-bottom: .8rem;
+      padding: .95rem 1rem;
+      border-color: rgba(99, 216, 255, .34);
+      background:
+        linear-gradient(135deg, rgba(99, 216, 255, .09), rgba(79, 141, 255, .028) 48%, transparent),
+        #0a0a0a;
+      box-shadow:
+        0 0 0 1px rgba(99, 216, 255, .035),
+        0 18px 56px rgba(16, 150, 220, .08);
+    }
+
+    #accountApp .account-desktop-connect-section[hidden],
+    #accountApp .account-top-device-link-hint[hidden] {
+      display: none;
+    }
+
+    #accountApp .account-desktop-connect-section > * {
+      position: relative;
+      z-index: 1;
+    }
+
+    #accountApp .account-desktop-connect-section.is-action-needed {
+      border-color: rgba(99, 216, 255, .62);
+      box-shadow:
+        0 0 0 1px rgba(99, 216, 255, .12),
+        0 22px 64px rgba(16, 150, 220, .16);
+    }
+
+    #accountApp .account-desktop-connect-section.is-action-needed::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      background: linear-gradient(
+        100deg,
+        transparent 0%,
+        transparent 32%,
+        rgba(99, 216, 255, .14) 48%,
+        transparent 66%,
+        transparent 100%
+      );
+      transform: translateX(-115%);
+      animation: blueyConnectWave 3.4s ease-in-out infinite;
+      pointer-events: none;
+    }
+
+    #accountApp .account-top-device-link-hint {
+      display: grid;
+      grid-template-columns: minmax(12rem, .35fr) minmax(0, 1fr);
+      gap: .55rem 1rem;
+      align-items: center;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+    }
+
+    #accountApp .account-top-device-link-hint strong {
+      grid-column: 1;
+      color: #f2f2f2;
+      font-size: 1.02rem;
+      font-weight: 820;
+      line-height: 1.15;
+    }
+
+    #accountApp .account-top-device-link-hint .device-code-form {
+      grid-column: 2;
+      grid-row: 1;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(7.2rem, auto);
+      gap: .55rem;
+      align-items: center;
+    }
+
+    #accountApp .account-top-device-link-hint .device-code-helper {
+      grid-column: 2;
+      grid-row: 2;
+      color: #9baab4;
+      font-size: .8rem;
+      line-height: 1.38;
+    }
+
+    #accountApp .account-top-device-link-hint .device-action-row {
+      grid-column: 2;
+      grid-row: 2;
+      display: flex;
+      align-items: center;
+      gap: .65rem;
+      flex-wrap: wrap;
+    }
+
+    #accountApp .account-top-device-link-hint .device-action-cue {
+      display: inline-flex;
+      align-items: center;
+      gap: .38rem;
+      color: #7fdfff;
+      font-size: .68rem;
+      font-weight: 850;
+      line-height: 1;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+
+    #accountApp .account-top-device-link-hint .device-action-cue::before {
+      content: "";
+      width: .46rem;
+      height: .46rem;
+      border-radius: 999px;
+      background: #63d8ff;
+      box-shadow: 0 0 0 0 rgba(99, 216, 255, .34);
+      animation: blueyCueDot 1.7s ease-out infinite;
+    }
+
+    #accountApp .account-top-device-link-hint .device-code-form input {
+      min-height: 42px;
+      height: 42px;
+      border-radius: 10px;
+    }
+
+    #accountApp .account-top-device-link-hint .account-button {
+      min-height: 42px;
+      border-radius: 10px;
+      white-space: nowrap;
+    }
+
+    #accountApp .account-top-device-link-hint .device-primary-action {
+      border-color: rgba(147, 231, 255, .62);
+      background:
+        linear-gradient(135deg, rgba(192, 244, 255, .98), rgba(82, 189, 255, .96));
+      color: #061018;
+      box-shadow:
+        0 0 0 1px rgba(99, 216, 255, .16),
+        0 12px 28px rgba(28, 171, 239, .2);
+    }
+
+    #accountApp .account-top-device-link-hint .device-code-status {
+      grid-column: 2;
+      grid-row: 3;
+      color: #8fdfff;
+      font-size: .74rem;
+      text-align: left;
+    }
+
     /* Round 398: keep desktop connect compact and separate from session history. */
     #accountApp #dashboardTabComputers {
       display: grid;
@@ -8194,6 +8406,19 @@
 
       #accountApp .dashboard-overview-card.balance-kpi #balanceValue {
         justify-self: start;
+      }
+
+      #accountApp .account-top-device-link-hint {
+        grid-template-columns: 1fr;
+        gap: .45rem;
+      }
+
+      #accountApp .account-top-device-link-hint .device-code-form,
+      #accountApp .account-top-device-link-hint .device-code-helper,
+      #accountApp .account-top-device-link-hint .device-code-status,
+      #accountApp .account-top-device-link-hint .device-action-row {
+        grid-column: 1;
+        grid-row: auto;
       }
 
       #accountApp .reload-setup-footer .account-button.primary {

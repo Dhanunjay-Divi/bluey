@@ -1,6 +1,6 @@
 //! Trial grant and abuse ledger.
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::params;
 use serde::Serialize;
@@ -172,26 +172,34 @@ pub fn attach_grant_account(pool: &DbPool, grant_id: &str, account_id: &str) -> 
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
-            conn.execute(
+            let updated = conn.execute(
                 "UPDATE trial_grants
                     SET account_id = ?1
                   WHERE id = ?2
                     AND decision = 'granted'
-                    AND account_id IS NULL",
+                    AND (account_id IS NULL OR account_id = ?1)",
                 params![account_id, grant_id],
             )?;
+            ensure!(
+                updated == 1,
+                "trial grant is missing, denied, or attached to another account"
+            );
             Ok(())
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            conn.execute(
+            let updated = conn.execute(
                 "UPDATE trial_grants
                     SET account_id = $1
                   WHERE id = $2
                     AND decision = 'granted'
-                    AND account_id IS NULL",
+                    AND (account_id IS NULL OR account_id = $1)",
                 &[&account_id, &grant_id],
             )?;
+            ensure!(
+                updated == 1,
+                "trial grant is missing, denied, or attached to another account"
+            );
             Ok(())
         }
     })
@@ -925,6 +933,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored_account_id, account_id);
+    }
+
+    #[test]
+    fn trial_grant_attach_is_idempotent_for_same_account_and_rejects_another() {
+        let pool = pool();
+        let signals = TrialAbuseSignals::from_raw(
+            "a@example.com",
+            Some("198.51.100.10"),
+            Some("device-1"),
+            Some("ua"),
+        );
+        let grant_id =
+            match reserve_trial_grant(&pool, TrialAbuseConfig::default(), &signals, 900).unwrap() {
+                TrialGrantReservation::Reserved { grant_id } => grant_id,
+                TrialGrantReservation::Denied { reason } => {
+                    panic!("trial should reserve, denied with {reason}")
+                }
+            };
+        let first_account = crate::db::accounts::Account::create(&pool, "a@example.com", "stub")
+            .unwrap()
+            .id;
+        let second_account = crate::db::accounts::Account::create(&pool, "b@example.com", "stub")
+            .unwrap()
+            .id;
+
+        attach_grant_account(&pool, &grant_id, &first_account).unwrap();
+        attach_grant_account(&pool, &grant_id, &first_account).unwrap();
+
+        let error = attach_grant_account(&pool, &grant_id, &second_account).unwrap_err();
+        assert!(error.to_string().contains("attached to another account"));
     }
 
     #[test]

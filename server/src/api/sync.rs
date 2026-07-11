@@ -454,9 +454,17 @@ fn validate_batch(req: &SyncBatchRequest) -> Result<(), (StatusCode, String)> {
 }
 
 fn validate_session_id(session_id: &str) -> Result<(), (StatusCode, String)> {
-    uuid::Uuid::parse_str(session_id)
-        .map(|_| ())
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid session id".to_string()))
+    let session_id = session_id.trim();
+    let valid = !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err((StatusCode::BAD_REQUEST, "invalid session id".to_string()))
+    }
 }
 
 fn validate_object_id(artifact_id: &str) -> Result<(), (StatusCode, String)> {
@@ -603,6 +611,21 @@ mod tests {
         let err = ensure_sync_usage_allowed(&test_account(true), "rag_query").unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(err.1.contains("billing is under review"));
+    }
+
+    #[test]
+    fn session_ids_accept_uuid_and_safe_legacy_shapes() {
+        assert!(validate_session_id("61b8c310-27de-4cc1-b598-c62bdcc07ba8").is_ok());
+        assert!(validate_session_id("sess-cloud-1").is_ok());
+        assert!(validate_session_id("local_session_42").is_ok());
+    }
+
+    #[test]
+    fn session_ids_reject_path_or_control_characters() {
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id("../other-account").is_err());
+        assert!(validate_session_id("session/child").is_err());
+        assert!(validate_session_id("session\nchild").is_err());
     }
 
     #[test]

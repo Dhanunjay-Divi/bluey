@@ -11,6 +11,8 @@ pub mod logging;
 pub mod meeting;
 pub mod observability;
 pub mod overlay;
+pub mod process_aliases;
+pub mod prompt_contracts;
 pub mod session;
 pub mod state;
 

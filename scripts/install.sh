@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+INSTALL_HELPER_NAMES=(
+  termb Terminal hostovb host-overlay adriverb audio-driver screen-driver
+  bluey-overlay-macos cue-overlay-macos
+  bluey-audio-macos cue-audio-macos
+  bluey-whisper-macos cue-whisper
+  bluey-file-picker-macos cue-file-picker-macos
+)
+
+PUBLIC_HELPER_NAMES=(
+  hostovb host-overlay adriverb audio-driver screen-driver
+  bluey-overlay-macos cue-overlay-macos
+  bluey-audio-macos cue-audio-macos
+  bluey-whisper-macos cue-whisper
+  bluey-file-picker-macos cue-file-picker-macos
+)
+
 die() {
   printf 'bluey install: %s\n' "$*" >&2
   exit 1
@@ -30,12 +46,51 @@ copy_first_binary_alias() {
   done
 }
 
+replace_first_binary_alias() {
+  local source_dir="$1"
+  local alias_name="$2"
+  shift 2
+  local candidate
+
+  rm -f "$source_dir/$alias_name"
+  for candidate in "$@"; do
+    if [[ -x "$source_dir/$candidate" ]]; then
+      cp "$source_dir/$candidate" "$source_dir/$alias_name"
+      chmod +x "$source_dir/$alias_name"
+      return 0
+    fi
+  done
+}
+
 ensure_process_identity_aliases() {
   local bin_path="$1"
 
+  replace_first_binary_alias "$bin_path" termb bluey-daemon cue-daemon
   copy_first_binary_alias "$bin_path" Terminal bluey-daemon cue-daemon
+  copy_first_binary_alias "$bin_path" hostovb bluey-overlay-macos cue-overlay-macos
   copy_first_binary_alias "$bin_path" host-overlay bluey-overlay-macos cue-overlay-macos
+  copy_first_binary_alias "$bin_path" adriverb bluey-audio-macos cue-audio-macos
   copy_first_binary_alias "$bin_path" audio-driver bluey-audio-macos cue-audio-macos
+}
+
+remove_bluey_legacy_terminal_link() {
+  local legacy_link="$1/Terminal"
+  local target
+
+  [[ -L "$legacy_link" ]] || return 0
+  target="$(readlink "$legacy_link" 2>/dev/null || true)"
+  if [[ "$target" != /* ]]; then
+    local link_dir target_dir target_name
+    link_dir="$(cd "$(dirname "$legacy_link")" 2>/dev/null && pwd -P)" || return 0
+    target_dir="$(cd "$link_dir/$(dirname "$target")" 2>/dev/null && pwd -P)" || return 0
+    target_name="$(basename "$target")"
+    target="$target_dir/$target_name"
+  fi
+  case "$target" in
+    "$target_root"/*|"$HOME/.bluey"/*)
+      rm -f "$legacy_link"
+      ;;
+  esac
 }
 
 install_local_doc_tools() {
@@ -159,19 +214,11 @@ tar -xzf "$archive" -C "$extract_dir"
 
 cp -R "$extract_dir"/. "$target_tmp"/
 ensure_process_identity_aliases "$target_tmp/bin"
-chmod +x "$target_tmp/bin/bluey" "$target_tmp/bin/bluey-daemon"
-if [[ -f "$target_tmp/bin/Terminal" ]]; then chmod +x "$target_tmp/bin/Terminal"; fi
-if [[ -f "$target_tmp/bin/host-overlay" ]]; then chmod +x "$target_tmp/bin/host-overlay"; fi
-if [[ -f "$target_tmp/bin/audio-driver" ]]; then chmod +x "$target_tmp/bin/audio-driver"; fi
-if [[ -f "$target_tmp/bin/screen-driver" ]]; then chmod +x "$target_tmp/bin/screen-driver"; fi
-if [[ -f "$target_tmp/bin/bluey-overlay-macos" ]]; then chmod +x "$target_tmp/bin/bluey-overlay-macos"; fi
-if [[ -f "$target_tmp/bin/cue-overlay-macos" ]]; then chmod +x "$target_tmp/bin/cue-overlay-macos"; fi
-if [[ -f "$target_tmp/bin/bluey-audio-macos" ]]; then chmod +x "$target_tmp/bin/bluey-audio-macos"; fi
-if [[ -f "$target_tmp/bin/cue-audio-macos" ]]; then chmod +x "$target_tmp/bin/cue-audio-macos"; fi
-if [[ -f "$target_tmp/bin/cue-whisper" ]]; then chmod +x "$target_tmp/bin/cue-whisper"; fi
-if [[ -f "$target_tmp/bin/bluey-whisper-macos" ]]; then chmod +x "$target_tmp/bin/bluey-whisper-macos"; fi
-if [[ -f "$target_tmp/bin/bluey-file-picker-macos" ]]; then chmod +x "$target_tmp/bin/bluey-file-picker-macos"; fi
-if [[ -f "$target_tmp/bin/cue-file-picker-macos" ]]; then chmod +x "$target_tmp/bin/cue-file-picker-macos"; fi
+for executable in bluey bluey-daemon "${INSTALL_HELPER_NAMES[@]}"; do
+  if [[ -f "$target_tmp/bin/$executable" ]]; then
+    chmod +x "$target_tmp/bin/$executable"
+  fi
+done
 if [[ -f "$target_tmp/bin/BlueyFilePicker.app/Contents/MacOS/bluey-file-picker-macos" ]]; then
   chmod +x "$target_tmp/bin/BlueyFilePicker.app/Contents/MacOS/bluey-file-picker-macos"
 fi
@@ -180,19 +227,17 @@ install_local_doc_tools "$target_tmp"
 rm -rf "$target"
 mv "$target_tmp" "$target"
 
+remove_bluey_legacy_terminal_link "$bin_dir"
 ln -sfn "$target/bin/bluey" "$bin_dir/bluey"
-daemon_link_target="$target/bin/Terminal"
+daemon_link_target="$target/bin/termb"
+if [[ ! -x "$daemon_link_target" ]]; then
+  daemon_link_target="$target/bin/Terminal"
+fi
 if [[ ! -x "$daemon_link_target" ]]; then
   daemon_link_target="$target/bin/bluey-daemon"
 fi
 ln -sfn "$daemon_link_target" "$bin_dir/bluey-daemon"
-for helper in \
-  Terminal host-overlay audio-driver screen-driver \
-  bluey-overlay-macos cue-overlay-macos \
-  bluey-audio-macos cue-audio-macos \
-  bluey-whisper-macos cue-whisper \
-  bluey-file-picker-macos cue-file-picker-macos
-do
+for helper in "${PUBLIC_HELPER_NAMES[@]}"; do
   if [[ -x "$target/bin/$helper" ]]; then
     ln -sfn "$target/bin/$helper" "$bin_dir/$helper"
   fi

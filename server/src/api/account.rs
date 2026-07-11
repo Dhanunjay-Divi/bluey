@@ -102,8 +102,34 @@ pub struct BillingSettingsRequest {
 
 pub async fn me(
     State(state): State<AppState>,
-    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Extension(AuthedAccount(mut account)): Extension<AuthedAccount>,
 ) -> Json<AccountMe> {
+    match crate::db::stt_accounting::release_stale_sessions(
+        &state.pool,
+        &account.id,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        Ok(released) if released > 0 => {
+            tracing::info!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                released,
+                "released stale STT reservations during account refresh"
+            );
+            if let Ok(Some(refreshed)) =
+                crate::db::accounts::Account::fetch_by_id(&state.pool, &account.id)
+            {
+                account = refreshed;
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %error,
+                "failed to reconcile stale STT reservations during account refresh"
+            );
+        }
+    }
     Json(account_me_payload(&state, account))
 }
 

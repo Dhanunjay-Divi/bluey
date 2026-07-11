@@ -132,7 +132,7 @@ def bluey_windows():
     rows = []
     for win in windows():
         owner = (win.get("kCGWindowOwnerName") or "").lower()
-        if owner not in ("bluey overlay", "host-overlay", "bluey-overlay-macos"):
+        if owner not in ("bluey overlay", "hostovb", "host-overlay", "bluey-overlay-macos"):
             continue
         bounds = win.get("kCGWindowBounds", {})
         rows.append(bounds)
@@ -184,7 +184,7 @@ import Quartz
 rows = []
 for win in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []:
     owner = (win.get("kCGWindowOwnerName") or "").lower()
-    if owner in ("bluey overlay", "host-overlay", "bluey-overlay-macos"):
+    if owner in ("bluey overlay", "hostovb", "host-overlay", "bluey-overlay-macos"):
         b = win.get("kCGWindowBounds", {})
         rows.append({"width": int(round(b.get("Width", 0))), "height": int(round(b.get("Height", 0))), "x": int(round(b.get("X", 0))), "y": int(round(b.get("Y", 0))), "sharing": win.get("kCGWindowSharingState")})
 print(json.dumps(rows))
@@ -201,7 +201,7 @@ import Quartz
 rows = []
 for win in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []:
     owner = (win.get("kCGWindowOwnerName") or "").lower()
-    if owner in ("bluey overlay", "host-overlay", "bluey-overlay-macos"):
+    if owner in ("bluey overlay", "hostovb", "host-overlay", "bluey-overlay-macos"):
         b = win.get("kCGWindowBounds", {})
         rows.append({"width": int(round(b.get("Width", 0))), "height": int(round(b.get("Height", 0))), "x": int(round(b.get("X", 0))), "y": int(round(b.get("Y", 0))), "sharing": win.get("kCGWindowSharingState")})
 print(json.dumps(rows))

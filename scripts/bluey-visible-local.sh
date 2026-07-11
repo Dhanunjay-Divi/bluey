@@ -44,7 +44,9 @@ fi
 
 overlay_bin="${BLUEY_OVERLAY_BIN:-}"
 if [ -z "$overlay_bin" ] && [ "$(uname -s)" = "Darwin" ]; then
-    if [ -x "$ROOT/native/macos/cue-overlay/.build/host-overlay" ]; then
+    if [ -x "$ROOT/native/macos/cue-overlay/.build/hostovb" ]; then
+        overlay_bin="$ROOT/native/macos/cue-overlay/.build/hostovb"
+    elif [ -x "$ROOT/native/macos/cue-overlay/.build/host-overlay" ]; then
         overlay_bin="$ROOT/native/macos/cue-overlay/.build/host-overlay"
     elif [ -x "$ROOT/native/macos/cue-overlay/.build/bluey-overlay-macos" ]; then
         overlay_bin="$ROOT/native/macos/cue-overlay/.build/bluey-overlay-macos"

@@ -282,9 +282,7 @@ fn meeting_should_follow_cloud_delete(
     owner_account_id: Option<&str>,
 ) -> bool {
     match owner_account_id {
-        Some(owner) => {
-            meeting.owner_account_id.as_deref() == Some(owner) || meeting.owner_account_id.is_none()
-        }
+        Some(owner) => meeting.owner_account_id.as_deref() == Some(owner),
         None => meeting.owner_account_id.is_none(),
     }
 }
@@ -1472,6 +1470,7 @@ async fn meeting_from_cloud_bundle(
         }
     }
 
+    let live_answer_transcript_cursor = transcript.len();
     Ok(MeetingRecord {
         id,
         owner_account_id: None,
@@ -1483,6 +1482,9 @@ async fn meeting_from_cloud_bundle(
             Some(bundle.session.updated_at_ms.to_string())
         },
         transcript,
+        // A restored cloud transcript is historical context. Only speech
+        // captured after resume should be submitted by the live Answer action.
+        live_answer_transcript_cursor,
         action_items: Vec::new(),
         decisions: Vec::new(),
         context,
@@ -2455,7 +2457,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_delete_follows_current_owner_or_legacy_unowned_cache() {
+    fn cloud_delete_follows_only_the_current_owner() {
         let mut owned = MeetingRecord::new(Some("Owned".into()));
         owned.owner_account_id = Some("acct_current".into());
         let mut other = MeetingRecord::new(Some("Other".into()));
@@ -2466,7 +2468,7 @@ mod tests {
             &owned,
             Some("acct_current")
         ));
-        assert!(meeting_should_follow_cloud_delete(
+        assert!(!meeting_should_follow_cloud_delete(
             &unowned,
             Some("acct_current")
         ));

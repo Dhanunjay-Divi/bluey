@@ -54,6 +54,7 @@ static HWND g_ask_edit;
 static HWND g_send_button;
 static HWND g_record_button;
 static HWND g_auto_send_combo;
+static HWND g_answer_detail_combo;
 static HWND g_transcript_clear_button;
 static HWND g_paste_answer_button;
 static HWND g_help_button;
@@ -71,6 +72,8 @@ static wchar_t g_body[2048] = L"Waiting for meeting intelligence...";
 static wchar_t g_kind[64] = L"system";
 static wchar_t g_source[256] = L"";
 static wchar_t g_card_id[80] = L"";
+static wchar_t g_last_question[2048] = L"";
+static int g_recovery_mode = 0; /* 0 none, 1 continue partial, 2 retry */
 static bool g_visible = true;
 static bool g_collapsed = false;
 static bool g_interactive_mode = true;
@@ -78,7 +81,12 @@ static bool g_recording = false;
 static DWORD g_last_record_toggle_ms = 0;
 static DWORD g_record_restart_after_ms = 0;
 static int g_auto_send_mode = 0;
+static int g_answer_detail_mode = 0; /* 0 Auto, 1 Quick, 2 Thorough */
 static bool g_auto_send_timer_armed = false;
+static bool g_manual_send_timer_armed = false;
+static ULONGLONG g_manual_send_started_ms = 0;
+static int g_audio_auto_stop_remaining_secs = -1;
+static int g_audio_auto_stop_idle_secs = 0;
 static bool g_light_theme = false;
 static double g_opacity = 0.92;
 static const int BLUEY_LIGHT_ACCENT_R = 0;
@@ -123,6 +131,7 @@ static wchar_t g_active_session_title[160] = L"";
 static WNDPROC g_ask_edit_proc = NULL;
 
 static void send_current_question(void);
+static void send_current_question_now(void);
 static void cancel_auto_send_timer(const char *origin);
 static void schedule_auto_send_after_caption_settled(void);
 static void show_full_overlay(bool emit_event);
@@ -140,6 +149,7 @@ typedef struct OverlayContextChip {
     wchar_t title[260];
     wchar_t kind[64];
     wchar_t path[520];
+    wchar_t processing_status[32];
 } OverlayContextChip;
 
 static OverlayContextChip g_context_chips[MAX_CONTEXT_CHIPS];
@@ -150,6 +160,39 @@ static ULONGLONG g_pending_context_expected_until_ms = 0;
 static OverlayContextChip g_sent_chips[MAX_CONTEXT_CHIPS];
 static int g_sent_chip_count = 0;
 static void consume_sent_context_chips(void);
+
+static bool wide_contains_ci(const wchar_t *text, const wchar_t *needle) {
+    if (!text || !needle || !*needle) return false;
+    size_t needle_len = wcslen(needle);
+    for (const wchar_t *cursor = text; *cursor; cursor++) {
+        if (_wcsnicmp(cursor, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
+static void set_recovery_mode(int mode) {
+    g_recovery_mode = mode;
+    if (!g_send_button) return;
+    SetWindowTextW(g_send_button, mode == 1 ? L"Continue" : (mode == 2 ? L"Retry" : L"Answer"));
+}
+
+static void update_recovery_action_from_current_card(void) {
+    if (_wcsicmp(g_kind, L"answer") != 0) {
+        set_recovery_mode(0);
+        return;
+    }
+    if (wide_contains_ci(g_body, L"kept the partial answer")
+        || wide_contains_ci(g_body, L"select continue")) {
+        set_recovery_mode(1);
+    } else if (wide_contains_ci(g_body, L"select retry")
+        || wide_contains_ci(g_body, L"could not finish")
+        || wide_contains_ci(g_body, L"could not complete")
+        || wide_contains_ci(g_body, L"busy for a moment")) {
+        set_recovery_mode(2);
+    } else {
+        set_recovery_mode(0);
+    }
+}
 
 #ifdef __cplusplus
 #define BLUEY_COM_RELEASE(ptr) (ptr)->Release()
@@ -208,6 +251,7 @@ static void consume_sent_context_chips(void);
 #define ID_RECAP_BUTTON 1011
 #define ID_THEME_BUTTON 1012
 #define ID_SHORTCUTS_BUTTON 1016
+#define ID_ANSWER_DETAIL_BUTTON 1017
 #define COLLAPSED_DRAG_THRESHOLD 4
 #define ID_HOTKEY_TOGGLE_OVERLAY 2001
 #define ID_HOTKEY_FOCUS_ASK 2002
@@ -218,7 +262,11 @@ static void consume_sent_context_chips(void);
 #define ID_HOTKEY_HISTORY 2007
 #define ID_HOTKEY_FILES 2008
 #define ID_AUTOSEND_TIMER 3001
+#define ID_MANUAL_SEND_TIMER 3002
 #define AUTOSEND_CAPTION_SETTLE_DELAY_MS 300
+#define MANUAL_CAPTION_SETTLE_DELAY_MS 600
+#define MANUAL_FINAL_CAPTION_SETTLE_DELAY_MS 250
+#define MANUAL_CAPTION_SETTLE_MAX_MS 2000
 #define BLUEY_GLOBAL_HOTKEY_MODS (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT)
 
 /* Stealth: hide overlay from screen recording, screenshots, and screen-share.
@@ -306,6 +354,7 @@ static void configure_tooltips(void) {
     add_control_tooltip(g_send_button, L"Send the question");
     add_control_tooltip(g_record_button, L"Start or stop listening");
     add_control_tooltip(g_auto_send_combo, L"Choose which audio source should auto-send after captions pause briefly. Stop cancels pending auto-send.");
+    add_control_tooltip(g_answer_detail_combo, L"Auto chooses for you. Quick is compact; Thorough gives a deeper answer.");
     add_control_tooltip(g_transcript_clear_button, L"Clear current captions from the next answer");
     add_control_tooltip(g_help_button, L"Show Bluey help");
     add_control_tooltip(g_session_button, L"Open conversation history");
@@ -487,7 +536,13 @@ static void emit_ask_event(const wchar_t *question) {
     free(utf8);
     // Close `question`, emit fixed fields, append `,"token":"..."` if set,
     // then close the JSON object.
-    fputs("\",\"provider\":\"auto\",\"model\":\"\",\"mode\":\"General\"", stdout);
+    if (g_answer_detail_mode == 1) {
+        fputs("\",\"provider\":\"managed\",\"model\":\"instant\",\"mode\":\"instant\"", stdout);
+    } else if (g_answer_detail_mode == 2) {
+        fputs("\",\"provider\":\"managed\",\"model\":\"deep\",\"mode\":\"deep\"", stdout);
+    } else {
+        fputs("\",\"provider\":\"auto\",\"model\":\"\",\"mode\":\"general\"", stdout);
+    }
     emit_token_field();
     fputs("}\n", stdout);
     fflush(stdout);
@@ -917,7 +972,7 @@ static void draw_resize_affordance(HDC hdc, RECT rect) {
 static void set_controls_visible(bool visible) {
     int state = visible ? SW_SHOW : SW_HIDE;
     HWND controls[] = {
-        g_ask_edit, g_send_button, g_record_button, g_auto_send_combo, g_paste_answer_button, g_help_button, g_session_button,
+        g_ask_edit, g_send_button, g_record_button, g_auto_send_combo, g_answer_detail_combo, g_paste_answer_button, g_help_button, g_session_button,
         g_page_button, g_attach_button, g_recap_button, g_note_button, g_theme_button, g_shortcuts_button, g_close_button
     };
     for (int i = 0; i < (int)(sizeof(controls) / sizeof(controls[0])); i++) {
@@ -1283,9 +1338,11 @@ static void layout_controls(void) {
     MoveWindow(g_auto_send_combo, composer_left + composer_w - 12 - send_w - gap - auto_w, button_y, auto_w, button_h + 100, TRUE);
     MoveWindow(g_ask_edit, composer_left + 12 + button_w + gap, input_y, composer_w - 24 - button_w - send_w - auto_w - (gap * 3), input_h, TRUE);
 
-    int chip_w = (composer_w - 34) / 2;
+    int chip_gap = 8;
+    int chip_w = (composer_w - 24 - (chip_gap * 2)) / 3;
     MoveWindow(g_recap_button, composer_left + 12, chip_y, chip_w, 30, TRUE);
-    MoveWindow(g_page_button, composer_left + 22 + chip_w, chip_y, chip_w, 30, TRUE);
+    MoveWindow(g_answer_detail_combo, composer_left + 12 + chip_w + chip_gap, chip_y, chip_w, 120, TRUE);
+    MoveWindow(g_page_button, composer_left + 12 + (chip_w + chip_gap) * 2, chip_y, chip_w, 30, TRUE);
 
     int header_w = clamp_int((rect.right * 84) / 100, 520, 780);
     if (header_w > rect.right - 28) header_w = rect.right - 28;
@@ -1326,6 +1383,7 @@ static bool point_hits_overlay_control(POINT point) {
         g_send_button,
         g_record_button,
         g_auto_send_combo,
+        g_answer_detail_combo,
         g_transcript_clear_button,
         g_paste_answer_button,
         g_help_button,
@@ -1434,6 +1492,14 @@ static void create_controls(HWND hwnd) {
     SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Auto-send mic or system captions");
     SendMessageW(g_auto_send_combo, CB_SETDROPPEDWIDTH, 280, 0);
     SendMessageW(g_auto_send_combo, CB_SETCURSEL, g_auto_send_mode, 0);
+    g_answer_detail_combo = CreateWindowW(
+        L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+        0, 0, 150, 120, hwnd, (HMENU)ID_ANSWER_DETAIL_BUTTON, GetModuleHandleW(NULL), NULL);
+    SendMessageW(g_answer_detail_combo, CB_ADDSTRING, 0, (LPARAM)L"Auto");
+    SendMessageW(g_answer_detail_combo, CB_ADDSTRING, 0, (LPARAM)L"Quick");
+    SendMessageW(g_answer_detail_combo, CB_ADDSTRING, 0, (LPARAM)L"Thorough");
+    SendMessageW(g_answer_detail_combo, CB_SETCURSEL, g_answer_detail_mode, 0);
     g_transcript_clear_button = CreateWindowW(L"BUTTON", L"Clear", WS_CHILD | BS_OWNERDRAW,
         0, 0, 60, 24, hwnd, (HMENU)ID_TRANSCRIPT_CLEAR_BUTTON, GetModuleHandleW(NULL), NULL);
     g_paste_answer_button = CreateWindowW(L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW,
@@ -1458,7 +1524,7 @@ static void create_controls(HWND hwnd) {
         0, 0, 60, 30, hwnd, (HMENU)ID_CLOSE_BUTTON, GetModuleHandleW(NULL), NULL);
 
     HWND controls[] = {
-        g_ask_edit, g_send_button, g_record_button, g_auto_send_combo, g_transcript_clear_button, g_paste_answer_button, g_help_button, g_session_button,
+        g_ask_edit, g_send_button, g_record_button, g_auto_send_combo, g_answer_detail_combo, g_transcript_clear_button, g_paste_answer_button, g_help_button, g_session_button,
         g_page_button, g_attach_button, g_recap_button, g_note_button, g_theme_button, g_shortcuts_button, g_close_button
     };
     for (int i = 0; i < (int)(sizeof(controls) / sizeof(controls[0])); i++) {
@@ -1482,6 +1548,11 @@ static void consume_sent_context_chips(void) {
 static void clear_local_transcript_context(void) {
     if (g_auto_send_timer_armed) {
         cancel_auto_send_timer("transcript_clear");
+    }
+    if (g_manual_send_timer_armed && g_hwnd) {
+        KillTimer(g_hwnd, ID_MANUAL_SEND_TIMER);
+        g_manual_send_timer_armed = false;
+        g_manual_send_started_ms = 0;
     }
     char detail[160];
     snprintf(
@@ -1697,8 +1768,78 @@ static const wchar_t *fallback_question_for_context(void) {
     return L"Answer using the attached context.";
 }
 
+static void arm_manual_send_timer(UINT delay_ms, const char *reason) {
+    if (!g_hwnd) return;
+    KillTimer(g_hwnd, ID_MANUAL_SEND_TIMER);
+    SetTimer(g_hwnd, ID_MANUAL_SEND_TIMER, delay_ms > 0 ? delay_ms : 1, NULL);
+    g_manual_send_timer_armed = true;
+    char detail[192];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "reason=%s delay_ms=%u elapsed_ms=%llu transcript_context=%s",
+        reason ? reason : "unknown",
+        delay_ms,
+        (unsigned long long)(GetTickCount64() - g_manual_send_started_ms),
+        has_transcript_context() ? "true" : "false"
+    );
+    emit_lifecycle_event("manual_answer_waiting_for_transcript_settle", "ok", detail);
+}
+
+static void reschedule_manual_send_after_transcript_update(bool final) {
+    if (!g_manual_send_timer_armed || g_manual_send_started_ms == 0) return;
+    ULONGLONG elapsed = GetTickCount64() - g_manual_send_started_ms;
+    if (elapsed >= MANUAL_CAPTION_SETTLE_MAX_MS) {
+        arm_manual_send_timer(1, "settle_cap");
+        return;
+    }
+    UINT quiet_ms = final
+        ? MANUAL_FINAL_CAPTION_SETTLE_DELAY_MS
+        : MANUAL_CAPTION_SETTLE_DELAY_MS;
+    ULONGLONG remaining = MANUAL_CAPTION_SETTLE_MAX_MS - elapsed;
+    if ((ULONGLONG)quiet_ms > remaining) quiet_ms = (UINT)remaining;
+    arm_manual_send_timer(quiet_ms, final ? "final_caption" : "partial_caption");
+}
+
 static void send_current_question(void) {
+    if (g_recovery_mode != 0 && GetWindowTextLengthW(g_ask_edit) <= 0) {
+        send_current_question_now();
+        return;
+    }
     int length = GetWindowTextLengthW(g_ask_edit);
+    if (length <= 0 && g_recording) {
+        if (!g_manual_send_timer_armed) {
+            g_manual_send_started_ms = GetTickCount64();
+        }
+        arm_manual_send_timer(MANUAL_CAPTION_SETTLE_DELAY_MS, "enter");
+        return;
+    }
+    if (g_manual_send_timer_armed && g_hwnd) {
+        KillTimer(g_hwnd, ID_MANUAL_SEND_TIMER);
+        g_manual_send_timer_armed = false;
+        g_manual_send_started_ms = 0;
+    }
+    send_current_question_now();
+}
+
+static void send_current_question_now(void) {
+    int length = GetWindowTextLengthW(g_ask_edit);
+    if (length <= 0 && g_recovery_mode != 0) {
+        const wchar_t *question = g_recovery_mode == 1
+            ? L"Continue the previous answer from where it stopped. Do not repeat completed content. Finish any missing code, explanation, complexity, or conclusion."
+            : (g_last_question[0]
+                ? g_last_question
+                : L"Retry the previous question and return a complete answer.");
+        emit_lifecycle_event(
+            "answer_recovery_requested",
+            "ok",
+            g_recovery_mode == 1 ? "action=continue platform=windows" : "action=retry platform=windows");
+        set_recovery_mode(0);
+        emit_ask_event(question);
+        InvalidateRect(g_hwnd, NULL, TRUE);
+        SetFocus(g_ask_edit);
+        return;
+    }
     bool used_fallback = length <= 0;
     wchar_t transcript_question[1024] = L"";
     bool used_short_transcript = used_fallback && live_transcript_visible_question(transcript_question, 260);
@@ -1734,9 +1875,11 @@ static void send_current_question(void) {
         wchar_t *question = (wchar_t *)calloc((size_t)length + 1, sizeof(wchar_t));
         if (!question) return;
         GetWindowTextW(g_ask_edit, question, length + 1);
+        wcsncpy_s(g_last_question, 2048, question, _TRUNCATE);
         emit_ask_event(question);
         free(question);
     }
+    set_recovery_mode(0);
     SetWindowTextW(g_ask_edit, L"");
     clear_local_transcript_context();
     consume_sent_context_chips();
@@ -1793,6 +1936,7 @@ static int keyboard_focus_controls(HWND *controls, int max_controls) {
         g_transcript_clear_button,
         g_ask_edit,
         g_auto_send_combo,
+        g_answer_detail_combo,
         g_record_button,
         g_send_button,
     };
@@ -1848,6 +1992,10 @@ static bool activate_focused_keyboard_control(void) {
     case ID_AUTO_SEND_BUTTON:
         SendMessageW(g_auto_send_combo, CB_SHOWDROPDOWN, TRUE, 0);
         emit_lifecycle_event("keyboard_focus_activated", "ok", "control=auto_send platform=windows");
+        return true;
+    case ID_ANSWER_DETAIL_BUTTON:
+        SendMessageW(g_answer_detail_combo, CB_SHOWDROPDOWN, TRUE, 0);
+        emit_lifecycle_event("keyboard_focus_activated", "ok", "control=answer_detail platform=windows");
         return true;
     case ID_SEND_BUTTON:
     case ID_RECORD_BUTTON:
@@ -1986,14 +2134,25 @@ static void set_chips_from_json_key(
         char title[JSON_MAX_FIELD_LEN];
         char kind[128];
         char path[JSON_MAX_FIELD_LEN];
+        char processing_status[64];
         bool has_title = json_extract_string(object_start, object_len, "title", title, sizeof(title));
         bool has_kind = json_extract_string(object_start, object_len, "kind", kind, sizeof(kind));
         bool has_path = json_extract_string(object_start, object_len, "path", path, sizeof(path));
+        bool has_processing_status = json_extract_string(
+            object_start,
+            object_len,
+            "processing_status",
+            processing_status,
+            sizeof(processing_status));
 
         OverlayContextChip *chip = &chips[*chip_count];
         set_utf8_text(chip->title, sizeof(chip->title) / sizeof(chip->title[0]), has_title ? title : "Attached file");
         set_utf8_text(chip->kind, sizeof(chip->kind) / sizeof(chip->kind[0]), has_kind ? kind : "document");
         set_utf8_text(chip->path, sizeof(chip->path) / sizeof(chip->path[0]), has_path ? path : "");
+        set_utf8_text(
+            chip->processing_status,
+            sizeof(chip->processing_status) / sizeof(chip->processing_status[0]),
+            has_processing_status ? processing_status : "");
         (*chip_count)++;
         p = object_end;
     }
@@ -2049,6 +2208,7 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             wcscpy_s(g_source, 256, L"");
             wcscpy_s(g_card_id, 80, L"");
             g_sent_chip_count = 0;
+            set_recovery_mode(0);
             update_paste_answer_button();
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "boot") == 0) {
@@ -2058,6 +2218,7 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             wcscpy_s(g_source, 256, L"");
             wcscpy_s(g_card_id, 80, L"");
             safe_extract_json_to_wide(line, line_len, "title", g_title, 256);
+            set_recovery_mode(0);
             show_full_overlay(false);
             update_paste_answer_button();
             InvalidateRect(g_hwnd, NULL, TRUE);
@@ -2080,12 +2241,16 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             safe_extract_json_to_wide(line, line_len, "title", g_title, 256);
             safe_extract_json_to_wide(line, line_len, "body", g_body, 2048);
             safe_extract_json_to_wide(line, line_len, "kind", g_kind, 64);
+            if (_wcsicmp(g_kind, L"question") == 0) {
+                wcsncpy_s(g_last_question, 2048, g_body, _TRUNCATE);
+            }
             if (_wcsicmp(g_kind, L"answer") == 0) {
                 normalize_answer_display_text(g_body, 2048);
             }
             safe_extract_json_to_wide(line, line_len, "source", g_source, 256);
             safe_extract_json_to_wide(line, line_len, "id", g_card_id, 80);
             set_sent_chips_from_json(line, line_len);
+            update_recovery_action_from_current_card();
             if (g_visible && !g_collapsed) {
                 show_full_overlay(false);
             }
@@ -2099,6 +2264,7 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
                 if (_wcsicmp(g_kind, L"answer") == 0) {
                     normalize_answer_display_text(g_body, 2048);
                 }
+                update_recovery_action_from_current_card();
                 update_paste_answer_button();
                 InvalidateRect(g_hwnd, NULL, TRUE);
             }
@@ -2108,6 +2274,8 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
         } else if (strcmp(msg_type, "transcript_partial") == 0) {
             safe_extract_json_to_wide(line, line_len, "text", g_transcript_partial, 1024);
             safe_extract_json_to_wide(line, line_len, "source", g_transcript_source, 64);
+            g_audio_auto_stop_remaining_secs = -1;
+            reschedule_manual_send_after_transcript_update(false);
             update_transcript_clear_button();
             update_paste_answer_button();
             InvalidateRect(g_hwnd, NULL, TRUE);
@@ -2115,9 +2283,29 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             safe_extract_json_to_wide(line, line_len, "text", g_transcript_final, 1024);
             safe_extract_json_to_wide(line, line_len, "source", g_transcript_source, 64);
             g_transcript_partial[0] = L'\0';
+            g_audio_auto_stop_remaining_secs = -1;
+            reschedule_manual_send_after_transcript_update(true);
             update_transcript_clear_button();
             update_paste_answer_button();
             schedule_auto_send_after_caption_settled();
+            InvalidateRect(g_hwnd, NULL, TRUE);
+        } else if (strcmp(msg_type, "listening_state_changed") == 0) {
+            char state[32] = "idle";
+            json_extract_string(line, line_len, "state", state, sizeof(state));
+            g_recording = strcmp(state, "listening") == 0;
+            g_audio_auto_stop_remaining_secs = -1;
+            update_record_button();
+            InvalidateRect(g_hwnd, NULL, TRUE);
+        } else if (strcmp(msg_type, "audio_auto_stop_countdown") == 0) {
+            double remaining = 0.0;
+            double idle = 0.0;
+            safe_extract_json_number(line, line_len, "remaining_secs", &remaining);
+            safe_extract_json_number(line, line_len, "idle_secs", &idle);
+            g_audio_auto_stop_remaining_secs = remaining < 0.0 ? 0 : (int)remaining;
+            g_audio_auto_stop_idle_secs = idle < 0.0 ? 0 : (int)idle;
+            InvalidateRect(g_hwnd, NULL, TRUE);
+        } else if (strcmp(msg_type, "audio_auto_stop_countdown_cleared") == 0) {
+            g_audio_auto_stop_remaining_secs = -1;
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "session_switched") == 0) {
             if (g_auto_send_timer_armed) {
@@ -2309,9 +2497,32 @@ static bool context_kind_is_image(const wchar_t *kind) {
 
 static void context_chip_label(const OverlayContextChip *chip, wchar_t *dest, size_t dest_len) {
     const wchar_t *title = chip->title[0] ? chip->title : L"Attached file";
-    const wchar_t *prefix = context_kind_is_image(chip->kind) ? L"IMG" : L"DOC";
-    swprintf(dest, dest_len, L"%ls %ls", prefix, title);
+    const wchar_t *prefix = _wcsicmp(chip->kind, L"web") == 0
+        ? L"WEB"
+        : (context_kind_is_image(chip->kind) ? L"IMG" : L"DOC");
+    if (_wcsicmp(chip->processing_status, L"pending") == 0) {
+        swprintf(dest, dest_len, L"%ls Reading %ls...", prefix, title);
+    } else if (_wcsicmp(chip->processing_status, L"ready") == 0) {
+        swprintf(dest, dest_len, L"%ls %ls - Ready", prefix, title);
+    } else if (_wcsicmp(chip->processing_status, L"failed") == 0
+        || _wcsicmp(chip->processing_status, L"unsupported") == 0) {
+        swprintf(dest, dest_len, L"%ls %ls - Needs attention", prefix, title);
+    } else {
+        swprintf(dest, dest_len, L"%ls %ls", prefix, title);
+    }
     dest[dest_len - 1] = L'\0';
+}
+
+static bool sent_chips_visible_for_current_card(void) {
+    if (g_sent_chip_count <= 0) return false;
+    if (_wcsicmp(g_kind, L"question") == 0) return true;
+    return _wcsicmp(g_kind, L"context") == 0 && wide_contains_ci(g_title, L"source");
+}
+
+static bool context_chip_is_web_source(const OverlayContextChip *chip) {
+    if (!chip || _wcsicmp(chip->kind, L"web") != 0) return false;
+    return _wcsnicmp(chip->path, L"https://", 8) == 0
+        || _wcsnicmp(chip->path, L"http://", 7) == 0;
 }
 
 static float context_chip_width(const wchar_t *label) {
@@ -2320,6 +2531,43 @@ static float context_chip_width(const wchar_t *label) {
     if (width < 96.0f) width = 96.0f;
     if (width > 164.0f) width = 164.0f;
     return width;
+}
+
+static int sent_source_chip_index_at_client_point(POINT point) {
+    if (!g_hwnd || !sent_chips_visible_for_current_card()) return -1;
+
+    RECT rect;
+    if (!GetClientRect(g_hwnd, &rect)) return -1;
+    int context_reserved = context_chips_visible() ? 34 : 0;
+    int x = 18;
+    int y = rect.bottom - 158 - context_reserved;
+    int max_right = rect.right - 18;
+
+    for (int i = 0; i < g_sent_chip_count && x < max_right - 50; i++) {
+        wchar_t label[360];
+        context_chip_label(&g_sent_chips[i], label, sizeof(label) / sizeof(label[0]));
+        int width = (int)context_chip_width(label);
+        if (x + width > max_right) width = max_right - x;
+        RECT chip_rect = {x, y, x + width, y + 26};
+        if (PtInRect(&chip_rect, point) && context_chip_is_web_source(&g_sent_chips[i])) {
+            return i;
+        }
+        x += width + 6;
+    }
+    return -1;
+}
+
+static int sent_source_chip_index_at_screen_point(POINT point) {
+    if (!g_hwnd || !ScreenToClient(g_hwnd, &point)) return -1;
+    return sent_source_chip_index_at_client_point(point);
+}
+
+static bool open_sent_source_chip_at_client_point(POINT point) {
+    int index = sent_source_chip_index_at_client_point(point);
+    if (index < 0) return false;
+    ShellExecuteW(NULL, L"open", g_sent_chips[index].path, NULL, NULL, SW_SHOWNORMAL);
+    emit_lifecycle_event("source_opened", "ok", "platform=windows kind=web");
+    return true;
 }
 
 static void draw_context_chips_d2d(RECT rect) {
@@ -2345,7 +2593,7 @@ static void draw_context_chips_d2d(RECT rect) {
 }
 
 static void draw_sent_chips_d2d(RECT rect, float context_reserved) {
-    if (g_sent_chip_count <= 0 || _wcsicmp(g_kind, L"question") != 0) return;
+    if (!sent_chips_visible_for_current_card()) return;
 
     float x = 18.0f;
     float y = (float)rect.bottom - 158.0f - context_reserved;
@@ -2406,7 +2654,7 @@ static void draw_context_chips_gdi(HDC hdc, RECT rect) {
 }
 
 static void draw_sent_chips_gdi(HDC hdc, RECT rect, int context_reserved) {
-    if (g_sent_chip_count <= 0 || _wcsicmp(g_kind, L"question") != 0) return;
+    if (!sent_chips_visible_for_current_card()) return;
 
     int x = 18;
     int y = rect.bottom - 158 - context_reserved;
@@ -2659,7 +2907,7 @@ static bool paint_with_d2d(HWND hwnd) {
             d2d_text(g_title, g_fmt_title, d2d_rectf(18.0f, 82.0f, (float)rect.right - 18.0f, 108.0f), g_light_theme ? 8 : 230, g_light_theme ? 22 : 240, g_light_theme ? 32 : 245, 1.0f);
         }
         float context_reserved = context_chips_visible() ? 34.0f : 0.0f;
-        float sent_reserved = (_wcsicmp(g_kind, L"question") == 0 && g_sent_chip_count > 0) ? 34.0f : 0.0f;
+        float sent_reserved = sent_chips_visible_for_current_card() ? 34.0f : 0.0f;
         d2d_text(g_body, g_fmt_body, d2d_rectf(18.0f, (float)body_top, (float)rect.right - 18.0f, (float)rect.bottom - 124.0f - context_reserved - sent_reserved), g_light_theme ? 22 : 230, g_light_theme ? 43 : 240, g_light_theme ? 56 : 245, 1.0f);
         draw_sent_chips_d2d(rect, context_reserved);
 
@@ -2675,6 +2923,25 @@ static bool paint_with_d2d(HWND hwnd) {
             if (g_session_banner[0] && (GetTickCount64() - g_session_banner_tick) < 3000) {
                 d2d_fill_round(tx_left, tx_top, tx_right, tx_bottom, 8.0f, 10, 30, 50, 0.85f);
                 d2d_text(g_session_banner, g_fmt_label, d2d_rectf(tx_left + 10.0f, tx_top + 4.0f, tx_right - 10.0f, tx_bottom - 4.0f), 100, 230, 255, 1.0f);
+            } else if (g_audio_auto_stop_remaining_secs >= 0) {
+                wchar_t countdown[160];
+                if (g_audio_auto_stop_remaining_secs > 0) {
+                    swprintf_s(
+                        countdown,
+                        160,
+                        L"No speech detected. Listen stops in %d s to limit billing.",
+                        g_audio_auto_stop_remaining_secs
+                    );
+                } else {
+                    swprintf_s(
+                        countdown,
+                        160,
+                        L"Listen auto-stopped after %d s without speech.",
+                        g_audio_auto_stop_idle_secs
+                    );
+                }
+                d2d_fill_round(tx_left, tx_top, tx_right, tx_bottom, 8.0f, 48, 32, 6, 0.88f);
+                d2d_text(countdown, g_fmt_body, d2d_rectf(tx_left + 10.0f, tx_top + 8.0f, tx_right - 10.0f, tx_bottom - 6.0f), 255, 188, 84, 1.0f);
             } else if (g_transcript_final[0] || g_transcript_partial[0]) {
                 d2d_fill_round(tx_left, tx_top, tx_right, tx_bottom, 8.0f, 5, 10, 18, 0.82f);
                 /* Final text (normal, white) */
@@ -2719,7 +2986,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             g_auto_send_timer_armed = false;
             if (g_recording && has_auto_send_context()) {
                 emit_lifecycle_event("autosend_answer_sent", "ok", "trigger=caption_settle platform=windows");
-                send_current_question();
+                send_current_question_now();
             } else {
                 emit_lifecycle_event(
                     "autosend_answer_skipped",
@@ -2727,6 +2994,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                     "trigger=caption_settle platform=windows"
                 );
             }
+            return 0;
+        }
+        if (wparam == ID_MANUAL_SEND_TIMER) {
+            KillTimer(hwnd, ID_MANUAL_SEND_TIMER);
+            ULONGLONG elapsed = g_manual_send_started_ms == 0
+                ? MANUAL_CAPTION_SETTLE_MAX_MS
+                : GetTickCount64() - g_manual_send_started_ms;
+            if (g_recording && !has_transcript_context() && elapsed < MANUAL_CAPTION_SETTLE_MAX_MS) {
+                UINT remaining = (UINT)(MANUAL_CAPTION_SETTLE_MAX_MS - elapsed);
+                arm_manual_send_timer(remaining < 250 ? remaining : 250, "awaiting_first_caption");
+                return 0;
+            }
+            g_manual_send_timer_armed = false;
+            g_manual_send_started_ms = 0;
+            send_current_question_now();
             return 0;
         }
         break;
@@ -2760,6 +3042,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 int selected = (int)SendMessageW(g_auto_send_combo, CB_GETCURSEL, 0, 0);
                 g_auto_send_mode = selected < 0 ? 0 : selected;
                 update_auto_send_control();
+            }
+            return 0;
+        }
+        if (id == ID_ANSWER_DETAIL_BUTTON) {
+            if (HIWORD(wparam) == CBN_SELCHANGE) {
+                int selected = (int)SendMessageW(g_answer_detail_combo, CB_GETCURSEL, 0, 0);
+                g_answer_detail_mode = selected < 0 ? 0 : selected;
             }
             return 0;
         }
@@ -2914,6 +3203,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             SetCapture(hwnd);
             return 0;
         }
+        {
+            POINT local_point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            if (open_sent_source_chip_at_client_point(local_point)) return 0;
+        }
         if (GetFocus() == g_ask_edit) {
             POINT point;
             GetCursorPos(&point);
@@ -3040,6 +3333,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         if (g_collapsed) return HTCLIENT;
         POINT point = { GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
         if (point_hits_overlay_control(point)) return HTCLIENT;
+        if (sent_source_chip_index_at_screen_point(point) >= 0) return HTCLIENT;
         if (!g_interactive_mode && point_hits_clickthrough_move_handle(point)) return HTCAPTION;
         LRESULT resize_hit = hit_test_expanded_resize(point);
         if (resize_hit != HTNOWHERE) return resize_hit;
@@ -3048,6 +3342,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
     }
     case WM_SETCURSOR: {
         if ((HWND)wparam == hwnd) {
+            POINT point;
+            if (GetCursorPos(&point) && sent_source_chip_index_at_screen_point(point) >= 0) {
+                SetCursor(LoadCursorW(NULL, IDC_HAND));
+                return TRUE;
+            }
             switch (LOWORD(lparam)) {
             case HTLEFT:
             case HTRIGHT:
@@ -3242,7 +3541,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
 
         int context_reserved = context_chips_visible() ? 34 : 0;
-        int sent_reserved = (_wcsicmp(g_kind, L"question") == 0 && g_sent_chip_count > 0) ? 34 : 0;
+        int sent_reserved = sent_chips_visible_for_current_card() ? 34 : 0;
         RECT body_rect = {18, body_top, rect.right - 18, rect.bottom - 124 - context_reserved - sent_reserved};
         SelectObject(hdc, body_font);
         SetTextColor(hdc, g_light_theme ? RGB(22, 43, 56) : RGB(230, 240, 245));

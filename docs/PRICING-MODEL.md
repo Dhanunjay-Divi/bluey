@@ -54,8 +54,8 @@
 > OpenAI `gpt-5.4-mini`, OpenAI `gpt-5.5`, Anthropic
 > `claude-sonnet-4-6`, Anthropic `claude-opus-4-8`, Anthropic
 > `claude-haiku-4-5-20251001`, Gemini `gemini-3.1-pro-preview`,
-> Gemini `gemini-3-flash-preview`, Gemini `gemini-3.1-flash-lite`,
-> Z.AI `glm-5.2`, DeepSeek `deepseek-v4-pro`, and DeepSeek
+> Gemini `gemini-3.5-flash`, Gemini `gemini-3.1-flash-lite`,
+> Z.AI `glm-5.2`, Z.AI `glm-4.7-flashx`, DeepSeek `deepseek-v4-pro`, and DeepSeek
 > `deepseek-v4-flash`.
 >
 > **Cache-price caveat:** DeepSeek and Z.AI publish lower cached-input prices.
@@ -84,7 +84,9 @@
 
 | Provider/model | Upstream input | Upstream output | Customer markup | Bluey note |
 |---|---:|---:|---:|---|
-| Z.AI `glm-5.2` | $1.40/1M cache-miss tokens | $4.40/1M tokens | 150% | Instant/balanced/deep candidate in default `provider_mix`; first balanced/deep text candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `ZAI_API_KEY(S)` is configured |
+| Gemini `gemini-3.5-flash` | $1.50/1M tokens | $9.00/1M tokens | 150% | Stable fast-capable candidate for instant, balanced, vision, and deep fallback |
+| Z.AI `glm-4.7-flashx` | $0.07/1M tokens | $0.40/1M tokens | 200% | Fast instant/balanced candidate with thinking disabled |
+| Z.AI `glm-5.2` | $1.40/1M cache-miss tokens | $4.40/1M tokens | 150% | Flagship deep candidate and balanced fallback when `ZAI_API_KEY(S)` is configured |
 | DeepSeek `deepseek-v4-pro` | $0.435/1M cache-miss tokens | $0.87/1M tokens | 150% | Deep candidate in default `provider_mix`; second deep candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `DEEPSEEK_API_KEY(S)` is configured |
 | DeepSeek `deepseek-v4-flash` | $0.14/1M cache-miss tokens | $0.28/1M tokens | 200% | Instant/balanced candidate in default `provider_mix`; first instant candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `DEEPSEEK_API_KEY(S)` is configured |
 

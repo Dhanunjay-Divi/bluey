@@ -470,3 +470,41 @@ CREATE INDEX IF NOT EXISTS idx_account_devices_account
   ON account_devices(account_id, revoked_at);
 CREATE INDEX IF NOT EXISTS idx_account_devices_account_device
   ON account_devices(account_id, device_id);
+
+CREATE TABLE IF NOT EXISTS legal_acceptances (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  purpose TEXT NOT NULL,
+  terms_version TEXT NOT NULL,
+  privacy_version TEXT NOT NULL,
+  terms_text_hash TEXT NOT NULL DEFAULT '',
+  privacy_text_hash TEXT NOT NULL DEFAULT '',
+  email_hash TEXT,
+  ip_hash TEXT,
+  user_agent_hash TEXT,
+  device_hash TEXT,
+  ip_user_agent_hash TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  retention_expires_at TIMESTAMPTZ,
+  accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(account_id, purpose, terms_version, privacy_version)
+);
+ALTER TABLE legal_acceptances
+  ADD COLUMN IF NOT EXISTS terms_text_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE legal_acceptances
+  ADD COLUMN IF NOT EXISTS privacy_text_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE legal_acceptances
+  ADD COLUMN IF NOT EXISTS email_hash TEXT;
+ALTER TABLE legal_acceptances
+  ADD COLUMN IF NOT EXISTS ip_user_agent_hash TEXT;
+ALTER TABLE legal_acceptances
+  ADD COLUMN IF NOT EXISTS retention_expires_at TIMESTAMPTZ;
+ALTER TABLE legal_acceptances
+  ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ NOT NULL DEFAULT now();
+CREATE INDEX IF NOT EXISTS idx_legal_acceptances_account_created
+  ON legal_acceptances(account_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_legal_acceptances_purpose_created
+  ON legal_acceptances(purpose, created_at);
+CREATE INDEX IF NOT EXISTS idx_legal_acceptances_email_created
+  ON legal_acceptances(email_hash, created_at);

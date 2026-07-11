@@ -60,17 +60,18 @@ HTTP 429/529 cooldowns still fall through to the next approved route.
 
 | Bluey lane | Default top tier | Primary use |
 | --- | --- | --- |
-| `instant` | OpenAI `gpt-5.4-mini`, DeepSeek `deepseek-v4-flash`, Gemini `gemini-3.1-flash-lite`, Anthropic `claude-haiku-4-5-20251001`, Z.AI `glm-5.2` | Easy questions, quick answers, optional cheap draft |
-| `balanced` | Anthropic `claude-sonnet-4-6`, DeepSeek `deepseek-v4-flash`, Z.AI `glm-5.2`, Gemini `gemini-3.1-pro-preview`, OpenAI `gpt-5.5` | Default technical/general answer |
+| `instant` | OpenAI `gpt-5.4-mini`, DeepSeek `deepseek-v4-flash`, Gemini `gemini-3.1-flash-lite`, Anthropic `claude-haiku-4-5-20251001`, Z.AI `glm-4.7-flashx` | Easy questions and quick answers; each provider has one rotating low-latency first-attempt slot |
+| `balanced` | Anthropic `claude-sonnet-4-6`, DeepSeek `deepseek-v4-flash`, Gemini `gemini-3.5-flash`, OpenAI `gpt-5.4-mini`, Z.AI `glm-4.7-flashx` | Default technical/general answer with one rotating first-attempt slot per provider |
 | `deep` | Anthropic `claude-opus-4-8`, Z.AI `glm-5.2`, DeepSeek `deepseek-v4-pro`, Gemini `gemini-3.1-pro-preview`, OpenAI `gpt-5.5` | Hard coding, system design, long reasoning with a larger thinking/output budget |
-| `vision` | OpenAI `gpt-5.5`, Gemini `gemini-3.1-pro-preview`, Gemini `gemini-3-flash-preview` | Analyse Screen, screenshots, image context |
+| `vision` | Gemini `gemini-3.5-flash`, OpenAI `gpt-5.5` | Analyse Screen, screenshots, and image context with slower Gemini Pro as fallback |
 
 Optional server-managed text candidates are also wired when their key pools are
 configured:
 
 | Provider | Model | Lanes | Notes |
 | --- | --- | --- | --- |
-| Z.AI | `glm-5.2` | `instant`, `balanced`, `deep` | OpenAI-compatible endpoint; deep lane sends thinking enabled |
+| Z.AI | `glm-4.7-flashx` | `instant`, `balanced` | OpenAI-compatible high-speed route with thinking disabled |
+| Z.AI | `glm-5.2` | `deep` and balanced fallback | OpenAI-compatible flagship route; deep lane sends thinking enabled |
 | DeepSeek | `deepseek-v4-pro` | `deep` | OpenAI-compatible endpoint; deep lane sends thinking enabled |
 | DeepSeek | `deepseek-v4-flash` | `instant`, `balanced`, `deep` fallback | OpenAI-compatible endpoint; instant/balanced send thinking disabled |
 
@@ -206,10 +207,10 @@ harder work.
 
 | Lane | Rotated top tier | Fixed fallback tail |
 | --- | --- | --- |
-| `instant` | OpenAI `gpt-5.4-mini` / DeepSeek `deepseek-v4-flash` / Gemini `gemini-3.1-flash-lite` / Anthropic `claude-haiku-4-5-20251001` / Z.AI `glm-5.2` | Gemini `gemini-3-flash-preview` -> Anthropic `claude-sonnet-4-6` |
-| `balanced` | Anthropic `claude-sonnet-4-6` / DeepSeek `deepseek-v4-flash` / Z.AI `glm-5.2` / Gemini `gemini-3.1-pro-preview` / OpenAI `gpt-5.5` | Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
-| `deep` | Anthropic `claude-opus-4-8` / Z.AI `glm-5.2` / DeepSeek `deepseek-v4-pro` / Gemini `gemini-3.1-pro-preview` / OpenAI `gpt-5.5` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3-flash-preview` |
-| `vision` | OpenAI `gpt-5.5` / Gemini `gemini-3.1-pro-preview` / Gemini `gemini-3-flash-preview` | OpenAI `gpt-5.4-mini` |
+| `instant` | OpenAI `gpt-5.4-mini` / DeepSeek `deepseek-v4-flash` / Gemini `gemini-3.1-flash-lite` / Anthropic `claude-haiku-4-5-20251001` / Z.AI `glm-4.7-flashx` | Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
+| `balanced` | Anthropic `claude-sonnet-4-6` / DeepSeek `deepseek-v4-flash` / Gemini `gemini-3.5-flash` / OpenAI `gpt-5.4-mini` / Z.AI `glm-4.7-flashx` | Anthropic `claude-haiku-4-5-20251001` -> OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Z.AI `glm-5.2` |
+| `deep` | Anthropic `claude-opus-4-8` / Z.AI `glm-5.2` / DeepSeek `deepseek-v4-pro` / Gemini `gemini-3.1-pro-preview` / OpenAI `gpt-5.5` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` |
+| `vision` | Gemini `gemini-3.5-flash` / OpenAI `gpt-5.5` | Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.4-mini` |
 
 Optional `quality_first` candidate order:
 
@@ -218,10 +219,10 @@ static first-provider order.
 
 | Lane | Candidate order |
 | --- | --- |
-| `instant` | OpenAI `gpt-5.4-mini` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3-flash-preview` -> Anthropic `claude-sonnet-4-6` |
-| `balanced` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Z.AI `glm-5.2` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
-| `deep` | Anthropic `claude-opus-4-8` -> Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3-flash-preview` |
-| `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
+| `instant` | OpenAI `gpt-5.4-mini` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
+| `balanced` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Z.AI `glm-5.2` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` |
+| `deep` | Anthropic `claude-opus-4-8` -> Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` |
+| `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` |
 
 Optional `cost_optimized` candidate order:
 
@@ -232,14 +233,29 @@ image support.
 
 | Lane | Candidate order |
 | --- | --- |
-| `instant` | DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3-flash-preview` -> Anthropic `claude-sonnet-4-6` |
-| `balanced` | Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-flash` -> Anthropic `claude-sonnet-4-6` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
-| `deep` | Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Anthropic `claude-opus-4-8` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3-flash-preview` |
-| `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
+| `instant` | DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> Z.AI `glm-4.7-flashx` -> OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
+| `balanced` | Z.AI `glm-4.7-flashx` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-4-5-20251001` -> Anthropic `claude-sonnet-4-6` -> Z.AI `glm-5.2` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` |
+| `deep` | Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Anthropic `claude-opus-4-8` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` |
+| `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` |
 
 Every managed LLM candidate above has a matching entry in
 `server/src/pricing/mod.rs`; the dispatcher unit tests assert this so an
 unpriced model cannot silently become a paid route.
+
+### First-useful-text budgets
+
+Bluey optimizes first useful text, not the impossible promise that every full
+answer finishes under one second. Default provider first-event deadlines are
+1.2 seconds for `instant`, 2.5 seconds for `balanced`, 4 seconds for `vision`,
+and 12 seconds for thinking/deep work. A stalled candidate falls through to the
+next healthy route. The server logs memory lookup, AnswerPlan, web search,
+prompt size, pre-dispatch time, provider first event, and total request-to-first
+event under the same request/session references.
+
+The daemon sends a compact managed base contract because the server owns the
+task-specific AnswerPlan. Direct/BYOK routes retain the complete standalone
+prompt contract. This avoids paying twice in prompt tokens and first-token
+latency for the same coding, design, or interview instructions.
 
 Code references:
 

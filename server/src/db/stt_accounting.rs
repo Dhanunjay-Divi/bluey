@@ -13,6 +13,8 @@ use crate::{
     pricing,
 };
 
+const STALE_RELAY_GRACE_MS: i64 = 60_000;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReserveSessionInput<'a> {
     pub account_id: &'a str,
@@ -91,6 +93,7 @@ pub(crate) fn reserve_session(
     pool: &DbPool,
     input: ReserveSessionInput<'_>,
 ) -> Result<ReservedSttSession, SttAccountingError> {
+    release_stale_sessions(pool, input.account_id, input.created_at_ms)?;
     crate::db::run_blocking_db(|| {
         let pricing = pricing::lookup(input.provider, input.model)
             .ok_or(SttAccountingError::UnsupportedModel)?;
@@ -317,6 +320,89 @@ pub(crate) fn reserve_session(
             projected_bluey_cents,
         })
     })
+}
+
+/// Release reservations left behind when the client never claimed a relay or
+/// the server process died before an active relay could settle. The grace
+/// window keeps a slow but valid connection from being reclaimed underneath
+/// the client. With no trustworthy audio duration after a crash, stale
+/// sessions are settled at zero rather than charging guessed usage.
+pub(crate) fn release_stale_sessions(
+    pool: &DbPool,
+    account_id: &str,
+    now_ms: i64,
+) -> Result<usize, SttAccountingError> {
+    let stale_sessions: Vec<(String, String)> = crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get().map_err(SttAccountingError::Db)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT session_token, model
+                       FROM stt_sessions
+                      WHERE account_id = ?1
+                        AND ended_at_ms IS NULL
+                        AND (
+                          (started_at_ms IS NULL AND expires_at_ms <= ?2)
+                          OR
+                          (started_at_ms IS NOT NULL
+                           AND started_at_ms + (max_seconds * 1000) + ?3 <= ?2)
+                        )",
+                )
+                .map_err(|err| SttAccountingError::Db(err.into()))?;
+            let rows = stmt
+                .query_map(params![account_id, now_ms, STALE_RELAY_GRACE_MS], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|err| SttAccountingError::Db(err.into()))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|err| SttAccountingError::Db(err.into()))
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg().map_err(SttAccountingError::Db)?;
+            conn.query(
+                "SELECT session_token, model
+                   FROM stt_sessions
+                  WHERE account_id = $1
+                    AND ended_at_ms IS NULL
+                    AND (
+                      (started_at_ms IS NULL AND expires_at_ms <= $2)
+                      OR
+                      (started_at_ms IS NOT NULL
+                       AND started_at_ms + (max_seconds * 1000) + $3 <= $2)
+                    )",
+                &[&account_id, &now_ms, &STALE_RELAY_GRACE_MS],
+            )
+            .map_err(|err| SttAccountingError::Db(err.into()))?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get(0)
+                        .map_err(|err| SttAccountingError::Db(err.into()))?,
+                    row.try_get(1)
+                        .map_err(|err| SttAccountingError::Db(err.into()))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, SttAccountingError>>()
+        }
+    })?;
+
+    let mut released = 0;
+    for (session_token, model) in stale_sessions {
+        match settle_session(
+            pool,
+            &session_token,
+            account_id,
+            &model,
+            0,
+            "stale_reservation_released",
+            now_ms,
+        ) {
+            Ok(_) => released += 1,
+            Err(SttAccountingError::AlreadySettled) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(released)
 }
 
 pub(crate) fn claim_relay_session(
@@ -1002,6 +1088,59 @@ mod tests {
                 ("stt_reserve".to_string(), -28, 528, 500),
                 ("stt_settle".to_string(), 28, 500, 528),
             ]
+        );
+    }
+
+    #[test]
+    fn stale_unclaimed_session_releases_reserved_credit() {
+        let pool = temp_pool();
+        let account_id = create_paid_account(&pool, "stale-unclaimed@example.com", 100);
+        let reserved = reserve_session(&pool, input(&account_id, "stt-stale", 60)).unwrap();
+        assert!(reserved.reserved_cents > 0);
+
+        assert_eq!(
+            release_stale_sessions(&pool, &account_id, 61_001).unwrap(),
+            1
+        );
+        assert_eq!(
+            release_stale_sessions(&pool, &account_id, 61_001).unwrap(),
+            0
+        );
+
+        let conn = pool.get().unwrap();
+        let (balance_cents, reserved_cents): (i64, i64) = conn
+            .query_row(
+                "SELECT balance_cents, reserved_cents FROM accounts WHERE id = ?1",
+                params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(balance_cents, 100);
+        assert_eq!(reserved_cents, 0);
+        let reason: String = conn
+            .query_row(
+                "SELECT relay_close_reason FROM stt_sessions WHERE session_token = 'stt-stale'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "stale_reservation_released");
+    }
+
+    #[test]
+    fn claimed_session_is_not_released_until_runtime_and_grace_expire() {
+        let pool = temp_pool();
+        let account_id = create_paid_account(&pool, "stale-active@example.com", 100);
+        reserve_session(&pool, input(&account_id, "stt-active", 60)).unwrap();
+        claim_relay_session(&pool, &account_id, "stt-active", 2_000).unwrap();
+
+        assert_eq!(
+            release_stale_sessions(&pool, &account_id, 121_999).unwrap(),
+            0
+        );
+        assert_eq!(
+            release_stale_sessions(&pool, &account_id, 122_000).unwrap(),
+            1
         );
     }
 

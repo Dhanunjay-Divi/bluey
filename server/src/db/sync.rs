@@ -1720,7 +1720,16 @@ mod tests {
             metadata: serde_json::json!({}),
             deleted_at_ms: None,
         };
-        upsert_batch(&pool, account_id, &[session.clone()], &[], &[], &[], &[]).unwrap();
+        upsert_batch(
+            &pool,
+            account_id,
+            std::slice::from_ref(&session),
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
 
         let sessions = list_sessions(&pool, account_id, 10).unwrap();
         assert!(
@@ -1810,7 +1819,7 @@ mod tests {
         upsert_batch(
             &pool,
             account_id,
-            &[session.clone()],
+            std::slice::from_ref(&session),
             &[],
             std::slice::from_ref(&response),
             &[],

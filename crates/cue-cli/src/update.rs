@@ -128,6 +128,56 @@ pub async fn maybe_update_before_on(title: Option<&str>) -> Result<()> {
     }
 }
 
+pub async fn maybe_update_before_login() -> Result<()> {
+    if env_flag("BLUEY_SKIP_UPDATE") {
+        return Ok(());
+    }
+    if running_from_dev_target() && !env_flag("BLUEY_UPDATE_FORCE") {
+        return Ok(());
+    }
+
+    match check_for_update().await {
+        Ok(Some(plan)) => {
+            if update_check_only_requested() {
+                print_update_available(&plan);
+                print_update_posture(&plan);
+                return Ok(());
+            }
+            if let Err(error) = ensure_update_installable(&plan) {
+                if env_flag("BLUEY_UPDATE_STRICT") {
+                    return Err(error);
+                }
+                eprintln!("warning: Bluey auto-update disabled: {error:#}");
+                return Ok(());
+            }
+            if !confirm_or_auto_update(&plan, false) {
+                println!("Bluey update skipped for this sign-in.");
+                return Ok(());
+            }
+            if let Err(error) = install_update(&plan).await {
+                if env_flag("BLUEY_UPDATE_STRICT") {
+                    return Err(error);
+                }
+                eprintln!("warning: Bluey update failed, continuing current version: {error:#}");
+                return Ok(());
+            }
+            relaunch_bluey_login()?;
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(error) => {
+            if env_flag("BLUEY_UPDATE_STRICT") {
+                Err(error)
+            } else {
+                if env_flag("BLUEY_UPDATE_VERBOSE") {
+                    eprintln!("warning: Bluey update check skipped: {error:#}");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 pub async fn manual_update(check_only: bool, yes: bool, force: bool) -> Result<()> {
     if running_from_dev_target() && !force && !env_flag("BLUEY_UPDATE_FORCE") {
         println!(
@@ -522,6 +572,25 @@ fn relaunch_bluey_on(title: Option<&str>) -> Result<()> {
     if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
         command.arg("--title").arg(title);
     }
+    command.env("BLUEY_SKIP_UPDATE", "1");
+
+    #[cfg(unix)]
+    {
+        Err(command.exec()).context("failed to relaunch updated bluey")
+    }
+    #[cfg(not(unix))]
+    {
+        command
+            .spawn()
+            .context("failed to relaunch updated bluey")?;
+        std::process::exit(0);
+    }
+}
+
+fn relaunch_bluey_login() -> Result<()> {
+    println!("Bluey updated. Reopening sign-in...");
+    let mut command = Command::new(relaunch_bluey_bin());
+    command.arg("login");
     command.env("BLUEY_SKIP_UPDATE", "1");
 
     #[cfg(unix)]

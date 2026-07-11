@@ -2,7 +2,7 @@
 //!
 //! Source of truth lives here AND in `docs/PRICING-MODEL.md`. Any
 //! change to either must be reflected in both. Last reconciled
-//! 2026-06-20 against PRICING-MODEL.md and MODEL-ROUTING.md.
+//! 2026-07-10 against PRICING-MODEL.md and MODEL-ROUTING.md.
 //!
 //! ## Unit semantics
 //!
@@ -80,12 +80,21 @@ pub const PRICING: &[ModelPricing] = &[
         markup_percent: 150,
     },
     ModelPricing {
-        // Gemini 3 Flash preview: $0.50/1M in, $3/1M out.
+        // Retained for historical usage rows created before the stable Flash
+        // route replaced this preview model.
         provider: "gemini",
         model: "gemini-3-flash-preview",
         upstream_in_microcents_per_1m: 500_000,
         upstream_out_microcents_per_1m: 3_000_000,
         markup_percent: 200,
+    },
+    ModelPricing {
+        // Gemini 3.5 Flash stable: $1.50/1M in, $9/1M out.
+        provider: "gemini",
+        model: "gemini-3.5-flash",
+        upstream_in_microcents_per_1m: 1_500_000,
+        upstream_out_microcents_per_1m: 9_000_000,
+        markup_percent: 150,
     },
     ModelPricing {
         // Gemini 3.1 Flash-Lite: $0.25/1M in, $1.50/1M out.
@@ -104,6 +113,14 @@ pub const PRICING: &[ModelPricing] = &[
         upstream_in_microcents_per_1m: 1_400_000,
         upstream_out_microcents_per_1m: 4_400_000,
         markup_percent: 150,
+    },
+    ModelPricing {
+        // Z.AI GLM-4.7-FlashX: $0.07/1M input, $0.40/1M output.
+        provider: "zai",
+        model: "glm-4.7-flashx",
+        upstream_in_microcents_per_1m: 70_000,
+        upstream_out_microcents_per_1m: 400_000,
+        markup_percent: 200,
     },
     ModelPricing {
         // DeepSeek V4 Pro: $0.435/1M cache-miss input, $0.87/1M output.
@@ -244,7 +261,12 @@ mod tests {
                 .markup_percent,
             200
         );
+        assert_eq!(
+            lookup("gemini", "gemini-3.5-flash").unwrap().markup_percent,
+            150
+        );
         assert_eq!(lookup("zai", "glm-5.2").unwrap().markup_percent, 150);
+        assert_eq!(lookup("zai", "glm-4.7-flashx").unwrap().markup_percent, 200);
         assert_eq!(
             lookup("deepseek", "deepseek-v4-pro")
                 .unwrap()

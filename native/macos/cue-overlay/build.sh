@@ -13,6 +13,7 @@ fi
 swift build "${swift_args[@]}"
 mkdir -p .build
 BIN="$(swift build "${swift_args[@]}" --show-bin-path)/cue-overlay"
+cp "$BIN" .build/hostovb
 cp "$BIN" .build/host-overlay
 cp "$BIN" .build/bluey-overlay-macos
 cp "$BIN" .build/cue-overlay-macos
@@ -20,8 +21,9 @@ cp "$BIN" .build/cue-overlay-macos
 APP_DIR=".build/BlueyOverlay.app"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
+cp "$BIN" "$APP_DIR/Contents/MacOS/hostovb"
 cp "$BIN" "$APP_DIR/Contents/MacOS/host-overlay"
-chmod +x "$APP_DIR/Contents/MacOS/host-overlay"
+chmod +x "$APP_DIR/Contents/MacOS/hostovb" "$APP_DIR/Contents/MacOS/host-overlay"
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -31,7 +33,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleExecutable</key>
-  <string>host-overlay</string>
+  <string>hostovb</string>
   <key>CFBundleIdentifier</key>
   <string>sh.bluey.overlay</string>
   <key>CFBundleName</key>
@@ -60,6 +62,7 @@ fi
 for profile in "${target_profiles[@]}"; do
   target_dir="$ROOT/target/$profile"
   if [[ -d "$target_dir" ]]; then
+    cp "$BIN" "$target_dir/hostovb"
     cp "$BIN" "$target_dir/host-overlay"
     cp "$BIN" "$target_dir/bluey-overlay-macos"
     cp "$BIN" "$target_dir/cue-overlay-macos"
@@ -68,4 +71,4 @@ for profile in "${target_profiles[@]}"; do
   fi
 done
 
-echo ".build/host-overlay"
+echo ".build/hostovb"
