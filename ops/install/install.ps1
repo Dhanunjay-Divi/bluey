@@ -181,27 +181,130 @@ function Ensure-ProcessIdentityAliases {
     Copy-FirstBinaryAlias -Dir $Dir -AliasName "audio-driver.exe" -Candidates @("bluey-audio.exe", "cue-audio.exe")
 }
 
+function Test-BlueyPythonCommand {
+    param(
+        [System.Management.Automation.CommandInfo]$Command,
+        [string[]]$Args = @()
+    )
+    if (-not $Command) {
+        return $false
+    }
+    try {
+        $output = & $Command.Source @Args --version 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
+        return (($output -join "`n") -match 'Python\s+3\.')
+    } catch {
+        return $false
+    }
+}
+
+function Get-BlueyPythonCommand {
+    $python3 = Get-Command python3 -ErrorAction SilentlyContinue
+    if (Test-BlueyPythonCommand -Command $python3) {
+        return @{ Source = $python3.Source; Args = @() }
+    }
+
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (Test-BlueyPythonCommand -Command $python) {
+        return @{ Source = $python.Source; Args = @() }
+    }
+
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if (Test-BlueyPythonCommand -Command $py -Args @("-3")) {
+        return @{ Source = $py.Source; Args = @("-3") }
+    }
+
+    return $null
+}
+
+function Get-BlueyUvUrl {
+    if (![string]::IsNullOrWhiteSpace($env:BLUEY_UV_URL)) {
+        return $env:BLUEY_UV_URL
+    }
+
+    $arch = if (![string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITEW6432)) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+    switch -Regex ($arch) {
+        '^(ARM64|AARCH64)$' {
+            return "https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-pc-windows-msvc.zip"
+        }
+        default {
+            return "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
+        }
+    }
+}
+
+function Install-BlueyLocalUv {
+    param([string]$Root)
+
+    $uvDir = Join-Path $Root "tools\uv"
+    $uvExe = Join-Path $uvDir "uv.exe"
+    if (Test-Path $uvExe) {
+        return $uvExe
+    }
+
+    $uvUrl = Get-BlueyUvUrl
+    $tempRoot = Join-Path $env:TEMP ("bluey-uv-" + [guid]::NewGuid().ToString("N"))
+    $zipPath = Join-Path $tempRoot "uv.zip"
+    $extractPath = Join-Path $tempRoot "extract"
+
+    try {
+        New-Item -ItemType Directory -Force -Path $uvDir, $tempRoot, $extractPath | Out-Null
+        Write-Step "Installing Bluey local Python runtime helper..."
+        Invoke-WebRequest -Uri $uvUrl -OutFile $zipPath -UseBasicParsing
+        Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+        $downloadedUv = Get-ChildItem -Path $extractPath -Filter "uv.exe" -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $downloadedUv) {
+            Write-Warn "Could not find uv.exe in the downloaded Bluey Python helper"
+            return $null
+        }
+        Copy-Item -Force $downloadedUv.FullName $uvExe
+        Write-Ok "Installed Bluey local Python runtime helper"
+        return $uvExe
+    } catch {
+        Write-Warn "Could not install Bluey local Python runtime helper: $($_.Exception.Message)"
+        return $null
+    } finally {
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-WithBlueyUvEnv {
+    param(
+        [string]$Root,
+        [scriptblock]$Body
+    )
+
+    $oldCache = $env:UV_CACHE_DIR
+    $oldPythonInstall = $env:UV_PYTHON_INSTALL_DIR
+    $oldDownloads = $env:UV_PYTHON_DOWNLOADS
+    $oldLinkMode = $env:UV_LINK_MODE
+    try {
+        $env:UV_CACHE_DIR = Join-Path $Root "tools\uv-cache"
+        $env:UV_PYTHON_INSTALL_DIR = Join-Path $Root "tools\python"
+        $env:UV_PYTHON_DOWNLOADS = "automatic"
+        $env:UV_LINK_MODE = "copy"
+        New-Item -ItemType Directory -Force -Path $env:UV_CACHE_DIR, $env:UV_PYTHON_INSTALL_DIR | Out-Null
+        & $Body
+    } finally {
+        if ($null -eq $oldCache) { Remove-Item Env:\UV_CACHE_DIR -ErrorAction SilentlyContinue } else { $env:UV_CACHE_DIR = $oldCache }
+        if ($null -eq $oldPythonInstall) { Remove-Item Env:\UV_PYTHON_INSTALL_DIR -ErrorAction SilentlyContinue } else { $env:UV_PYTHON_INSTALL_DIR = $oldPythonInstall }
+        if ($null -eq $oldDownloads) { Remove-Item Env:\UV_PYTHON_DOWNLOADS -ErrorAction SilentlyContinue } else { $env:UV_PYTHON_DOWNLOADS = $oldDownloads }
+        if ($null -eq $oldLinkMode) { Remove-Item Env:\UV_LINK_MODE -ErrorAction SilentlyContinue } else { $env:UV_LINK_MODE = $oldLinkMode }
+    }
+}
+
 function Install-BlueyLocalDocTools {
     param([string]$Root)
 
     if ($env:BLUEY_SKIP_LOCAL_TOOLS -eq "1") {
         Write-Warn "Skipping Bluey document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
-        return
-    }
-
-    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
-    $pythonArgs = @()
-    if (-not $pythonCommand) {
-        $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
-    }
-    if (-not $pythonCommand) {
-        $pythonCommand = Get-Command py -ErrorAction SilentlyContinue
-        if ($pythonCommand) {
-            $pythonArgs = @("-3")
-        }
-    }
-    if (-not $pythonCommand) {
-        Write-Warn "Python was not found; document conversion will use built-in fallbacks only"
         return
     }
 
@@ -212,17 +315,48 @@ function Install-BlueyLocalDocTools {
     New-Item -ItemType Directory -Force -Path $toolsDir, (Split-Path -Parent $wrapper) | Out-Null
 
     try {
-        & $pythonCommand.Source @pythonArgs -m venv $venvDir | Out-Null
-        if ($LASTEXITCODE -ne 0) {
+        $pythonSpec = Get-BlueyPythonCommand
+        $uvExe = $null
+        if ($pythonSpec) {
+            & $pythonSpec.Source @($pythonSpec.Args) -m venv $venvDir | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn "Could not create Bluey's local Python environment with installed Python; trying Bluey's local bootstrap"
+                $uvExe = Install-BlueyLocalUv -Root $Root
+            }
+        } else {
+            Write-Warn "A real Python 3 install was not found; creating Bluey's local document tools runtime"
+            $uvExe = Install-BlueyLocalUv -Root $Root
+        }
+
+        if ($uvExe) {
+            Invoke-WithBlueyUvEnv -Root $Root -Body {
+                & $uvExe venv --python 3.12 $venvDir | Out-Null
+            }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
+                return
+            }
+        } elseif (-not (Test-Path (Join-Path $venvDir "Scripts\python.exe"))) {
             Write-Warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
             return
         }
 
         $venvPython = Join-Path $venvDir "Scripts\python.exe"
-        & $venvPython -m pip install --disable-pip-version-check --upgrade pip | Out-Null
-        & $venvPython -m pip install --disable-pip-version-check "markitdown[all]" | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            & $venvPython -m pip install --disable-pip-version-check markitdown | Out-Null
+        if ($uvExe) {
+            Invoke-WithBlueyUvEnv -Root $Root -Body {
+                & $uvExe pip install --python $venvPython "markitdown[all]" | Out-Null
+            }
+            if ($LASTEXITCODE -ne 0) {
+                Invoke-WithBlueyUvEnv -Root $Root -Body {
+                    & $uvExe pip install --python $venvPython markitdown | Out-Null
+                }
+            }
+        } else {
+            & $venvPython -m pip install --disable-pip-version-check --upgrade pip | Out-Null
+            & $venvPython -m pip install --disable-pip-version-check "markitdown[all]" | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                & $venvPython -m pip install --disable-pip-version-check markitdown | Out-Null
+            }
         }
         if ($LASTEXITCODE -ne 0) {
             Write-Warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"

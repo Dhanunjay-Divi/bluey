@@ -184,6 +184,75 @@ ensure_process_identity_aliases() {
     copy_first_binary_alias "$bin_dir" audio-driver bluey-audio-macos cue-audio-macos
 }
 
+bluey_uv_url() {
+    if [ -n "${BLUEY_UV_URL:-}" ]; then
+        printf "%s\n" "$BLUEY_UV_URL"
+        return 0
+    fi
+
+    case "$(uname -m)" in
+        arm64|aarch64)
+            printf "%s\n" "https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-apple-darwin.tar.gz"
+            ;;
+        x86_64|amd64)
+            printf "%s\n" "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-apple-darwin.tar.gz"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_bluey_uv() {
+    local root="$1"
+    local uv_dir="$root/tools/uv"
+    local uv_bin="$uv_dir/uv"
+
+    if [ -x "$uv_bin" ]; then
+        printf "%s\n" "$uv_bin"
+        return 0
+    fi
+
+    local url tmp archive extract found
+    url="$(bluey_uv_url)" || return 1
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/bluey-uv.XXXXXX")"
+    archive="$tmp/uv.tar.gz"
+    extract="$tmp/extract"
+    mkdir -p "$uv_dir" "$extract"
+
+    say "Installing Bluey local Python runtime helper..." >&2
+    if ! curl -fsSL "$url" -o "$archive"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! tar -xzf "$archive" -C "$extract"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    found="$(find "$extract" -type f -name uv 2>/dev/null | head -n 1 || true)"
+    if [ -z "$found" ]; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    cp "$found" "$uv_bin"
+    chmod +x "$uv_bin"
+    rm -rf "$tmp"
+    ok "Installed Bluey local Python runtime helper" >&2
+    printf "%s\n" "$uv_bin"
+}
+
+run_with_bluey_uv_env() {
+    local root="$1"
+    shift
+
+    mkdir -p "$root/tools/uv-cache" "$root/tools/python"
+    UV_CACHE_DIR="$root/tools/uv-cache" \
+    UV_PYTHON_INSTALL_DIR="$root/tools/python" \
+    UV_PYTHON_DOWNLOADS=automatic \
+    UV_LINK_MODE=copy \
+        "$@"
+}
+
 try_sudo_cli_link() {
     local dir="$1"
 
@@ -206,30 +275,58 @@ install_local_doc_tools() {
     local root="$1"
     local tools_dir="$root/tools/doc-converter"
     local wrapper="$root/bin/bluey-doc-converter"
+    local venv_dir="$tools_dir/.venv"
+    local uv_bin=""
 
     if [ "${BLUEY_SKIP_LOCAL_TOOLS:-0}" = "1" ]; then
         warn "Skipping Bluey document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
         return 0
     fi
-    if ! command -v python3 >/dev/null 2>&1; then
-        warn "python3 was not found; document conversion will use built-in fallbacks only"
-        return 0
-    fi
 
     say "Installing Bluey document tools..."
     mkdir -p "$tools_dir" "$root/bin"
-    if ! python3 -m venv "$tools_dir/.venv" >/dev/null 2>&1; then
+    if command -v python3 >/dev/null 2>&1 && python3 --version 2>&1 | grep -Eq 'Python 3\.'; then
+        if ! python3 -m venv "$venv_dir" >/dev/null 2>&1; then
+            warn "Could not create Bluey's local Python environment with installed python3; trying Bluey's local bootstrap"
+            rm -rf "$venv_dir"
+            uv_bin="$(ensure_bluey_uv "$root" || true)"
+        fi
+    else
+        warn "A real python3 install was not found; creating Bluey's local document tools runtime"
+        uv_bin="$(ensure_bluey_uv "$root" || true)"
+    fi
+
+    if [ -n "$uv_bin" ]; then
+        if ! run_with_bluey_uv_env "$root" "$uv_bin" venv --python 3.12 "$venv_dir" >/dev/null 2>&1; then
+            warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
+            return 0
+        fi
+    elif [ ! -x "$venv_dir/bin/python" ]; then
         warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
         return 0
     fi
 
-    local py="$tools_dir/.venv/bin/python"
-    "$py" -m pip install --disable-pip-version-check --upgrade pip >/dev/null 2>&1 || true
-    if ! "$py" -m pip install --disable-pip-version-check "markitdown[all]" >/dev/null 2>&1; then
-        if ! "$py" -m pip install --disable-pip-version-check markitdown >/dev/null 2>&1; then
-            warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
-            return 0
+    local py="$venv_dir/bin/python"
+    if [ -n "$uv_bin" ]; then
+        if ! run_with_bluey_uv_env "$root" "$uv_bin" pip install --python "$py" "markitdown[all]" >/dev/null 2>&1; then
+            if ! run_with_bluey_uv_env "$root" "$uv_bin" pip install --python "$py" markitdown >/dev/null 2>&1; then
+                warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
+                return 0
+            fi
         fi
+    else
+        "$py" -m pip install --disable-pip-version-check --upgrade pip >/dev/null 2>&1 || true
+        if ! "$py" -m pip install --disable-pip-version-check "markitdown[all]" >/dev/null 2>&1; then
+            if ! "$py" -m pip install --disable-pip-version-check markitdown >/dev/null 2>&1; then
+                warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
+                return 0
+            fi
+        fi
+    fi
+
+    if [ ! -x "$venv_dir/bin/markitdown" ] && [ ! -x "$venv_dir/bin/markitdown.exe" ]; then
+        warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
+        return 0
     fi
 
     cat > "$wrapper" <<'SH'
