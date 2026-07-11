@@ -278,6 +278,8 @@ if ([string]::IsNullOrWhiteSpace($ArtifactUrl)) {
     if ($platformEntry -and ![string]::IsNullOrWhiteSpace($platformEntry.url)) {
         $ArtifactUrl = Resolve-BlueyUrl -Base $DownloadHost -Value $platformEntry.url
         $ArtifactSha256 = $platformEntry.sha256
+    } elseif ($Latest) {
+        Fail "Bluey $VersionTag does not include a Windows download yet. No files were changed. Please try again after the Windows release is published."
     } else {
         $ArtifactUrl = "$DownloadHost/releases/$VersionTag/bluey-$VersionNumber-$Platform.zip"
     }

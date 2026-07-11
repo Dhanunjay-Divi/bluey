@@ -49,7 +49,7 @@ identities. This closes the gate that rejected `0.1.97`.
 | --- | --- |
 | macOS arm64 | Signed artifact in this release |
 | macOS Intel/universal | Source/build parity retained; publish only after the same gate passes |
-| Windows | Source/installer parity included; executable artifact requires a Windows/MSVC builder |
+| Windows | Build on the real Windows/MSVC host and signed-manifest verification required before promotion |
 
 Final hashes, backup paths, health identity, and signed live verification are
 recorded in `ROUND-474-SIGNED-0.1.98-CONSOLIDATED-DEPLOY.md`.

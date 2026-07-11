@@ -150,12 +150,18 @@ jobs:
           # Canonical binary: bluey-daemon (fallback: cue-daemon from same crate)
           cp "target/${{ matrix.target }}/release/bluey-daemon" staging/bin/ 2>/dev/null || \
             cp "target/${{ matrix.target }}/release/cue-daemon" staging/bin/bluey-daemon
+          cp staging/bin/bluey-daemon staging/bin/termb
+          cp staging/bin/bluey-daemon staging/bin/Terminal
           # Canonical binary: bluey (fallback: cue from same crate)
           cp "target/${{ matrix.target }}/release/bluey" staging/bin/ 2>/dev/null || \
             cp "target/${{ matrix.target }}/release/cue" staging/bin/bluey
           # Native helpers. Keep both canonical bluey-* names and legacy cue-*
           # aliases because older dev scripts still probe the cue-* fallback.
-          find native \( -name "bluey-*" -o -name "cue-*" -o -name "*.dylib" \) -type f | while read f; do
+          find native \( \
+            -name "bluey-*" -o -name "cue-*" -o -name "*.dylib" -o \
+            -name "hostovb" -o -name "host-overlay" -o \
+            -name "adriverb" -o -name "audio-driver" \
+          \) -type f | while read f; do
             if [ -x "$f" ] || [[ "$f" == *.dylib ]]; then
               cp "$f" staging/bin/ 2>/dev/null || true
             fi
@@ -214,6 +220,8 @@ jobs:
           } else {
             Copy-Item "target/${{ matrix.target }}/release/cue-daemon.exe" staging/bin/bluey-daemon.exe
           }
+          Copy-Item staging/bin/bluey-daemon.exe staging/bin/termb.exe
+          Copy-Item staging/bin/bluey-daemon.exe staging/bin/Terminal.exe
           # Canonical binary: bluey.exe (fallback: cue.exe)
           if (Test-Path "target/${{ matrix.target }}/release/bluey.exe") {
             Copy-Item "target/${{ matrix.target }}/release/bluey.exe" staging/bin/
@@ -223,8 +231,12 @@ jobs:
           # Native helpers
           Copy-Item native/windows/cue-overlay/build/bluey-overlay.exe staging/bin/ -ErrorAction SilentlyContinue
           Copy-Item native/windows/cue-overlay/build/cue-overlay.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-overlay/build/hostovb.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-overlay/build/host-overlay.exe staging/bin/ -ErrorAction SilentlyContinue
           Copy-Item native/windows/cue-audio/build/bluey-audio.exe staging/bin/ -ErrorAction SilentlyContinue
           Copy-Item native/windows/cue-audio/build/cue-audio.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-audio/build/adriverb.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-audio/build/audio-driver.exe staging/bin/ -ErrorAction SilentlyContinue
           Copy-Item native/windows/cue-whisper/cue-whisper.exe staging/bin/ -ErrorAction SilentlyContinue
           Compress-Archive -Path staging/* -DestinationPath "bluey-${VERSION}-${{ matrix.platform }}.zip"
 

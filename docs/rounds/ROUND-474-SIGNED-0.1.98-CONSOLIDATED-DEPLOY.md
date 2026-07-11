@@ -62,6 +62,20 @@ Windows package aliases. Final source commit, artifact SHA256, backup paths, API
 binary SHA256, health identity, MIME/signature checks, service state, and log
 scan are recorded after the corrected promotion.
 
+## Windows Installer Gate
+
+A real Windows install smoke exposed another release blocker while `latest`
+still pointed at `0.1.96`: `install.ps1` invented a Windows ZIP URL when the
+signed manifest omitted `windows-x86_64`, then surfaced a raw HTTP 404. The
+installer now stops before download with a clear no-files-changed message when
+the platform is absent.
+
+The manual Windows builder now produces the required
+`dist/bluey-<version>-windows-x86_64.zip` with a `bin\...` layout in addition to
+the loose developer folder. It includes daemon/overlay/audio identity aliases
+and the Windows whisper helper. The future workflow package has the same alias
+contract, but no GitHub workflow is used in this release.
+
 ## Deployment Status
 
 Corrective signed promotion in progress.
