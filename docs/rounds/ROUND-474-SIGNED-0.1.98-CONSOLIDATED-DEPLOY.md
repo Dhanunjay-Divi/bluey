@@ -76,6 +76,10 @@ the loose developer folder. It includes daemon/overlay/audio identity aliases
 and the Windows whisper helper. The future workflow package has the same alias
 contract, but no GitHub workflow is used in this release.
 
+The first clean MSVC gate also caught an unconditional import of the Unix-only
+daemon executable-name helper in `cue-cli`. The import is now platform-scoped;
+native and cross-target Windows Clippy both pass before the MSVC rebuild.
+
 ## Deployment Status
 
 Corrective signed promotion in progress.

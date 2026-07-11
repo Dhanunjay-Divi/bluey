@@ -14,11 +14,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use cue_core::app_paths::AppPaths;
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
+#[cfg(unix)]
+use cue_core::process_aliases::is_daemon_executable_path;
 #[cfg(target_os = "macos")]
 use cue_core::process_aliases::MACOS_AUDIO_HELPER_NAMES;
-use cue_core::process_aliases::{
-    is_daemon_executable_path, is_daemon_identity_path, DAEMON_EXECUTABLE_STEMS,
-};
+use cue_core::process_aliases::{is_daemon_identity_path, DAEMON_EXECUTABLE_STEMS};
 use cue_core::{
     load_account, load_settings, new_trace_id, save_settings, trace_id_from_env, AccountConfig,
     ActionItem, AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerRequest, AnswerResponse,
