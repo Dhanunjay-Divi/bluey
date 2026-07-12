@@ -7496,9 +7496,7 @@ async fn audio_transcript_session_for_segment(
             finalizing: false,
         });
     }
-    let Some(finalizing) = runtime.finalizing_session.as_ref() else {
-        return None;
-    };
+    let finalizing = runtime.finalizing_session.as_ref()?;
     if Instant::now() <= finalizing.expires_at {
         return Some(AudioTranscriptSession {
             session_id: finalizing.session_id.clone(),
