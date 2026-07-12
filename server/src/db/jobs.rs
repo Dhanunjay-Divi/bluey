@@ -1177,6 +1177,7 @@ pub fn save_profile(
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
+            let onboarding_complete = i32::from(value.onboarding_complete);
             conn.execute(
                 "INSERT INTO jobs_profiles (
                     account_id, profile_json, onboarding_step, onboarding_complete,
@@ -1191,7 +1192,7 @@ pub fn save_profile(
                     &account_id,
                     &payload,
                     &value.onboarding_step,
-                    &i64::from(value.onboarding_complete),
+                    &onboarding_complete,
                     &value.updated_at_ms,
                 ],
             )?;
@@ -1665,6 +1666,7 @@ pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Res
             Ok(value)
         }
         DbPool::Postgres(_) => {
+            let active = i32::from(value.active);
             pool.get_pg()?.execute(
                 "INSERT INTO jobs_tracks(id, account_id, track_json, active, created_at_ms, updated_at_ms)
                  VALUES ($1, $2, $3, $4, $5, $6)
@@ -1677,7 +1679,7 @@ pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Res
                     &value.id,
                     &account_id,
                     &payload,
-                    &i64::from(value.active),
+                    &active,
                     &value.created_at_ms,
                     &value.updated_at_ms,
                 ],
@@ -5314,8 +5316,8 @@ pub fn get_entitlement(pool: &DbPool, account_id: &str) -> Result<JobsEntitlemen
                 row.get(3),
                 row.get(4),
                 row.get(5),
-                row.get::<_, i64>(6) != 0,
-                row.get::<_, i64>(7) != 0,
+                row.get::<_, i32>(6) != 0,
+                row.get::<_, i32>(7) != 0,
             ))
         }
     })
@@ -5329,8 +5331,8 @@ pub fn set_entitlement_plan(
     let policy = plan_policy(plan);
     let track_limit = policy.track_limit;
     let packet_limit = policy.packet_limit;
-    let local_browser = i64::from(policy.local_browser);
-    let cloud_browser = i64::from(policy.cloud_browser);
+    let local_browser = i32::from(policy.local_browser);
+    let cloud_browser = i32::from(policy.cloud_browser);
     let _ = get_entitlement(pool, account_id)?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -5496,7 +5498,7 @@ pub fn commit_packet(
                 )?;
                 return Ok(PacketCommitResult {
                     newly_metered: false,
-                    included: row.get::<_, i64>(0) != 0,
+                    included: row.get::<_, i32>(0) != 0,
                     amount_cents: row.get(1),
                     used_packets: entitlement.get(0),
                     monthly_packet_limit: entitlement.get(1),
@@ -5510,6 +5512,7 @@ pub fn commit_packet(
             let used: i64 = entitlement.get(0);
             let limit: i64 = entitlement.get(1);
             let included = used < limit;
+            let included_db = i32::from(included);
             let amount_cents = if included { 0 } else { PACKET_OVERAGE_CENTS };
             if amount_cents > 0 {
                 let balance_before: i64 = tx
@@ -5559,7 +5562,7 @@ pub fn commit_packet(
                     &application.job_id,
                     &application.id,
                     &metering_key,
-                    &i64::from(included),
+                    &included_db,
                     &amount_cents,
                     &now,
                 ],
@@ -6626,7 +6629,7 @@ pub fn list_application_identities(
             )?
             .into_iter()
             .map(|row| {
-                parse_application_identity_row(row.get(0), row.get(1), row.get::<_, i64>(2) != 0)
+                parse_application_identity_row(row.get(0), row.get(1), row.get::<_, i32>(2) != 0)
             })
             .collect(),
     })
@@ -6674,7 +6677,7 @@ pub fn get_application_identity(
                 &[&account_id, &identity_id],
             )?
             .map(|row| {
-                parse_application_identity_row(row.get(0), row.get(1), row.get::<_, i64>(2) != 0)
+                parse_application_identity_row(row.get(0), row.get(1), row.get::<_, i32>(2) != 0)
             })
             .transpose(),
     })
@@ -6718,7 +6721,7 @@ fn application_identity_by_hash(
                     parse_application_identity_row(
                         row.get(1),
                         row.get(2),
-                        row.get::<_, i64>(3) != 0,
+                        row.get::<_, i32>(3) != 0,
                     )?,
                 ))
             })
@@ -6847,6 +6850,7 @@ pub fn save_application_identity(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            let is_default = i32::from(value.is_default);
             if value.is_default {
                 tx.execute(
                     "UPDATE jobs_application_identities SET is_default = 0
@@ -6872,7 +6876,7 @@ pub fn save_application_identity(
                     &email_hash,
                     &payload,
                     &value.verification_status,
-                    &i64::from(value.is_default),
+                    &is_default,
                     &value.created_at_ms,
                     &value.updated_at_ms,
                 ],
