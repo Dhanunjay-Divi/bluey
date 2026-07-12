@@ -74,6 +74,8 @@ round is considered complete.
   `server/Cargo.lock` existed only as an ignored local file.
 - Bluey Server is an application, so its resolved dependency graph is now
   committed and the explicit ignore rule was removed.
+- The lockfile uses Cargo format 3 so both the developer toolchain and the
+  isolated production builder (Cargo/Rust 1.75) can verify the same graph.
 - `cargo metadata --manifest-path server/Cargo.toml --locked --no-deps` passes.
 - Production candidates must continue to build with `cargo build --locked`;
   silently resolving newer dependencies during a release is not allowed.
