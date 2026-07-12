@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use subtle::ConstantTimeEq;
 
 use crate::{
     api::AppState,
@@ -193,7 +192,6 @@ pub fn worker_router() -> Router<AppState> {
             "/api/jobs/internal/applications/:application_id/receipt",
             post(worker_receipt).route_layer(DefaultBodyLimit::max(RECEIPT_BODY_LIMIT_BYTES)),
         )
-        .route_layer(axum::middleware::from_fn(require_jobs_worker))
 }
 
 pub fn local_runner_router() -> Router<AppState> {
@@ -242,23 +240,6 @@ async fn require_jobs_beta(request: Request<Body>, next: Next) -> Result<Respons
             StatusCode::NOT_FOUND,
             "Bluey Jobs beta is not enabled.".to_string(),
         ));
-    }
-    Ok(next.run(request).await)
-}
-
-async fn require_jobs_worker(request: Request<Body>, next: Next) -> Result<Response, ApiError> {
-    let expected = std::env::var("BLUEY_JOBS_WORKER_TOKEN").unwrap_or_default();
-    let supplied = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    if expected.is_empty()
-        || supplied.len() != expected.len()
-        || supplied.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() != 1
-    {
-        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
     }
     Ok(next.run(request).await)
 }
@@ -1927,12 +1908,23 @@ pub async fn run_events(
 }
 
 #[derive(Debug, Deserialize)]
+struct LocalRunClaimRequest {
+    ticket: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct LocalRunAccessRequest {
+    #[serde(default)]
+    capability: String,
+    #[serde(default)]
     ticket: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct LocalRunResultRequest {
+    #[serde(default)]
+    capability: String,
+    #[serde(default)]
     ticket: String,
     receipt: Value,
     #[serde(default, rename = "receiptBundle")]
@@ -1944,7 +1936,7 @@ struct LocalRunResultRequest {
 async fn claim_local_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
-    Json(req): Json<LocalRunAccessRequest>,
+    Json(req): Json<LocalRunClaimRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let hash = local_run_ticket_hash(&req.ticket)?;
     let ticket = jobs::claim_local_run_ticket(&state.pool, &run_id, &hash)
@@ -1976,7 +1968,58 @@ async fn claim_local_run(
         json!({ "application_id": ticket.application_id }),
     )
     .map_err(internal)?;
-    Ok(Json(ticket.payload))
+    let browser_profile_id = ticket
+        .payload
+        .get("browserProfileId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or((
+            StatusCode::CONFLICT,
+            "This Bluey Browser launch is missing its browser profile.".to_string(),
+        ))?;
+    let result_capability = super::jobs_local_capability::issue(
+        &ticket.account_id,
+        &ticket.application_id,
+        &run_id,
+        browser_profile_id,
+        "result",
+        ticket.expires_at_ms,
+    )
+    .map_err(|error| {
+        tracing::error!(error = %error, "could not issue local result capability");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Browser could not start securely. Try again.".to_string(),
+        )
+    })?;
+    let resume_capability = super::jobs_local_capability::issue(
+        &ticket.account_id,
+        &ticket.application_id,
+        &run_id,
+        browser_profile_id,
+        "resume",
+        ticket.expires_at_ms,
+    )
+    .map_err(|error| {
+        tracing::error!(error = %error, "could not issue local resume capability");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Browser could not start securely. Try again.".to_string(),
+        )
+    })?;
+    let mut payload = ticket.payload.as_object().cloned().ok_or((
+        StatusCode::CONFLICT,
+        "This Bluey Browser launch is invalid.".to_string(),
+    ))?;
+    payload.insert(
+        "_blueyCapabilities".to_string(),
+        json!({
+            "result": result_capability,
+            "resume": resume_capability,
+            "expiresAtMs": ticket.expires_at_ms,
+        }),
+    );
+    Ok(Json(Value::Object(payload)))
 }
 
 async fn consume_local_run_resume(
@@ -1984,8 +2027,9 @@ async fn consume_local_run_resume(
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunAccessRequest>,
 ) -> Result<Json<jobs::LocalRunResumeAction>, ApiError> {
-    let hash = local_run_ticket_hash(&req.ticket)?;
-    let action = jobs::consume_local_run_resume_action(&state.pool, &run_id, &hash)
+    let ticket =
+        authorize_local_run_operation(&state, &run_id, &req.capability, &req.ticket, "resume")?;
+    let action = jobs::consume_local_run_resume_action(&state.pool, &run_id, &ticket.ticket_hash)
         .map_err(internal)?
         .ok_or((
             StatusCode::CONFLICT,
@@ -2028,13 +2072,8 @@ async fn save_local_run_result(
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunResultRequest>,
 ) -> Result<Json<JobApplication>, ApiError> {
-    let hash = local_run_ticket_hash(&req.ticket)?;
-    let ticket = jobs::get_local_run_ticket_by_hash(&state.pool, &run_id, &hash)
-        .map_err(internal)?
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
-        ))?;
+    let ticket =
+        authorize_local_run_operation(&state, &run_id, &req.capability, &req.ticket, "result")?;
     if ticket.expires_at_ms <= jobs::now_ms() {
         return Err((
             StatusCode::GONE,
@@ -2095,8 +2134,13 @@ async fn save_local_run_result(
                 &ticket.application_id,
                 "needs_input",
             )?;
-            jobs::update_local_run_ticket_status(&state.pool, &run_id, &hash, "needs_input")
-                .map_err(internal)?;
+            jobs::update_local_run_ticket_status(
+                &state.pool,
+                &run_id,
+                &ticket.ticket_hash,
+                "needs_input",
+            )
+            .map_err(internal)?;
             application
         }
         "submitted" => {
@@ -2132,7 +2176,7 @@ async fn save_local_run_result(
                 bundle,
                 req.evidence_objects,
                 "local",
-                Some(&hash),
+                Some(&ticket.ticket_hash),
             )
             .await?;
             application
@@ -2153,8 +2197,13 @@ async fn save_local_run_result(
                 &ticket.application_id,
                 "failed",
             )?;
-            jobs::update_local_run_ticket_status(&state.pool, &run_id, &hash, "failed")
-                .map_err(internal)?;
+            jobs::update_local_run_ticket_status(
+                &state.pool,
+                &run_id,
+                &ticket.ticket_hash,
+                "failed",
+            )
+            .map_err(internal)?;
             application
         }
         "side_effect_unknown" => {
@@ -2177,7 +2226,7 @@ async fn save_local_run_result(
                 &ticket.account_id,
                 &ticket.application_id,
                 &run_id,
-                &hash,
+                &ticket.ticket_hash,
                 reconciliation_receipt,
                 &session,
             )
@@ -2222,6 +2271,50 @@ fn local_result_binding(
             "Local run ticket does not match an active local browser session.".to_string(),
         ))?;
     Ok((application, session))
+}
+
+fn authorize_local_run_operation(
+    state: &AppState,
+    run_id: &str,
+    capability: &str,
+    _legacy_ticket: &str,
+    operation: &str,
+) -> Result<jobs::LocalRunTicket, ApiError> {
+    #[cfg(debug_assertions)]
+    if capability.is_empty() && !_legacy_ticket.is_empty() {
+        let hash = local_run_ticket_hash(_legacy_ticket)?;
+        return jobs::get_local_run_ticket_by_hash(&state.pool, run_id, &hash)
+            .map_err(internal)?
+            .ok_or((
+                StatusCode::NOT_FOUND,
+                "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+            ));
+    }
+
+    let claims =
+        super::jobs_local_capability::verify(capability, run_id, operation, jobs::now_ms())
+            .map_err(|_| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+                )
+            })?;
+    let ticket = jobs::get_local_run_ticket(&state.pool, &claims.account_id, run_id)
+        .map_err(internal)?
+        .filter(|ticket| {
+            ticket.application_id == claims.application_id
+                && ticket.expires_at_ms == claims.expires_at_ms
+                && ticket
+                    .payload
+                    .get("browserProfileId")
+                    .and_then(Value::as_str)
+                    == Some(claims.browser_profile_id.as_str())
+        })
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        ))?;
+    Ok(ticket)
 }
 
 fn local_run_ticket_hash(ticket: &str) -> Result<String, ApiError> {

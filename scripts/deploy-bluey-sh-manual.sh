@@ -52,7 +52,6 @@ echo "[manual-deploy] live checks"
 "$CURL_BIN" -fsS "https://bluey.sh/install.sh" >/dev/null
 "$CURL_BIN" -fsS "https://bluey.sh/install.ps1" >/dev/null
 for path in \
-    "/llms.txt" \
     "/robots.txt" \
     "/sitemap.xml" \
     "/how-bluey-works/" \
@@ -61,6 +60,12 @@ for path in \
 do
     "$CURL_BIN" -fsS "https://bluey.sh${path}" >/dev/null
 done
+
+llms_status="$($CURL_BIN -sS -o /dev/null -w '%{http_code}' "https://bluey.sh/llms.txt")"
+if [ "$llms_status" != "410" ]; then
+    echo "[manual-deploy] expected /llms.txt to return 410, got $llms_status" >&2
+    exit 1
+fi
 
 if [ -n "${BLUEY_RELEASE_PUBKEY_FILE:-}" ] || [ -n "${BLUEY_RELEASE_SIGNING_KEY_FILE:-}" ]; then
     scripts/bluey-release-live-verify.sh "$VERSION"

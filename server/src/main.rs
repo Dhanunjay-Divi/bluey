@@ -9,7 +9,7 @@ use bluey_server::{
     config::{Config, ServerDbBackend},
     db,
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -49,7 +49,13 @@ async fn main() -> anyhow::Result<()> {
     let app = api::build_router(pool.clone(), config.clone());
 
     // Bind
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let host = std::env::var("BLUEY_API_HOST")
+        .ok()
+        .map(|value| value.parse::<IpAddr>())
+        .transpose()
+        .context("BLUEY_API_HOST must be an IP address")?
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let addr = SocketAddr::new(host, config.port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;

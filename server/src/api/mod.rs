@@ -18,6 +18,8 @@ pub mod auth_routes;
 pub mod billing;
 pub mod jobs;
 pub mod jobs_interview_prep;
+pub mod jobs_local_capability;
+pub mod jobs_worker_auth;
 pub mod metrics;
 pub mod middleware;
 pub mod pricing;
@@ -109,7 +111,12 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .route(
             "/auth/device/start",
-            axum::routing::post(auth_routes::device_start),
+            axum::routing::post(auth_routes::device_start).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/device/poll",
@@ -128,22 +135,52 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route("/pricing/tiers", get(pricing::get_tiers))
         .route(
             "/auth/verify-email/confirm",
-            axum::routing::post(auth_routes::verify_email_confirm),
+            axum::routing::post(auth_routes::verify_email_confirm).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/password-reset/start",
-            axum::routing::post(auth_routes::password_reset_start),
+            axum::routing::post(auth_routes::password_reset_start).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/password-reset/confirm",
-            axum::routing::post(auth_routes::password_reset_confirm),
+            axum::routing::post(auth_routes::password_reset_confirm).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/link/exchange",
-            axum::routing::post(auth_routes::link_exchange),
+            axum::routing::post(auth_routes::link_exchange).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
-        .merge(jobs::worker_router())
-        .merge(jobs::local_runner_router());
+        .merge(
+            jobs::worker_router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                jobs_worker_auth::require_jobs_worker,
+            )),
+        )
+        .merge(
+            jobs::local_runner_router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::rate_limit::limit_jobs_local_runner,
+            )),
+        );
 
     // ---- Admin-only (require_auth + require_admin) -------------------------
     let admin_only = Router::new()
@@ -186,7 +223,12 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             axum::routing::patch(account::update_billing_settings),
         )
         .route("/account/usage", get(account::usage))
-        .merge(jobs::router())
+        .merge(
+            jobs::router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::rate_limit::limit_jobs_api,
+            )),
+        )
         .route(
             "/router/complete",
             axum::routing::post(router::complete)
@@ -277,11 +319,21 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .route(
             "/auth/device/approve",
-            axum::routing::post(auth_routes::device_approve),
+            axum::routing::post(auth_routes::device_approve).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/verify-email/start",
-            axum::routing::post(auth_routes::verify_email_start),
+            axum::routing::post(auth_routes::verify_email_start).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/link/mint",
@@ -289,11 +341,21 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .route(
             "/auth/trial/convert/start",
-            axum::routing::post(auth_routes::trial_convert_start),
+            axum::routing::post(auth_routes::trial_convert_start).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/trial/convert/confirm",
-            axum::routing::post(auth_routes::trial_convert_confirm),
+            axum::routing::post(auth_routes::trial_convert_confirm).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .merge(admin_only)
         .route_layer(axum::middleware::from_fn_with_state(
@@ -320,18 +382,32 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
         provider_health: crate::provider_health::ProviderHealth::default(),
     };
 
-    let protected =
-        Router::new()
-            .merge(jobs::router())
-            .route_layer(axum::middleware::from_fn_with_state(
+    let protected = Router::new()
+        .merge(
+            jobs::router().route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
-                auth::require_auth,
-            ));
+                crate::rate_limit::limit_jobs_api,
+            )),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
 
     Router::new()
         .route("/health", get(admin::health))
-        .merge(jobs::worker_router())
-        .merge(jobs::local_runner_router())
+        .merge(
+            jobs::worker_router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                jobs_worker_auth::require_jobs_worker,
+            )),
+        )
+        .merge(
+            jobs::local_runner_router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::rate_limit::limit_jobs_local_runner,
+            )),
+        )
         .merge(protected)
         .layer(from_fn(middleware::request_id::request_id_middleware))
         .with_state(state)

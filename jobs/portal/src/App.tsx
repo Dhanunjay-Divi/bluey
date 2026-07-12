@@ -33,6 +33,7 @@ import type {
 } from "./types";
 import { AppShell } from "./components/AppShell";
 import { Onboarding } from "./components/Onboarding";
+import { runnerLandingCopy } from "./lib/runner-access";
 import blueyIcon from "../../../web/assets/bluey-logo.svg";
 import blueyWordmark from "../../../web/assets/bluey-wordmark.svg";
 
@@ -699,19 +700,19 @@ function AuthGate() {
           <li><span><FileText /></span><div><b>Build one Career Profile</b><p>Import your resume, then add work history, locations, preferences, and reusable answers once.</p></div></li>
           <li><span><Search /></span><div><b>Find fresh, relevant roles</b><p>Career Tracks rank recent jobs by role, location, compensation, and your hard filters.</p></div></li>
           <li><span><Sparkles /></span><div><b>Create a unique application kit</b><p>Every job gets its own resume version, answer set, selected email, and visible change summary.</p></div></li>
-          <li><span><BriefcaseBusiness /></span><div><b>Review or keep running</b><p>Apply with the local browser or let the cloud runner continue while your computer is off.</p></div></li>
+          <li><span><BriefcaseBusiness /></span><div><b>{runnerLandingCopy.flowTitle}</b><p>{runnerLandingCopy.flowBody}</p></div></li>
           <li><span><MailCheck /></span><div><b>Keep the receipt</b><p>Submission evidence stays tied to the exact resume, answers, application email, and timestamp.</p></div></li>
         </ol>
       </section>
 
       <section className="entry-section entry-plans" id="jobs-plans">
-        <div className="entry-section-heading"><p className="eyebrow">PLANS</p><h2>Start free. Add automation when it helps.</h2></div>
+        <div className="entry-section-heading"><p className="eyebrow">PLANS</p><h2>{runnerLandingCopy.plansTitle}</h2></div>
         <div className="entry-plan-table">
           <div><span><b>Free</b><small>Build your profile and review tailored applications</small></span><strong>$0</strong><p>1 Career Track · 5 complete applications</p></div>
-          <div><span><b>Pro</b><small>Apply from the separate Bluey Browser</small></span><strong>$29<small>/month</small></strong><p>3 Career Tracks · 50 applications · local runner</p></div>
-          <div><span><b>Cloud</b><small>Keep applications moving in the background</small></span><strong>$49<small>/month</small></strong><p>5 Career Tracks · 100 applications · local + cloud</p></div>
+          <div><span><b>Pro</b><small>{runnerLandingCopy.proSummary}</small></span><strong>$29<small>/month</small></strong><p>{runnerLandingCopy.proDetails}</p></div>
+          <div><span><b>Cloud</b><small>{runnerLandingCopy.cloudSummary}</small></span><strong>$49<small>/month</small></strong><p>{runnerLandingCopy.cloudDetails}</p></div>
         </div>
-        <div className="entry-plan-action"><Cloud size={18} /><span>All plans keep the exact resume and answers used for every application.</span><a className="button primary" href="/login?mode=signup&next=%2Fjobs">Start free<ArrowRight size={16} /></a></div>
+        <div className="entry-plan-action"><Cloud size={18} /><span>{runnerLandingCopy.accessNote}</span><a className="button primary" href="/login?mode=signup&next=%2Fjobs">Start free<ArrowRight size={16} /></a></div>
       </section>
 
       <footer className="entry-footer">

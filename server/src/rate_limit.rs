@@ -34,7 +34,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -48,6 +48,7 @@ use tokio::sync::Mutex;
 
 type KeyedLimiterMap =
     Arc<Mutex<HashMap<String, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>>;
+type ReplayMap = Arc<Mutex<HashMap<String, u64>>>;
 
 /// One quota tier for a class of endpoint.
 #[derive(Clone)]
@@ -237,6 +238,61 @@ impl SharedLimiter {
     }
 }
 
+/// Short-lived replay protection for signed service requests.
+///
+/// Redis is authoritative in multi-process deployments. The local map keeps
+/// development and single-process tests functional without weakening a strict
+/// production Redis configuration.
+#[derive(Clone)]
+pub struct ReplayGuard {
+    local: ReplayMap,
+    redis: Option<RedisCapacityConfig>,
+}
+
+impl ReplayGuard {
+    fn new(redis: Option<RedisCapacityConfig>) -> Self {
+        Self {
+            local: Arc::new(Mutex::new(HashMap::new())),
+            redis,
+        }
+    }
+
+    pub async fn reserve(&self, key: &str, ttl_secs: u64) -> anyhow::Result<bool> {
+        if let Some(redis) = &self.redis {
+            let redis_key = format!("{}:replay:{}", redis.namespace, key);
+            match redis.client.get_multiplexed_async_connection().await {
+                Ok(mut conn) => {
+                    let result: Option<String> = redis::cmd("SET")
+                        .arg(redis_key)
+                        .arg("1")
+                        .arg("NX")
+                        .arg("EX")
+                        .arg(ttl_secs.max(1))
+                        .query_async(&mut conn)
+                        .await?;
+                    return Ok(result.is_some());
+                }
+                Err(error) if redis.strict => return Err(error.into()),
+                Err(error) => {
+                    tracing::warn!(error = %error, "redis replay guard unavailable; using local guard");
+                }
+            }
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut entries = self.local.lock().await;
+        entries.retain(|_, expires_at| *expires_at > now);
+        if entries.contains_key(key) {
+            return Ok(false);
+        }
+        entries.insert(key.to_string(), now.saturating_add(ttl_secs.max(1)));
+        Ok(true)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapacityDenied {
     pub retry_after_secs: u64,
@@ -250,9 +306,24 @@ pub struct RateLimiters {
     pub auth_signup: SharedLimiter,
     pub auth_refresh: SharedLimiter,
     pub auth_device_poll: SharedLimiter,
+    pub auth_otp: SharedLimiter,
     pub router_complete: SharedLimiter,
     pub router_embed: SharedLimiter,
     pub router_transcribe: SharedLimiter,
+    /// Authenticated Bluey Jobs reads, keyed by account and trusted client IP.
+    pub jobs_read: SharedLimiter,
+    /// Ordinary Bluey Jobs mutations.
+    pub jobs_write: SharedLimiter,
+    /// Packet generation, commit, and interview preparation.
+    pub jobs_expensive: SharedLimiter,
+    /// Application-email, verification, and mailbox operations.
+    pub jobs_identity: SharedLimiter,
+    /// Browser, intervention, and run-control operations.
+    pub jobs_run: SharedLimiter,
+    /// Receipt/evidence upload operations.
+    pub jobs_evidence: SharedLimiter,
+    /// Replay protection for short-lived signed Jobs worker requests.
+    pub jobs_worker_replay: ReplayGuard,
     /// Optional per-account runaway-loop guardrail for managed LLM requests.
     pub account_llm: Option<SharedLimiter>,
     /// Optional per-account runaway-loop guardrail for embeddings/RAG writes.
@@ -285,6 +356,7 @@ impl Default for RateLimiters {
             auth_signup: SharedLimiter::new("auth_signup", 5, 5, redis.clone()),
             auth_refresh: SharedLimiter::new("auth_refresh", 30, 30, redis.clone()),
             auth_device_poll: SharedLimiter::new("auth_device_poll", 60, 60, redis.clone()),
+            auth_otp: SharedLimiter::new("auth_otp", 10, 5, redis.clone()),
             router_complete: optional_route_limiter_from_env(
                 "router_complete",
                 "BLUEY_LIMIT_ROUTER_COMPLETE_PER_MIN",
@@ -300,6 +372,49 @@ impl Default for RateLimiters {
                 "BLUEY_LIMIT_ROUTER_TRANSCRIBE_PER_MIN",
                 redis.clone(),
             ),
+            jobs_read: limiter_from_env(
+                "jobs_read",
+                "BLUEY_LIMIT_JOBS_READ_PER_MIN",
+                240,
+                120,
+                redis.clone(),
+            ),
+            jobs_write: limiter_from_env(
+                "jobs_write",
+                "BLUEY_LIMIT_JOBS_WRITE_PER_MIN",
+                60,
+                30,
+                redis.clone(),
+            ),
+            jobs_expensive: limiter_from_env(
+                "jobs_expensive",
+                "BLUEY_LIMIT_JOBS_EXPENSIVE_PER_MIN",
+                12,
+                6,
+                redis.clone(),
+            ),
+            jobs_identity: limiter_from_env(
+                "jobs_identity",
+                "BLUEY_LIMIT_JOBS_IDENTITY_PER_MIN",
+                10,
+                5,
+                redis.clone(),
+            ),
+            jobs_run: limiter_from_env(
+                "jobs_run",
+                "BLUEY_LIMIT_JOBS_RUN_PER_MIN",
+                60,
+                20,
+                redis.clone(),
+            ),
+            jobs_evidence: limiter_from_env(
+                "jobs_evidence",
+                "BLUEY_LIMIT_JOBS_EVIDENCE_PER_MIN",
+                12,
+                4,
+                redis.clone(),
+            ),
+            jobs_worker_replay: ReplayGuard::new(redis.clone()),
             account_llm: optional_limiter_from_env(
                 "account_llm",
                 "BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN",
@@ -678,9 +793,117 @@ make_middleware!(limit_auth_login, auth_login);
 make_middleware!(limit_auth_signup, auth_signup);
 make_middleware!(limit_auth_refresh, auth_refresh);
 make_middleware!(limit_auth_device_poll, auth_device_poll);
+make_middleware!(limit_auth_otp, auth_otp);
 make_middleware!(limit_router_complete, router_complete);
 make_middleware!(limit_router_embed, router_embed);
 make_middleware!(limit_router_transcribe, router_transcribe);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobsRateClass {
+    Read,
+    Write,
+    Expensive,
+    Identity,
+    Run,
+    Evidence,
+}
+
+fn jobs_rate_class(method: &Method, path: &str) -> JobsRateClass {
+    if method == Method::GET {
+        return JobsRateClass::Read;
+    }
+    if path.contains("/evidence") {
+        return JobsRateClass::Evidence;
+    }
+    if path.contains("/application-identities") || path.contains("/mailbox-connections") {
+        return JobsRateClass::Identity;
+    }
+    if path.contains("/browser-sessions")
+        || path.contains("/interventions")
+        || path.contains("/runs")
+    {
+        return JobsRateClass::Run;
+    }
+    if path.contains("/interview-prep")
+        || path.ends_with("/applications")
+        || path.ends_with("/commit")
+    {
+        return JobsRateClass::Expensive;
+    }
+    JobsRateClass::Write
+}
+
+/// Account-plus-IP Bluey Jobs API limiter. The outer auth middleware inserts
+/// `AuthedAccount` before this layer executes; missing identity fails closed.
+pub async fn limit_jobs_api(
+    State(state): State<crate::api::AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, (StatusCode, [(axum::http::HeaderName, String); 1])> {
+    let Some(account) = req.extensions().get::<crate::auth::AuthedAccount>() else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            [(axum::http::header::RETRY_AFTER, "1".to_string())],
+        ));
+    };
+    let client = client_key(&req);
+    let key = format!("{}:{client}", account.0.id);
+    let rate_class = jobs_rate_class(req.method(), req.uri().path());
+    let limiter = match rate_class {
+        JobsRateClass::Read => &state.rate_limiters.jobs_read,
+        JobsRateClass::Write => &state.rate_limiters.jobs_write,
+        JobsRateClass::Expensive => &state.rate_limiters.jobs_expensive,
+        JobsRateClass::Identity => &state.rate_limiters.jobs_identity,
+        JobsRateClass::Run => &state.rate_limiters.jobs_run,
+        JobsRateClass::Evidence => &state.rate_limiters.jobs_evidence,
+    };
+    match limiter.check(&key).await {
+        Ok(()) => Ok(next.run(req).await),
+        Err(retry) => {
+            tracing::warn!(
+                account_id = %account.0.id,
+                client = %client,
+                rate_class = ?rate_class,
+                method = %req.method(),
+                path = %req.uri().path(),
+                retry_after_secs = retry,
+                "Bluey Jobs request rate limited"
+            );
+            Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, retry.to_string())],
+            ))
+        }
+    }
+}
+
+/// IP-scoped limiter for the unauthenticated local-browser delivery surface.
+/// The run ticket/capability provides authorization; this bucket limits online
+/// guessing and abusive receipt delivery before those secrets are evaluated.
+pub async fn limit_jobs_local_runner(
+    State(state): State<crate::api::AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, (StatusCode, [(axum::http::HeaderName, String); 1])> {
+    let client = client_key(&req);
+    let key = format!("local-run:{client}");
+    match state.rate_limiters.jobs_run.check(&key).await {
+        Ok(()) => Ok(next.run(req).await),
+        Err(retry) => {
+            tracing::warn!(
+                client = %client,
+                method = %req.method(),
+                path = %req.uri().path(),
+                retry_after_secs = retry,
+                "Bluey Jobs local runner request rate limited"
+            );
+            Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, retry.to_string())],
+            ))
+        }
+    }
+}
 
 /// Test-only helper: expose `client_key()` so an integration test can
 /// hit a real `axum::serve(...)` path and assert the peer IP arrives
@@ -777,6 +1000,59 @@ mod tests {
             .unwrap_err();
         assert_eq!(denied.reason, "provider_openai_llm_busy");
         assert!(limits.check_provider_llm("openai", "gpt-4o").await.is_ok());
+    }
+
+    #[test]
+    fn jobs_routes_use_separate_rate_classes() {
+        assert_eq!(
+            jobs_rate_class(&Method::GET, "/api/jobs/workspace"),
+            JobsRateClass::Read
+        );
+        assert_eq!(
+            jobs_rate_class(&Method::POST, "/api/jobs/applications"),
+            JobsRateClass::Expensive
+        );
+        assert_eq!(
+            jobs_rate_class(&Method::POST, "/api/jobs/application-identities/id/resend"),
+            JobsRateClass::Identity
+        );
+        assert_eq!(
+            jobs_rate_class(&Method::POST, "/api/jobs/applications/id/runs"),
+            JobsRateClass::Run
+        );
+        assert_eq!(
+            jobs_rate_class(&Method::POST, "/api/jobs/applications/id/evidence"),
+            JobsRateClass::Evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_replay_guard_rejects_the_same_nonce() {
+        let guard = ReplayGuard::new(None);
+        assert!(guard.reserve("worker:nonce", 60).await.unwrap());
+        assert!(!guard.reserve("worker:nonce", 60).await.unwrap());
+        assert!(guard.reserve("worker:other", 60).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn redis_limits_and_replay_guards_are_shared_across_instances() {
+        let Ok(url) = std::env::var("BLUEY_TEST_REDIS_URL") else {
+            return;
+        };
+        let config = RedisCapacityConfig {
+            client: redis::Client::open(url).unwrap(),
+            namespace: Arc::from(format!("bluey-test-{}", uuid::Uuid::new_v4())),
+            strict: true,
+        };
+        let first = SharedLimiter::new("jobs_multi_process", 60, 1, Some(config.clone()));
+        let second = SharedLimiter::new("jobs_multi_process", 60, 1, Some(config.clone()));
+        first.check("account:client").await.unwrap();
+        assert!(second.check("account:client").await.is_err());
+
+        let first_replay = ReplayGuard::new(Some(config.clone()));
+        let second_replay = ReplayGuard::new(Some(config));
+        assert!(first_replay.reserve("worker:nonce", 60).await.unwrap());
+        assert!(!second_replay.reserve("worker:nonce", 60).await.unwrap());
     }
 
     #[tokio::test]

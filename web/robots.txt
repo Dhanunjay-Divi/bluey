@@ -1,4 +1,49 @@
+# Bluey permits conventional search indexing of public marketing pages only.
+# These Content Signals reserve AI input/training rights. Enforcement happens
+# at the edge; robots.txt is a policy signal, not access authorization.
 User-agent: *
+Content-Signal: search=yes, ai-input=no, ai-train=no
 Allow: /
+
+# Fallback directives for self-identifying AI crawlers. Cloudflare AI Crawl
+# Control and WAF classification are the authoritative enforcement layer.
+User-agent: Amazonbot
+Disallow: /
+
+User-agent: Applebot-Extended
+Disallow: /
+
+User-agent: Bytespider
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: Claude-Web
+Disallow: /
+
+User-agent: cohere-ai
+Disallow: /
+
+User-agent: Google-Extended
+Disallow: /
+
+User-agent: GPTBot
+Disallow: /
+
+User-agent: meta-externalagent
+Disallow: /
+
+User-agent: Omgilibot
+Disallow: /
+
+User-agent: PerplexityBot
+Disallow: /
+
+User-agent: YouBot
+Disallow: /
 
 Sitemap: https://bluey.sh/sitemap.xml
