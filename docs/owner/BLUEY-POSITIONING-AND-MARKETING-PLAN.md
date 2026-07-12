@@ -1,6 +1,6 @@
 # Bluey Positioning And Marketing Plan
 
-Date: 2026-06-26
+Updated: 2026-07-12
 
 ## Recommended Position
 
@@ -15,8 +15,9 @@ repo/project memory, and coding-agent context where explicitly authorized.
 
 ## One-Line Pitch
 
-Bluey is a private desktop copilot that listens to live work, reads approved
-context, and answers from your meeting, screen, files, and project memory.
+Bluey is a consent-first desktop assistant that listens when you turn it on,
+reads approved context, and answers from your meeting, screen, files, and
+project memory.
 
 ## Better Hero Direction
 
@@ -127,11 +128,12 @@ Recommended feature pages:
 
 Use:
 
-- User-controlled capture.
-- Capture-excluded where OS-supported.
-- Provider keys stay on Bluey servers.
-- Account-scoped session memory.
-- Export/delete controls.
+- Visible, user-controlled listening and context attachment.
+- Best-effort capture exclusion where OS-supported.
+- Cloud sync off by default and controlled separately from sign-in.
+- Transient raw-audio processing; transcript text can be saved.
+- No customer-content training in the current product.
+- Export/delete controls with honest retention limits.
 - Source cards and missing-context prompts.
 
 Avoid:

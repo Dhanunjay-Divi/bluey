@@ -1,98 +1,106 @@
 # Installing Bluey
 
-> **v0.1.0 scope:** macOS arm64 (Apple Silicon) only. Intel Macs, Windows, and
-> Linux are not supported in this release; their builds and end-to-end testing
-> are scheduled for a later round (see `docs/rounds/PHASE-3-ROUND-13-PLAN.md`).
-> If you are on an unsupported platform, please wait for a later release.
+The public release manifest at `https://bluey.sh/latest.json` currently reports
+Bluey `0.1.99`.
 
-## Requirements
+## Supported Release Artifacts
 
-- macOS 13 (Ventura) or newer on Apple Silicon (M1, M2, M3, …)
-- Microphone, Screen Recording, and Accessibility permissions (granted at first
-  launch via the standard macOS prompts)
+| Platform | Status |
+| --- | --- |
+| macOS on Apple silicon | Available as `darwin-arm64` |
+| Windows x86-64 | Available; install-smoked on Windows 11 |
+| macOS Intel/universal | Not in the current manifest |
+| Linux | Not in the current manifest |
 
-## Manual install
+Do not treat source compatibility or an older artifact as a current support
+promise. The live manifest is the source of truth for downloadable platforms.
 
-Download the release archive and extract it:
+## macOS
 
-```bash
-curl -LO https://github.com/Dhanunjay-Divi/bluey/releases/latest/download/bluey-0.1.0-darwin-arm64.tar.gz
-curl -LO https://github.com/Dhanunjay-Divi/bluey/releases/latest/download/SHA256SUMS.txt
-grep ' bluey-0.1.0-darwin-arm64.tar.gz$' SHA256SUMS.txt | shasum -a 256 -c -
-
-mkdir -p /usr/local/lib/bluey/0.1.0
-tar -xzf bluey-0.1.0-darwin-arm64.tar.gz -C /usr/local/lib/bluey/0.1.0
-
-ln -sf /usr/local/lib/bluey/0.1.0/bin/bluey        /usr/local/bin/bluey
-ln -sf /usr/local/lib/bluey/0.1.0/bin/bluey-daemon /usr/local/bin/bluey-daemon
-```
-
-For local/dev validation, the same install layout can be produced with:
+Open Terminal and run:
 
 ```bash
-make package-darwin-arm64
-BLUEY_ARCHIVE=dist/bluey-0.1.0-darwin-arm64.tar.gz scripts/install.sh
+curl -fsSL https://bluey.sh/install.sh | bash
+bluey on
 ```
 
-## Code signing and Gatekeeper
+The current macOS release requires Apple silicon. Bluey requests operating
+system permissions only when a selected feature needs them. Microphone access
+is needed for mic transcription; system-audio, screen-recording, automation, or
+accessibility access depends on the context features you choose.
 
-The v0.1.0 tarball is **not** code-signed or notarized. Code signing
-is deferred to a later release; do not assume Gatekeeper or quarantine will
-silently allow unsigned binaries.
+## Windows
 
-If you download the archive through a browser, macOS may attach the
-`com.apple.quarantine` extended attribute. The standard remediation is:
+Open PowerShell and run:
+
+```powershell
+irm https://bluey.sh/install.ps1 | iex
+bluey on
+```
+
+The current public artifact is for Windows x86-64 and has been install-smoked
+on Windows 11. Windows 10 is not claimed by the current release record.
+
+## What The Installer Verifies
+
+The hosted installers read the current release manifest, select the matching
+platform artifact, and verify its pinned SHA256 before replacing an install.
+The Bluey updater also verifies the detached signature over `latest.json`.
+
+These checks protect the release download path. They do not imply macOS
+notarization, Windows Authenticode signing, or support for a platform that is
+not listed in the manifest.
+
+## First Run
+
+`bluey on` opens the compact Bluey overlay. The overlay is the normal product
+surface; no additional terminal commands are required for listening, attaching
+context, asking, or changing settings.
+
+Sign-in enables managed answers and account balance. It does not turn cloud
+session sync on. Cloud sync is off by default on new installs and can be enabled
+separately in desktop Settings.
+
+Listening and screen analysis have visible controls. Supported desktop paths
+request capture exclusion for the overlay, but users should test their meeting
+app before sharing because capture exclusion is best effort rather than a
+security boundary.
+
+## Update
+
+Bluey checks the signed release manifest during normal startup. To install the
+latest listed build manually, run:
 
 ```bash
-xattr -d com.apple.quarantine /usr/local/lib/bluey/0.1.0/bin/*
+bluey update
 ```
 
-If you `curl` the archive from a terminal, quarantine is typically not
-attached, but this is not a guaranteed bypass — it depends on the network
-client and macOS version. Validate behaviour on a clean machine before
-distributing internally.
+## Support
 
-We will revisit signing + notarization once we are ready to publish a
-public release outside our internal distribution.
-
-## Running
+If installation or first run fails:
 
 ```bash
-# Start the daemon
-bluey-daemon &
-
-# Use the CLI
-bluey on --title "My meeting"
-bluey off
+bluey support
 ```
 
-The dashboard (`bluey-dashboard`) is a developer tool and is **not** part of
-the v0.1.0 distribution. It will be reintroduced in a later release once it
-has been bundled and signed properly.
-
-## Auto-Update
-
-There is no auto-update mechanism in v0.1.0. Future releases will document
-the upgrade path explicitly.
+That command creates a redacted support bundle for `hello@bluey.sh`. For a
+local setup report without creating a bundle, `bluey doctor` remains available
+as a diagnostic command even though it is not shown in normal customer help.
 
 ## Uninstall
 
+Remove Bluey from the current device with:
+
 ```bash
-rm /usr/local/bin/bluey /usr/local/bin/bluey-daemon
-rm -rf /usr/local/lib/bluey
+bluey uninstall
 ```
 
-User data lives under `~/Library/Application Support/bluey/`; remove it
-manually if you want a fully clean uninstall.
+The default uninstall preserves local account tokens, settings, sessions, and
+logs. To remove those local data files too, use the explicit destructive option:
 
-## Other platforms
+```bash
+bluey uninstall --purge-data
+```
 
-Intel Macs, Linux, and Windows are tracked as future work:
-
-- macOS x86_64 (Intel): cross-compile + smoke-test on a clean Intel Mac.
-- Linux x86_64: cross-compile + audio capture validation on Linux.
-- Windows x86_64: blocked on the Windows whisper.cpp port (R12.5 / R13.4)
-  plus end-to-end testing on a clean Windows machine.
-
-When those land, this document will be updated. Until then, please do not
-treat the older multi-platform install instructions as a support promise.
+Cloud account deletion is separate and is available from the account surface.
+Review unused balance and synced data before deleting an account.

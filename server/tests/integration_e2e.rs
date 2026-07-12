@@ -2094,6 +2094,253 @@ async fn account_export_zip_contains_readable_bundle() {
 
 #[tokio::test]
 #[serial]
+async fn artifact_upload_retries_from_durable_outbox_and_is_idempotent() {
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let h = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
+    let email = "durable-object-upload@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let artifact_id = uuid::Uuid::new_v4().to_string();
+    let bytes = b"stable artifact bytes";
+    let hash = bluey_server::object_storage::sha256_hex(bytes);
+    let object_key = format!(
+        "bluey-cloud/accounts/{}/context/{artifact_id}/sha256/{hash}",
+        account.id
+    );
+
+    Mock::given(method("PUT"))
+        .and(path(format!("/bucket/{object_key}")))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    let upload = || {
+        Request::post(format!("/sync/artifacts/{artifact_id}/object"))
+            .header("authorization", format!("Bearer {access}"))
+            .header("content-type", "text/plain")
+            .body(Body::from(bytes.as_slice()))
+            .unwrap()
+    };
+    let resp = h.router.clone().oneshot(upload()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let durable_state: (String, String, i64) = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT u.state, o.state, o.attempt_count
+               FROM object_uploads u
+               JOIN object_storage_outbox o ON o.upload_id = u.id AND o.operation = 'put'
+              WHERE u.account_id = ?1 AND u.logical_id = ?2",
+            rusqlite::params![account.id, artifact_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable_state, ("pending".into(), "retry".into(), 1));
+
+    object_store.reset().await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/bucket/{object_key}")))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    let resp = h.router.clone().oneshot(upload()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = h.router.clone().oneshot(upload()).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "ready retry must skip R2 PUT"
+    );
+
+    let conflicting = Request::post(format!("/sync/artifacts/{artifact_id}/object"))
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "text/plain")
+        .body(Body::from("different bytes"))
+        .unwrap();
+    let resp = h.router.clone().oneshot(conflicting).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let final_state: (String, String, i64, i64) = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT u.state, o.state, d.reserved_bytes, d.reserved_objects
+               FROM object_uploads u
+               JOIN object_storage_outbox o ON o.upload_id = u.id AND o.operation = 'put'
+               JOIN object_upload_daily_usage d ON d.account_id = u.account_id
+              WHERE u.account_id = ?1 AND u.logical_id = ?2",
+            rusqlite::params![account.id, artifact_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        final_state,
+        ("ready".into(), "completed".into(), bytes.len() as i64, 1)
+    );
+
+    object_store.reset().await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/bucket/{object_key}")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    let req = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn audit_upload_requires_owned_session_and_live_billing() {
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let h = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.log_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "logs".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "prod/logs".to_string(),
+            retention_days: 180,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
+    let owner_access = signup_and_login(&h, "audit-owner@example.com", "longenoughpw").await;
+    let other_access = signup_and_login(&h, "audit-other@example.com", "longenoughpw").await;
+    let owner = Account::fetch_by_email(&h.pool, "audit-owner@example.com")
+        .unwrap()
+        .unwrap();
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let batch = json!({
+        "sessions": [{
+            "session_id": session_id,
+            "title": "Audit owner session",
+            "status": "active",
+            "created_at_ms": 1000,
+            "updated_at_ms": 2000
+        }],
+        "cue_responses": [{
+            "response_id": "audit-owner-answer",
+            "session_id": session_id,
+            "kind": "answer",
+            "text": "owned answer",
+            "ts_ms": 1500
+        }]
+    });
+    let req = Request::post("/sync/batch")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {owner_access}"))
+        .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+        .unwrap();
+    assert_eq!(
+        h.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let bundle_id = "audit-owned-bundle";
+    let bundle = br#"{"schema_version":1}"#;
+    let hash = bluey_server::object_storage::sha256_hex(bundle);
+    let key = format!(
+        "prod/logs/accounts/{}/sessions/{session_id}/audit/{bundle_id}/sha256/{hash}.json",
+        owner.id
+    );
+    Mock::given(method("PUT"))
+        .and(path(format!("/logs/{key}")))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    let audit_request = |token: &str, bundle_id: &str| {
+        Request::post(format!("/sync/session-audit/{session_id}/{bundle_id}"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(bundle.as_slice()))
+            .unwrap()
+    };
+    let resp = h
+        .router
+        .clone()
+        .oneshot(audit_request(&other_access, bundle_id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(audit_request(&owner_access, bundle_id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let indexed: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM diagnostic_log_chunks
+              WHERE account_id = ?1 AND session_id = ?2 AND object_key = ?3",
+            rusqlite::params![owner.id, session_id, key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed, 1);
+
+    h.pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE accounts
+                SET billing_restricted = 1, billing_restriction_reason = 'charge.dispute.created'
+              WHERE id = ?1",
+            rusqlite::params![owner.id],
+        )
+        .unwrap();
+    let resp = h
+        .router
+        .clone()
+        .oneshot(audit_request(&owner_access, "blocked-bundle"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+#[serial]
 async fn delete_account_deletes_artifact_objects_before_account_rows() {
     let object_store = MockServer::start().await;
     let endpoint = object_store.uri();
@@ -2742,6 +2989,100 @@ async fn billing_stripe_dispute_restricts_account_and_revokes_remaining_credit()
     assert_eq!(row.2, 0);
     assert!(row.3.is_none());
     assert!(row.4.unwrap().contains("charge.dispute.created"));
+}
+
+#[tokio::test]
+#[serial]
+async fn billing_stripe_auto_reload_succeeded_webhook_credits_exactly_once() {
+    let h = boot_harness().await;
+    let _access =
+        signup_and_login(&h, "stripe-auto-reload-webhook@example.com", "longenoughpw").await;
+    let account_id: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM accounts WHERE email = ?1",
+            rusqlite::params!["stripe-auto-reload-webhook@example.com"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    h.pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE accounts
+                SET auto_topup_enabled = 1,
+                    auto_topup_threshold_cents = 500,
+                    auto_topup_amount_cents = 1500,
+                    stripe_customer_id = 'cus_auto_webhook',
+                    stripe_payment_method_id = 'pm_auto_webhook'
+              WHERE id = ?1",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+    let attempt = bluey_server::db::stripe_auto_reload::reserve_if_eligible(&h.pool, &account_id)
+        .unwrap()
+        .unwrap();
+    let attempt = bluey_server::db::stripe_auto_reload::attach_payment_intent(
+        &h.pool,
+        &attempt.id,
+        "pi_auto_webhook_1",
+    )
+    .unwrap();
+
+    for event_id in ["evt_auto_webhook_1", "evt_auto_webhook_2"] {
+        let body = serde_json::to_string(&json!({
+            "id": event_id,
+            "type": "payment_intent.succeeded",
+            "data": {
+                "object": {
+                    "id": "pi_auto_webhook_1",
+                    "amount": 1500,
+                    "amount_received": 1500,
+                    "currency": "usd",
+                    "customer": "cus_auto_webhook",
+                    "payment_method": "pm_auto_webhook",
+                    "status": "succeeded",
+                    "latest_charge": "ch_auto_webhook_1",
+                    "metadata": {
+                        "bluey_kind": "auto_topup",
+                        "bluey_auto_reload_version": "v1",
+                        "bluey_auto_reload_attempt_id": attempt.id,
+                        "bluey_account_id": account_id,
+                        "bluey_amount_cents": "1500"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let signature = stripe_signature_for_test("whsec_test_e2e", &body);
+        let request = Request::post("/billing/webhook")
+            .header("Stripe-Signature", signature)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = h.router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let row: (i64, i64, String) = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT a.balance_cents,
+                    (SELECT COUNT(*) FROM credit_batches
+                      WHERE stripe_charge_id = 'stripe:pi_auto_webhook_1'),
+                    r.status
+               FROM accounts a
+               JOIN stripe_auto_reload_attempts r ON r.account_id = a.id
+              WHERE a.id = ?1",
+            rusqlite::params![account_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (1500, 1, "succeeded".to_string()));
 }
 
 #[tokio::test]

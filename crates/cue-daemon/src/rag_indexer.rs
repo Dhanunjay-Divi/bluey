@@ -2,8 +2,9 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use cue_cloud_client::TokenStore;
 use cue_core::{app_paths::AppPaths, load_account, new_request_id, ContextArtifact, MeetingRecord};
-use cue_rag::{EmbeddingError, EmbeddingProvider};
+use cue_rag::{EmbeddingError, EmbeddingProvider, RagScope};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -11,6 +12,7 @@ use crate::storage::MeetingStore;
 
 const MANAGED_EMBED_DIM: usize = cue_rag::embedder::OpenAiEmbedder::DIM;
 const MAX_MANAGED_EMBED_INPUT_CHARS: usize = 8_192;
+const LOCAL_RAG_ACCOUNT_ID: &str = "__bluey_local_account__";
 
 struct ManagedBlueyEmbedder {
     client: cue_cloud_client::CloudClient,
@@ -114,6 +116,7 @@ fn validate_managed_vectors(
 pub(crate) struct RagIndexCoordinator {
     pipeline: Arc<RwLock<Option<Arc<crate::db::rag::RagPipeline>>>>,
     session_lock: Arc<Mutex<()>>,
+    paths: AppPaths,
 }
 
 impl RagIndexCoordinator {
@@ -121,27 +124,54 @@ impl RagIndexCoordinator {
         Self {
             pipeline: Arc::new(RwLock::new(init_rag_pipeline(paths))),
             session_lock: Arc::new(Mutex::new(())),
+            paths: paths.clone(),
         }
     }
 
     pub(crate) fn refresh_from_paths(&self, paths: &AppPaths) -> bool {
-        if self.pipeline().is_some() {
+        let desired_scope = match current_rag_scope(paths) {
+            Ok(scope) => scope,
+            Err(error) => {
+                warn!(error = %error, "failed to resolve current RAG account scope");
+                None
+            }
+        };
+        let existing_scope = match self.pipeline.read() {
+            Ok(guard) => guard.as_ref().map(|pipeline| pipeline.scope().clone()),
+            Err(_) => {
+                warn!("failed to acquire RAG pipeline lock for refresh");
+                return false;
+            }
+        };
+        if existing_scope == desired_scope {
             return false;
         }
 
-        let Some(pipeline) = init_rag_pipeline(paths) else {
-            return false;
+        let mut replacement = desired_scope
+            .as_ref()
+            .and_then(|_| init_rag_pipeline(paths));
+        let confirmed_scope = current_rag_scope(paths).ok().flatten();
+        if replacement.as_ref().map(|pipeline| pipeline.scope()) != confirmed_scope.as_ref() {
+            replacement = None;
         };
 
         let Ok(mut guard) = self.pipeline.write() else {
             warn!("failed to acquire RAG pipeline lock for refresh");
             return false;
         };
-        if guard.is_some() {
+        let stored_scope = guard.as_ref().map(|pipeline| pipeline.scope().clone());
+        let replacement_scope = replacement
+            .as_ref()
+            .map(|pipeline| pipeline.scope().clone());
+        if stored_scope == replacement_scope {
             return false;
         }
-        *guard = Some(pipeline);
-        info!("RAG pipeline enabled after Bluey account link");
+        *guard = replacement;
+        if replacement_scope.is_some() {
+            info!("RAG pipeline refreshed for current account scope");
+        } else {
+            info!("RAG pipeline cleared after authentication change");
+        }
         true
     }
 
@@ -156,7 +186,11 @@ impl RagIndexCoordinator {
         let session_lock = Arc::clone(&self.session_lock);
         tokio::spawn(async move {
             let _guard = session_lock.lock().await;
-            if !session_still_exists(&store, &session_id, "RAG transcript index") {
+            if !session_still_exists(&store, &session_id, rag.scope(), "RAG transcript index") {
+                return;
+            }
+            if let Err(error) = rag.claim_legacy_session(&session_id).await {
+                warn!(session_id = %session_id, error = %error, "failed to claim legacy RAG rows before transcript index");
                 return;
             }
             rag.index_transcript(&session_id, &text).await;
@@ -179,7 +213,11 @@ impl RagIndexCoordinator {
         let session_lock = Arc::clone(&self.session_lock);
         tokio::spawn(async move {
             let _guard = session_lock.lock().await;
-            if !session_still_exists(&store, &session_id, "RAG artifact index") {
+            if !session_still_exists(&store, &session_id, rag.scope(), "RAG artifact index") {
+                return;
+            }
+            if let Err(error) = rag.claim_legacy_session(&session_id).await {
+                warn!(session_id = %session_id, error = %error, "failed to claim legacy RAG rows before artifact index");
                 return;
             }
             for artifact in artifacts {
@@ -223,11 +261,20 @@ impl RagIndexCoordinator {
         let Some(rag) = self.pipeline() else {
             return Ok((Vec::new(), Vec::new()));
         };
-        rag.query_current_and_global(query_text, current_limit, current_session_id, global_limit)
-            .await
+        let query_scope = rag.scope().clone();
+        let results = rag
+            .query_current_and_global(query_text, current_limit, current_session_id, global_limit)
+            .await?;
+        if current_rag_scope(&self.paths).ok().flatten().as_ref() != Some(&query_scope) {
+            self.refresh_from_paths(&self.paths);
+            debug!("discarding RAG query results after account scope changed");
+            return Ok((Vec::new(), Vec::new()));
+        }
+        Ok(results)
     }
 
     fn pipeline(&self) -> Option<Arc<crate::db::rag::RagPipeline>> {
+        self.refresh_from_paths(&self.paths);
         match self.pipeline.read() {
             Ok(guard) => guard.clone(),
             Err(_) => {
@@ -238,13 +285,22 @@ impl RagIndexCoordinator {
     }
 }
 
-fn session_still_exists(store: &MeetingStore, session_id: &str, action: &'static str) -> bool {
+fn session_still_exists(
+    store: &MeetingStore,
+    session_id: &str,
+    scope: &RagScope,
+    action: &'static str,
+) -> bool {
     let Ok(session_uuid) = uuid::Uuid::parse_str(session_id) else {
         warn!(session_id = %session_id, action, "skipping RAG work for invalid session id");
         return false;
     };
     match store.load_by_id(session_uuid) {
-        Ok(Some(_)) => true,
+        Ok(Some(meeting)) if meeting_belongs_to_rag_scope(&meeting, scope) => true,
+        Ok(Some(_)) => {
+            warn!(session_id = %session_id, action, "skipping RAG work for a session owned by another account");
+            false
+        }
         Ok(None) => {
             debug!(session_id = %session_id, action, "skipping RAG work for deleted session");
             false
@@ -253,6 +309,19 @@ fn session_still_exists(store: &MeetingStore, session_id: &str, action: &'static
             warn!(session_id = %session_id, action, error = %error, "skipping RAG work after session lookup failed");
             false
         }
+    }
+}
+
+fn meeting_belongs_to_rag_scope(meeting: &MeetingRecord, scope: &RagScope) -> bool {
+    let owner_account_id = meeting
+        .owner_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty());
+    if scope.account_id() == LOCAL_RAG_ACCOUNT_ID {
+        owner_account_id.is_none()
+    } else {
+        owner_account_id == Some(scope.account_id())
     }
 }
 
@@ -265,7 +334,11 @@ async fn rebuild_meeting_rag_index(
 ) {
     let _guard = session_lock.lock().await;
     let session_id = meeting.id.to_string();
-    if !session_still_exists(&store, &session_id, reason) {
+    if !session_still_exists(&store, &session_id, rag.scope(), reason) {
+        return;
+    }
+    if let Err(error) = rag.claim_legacy_session(&session_id).await {
+        warn!(session_id = %session_id, reason, error = %error, "failed to claim legacy RAG rows before rebuild");
         return;
     }
     if let Err(error) = rag.delete_session(&session_id).await {
@@ -313,22 +386,35 @@ async fn rebuild_meeting_rag_index(
 /// on `bluey-server`. Direct OpenAI embedding remains an explicit development
 /// fallback only.
 fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline>> {
-    let embedder = match managed_embedder(paths) {
-        Ok(Some(embedder)) => embedder,
-        Ok(None) => match dev_openai_embedder() {
-            Some(embedder) => embedder,
-            None => {
-                info!("RAG pipeline disabled: link a Bluey account for managed embeddings");
-                return None;
-            }
-        },
+    let scope = match current_rag_scope(paths) {
+        Ok(Some(scope)) => scope,
+        Ok(None) => {
+            info!("RAG pipeline disabled: link a Bluey account for managed embeddings");
+            return None;
+        }
         Err(error) => {
-            warn!("managed RAG embedder unavailable: {error:#}");
-            dev_openai_embedder()?
+            warn!("RAG account scope unavailable: {error:#}");
+            return None;
         }
     };
+    let embedder = if scope.account_id() == LOCAL_RAG_ACCOUNT_ID {
+        dev_openai_embedder()?
+    } else {
+        match managed_embedder(paths) {
+            Ok(Some(embedder)) => embedder,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!("managed RAG embedder unavailable: {error:#}");
+                dev_openai_embedder()?
+            }
+        }
+    };
+    if current_rag_scope(paths).ok().flatten().as_ref() != Some(&scope) {
+        debug!("RAG account scope changed during pipeline initialization");
+        return None;
+    }
     let store_path = paths.data_dir.join("rag_vectors.db");
-    match crate::db::rag::RagPipeline::new(store_path, embedder) {
+    match crate::db::rag::RagPipeline::new(store_path, embedder, scope) {
         Ok(pipeline) => {
             info!("RAG pipeline initialized");
             Some(Arc::new(pipeline))
@@ -340,10 +426,61 @@ fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline
     }
 }
 
+fn current_rag_scope(paths: &AppPaths) -> anyhow::Result<Option<RagScope>> {
+    if let Some(scope) = managed_account_scope(paths)? {
+        return Ok(Some(scope));
+    }
+    if dev_openai_api_key().is_some() {
+        return Ok(Some(local_rag_scope()));
+    }
+    Ok(None)
+}
+
+fn managed_account_scope(paths: &AppPaths) -> anyhow::Result<Option<RagScope>> {
+    let Some(account) = load_account(paths)? else {
+        return Ok(None);
+    };
+    if account.provider.trim() != "bluey" {
+        return Ok(None);
+    }
+    let Some(tokens) = cue_cloud_client::SecureAccountStore::new(paths.clone()).load()? else {
+        return Ok(None);
+    };
+    let account_user_id = account.user_id.trim();
+    let token_user_id = tokens.email.trim();
+    anyhow::ensure!(
+        account_user_id.is_empty() || token_user_id.is_empty() || account_user_id == token_user_id,
+        "RAG account profile does not match stored credentials"
+    );
+    Ok(Some(rag_scope_for_account(&account)?))
+}
+
+fn rag_scope_for_account(account: &cue_core::AccountConfig) -> anyhow::Result<RagScope> {
+    let account_id = account
+        .cloud_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
+        .or_else(|| {
+            let user_id = account.user_id.trim();
+            (!user_id.is_empty() && user_id != "local-user").then_some(user_id)
+        })
+        .ok_or_else(|| anyhow::anyhow!("linked Bluey account has no stable account id"))?;
+    RagScope::new(account_id, Some(account.workspace_id.as_str()))
+}
+
+fn local_rag_scope() -> RagScope {
+    RagScope::new(LOCAL_RAG_ACCOUNT_ID, Some("default"))
+        .expect("local RAG scope constants must be valid")
+}
+
 fn managed_embedder(paths: &AppPaths) -> anyhow::Result<Option<Arc<dyn EmbeddingProvider>>> {
     let Some(account) = load_account(paths)? else {
         return Ok(None);
     };
+    if account.provider.trim() != "bluey" || managed_account_scope(paths)?.is_none() {
+        return Ok(None);
+    }
 
     let base_url = std::env::var("BLUEY_CLOUD_API_URL")
         .or_else(|_| std::env::var("CUE_CLOUD_API_URL"))
@@ -364,17 +501,20 @@ fn managed_embedder(paths: &AppPaths) -> anyhow::Result<Option<Arc<dyn Embedding
 }
 
 fn dev_openai_embedder() -> Option<Arc<dyn EmbeddingProvider>> {
-    if !dev_env_truthy("BLUEY_DEV_BYOK") {
-        return None;
-    }
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .ok()
-        .filter(|key| !key.trim().is_empty())
-        .or_else(|| crate::secrets::load_api_key("openai").ok().flatten());
-    api_key.map(|api_key| {
+    dev_openai_api_key().map(|api_key| {
         warn!("RAG using direct OpenAI embeddings from local developer configuration");
         Arc::new(cue_rag::embedder::OpenAiEmbedder::new(api_key)) as Arc<dyn EmbeddingProvider>
     })
+}
+
+fn dev_openai_api_key() -> Option<String> {
+    if !dev_env_truthy("BLUEY_DEV_BYOK") {
+        return None;
+    }
+    std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| crate::secrets::load_api_key("openai").ok().flatten())
 }
 
 fn bounded_embed_input(text: &str) -> String {
@@ -465,6 +605,18 @@ mod tests {
         }
     }
 
+    fn linked_account(account_id: &str, user_id: &str, workspace_id: &str) -> AccountConfig {
+        let mut account = AccountConfig::local();
+        account.provider = "bluey".to_string();
+        account.api_url = "http://127.0.0.1:8787".to_string();
+        account.cloud_account_id = Some(account_id.to_string());
+        account.user_id = user_id.to_string();
+        account.workspace_id = workspace_id.to_string();
+        account.access_token = Some(format!("access-{account_id}"));
+        account.refresh_token = Some(format!("refresh-{account_id}"));
+        account
+    }
+
     #[test]
     fn managed_embedder_requires_linked_account_token() {
         with_plaintext_token_fallback(|| {
@@ -529,5 +681,54 @@ mod tests {
             assert!(coordinator.pipeline().is_some());
             assert!(!coordinator.refresh_from_paths(&paths));
         });
+    }
+
+    #[test]
+    fn coordinator_swaps_pipeline_on_account_change_and_clears_on_logout() {
+        with_plaintext_token_fallback(|| {
+            let paths = test_paths();
+            paths.ensure().unwrap();
+            save_account(
+                &paths,
+                &linked_account("account-a", "a@example.com", "workspace-a"),
+            )
+            .unwrap();
+
+            let coordinator = RagIndexCoordinator::from_paths(&paths);
+            let pipeline_a = coordinator.pipeline().expect("account A pipeline");
+            assert_eq!(pipeline_a.scope().account_id(), "account-a");
+            assert_eq!(pipeline_a.scope().workspace_id(), Some("workspace-a"));
+
+            save_account(
+                &paths,
+                &linked_account("account-b", "b@example.com", "workspace-b"),
+            )
+            .unwrap();
+            let pipeline_b = coordinator.pipeline().expect("account B pipeline");
+            assert_eq!(pipeline_b.scope().account_id(), "account-b");
+            assert_eq!(pipeline_b.scope().workspace_id(), Some("workspace-b"));
+            assert!(!Arc::ptr_eq(&pipeline_a, &pipeline_b));
+
+            let mut signed_out = linked_account("account-b", "b@example.com", "workspace-b");
+            signed_out.access_token = None;
+            signed_out.refresh_token = None;
+            save_account(&paths, &signed_out).unwrap();
+            assert!(coordinator.pipeline().is_none());
+        });
+    }
+
+    #[test]
+    fn meeting_ownership_must_match_pipeline_account() {
+        let mut meeting = MeetingRecord::new(None);
+        let account_a = RagScope::new("account-a", Some("workspace-a")).unwrap();
+        let account_b = RagScope::new("account-b", Some("workspace-b")).unwrap();
+
+        assert!(meeting_belongs_to_rag_scope(&meeting, &local_rag_scope()));
+        assert!(!meeting_belongs_to_rag_scope(&meeting, &account_a));
+
+        meeting.owner_account_id = Some("account-a".to_string());
+        assert!(meeting_belongs_to_rag_scope(&meeting, &account_a));
+        assert!(!meeting_belongs_to_rag_scope(&meeting, &account_b));
+        assert!(!meeting_belongs_to_rag_scope(&meeting, &local_rag_scope()));
     }
 }

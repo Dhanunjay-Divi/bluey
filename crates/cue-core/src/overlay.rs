@@ -142,6 +142,8 @@ pub enum OverlayEvent {
         mode: Option<String>,
         #[serde(default)]
         visible_context_ids: Vec<uuid::Uuid>,
+        #[serde(default)]
+        answer_current_transcript: bool,
     },
     AttachRequested,
     AttachFilesRequested {
@@ -386,5 +388,36 @@ mod tests {
             serde_json::to_string(&OverlayEvent::SignInRequested).expect("serialize sign-in event");
 
         assert_eq!(json, r#"{"type":"sign_in_requested"}"#);
+    }
+
+    #[test]
+    fn ask_event_defaults_transcript_intent_to_false() {
+        let event: OverlayEvent =
+            serde_json::from_str(r#"{"type":"ask_requested","question":"hello"}"#)
+                .expect("deserialize legacy ask event");
+
+        assert!(matches!(
+            event,
+            OverlayEvent::AskRequested {
+                answer_current_transcript: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ask_event_preserves_explicit_transcript_intent() {
+        let event: OverlayEvent = serde_json::from_str(
+            r#"{"type":"ask_requested","question":"answer this","answer_current_transcript":true}"#,
+        )
+        .expect("deserialize transcript ask event");
+
+        assert!(matches!(
+            event,
+            OverlayEvent::AskRequested {
+                answer_current_transcript: true,
+                ..
+            }
+        ));
     }
 }

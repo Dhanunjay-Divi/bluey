@@ -1,13 +1,13 @@
 # Bluey
 
-Bluey is a private desktop AI copilot for engineering meetings and live technical work.
+Bluey is a consent-first live-context assistant for engineering meetings and technical work.
 
 ## Product Summary
 
 Bluey helps users ask questions from the context already around their work:
 live conversation, transcripts, screen context, attached files, documents,
-code, saved session memory, and project notes. Bluey is terminal-first: install
-it, run `bluey on`, and use the desktop overlay when live context is needed.
+code, saved session memory, and project notes. Install it, run `bluey on`, then
+use the desktop overlay for normal work.
 
 Bluey is not positioned as a meeting recorder or generic chatbot. The intended
 use case is source-aware help during technical work: design reviews, planning,
@@ -34,6 +34,13 @@ and document-heavy work sessions.
 - Bluey should be used only for work context the user is authorized to capture,
   upload, or analyze.
 - Capture and listening are tied to visible user controls.
+- Cloud session sync is off by default on new installs and requires an explicit
+  Settings choice.
+- Bluey does not retain a raw-audio library in the current release.
+- Submitted customer content is not used to train or fine-tune models.
+- Auto Reload is opt-in and requires an approved saved card, threshold, and amount.
+- Capture exclusion is best effort and is not an invisibility guarantee or a
+  security boundary.
 - Managed cloud credentials are not stored in the desktop app.
 - Account-scoped saved sessions support export and deletion workflows.
 - Bluey should not be described as a way to bypass rules, proctoring, security
@@ -60,9 +67,8 @@ and document-heavy work sessions.
 
 ## Suggested Short Description
 
-Bluey is a private desktop copilot that listens to live work, reads approved
-context, and answers from your meeting, screen, files, code, docs, and project
-memory.
+Bluey is a consent-first desktop assistant that answers from the conversation,
+screen, files, code, docs, and project memory you approve.
 
 ## Suggested Category
 

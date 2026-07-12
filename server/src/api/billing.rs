@@ -7,7 +7,7 @@
 //!   - POST /billing/square/webhook: validates Square signatures and
 //!     credits balance only for completed Bluey reload payments.
 //!   - POST /billing/webhook: validates Stripe signatures and credits
-//!     only completed Stripe Checkout sessions with a PaymentIntent id.
+//!     completed Checkout sessions plus durable Auto Reload PaymentIntents.
 //!   - POST /billing/square/card: saves a Square card-on-file token for
 //!     explicit Auto Reload; spendable balance is still credited only
 //!     from successful processor payments.
@@ -28,7 +28,7 @@ use crate::billing::policy::{
     is_internal_or_test_billing_account, INTERNAL_TEST_BILLING_BLOCK_MESSAGE,
 };
 use crate::config::BillingProvider;
-use crate::db::{accounts::Account, balance, webhook_events};
+use crate::db::{accounts::Account, balance, stripe_auto_reload, webhook_events};
 
 #[derive(Deserialize)]
 pub struct CheckoutRequest {
@@ -1263,12 +1263,16 @@ pub async fn webhook(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, StatusCode> {
-    if headers.contains_key("x-square-hmacsha256-signature")
-        || matches!(state.config.billing_provider(), BillingProvider::Square)
-    {
+    if headers.contains_key("Stripe-Signature") {
+        return stripe_webhook_impl(state, headers, body).await;
+    }
+    if headers.contains_key("x-square-hmacsha256-signature") {
         return square_webhook_impl(state, headers, body).await;
     }
-    stripe_webhook_impl(state, headers, body).await
+    match state.config.billing_provider() {
+        BillingProvider::Stripe => stripe_webhook_impl(state, headers, body).await,
+        BillingProvider::Square => square_webhook_impl(state, headers, body).await,
+    }
 }
 
 pub async fn square_webhook(
@@ -1317,12 +1321,46 @@ async fn stripe_webhook_impl(
     {
         return Ok(StatusCode::OK);
     }
-    let _ = webhook_events::record_received(&state.pool, event_id, event_type, &body);
+    webhook_events::record_received(&state.pool, event_id, event_type, &body).map_err(|error| {
+        tracing::error!(error = %error, event_id, "failed to persist Stripe webhook");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     if event_type == "checkout.session.completed" {
         if let Err(e) = handle_checkout_completed(&state, &event).await {
             tracing::error!(error = %e, event_id, "checkout.session.completed handler failed");
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+    if matches!(
+        event_type,
+        "payment_intent.succeeded"
+            | "payment_intent.payment_failed"
+            | "payment_intent.requires_action"
+            | "payment_intent.canceled"
+            | "payment_intent.processing"
+    ) {
+        match crate::billing::topup::handle_stripe_payment_intent_event(
+            &state.pool,
+            event_type,
+            event_id,
+            &event,
+        ) {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                event_id,
+                event_type,
+                "Stripe PaymentIntent event is unrelated to Auto Reload"
+            ),
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    event_id,
+                    event_type,
+                    "Stripe Auto Reload PaymentIntent handler failed"
+                );
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
         }
     }
     if is_billing_risk_event(event_type) {
@@ -1334,7 +1372,10 @@ async fn stripe_webhook_impl(
         }
     }
 
-    let _ = webhook_events::mark_processed(&state.pool, event_id);
+    webhook_events::mark_processed(&state.pool, event_id).map_err(|error| {
+        tracing::error!(error = %error, event_id, "failed to mark Stripe webhook processed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(StatusCode::OK)
 }
@@ -1641,7 +1682,62 @@ async fn handle_processor_risk_event(
     event_id: &str,
     event: &serde_json::Value,
 ) -> Result<()> {
-    let payment_id = processor_payment_id_from_risk_event(provider, event);
+    let mut payment_id = processor_payment_id_from_risk_event(provider, event);
+    let stripe_charge_id = (provider == "stripe")
+        .then(|| stripe_charge_id_from_risk_event(event_type, event))
+        .flatten();
+    if provider == "stripe" {
+        if payment_id.is_none() {
+            if let Some(charge_id) = stripe_charge_id.as_deref() {
+                if let Some(attempt) = stripe_auto_reload::find_by_charge(&state.pool, charge_id)? {
+                    payment_id = attempt.stripe_payment_intent_id;
+                } else {
+                    let stripe_key = state
+                        .config
+                        .stripe_secret_key
+                        .as_deref()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Stripe risk event requires charge reconciliation but STRIPE_SECRET_KEY is missing"
+                            )
+                        })?;
+                    payment_id =
+                        fetch_payment_intent_for_stripe_charge(stripe_key, charge_id).await?;
+                }
+            }
+        }
+
+        let attempt = if let Some(payment_intent_id) = payment_id.as_deref() {
+            stripe_auto_reload::find_by_payment_intent(&state.pool, payment_intent_id)?
+        } else if let Some(charge_id) = stripe_charge_id.as_deref() {
+            stripe_auto_reload::find_by_charge(&state.pool, charge_id)?
+        } else {
+            None
+        };
+        if let Some(attempt) = attempt {
+            let reversed = stripe_auto_reload::reverse_and_restrict(
+                &state.pool,
+                &attempt.id,
+                event_type,
+                event_id,
+            )?;
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&reversed.account_id),
+                event_type,
+                event_id,
+                stripe_payment_intent_id = attempt
+                    .stripe_payment_intent_id
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                stripe_charge_id = stripe_charge_id.as_deref().unwrap_or("unknown"),
+                revoked_cents = reversed.revoked_cents,
+                already_reversed = reversed.already_reversed,
+                "Stripe Auto Reload reversed and billing restricted"
+            );
+            return Ok(());
+        }
+    }
+
     let account_id = direct_account_id_from_event(event).or_else(|| {
         payment_id.as_deref().and_then(|payment_id| {
             crate::db::accounts::Account::account_id_for_processor_payment(
@@ -1686,6 +1782,41 @@ async fn handle_processor_risk_event(
         "account billing restricted from processor risk event"
     );
     Ok(())
+}
+
+fn stripe_charge_id_from_risk_event(event_type: &str, event: &serde_json::Value) -> Option<String> {
+    let nested = ["/data/object/charge", "/data/object/charge/id"]
+        .into_iter()
+        .find_map(|pointer| event.pointer(pointer).and_then(stripe_id_value));
+    if nested.is_some() {
+        return nested;
+    }
+    if event_type == "charge.refunded" {
+        return event.pointer("/data/object/id").and_then(stripe_id_value);
+    }
+    None
+}
+
+async fn fetch_payment_intent_for_stripe_charge(
+    stripe_key: &str,
+    charge_id: &str,
+) -> Result<Option<String>> {
+    let path = format!("/v1/charges/{charge_id}");
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("build Stripe risk reconciliation client")?
+        .get(stripe_api_url(&path))
+        .basic_auth(stripe_key, Some(""))
+        .send()
+        .await
+        .context("retrieve Stripe charge for risk reconciliation")?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        return Err(anyhow!("Stripe charge reconciliation returned {status}"));
+    }
+    Ok(body.get("payment_intent").and_then(stripe_id_value))
 }
 
 fn direct_account_id_from_event(event: &serde_json::Value) -> Option<String> {
@@ -2077,6 +2208,36 @@ mod tests {
         assert!(!safe.contains("pi_secret_123"));
         assert!(!safe.contains("pm_secret"));
         assert!(safe.contains("<redacted>"));
+    }
+
+    #[test]
+    fn stripe_risk_events_resolve_charge_ids_for_reconciliation() {
+        let dispute = serde_json::json!({
+            "type": "charge.dispute.created",
+            "data": {"object": {"id": "dp_1", "charge": "ch_disputed"}}
+        });
+        assert_eq!(
+            stripe_charge_id_from_risk_event("charge.dispute.created", &dispute).as_deref(),
+            Some("ch_disputed")
+        );
+
+        let refund = serde_json::json!({
+            "type": "refund.created",
+            "data": {"object": {"id": "re_1", "charge": {"id": "ch_refunded"}}}
+        });
+        assert_eq!(
+            stripe_charge_id_from_risk_event("refund.created", &refund).as_deref(),
+            Some("ch_refunded")
+        );
+
+        let charge_refunded = serde_json::json!({
+            "type": "charge.refunded",
+            "data": {"object": {"id": "ch_direct"}}
+        });
+        assert_eq!(
+            stripe_charge_id_from_risk_event("charge.refunded", &charge_refunded).as_deref(),
+            Some("ch_direct")
+        );
     }
 
     #[test]

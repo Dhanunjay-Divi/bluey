@@ -419,7 +419,14 @@ impl MeetingRecord {
     }
 
     pub fn mark_live_transcript_answered(&mut self) {
-        self.live_answer_transcript_cursor = self.transcript.len();
+        self.mark_live_transcript_answered_through(self.transcript.len());
+    }
+
+    /// Marks only the transcript prefix that was included in an answer.
+    /// Segments arriving while the answer is streaming remain available for
+    /// the next Answer request instead of being consumed accidentally.
+    pub fn mark_live_transcript_answered_through(&mut self, segment_count: usize) {
+        self.live_answer_transcript_cursor = segment_count.min(self.transcript.len());
     }
 
     fn transcript_text_bounded_from(
@@ -617,6 +624,29 @@ mod tests {
         assert!(meeting
             .unanswered_live_transcript_text_bounded(8, 1_000)
             .is_empty());
+    }
+
+    #[test]
+    fn live_answer_cursor_does_not_consume_speech_arriving_during_generation() {
+        let mut meeting = MeetingRecord::new(Some("Live answer boundary".to_string()));
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "question included in the request",
+            true,
+        ));
+        let request_high_water_mark = meeting.transcript.len();
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "follow-up spoken while Bluey was answering",
+            true,
+        ));
+
+        meeting.mark_live_transcript_answered_through(request_high_water_mark);
+
+        assert!(meeting.has_unanswered_live_transcript());
+        let remaining = meeting.unanswered_live_transcript_text_bounded(8, 1_000);
+        assert!(!remaining.contains("included in the request"));
+        assert!(remaining.contains("while Bluey was answering"));
     }
 
     #[test]

@@ -1,5 +1,10 @@
 # Production Readiness
 
+> Historical `0.1.0` readiness snapshot. It is not the current go/no-go report
+> or support matrix. The July 12, 2026 public manifest reports `0.1.99` with
+> macOS Apple silicon and Windows x86-64 artifacts. Current trust and install
+> claims live in `README.md`, `INSTALL.md`, and `SETTINGS-UI-CONTRACT.md`.
+
 This is the current source of truth for what Bluey can honestly ship, what is
 implemented locally, and what remains before a paid cloud product launch.
 

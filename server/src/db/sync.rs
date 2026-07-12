@@ -378,6 +378,13 @@ fn upsert_batch_sqlite(
                 metadata,
             ],
         )?;
+        crate::db::object_uploads::link_artifact_session_sqlite_tx(
+            &tx,
+            account_id,
+            &record.artifact_id,
+            &record.session_id,
+            now_ms(),
+        )?;
     }
 
     for record in rag_chunks {
@@ -654,6 +661,13 @@ fn upsert_batch_postgres(
                 record.artifact_id, record.session_id
             )
         })?;
+        crate::db::object_uploads::link_artifact_session_postgres_tx(
+            &mut tx,
+            account_id,
+            &record.artifact_id,
+            &record.session_id,
+            now_ms(),
+        )?;
     }
 
     for record in rag_chunks {
@@ -819,9 +833,10 @@ fn list_deleted_sessions_postgres(
 }
 
 fn tombstone_session_sqlite(pool: &DbPool, account_id: &str, session_id: &str) -> Result<()> {
-    let conn = pool.get().context("get db conn")?;
+    let mut conn = pool.get().context("get db conn")?;
+    let tx = conn.transaction().context("begin session tombstone tx")?;
     let now = now_ms();
-    conn.execute(
+    tx.execute(
         "INSERT INTO cloud_sessions (
             account_id, session_id, title, status, created_at_ms, updated_at_ms,
             last_active_at_ms, answer_style, metadata_json, deleted_at_ms
@@ -842,16 +857,23 @@ fn tombstone_session_sqlite(pool: &DbPool, account_id: &str, session_id: &str) -
             now,
         ],
     )?;
+    crate::db::object_uploads::schedule_session_cleanup_sqlite_tx(
+        &tx, account_id, session_id, now,
+    )?;
+    tx.commit().context("commit session tombstone tx")?;
     Ok(())
 }
 
 fn tombstone_session_postgres(pool: &DbPool, account_id: &str, session_id: &str) -> Result<()> {
     let mut conn = pool.get_pg().context("get postgres db conn")?;
+    let mut tx = conn
+        .transaction()
+        .context("begin postgres session tombstone tx")?;
     let now = now_ms();
     let title = db_text("Deleted session");
     let status = db_text("deleted");
     let metadata = "{}".to_string();
-    conn.execute(
+    tx.execute(
         "INSERT INTO cloud_sessions (
             account_id, session_id, title, status, created_at_ms, updated_at_ms,
             last_active_at_ms, answer_style, metadata_json, deleted_at_ms
@@ -873,6 +895,11 @@ fn tombstone_session_postgres(pool: &DbPool, account_id: &str, session_id: &str)
         ],
     )
     .with_context(|| format!("tombstone cloud_sessions session_id={session_id}"))?;
+    crate::db::object_uploads::schedule_session_cleanup_postgres_tx(
+        &mut tx, account_id, session_id, now,
+    )?;
+    tx.commit()
+        .context("commit postgres session tombstone tx")?;
     Ok(())
 }
 
@@ -1846,5 +1873,112 @@ mod tests {
             list_deleted_sessions(&pool, account_id, 10).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn artifact_upload_is_linked_and_delete_is_enqueued_with_session_tombstone() {
+        use crate::db::object_uploads::{
+            mark_upload_ready, reserve_upload, NewObjectUpload, ObjectKind, StorageScope,
+        };
+        use crate::object_storage::{sha256_hex, UploadLimits};
+
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_object_delete";
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let artifact_id = uuid::Uuid::new_v4().to_string();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                rusqlite::params![account_id, "objects@example.com", "hash"],
+            )
+            .unwrap();
+
+        let created_at_ms = now_ms();
+        let hash = sha256_hex("artifact bytes");
+        let reservation = reserve_upload(
+            &pool,
+            &NewObjectUpload {
+                account_id: account_id.into(),
+                object_kind: ObjectKind::Artifact,
+                logical_id: artifact_id.clone(),
+                session_id: None,
+                storage_scope: StorageScope::Artifact,
+                object_key: format!("objects/accounts/{account_id}/{artifact_id}/{hash}"),
+                size_bytes: 14,
+                sha256: hash,
+                content_type: "text/plain".into(),
+                expires_at_ms: created_at_ms + 86_400_000,
+                metadata_json: serde_json::json!({}),
+                now_ms: created_at_ms,
+                limits: UploadLimits {
+                    max_object_bytes: 100,
+                    max_account_bytes: 1_000,
+                    max_daily_bytes: 1_000,
+                    max_account_objects: 10,
+                },
+            },
+        )
+        .unwrap();
+        mark_upload_ready(&pool, &reservation.upload.id, created_at_ms + 1).unwrap();
+
+        upsert_batch(
+            &pool,
+            account_id,
+            &[SyncSessionRecord {
+                session_id: session_id.clone(),
+                title: "Object session".into(),
+                status: "active".into(),
+                created_at_ms,
+                updated_at_ms: created_at_ms,
+                last_active_at_ms: None,
+                answer_style: None,
+                metadata: serde_json::json!({}),
+                deleted_at_ms: None,
+            }],
+            &[],
+            &[],
+            &[SyncContextArtifactRecord {
+                artifact_id: artifact_id.clone(),
+                session_id: session_id.clone(),
+                kind: "document".into(),
+                title: "Document".into(),
+                note: None,
+                source_uri: None,
+                content_hash: None,
+                text_preview: None,
+                created_at_ms,
+                metadata: serde_json::json!({}),
+            }],
+            &[],
+        )
+        .unwrap();
+        let linked_session: Option<String> = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT session_id FROM object_uploads WHERE id = ?1",
+                rusqlite::params![reservation.upload.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked_session.as_deref(), Some(session_id.as_str()));
+
+        tombstone_session(&pool, account_id, &session_id).unwrap();
+        let lifecycle: (String, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT u.state, o.state
+                   FROM object_uploads u
+                   JOIN object_storage_outbox o
+                     ON o.upload_id = u.id AND o.operation = 'delete'
+                  WHERE u.id = ?1",
+                rusqlite::params![reservation.upload.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, ("delete_pending".into(), "pending".into()));
     }
 }

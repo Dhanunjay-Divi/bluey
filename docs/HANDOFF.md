@@ -1,5 +1,9 @@
 # Bluey Handoff
 
+> Historical implementation handoff. Its `0.1.0` packaging statements are not
+> current release claims. The public `0.1.99` manifest lists macOS Apple silicon
+> and Windows x86-64 artifacts.
+
 This document is the quick-start map for the next agent or engineer picking up Bluey.
 
 ## Product Shape

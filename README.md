@@ -1,129 +1,144 @@
 # Bluey
 
-Bluey is a lightweight native AI work copilot. This repo is starting from a clean Rust/native foundation, using the reference packages in this folder as architectural inspiration.
+Bluey is a consent-first live-context assistant for engineering meetings and
+technical work. Its native desktop overlay can answer from the conversation,
+screen context, files, code, and saved project context that the user chooses.
 
-Product direction: Bluey is a commercial managed-cloud product, not an open-source/BYOK clone. The current v0.1.0 track is a macOS arm64, local-first terminal distribution with a native overlay and bundled helpers. Managed cloud sync, managed provider routing, cloud RAG, billing, and workspace controls remain the paid-product path.
+Bluey is not positioned as covert, undetectable, or a way to bypass workplace,
+assessment, security, or consent rules.
 
-Current shape:
+## Current Release
 
-- `bluey` CLI: terminal-first lifecycle (`bluey on` / `bluey off`) plus
-  hidden support/admin commands for diagnostics and automation.
-- `bluey-daemon`: local background process and IPC server.
-- `cue-core`: shared protocol, cards, state, paths.
-- `native/macos/cue-overlay`: AppKit overlay sidecar, excluded from screen capture with `NSWindow.sharingType = .none`; compact pill-first startup, click-to-open feed/composer, tokenized IPC, attach/instructions/recap/ask events, and opacity controls.
-- `native/windows/cue-overlay`: Win32 overlay sidecar source with Direct2D rendering and capture-exclusion work, kept for the Windows parity round. Windows is not shipped in v0.1.0 until hardware QA and Windows whisper.cpp are complete.
+The public signed release manifest at `https://bluey.sh/latest.json` currently
+reports `0.1.99`, released July 11, 2026 UTC.
 
-## Build
+| Platform | Current public artifact |
+| --- | --- |
+| macOS | Apple silicon (`darwin-arm64`) |
+| Windows | x86-64; install-smoked on Windows 11 |
+| macOS Intel/universal | Not listed in the current manifest |
+| Linux | Not listed in the current manifest |
+
+The installers verify the signed release manifest and checksum-pinned artifact
+before installing. This is a distribution-integrity statement, not a claim
+that every binary has platform code-signing or notarization.
+
+## Product Contract
+
+- Listening, screen analysis, file attachment, and answering start from visible
+  user controls.
+- Cloud session sync is off by default on new installs and remains separate
+  from sign-in. It can be changed in desktop Settings.
+- Raw audio is processed transiently for transcription. Bluey does not keep a
+  raw-audio library in the current release; transcript text may be saved.
+- Submitted prompts, transcripts, audio, files, screenshots, and answers are
+  not used to train or fine-tune models.
+- Auto Reload is off until the account owner deliberately enables it and
+  approves a saved card, threshold, and amount.
+- Supported desktop paths request capture exclusion for the overlay. That is a
+  best-effort screen-share privacy control, not an invisibility guarantee or a
+  security boundary.
+
+See `https://bluey.sh/privacy`, `https://bluey.sh/terms`, and
+`https://bluey.sh/docs/disguise` for the public contract.
+
+## Install And Run
+
+macOS on Apple silicon:
+
+```bash
+curl -fsSL https://bluey.sh/install.sh | bash
+bluey on
+```
+
+Windows x86-64 in PowerShell:
+
+```powershell
+irm https://bluey.sh/install.ps1 | iex
+bluey on
+```
+
+`bluey on` starts the desktop overlay, checks for a newer signed release, and
+opens browser sign-in only when managed cloud work needs an account. Use the
+overlay for normal listening, context selection, asking, session history, and
+settings. Stop the product completely with:
+
+```bash
+bluey off
+```
+
+The current visible `bluey help` surface includes lifecycle and maintenance
+commands such as `on`, `off`, `status`, `update`, `usage`, `portal`, and
+`support`. Developer and diagnostic commands remain hidden from normal help.
+
+For support, run `bluey support`; it creates a redacted bundle intended for
+`hello@bluey.sh`.
+
+## Desktop Experience
+
+Bluey starts as a compact pill and expands into the real product surface:
+
+- a chronological conversation and answer feed;
+- visible Mic and System transcript sources;
+- attached file, screen, page, and saved-context indicators;
+- `Auto`, `Quick`, and `Thorough` answer modes;
+- compact answers with a larger canvas for code or detailed work;
+- visible listening, screen-context, and attachment controls;
+- account balance and session controls.
+
+On macOS the global shortcut family uses `Ctrl+Option`; on Windows it uses
+`Ctrl+Alt`. The overlay's keyboard guide is the source of truth for shortcuts,
+so first-run setup does not require memorizing commands or key combinations.
+
+## Development
+
+Build the Rust workspace and the macOS native helpers:
 
 ```bash
 bash native/macos/cue-overlay/build.sh
 cargo build
 ```
 
-Terminal-first release folders:
+Build release packages with the repository scripts:
 
 ```bash
 scripts/build-macos.sh
-```
-
-On Windows with Rust and MSVC Build Tools:
-
-```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 ```
 
-## Smoke Test
-
-For an isolated repeatable run:
+Run the isolated smoke test:
 
 ```bash
 scripts/smoke-test.sh
 ```
 
-That command is only a health check. To actually use Bluey locally:
+For a local debug session:
 
 ```bash
-./target/debug/bluey on --title "My test meeting"
-```
-
-To turn Bluey off:
-
-```bash
+./target/debug/bluey on --title "Design review"
 ./target/debug/bluey off
 ```
 
-There is no separate customer login command. If Bluey has no stored account
-token, `bluey on` opens the browser sign-in flow and then continues the same
-session after the app receives the `bluey://` callback. Support/dev commands
-remain hidden for diagnostics and local test automation.
+The daemon listens on `127.0.0.1:57321` by default. Development overrides
+include `BLUEY_DAEMON_ADDR`, `BLUEY_DAEMON_BIN`, `BLUEY_OVERLAY_BIN`,
+`BLUEY_DATA_DIR`, `BLUEY_CONFIG_DIR`, and `BLUEY_RUNTIME_DIR`. Older `CUE_*`
+names remain compatibility aliases.
 
-That opens the overlay-first flow. Use the overlay buttons for normal setup:
+## Repository Shape
 
-```text
-sparkles: focus the ask tray at the bottom
-question mark: explain every icon and dot
-session: continue the active session or start a clean one
-bottom mic: start/stop recording; green dot means recording is active
-bottom send: ask Bluey from the current screen, transcript, files, and memory
-analyse: read the active browser page and generate an answer
-recap: summarize the active session
-paperclip: attach files or show attached context for this session
-notepad: set answer style/rules
-opacity slider: adjust background glass transparency while keeping text and icons readable
-```
+- `crates/cue-cli`: customer lifecycle command and support tooling.
+- `crates/cue-daemon`: local session, audio, context, answer, and sync runtime.
+- `crates/cue-core`: shared protocol, cards, settings, paths, and state.
+- `native/macos`: AppKit overlay and native helper sources.
+- `native/windows`: Win32 overlay and helper sources.
+- `server`: managed auth, routing, sync, billing, and account APIs.
+- `web`: public site, account dashboard, legal pages, and downloads.
 
-The overlay can be moved by dragging its top bar. Resize it from the edges or bottom-right grip. Use the header slider or `/opacity 70` to adjust background glass transparency. Text and icons stay readable because the slider no longer fades the whole macOS window. The macOS overlay remembers its last frame and opacity between runs.
-The header and bottom tray are interactive. The middle reading area is click-through so the app underneath Bluey remains usable, while wheel/trackpad scrolling over the feed still scrolls Bluey's history.
-Use the keyboard icon beside Theme to see the full shortcut list. Keyboard shortcuts use one shared family across desktop platforms: `Ctrl+Option+B` on macOS or `Ctrl+Alt+B` on Windows shows/hides Bluey, `T` focuses Ask, `L` toggles Listen, `S` captures screen context, `I` toggles click-through/interactive mode, and `Enter` answers when used with that same modifier chord. When Bluey is already interactive and the Ask field is not focused, plain `L/S/I/H/F/Esc` also work locally for Listen, Screen, Interactive, History, Files, and close/cancel.
-Use the Session icon to continue the active session with its existing transcript/context, or start a clean session. A new session archives the current one first.
-Use the Analyse chip when a browser page has more text than is visible on screen. Bluey asks supported browsers for readable page text, attaches it as session context, and generates an answer; macOS may show the normal Automation permission prompt, and Windows uses user-level UI Automation when browsers expose document text. If page text is unavailable, Bluey can fall back to one permissioned screenshot plus an OpenAI-compatible vision route when `OPENAI_API_KEY`, `BLUEY_VISION_PROVIDER`, or Bluey managed vision is configured.
-Use the paperclip icon to select session files or show what is already attached. Use the notepad icon to set how Bluey should answer questions. Use the eye-slash icon to collapse the overlay into a small Bluey button; click that button to reopen. Use X/Quit when you want to stop Bluey completely.
+Useful product references:
 
-Real audio transcription is wired through bundled native helpers and the streaming STT provider chain. On macOS, Bluey uses native system/mic capture helpers, two-stage VAD, Deepgram/OpenAI Realtime/LocalWhisper-capable STT routing, and source-labeled transcript storage. Windows audio helper source exists but is not part of the v0.1.0 support matrix until Windows QA is complete. Users do not need loopback drivers for the primary macOS path. FFmpeg remains a fallback/dev path, with optional `BLUEY_FFMPEG_PATH`, `BLUEY_MIC_AUDIO_DEVICE`, and `BLUEY_SYSTEM_AUDIO_DEVICE` overrides.
-
-The live feed is chronological and scrollable: system audio appears as `System transcript`, microphone audio appears as `Mic transcript`, submitted questions appear as `You`, and generated responses appear as `Bluey / Response` cards directly after the question. Recent turns are stored in the active session so follow-up questions continue from the previous answer.
-
-Bluey streams answers into the same response card: live OpenAI-compatible providers update the card as deltas arrive, while local fallback/non-streaming answers replay word by word. Coding answers render fenced code as a dedicated code pane beside the explanation when possible. Before each model call, Bluey compacts transcript, recent Q&A, documents, screenshots, and notes so the request stays inside the active model window.
-
-Development and support commands remain hidden from normal help. The visible
-terminal product surface is only `bluey on` and `bluey off`; account, billing,
-history, and settings live in the overlay/dashboard.
-
-The daemon listens on `127.0.0.1:57321` by default. Set `BLUEY_DAEMON_ADDR`, `BLUEY_DAEMON_BIN`, or `BLUEY_OVERLAY_BIN` to override local development paths. Set `BLUEY_DATA_DIR`, `BLUEY_CONFIG_DIR`, or `BLUEY_RUNTIME_DIR` to isolate local state during testing. The older `CUE_*` names still work as compatibility aliases.
-
-## Direction
-
-The hot path stays small:
-
-```text
-audio chunk -> VAD -> STT partial/final -> rolling context -> LLM stream -> overlay card
-```
-
-No Electron and no Python runtime in the first native build. Saved sessions and settings are terminal-first now; a fuller dashboard can come later if it earns its keep.
-
-## First Testable Version
-
-This build is testable with or without provider keys. The customer-visible loop is:
-
-- `bluey on --title "Name"` starts the overlay-first session and opens sign-in
-  only when needed.
-- Use the larger bottom mic button to start/stop real chunked audio transcription when STT credentials are present; otherwise Bluey falls back to the labeled development simulator for local testing.
-- Use the bottom ask tray and send button to ask Bluey questions.
-- Use Analyse, Recap, paperclip, notepad, model picker, and mode picker from the overlay.
-- Use the overlay/dashboard for saved session history, answer style, settings,
-  balance, and account actions.
-- `bluey off` stops Bluey.
-
-The audio path feeds the same session engine either way: source-labeled transcript segment in, context-aware answer cards out.
-
-See `docs/FEATURE-MAP.md` for the ethical translation of the reference-app feature checklist into Bluey's roadmap.
-See `docs/WORKLOG.md` for the round-by-round implementation history.
-See `docs/ICON-GUIDE.md` for every overlay icon, dot, and card type.
-See `docs/SESSION-FLOW.md` for the overlay-first user flow.
-See `docs/PRODUCT-STRATEGY.md` and `docs/CLOUD-RAG.md` for commercial cloud/RAG direction.
-See `docs/COMPETITIVE-GAPS.md` for the paid-product gap list.
-See `docs/PRODUCTION-READINESS.md` for the current implemented/missing production matrix.
-See `docs/PRE-PRICING-REVIEW.md` for the working checklist before pricing plans.
-See `docs/IMPLEMENTATION-SEAMS.md` for the code seams that native audio, STT, managed AI, and cloud RAG should plug into next.
-See `docs/DEPLOYMENT-SCALING.md` for packaging, cloud APIs, storage, provider keys, and scaling plan.
-See `docs/BACKEND-CONTRACTS.md`, `docs/SETTINGS-UI-CONTRACT.md`, `docs/INSTALLER-CHECKLIST.md`, and `infra/` for the production backend/deployment skeleton.
+- `docs/FEATURE-MAP.md`
+- `docs/SESSION-FLOW.md`
+- `docs/SETTINGS-UI-CONTRACT.md`
+- `docs/PRODUCT-STRATEGY.md`
+- `docs/SECURITY-HARDENING.md`
+- `docs/RELEASE-RUNBOOK.md`

@@ -10,4 +10,4 @@ pub mod store;
 
 pub use chunker::{Chunk, Chunker};
 pub use embedder::{EmbeddingError, EmbeddingProvider};
-pub use store::{RagHit, VectorStore};
+pub use store::{RagHit, RagScope, VectorStore};

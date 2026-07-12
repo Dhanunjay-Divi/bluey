@@ -1721,13 +1721,23 @@ private func emitLifecycle(_ stage: String, status: String = "ok", detail: Strin
     emitEvent(payload)
 }
 
-private func emitAsk(question: String, provider: String?, model: String?, mode: String?, visibleContextIds: [String] = []) {
+private func emitAsk(
+    question: String,
+    provider: String?,
+    model: String?,
+    mode: String?,
+    visibleContextIds: [String] = [],
+    answerCurrentTranscript: Bool = false
+) {
     var p: [String: Any] = ["type": "ask_requested", "question": question]
     if let provider = provider { p["provider"] = provider }
     if let model = model       { p["model"]    = model }
     if let mode = mode         { p["mode"]     = mode }
     if !visibleContextIds.isEmpty {
         p["visible_context_ids"] = visibleContextIds
+    }
+    if answerCurrentTranscript {
+        p["answer_current_transcript"] = true
     }
     emitEvent(p)
 }
@@ -9680,7 +9690,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             provider: route.provider,
             model: route.model,
             mode: route.mode,
-            visibleContextIds: sentContextIds
+            visibleContextIds: sentContextIds,
+            answerCurrentTranscript: true
         )
         consumeSentPendingContextAttachments()
         screenContextReadyForAnswer = false
@@ -9845,7 +9856,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             provider: route.provider,
             model: route.model,
             mode: route.mode,
-            visibleContextIds: sentContextIds
+            visibleContextIds: sentContextIds,
+            answerCurrentTranscript: hadTranscriptContext || hadPreviewTranscriptContext
         )
         consumeSentPendingContextAttachments()
         screenContextReadyForAnswer = false

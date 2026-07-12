@@ -1,4 +1,4 @@
-//! Real router endpoints: managed dispatch + atomic deduction + idempotency.
+//! Real router endpoints: managed dispatch + atomic reservation/settlement + idempotency.
 
 use axum::{
     extract::State,
@@ -22,6 +22,7 @@ use crate::db::accounts::Account;
 use crate::db::{
     balance, idempotency, ops_audit, sync,
     usage::{self, UsageEvent},
+    usage_reservations::{self, ReserveUsageInput, ReservedUsage, SettledUsage},
 };
 use crate::pricing;
 use crate::routing;
@@ -52,6 +53,9 @@ const DEFAULT_DEEP_SLOW_FIRST_TOKEN_AUDIT_MS: i64 = 8_000;
 const CODE_ARTIFACT_MIN_OUTPUT_TOKENS: u32 = 4_096;
 const CANVAS_DETAIL_MIN_OUTPUT_TOKENS: u32 = 3_072;
 const DEFAULT_CAPACITY_SHORT_WAIT_MAX_SECS: u64 = 2;
+const DEFAULT_LLM_USAGE_RESERVATION_TTL_SECS: u64 = 30 * 60;
+const LLM_SETTLEMENT_RETRY_ATTEMPTS: usize = 3;
+const LLM_SETTLEMENT_RETRY_DELAY_MS: u64 = 100;
 
 struct AnswerOpsEvent<'a> {
     account_id: &'a str,
@@ -246,100 +250,278 @@ fn normalize_guardrail_text(text: &str) -> String {
     normalized.trim().to_string()
 }
 
-struct StreamingIdempotencyGuard {
+fn managed_usage_now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn llm_usage_reservation_ttl() -> Duration {
+    let seconds = std::env::var("BLUEY_LLM_USAGE_RESERVATION_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_LLM_USAGE_RESERVATION_TTL_SECS);
+    Duration::from_secs(seconds)
+}
+
+fn reconcile_expired_llm_usage(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+) -> Result<(), Box<(StatusCode, Json<ApiError>)>> {
+    match usage_reservations::reconcile_expired_for_account(
+        pool,
+        account_id,
+        managed_usage_now_ms(),
+    ) {
+        Ok(0) => Ok(()),
+        Ok(released) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                released,
+                "reconciled expired managed usage reservations"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                error = %error,
+                "failed to reconcile expired managed usage reservations"
+            );
+            Err(Box::new((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "managed usage reconciliation failed".into(),
+                    reason: Some("usage_reconciliation_failed".into()),
+                    ..Default::default()
+                }),
+            )))
+        }
+    }
+}
+
+fn reserve_llm_usage(
+    state: &AppState,
+    account: &Account,
+    request_id: &str,
+    estimated_customer_cents: i64,
+    estimated_upstream_cents: i64,
+    reason: &'static str,
+) -> Result<ReservedUsage, Box<(StatusCode, Json<ApiError>)>> {
+    let created_at_ms = managed_usage_now_ms();
+    let ttl_ms = llm_usage_reservation_ttl()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let expires_at_ms = created_at_ms.saturating_add(ttl_ms);
+    match usage_reservations::reserve(
+        &state.pool,
+        ReserveUsageInput {
+            account_id: &account.id,
+            request_id,
+            kind: "llm",
+            reason,
+            estimated_customer_cents,
+            estimated_upstream_cents,
+            created_at_ms,
+            expires_at_ms,
+        },
+    ) {
+        Ok(reservation) => {
+            spawn_llm_usage_expiry_reconciler(
+                state.pool.clone(),
+                account.id.clone(),
+                request_id.to_string(),
+                expires_at_ms,
+            );
+            Ok(reservation)
+        }
+        Err(usage_reservations::UsageReservationError::InsufficientBalance) => {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, request_id);
+            let balance_cents = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
+            Err(Box::new((
+                StatusCode::PAYMENT_REQUIRED,
+                Json(ApiError {
+                    error: "insufficient balance".into(),
+                    balance_cents: Some(balance_cents),
+                    estimated_cost_cents: Some(estimated_customer_cents),
+                    reason: Some("insufficient_balance".into()),
+                    reload_url: Some(format!("{}/reload", state.config.public_url)),
+                    ..Default::default()
+                }),
+            )))
+        }
+        Err(usage_reservations::UsageReservationError::InProgress) => Err(Box::new((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "request already has an active usage reservation".into(),
+                reason: Some("request_in_progress".into()),
+                ..Default::default()
+            }),
+        ))),
+        Err(usage_reservations::UsageReservationError::AlreadySettled) => Err(Box::new((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "request usage is settled but its response needs reconciliation".into(),
+                reason: Some("request_settled_reconciliation_pending".into()),
+                ..Default::default()
+            }),
+        ))),
+        Err(usage_reservations::UsageReservationError::AccountUnavailable) => {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, request_id);
+            Err(Box::new((
+                StatusCode::FORBIDDEN,
+                Json(ApiError {
+                    error: "Account usage is unavailable.".into(),
+                    reason: Some("account_unavailable".into()),
+                    ..Default::default()
+                }),
+            )))
+        }
+        Err(error) => {
+            let _ = idempotency::release(&state.pool, &account.id, request_id);
+            tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                request_id,
+                error = %error,
+                "managed usage reservation failed"
+            );
+            Err(Box::new((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "managed usage reservation failed".into(),
+                    reason: Some("usage_reservation_failed".into()),
+                    ..Default::default()
+                }),
+            )))
+        }
+    }
+}
+
+fn spawn_llm_usage_expiry_reconciler(
     pool: crate::db::DbPool,
     account_id: String,
     request_id: String,
-    drop_action: StreamingDropAction,
+    expires_at_ms: i64,
+) {
+    tokio::spawn(async move {
+        let wait_ms = expires_at_ms.saturating_sub(managed_usage_now_ms()).max(0) as u64;
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        match usage_reservations::reconcile_expired_for_account(
+            &pool,
+            &account_id,
+            managed_usage_now_ms(),
+        ) {
+            Ok(released) if released > 0 => tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+                request_id,
+                released,
+                "released expired managed usage reservation"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+                request_id,
+                error = %error,
+                "failed delayed managed usage reconciliation"
+            ),
+        }
+    });
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StreamingDropAction {
-    Release,
-    KeepInProgress,
-    None,
+fn release_llm_usage(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    request_id: &str,
+    reason: &'static str,
+) {
+    match usage_reservations::release(pool, account_id, request_id, reason, managed_usage_now_ms())
+    {
+        Ok(released) => tracing::info!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            request_id,
+            refunded_cents = released.refunded_cents,
+            refunded_trial_seconds = released.refunded_trial_seconds,
+            reason,
+            "managed usage reservation released"
+        ),
+        Err(usage_reservations::UsageReservationError::AlreadyReleased)
+        | Err(usage_reservations::UsageReservationError::NotFound) => {}
+        Err(error) => tracing::error!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            request_id,
+            reason,
+            error = %error,
+            "failed to release managed usage reservation"
+        ),
+    }
 }
 
-impl StreamingIdempotencyGuard {
-    fn new(pool: crate::db::DbPool, account_id: String, request_id: String) -> Self {
-        Self {
+fn fail_stream_llm_usage(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    request_id: &str,
+    delivered_delta: bool,
+    reason: &'static str,
+) {
+    if delivered_delta {
+        let _ = idempotency::mark_failed(pool, account_id, request_id);
+    }
+    release_llm_usage(pool, account_id, request_id, reason);
+}
+
+async fn settle_llm_usage_with_retry(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    request_id: &str,
+    actual_customer_cents: i64,
+    elapsed_ms: i64,
+    reason: &'static str,
+) -> Result<SettledUsage, usage_reservations::UsageReservationError> {
+    let mut last_error = None;
+    for attempt in 1..=LLM_SETTLEMENT_RETRY_ATTEMPTS {
+        match usage_reservations::settle(
             pool,
             account_id,
             request_id,
-            drop_action: StreamingDropAction::Release,
+            actual_customer_cents,
+            elapsed_ms,
+            reason,
+            managed_usage_now_ms(),
+        ) {
+            Ok(settled) => return Ok(settled),
+            Err(error @ usage_reservations::UsageReservationError::Db(_))
+                if attempt < LLM_SETTLEMENT_RETRY_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                    request_id,
+                    attempt,
+                    error = %error,
+                    "managed usage settlement attempt failed; retrying"
+                );
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(LLM_SETTLEMENT_RETRY_DELAY_MS)).await;
+            }
+            Err(error) => return Err(error),
         }
     }
-
-    fn release_now(&mut self) {
-        if self.drop_action != StreamingDropAction::Release {
-            return;
-        }
-        if let Err(e) = idempotency::release(&self.pool, &self.account_id, &self.request_id) {
-            tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
-                request_id = %self.request_id,
-                error = %e,
-                "failed to release streaming idempotency reservation"
-            );
-        }
-        self.drop_action = StreamingDropAction::None;
-    }
-
-    fn mark_failed_now(&mut self) {
-        if self.drop_action == StreamingDropAction::None {
-            return;
-        }
-        if let Err(e) = idempotency::mark_failed(&self.pool, &self.account_id, &self.request_id) {
-            tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
-                request_id = %self.request_id,
-                error = %e,
-                "failed to mark streaming idempotency reservation failed"
-            );
-        }
-        self.drop_action = StreamingDropAction::None;
-    }
-
-    fn mark_complete_now(&mut self, response_json: &str) -> anyhow::Result<()> {
-        let result = idempotency::mark_complete(
-            &self.pool,
-            &self.account_id,
-            &self.request_id,
-            response_json,
-        );
-        self.drop_action = StreamingDropAction::None;
-        result
-    }
-
-    fn keep_in_progress_for_manual_reconciliation(&mut self) {
-        if self.drop_action != StreamingDropAction::None {
-            self.drop_action = StreamingDropAction::KeepInProgress;
-        }
-    }
+    Err(last_error.expect("settlement retry loop must retain its database error"))
 }
 
-impl Drop for StreamingIdempotencyGuard {
-    fn drop(&mut self) {
-        match self.drop_action {
-            StreamingDropAction::Release => {
-                if let Err(e) = idempotency::release(&self.pool, &self.account_id, &self.request_id)
-                {
-                    tracing::warn!(
-                        account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
-                        request_id = %self.request_id,
-                        error = %e,
-                        "failed to release dropped streaming idempotency reservation"
-                    );
-                }
-            }
-            StreamingDropAction::KeepInProgress => tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
-                request_id = %self.request_id,
-                "streaming response was dropped after deltas were delivered; reservation kept in progress for reconciliation"
-            ),
-            StreamingDropAction::None => {}
+fn detach_router_stream(mut source: RouterSseStream) -> RouterSseStream {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = source.next().await {
+            // The provider/settlement task deliberately keeps draining after
+            // the HTTP body is dropped. A closed receiver only suppresses
+            // delivery; it never cancels settlement.
+            let _ = sender.send(event);
         }
-    }
+    });
+    Box::pin(async_stream::stream! {
+        while let Some(event) = receiver.recv().await {
+            yield event;
+        }
+    })
 }
 
 fn billing_restricted_error(account: &Account) -> Option<(StatusCode, Json<ApiError>)> {
@@ -4404,11 +4586,13 @@ fn record_web_search_usage(
     account_id: &str,
     request_id: &str,
     outcome: &WebSearchOutcome,
+    charged_customer_cents: i64,
     streaming: bool,
 ) {
-    let Some(event) = web_search_usage_event(request_id, outcome) else {
+    let Some(mut event) = web_search_usage_event(request_id, outcome) else {
         return;
     };
+    event.cost_cents_to_customer = charged_customer_cents.max(0);
     match usage::record(pool, account_id, &event) {
         Ok(true) => tracing::info!(
             account_id_hash = %cue_core::account_id_hash_prefix(account_id),
@@ -4416,7 +4600,7 @@ fn record_web_search_usage(
             provider = event.provider.as_deref().unwrap_or("unknown"),
             searches_used = outcome.searches_used,
             source_count = outcome.sources.len(),
-            cost_cents = outcome.customer_cost_cents,
+            cost_cents = event.cost_cents_to_customer,
             streaming,
             "managed web search usage event recorded"
         ),
@@ -4444,16 +4628,29 @@ pub async fn complete(
     >,
     Json(req): Json<CompleteRequest>,
 ) -> Result<Json<CompleteResponse>, (StatusCode, Json<ApiError>)> {
-    Ok(Json(complete_inner(state, account, req, trace_id).await?))
+    match tokio::spawn(complete_inner(state, account, req, trace_id)).await {
+        Ok(result) => result.map(Json),
+        Err(error) => {
+            tracing::error!(error = %error, "detached managed completion task failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "managed completion task failed".into(),
+                    reason: Some("managed_task_failed".into()),
+                    ..Default::default()
+                }),
+            ))
+        }
+    }
 }
 
 /// Streaming variant of `/router/complete`.
 ///
 /// This path performs the same entry checks/idempotency reservation as the
-/// non-streaming endpoint, then proxies provider deltas as they arrive. Billing,
-/// usage recording, and idempotency caching happen only after the upstream
-/// stream finishes, followed by one `billing` SSE event carrying the final
-/// `CompleteResponse`.
+/// non-streaming endpoint, then proxies provider deltas from a detached worker.
+/// The worker owns the provider stream, billing, usage recording, and
+/// idempotency caching, so dropping the HTTP response body cannot cancel
+/// settlement. A terminal `billing` event carries the final `CompleteResponse`.
 pub async fn complete_stream(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -4462,7 +4659,20 @@ pub async fn complete_stream(
     >,
     Json(req): Json<CompleteRequest>,
 ) -> Result<Sse<RouterSseStream>, (StatusCode, Json<ApiError>)> {
-    complete_stream_inner(state, account, req, trace_id).await
+    match tokio::spawn(complete_stream_inner(state, account, req, trace_id)).await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(error = %error, "detached managed streaming setup task failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "managed streaming task failed".into(),
+                    reason: Some("managed_task_failed".into()),
+                    ..Default::default()
+                }),
+            ))
+        }
+    }
 }
 
 async fn complete_stream_inner(
@@ -4472,6 +4682,7 @@ async fn complete_stream_inner(
     trace_id: String,
 ) -> Result<Sse<RouterSseStream>, (StatusCode, Json<ApiError>)> {
     let request_started = Instant::now();
+    reconcile_expired_llm_usage(&state.pool, &account.id).map_err(|error| *error)?;
     if let Some(err) = billing_restricted_error(&account) {
         return Err(err);
     }
@@ -4725,10 +4936,12 @@ async fn complete_stream_inner(
     let effective_max_out =
         estimate_max_output_tokens_for_answer_plan(req.max_tokens, thinking, answer_plan.output);
     let max_out = i64::from(effective_max_out);
+    let server_est_in = ((provider_system.len() + provider_user.len()) as i64) / 4
+        + image_token_estimate(req.image_data_urls.len());
     let est_in = req
         .estimated_input_tokens
-        .unwrap_or_else(|| ((provider_system.len() + provider_user.len()) as i64) / 4)
-        + image_token_estimate(req.image_data_urls.len());
+        .unwrap_or_default()
+        .max(server_est_in);
     let pre_dispatch_ms = request_started.elapsed().as_millis() as i64;
     tracing::info!(
         account_id_hash = %account_id_hash,
@@ -4793,34 +5006,26 @@ async fn complete_stream_inner(
         return Err(err);
     }
 
-    let on_trial = account.trial_seconds_remaining > 0;
-    if !on_trial {
-        let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: format!("balance: {e}"),
-                    ..Default::default()
-                }),
-            )
-        })?;
-        if !can {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            let bal = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
-            return Err((
-                StatusCode::PAYMENT_REQUIRED,
-                Json(ApiError {
-                    error: "insufficient balance".into(),
-                    balance_cents: Some(bal),
-                    estimated_cost_cents: Some(est_cost),
-                    reason: Some("insufficient_balance".into()),
-                    reload_url: Some(format!("{}/reload", state.config.public_url)),
-                    ..Default::default()
-                }),
-            ));
-        }
-    }
+    let usage_reservation = reserve_llm_usage(
+        &state,
+        &account,
+        &req.request_id,
+        est_cost,
+        est_bluey_cost,
+        "llm_stream",
+    )
+    .map_err(|error| *error)?;
+    let on_trial = usage_reservation.is_trial();
+    tracing::info!(
+        account_id_hash = %account_id_hash,
+        request_id = %req.request_id,
+        attempt = usage_reservation.attempt,
+        reserved_cents = usage_reservation.reserved_cents,
+        reserved_trial_seconds = usage_reservation.reserved_trial_seconds,
+        expires_at_ms = usage_reservation.expires_at_ms,
+        streaming = true,
+        "managed chat usage reserved before provider dispatch"
+    );
 
     let started = Instant::now();
     let mut last_error: Option<anyhow::Error> = None;
@@ -5167,7 +5372,12 @@ async fn complete_stream_inner(
     let (selected_route, streaming) = match (selected_route, selected_stream) {
         (Some(route), Some(streaming)) => (route, streaming),
         _ => {
-            let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+            release_llm_usage(
+                &state.pool,
+                &account.id,
+                &req.request_id,
+                "provider_dispatch_failed",
+            );
             if last_failure_was_capacity {
                 let denied = last_capacity.expect("capacity flag set with no capacity denial");
                 tracing::warn!(
@@ -5246,16 +5456,10 @@ async fn complete_stream_inner(
         }
     };
 
-    let idempotency_guard = StreamingIdempotencyGuard::new(
-        state.pool.clone(),
-        account.id.clone(),
-        req.request_id.clone(),
-    );
     let stream_status_events =
         retrieval_status_events(&answer_plan, rag_matches.len(), &web_search);
     let stream_sources = web_sources.clone();
     let event_stream = async_stream::stream! {
-        let mut idempotency_guard = idempotency_guard;
         let mut events = streaming.events;
         let mut pending_first = selected_first_event;
         let mut text = String::new();
@@ -5278,11 +5482,13 @@ async fn complete_stream_inner(
                 None => match tokio::time::timeout(stream_idle_deadline, events.next()).await {
                     Ok(event) => event,
                     Err(_) => {
-                        if delivered_delta {
-                            idempotency_guard.mark_failed_now();
-                        } else {
-                            idempotency_guard.release_now();
-                        }
+                        fail_stream_llm_usage(
+                            &state.pool,
+                            &account.id,
+                            &req.request_id,
+                            delivered_delta,
+                            "stream_idle_timeout",
+                        );
                         tracing::warn!(
                             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                             request_id = %req.request_id,
@@ -5328,7 +5534,13 @@ async fn complete_stream_inner(
             };
             let Some(event) = event else { break };
             if let Some(payload) = live_account_error_payload(live_account_state(&state.pool, &account.id)) {
-                idempotency_guard.mark_failed_now();
+                let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+                release_llm_usage(
+                    &state.pool,
+                    &account.id,
+                    &req.request_id,
+                    "account_inactive",
+                );
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     request_id = %req.request_id,
@@ -5353,10 +5565,7 @@ async fn complete_stream_inner(
                         text.push_str(&delta);
                         delta
                     };
-                    if !delivered_delta {
-                        delivered_delta = true;
-                        idempotency_guard.keep_in_progress_for_manual_reconciliation();
-                    }
+                    delivered_delta = true;
                     yield Ok(Event::default().data(
                         serde_json::json!({
                             "choices": [
@@ -5371,11 +5580,13 @@ async fn complete_stream_inner(
                     break;
                 }
                 Err(e) => {
-                    if delivered_delta {
-                        idempotency_guard.mark_failed_now();
-                    } else {
-                        idempotency_guard.release_now();
-                    }
+                    fail_stream_llm_usage(
+                        &state.pool,
+                        &account.id,
+                        &req.request_id,
+                        delivered_delta,
+                        "upstream_stream_error",
+                    );
                     let retry_after_secs = routing::upstream_retry_after(&e);
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
@@ -5431,11 +5642,13 @@ async fn complete_stream_inner(
         }
 
         let Some((input_tokens, output_tokens)) = final_tokens else {
-            if delivered_delta {
-                idempotency_guard.mark_failed_now();
-            } else {
-                idempotency_guard.release_now();
-            }
+            fail_stream_llm_usage(
+                &state.pool,
+                &account.id,
+                &req.request_id,
+                delivered_delta,
+                "upstream_stream_incomplete",
+            );
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %req.request_id,
@@ -5473,7 +5686,13 @@ async fn complete_stream_inner(
             return;
         };
         if let Some(payload) = live_account_error_payload(live_account_state(&state.pool, &account.id)) {
-            idempotency_guard.mark_failed_now();
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+            release_llm_usage(
+                &state.pool,
+                &account.id,
+                &req.request_id,
+                "account_inactive",
+            );
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %req.request_id,
@@ -5535,65 +5754,45 @@ async fn complete_stream_inner(
         let bluey_cost = llm_bluey_cost.saturating_add(web_search.bluey_cost_cents);
         let customer_cost = llm_customer_cost.saturating_add(web_search.customer_cost_cents);
 
-        let trial_remaining = if on_trial {
-            match balance::consume_trial_seconds(&state.pool, &account.id, elapsed_ms) {
-                Ok(value) => value,
-                Err(e) => {
-                    idempotency_guard.mark_failed_now();
-                    yield Ok(Event::default().event("error").data(
-                        serde_json::json!({
-                            "error": format!("trial: {e}"),
-                            "reason": "trial_update_failed",
-                        })
-                        .to_string(),
-                    ));
-                    return;
-                }
-            }
-        } else {
-            match balance::deduct_for_request(
-                &state.pool,
-                &account.id,
-                customer_cost,
-                "llm_stream",
-                &req.request_id,
-            ) {
-                Ok(ok) => {
-                    if ok {
-                        account.trial_seconds_remaining
-                    } else {
-                        tracing::warn!(
-                            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                            cost_cents = customer_cost,
-                            "streaming post-completion deduct failed"
-                        );
-                        idempotency_guard.mark_failed_now();
-                        yield Ok(Event::default().event("error").data(
-                            serde_json::json!({
-                                "error": "insufficient balance after completion; add credits and retry",
-                                "reason": "insufficient_balance",
-                                "reload_url": format!("{}/reload", state.config.public_url),
-                            })
-                            .to_string(),
-                        ));
-                        return;
-                    }
-                }
-                Err(e) => {
-                    idempotency_guard.mark_failed_now();
-                    yield Ok(Event::default().event("error").data(
-                        serde_json::json!({
-                            "error": format!("deduct: {e}"),
-                            "reason": "deduct_failed",
-                        })
-                        .to_string(),
-                    ));
-                    return;
-                }
+        let settled_usage = match settle_llm_usage_with_retry(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+            customer_cost,
+            elapsed_ms,
+            "completed",
+        )
+        .await
+        {
+            Ok(settled) => settled,
+            Err(error) => {
+                tracing::error!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id = %req.request_id,
+                    error = %error,
+                    "streaming managed usage settlement failed after provider completion"
+                );
+                yield Ok(Event::default().event("error").data(
+                    serde_json::json!({
+                        "error": "usage settlement is pending reconciliation",
+                        "reason": "usage_settlement_pending",
+                    })
+                    .to_string(),
+                ));
+                return;
             }
         };
-
-        let balance_after = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
+        let charged_customer_cost = settled_usage.charged_customer_cents;
+        let charged_llm_customer_cost = if on_trial {
+            0
+        } else {
+            llm_customer_cost.min(charged_customer_cost)
+        };
+        let charged_web_search_customer_cost = charged_customer_cost
+            .saturating_sub(charged_llm_customer_cost)
+            .min(web_search.customer_cost_cents);
+        let trial_remaining = settled_usage.trial_seconds_remaining;
+        let balance_after = settled_usage.balance_cents_after;
         if !on_trial {
             crate::billing::topup::maybe_spawn(
                 state.pool.clone(),
@@ -5621,7 +5820,7 @@ async fn complete_stream_inner(
             output_tokens,
             latency_ms: elapsed_ms,
             cost_cents_to_bluey: llm_bluey_cost,
-            cost_cents_to_customer: llm_customer_cost,
+            cost_cents_to_customer: charged_llm_customer_cost,
             was_speculative: false,
             was_fallback: selected_route_idx > 0,
         };
@@ -5635,7 +5834,7 @@ async fn complete_stream_inner(
                 session_ref = %session_ref_log,
                 provider = %streaming.provider,
                 model = %streaming.model,
-                cost_cents = llm_customer_cost,
+                cost_cents = charged_llm_customer_cost,
                 balance_cents_after = balance_after,
                 latency_ms = elapsed_ms,
                 streaming = true,
@@ -5668,6 +5867,7 @@ async fn complete_stream_inner(
             &account.id,
             &req.request_id,
             &web_search,
+            charged_web_search_customer_cost,
             true,
         );
 
@@ -5687,9 +5887,9 @@ async fn complete_stream_inner(
             model = %streaming.model,
             input_tokens,
             output_tokens,
-            cost_cents = customer_cost,
+            cost_cents = charged_customer_cost,
             bluey_cost_cents = bluey_cost,
-            llm_cost_cents = llm_customer_cost,
+            llm_cost_cents = charged_llm_customer_cost,
             web_search_cost_cents = web_search.customer_cost_cents,
             balance_cents_after = balance_after,
             trial_seconds_remaining = trial_remaining,
@@ -5734,7 +5934,7 @@ async fn complete_stream_inner(
             model: streaming.model,
             input_tokens,
             output_tokens,
-            cost_cents: customer_cost,
+            cost_cents: charged_customer_cost,
             balance_cents_after: balance_after,
             trial_seconds_remaining: trial_remaining,
             artifact_type: artifact
@@ -5742,7 +5942,7 @@ async fn complete_stream_inner(
                 .map(|artifact| artifact.artifact_type.to_string()),
             artifact_body: artifact.as_ref().map(|artifact| artifact.body.clone()),
             cost_label: Some(router_cost_label_with_web_search(
-                customer_cost,
+                charged_customer_cost,
                 balance_after,
                 &web_search,
             )),
@@ -5752,7 +5952,9 @@ async fn complete_stream_inner(
 
         match serde_json::to_string(&response) {
             Ok(json) => {
-                if let Err(e) = idempotency_guard.mark_complete_now(&json) {
+                if let Err(e) =
+                    idempotency::mark_complete(&state.pool, &account.id, &req.request_id, &json)
+                {
                     tracing::error!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                         request_id = %req.request_id,
@@ -5768,7 +5970,6 @@ async fn complete_stream_inner(
                     error = %e,
                     "failed to serialize streaming response for idempotency cache; retry will return 409 — manual reconciliation required"
                 );
-                idempotency_guard.keep_in_progress_for_manual_reconciliation();
             }
         }
 
@@ -5777,7 +5978,7 @@ async fn complete_stream_inner(
         yield Ok(Event::default().data("[DONE]"));
     };
 
-    Ok(router_sse(Box::pin(event_stream)))
+    Ok(router_sse(detach_router_stream(Box::pin(event_stream))))
 }
 
 async fn complete_inner(
@@ -5786,6 +5987,7 @@ async fn complete_inner(
     req: CompleteRequest,
     trace_id: String,
 ) -> Result<CompleteResponse, (StatusCode, Json<ApiError>)> {
+    reconcile_expired_llm_usage(&state.pool, &account.id).map_err(|error| *error)?;
     if let Some(err) = billing_restricted_error(&account) {
         return Err(err);
     }
@@ -6025,8 +6227,8 @@ async fn complete_inner(
     let (provider_system, provider_user) =
         prompt_with_answer_plan(&provider_system, &provider_user, &answer_plan, &web_search);
 
-    // 2. Resolve lane → provider+model candidates. Entry balance check uses
-    // the maximum candidate estimate so provider failover cannot overrun a
+    // 2. Resolve lane → provider+model candidates. The reservation uses the
+    // maximum candidate estimate so provider failover cannot overrun a
     // customer's hard-stop budget.
     let thinking = routing::resolve_thinking_budget(
         &effective_lane,
@@ -6037,10 +6239,12 @@ async fn complete_inner(
     let effective_max_out =
         estimate_max_output_tokens_for_answer_plan(req.max_tokens, thinking, answer_plan.output);
     let max_out = i64::from(effective_max_out);
-    let est_in = req.estimated_input_tokens.unwrap_or_else(|| {
-        // Crude fallback: ~4 chars/token
-        ((provider_system.len() + provider_user.len()) as i64) / 4
-    }) + image_token_estimate(req.image_data_urls.len());
+    let server_est_in = ((provider_system.len() + provider_user.len()) as i64) / 4
+        + image_token_estimate(req.image_data_urls.len());
+    let est_in = req
+        .estimated_input_tokens
+        .unwrap_or_default()
+        .max(server_est_in);
     let routes = priced_routes_for(&effective_lane, est_in, max_out, &req.request_id);
     if routes.is_empty() {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
@@ -6086,36 +6290,27 @@ async fn complete_inner(
         return Err(err);
     }
 
-    let on_trial = account.trial_seconds_remaining > 0;
-
-    // 4. Entry check — unless the account is still on the free trial.
-    if !on_trial {
-        let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: format!("balance: {e}"),
-                    ..Default::default()
-                }),
-            )
-        })?;
-        if !can {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            let bal = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
-            return Err((
-                StatusCode::PAYMENT_REQUIRED,
-                Json(ApiError {
-                    error: "insufficient balance".into(),
-                    balance_cents: Some(bal),
-                    estimated_cost_cents: Some(est_cost),
-                    reason: Some("insufficient_balance".into()),
-                    reload_url: Some(format!("{}/reload", state.config.public_url)),
-                    ..Default::default()
-                }),
-            ));
-        }
-    }
+    // 4. Atomically reserve the maximum customer charge before dispatch.
+    let usage_reservation = reserve_llm_usage(
+        &state,
+        &account,
+        &req.request_id,
+        est_cost,
+        est_bluey_cost,
+        "llm",
+    )
+    .map_err(|error| *error)?;
+    let on_trial = usage_reservation.is_trial();
+    tracing::info!(
+        account_id_hash = %account_id_hash,
+        request_id = %req.request_id,
+        attempt = usage_reservation.attempt,
+        reserved_cents = usage_reservation.reserved_cents,
+        reserved_trial_seconds = usage_reservation.reserved_trial_seconds,
+        expires_at_ms = usage_reservation.expires_at_ms,
+        streaming = false,
+        "managed chat usage reserved before provider dispatch"
+    );
 
     // 5. Dispatch to upstream provider. Try candidate routes in order. Provider
     //    capacity is checked before each attempt, so a provider 429/rate-limit
@@ -6304,7 +6499,12 @@ async fn complete_inner(
     let (selected_route, comp) = match (selected_route, selected_completion) {
         (Some(route), Some(completion)) => (route, completion),
         _ => {
-            let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+            release_llm_usage(
+                &state.pool,
+                &account.id,
+                &req.request_id,
+                "provider_dispatch_failed",
+            );
             if last_failure_was_capacity {
                 let denied = last_capacity.expect("capacity flag set with no capacity denial");
                 tracing::warn!(
@@ -6389,6 +6589,12 @@ async fn complete_inner(
 
     if let Some(err) = account_not_active_error(&state.pool, &account.id) {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+        release_llm_usage(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+            "account_inactive",
+        );
         tracing::warn!(
             account_id_hash = %account_id_hash,
             request_id = %req.request_id,
@@ -6407,6 +6613,12 @@ async fn complete_inner(
     let artifact = response_artifact_for_output(&response_text, answer_plan.output);
     if code_artifact_missing_for_plan(&answer_plan, artifact.as_ref()) {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+        release_llm_usage(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+            "code_artifact_missing",
+        );
         tracing::warn!(
             account_id_hash = %account_id_hash,
             request_id = %req.request_id,
@@ -6459,50 +6671,43 @@ async fn complete_inner(
     let bluey_cost = llm_bluey_cost.saturating_add(web_search.bluey_cost_cents);
     let customer_cost = llm_customer_cost.saturating_add(web_search.customer_cost_cents);
 
-    // 7. Charge: trial decrement OR balance deduction.
-    let trial_remaining = if on_trial {
-        balance::consume_trial_seconds(&state.pool, &account.id, elapsed_ms).map_err(|e| {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: format!("trial: {e}"),
-                    ..Default::default()
-                }),
-            )
-        })?
-    } else {
-        let ok = balance::deduct_for_request(
-            &state.pool,
-            &account.id,
-            customer_cost,
-            "llm",
-            &req.request_id,
+    // 7. Settle actual usage and atomically refund the unused ceiling.
+    let settled_usage = settle_llm_usage_with_retry(
+        &state.pool,
+        &account.id,
+        &req.request_id,
+        customer_cost,
+        elapsed_ms,
+        "completed",
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            request_id = %req.request_id,
+            error = %error,
+            "managed usage settlement failed after provider completion"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "usage settlement is pending reconciliation".into(),
+                reason: Some("usage_settlement_pending".into()),
+                ..Default::default()
+            }),
         )
-        .map_err(|e| {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: format!("deduct: {e}"),
-                    ..Default::default()
-                }),
-            )
-        })?;
-        // If !ok here we'd be in a "completed upstream call but couldn't
-        // charge" state. Bluey eats the overrun rather than putting the
-        // customer in the red (per DECISIONS.md hard-stop guarantee).
-        if !ok {
-            tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                cost_cents = customer_cost,
-                "post-completion deduct failed; bluey absorbs overrun"
-            );
-        }
-        account.trial_seconds_remaining
+    })?;
+    let charged_customer_cost = settled_usage.charged_customer_cents;
+    let charged_llm_customer_cost = if on_trial {
+        0
+    } else {
+        llm_customer_cost.min(charged_customer_cost)
     };
-
-    let balance_after = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
+    let charged_web_search_customer_cost = charged_customer_cost
+        .saturating_sub(charged_llm_customer_cost)
+        .min(web_search.customer_cost_cents);
+    let trial_remaining = settled_usage.trial_seconds_remaining;
+    let balance_after = settled_usage.balance_cents_after;
 
     // Codex Stage 10: auto top-up trigger. Fire-and-forget; the actual
     // charge resolves on the executor and the webhook for the
@@ -6538,7 +6743,7 @@ async fn complete_inner(
         output_tokens: comp.output_tokens,
         latency_ms: elapsed_ms,
         cost_cents_to_bluey: llm_bluey_cost,
-        cost_cents_to_customer: llm_customer_cost,
+        cost_cents_to_customer: charged_llm_customer_cost,
         was_speculative: false,
         was_fallback: selected_route_idx > 0,
     };
@@ -6552,7 +6757,7 @@ async fn complete_inner(
             session_ref = %session_ref_log,
             provider = %comp.provider,
             model = %comp.model,
-            cost_cents = llm_customer_cost,
+            cost_cents = charged_llm_customer_cost,
             balance_cents_after = balance_after,
             latency_ms = elapsed_ms,
             streaming = false,
@@ -6585,6 +6790,7 @@ async fn complete_inner(
         &account.id,
         &req.request_id,
         &web_search,
+        charged_web_search_customer_cost,
         false,
     );
 
@@ -6610,9 +6816,9 @@ async fn complete_inner(
         model = %comp.model,
         input_tokens = comp.input_tokens,
         output_tokens = comp.output_tokens,
-        cost_cents = customer_cost,
+        cost_cents = charged_customer_cost,
         bluey_cost_cents = bluey_cost,
-        llm_cost_cents = llm_customer_cost,
+        llm_cost_cents = charged_llm_customer_cost,
         web_search_cost_cents = web_search.customer_cost_cents,
         balance_cents_after = balance_after,
         trial_seconds_remaining = trial_remaining,
@@ -6653,7 +6859,7 @@ async fn complete_inner(
         model: comp.model,
         input_tokens: comp.input_tokens,
         output_tokens: comp.output_tokens,
-        cost_cents: customer_cost,
+        cost_cents: charged_customer_cost,
         balance_cents_after: balance_after,
         trial_seconds_remaining: trial_remaining,
         artifact_type: artifact
@@ -6661,7 +6867,7 @@ async fn complete_inner(
             .map(|artifact| artifact.artifact_type.to_string()),
         artifact_body: artifact.as_ref().map(|artifact| artifact.body.clone()),
         cost_label: Some(router_cost_label_with_web_search(
-            customer_cost,
+            charged_customer_cost,
             balance_after,
             &web_search,
         )),
@@ -8966,45 +9172,85 @@ mod tests {
         std::env::remove_var("BLUEY_CAPACITY_SHORT_WAIT_MAX_SECS");
     }
 
-    #[test]
-    fn streaming_idempotency_guard_releases_on_drop_before_billing() {
+    #[tokio::test]
+    async fn detached_stream_settles_after_client_receiver_is_dropped() {
         let pool = temp_pool();
         let account_id = make_account(&pool, "stream-drop@example.com");
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET trial_seconds_remaining = 0 WHERE id = ?1",
+                rusqlite::params![&account_id],
+            )
+            .unwrap();
+        balance::credit_internal(&pool, &account_id, 100, "detached-stream-test").unwrap();
         idempotency::reserve(&pool, &account_id, "stream-drop").unwrap();
+        usage_reservations::reserve(
+            &pool,
+            ReserveUsageInput {
+                account_id: &account_id,
+                request_id: "stream-drop",
+                kind: "llm",
+                reason: "llm_stream",
+                estimated_customer_cents: 60,
+                estimated_upstream_cents: 20,
+                created_at_ms: 1_000,
+                expires_at_ms: 61_000,
+            },
+        )
+        .unwrap();
 
-        {
-            let _guard = StreamingIdempotencyGuard::new(
-                pool.clone(),
-                account_id.clone(),
-                "stream-drop".into(),
-            );
-        }
+        let (continue_sender, continue_receiver) = tokio::sync::oneshot::channel();
+        let (completed_sender, completed_receiver) = tokio::sync::oneshot::channel();
+        let worker_pool = pool.clone();
+        let worker_account_id = account_id.clone();
+        let source: RouterSseStream = Box::pin(async_stream::stream! {
+            yield Ok(Event::default().data("first delta"));
+            let _ = continue_receiver.await;
+            usage_reservations::settle(
+                &worker_pool,
+                &worker_account_id,
+                "stream-drop",
+                20,
+                1_000,
+                "completed",
+                2_000,
+            )
+            .unwrap();
+            idempotency::mark_complete(
+                &worker_pool,
+                &worker_account_id,
+                "stream-drop",
+                r#"{"text":"done"}"#,
+            )
+            .unwrap();
+            let _ = completed_sender.send(());
+            yield Ok(Event::default().event("billing").data("done"));
+        });
 
-        assert_eq!(
+        let mut client_stream = detach_router_stream(source);
+        assert!(client_stream.next().await.is_some());
+        drop(client_stream);
+        continue_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), completed_receiver)
+            .await
+            .expect("detached settlement timed out")
+            .unwrap();
+
+        let (balance_cents, reserved_cents): (i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT balance_cents, reserved_cents FROM accounts WHERE id = ?1",
+                rusqlite::params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((balance_cents, reserved_cents), (80, 0));
+        assert!(matches!(
             idempotency::reserve(&pool, &account_id, "stream-drop").unwrap(),
-            idempotency::ReserveOutcome::FreshReservation
-        );
-    }
-
-    #[test]
-    fn streaming_idempotency_guard_can_preserve_in_progress_after_billing() {
-        let pool = temp_pool();
-        let account_id = make_account(&pool, "stream-reconcile@example.com");
-        idempotency::reserve(&pool, &account_id, "stream-reconcile").unwrap();
-
-        {
-            let mut guard = StreamingIdempotencyGuard::new(
-                pool.clone(),
-                account_id.clone(),
-                "stream-reconcile".into(),
-            );
-            guard.keep_in_progress_for_manual_reconciliation();
-        }
-
-        assert_eq!(
-            idempotency::reserve(&pool, &account_id, "stream-reconcile").unwrap(),
-            idempotency::ReserveOutcome::InProgress
-        );
+            idempotency::ReserveOutcome::CachedComplete(_)
+        ));
     }
 
     #[test]

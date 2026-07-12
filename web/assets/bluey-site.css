@@ -8556,3 +8556,424 @@
         grid-template-columns: 1fr;
       }
     }
+
+    /* Consent-first product preview and compact onboarding. */
+    #productSite .hero-connect {
+      max-width: 430px;
+      margin-top: 1rem;
+      color: #8e9aa0;
+      font-size: .78rem;
+    }
+
+    #productSite .hero-connect summary {
+      width: fit-content;
+      cursor: pointer;
+      color: #9eb1ba;
+      font-weight: 650;
+    }
+
+    #productSite .hero-connect[open] summary {
+      color: var(--bluey-accent);
+    }
+
+    #productSite .hero-connect .join-bar {
+      margin-top: .65rem;
+    }
+
+    #productSite .overlay-preview {
+      width: min(100%, 540px);
+      padding: 8px;
+      border: 1px solid rgba(116, 218, 246, .18);
+      border-radius: 8px;
+      background: #071014;
+      box-shadow: 0 28px 80px rgba(0, 0, 0, .46);
+    }
+
+    #productSite .overlay-demo {
+      min-height: 418px;
+      overflow: hidden;
+      border: 1px solid rgba(141, 225, 248, .16);
+      border-radius: 6px;
+      background: #080d11;
+      color: #edf7fa;
+    }
+
+    #productSite .overlay-demo-header {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      align-items: center;
+      gap: .75rem;
+      min-height: 48px;
+      padding: 0 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, .08);
+      background: #0d151a;
+    }
+
+    #productSite .overlay-demo-brand,
+    #productSite .overlay-demo-state {
+      display: inline-flex;
+      align-items: center;
+      gap: .5rem;
+    }
+
+    #productSite .overlay-demo-brand {
+      font-size: .82rem;
+      font-weight: 750;
+    }
+
+    #productSite .overlay-demo-brand img {
+      width: 20px;
+      height: 20px;
+      border-radius: 5px;
+    }
+
+    #productSite .overlay-demo-state,
+    #productSite .overlay-demo-session {
+      color: #a8bac2;
+      font-size: .69rem;
+      font-weight: 650;
+    }
+
+    #productSite .overlay-demo-state > span,
+    #productSite .overlay-listening-state > span {
+      width: 7px;
+      height: 7px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: #65dfa1;
+      box-shadow: 0 0 10px rgba(101, 223, 161, .46);
+    }
+
+    #productSite .overlay-context-ledger {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 42px;
+      padding: 7px 14px;
+      overflow: hidden;
+      border-bottom: 1px solid rgba(255, 255, 255, .06);
+      background: #0a1115;
+      white-space: nowrap;
+    }
+
+    #productSite .overlay-context-ledger strong {
+      margin-right: 2px;
+      color: #dbe8ec;
+      font-size: .68rem;
+    }
+
+    #productSite .overlay-context-ledger span {
+      padding: 4px 7px;
+      border: 1px solid rgba(124, 205, 229, .18);
+      border-radius: 999px;
+      color: #9dc8d6;
+      background: rgba(84, 164, 190, .08);
+      font-size: .63rem;
+      font-weight: 650;
+    }
+
+    #productSite .overlay-demo-feed {
+      display: grid;
+      gap: 10px;
+      min-height: 236px;
+      padding: 13px 14px;
+      background: #080d11;
+    }
+
+    #productSite .overlay-demo-turn {
+      padding: 10px 12px;
+      border: 1px solid rgba(255, 255, 255, .08);
+      border-radius: 6px;
+      background: #0c1419;
+    }
+
+    #productSite .overlay-demo-question {
+      width: 82%;
+      justify-self: end;
+      border-color: rgba(101, 187, 216, .22);
+      background: #102029;
+    }
+
+    #productSite .overlay-demo-answer {
+      width: 94%;
+      border-left: 2px solid #68cce8;
+    }
+
+    #productSite .overlay-demo-turn-label,
+    #productSite .overlay-demo-turn-head > span {
+      color: #71cfe9;
+      font-size: .64rem;
+      font-weight: 750;
+      text-transform: uppercase;
+    }
+
+    #productSite .overlay-demo-turn-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    #productSite .overlay-demo-turn-head > span {
+      color: #83d5aa;
+    }
+
+    #productSite .overlay-demo-turn p {
+      max-width: none;
+      margin: 5px 0 0;
+      color: #d9e6ea;
+      font-size: .74rem;
+      line-height: 1.48;
+    }
+
+    #productSite .overlay-answer-points {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px;
+      margin-top: 9px;
+    }
+
+    #productSite .overlay-answer-points span {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: #b5c6cc;
+      font-size: .65rem;
+    }
+
+    #productSite .overlay-answer-points strong {
+      display: grid;
+      width: 18px;
+      height: 18px;
+      flex: 0 0 auto;
+      place-items: center;
+      border: 1px solid rgba(246, 186, 99, .28);
+      border-radius: 50%;
+      color: #f6ba63;
+      font-size: .59rem;
+    }
+
+    #productSite .overlay-answer-sources {
+      margin-top: 9px;
+      color: #79919b;
+      font-size: .62rem;
+    }
+
+    #productSite .overlay-listening-state {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 28px;
+      padding: 0 14px;
+      border-top: 1px solid rgba(255, 255, 255, .06);
+      color: #8da0a8;
+      background: #0a1115;
+      font-size: .64rem;
+    }
+
+    #productSite .overlay-listening-state > span {
+      background: #75838a;
+      box-shadow: none;
+    }
+
+    #productSite .overlay-demo-composer {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      min-height: 62px;
+      padding: 8px 10px 8px 14px;
+      border-top: 1px solid rgba(255, 255, 255, .08);
+      background: #0f181d;
+    }
+
+    #productSite .overlay-composer-placeholder {
+      overflow: hidden;
+      color: #73858d;
+      font-size: .71rem;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #productSite .overlay-composer-actions {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    #productSite .overlay-composer-actions span,
+    #productSite .overlay-composer-actions strong {
+      padding: 5px 7px;
+      border: 1px solid rgba(255, 255, 255, .09);
+      border-radius: 5px;
+      color: #a8bac2;
+      background: #111d23;
+      font-size: .59rem;
+      font-weight: 650;
+    }
+
+    #productSite .overlay-composer-actions strong {
+      border-color: rgba(104, 204, 232, .38);
+      color: #071115;
+      background: #68cce8;
+    }
+
+    #productSite .overlay-preview-note {
+      max-width: none;
+      margin: 8px 2px 1px;
+      color: #73858d;
+      font-size: .67rem;
+      line-height: 1.4;
+    }
+
+    #downloadApp .release-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: .4rem;
+      margin-top: .8rem;
+      padding: .4rem .6rem;
+      border: 1px solid rgba(99, 216, 255, .24);
+      border-radius: 6px;
+      color: #8fa3ad;
+      background: rgba(99, 216, 255, .05);
+      font-size: .75rem;
+    }
+
+    #downloadApp .release-badge strong {
+      color: #bdefff;
+    }
+
+    #downloadApp .download-card.is-release-unavailable {
+      cursor: not-allowed;
+      opacity: .58;
+    }
+
+    #downloadApp .download-help {
+      margin-top: 1rem;
+      border-top: 1px solid #1d252a;
+      border-bottom: 1px solid #1d252a;
+    }
+
+    #downloadApp .download-help > summary {
+      cursor: pointer;
+      padding: 1rem 0;
+      color: #a9bbc3;
+      font-size: .88rem;
+      font-weight: 700;
+    }
+
+    #downloadApp .download-help[open] > summary {
+      color: var(--bluey-accent);
+    }
+
+    #downloadApp .download-help-body {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      padding: 0 0 1.4rem;
+    }
+
+    #downloadApp .download-help .download-shortcuts,
+    #downloadApp .download-help .commands {
+      margin: 0;
+      padding: 0;
+      border: 0;
+    }
+
+    #downloadApp .shortcut-grid.compact,
+    #downloadApp .cmd-grid.compact {
+      grid-template-columns: 1fr;
+    }
+
+    html[data-bluey-theme="light"] #productSite .overlay-preview {
+      border-color: #c5dce7;
+      background: #eaf3f7;
+      box-shadow: 0 24px 70px rgba(31, 70, 91, .18);
+    }
+
+    html[data-bluey-theme="light"] #productSite .overlay-preview-note {
+      color: #627986;
+    }
+
+    html[data-bluey-theme="light"] #productSite .hero-connect,
+    html[data-bluey-theme="light"] #productSite .hero-connect summary {
+      color: #536f7e;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .release-badge {
+      border-color: #cfe3ed;
+      color: #5b7280;
+      background: #f4fbfe;
+    }
+
+    html[data-bluey-theme="light"] #downloadApp .release-badge strong {
+      color: #087ca6;
+    }
+
+    @media (max-width: 820px) {
+      #productSite.page {
+        overflow-y: auto;
+      }
+
+      #productSite .content {
+        max-width: 620px;
+        gap: 1.5rem;
+        padding: 1.5rem 0 2rem;
+      }
+
+      #productSite .product-preview.overlay-preview {
+        display: block;
+      }
+
+      #productSite .overlay-preview {
+        width: 100%;
+      }
+
+      #downloadApp .download-help-body {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 520px) {
+      #productSite .main {
+        padding: 0 1rem;
+      }
+
+      #productSite .hero h1 {
+        font-size: 2.12rem;
+      }
+
+      #productSite .hero-lede,
+      #productSite .hero-proof {
+        font-size: .91rem !important;
+      }
+
+      #productSite .overlay-demo-header {
+        grid-template-columns: 1fr auto;
+      }
+
+      #productSite .overlay-demo-session {
+        display: none;
+      }
+
+      #productSite .overlay-context-ledger span:last-child {
+        display: none;
+      }
+
+      #productSite .overlay-demo-question,
+      #productSite .overlay-demo-answer {
+        width: 100%;
+      }
+
+      #productSite .overlay-answer-points {
+        grid-template-columns: 1fr;
+      }
+
+      #productSite .overlay-demo-composer {
+        grid-template-columns: 1fr;
+      }
+
+      #productSite .overlay-composer-actions {
+        justify-content: space-between;
+      }
+    }

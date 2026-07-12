@@ -1,5 +1,9 @@
 # Pre-Pricing Product Review
 
+> Historical pre-pricing snapshot. Platform statements below predate the
+> current `0.1.99` manifest, which lists macOS Apple silicon and Windows x86-64.
+> This document is not a current readiness or pricing approval.
+
 This is the working checklist before we discuss pricing plans. The goal is to know what Bluey can honestly sell, what is still a prototype seam, and what reference-app capabilities remain missing.
 
 ## Current Working Model

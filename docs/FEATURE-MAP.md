@@ -2,24 +2,29 @@
 
 This translates the reference-app comparison language into Bluey's ethical product scope.
 
-## Implemented In This First Version
+## Implemented In The Current Product
 
-- Private native overlay: macOS capture exclusion through `NSWindow.sharingType = .none`; Windows source uses `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`.
-- Focus-friendly overlay: non-activating, movable, resizable, opacity-adjustable, and hidden from the normal app switcher/taskbar style surfaces.
+- Native overlay with best-effort capture exclusion: macOS requests exclusion
+  through `NSWindow.sharingType = .none`; Windows uses
+  `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`. Neither path is an
+  invisibility guarantee or security boundary.
+- Focus-friendly overlay: non-activating, movable, resizable,
+  opacity-adjustable, and collapsible through explicit show/hide controls.
 - User-selected visual/code context: `bluey context add <path>` and `/attach <path>` for screenshots, diagrams, documents, and code files.
 - Permissioned screen context: `bluey context capture` and live `/capture` on macOS use the OS capture picker, preview the result, and ask before attaching.
 - Consent-based page analysis: the Analyse Screen chip can attach readable active browser page text and generate an answer, so long pages can be included without manual scrolling. macOS uses browser scripting; Windows uses UI Automation where browsers expose document text. If that fails, Bluey can attach one screenshot and send it to a configured vision route.
 - Simple session setup: overlay paperclip attaches files or shows attached context, and overlay notepad sets answer instructions.
 - Overlay ask flow: the speech-bubble button asks Bluey a question and renders the answer back into the overlay.
 - Source-labeled transcript cards: audio/STT segments render as system-audio or microphone transcript cards in the overlay.
-- Real audio/STT runtime: when STT is configured, Bluey captures mic/system audio through bundled native helpers, applies VAD, routes through Deepgram/OpenAI Realtime/LocalWhisper-capable providers, and stores source-labeled transcript text. macOS is the v0.1.0 supported path; Windows helper source exists but awaits hardware QA and real Windows whisper.cpp.
+- Real audio/STT runtime: when STT is configured, Bluey captures mic/system audio through bundled native helpers, applies VAD, routes through managed or local transcription paths, deletes Bluey's temporary raw-audio chunk after transcription, and stores source-labeled transcript text. Release `0.1.99` lists macOS Apple silicon and Windows x86-64 artifacts; its Windows proof is on Windows 11.
 - Live provider answer path: OpenAI, Groq, Cerebras, and OpenAI-compatible Bluey managed endpoints can answer when credentials are present; local deterministic answers remain available for offline tests.
 - Built-in control legend: the overlay explains every icon, dot, quick action, and card type from the question-mark/Help control.
 - Safe shutdown: overlay close button asks for confirmation before stopping Bluey.
 - Meeting intelligence loop: transcript in, action items/decisions/questions/recap out.
 - Provider readiness: `bluey providers` checks provider configuration without printing secrets.
 - RAG memory surface: `bluey memory search` retrieves across meeting history and attached context.
-- Commercial SaaS direction: managed cloud storage, managed provider routing, billing, and workspace accounts.
+- Commercial account path: managed provider routing, billing, and opt-in cloud
+  session sync. New installs default sync off.
 
 ## Next Ethical Slices
 
@@ -36,3 +41,5 @@ This translates the reference-app comparison language into Bluey's ethical produ
 - No product positioning for exams, interviews, or monitored assessments.
 - No bypassing proctoring, anti-cheat, enterprise monitoring, or consent requirements.
 - No passive screen scraping. Screen or image context should be user-selected or permissioned.
+- No process-impersonation, covert, or undetectable product positioning.
+- No customer-content model training without a separate implemented opt-in.

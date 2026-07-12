@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-11 UTC / 2026-07-10 EDT
+Latest checkpoint: 2026-07-12 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,10 +30,34 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-474-SIGNED-0.1.98-CONSOLIDATED-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-475-...`.
+- Latest completed Bluey engineering round doc is `ROUND-478-RELIABILITY-TRUST-AND-USAGE-HARDENING.md`; the next canonical Bluey round doc should start at `ROUND-479-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
+
+- Round 478 completed the consolidated pre-release hardening pass on branch
+  `codex/bluey-web-ui-parallel-20260704`:
+  - audio, transcripts, answers, and artifacts are pinned to the account/session
+    epoch that dispatched them; account/session changes stop stale work
+  - explicit transcript-answer intent plus a high-water cursor prevents missing
+    final words and prevents new speech from being consumed by an earlier answer
+  - local RAG is account/workspace scoped and legacy unowned rows are quarantined
+  - managed answer/trial usage is reserved before provider dispatch and detached
+    stream settlement survives client disconnects
+  - Stripe Auto Reload and object-storage uploads use durable database state,
+    idempotency, reconciliation, quotas, cleanup, and retry/outbox paths
+  - Windows now uses bounded dynamic NDJSON parsing and has transcript-intent and
+    long-answer protocol parity with macOS
+  - product copy now treats screen-share exclusion as best-effort privacy rather
+    than guaranteed invisibility; automatic disguise UI was removed
+  - 166 core/CLI, 357 daemon, 13 RAG, 317 server-library, and 57 server-integration
+    tests passed; strict Clippy, native builds, dashboard tests/build, JS syntax,
+    sanitizer protocol tests, secret scan, and whitespace checks passed
+  - release/deploy proof belongs in the next numbered signed-deploy round
+  - round doc:
+    `docs/rounds/ROUND-478-RELIABILITY-TRUST-AND-USAGE-HARDENING.md`
+- Rounds 475-477 added Bluey-owned document-tool bootstrap, private interview
+  context QA, and the full competitive/engineering audit that drove Round 478.
 
 - Round 474 completed the consolidated signed `0.1.98` release on branch
   `codex/bluey-web-ui-parallel-20260704` without GitHub Actions:

@@ -54,6 +54,8 @@ pub struct CueSettings {
     pub audio_system_enabled: bool,
     pub audio_microphone_enabled: bool,
     pub cloud_sync_enabled: bool,
+    #[serde(default = "legacy_cloud_sync_consent_granted")]
+    pub cloud_sync_consent_granted: bool,
     pub retention_days: u32,
     pub updated_at: String,
 
@@ -78,18 +80,26 @@ impl Default for CueSettings {
             overlay_opacity: 0.92,
             audio_system_enabled: true,
             audio_microphone_enabled: true,
-            cloud_sync_enabled: true,
+            cloud_sync_enabled: false,
+            cloud_sync_consent_granted: false,
             retention_days: 30,
             updated_at: clock::now_epoch_ms_string(),
             auto_disguise_prompted: false,
             auto_disguise_enabled: false,
-            disguise_mode: "activity".to_string(),
+            disguise_mode: "none".to_string(),
         }
     }
 }
 
 impl CueSettings {
+    fn enforce_consent(&mut self) {
+        if !self.cloud_sync_consent_granted {
+            self.cloud_sync_enabled = false;
+        }
+    }
+
     pub fn touch(&mut self) {
+        self.enforce_consent();
         self.overlay_opacity = self.overlay_opacity.clamp(0.18, 1.0);
         self.retention_days = self.retention_days.clamp(1, 3650);
         self.updated_at = clock::now_epoch_ms_string();
@@ -116,7 +126,11 @@ pub fn save_account(paths: &AppPaths, account: &AccountConfig) -> Result<()> {
 pub fn load_settings(paths: &AppPaths) -> Result<CueSettings> {
     match fs::read(&paths.settings_file) {
         Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse {}", paths.settings_file.display())),
+            .with_context(|| format!("failed to parse {}", paths.settings_file.display()))
+            .map(|mut settings: CueSettings| {
+                settings.enforce_consent();
+                settings
+            }),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(CueSettings::default()),
         Err(error) => {
             Err(error).with_context(|| format!("failed to read {}", paths.settings_file.display()))
@@ -144,7 +158,14 @@ fn write_private_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result
 }
 
 fn default_disguise_mode() -> String {
-    "activity".to_string()
+    "none".to_string()
+}
+
+// Existing signed-in installs already enabled saved-session sync under the
+// accepted account terms. Missing this newly introduced field must preserve
+// that state; brand-new settings still default to false until sign-in.
+fn legacy_cloud_sync_consent_granted() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -152,9 +173,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_settings_enable_cloud_sync_after_sign_in() {
+    fn default_settings_require_cloud_sync_opt_in() {
         let settings = CueSettings::default();
 
+        assert!(!settings.cloud_sync_enabled);
+        assert!(!settings.cloud_sync_consent_granted);
+        assert_eq!(settings.disguise_mode, "none");
+    }
+
+    #[test]
+    fn legacy_enabled_sync_without_new_consent_field_stays_on() {
+        let mut value = serde_json::to_value(CueSettings::default()).unwrap();
+        value["cloud_sync_enabled"] = serde_json::Value::Bool(true);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("cloud_sync_consent_granted");
+
+        let mut settings: CueSettings = serde_json::from_value(value).unwrap();
+        settings.enforce_consent();
+
         assert!(settings.cloud_sync_enabled);
+        assert!(settings.cloud_sync_consent_granted);
+    }
+
+    #[test]
+    fn explicit_sync_consent_stays_enabled() {
+        let mut settings = CueSettings {
+            cloud_sync_enabled: true,
+            cloud_sync_consent_granted: true,
+            ..CueSettings::default()
+        };
+
+        settings.touch();
+
+        assert!(settings.cloud_sync_enabled);
+        assert!(settings.cloud_sync_consent_granted);
     }
 }

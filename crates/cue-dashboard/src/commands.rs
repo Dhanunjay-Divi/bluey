@@ -541,6 +541,39 @@ pub fn list_turns(
 
 // ===== Settings + Secrets commands (Phase 3 Round 5) =====
 
+#[derive(Clone, Serialize)]
+pub struct DataControlsPayload {
+    pub cloud_sync_enabled: bool,
+    pub raw_audio_retained: bool,
+    pub training_enabled: bool,
+}
+
+fn data_controls_payload(settings: &cue_core::CueSettings) -> DataControlsPayload {
+    DataControlsPayload {
+        cloud_sync_enabled: settings.cloud_sync_enabled,
+        raw_audio_retained: false,
+        training_enabled: false,
+    }
+}
+
+#[tauri::command]
+pub fn get_data_controls() -> Result<DataControlsPayload, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let settings = cue_core::load_settings(&paths).map_err(|e| e.to_string())?;
+    Ok(data_controls_payload(&settings))
+}
+
+#[tauri::command]
+pub fn set_cloud_sync_enabled(enabled: bool) -> Result<DataControlsPayload, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let mut settings = cue_core::load_settings(&paths).map_err(|e| e.to_string())?;
+    settings.cloud_sync_consent_granted = enabled;
+    settings.cloud_sync_enabled = enabled;
+    settings.touch();
+    cue_core::save_settings(&paths, &settings).map_err(|e| e.to_string())?;
+    Ok(data_controls_payload(&settings))
+}
+
 #[tauri::command]
 pub fn save_stt_api_key(provider: String, key: String) -> Result<(), String> {
     cue_daemon::secrets::store_api_key(&provider, &key).map_err(|e| e.to_string())
@@ -1104,127 +1137,6 @@ pub fn get_live_transcripts(since_index: usize) -> Result<Vec<LiveTranscriptPayl
         })
         .collect();
     Ok(segments)
-}
-
-// ===== Phase 3 Round 8: Process Masquerading =====
-
-/// Apply a disguise mode and persist it. Updates all open windows.
-#[tauri::command]
-pub fn set_disguise(mode: String, app: AppHandle) -> Result<(), String> {
-    let disguise_mode = cue_stealth::DisguiseMode::from_str_loose(&mode);
-    let req = cue_stealth::build_request(disguise_mode, None);
-    cue_stealth::apply_disguise(&req).map_err(|e| e.to_string())?;
-
-    // Codex follow-up: real tray icon swap. Disguise PNGs are
-    // embedded at compile time via include_bytes! so they are part of
-    // the signed app bundle (no runtime path lookup, no missing-file
-    // class). None mode restores the default Bluey icon.
-    if let Some(tray) = app.tray_by_id("main") {
-        match disguise_icon_bytes(disguise_mode) {
-            Some(bytes) => match tauri::image::Image::from_bytes(bytes) {
-                Ok(img) => {
-                    if let Err(e) = tray.set_icon(Some(img)) {
-                        tracing::warn!(error = %e, "tray icon swap failed");
-                    } else {
-                        tracing::debug!(mode = %disguise_mode.as_str(), "tray icon swapped");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "tray icon decode failed");
-                }
-            },
-            None => {
-                if let Some(default_img) = app.default_window_icon().cloned() {
-                    if let Err(e) = tray.set_icon(Some(default_img)) {
-                        tracing::warn!(error = %e, "tray icon restore failed");
-                    } else {
-                        tracing::debug!("tray icon restored to default");
-                    }
-                }
-            }
-        }
-    }
-
-    // Update all window titles
-    let title = req.app_name.trim();
-    for (_label, window) in app.webview_windows() {
-        let _ = window.set_title(title);
-    }
-
-    // Persist setting
-    let db_state: State<DbState> = app.state();
-    let db = db_state.0.lock().map_err(|e| e.to_string())?;
-    db.save_setting("disguise_mode", disguise_mode.as_str())
-        .map_err(|e| e.to_string())?;
-    persist_core_disguise_mode(disguise_mode.as_str());
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn disguise_icon_bytes(mode: cue_stealth::DisguiseMode) -> Option<&'static [u8]> {
-    match mode {
-        cue_stealth::DisguiseMode::None => None,
-        cue_stealth::DisguiseMode::Activity => {
-            Some(include_bytes!("../icons/disguise/mac/activity.png"))
-        }
-        cue_stealth::DisguiseMode::Terminal => {
-            Some(include_bytes!("../icons/disguise/mac/terminal.png"))
-        }
-        cue_stealth::DisguiseMode::Settings => {
-            Some(include_bytes!("../icons/disguise/mac/settings.png"))
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn disguise_icon_bytes(mode: cue_stealth::DisguiseMode) -> Option<&'static [u8]> {
-    match mode {
-        cue_stealth::DisguiseMode::None => None,
-        cue_stealth::DisguiseMode::Activity => {
-            Some(include_bytes!("../icons/disguise/win/activity.png"))
-        }
-        cue_stealth::DisguiseMode::Terminal => {
-            Some(include_bytes!("../icons/disguise/win/terminal.png"))
-        }
-        cue_stealth::DisguiseMode::Settings => {
-            Some(include_bytes!("../icons/disguise/win/settings.png"))
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn disguise_icon_bytes(_mode: cue_stealth::DisguiseMode) -> Option<&'static [u8]> {
-    None
-}
-
-fn persist_core_disguise_mode(mode: &str) {
-    let Ok(paths) = cue_core::app_paths::AppPaths::discover() else {
-        return;
-    };
-    let mut settings = match cue_core::load_settings(&paths) {
-        Ok(settings) => settings,
-        Err(error) => {
-            tracing::warn!(%error, "failed to load core settings for disguise persistence");
-            return;
-        }
-    };
-    settings.disguise_mode = mode.to_string();
-    settings.touch();
-    if let Err(error) = cue_core::save_settings(&paths, &settings) {
-        tracing::warn!(%error, "failed to persist core disguise setting");
-    }
-}
-
-/// Get the current disguise mode from persisted settings.
-#[tauri::command]
-pub fn get_disguise(db: State<DbState>) -> Result<String, String> {
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    let mode = db
-        .load_setting("disguise_mode")
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| "activity".to_string());
-    Ok(mode)
 }
 
 // ===== Phase 3 Round 9: Mouse Passthrough Toggle =====

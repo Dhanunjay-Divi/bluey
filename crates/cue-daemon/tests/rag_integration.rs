@@ -6,7 +6,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cue_core::{ContextArtifact, ContextKind};
 use cue_daemon::db::rag::RagPipeline;
-use cue_rag::{Chunk, Chunker, EmbeddingError, EmbeddingProvider, VectorStore};
+use cue_rag::{Chunk, Chunker, EmbeddingError, EmbeddingProvider, RagScope, VectorStore};
+
+fn test_scope() -> RagScope {
+    RagScope::new("integration-test-account", Some("default")).unwrap()
+}
 
 /// Mock embedder that returns deterministic embeddings based on text length.
 struct MockEmbedder;
@@ -62,6 +66,7 @@ fn chunker_short_text() {
 fn vector_store_index_and_query() {
     let dim = 4;
     let store = VectorStore::open(Path::new(":memory:"), dim).unwrap();
+    let scope = test_scope();
 
     for i in 0..5 {
         let chunk = Chunk {
@@ -76,7 +81,7 @@ fn vector_store_index_and_query() {
             (i as f32 * 0.3).sin(),
             (i as f32 * 0.3).cos(),
         ];
-        store.index("session-A", &chunk, &emb).unwrap();
+        store.index(&scope, "session-A", &chunk, &emb).unwrap();
     }
 
     // Query with embedding identical to chunk 3
@@ -86,7 +91,7 @@ fn vector_store_index_and_query() {
         (3.0_f32 * 0.3).sin(),
         (3.0_f32 * 0.3).cos(),
     ];
-    let results = store.query(&query, 3, None).unwrap();
+    let results = store.query(&scope, &query, 3, None).unwrap();
     assert_eq!(results.len(), 3);
     // Top result should be chunk 3 (exact match = score 1.0)
     assert!(
@@ -104,10 +109,12 @@ fn vector_store_index_and_query() {
 fn vector_store_session_filter() {
     let dim = 4;
     let store = VectorStore::open(Path::new(":memory:"), dim).unwrap();
+    let scope = test_scope();
     let emb = vec![1.0, 0.0, 0.0, 0.0];
 
     store
         .index(
+            &scope,
             "s1",
             &Chunk {
                 text: "s1 data".into(),
@@ -119,6 +126,7 @@ fn vector_store_session_filter() {
         .unwrap();
     store
         .index(
+            &scope,
             "s2",
             &Chunk {
                 text: "s2 data".into(),
@@ -130,6 +138,7 @@ fn vector_store_session_filter() {
         .unwrap();
     store
         .index(
+            &scope,
             "s2",
             &Chunk {
                 text: "s2 more".into(),
@@ -141,16 +150,16 @@ fn vector_store_session_filter() {
         .unwrap();
 
     // Filter to s1 only
-    let results = store.query(&emb, 10, Some("s1")).unwrap();
+    let results = store.query(&scope, &emb, 10, Some("s1")).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].session_id, "s1");
 
     // Filter to s2
-    let results = store.query(&emb, 10, Some("s2")).unwrap();
+    let results = store.query(&scope, &emb, 10, Some("s2")).unwrap();
     assert_eq!(results.len(), 2);
 
     // No filter returns all
-    let results = store.query(&emb, 10, None).unwrap();
+    let results = store.query(&scope, &emb, 10, None).unwrap();
     assert_eq!(results.len(), 3);
 }
 
@@ -158,10 +167,12 @@ fn vector_store_session_filter() {
 fn vector_store_delete_session_cascade() {
     let dim = 4;
     let store = VectorStore::open(Path::new(":memory:"), dim).unwrap();
+    let scope = test_scope();
     let emb = vec![0.5, 0.5, 0.5, 0.5];
 
     store
         .index(
+            &scope,
             "keep",
             &Chunk {
                 text: "keeper".into(),
@@ -173,6 +184,7 @@ fn vector_store_delete_session_cascade() {
         .unwrap();
     store
         .index(
+            &scope,
             "remove",
             &Chunk {
                 text: "goner1".into(),
@@ -184,6 +196,7 @@ fn vector_store_delete_session_cascade() {
         .unwrap();
     store
         .index(
+            &scope,
             "remove",
             &Chunk {
                 text: "goner2".into(),
@@ -194,13 +207,13 @@ fn vector_store_delete_session_cascade() {
         )
         .unwrap();
 
-    assert_eq!(store.chunk_count().unwrap(), 3);
-    let deleted = store.delete_session("remove").unwrap();
+    assert_eq!(store.chunk_count(&scope).unwrap(), 3);
+    let deleted = store.delete_session(&scope, "remove").unwrap();
     assert_eq!(deleted, 2);
-    assert_eq!(store.chunk_count().unwrap(), 1);
+    assert_eq!(store.chunk_count(&scope).unwrap(), 1);
 
     // Query should only return the kept session
-    let results = store.query(&emb, 10, None).unwrap();
+    let results = store.query(&scope, &emb, 10, None).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].session_id, "keep");
 }
@@ -210,6 +223,7 @@ async fn rag_live_indexing_smoke() {
     // Simulate the live indexing path: text -> chunker -> embedder -> store
     let dim = 4;
     let store = VectorStore::open(Path::new(":memory:"), dim).unwrap();
+    let scope = test_scope();
     let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder);
     let chunker = Chunker::new();
 
@@ -220,15 +234,19 @@ async fn rag_live_indexing_smoke() {
 
     for chunk in &chunks {
         let embedding = embedder.embed(&chunk.text).await.unwrap();
-        store.index("live-session", chunk, &embedding).unwrap();
+        store
+            .index(&scope, "live-session", chunk, &embedding)
+            .unwrap();
     }
 
     // Verify data was indexed
-    assert!(store.chunk_count().unwrap() > 0);
+    assert!(store.chunk_count(&scope).unwrap() > 0);
 
     // Query should return results
     let query_emb = embedder.embed("revenue increase").await.unwrap();
-    let results = store.query(&query_emb, 5, Some("live-session")).unwrap();
+    let results = store
+        .query(&scope, &query_emb, 5, Some("live-session"))
+        .unwrap();
     assert!(!results.is_empty());
     assert_eq!(results[0].session_id, "live-session");
 }
@@ -236,7 +254,7 @@ async fn rag_live_indexing_smoke() {
 #[tokio::test]
 async fn rag_indexes_context_artifact_with_source_labels() {
     let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder);
-    let pipeline = RagPipeline::new(PathBuf::from(":memory:"), embedder).unwrap();
+    let pipeline = RagPipeline::new(PathBuf::from(":memory:"), embedder, test_scope()).unwrap();
     let artifact = ContextArtifact::new(
         ContextKind::Document,
         "/Users/example/launch-plan.md",
@@ -266,7 +284,7 @@ async fn rag_indexes_context_artifact_with_source_labels() {
 #[tokio::test]
 async fn rag_indexes_saved_markdown_artifact_when_available() {
     let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder);
-    let pipeline = RagPipeline::new(PathBuf::from(":memory:"), embedder).unwrap();
+    let pipeline = RagPipeline::new(PathBuf::from(":memory:"), embedder, test_scope()).unwrap();
     let base = std::env::temp_dir().join(format!("bluey-rag-markdown-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     let markdown_path = base.join("context.md");

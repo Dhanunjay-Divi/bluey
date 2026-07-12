@@ -1,5 +1,10 @@
 # Installer Checklist
 
+> Historical `0.1.0` checklist. The current public release is `0.1.99` with
+> manifest-listed macOS Apple silicon and Windows x86-64 artifacts. Use
+> `INSTALL.md` and `https://bluey.sh/latest.json` for current platform facts;
+> the items below remain useful as regression history.
+
 Bluey v0.1.0 installs as a macOS arm64 terminal-distributed local-first product.
 The longer-term commercial target is a signed desktop product with cloud auth,
 visible permissions onboarding, local resilience, and support diagnostics.

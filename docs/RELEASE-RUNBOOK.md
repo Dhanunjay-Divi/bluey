@@ -194,7 +194,7 @@ vim docs/release/RELEASE-vX.Y.Z.md
 Required sections:
 - Released date + audience
 - Supported platforms table (✅/❌ with reason)
-- What's in this release (capture / overlays / stealth / dashboard)
+- What's in this release (capture / overlays / screen-share privacy / dashboard)
 - Code signing status
 - Known gaps (link to `FUTURE-IMPLEMENTATIONS.md`)
 - Verification log (the pipeline output above)

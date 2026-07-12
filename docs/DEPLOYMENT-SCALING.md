@@ -1,5 +1,10 @@
 # Deployment And Scaling Plan
 
+> Historical planning baseline. Statements below about the "current v0.1.0"
+> release are preserved as architecture history. The current public manifest is
+> `0.1.99` and lists `darwin-arm64` and `windows-x86_64`; use `INSTALL.md` for
+> the current customer support matrix.
+
 Bluey should become a desktop product backed by a managed cloud service. The
 current v0.1.0 release scope is narrower: macOS arm64, terminal-distributed,
 local-first, with the native overlay and helper binaries bundled in a tarball.

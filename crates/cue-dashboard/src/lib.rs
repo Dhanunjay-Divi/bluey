@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use cue_daemon::db::Database;
 use tauri::{
-    menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
+    menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
     tray::TrayIconBuilder,
     Emitter, Manager,
 };
@@ -25,21 +25,6 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(InvisibilityState::default())
-        .manage({
-            let cfg = AutoDisguiseConfig::default();
-            if let Ok(paths) = cue_core::app_paths::AppPaths::discover() {
-                let st = cue_core::load_settings(&paths).unwrap_or_default();
-                cfg.prompted.store(
-                    st.auto_disguise_prompted,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                cfg.enabled.store(
-                    st.auto_disguise_enabled,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
-            cfg
-        })
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
@@ -59,6 +44,8 @@ pub fn run() {
             commands::report_frontend_error,
             commands::get_signin_url,
             commands::complete_onboarding,
+            commands::get_data_controls,
+            commands::set_cloud_sync_enabled,
             commands::list_sessions,
             commands::create_session,
             commands::get_session,
@@ -92,9 +79,6 @@ pub fn run() {
             commands::open_privacy_settings,
             commands::emit_permission_denied,
             commands::poll_audio_permission,
-            // R8: Process Masquerading
-            commands::set_disguise,
-            commands::get_disguise,
             // R9: LLM / Cue
             commands::save_llm_api_key,
             commands::list_llm_providers,
@@ -110,9 +94,7 @@ pub fn run() {
             commands::request_cue,
             commands::auto_recap,
             invisibility_toggle,
-            invisibility_state,
-            auto_disguise_accept,
-            auto_disguise_decline
+            invisibility_state
         ])
         .setup(|app| {
             install_deep_link_handler(app);
@@ -134,48 +116,6 @@ pub fn run() {
             });
             app.manage(DbState(Mutex::new(db)));
             app.manage(ActiveSessionState(Mutex::new(restored)));
-
-            // R8: Apply process disguise on startup
-            {
-                let db_state: tauri::State<DbState> = app.state();
-                let mode_str = db_state
-                    .0
-                    .lock()
-                    .ok()
-                    .and_then(|db| db.load_setting("disguise_mode").ok().flatten())
-                    .unwrap_or_else(|| "activity".to_string());
-                let mode = cue_stealth::DisguiseMode::from_str_loose(&mode_str);
-                let req = cue_stealth::build_request(mode, None);
-                if let Err(e) = cue_stealth::apply_disguise(&req) {
-                    tracing::warn!(error = %e, "failed to apply startup disguise");
-                }
-                // Re-assertion timers: OS sometimes drifts the process title.
-                // Read the CURRENT persisted mode at each tick so rapid user
-                // changes are respected (no stale overrides).
-                let app_name = req.app_name.clone();
-                let db_path = db_path.to_str().unwrap_or("bluey.db").to_owned();
-                std::thread::spawn(move || {
-                    for delay_ms in [200, 1000, 5000] {
-                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                        let current_mode = cue_daemon::db::Database::open(&db_path)
-                            .ok()
-                            .and_then(|db| db.load_setting("disguise_mode").ok().flatten())
-                            .unwrap_or_else(|| "none".to_string());
-                        let re_req = cue_stealth::build_request(
-                            cue_stealth::DisguiseMode::from_str_loose(&current_mode),
-                            None,
-                        );
-                        let _ = cue_stealth::apply_disguise(&re_req);
-                    }
-                });
-                // Set window title if disguise is active
-                if mode != cue_stealth::DisguiseMode::None {
-                    let title = app_name.trim().to_owned();
-                    if let Some(w) = app.get_webview_window("main") {
-                        let _ = w.set_title(&title);
-                    }
-                }
-            }
 
             // R7: Live transcript poller — reads daemon meeting file and emits
             // Tauri events for new segments.
@@ -235,17 +175,6 @@ pub fn run() {
 
             // Setup system tray
             setup_tray(app)?;
-            let startup_disguise =
-                crate::commands::get_disguise(app.state()).unwrap_or_else(|_| "activity".into());
-            if let Err(error) =
-                crate::commands::set_disguise(startup_disguise, app.handle().clone())
-            {
-                tracing::warn!(%error, "failed to apply startup tray disguise");
-            }
-
-            // Stage 18 auto-disguise watch must be installed in the single
-            // effective setup closure. Tauri stores only one setup callback.
-            spawn_meeting_watch(app.handle().clone());
 
             // Auto-update: silent background check after 30s delay
             let handle = app.handle().clone();
@@ -338,7 +267,7 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
             }
         })?;
 
-    // Codex Stage 18 commit 6: F19 system-wide invisibility toggle.
+    // F19 system-wide overlay visibility toggle.
     let handle_f19 = app.handle().clone();
     if let Err(e) = app
         .global_shortcut()
@@ -363,44 +292,19 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         MenuItemBuilder::with_id("toggle_listening", "Toggle Listening").build(app)?;
     let show_dashboard = MenuItemBuilder::with_id("show_dashboard", "Show Dashboard").build(app)?;
     let toggle_overlay = MenuItemBuilder::with_id("toggle_overlay", "Toggle Overlay").build(app)?;
-    let invisible = MenuItemBuilder::with_id("invisible_toggle", "Invisible (F19)").build(app)?;
+    let overlay_visibility =
+        MenuItemBuilder::with_id("overlay_visibility", "Show / Hide Overlay (F19)").build(app)?;
     let signin = MenuItemBuilder::with_id("signin", "Sign in / Out").build(app)?;
     let settings = MenuItemBuilder::with_id("settings", "Settings…").build(app)?;
     let check_updates =
         MenuItemBuilder::with_id("check_updates", "Check for Updates…").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
-    let current_disguise =
-        crate::commands::get_disguise(app.state()).unwrap_or_else(|_| "activity".to_string());
-    let label = |value: &str, name: &str| {
-        if value == current_disguise {
-            format!("✓ {name}")
-        } else {
-            format!("  {name}")
-        }
-    };
-    let disguise_submenu = SubmenuBuilder::new(app, "Disguise")
-        .item(&MenuItemBuilder::with_id("disguise:none", label("none", "Off")).build(app)?)
-        .item(
-            &MenuItemBuilder::with_id("disguise:activity", label("activity", activity_label()))
-                .build(app)?,
-        )
-        .item(
-            &MenuItemBuilder::with_id("disguise:terminal", label("terminal", terminal_label()))
-                .build(app)?,
-        )
-        .item(
-            &MenuItemBuilder::with_id("disguise:settings", label("settings", settings_label()))
-                .build(app)?,
-        )
-        .build()?;
-
     let menu = MenuBuilder::new(app)
         .item(&toggle_listening)
         .item(&show_dashboard)
         .item(&toggle_overlay)
-        .item(&invisible)
-        .item(&disguise_submenu)
+        .item(&overlay_visibility)
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&signin)
         .item(&settings)
@@ -422,20 +326,12 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "toggle_overlay" => {
                 let _ = app.emit("hotkey_toggle_overlay", ());
             }
-            "invisible_toggle" => {
+            "overlay_visibility" => {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state: tauri::State<'_, InvisibilityState> = handle.state();
                     let _ = invisibility_toggle(state, handle.clone()).await;
                 });
-            }
-            id if id.starts_with("disguise:") => {
-                let mode = id.trim_start_matches("disguise:").to_string();
-                if let Err(e) = crate::commands::set_disguise(mode.clone(), app.clone()) {
-                    tracing::warn!(error = %e, "set_disguise from tray failed");
-                } else {
-                    tracing::info!(mode = %mode, "disguise changed via tray");
-                }
             }
             "signin" => {
                 show_main_window(app);
@@ -475,36 +371,6 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
 
     Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn activity_label() -> &'static str {
-    "Task Manager"
-}
-
-#[cfg(not(target_os = "windows"))]
-fn activity_label() -> &'static str {
-    "Activity Monitor"
-}
-
-#[cfg(target_os = "windows")]
-fn terminal_label() -> &'static str {
-    "Command Prompt"
-}
-
-#[cfg(not(target_os = "windows"))]
-fn terminal_label() -> &'static str {
-    "Terminal"
-}
-
-#[cfg(target_os = "macos")]
-fn settings_label() -> &'static str {
-    "System Settings"
-}
-
-#[cfg(not(target_os = "macos"))]
-fn settings_label() -> &'static str {
-    "Settings"
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -699,7 +565,7 @@ async fn notify_daemon_account_linked() {
     }
 }
 
-// ─── Codex Stage 18 commit 4: invisibility state + tray "Invisible" toggle ──
+// Overlay visibility state shared by F19, Settings, and the tray.
 
 #[derive(Clone, Default)]
 struct InvisibilityState {
@@ -724,13 +590,7 @@ async fn invisibility_toggle(
     use tauri::Emitter;
     let next = !state.is_invisible();
     state.set(next);
-    // Toggle overlay visibility (existing daemon command).
     let _ = app.emit("hotkey_toggle_overlay", next);
-    // Toggle disguise on/off (default disguise mode is "activity").
-    let mode = if next { "activity" } else { "none" };
-    if let Err(e) = crate::commands::set_disguise(mode.to_string(), app.clone()) {
-        tracing::warn!(error = %e, "set_disguise failed during invisibility toggle");
-    }
     let _ = app.emit("invisibility_changed", next);
     Ok(next)
 }
@@ -738,69 +598,4 @@ async fn invisibility_toggle(
 #[tauri::command]
 fn invisibility_state(state: tauri::State<'_, InvisibilityState>) -> bool {
     state.is_invisible()
-}
-
-// ─── Codex Stage 18 commit 8: meeting-app auto-disguise wiring ──────────
-
-#[derive(Default, Clone)]
-struct AutoDisguiseConfig {
-    /// Has the customer been asked once already?
-    pub prompted: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Did they say yes?
-    pub enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-#[tauri::command]
-fn auto_disguise_accept(
-    cfg: tauri::State<'_, AutoDisguiseConfig>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    cfg.enabled
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    cfg.prompted
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    persist_auto_disguise_settings(true, true)?;
-    if let Err(e) = crate::commands::set_disguise("activity".to_string(), app) {
-        tracing::warn!(error = %e, "set_disguise failed during auto_disguise_accept");
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn auto_disguise_decline(cfg: tauri::State<'_, AutoDisguiseConfig>) -> Result<(), String> {
-    cfg.prompted
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    persist_auto_disguise_settings(true, false)?;
-    Ok(())
-}
-
-fn persist_auto_disguise_settings(prompted: bool, enabled: bool) -> Result<(), String> {
-    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
-    let mut settings = cue_core::load_settings(&paths).map_err(|e| e.to_string())?;
-    settings.auto_disguise_prompted = prompted;
-    settings.auto_disguise_enabled = enabled;
-    settings.touch();
-    cue_core::save_settings(&paths, &settings).map_err(|e| e.to_string())
-}
-
-fn spawn_meeting_watch(app: tauri::AppHandle) {
-    use tauri::Emitter;
-    let watcher = cue_daemon::cloud::meeting_detect::MeetingWatch::default();
-    let _handle = cue_daemon::cloud::meeting_detect::spawn_loop(watcher.clone());
-    let mut rx = watcher.subscribe();
-    tauri::async_runtime::spawn(async move {
-        while rx.changed().await.is_ok() {
-            let cur = rx.borrow().clone();
-            if let Some(evt) = cur {
-                let cfg: tauri::State<'_, AutoDisguiseConfig> = app.state();
-                let prompted = cfg.prompted.load(std::sync::atomic::Ordering::Relaxed);
-                let enabled = cfg.enabled.load(std::sync::atomic::Ordering::Relaxed);
-                if !prompted {
-                    let _ = app.emit("auto_disguise_offer", &evt);
-                } else if enabled {
-                    let _ = crate::commands::set_disguise("activity".to_string(), app.clone());
-                }
-            }
-        }
-    });
 }

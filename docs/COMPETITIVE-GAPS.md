@@ -1,5 +1,10 @@
 # Competitive Gaps
 
+> Historical gap snapshot. References below to the current `0.1.0` macOS-only
+> release are superseded by the public `0.1.99` manifest, which lists macOS
+> Apple silicon and Windows x86-64. Current product trust gaps are tracked in
+> `SETTINGS-UI-CONTRACT.md` and `PRODUCT-STRATEGY.md`.
+
 This tracks what Bluey still needs to feel like a paid product beyond the
 current macOS arm64 local-first release.
 

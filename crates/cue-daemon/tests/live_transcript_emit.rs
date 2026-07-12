@@ -9,6 +9,7 @@ use cue_core::MeetingRecord;
 fn live_transcript_event_serializes_correctly() {
     let event = cue_daemon::app::LiveTranscriptEvent {
         session_id: "abc-123".to_string(),
+        audio_session_id: "audio-1".to_string(),
         source: "microphone".to_string(),
         text: "hello world".to_string(),
         is_final: true,
@@ -17,6 +18,7 @@ fn live_transcript_event_serializes_correctly() {
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["session_id"], "abc-123");
+    assert_eq!(json["audio_session_id"], "audio-1");
     assert_eq!(json["source"], "microphone");
     assert_eq!(json["text"], "hello world");
     assert_eq!(json["is_final"], true);
@@ -34,6 +36,7 @@ async fn broadcast_channel_delivers_live_transcript_event() {
 
     let event = cue_daemon::app::LiveTranscriptEvent {
         session_id: "sess-1".to_string(),
+        audio_session_id: "audio-2".to_string(),
         source: "system".to_string(),
         text: "test segment".to_string(),
         is_final: false,
@@ -44,6 +47,7 @@ async fn broadcast_channel_delivers_live_transcript_event() {
     tx.send(event.clone()).unwrap();
     let received = rx.recv().await.unwrap();
     assert_eq!(received.session_id, "sess-1");
+    assert_eq!(received.audio_session_id, "audio-2");
     assert_eq!(received.source, "system");
     assert_eq!(received.text, "test segment");
     assert!(!received.is_final);

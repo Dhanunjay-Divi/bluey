@@ -737,6 +737,11 @@ pub struct AnswerRequestMetadata {
     pub required_capabilities: Vec<AiCapability>,
     #[serde(default)]
     pub visible_context_ids: Vec<Uuid>,
+    /// True when the request was triggered from the live-caption Answer flow.
+    /// This is explicit because localized or user-edited visible prompt text is
+    /// not a reliable protocol signal for transcript finalization.
+    #[serde(default)]
+    pub answer_current_transcript: bool,
 }
 
 impl AnswerRequestMetadata {
@@ -749,6 +754,7 @@ impl AnswerRequestMetadata {
             stream: false,
             required_capabilities: vec![AiCapability::Chat],
             visible_context_ids: Vec::new(),
+            answer_current_transcript: false,
         }
     }
 
@@ -774,6 +780,11 @@ impl AnswerRequestMetadata {
 
     pub fn with_visible_context_ids(mut self, ids: Vec<Uuid>) -> Self {
         self.visible_context_ids = ids;
+        self
+    }
+
+    pub fn answering_current_transcript(mut self) -> Self {
+        self.answer_current_transcript = true;
         self
     }
 }

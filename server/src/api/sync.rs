@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use crate::auth::AuthedAccount;
-use crate::db::diagnostic_logs::{self, DiagnosticLogChunkInput};
+use crate::db::object_uploads::{
+    self, NewObjectUpload, ObjectKind, ObjectUpload, StorageScope, UploadControlError,
+};
 use crate::db::sync::{
     self, CloudDeletedSession, CloudSessionBundle, CloudSessionSummary, RagMatch,
     SyncContextArtifactRecord, SyncCounts, SyncCueResponseRecord, SyncRagChunkRecord,
@@ -147,6 +149,29 @@ pub async fn delete_session(
 ) -> Result<Json<SyncBatchResponse>, (StatusCode, String)> {
     validate_session_id(&session_id)?;
     sync::tombstone_session(&state.pool, &account.id, &session_id).map_err(internal)?;
+    if let Some(config) = state.config.object_storage.clone() {
+        drain_cleanup_jobs(
+            &state,
+            &account.id,
+            StorageScope::Artifact,
+            &ObjectStorage::new(config),
+        )
+        .await;
+    }
+    if let Some(config) = state
+        .config
+        .log_storage
+        .clone()
+        .or_else(|| state.config.object_storage.clone())
+    {
+        drain_cleanup_jobs(
+            &state,
+            &account.id,
+            StorageScope::Audit,
+            &ObjectStorage::new(config),
+        )
+        .await;
+    }
     Ok(Json(SyncBatchResponse {
         accepted: SyncCounts {
             sessions: 1,
@@ -197,7 +222,7 @@ pub async fn upload_artifact_object(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ArtifactObjectResponse>, (StatusCode, String)> {
-    ensure_sync_usage_allowed(&account, "artifact_upload")?;
+    ensure_upload_allowed(&account, "artifact_upload")?;
     validate_object_id(&artifact_id)?;
     let storage_config = state.config.object_storage.clone().ok_or_else(|| {
         (
@@ -216,7 +241,6 @@ pub async fn upload_artifact_object(
     }
 
     let storage = ObjectStorage::new(storage_config);
-    let key = storage.artifact_key(&account.id, &artifact_id);
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -224,18 +248,39 @@ pub async fn upload_artifact_object(
         .unwrap_or("application/octet-stream")
         .to_string();
     let hash = sha256_hex(&body);
-    storage
-        .put(&key, body.clone(), &content_type)
-        .await
-        .map_err(internal)?;
+    let key = storage.artifact_upload_key(&account.id, &artifact_id, &hash);
+    drain_cleanup_jobs(&state, &account.id, StorageScope::Artifact, &storage).await;
+    let created_at_ms = now_ms();
+    let upload = reserve_put_and_finalize(
+        &state,
+        &storage,
+        NewObjectUpload {
+            account_id: account.id.clone(),
+            object_kind: ObjectKind::Artifact,
+            logical_id: artifact_id.clone(),
+            session_id: None,
+            storage_scope: StorageScope::Artifact,
+            object_key: key,
+            size_bytes: body.len() as i64,
+            sha256: hash,
+            content_type,
+            expires_at_ms: created_at_ms
+                .saturating_add(storage.retention_days().saturating_mul(86_400_000)),
+            metadata_json: serde_json::json!({}),
+            now_ms: created_at_ms,
+            limits: storage.upload_limits(),
+        },
+        body,
+    )
+    .await?;
 
     Ok(Json(ArtifactObjectResponse {
         artifact_id,
-        object_key: key,
-        size_bytes: body.len() as u64,
-        sha256: hash,
-        content_type,
-        expires_at_ms: now_ms() + storage.retention_days().saturating_mul(86_400_000),
+        object_key: upload.object_key,
+        size_bytes: upload.size_bytes as u64,
+        sha256: upload.sha256,
+        content_type: upload.content_type,
+        expires_at_ms: upload.expires_at_ms,
     }))
 }
 
@@ -246,6 +291,7 @@ pub async fn upload_session_audit_bundle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<SessionAuditBundleResponse>, (StatusCode, String)> {
+    ensure_upload_allowed(&account, "session_audit_upload")?;
     validate_session_id(&session_id)?;
     validate_audit_bundle_id(&bundle_id)?;
     let storage_config = state
@@ -276,62 +322,50 @@ pub async fn upload_session_audit_bundle(
         .unwrap_or("application/json")
         .to_string();
     let hash = sha256_hex(&body);
-    let key = session_audit_object_key(
-        &storage_config.key_prefix,
-        &account.id,
-        &session_id,
-        &bundle_id,
-    );
-    let retention_days = storage_config.retention_days;
     let storage = ObjectStorage::new(storage_config);
-    storage
-        .put(&key, body.clone(), &content_type)
-        .await
-        .map_err(internal)?;
-
     let created_at_ms = now_ms();
-    let expires_at_ms = created_at_ms + retention_days.saturating_mul(86_400_000);
-    let session_code = uuid::Uuid::parse_str(&session_id)
-        .ok()
-        .map(cue_core::short_session_code);
-    diagnostic_logs::record_chunk(
-        &state.pool,
-        DiagnosticLogChunkInput {
-            id: Some(format!(
-                "session-audit:{}:{}:{}",
-                account.id, session_id, bundle_id
-            )),
-            account_id: Some(account.id.clone()),
-            workspace_id: None,
+    let key = storage.audit_upload_key(&account.id, &session_id, &bundle_id, &hash);
+    drain_cleanup_jobs(&state, &account.id, StorageScope::Audit, &storage).await;
+    let upload = reserve_put_and_finalize(
+        &state,
+        &storage,
+        NewObjectUpload {
+            account_id: account.id.clone(),
+            object_kind: ObjectKind::SessionAudit,
+            logical_id: format!("{session_id}/{bundle_id}"),
             session_id: Some(session_id.clone()),
-            session_code,
-            kind: "session_audit_bundle".to_string(),
-            storage: "r2".to_string(),
-            object_key: Some(key.clone()),
-            local_path: None,
-            bytes: body.len() as i64,
-            sha256: Some(hash.clone()),
-            created_at_ms,
-            expires_at_ms,
+            storage_scope: StorageScope::Audit,
+            object_key: key,
+            size_bytes: body.len() as i64,
+            sha256: hash,
+            content_type,
+            expires_at_ms: created_at_ms
+                .saturating_add(storage.retention_days().saturating_mul(86_400_000)),
             metadata_json: serde_json::json!({
                 "bundle_id": bundle_id,
-                "content_type": content_type,
+                "content_type": headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("application/json"),
                 "schema_version": headers
                     .get("x-bluey-audit-schema-version")
                     .and_then(|value| value.to_str().ok()),
             }),
+            now_ms: created_at_ms,
+            limits: storage.upload_limits(),
         },
+        body,
     )
-    .map_err(internal)?;
+    .await?;
 
     Ok(Json(SessionAuditBundleResponse {
         session_id,
         bundle_id,
-        object_key: key,
-        size_bytes: body.len() as u64,
-        sha256: hash,
-        content_type,
-        expires_at_ms,
+        object_key: upload.object_key,
+        size_bytes: upload.size_bytes as u64,
+        sha256: upload.sha256,
+        content_type: upload.content_type,
+        expires_at_ms: upload.expires_at_ms,
     }))
 }
 
@@ -348,22 +382,44 @@ pub async fn download_artifact_object(
             "object sync is not configured".into(),
         )
     })?;
-    let record = sync::load_context_artifact(&state.pool, &account.id, &artifact_id)
-        .map_err(internal)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "artifact not found".to_string()))?;
-    let key = record
-        .metadata
-        .get("object_key")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                "artifact object not found".to_string(),
-            )
-        })?;
     let storage = ObjectStorage::new(storage_config);
-    if !storage.key_belongs_to_account(key, &account.id) {
+    let indexed = object_uploads::artifact_upload(&state.pool, &account.id, &artifact_id)
+        .map_err(internal)?;
+    let (key, expires_at_ms, durable_index) = if let Some(upload) = indexed {
+        if upload.state != "ready" {
+            if upload.state == "delete_pending" {
+                drain_cleanup_jobs(&state, &account.id, StorageScope::Artifact, &storage).await;
+                return Err((StatusCode::GONE, "artifact object deleted".to_string()));
+            }
+            return Err((
+                StatusCode::NOT_FOUND,
+                "artifact object is not ready".to_string(),
+            ));
+        }
+        (upload.object_key, Some(upload.expires_at_ms), true)
+    } else {
+        let record = sync::load_context_artifact(&state.pool, &account.id, &artifact_id)
+            .map_err(internal)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "artifact not found".to_string()))?;
+        let key = record
+            .metadata
+            .get("object_key")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "artifact object not found".to_string(),
+                )
+            })?
+            .to_string();
+        let expires_at_ms = record
+            .metadata
+            .get("object_expires_at_ms")
+            .and_then(|value| value.as_i64());
+        (key, expires_at_ms, false)
+    };
+    if !storage.key_belongs_to_account(&key, &account.id) {
         tracing::warn!(
             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
             artifact_id = %artifact_id,
@@ -375,23 +431,16 @@ pub async fn download_artifact_object(
             "artifact object not available".into(),
         ));
     }
-    if record
-        .metadata
-        .get("object_expires_at_ms")
-        .and_then(|value| value.as_i64())
-        .is_some_and(|expires_at_ms| expires_at_ms <= now_ms())
-    {
-        if let Err(error) = storage.delete(key).await {
-            tracing::warn!(
-                error = %error,
-                artifact_id = %artifact_id,
-                "lazy object delete failed"
-            );
+    if expires_at_ms.is_some_and(|expires_at_ms| expires_at_ms <= now_ms()) {
+        if durable_index {
+            drain_cleanup_jobs(&state, &account.id, StorageScope::Artifact, &storage).await;
+        } else if let Err(error) = storage.delete(&key).await {
+            tracing::warn!(error = %error, artifact_id = %artifact_id, "legacy lazy object delete failed");
         }
         return Err((StatusCode::GONE, "artifact object expired".into()));
     }
 
-    let object = storage.get(key).await.map_err(internal)?;
+    let object = storage.get(&key).await.map_err(internal)?;
     let mut response = Response::new(Body::from(object.bytes));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -490,23 +539,6 @@ fn validate_audit_bundle_id(bundle_id: &str) -> Result<(), (StatusCode, String)>
     }
 }
 
-fn session_audit_object_key(
-    prefix: &str,
-    account_id: &str,
-    session_id: &str,
-    bundle_id: &str,
-) -> String {
-    let prefix = prefix.trim_matches('/');
-    let date = chrono::Utc::now().format("%Y-%m-%d");
-    let suffix =
-        format!("accounts/{account_id}/date-{date}/sessions/{session_id}/audit/{bundle_id}.json");
-    if prefix.is_empty() {
-        suffix
-    } else {
-        format!("{prefix}/{suffix}")
-    }
-}
-
 fn internal(e: anyhow::Error) -> (StatusCode, String) {
     let error_chain = e
         .chain()
@@ -515,6 +547,187 @@ fn internal(e: anyhow::Error) -> (StatusCode, String) {
         .join(" | ");
     tracing::warn!(error = %e, error_chain = %error_chain, "sync endpoint failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "sync failed".to_string())
+}
+
+async fn reserve_put_and_finalize(
+    state: &AppState,
+    storage: &ObjectStorage,
+    input: NewObjectUpload,
+    body: Bytes,
+) -> Result<ObjectUpload, (StatusCode, String)> {
+    let reservation = object_uploads::reserve_upload(&state.pool, &input).map_err(upload_error)?;
+    if !reservation.needs_put {
+        return Ok(reservation.upload);
+    }
+
+    if let Err(error) = storage
+        .put(
+            &reservation.upload.object_key,
+            body,
+            &reservation.upload.content_type,
+        )
+        .await
+    {
+        if let Err(index_error) = object_uploads::record_put_failure(
+            &state.pool,
+            &reservation.upload.id,
+            &error.to_string(),
+            now_ms(),
+        ) {
+            tracing::error!(
+                error = %index_error,
+                upload_id_hash = %sha256_hex(reservation.upload.id.as_bytes()),
+                "failed to persist object PUT retry state"
+            );
+        }
+        tracing::warn!(
+            error = %error,
+            upload_id_hash = %sha256_hex(reservation.upload.id.as_bytes()),
+            "object PUT failed with durable metadata retained for retry"
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "object storage write failed".to_string(),
+        ));
+    }
+
+    match object_uploads::mark_upload_ready(&state.pool, &reservation.upload.id, now_ms()) {
+        Ok(upload) => Ok(upload),
+        Err(error) => {
+            let lifecycle_conflict =
+                error
+                    .downcast_ref::<UploadControlError>()
+                    .is_some_and(|policy| {
+                        matches!(
+                            policy,
+                            UploadControlError::UploadGone | UploadControlError::UploadNotFound
+                        )
+                    });
+            if lifecycle_conflict {
+                match storage.delete(&reservation.upload.object_key).await {
+                    Ok(()) => {
+                        let _ = object_uploads::mark_cleanup_succeeded(
+                            &state.pool,
+                            &reservation.upload.id,
+                            now_ms(),
+                        );
+                    }
+                    Err(cleanup_error) => {
+                        let _ = object_uploads::mark_cleanup_failed(
+                            &state.pool,
+                            &reservation.upload.id,
+                            &cleanup_error.to_string(),
+                            now_ms(),
+                        );
+                        tracing::error!(
+                            error = %cleanup_error,
+                            upload_id_hash = %sha256_hex(reservation.upload.id.as_bytes()),
+                            "object PUT completed after lifecycle deletion; cleanup will retry"
+                        );
+                    }
+                }
+            }
+            Err(upload_error(error))
+        }
+    }
+}
+
+async fn drain_cleanup_jobs(
+    state: &AppState,
+    account_id: &str,
+    storage_scope: StorageScope,
+    storage: &ObjectStorage,
+) {
+    let now = now_ms();
+    let stale_before_ms = now.saturating_sub(24 * 60 * 60 * 1000);
+    let jobs = match object_uploads::claim_cleanup_jobs(
+        &state.pool,
+        account_id,
+        storage_scope,
+        now,
+        stale_before_ms,
+        5,
+    ) {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to claim object cleanup jobs");
+            return;
+        }
+    };
+
+    for job in jobs {
+        let result = if storage.key_belongs_to_account(&job.object_key, account_id) {
+            storage.delete(&job.object_key).await
+        } else {
+            Err(anyhow::anyhow!(
+                "object cleanup key is outside account scope"
+            ))
+        };
+        match result {
+            Ok(()) => {
+                if let Err(error) =
+                    object_uploads::mark_cleanup_succeeded(&state.pool, &job.upload_id, now_ms())
+                {
+                    tracing::error!(error = %error, "failed to complete object cleanup metadata");
+                }
+            }
+            Err(error) => {
+                if let Err(index_error) = object_uploads::mark_cleanup_failed(
+                    &state.pool,
+                    &job.upload_id,
+                    &error.to_string(),
+                    now_ms(),
+                ) {
+                    tracing::error!(error = %index_error, "failed to persist object cleanup retry");
+                }
+                tracing::warn!(error = %error, "object cleanup will be retried");
+            }
+        }
+    }
+}
+
+fn upload_error(error: anyhow::Error) -> (StatusCode, String) {
+    let Some(policy) = error.downcast_ref::<UploadControlError>() else {
+        return internal(error);
+    };
+    match policy {
+        UploadControlError::ObjectTooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "object is too large".to_string(),
+        ),
+        UploadControlError::AccountBytesQuotaExceeded => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "account object storage quota exceeded".to_string(),
+        ),
+        UploadControlError::AccountObjectQuotaExceeded => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "account object count quota exceeded".to_string(),
+        ),
+        UploadControlError::DailyQuotaExceeded => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "daily object upload quota exceeded".to_string(),
+        ),
+        UploadControlError::IdempotencyConflict => (
+            StatusCode::CONFLICT,
+            "object id is already bound to different content".to_string(),
+        ),
+        UploadControlError::UploadInProgress => (
+            StatusCode::CONFLICT,
+            "object upload is already in progress".to_string(),
+        ),
+        UploadControlError::UploadGone => (
+            StatusCode::GONE,
+            "object upload has been deleted".to_string(),
+        ),
+        UploadControlError::SessionNotOwned | UploadControlError::UploadNotFound => (
+            StatusCode::NOT_FOUND,
+            "session or object not found".to_string(),
+        ),
+        UploadControlError::InvalidMetadata(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid object metadata".to_string(),
+        ),
+    }
 }
 
 fn now_ms() -> i64 {
@@ -540,6 +753,31 @@ fn ensure_sync_usage_allowed(
     Err((
         StatusCode::FORBIDDEN,
         "Account usage is paused while billing is under review.".to_string(),
+    ))
+}
+
+fn ensure_upload_allowed(
+    account: &crate::db::accounts::Account,
+    surface: &str,
+) -> Result<(), (StatusCode, String)> {
+    ensure_sync_usage_allowed(account, surface)?;
+    if account.is_temporary_expired() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Temporary account access has expired.".to_string(),
+        ));
+    }
+    if account.is_admin || account.balance_cents > 0 || account.trial_seconds_remaining > 0 {
+        return Ok(());
+    }
+    tracing::warn!(
+        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+        surface,
+        "account without active cloud-upload entitlement was blocked"
+    );
+    Err((
+        StatusCode::PAYMENT_REQUIRED,
+        "Cloud uploads require an active trial or credit balance.".to_string(),
     ))
 }
 
@@ -614,6 +852,21 @@ mod tests {
     }
 
     #[test]
+    fn every_upload_requires_live_billing_and_cloud_entitlement() {
+        let mut account = test_account(false);
+        let err = ensure_upload_allowed(&account, "artifact_upload").unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYMENT_REQUIRED);
+
+        account.trial_seconds_remaining = 60;
+        assert!(ensure_upload_allowed(&account, "artifact_upload").is_ok());
+
+        account.billing_restricted = true;
+        account.billing_restriction_reason = Some("charge.dispute.created".into());
+        let err = ensure_upload_allowed(&account, "session_audit_upload").unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
     fn session_ids_accept_uuid_and_safe_legacy_shapes() {
         assert!(validate_session_id("61b8c310-27de-4cc1-b598-c62bdcc07ba8").is_ok());
         assert!(validate_session_id("sess-cloud-1").is_ok());
@@ -636,20 +889,5 @@ mod tests {
         assert!(validate_audit_bundle_id("../audit").is_err());
         assert!(validate_audit_bundle_id("audit/slash").is_err());
         assert!(validate_audit_bundle_id("").is_err());
-    }
-
-    #[test]
-    fn session_audit_object_key_is_account_and_session_scoped() {
-        let key = session_audit_object_key(
-            "bluey-prod",
-            "acct_123",
-            "550e8400-e29b-41d4-a716-446655440000",
-            "audit-ABC123-1780000000000",
-        );
-        assert!(key.starts_with("bluey-prod/accounts/acct_123/date-"));
-        assert!(key.contains(
-            "/sessions/550e8400-e29b-41d4-a716-446655440000/audit/audit-ABC123-1780000000000.json"
-        ));
-        assert!(!key.contains("//"));
     }
 }

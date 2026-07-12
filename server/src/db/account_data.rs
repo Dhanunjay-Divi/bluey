@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use postgres::Row as PgRow;
 use rusqlite::{params, OptionalExtension};
+use std::collections::HashSet;
 
 use crate::db::DbPool;
 
@@ -502,6 +503,7 @@ fn artifact_object_refs_sqlite(pool: &DbPool, account_id: &str) -> Result<Vec<Ar
             refs.push(reference);
         }
     }
+    append_upload_ledger_artifact_refs_sqlite(&conn, account_id, &mut refs)?;
     Ok(refs)
 }
 
@@ -526,7 +528,76 @@ fn artifact_object_refs_postgres(
             refs.push(reference);
         }
     }
+    append_upload_ledger_artifact_refs_postgres(&mut conn, account_id, &mut refs)?;
     Ok(refs)
+}
+
+fn append_upload_ledger_artifact_refs_sqlite(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    refs: &mut Vec<ArtifactObjectRef>,
+) -> Result<()> {
+    let mut seen = refs
+        .iter()
+        .map(|reference| reference.object_key.clone())
+        .collect::<HashSet<_>>();
+    let mut stmt = conn.prepare(
+        "SELECT logical_id, object_key, content_type, size_bytes, sha256, expires_at_ms
+           FROM object_uploads
+          WHERE account_id = ?1 AND object_kind = 'artifact' AND state <> 'deleted'
+          ORDER BY created_at_ms",
+    )?;
+    let rows = stmt.query_map(params![account_id], |row| {
+        Ok(ArtifactObjectRef {
+            artifact_id: row.get(0)?,
+            title: "Uploaded artifact".to_string(),
+            object_key: row.get(1)?,
+            content_type: row.get(2)?,
+            size_bytes: row.get(3)?,
+            sha256: row.get(4)?,
+            expires_at_ms: row.get(5)?,
+        })
+    })?;
+    for row in rows {
+        let reference = row?;
+        if seen.insert(reference.object_key.clone()) {
+            refs.push(reference);
+        }
+    }
+    Ok(())
+}
+
+fn append_upload_ledger_artifact_refs_postgres(
+    conn: &mut crate::db::SafePostgresClient,
+    account_id: &str,
+    refs: &mut Vec<ArtifactObjectRef>,
+) -> Result<()> {
+    let mut seen = refs
+        .iter()
+        .map(|reference| reference.object_key.clone())
+        .collect::<HashSet<_>>();
+    let rows = conn.query(
+        "SELECT logical_id, object_key, content_type, size_bytes, sha256, expires_at_ms
+           FROM object_uploads
+          WHERE account_id = $1 AND object_kind = 'artifact' AND state <> 'deleted'
+          ORDER BY created_at_ms",
+        &[&account_id],
+    )?;
+    for row in rows {
+        let reference = ArtifactObjectRef {
+            artifact_id: row.try_get(0)?,
+            title: "Uploaded artifact".to_string(),
+            object_key: row.try_get(1)?,
+            content_type: row.try_get(2)?,
+            size_bytes: row.try_get(3)?,
+            sha256: row.try_get(4)?,
+            expires_at_ms: row.try_get(5)?,
+        };
+        if seen.insert(reference.object_key.clone()) {
+            refs.push(reference);
+        }
+    }
+    Ok(())
 }
 
 fn object_ref_from_metadata(

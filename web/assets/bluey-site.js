@@ -70,7 +70,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const DEVICE_LINK_TTL_MS = 10 * 60 * 1000;
     const DEVICE_APPROVAL_WAIT_MS = 45 * 1000;
     const DEVICE_LINK_STORAGE_KEY = 'bluey_pending_device_code';
-    const AUTO_RELOAD_SETUP_OPT_OUT_PREFIX = 'bluey_auto_reload_setup_opt_out:';
     const ACCESS_TOKEN_KEY = 'bluey_access_token';
     const REFRESH_TOKEN_KEY = 'bluey_refresh_token';
     const AUTH_PERSISTENCE_KEY = 'bluey_auth_persistence';
@@ -87,6 +86,34 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function paymentRequestId() {
       if (window.crypto?.randomUUID) return window.crypto.randomUUID();
       return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+
+    async function loadReleaseManifest() {
+      try {
+        const response = await fetch('/latest.json', {
+          headers: { Accept: 'application/json' },
+          cache: 'no-store',
+        });
+        if (!response.ok) return;
+        const manifest = await response.json();
+        const version = String(manifest?.version || '').trim();
+        if (!/^\d+\.\d+\.\d+$/.test(version)) return;
+
+        document.querySelectorAll('[data-release-version]').forEach((element) => {
+          element.textContent = version;
+        });
+        document.querySelectorAll('[data-release-platform]').forEach((card) => {
+          const platform = card.dataset.releasePlatform || '';
+          const available = Boolean(manifest?.platforms?.[platform]?.url);
+          card.classList.toggle('is-release-unavailable', !available);
+          if (!available) {
+            card.setAttribute('aria-disabled', 'true');
+            card.querySelector('.download-card-action')?.replaceChildren('Not in current release');
+          }
+        });
+      } catch {
+        // Keep the server-rendered release facts if the manifest is temporarily unavailable.
+      }
     }
 
     function formatApproxDays(days) {
@@ -283,26 +310,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         history.replaceState(history.state, '', nextUrl);
       } catch {
         // If history is unavailable, the stored handoff expiry still prevents stale prompts.
-      }
-    }
-
-    function autoReloadSetupOptOutKey(me = latestAccountForBilling) {
-      const email = String(me?.email || currentAccountEmail || '').trim().toLowerCase();
-      return email ? `${AUTO_RELOAD_SETUP_OPT_OUT_PREFIX}${email}` : '';
-    }
-
-    function autoReloadSetupOptedOut(me = latestAccountForBilling) {
-      const key = autoReloadSetupOptOutKey(me);
-      return key ? localStorage.getItem(key) === '1' : false;
-    }
-
-    function setAutoReloadSetupOptOut(enabled, me = latestAccountForBilling) {
-      const key = autoReloadSetupOptOutKey(me);
-      if (!key) return;
-      if (enabled) {
-        localStorage.setItem(key, '1');
-      } else {
-        localStorage.removeItem(key);
       }
     }
 
@@ -710,78 +717,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           button.textContent = previousText;
         }
       }
-    }
-
-    function bootBlueyTerminal() {
-      const term = document.getElementById('blueyTerminal');
-      if (!term || term.dataset.booted === '1') return;
-      term.dataset.booted = '1';
-
-      const scenes = [
-        {
-          cmd: 'bluey on',
-          lines: [
-            { t: '', d: 180 },
-            { t: '<span class="blue">[bluey]</span> starting desktop overlay', d: 220 },
-            { t: '<span class="green">[ok]</span> overlay pill ready', d: 300 },
-            { t: '<span class="green">[ok]</span> private session ready', d: 300 },
-            { t: '<span class="green">[ok]</span> running in background', d: 320 },
-            { t: '<span class="dim">Close this terminal. Bluey continues in the background.</span>', d: 360 },
-          ],
-        },
-        {
-          cmd: 'bluey listen',
-          lines: [
-            { t: '', d: 160 },
-            { t: '<span class="label">system</span> <span class="value">transcript ready</span>', d: 260 },
-            { t: '<span class="label">mic</span> <span class="value">transcript ready</span>', d: 260 },
-            { t: '<span class="green">[ok]</span> stops after silence to control cost', d: 300 },
-          ],
-        },
-        {
-          cmd: 'bluey ask "what is the plan?"',
-          lines: [
-            { t: '', d: 160 },
-            { t: '<span class="label">context</span> transcript + docs + screen', d: 260 },
-            { t: '<span class="green">[stream]</span> answer appears in Bluey', d: 320 },
-          ],
-        },
-      ];
-
-      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-      const typeText = async (text, el) => {
-        for (let i = 0; i < text.length; i += 1) {
-          el.textContent += text[i];
-          await sleep(28 + Math.random() * 18);
-        }
-      };
-      const renderCommandLine = (cmd, cursor = false) => {
-        term.innerHTML = `<span class="prompt">$ </span><span class="cmd">${cmd}</span>${cursor ? '<span class="terminal-cursor"></span>' : ''}`;
-      };
-      const playScene = async (scene) => {
-        if (!term.isConnected) return;
-        term.innerHTML = '<span class="prompt">$ </span><span class="cmd" id="blueyTyping"></span><span class="terminal-cursor"></span>';
-        await sleep(280);
-        await typeText(scene.cmd, document.getElementById('blueyTyping'));
-        await sleep(260);
-        renderCommandLine(scene.cmd);
-        for (const line of scene.lines) {
-          await sleep(line.d);
-          term.innerHTML += `<br>${line.t}`;
-        }
-        await sleep(2100);
-        renderCommandLine(scene.cmd, true);
-        await sleep(350);
-      };
-
-      (async () => {
-        let index = 0;
-        while (term.isConnected) {
-          await playScene(scenes[index % scenes.length]);
-          index += 1;
-          await sleep(500);
-        }
-      })();
     }
 
     async function refreshAccountToken() {
@@ -1898,10 +1833,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function confirmAutoReloadOff() {
       return confirmAction({
         title: 'Turn off Auto Reload?',
-        message: 'Bluey can run out of balance during a call, interview, or long conversation if Auto Reload is off.',
-        note: 'Keep Auto Reload on to top up before the account balance gets too low. You can still add balance manually anytime.',
+        message: 'Future automatic card charges will stop. Your current balance and saved card are unchanged.',
+        note: 'You can add balance manually or turn Auto Reload on again later.',
         confirmText: 'Turn off',
-        cancelText: 'Keep on',
+        cancelText: 'Cancel',
       });
     }
 
@@ -2221,13 +2156,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const threshold = money(thresholdCents);
       const canSaveSquareCard = canUseSquareCardSetup(me);
       const hasSavedMethod = Boolean(me?.auto_topup_available);
-      const optedOutOfSetup = autoReloadSetupOptedOut(me);
-
-      const setupDefaultOn = !me?.auto_topup_enabled && canSaveSquareCard && !hasSavedMethod && !optedOutOfSetup;
-      const toggleChecked = Boolean(me?.auto_topup_enabled) || setupDefaultOn;
       card.classList.toggle('is-on', Boolean(me?.auto_topup_enabled));
-      card.classList.toggle('is-setup-default', setupDefaultOn);
-      toggle.checked = toggleChecked;
+      card.classList.remove('is-setup-default');
+      toggle.checked = Boolean(me?.auto_topup_enabled);
       toggle.disabled = false;
       if (changeCardButton) {
         changeCardButton.hidden = !canSaveSquareCard;
@@ -2249,9 +2180,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (me?.auto_topup_enabled) {
         hint.textContent = `On. Adds ${amount} when balance is below ${threshold}.`;
       } else if (hasSavedMethod) {
-        hint.textContent = 'Off. Turn on to resume automatic reloads.';
+        hint.textContent = 'Off. No automatic charges will be made.';
       } else if (canSaveSquareCard) {
-        hint.textContent = 'Add balance once and keep Auto Reload on to save a card.';
+        hint.textContent = 'Off. Turn it on only if you want to save a card for future automatic charges.';
       } else {
         hint.textContent = friendlyBillingMessage(me?.auto_topup_unavailable_reason);
       }
@@ -2332,7 +2263,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           ? `Auto Reload is active with ${savedMethod || 'a saved card'}.`
           : savedMethod
             ? 'Auto Reload is off. Your saved card stays available if you turn it back on.'
-            : 'Add balance once, or keep Auto Reload on to save a card.';
+            : 'Auto Reload is off. Turn it on only if you want to save a card for future automatic charges.';
       }
     }
 
@@ -2382,7 +2313,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const settings = readAutoReloadSettings();
         rule.textContent = hasSavedMethod
           ? `Adds ${money(settings.auto_topup_amount_cents)} when balance is below ${money(settings.auto_topup_threshold_cents)}.`
-          : `Add balance once and keep Auto Reload on to add ${money(settings.auto_topup_amount_cents)} below ${money(settings.auto_topup_threshold_cents)}.`;
+          : `After you approve a card, future charges add ${money(settings.auto_topup_amount_cents)} below ${money(settings.auto_topup_threshold_cents)}.`;
       } catch (error) {
         rule.textContent = error.message;
       }
@@ -2477,10 +2408,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       const balanceCents = Number(me?.balance_cents || 0);
       if (balanceCents <= 0) {
-        return 'Add balance to start. Keep Auto Reload on to top up before work stops.';
+        return 'Add balance to start. Auto Reload is optional and stays off until you enable it.';
       }
       if (balanceCents < 100) {
-        return 'Almost out. Add balance or keep Auto Reload on.';
+        return 'Almost out. Add balance manually, or enable Auto Reload if you want automatic charges.';
       }
       if (balanceCents < 500) {
         return 'Low balance. Add more soon.';
@@ -2826,14 +2757,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const modalAutoAmount = document.getElementById('modalAutoReloadAmount');
       const dashboardAutoAmount = document.getElementById('autoReloadAmount');
 
-      const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
       const wasEnabled = Boolean(latestAccountForBilling?.auto_topup_enabled);
-      const canSaveSquareCard = canUseSquareCardSetup(latestAccountForBilling);
-      const defaultAutoReloadOn = wasEnabled
-        || (canSaveSquareCard && !hasSavedMethod && !autoReloadSetupOptedOut(latestAccountForBilling));
 
       if (modalAmount) modalAmount.value = manualAmount?.value || centsToDollars(MANUAL_RELOAD_AMOUNT_CENTS);
-      if (modalToggle) modalToggle.checked = defaultAutoReloadOn || Boolean(dashboardToggle?.checked);
+      if (modalToggle) modalToggle.checked = wasEnabled || Boolean(dashboardToggle?.checked);
       if (modalThreshold) modalThreshold.value = dashboardThreshold?.value || centsToDollars(AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS);
       if (modalAutoAmount) modalAutoAmount.value = dashboardAutoAmount?.value || centsToDollars(AUTO_RELOAD_DEFAULT_AMOUNT_CENTS);
       renderReloadSetupCardState();
@@ -3056,12 +2983,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const wasEnabled = Boolean(latestAccountForBilling?.auto_topup_enabled);
       const hasSavedMethod = Boolean(latestAccountForBilling?.auto_topup_available);
 
-      if (enabled) {
-        setAutoReloadSetupOptOut(false);
-      } else if (!wasEnabled && !hasSavedMethod) {
-        setAutoReloadSetupOptOut(true);
-      }
-
       if (enabled && hasSavedMethod) {
         applyReloadSetupToDashboard();
         await updateAutoReload(true);
@@ -3088,9 +3009,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
 
       const autoReloadSelected = Boolean(document.getElementById('modalAutoReloadToggle')?.checked);
-      setAutoReloadSetupOptOut(!autoReloadSelected
-        && !latestAccountForBilling?.auto_topup_enabled
-        && !latestAccountForBilling?.auto_topup_available);
       let autoReloadSettings = null;
       if (autoReloadSelected) {
         try {
@@ -4207,11 +4125,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
             updateAutoReloadDraftCopy();
             return;
           }
-          if (!latestAccountForBilling?.auto_topup_enabled && !latestAccountForBilling?.auto_topup_available) {
-            setAutoReloadSetupOptOut(true);
-          }
-        } else {
-          setAutoReloadSetupOptOut(false);
         }
         if (toggle.checked && !latestAccountForBilling?.auto_topup_available) {
           toggle.checked = Boolean(latestAccountForBilling?.auto_topup_enabled);
@@ -4245,20 +4158,19 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       document.getElementById('modalAutoReloadToggle')?.addEventListener('change', async (event) => {
         const toggle = event.currentTarget;
-        if (toggle && !toggle.checked) {
+        if (toggle && !toggle.checked && latestAccountForBilling?.auto_topup_enabled) {
           const confirmed = await confirmAutoReloadOff();
           if (!confirmed) {
             toggle.checked = true;
-          } else if (!latestAccountForBilling?.auto_topup_enabled && !latestAccountForBilling?.auto_topup_available) {
-            setAutoReloadSetupOptOut(true);
-            closeSquareCardSetup({
-              setupId: 'reloadSetupSquareCardSetup',
-              containerId: 'reloadSetupSquareCardContainer',
-              changeButtonId: 'reloadSetupCardButton',
-            });
           }
+        }
+        if (toggle && !toggle.checked) {
+          closeSquareCardSetup({
+            setupId: 'reloadSetupSquareCardSetup',
+            containerId: 'reloadSetupSquareCardContainer',
+            changeButtonId: 'reloadSetupCardButton',
+          });
         } else if (toggle?.checked) {
-          setAutoReloadSetupOptOut(false);
           if (!latestAccountForBilling?.auto_topup_available
             && canUseSquareCardSetup(latestAccountForBilling)) {
             openReloadSetupCard().catch(handleReloadCardSetupFailure);
@@ -4489,7 +4401,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         card.dataset.instructionsReady = '1';
         const platform = card.dataset.platformCard;
         const open = () => {
-          if (!platform || card.classList.contains('disabled')) return;
+          if (!platform || card.classList.contains('disabled') || card.getAttribute('aria-disabled') === 'true') return;
           selectDownloadPlatform(platform);
         };
         card.addEventListener('click', (event) => {
@@ -4588,7 +4500,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     initSiteTheme();
     initProfileMenus();
     initProductJoinForm();
-    bootBlueyTerminal();
+    loadReleaseManifest();
     syncAccountNav();
     initDownloadInstructions();
     initAccountApp();

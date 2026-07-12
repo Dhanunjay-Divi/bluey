@@ -1,9 +1,9 @@
 # Session Flow
 
-Bluey should feel like an overlay-first, terminal-first product. `bluey on`
-and `bluey off` are the customer-facing live-session commands. The first
-`bluey on` opens browser sign-in when needed; the overlay/dashboard handles
-account, history, answer style, and settings from there.
+Bluey is an overlay-first product with a terminal launcher. `bluey on` and
+`bluey off` handle lifecycle; normal work happens in the overlay. The first
+`bluey on` opens browser sign-in when needed, while the overlay/dashboard owns
+account, history, answer style, data controls, and settings.
 
 ## Normal User Flow
 
@@ -28,11 +28,11 @@ Use the bottom tray for the main loop:
 Audio/STT text appears as source-labeled transcript cards: `System transcript`
 for system/browser audio and `Mic transcript` for microphone audio. Typed
 questions render as `You` cards, and model output renders as `Bluey / Response`
-cards. On the v0.1.0 macOS path, Bluey captures audio through bundled native
-helpers, applies VAD, and routes transcription through configured Deepgram,
-OpenAI Realtime, or LocalWhisper providers. Windows WASAPI source exists for the
-parity round but is not shipped in v0.1.0 until Windows whisper.cpp and hardware
-QA are complete. FFmpeg and mock/echo providers remain fallback/dev paths.
+cards. Release `0.1.99` includes public artifacts for macOS Apple silicon and
+Windows x86-64. Bluey captures audio through bundled native helpers, applies
+VAD, and routes transcription through configured managed or local paths.
+The release record install-smokes Windows on Windows 11; it does not claim
+Windows 10. FFmpeg and mock/echo providers remain fallback/dev paths.
 
 Use the header icons for setup and window control:
 
@@ -55,6 +55,18 @@ bluey off
 Support/dev terminal surfaces still exist behind the scenes for diagnostics,
 automation, and smoke tests, but they are not part of the paid customer flow.
 
+## Data Choices
+
+- Sign-in enables managed answers and account balance. Cloud session sync is a
+  separate Settings choice and defaults off for new installs.
+- Legacy sync state without an explicit consent marker is treated as off.
+- Raw audio is processed transiently for transcription and is not kept in a
+  Bluey raw-audio library. Transcript text can remain in the local session.
+- Submitted session content is not used for model training.
+- Supported desktop paths request capture exclusion for the overlay, but this
+  is best effort. Users should test the meeting app or capture path before
+  relying on it.
+
 ## Answer Instructions
 
 Use the notepad icon for this. Examples:
@@ -75,7 +87,7 @@ Context belongs to the current session. Continuing a session keeps its transcrip
 
 Use the paperclip icon first. It can open a native file picker and attach selected files to the active meeting, or show the documents, screenshots, page captures, and notes already attached.
 
-Use the Analyse Screen quick chip when the important content is a browser page that extends beyond the visible viewport. After confirmation, Bluey first asks a supported browser for readable page text, saves it as session context, and generates an answer. If browser text is unavailable, Bluey falls back to one screenshot and sends it to a configured vision route. The overlay stays open and is excluded from normal screen capture. On macOS, browser text works for supported Chrome-family browsers and Safari through normal browser scripting permissions; screenshot fallback uses the platform screenshot path. On Windows, browser text uses user-level UI Automation where the browser exposes document text, then falls back to the Windows screenshot path when a vision route is available.
+Use the Analyse Screen quick chip when the important content is a browser page that extends beyond the visible viewport. After confirmation, Bluey first asks a supported browser for readable page text, saves it as session context, and generates an answer. If browser text is unavailable, Bluey falls back to one screenshot and sends it to a configured vision route. The overlay remains visible to the user and requests capture exclusion where the operating system supports it; that exclusion is not guaranteed. On macOS, browser text works for supported Chrome-family browsers and Safari through normal browser scripting permissions; screenshot fallback uses the platform screenshot path. On Windows, browser text uses user-level UI Automation where the browser exposes document text, then falls back to the Windows screenshot path when a vision route is available.
 
 Use terminal fallback capture commands when the useful context is not available as browser text.
 
