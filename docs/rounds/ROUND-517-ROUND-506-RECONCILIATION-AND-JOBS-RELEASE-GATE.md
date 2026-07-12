@@ -68,3 +68,12 @@ The exact integrated commit, live artifact hashes, service restart evidence,
 post-deploy smoke results, and rollback reference must be appended before the
 round is considered complete.
 
+## Reproducible Server Build Gate
+
+- The first clean droplet build correctly rejected `--locked` because
+  `server/Cargo.lock` existed only as an ignored local file.
+- Bluey Server is an application, so its resolved dependency graph is now
+  committed and the explicit ignore rule was removed.
+- `cargo metadata --manifest-path server/Cargo.toml --locked --no-deps` passes.
+- Production candidates must continue to build with `cargo build --locked`;
+  silently resolving newer dependencies during a release is not allowed.

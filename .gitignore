@@ -23,7 +23,6 @@ __pycache__/
 
 # bluey-server build artifacts
 server/target/
-server/Cargo.lock
 server/*.db
 server/*.db-journal
 server/*.db-shm
