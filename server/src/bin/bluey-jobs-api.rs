@@ -6,7 +6,7 @@ use bluey_server::{
     config::{Config, ServerDbBackend},
     db,
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -24,6 +24,12 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(8081);
+    let host = std::env::var("BLUEY_JOBS_API_HOST")
+        .ok()
+        .map(|value| value.parse::<IpAddr>())
+        .transpose()
+        .context("BLUEY_JOBS_API_HOST must be an IP address")?
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let pool = match config.db_backend {
         ServerDbBackend::Sqlite => db::open_pool(&config.db_path).context("open sqlite db")?,
         ServerDbBackend::Postgres => {
@@ -37,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     db::run_migrations(&pool).context("run Jobs migrations")?;
 
     let app = api::build_jobs_router(pool, config);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::new(host, port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;

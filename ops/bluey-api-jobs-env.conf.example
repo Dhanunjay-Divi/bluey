@@ -1,0 +1,2 @@
+[Service]
+EnvironmentFile=/etc/bluey-api/bluey-jobs.env

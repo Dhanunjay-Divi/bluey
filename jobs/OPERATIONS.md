@@ -16,6 +16,10 @@ On a Bluey production host, install `ops/bluey-jobs.env.example` as
 secret, and set mode `0640` with owner `root:bluey`. The Jobs systemd unit also
 loads the shared API, Valkey, and Postgres environment files. Keep
 `BLUEY_JOBS_BETA_ENABLED=0` until the restricted beta is intentionally opened.
+Install `ops/bluey-api-jobs-env.conf.example` as the main API service drop-in so
+account export, account deletion, and Jobs admin routes use the same data key.
+The standalone Jobs API binds to loopback by default; container deployments
+must opt into another IP with `BLUEY_JOBS_API_HOST` and enforce private ingress.
 
 The Jobs API and workflow gateway share `BLUEY_JOBS_WORKFLOW_TOKEN`. The Jobs
 API and Temporal worker share `BLUEY_JOBS_WORKER_TOKEN`. The Temporal worker
