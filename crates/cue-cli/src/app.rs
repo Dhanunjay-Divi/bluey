@@ -2728,9 +2728,8 @@ fn recorded_daemon_command_matches(command: &str, daemon_bin: Option<&Path>) -> 
 
 #[cfg(unix)]
 fn is_daemon_executable_name(path: &str) -> bool {
-    daemon_executable_match_name(path).is_some_and(|name| {
-        name == "terminal" || name == "bluey-daemon" || name == "cue-daemon"
-    })
+    daemon_executable_match_name(path)
+        .is_some_and(|name| name == "terminal" || name == "bluey-daemon" || name == "cue-daemon")
 }
 
 #[cfg(unix)]
