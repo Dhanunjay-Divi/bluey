@@ -11,6 +11,12 @@ Run these as separate deployable services:
 5. `@bluey/jobs-runner` in a Chromium-capable container pool.
 6. The static Jobs portal under `/jobs`.
 
+On a Bluey production host, install `ops/bluey-jobs.env.example` as
+`/etc/bluey-api/bluey-jobs.env`, replace every placeholder with an independent
+secret, and set mode `0640` with owner `root:bluey`. The Jobs systemd unit also
+loads the shared API, Valkey, and Postgres environment files. Keep
+`BLUEY_JOBS_BETA_ENABLED=0` until the restricted beta is intentionally opened.
+
 The Jobs API and workflow gateway share `BLUEY_JOBS_WORKFLOW_TOKEN`. The Jobs
 API and Temporal worker share `BLUEY_JOBS_WORKER_TOKEN`. The Temporal worker
 and browser pool share `BLUEY_JOBS_RUNNER_TOKEN`. Use independently generated

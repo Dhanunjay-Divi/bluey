@@ -9,8 +9,10 @@ User=bluey
 Group=bluey
 WorkingDirectory=/opt/bluey-api
 EnvironmentFile=/etc/bluey-api/bluey-api.env
+EnvironmentFile=-/etc/bluey-api/bluey-valkey.env
+EnvironmentFile=-/etc/bluey-api/bluey-postgres.env
+EnvironmentFile=/etc/bluey-api/bluey-jobs.env
 Environment=BLUEY_JOBS_API_PORT=8081
-Environment=BLUEY_JOBS_BETA_ENABLED=1
 ExecStart=/usr/local/bin/bluey-jobs-api
 Restart=on-failure
 RestartSec=2s
@@ -30,6 +32,7 @@ RestrictNamespaces=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
+UMask=0077
 
 LimitNOFILE=8192
 MemoryMax=1G
