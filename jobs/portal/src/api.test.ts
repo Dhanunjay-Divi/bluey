@@ -37,8 +37,8 @@ describe("Jobs API authentication", () => {
   });
 
   it("deduplicates concurrent refreshes for the initial workspace load", async () => {
-    localStorage.setItem("bluey_access_token", "expired-access");
-    localStorage.setItem("bluey_refresh_token", "refresh-one");
+    localStorage.setItem("bluey_access_token", "dummy-expired-access-token");
+    localStorage.setItem("bluey_refresh_token", "dummy-refresh-token-one");
     let refreshCalls = 0;
     const authorizationHeaders: string[] = [];
 
@@ -47,12 +47,15 @@ describe("Jobs API authentication", () => {
       if (path === "/auth/refresh") {
         refreshCalls += 1;
         await Promise.resolve();
-        return Response.json({ access_token: "fresh-access", refresh_token: "refresh-two" });
+        return Response.json({
+          access_token: "dummy-fresh-access-token",
+          refresh_token: "dummy-refresh-token-two",
+        });
       }
 
       const authorization = new Headers(init?.headers).get("Authorization") ?? "";
       authorizationHeaders.push(`${path}:${authorization}`);
-      if (authorization !== "Bearer fresh-access") {
+      if (authorization !== "Bearer dummy-fresh-access-token") {
         return Response.json({ message: "expired" }, { status: 401 });
       }
       if (path === "/api/jobs/workspace") return Response.json({ profile: {} });
@@ -65,13 +68,13 @@ describe("Jobs API authentication", () => {
     expect(refreshCalls).toBe(1);
     expect(workspace).toEqual({ profile: {} });
     expect(account.email).toBe("user@example.com");
-    expect(localStorage.getItem("bluey_access_token")).toBe("fresh-access");
-    expect(localStorage.getItem("bluey_refresh_token")).toBe("refresh-two");
+    expect(localStorage.getItem("bluey_access_token")).toBe("dummy-fresh-access-token");
+    expect(localStorage.getItem("bluey_refresh_token")).toBe("dummy-refresh-token-two");
     expect(authorizationHeaders).toEqual(expect.arrayContaining([
-      "/api/jobs/workspace:Bearer expired-access",
-      "/account/me:Bearer expired-access",
-      "/api/jobs/workspace:Bearer fresh-access",
-      "/account/me:Bearer fresh-access",
+      "/api/jobs/workspace:Bearer dummy-expired-access-token",
+      "/account/me:Bearer dummy-expired-access-token",
+      "/api/jobs/workspace:Bearer dummy-fresh-access-token",
+      "/account/me:Bearer dummy-fresh-access-token",
     ]));
   });
 });
