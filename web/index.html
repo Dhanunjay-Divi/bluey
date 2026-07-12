@@ -8,7 +8,6 @@
   <meta name="theme-color" content="#020405">
   <meta name="robots" content="index,follow">
   <link rel="canonical" href="https://bluey.sh/">
-  <link rel="alternate" type="text/plain" href="/llms.txt" title="Bluey llms.txt">
   <link rel="sitemap" type="application/xml" href="/sitemap.xml">
   <link rel="icon" type="image/svg+xml" href="/assets/bluey-logo.svg">
   <link rel="icon" type="image/png" sizes="512x512" href="/assets/favicon-512.png">
@@ -148,10 +147,14 @@
           <li>User-approved context such as typed prompts, source-labeled transcripts, temporary audio chunks needed for transcription, attached files, screen-analysis results, answer-style instructions, and generated responses.</li>
           <li>Diagnostic data such as error reports, service health, abuse controls, and support bundles. Logs are designed to avoid secrets and full user content.</li>
           <li>Payment information needed to complete reloads. Bluey does not collect or store full card numbers, CVV, or card expiration data.</li>
+          <li>Bluey Jobs data such as your Career Profile, verified application email addresses and labels, resume versions, work and education history, skills, location and salary preferences, job matches, application answers, browser-run events, interventions, submission screenshots, and receipts.</li>
         </ul>
 
         <h2>How We Use Data</h2>
         <p>We use account and session data to authenticate you, answer requests, meter paid usage, provide the local or cloud history you choose, show balance and cost labels, debug failures, prevent abuse, and support export or deletion requests.</p>
+
+        <h2>Security and Abuse Signals</h2>
+        <p>To protect accounts, product content, and service availability, Bluey may process request metadata such as IP address, user agent, trusted proxy headers, TLS or browser fingerprints where available, account and device identifiers, authentication outcomes, request paths, response sizes, error rates, and traversal velocity. We use these signals to rate-limit abusive traffic, detect automated extraction or account farming, investigate security events, and enforce access restrictions. Ordinary security logs are designed not to contain resume text, prompts, transcripts, application answers, cookies, passwords, payment details, or verification codes.</p>
 
         <h2>Training and Product Improvement</h2>
         <p>Bluey does not use your prompts, transcripts, audio, files, screenshots, or generated answers to train or fine-tune models. A future research or training program would require a separate, clearly labeled opt-in. The current product has no such opt-in, so submitted content is not training data. We may use aggregate service metrics and feedback you deliberately submit to diagnose reliability and improve safeguards.</p>
@@ -165,20 +168,28 @@
         <h2>Audio Retention</h2>
         <p>Bluey does not offer a retained-audio library in the current release. Raw audio is processed transiently for transcription and Bluey's temporary local chunks are deleted after transcription. Transcript text may remain in the local session and may sync only when cloud sync is on. Speech providers process audio needed to return the transcript under their service terms.</p>
 
+        <h2>Bluey Jobs</h2>
+        <p>When you use Bluey Jobs, we process the profile facts, preferences, job descriptions, tailored documents, application answers, and status records needed to find roles, prepare job-specific materials, and track applications. When you approve or enable submission, Bluey sends the selected resume, cover letter, answers, and contact details to that employer and the application provider operating its form.</p>
+        <p>If you choose to remember an application answer, Bluey stores it in your encrypted Answer Memory and reuses it according to the scope you select: one company, one Career Track, or all applications. You can review, edit, or remove saved answers in Jobs settings. Sensitive questions may still pause for your direct review.</p>
+        <p>For each submitted application, Bluey keeps a receipt identifying the exact resume version and files used, the submission confirmation, and the application answers sent. When an email or calendar connection is available and enabled for your account, related status records may also be linked to that application. This lets you review what was sent without mixing records between employers or roles.</p>
+        <p>A local Bluey Browser keeps its job-site profile on your computer. Cloud runs may store an encrypted browser profile and cookies so an application you authorized can continue while your computer is off. You can remove Bluey-controlled browser profiles from Jobs settings. Bluey does not place raw job-site passwords in ordinary logs or application records.</p>
+        <p>You can verify more than one application email and choose a default or a different address for each Career Track. Bluey records which verified address was used with each application. If an email or calendar connection is available to your account and you enable it, Bluey may process the mailbox or calendar identifier, provider authorization, aliases, and application or interview status signals shown in that feature. During an application, Bluey may identify a matching, recent email verification code and ask you to approve using it. The code is handled transiently and is not retained in the application timeline or ordinary logs. Addresses delivered into the same mailbox may appear as aliases of one connection. You can remove an application email or disconnect a provider from Jobs settings. Job sites and connected providers process information under their own privacy terms.</p>
+
         <h2>Your Controls</h2>
         <p>Desktop capture starts only through visible user controls. You can stop listening, remove attached context, turn cloud sync off, keep sessions local, export account data, delete your account, and clear local state. Auto Reload is also off until you turn it on and approve a saved card.</p>
 
         <h2>Retention</h2>
         <p>Purchased balance remains in account records for accounting and expires up to 12 months (365 days) after purchase. Bluey does not retain raw audio after transcription by default. Local session records remain on your device until you remove them. The current cloud product does not yet guarantee automatic deletion after a fixed number of days; synced records may remain until you delete the session or account. Contact support for a deletion review if needed.</p>
+        <p>Bluey Jobs keeps your Career Profile, verified application emails, preferences, tailored documents, application answers, receipts, and outcome history while your account is active so you can reuse facts and review prior applications. You can remove individual Jobs records where that control is available or delete the account. Connected-service access ends when you disconnect it, and Bluey-controlled cloud browser profiles are removed when you remove them or delete the account, subject to limited backup and legal retention periods.</p>
 
         <h2>Account Deletion</h2>
-        <p>Deleting your account is permanent and requests removal of account access, device authorizations, and account-scoped synced content. Payment, fraud-prevention, security, or backup records may be retained where required, and deletion across storage systems may not be immediate. The current product does not yet show per-object deletion status. Unused account balance is lost, so contact support before deletion if you need a billing or deletion review.</p>
+        <p>Deleting your account is permanent and requests removal of account access, device authorizations, account-scoped synced content, Jobs profiles, tailored resumes, application records, and Bluey-controlled browser profiles. Payment, fraud-prevention, security, or backup records may be retained where required, and deletion across storage systems may not be immediate. The current product does not yet show per-object deletion status. Unused account balance is lost, so contact support before deletion if you need a billing or deletion review.</p>
 
         <h2>Security</h2>
         <p>Desktop account tokens are stored in Bluey's private local account profile so the app can reconnect without operating-system keychain prompts. Payment and AI credentials are kept outside the desktop app. Logs are designed for debugging and support, not for storing raw secrets or full user content.</p>
 
         <h2>Sharing</h2>
-        <p>We share data with infrastructure, payment, email, speech, and AI services only to operate the features you request. We do not sell customer data, and submitted content is not used for model training.</p>
+        <p>We share data with infrastructure, payment, email, calendar, speech, AI, and application-processing services only to operate the features you request. For Bluey Jobs, an employer and its application provider receive only the application materials you choose to submit. Bundled open-source components do not receive your data merely because Bluey uses them. We do not sell customer data, and submitted content is not used for model training.</p>
 
         <h2>Contact</h2>
         <p>For privacy, security, export, deletion, or billing questions, contact support at the address published in the product account page.</p>
@@ -202,6 +213,9 @@
         <h2>Acceptable Use</h2>
         <p>You may use Bluey for your own work, meetings, documents, coding, research, and day-to-day productivity. You may not use Bluey to break laws, access data you are not authorized to access, deceive third-party assessment/security systems, harvest credentials or session cookies, or bypass platform restrictions.</p>
 
+        <h2>Automated Access and Content Use</h2>
+        <p>Unless Bluey gives you prior written permission or a separate license, you may not use crawlers, scraping tools, browser agents, bulk downloaders, account farms, or similar automated means to extract, reproduce, index, benchmark, monitor, reverse engineer, or create a substitute for Bluey, its interfaces, documentation, outputs, pricing, product behavior, or application data. You may not use Bluey content or output to train, fine-tune, evaluate, ground, or supply an AI or machine-learning system, and you may not evade access controls, robots directives, rate limits, bot defenses, or technical restrictions. Standards-compliant conventional search indexing is permitted only to the extent allowed by Bluey's published crawler policy. For licensing or security research authorization, contact <a href="mailto:security@bluey.sh">security@bluey.sh</a>.</p>
+
         <h2>User-Controlled Context</h2>
         <p>You are responsible for the documents, transcripts, voice/audio, screenshots, repositories, and other context you attach or ask Bluey to analyze. Bluey should be used with consent where required, and it should not be used for hidden capture of people or information you are not allowed to process.</p>
 
@@ -216,6 +230,25 @@
 
         <h2>AI Output</h2>
         <p>Bluey can help draft answers, summarize sessions, explain code, reason about systems, and organize context. AI output may be incomplete or wrong. You are responsible for reviewing generated output before relying on it, sending it, submitting it, or using it to make decisions.</p>
+
+        <h2>Bluey Jobs</h2>
+        <p>Bluey Jobs can rank imported roles, tailor job-specific resumes, prepare application answers, operate an authorized browser session, and submit supported applications according to the review and automation settings you choose. Cover letters and post-application tracking are included only where those features are shown as available in your Jobs workspace. You authorize Bluey to take those actions on your behalf. You remain responsible for the accuracy of your Career Profile, confirmed claims, application answers, location and authorization statements, and every application submitted from your account.</p>
+        <ul>
+          <li>One Bluey Jobs account is for one job seeker. You may verify multiple application emails for that profile and choose an address per Career Track. An address may not be verified on two Bluey Jobs accounts at the same time.</li>
+          <li>Each application packet is prepared for one job. Match scores, outcome analytics, salary information, and job availability are estimates and may be incomplete.</li>
+          <li>Bluey may exclude listings outside your selected posting-age window and check that a listing is still open before applying. Posting dates and availability come from employers and application providers and may be delayed, missing, or inaccurate.</li>
+          <li>A submitted application record is tied to the exact resume version and submission confirmation used for that job. Connected email and calendar events may be added to the same application timeline when you authorize those connections.</li>
+          <li>Bluey may offer one-click approval for a matching, unexpired verification code received by an inbox you connected. CAPTCHA, phone or authenticator checks, push approvals, and assessments require your direct action in the preserved browser session. Bluey does not circumvent those checks.</li>
+          <li>Bluey may pause for missing information, authentication, assessments, sensitive questions, CAPTCHAs, or browser takeover rather than guess.</li>
+          <li>When you save an answer to Answer Memory, you authorize Bluey to reuse that confirmed answer according to its selected company, Career Track, or account scope until you edit or remove it. You remain responsible for keeping saved answers accurate.</li>
+          <li>You must follow the rules of job sites and employers. Some sites are limited to user-controlled handoff instead of background submission.</li>
+          <li>Jobs plans include the Career Track, application-email, connected-inbox, browser, and monthly packet allowances shown at purchase. Multiple addresses delivered into the same connected mailbox may be treated as aliases of one inbox connection. A separate Gmail or Outlook mailbox uses another connection slot.</li>
+          <li>Additional inbox slots are billed at the price shown when added to the plan. An additional completed packet may use the stated overage from your Bluey balance, once per unique job. Regeneration, retries, and handoffs do not count again.</li>
+          <li>Bluey does not guarantee interviews, offers, employer responses, uninterrupted browser automation, or the continued availability of any job listing.</li>
+        </ul>
+
+        <h2>Open Source Software</h2>
+        <p>Bluey includes and adapts open-source software under its applicable licenses. Copyright and permission notices are retained with the product source and release materials. Inclusion does not imply that an upstream author or project endorses Bluey, and open-source components remain subject to their own warranty disclaimers.</p>
 
         <h2>Payments</h2>
         <p>Payments, receipts, disputes, and saved cards are managed through checkout. Bluey keeps what is needed to update your balance, show usage, and support refunds or account deletion.</p>

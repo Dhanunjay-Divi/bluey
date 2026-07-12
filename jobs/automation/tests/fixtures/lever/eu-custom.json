@@ -1,0 +1,86 @@
+{
+  "name": "EU hosted form with custom card and attachments",
+  "postingUrl": "https://jobs.eu.lever.co/atlas/22222222-2222-4222-8222-222222222222",
+  "applicationUrl": "https://jobs.eu.lever.co/atlas/22222222-2222-4222-8222-222222222222/apply",
+  "title": "Atlas - Product Engineer",
+  "startAtPosting": false,
+  "applySelector": "[data-qa='btn-apply-bottom'] a[data-qa='show-page-apply']",
+  "submitSelector": "#application-form #btn-submit[data-qa='btn-submit']",
+  "providerLabels": {
+    "[data-bluey-field-id='why']": "Why do you want to join Atlas?"
+  },
+  "controls": [
+    {
+      "selector": "[data-bluey-field-id='resume']",
+      "kind": "file",
+      "label": "Resume/CV",
+      "name": "resume",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='cover']",
+      "kind": "file",
+      "label": "Cover letter",
+      "name": "coverLetter",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='name']",
+      "kind": "text",
+      "label": "Full name",
+      "name": "name",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='email']",
+      "kind": "email",
+      "label": "Email",
+      "name": "email",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='location']",
+      "kind": "select",
+      "label": "Preferred location",
+      "name": "preferredLocation",
+      "placeholder": "",
+      "required": true,
+      "value": "",
+      "options": [
+        { "label": "Choose a location", "value": "" },
+        { "label": "London", "value": "london" },
+        { "label": "Toronto", "value": "toronto" }
+      ]
+    },
+    {
+      "selector": "[data-bluey-field-id='why']",
+      "kind": "textarea",
+      "label": "",
+      "name": "cards[custom][field0]",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    }
+  ],
+  "answers": {
+    "full_name": "Ada Lovelace",
+    "preferred_location": "London",
+    "Why do you want to join Atlas?": "I want to build reliable developer tools."
+  },
+  "expectedValues": {
+    "[data-bluey-field-id='resume']": "resume.pdf",
+    "[data-bluey-field-id='cover']": "cover-letter.pdf",
+    "[data-bluey-field-id='name']": "Ada Lovelace",
+    "[data-bluey-field-id='email']": "ada@example.com",
+    "[data-bluey-field-id='location']": "london",
+    "[data-bluey-field-id='why']": "I want to build reliable developer tools."
+  }
+}

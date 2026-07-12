@@ -11,6 +11,10 @@ license = "Proprietary"
 name = "bluey-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "bluey-jobs-api"
+path = "src/bin/bluey-jobs-api.rs"
+
 [dependencies]
 tower = { version = "0.4", features = ["util"] }
 # Web framework
@@ -54,6 +58,7 @@ hex = "0.4"
 sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
+aes-gcm = "0.10"
 governor = "0.6"
 base64 = "0.22"
 rand = "0.8"

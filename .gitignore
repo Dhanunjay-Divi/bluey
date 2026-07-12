@@ -1,5 +1,6 @@
 /target/
 **/.build/
+**/node_modules/
 .DS_Store
 
 # Local reference/source snapshots used for research, not product source.
@@ -8,6 +9,9 @@ _refs/
 
 # Build and release output.
 dist/
+**/.vite/
+jobs/browser/browser-bundle/
+jobs/browser/release/
 
 # Local visual QA screenshots.
 tmp-*.png

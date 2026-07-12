@@ -54,6 +54,32 @@ pub async fn send_signup_otp(
     .await
 }
 
+pub async fn send_jobs_identity_otp(
+    config: &Config,
+    to: &str,
+    code: &str,
+    expires_in_minutes: i64,
+) -> anyhow::Result<MailDelivery> {
+    let text_body = format!(
+        "Verify this application email for Bluey Jobs.\n\nYour verification code is:\n\n{code}\n\nThis code expires in {expires_in_minutes} minutes. If you did not add this address to Bluey Jobs, you can ignore this email."
+    );
+    let html_body = otp_email_html(
+        code,
+        expires_in_minutes,
+        "application email",
+        "Verify your application email.",
+        "Use this code to confirm Bluey can use this address on resumes and job applications.",
+    );
+    send_transactional(
+        config,
+        to,
+        "Verify your Bluey Jobs application email",
+        &text_body,
+        Some(&html_body),
+    )
+    .await
+}
+
 pub async fn send_password_reset(
     config: &Config,
     to: &str,
@@ -171,7 +197,26 @@ async fn send_resend_api(
 }
 
 fn signup_otp_email_html(code: &str, expires_in_minutes: i64) -> String {
+    otp_email_html(
+        code,
+        expires_in_minutes,
+        "secure sign in",
+        "Welcome to Bluey.",
+        "Use this code to finish signing in. Keep it private; Bluey will never ask you to share it with anyone.",
+    )
+}
+
+fn otp_email_html(
+    code: &str,
+    expires_in_minutes: i64,
+    eyebrow: &str,
+    title: &str,
+    copy: &str,
+) -> String {
     let code = escape_html(&spaced_verification_code(code));
+    let eyebrow = escape_html(eyebrow);
+    let title = escape_html(title);
+    let copy = escape_html(copy);
     format!(
         r#"<!doctype html>
 <html>
@@ -192,7 +237,7 @@ fn signup_otp_email_html(code: &str, expires_in_minutes: i64) -> String {
                       <div style="font-size:42px;line-height:1;font-weight:850;letter-spacing:-.01em">
                         <span style="color:#e9f7ff">blu</span><span style="color:#39c7ff">ey</span>
                       </div>
-                      <div style="padding-top:6px;color:#8fb3c7;font-size:13px;line-height:1.35;font-weight:700;letter-spacing:.12em;text-transform:uppercase">secure sign in</div>
+                      <div style="padding-top:6px;color:#8fb3c7;font-size:13px;line-height:1.35;font-weight:700;letter-spacing:.12em;text-transform:uppercase">{eyebrow}</div>
                     </td>
                   </tr>
                 </table>
@@ -205,8 +250,8 @@ fn signup_otp_email_html(code: &str, expires_in_minutes: i64) -> String {
             </tr>
             <tr>
               <td style="padding:26px 28px 10px">
-                <h1 style="margin:0 0 10px;color:#f4fbff;font-size:28px;line-height:1.18;font-weight:850">Welcome to Bluey.</h1>
-                <p style="margin:0;color:#aec1ce;font-size:16px;line-height:1.55">Use this code to finish signing in. Keep it private; Bluey will never ask you to share it with anyone.</p>
+                <h1 style="margin:0 0 10px;color:#f4fbff;font-size:28px;line-height:1.18;font-weight:850">{title}</h1>
+                <p style="margin:0;color:#aec1ce;font-size:16px;line-height:1.55">{copy}</p>
               </td>
             </tr>
             <tr>

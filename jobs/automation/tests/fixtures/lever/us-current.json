@@ -1,0 +1,57 @@
+{
+  "name": "US current hosted posting",
+  "postingUrl": "https://jobs.lever.co/northstar/11111111-1111-4111-8111-111111111111",
+  "applicationUrl": "https://jobs.lever.co/northstar/11111111-1111-4111-8111-111111111111/apply?lever-source=bluey-test",
+  "title": "Northstar - Platform Engineer",
+  "startAtPosting": true,
+  "applySelector": "[data-qa='btn-apply-bottom'] a[data-qa='show-page-apply']",
+  "submitSelector": "#application-form #btn-submit[data-qa='btn-submit']",
+  "controls": [
+    {
+      "selector": "[data-bluey-field-id='resume']",
+      "kind": "file",
+      "label": "Resume/CV",
+      "name": "resume",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='name']",
+      "kind": "text",
+      "label": "Full name",
+      "name": "name",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='email']",
+      "kind": "email",
+      "label": "Email",
+      "name": "email",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='phone']",
+      "kind": "tel",
+      "label": "Phone",
+      "name": "phone",
+      "placeholder": "",
+      "required": false,
+      "value": ""
+    }
+  ],
+  "answers": {
+    "full_name": "Ada Lovelace",
+    "phone": "+1 212 555 0100"
+  },
+  "expectedValues": {
+    "[data-bluey-field-id='resume']": "resume.pdf",
+    "[data-bluey-field-id='name']": "Ada Lovelace",
+    "[data-bluey-field-id='email']": "ada@example.com",
+    "[data-bluey-field-id='phone']": "+1 212 555 0100"
+  }
+}

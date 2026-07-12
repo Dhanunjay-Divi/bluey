@@ -1,0 +1,29 @@
+{
+  "name": "@bluey/jobs-browser",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Bluey's isolated browser for job applications",
+  "author": "Bluey",
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "start": "electron dist/main.js",
+    "prepare:chromium": "node scripts/install-chromium.mjs",
+    "package": "npm run build && npm run prepare:chromium && electron-builder --config electron-builder.yml"
+  },
+  "dependencies": {
+    "@bluey/jobs-automation": "0.1.0",
+    "playwright": "^1.61.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "electron": "43.1.0",
+    "electron-builder": "^26.0.12",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.9"
+  }
+}

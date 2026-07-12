@@ -5981,6 +5981,15 @@ async fn complete_stream_inner(
     Ok(router_sse(detach_router_stream(Box::pin(event_stream))))
 }
 
+pub(crate) async fn complete_for_account(
+    state: AppState,
+    account: Account,
+    req: CompleteRequest,
+    trace_id: String,
+) -> Result<CompleteResponse, (StatusCode, Json<ApiError>)> {
+    complete_inner(state, account, req, trace_id).await
+}
+
 async fn complete_inner(
     state: AppState,
     account: Account,

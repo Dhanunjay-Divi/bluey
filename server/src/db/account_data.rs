@@ -5,7 +5,9 @@ use postgres::Row as PgRow;
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
 
-use crate::db::DbPool;
+use std::collections::HashSet;
+
+use crate::db::{jobs, DbPool};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSummary {
@@ -33,6 +35,7 @@ pub struct ExportBundle {
     pub cloud_rag_chunks_count: i64,
     pub refresh_tokens_count: i64,
     pub stripe_webhook_events_count: i64,
+    pub jobs: Option<jobs::JobsAccountExport>,
     pub exported_at: String,
 }
 
@@ -71,10 +74,14 @@ pub fn usage_summary(pool: &DbPool, account_id: &str) -> Result<UsageSummary> {
 }
 
 pub fn export_bundle(pool: &DbPool, account_id: &str) -> Result<Option<ExportBundle>> {
-    crate::db::run_blocking_db(|| match pool {
+    let mut bundle = crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => export_bundle_sqlite(pool, account_id),
         DbPool::Postgres(_) => export_bundle_postgres(pool, account_id),
-    })
+    })?;
+    if let Some(value) = &mut bundle {
+        value.jobs = jobs::account_export(pool, account_id, &value.account.email)?;
+    }
+    Ok(bundle)
 }
 
 pub fn hard_delete_account(pool: &DbPool, account_id: &str) -> Result<bool> {
@@ -85,10 +92,106 @@ pub fn hard_delete_account(pool: &DbPool, account_id: &str) -> Result<bool> {
 }
 
 pub fn artifact_object_refs(pool: &DbPool, account_id: &str) -> Result<Vec<ArtifactObjectRef>> {
-    crate::db::run_blocking_db(|| match pool {
+    let mut refs = crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => artifact_object_refs_sqlite(pool, account_id),
         DbPool::Postgres(_) => artifact_object_refs_postgres(pool, account_id),
-    })
+    })?;
+    let mut seen = refs
+        .iter()
+        .map(|reference| reference.object_key.clone())
+        .collect::<HashSet<_>>();
+    for evidence in jobs::list_application_evidence(pool, account_id, None)? {
+        let key = evidence.storage_key.trim();
+        if key.is_empty() || !seen.insert(key.to_string()) {
+            continue;
+        }
+        refs.push(ArtifactObjectRef {
+            artifact_id: evidence.id,
+            title: if evidence.file_name.trim().is_empty() {
+                evidence.label
+            } else {
+                evidence.file_name
+            },
+            object_key: key.to_string(),
+            content_type: (!evidence.media_type.trim().is_empty()).then_some(evidence.media_type),
+            size_bytes: evidence
+                .metadata
+                .get("size_bytes")
+                .and_then(serde_json::Value::as_i64),
+            sha256: (!evidence.sha256.trim().is_empty()).then_some(evidence.sha256),
+            expires_at_ms: evidence
+                .metadata
+                .get("expires_at_ms")
+                .and_then(serde_json::Value::as_i64),
+        });
+    }
+    for application in jobs::list_applications(pool, account_id)? {
+        let receipt = &application.receipt;
+        for (index, document) in receipt
+            .get("documents")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let key = document
+                .get("storageKey")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if key.is_empty() || !seen.insert(key.to_string()) {
+                continue;
+            }
+            let kind = document
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("document");
+            refs.push(ArtifactObjectRef {
+                artifact_id: format!("{}:document:{index}", application.id),
+                title: document
+                    .get("fileName")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(kind)
+                    .to_string(),
+                object_key: key.to_string(),
+                content_type: document
+                    .get("mediaType")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                size_bytes: document
+                    .get("sizeBytes")
+                    .and_then(serde_json::Value::as_i64),
+                sha256: document
+                    .get("sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                expires_at_ms: None,
+            });
+        }
+        for (index, screenshot) in receipt
+            .get("screenshotKeys")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let key = screenshot.as_str().map(str::trim).unwrap_or_default();
+            if key.is_empty() || !seen.insert(key.to_string()) {
+                continue;
+            }
+            refs.push(ArtifactObjectRef {
+                artifact_id: format!("{}:screenshot:{index}", application.id),
+                title: "Application confirmation screenshot".to_string(),
+                object_key: key.to_string(),
+                content_type: Some("image/png".to_string()),
+                size_bytes: None,
+                sha256: None,
+                expires_at_ms: None,
+            });
+        }
+    }
+    Ok(refs)
 }
 
 fn usage_summary_sqlite(pool: &DbPool, account_id: &str) -> Result<UsageSummary> {
@@ -350,6 +453,7 @@ fn export_bundle_sqlite(pool: &DbPool, account_id: &str) -> Result<Option<Export
         cloud_rag_chunks_count,
         refresh_tokens_count,
         stripe_webhook_events_count,
+        jobs: None,
         exported_at: chrono::Utc::now().to_rfc3339(),
     }))
 }
@@ -449,6 +553,7 @@ fn export_bundle_postgres(pool: &DbPool, account_id: &str) -> Result<Option<Expo
         cloud_rag_chunks_count,
         refresh_tokens_count,
         stripe_webhook_events_count,
+        jobs: None,
         exported_at: chrono::Utc::now().to_rfc3339(),
     }))
 }

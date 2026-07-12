@@ -1,0 +1,42 @@
+[Unit]
+Description=Bluey Jobs API
+After=network-online.target bluey-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bluey
+Group=bluey
+WorkingDirectory=/opt/bluey-api
+EnvironmentFile=/etc/bluey-api/bluey-api.env
+EnvironmentFile=-/etc/bluey-api/bluey-valkey.env
+EnvironmentFile=-/etc/bluey-api/bluey-postgres.env
+EnvironmentFile=/etc/bluey-api/bluey-jobs.env
+Environment=BLUEY_JOBS_API_PORT=8081
+ExecStart=/usr/local/bin/bluey-jobs-api
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/opt/bluey-api /var/log/bluey-api
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+UMask=0077
+
+LimitNOFILE=8192
+MemoryMax=1G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target

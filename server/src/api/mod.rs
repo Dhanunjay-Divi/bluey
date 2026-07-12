@@ -16,6 +16,10 @@ pub mod account;
 pub mod admin;
 pub mod auth_routes;
 pub mod billing;
+pub mod jobs;
+pub mod jobs_interview_prep;
+pub mod jobs_local_capability;
+pub mod jobs_worker_auth;
 pub mod metrics;
 pub mod middleware;
 pub mod pricing;
@@ -107,7 +111,12 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .route(
             "/auth/device/start",
-            axum::routing::post(auth_routes::device_start),
+            axum::routing::post(auth_routes::device_start).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/device/poll",
@@ -126,19 +135,51 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route("/pricing/tiers", get(pricing::get_tiers))
         .route(
             "/auth/verify-email/confirm",
-            axum::routing::post(auth_routes::verify_email_confirm),
+            axum::routing::post(auth_routes::verify_email_confirm).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/password-reset/start",
-            axum::routing::post(auth_routes::password_reset_start),
+            axum::routing::post(auth_routes::password_reset_start).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/password-reset/confirm",
-            axum::routing::post(auth_routes::password_reset_confirm),
+            axum::routing::post(auth_routes::password_reset_confirm).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/link/exchange",
-            axum::routing::post(auth_routes::link_exchange),
+            axum::routing::post(auth_routes::link_exchange).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
+        )
+        .merge(
+            jobs::worker_router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                jobs_worker_auth::require_jobs_worker,
+            )),
+        )
+        .merge(
+            jobs::local_runner_router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::rate_limit::limit_jobs_local_runner,
+            )),
         );
 
     // ---- Admin-only (require_auth + require_admin) -------------------------
@@ -155,6 +196,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             "/admin/support/accounts/:account_id",
             get(admin::support_account),
         )
+        .merge(jobs::admin_router())
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 
     // ---- Authenticated (Bearer JWT) -----------------------------------------
@@ -181,6 +223,12 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             axum::routing::patch(account::update_billing_settings),
         )
         .route("/account/usage", get(account::usage))
+        .merge(
+            jobs::router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::rate_limit::limit_jobs_api,
+            )),
+        )
         .route(
             "/router/complete",
             axum::routing::post(router::complete)
@@ -271,11 +319,21 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .route(
             "/auth/device/approve",
-            axum::routing::post(auth_routes::device_approve),
+            axum::routing::post(auth_routes::device_approve).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/verify-email/start",
-            axum::routing::post(auth_routes::verify_email_start),
+            axum::routing::post(auth_routes::verify_email_start).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/link/mint",
@@ -283,11 +341,21 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .route(
             "/auth/trial/convert/start",
-            axum::routing::post(auth_routes::trial_convert_start),
+            axum::routing::post(auth_routes::trial_convert_start).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .route(
             "/auth/trial/convert/confirm",
-            axum::routing::post(auth_routes::trial_convert_confirm),
+            axum::routing::post(auth_routes::trial_convert_confirm).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_otp,
+                ),
+            ),
         )
         .merge(admin_only)
         .route_layer(axum::middleware::from_fn_with_state(
@@ -297,6 +365,49 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
 
     Router::new()
         .merge(public)
+        .merge(protected)
+        .layer(from_fn(middleware::request_id::request_id_middleware))
+        .with_state(state)
+}
+
+/// Independently deployable Bluey Jobs API surface.
+///
+/// It validates the same Bluey bearer tokens and uses the same account and
+/// balance database, but does not expose meeting, audio, router, or sync APIs.
+pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
+    let state = AppState {
+        pool,
+        config: Arc::new(config),
+        rate_limiters: crate::rate_limit::RateLimiters::default(),
+        provider_health: crate::provider_health::ProviderHealth::default(),
+    };
+
+    let protected = Router::new()
+        .merge(
+            jobs::router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::rate_limit::limit_jobs_api,
+            )),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
+    Router::new()
+        .route("/health", get(admin::health))
+        .merge(
+            jobs::worker_router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                jobs_worker_auth::require_jobs_worker,
+            )),
+        )
+        .merge(
+            jobs::local_runner_router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::rate_limit::limit_jobs_local_runner,
+            )),
+        )
         .merge(protected)
         .layer(from_fn(middleware::request_id::request_id_middleware))
         .with_state(state)
