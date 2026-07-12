@@ -14,7 +14,8 @@ bluey.sh, www.bluey.sh {
     @bluey_jobs_api path /api/jobs/*
     @bluey_api path /health /auth/* /billing/* /pricing/* /router/* /stt/* /sync/* /rag/* /usage/* /account/me /account/usage /account/billing /account/devices /account/devices/* /account/export /account/delete
     @bluey_install path /install.sh /install.ps1 /latest.json /latest.json.sig /releases/*
-    @bluey_assets path /assets/* /jobs/assets/*
+    @bluey_assets path /assets/*
+    @bluey_jobs_assets path /jobs/assets/*
     @bluey_jobs path /jobs /jobs/*
     @bluey_html path / /login /download /install /account /reload /link /device /verify-email /password-reset /docs/* /robots.txt /sitemap.xml /how-bluey-works* /bluey-faq* /ai-meeting-context-copilot* /engineering-meeting-copilot* /ai-copilot-for-design-reviews* /screen-context-ai-assistant* /meeting-memory-and-project-context* /auto-model-router* /private-desktop-ai-overlay* /bluey-vs-ai-meeting-notetakers* /bluey-vs-coding-agents* /context-coverage*
     @bluey_noindex path /jobs /jobs/* /api/* /account /account/* /reload /link /device /verify-email /password-reset /docs/*
@@ -94,7 +95,14 @@ bluey.sh, www.bluey.sh {
         file_server
     }
 
+    handle @bluey_jobs_assets {
+        header Cache-Control "public, max-age=31536000, immutable"
+        root * /var/www/bluey
+        file_server
+    }
+
     handle @bluey_jobs {
+        header Cache-Control "no-cache"
         root * /var/www/bluey
         try_files {path} {path}/index.html /jobs/index.html
         file_server

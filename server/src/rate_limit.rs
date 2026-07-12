@@ -259,22 +259,11 @@ impl ReplayGuard {
 
     pub async fn reserve(&self, key: &str, ttl_secs: u64) -> anyhow::Result<bool> {
         if let Some(redis) = &self.redis {
-            let redis_key = format!("{}:replay:{}", redis.namespace, key);
-            match redis.client.get_multiplexed_async_connection().await {
-                Ok(mut conn) => {
-                    let result: Option<String> = redis::cmd("SET")
-                        .arg(redis_key)
-                        .arg("1")
-                        .arg("NX")
-                        .arg("EX")
-                        .arg(ttl_secs.max(1))
-                        .query_async(&mut conn)
-                        .await?;
-                    return Ok(result.is_some());
-                }
+            match Self::reserve_redis(redis, key, ttl_secs).await {
+                Ok(reserved) => return Ok(reserved),
                 Err(error) if redis.strict => return Err(error.into()),
                 Err(error) => {
-                    tracing::warn!(error = %error, "redis replay guard unavailable; using local guard");
+                    tracing::warn!(error = %error, "redis replay guard failed; using local guard");
                 }
             }
         }
@@ -290,6 +279,24 @@ impl ReplayGuard {
         }
         entries.insert(key.to_string(), now.saturating_add(ttl_secs.max(1)));
         Ok(true)
+    }
+
+    async fn reserve_redis(
+        redis: &RedisCapacityConfig,
+        key: &str,
+        ttl_secs: u64,
+    ) -> redis::RedisResult<bool> {
+        let redis_key = format!("{}:replay:{}", redis.namespace, key);
+        let mut conn = redis.client.get_multiplexed_async_connection().await?;
+        let result: Option<String> = redis::cmd("SET")
+            .arg(redis_key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs.max(1))
+            .query_async(&mut conn)
+            .await?;
+        Ok(result.is_some())
     }
 }
 
@@ -917,6 +924,8 @@ pub fn client_key_for_test(req: &axum::extract::Request) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn limiter_allows_within_burst() {
@@ -1032,6 +1041,85 @@ mod tests {
         assert!(guard.reserve("worker:nonce", 60).await.unwrap());
         assert!(!guard.reserve("worker:nonce", 60).await.unwrap());
         assert!(guard.reserve("worker:other", 60).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn non_strict_redis_connection_failure_uses_local_replay_guard() {
+        let guard = ReplayGuard::new(Some(unavailable_redis_config(false).await));
+
+        assert!(guard.reserve("worker:nonce", 60).await.unwrap());
+        assert!(!guard.reserve("worker:nonce", 60).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn non_strict_redis_command_failure_uses_local_replay_guard() {
+        let (config, server) = redis_command_failure_config(false, 2).await;
+        let guard = ReplayGuard::new(Some(config));
+
+        assert!(guard.reserve("worker:nonce", 60).await.unwrap());
+        assert!(!guard.reserve("worker:nonce", 60).await.unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_redis_connection_failure_fails_closed() {
+        let guard = ReplayGuard::new(Some(unavailable_redis_config(true).await));
+
+        assert!(guard.reserve("worker:nonce", 60).await.is_err());
+        assert!(guard.local.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn strict_redis_command_failure_fails_closed() {
+        let (config, server) = redis_command_failure_config(true, 1).await;
+        let guard = ReplayGuard::new(Some(config));
+
+        assert!(guard.reserve("worker:nonce", 60).await.is_err());
+        assert!(guard.local.lock().await.is_empty());
+        server.await.unwrap();
+    }
+
+    async fn unavailable_redis_config(strict: bool) -> RedisCapacityConfig {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        redis_test_config(format!("redis://{address}/"), strict)
+    }
+
+    async fn redis_command_failure_config(
+        strict: bool,
+        expected_connections: usize,
+    ) -> (RedisCapacityConfig, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..expected_connections {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0_u8; 1024];
+
+                // redis-rs sends two CLIENT SETINFO commands while acquiring
+                // the connection, then sends the replay SET command.
+                assert!(stream.read(&mut buffer).await.unwrap() > 0);
+                stream.write_all(b"+OK\r\n+OK\r\n").await.unwrap();
+                assert!(stream.read(&mut buffer).await.unwrap() > 0);
+                stream
+                    .write_all(b"-ERR forced replay command failure\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        (
+            redis_test_config(format!("redis://{address}/"), strict),
+            server,
+        )
+    }
+
+    fn redis_test_config(url: String, strict: bool) -> RedisCapacityConfig {
+        RedisCapacityConfig {
+            client: redis::Client::open(url).unwrap(),
+            namespace: Arc::from("bluey-replay-failure-test"),
+            strict,
+        }
     }
 
     #[tokio::test]

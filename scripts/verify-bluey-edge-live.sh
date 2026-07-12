@@ -42,6 +42,26 @@ case "$jobs_robots" in
     *) echo "FAIL Jobs X-Robots-Tag: $jobs_robots" >&2; exit 1 ;;
 esac
 
+for jobs_path in /jobs/ /jobs/applications; do
+    jobs_cache="$($CURL -sSI "$BASE$jobs_path" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^cache-control:/{print tolower($0)}')"
+    case "$jobs_cache" in
+        *no-cache*) echo "PASS $jobs_path Cache-Control" ;;
+        *) echo "FAIL $jobs_path Cache-Control: $jobs_cache" >&2; exit 1 ;;
+    esac
+done
+
+jobs_asset="$($CURL -sS "$BASE/jobs/" | grep -Eo '/jobs/assets/[^" ]+-[A-Za-z0-9_-]{8}\.(js|css)' | head -1 || true)"
+if [ -z "$jobs_asset" ]; then
+    echo "FAIL could not find a hashed Jobs asset" >&2
+    exit 1
+fi
+expect_status 200 "$BASE$jobs_asset"
+jobs_asset_cache="$($CURL -sSI "$BASE$jobs_asset" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^cache-control:/{print tolower($0)}')"
+case "$jobs_asset_cache" in
+    *public*max-age=31536000*immutable*) echo "PASS Jobs asset Cache-Control" ;;
+    *) echo "FAIL Jobs asset Cache-Control: $jobs_asset_cache" >&2; exit 1 ;;
+esac
+
 gpt_status="$($CURL -sS -o /dev/null -w '%{http_code}' -A GPTBot "$BASE/")"
 if [ "$gpt_status" = "200" ]; then
     echo "FAIL GPTBot still receives 200" >&2

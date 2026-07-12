@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { createJobsWorkerAuthHeaders } from "@bluey/jobs-automation/worker-auth";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_REPORT_ATTEMPTS = 3;
@@ -87,7 +88,7 @@ export type DiscoveryApiFetch = (input: string | URL | Request, init?: RequestIn
 
 export interface DiscoveryApiClientOptions {
   origin: string;
-  token: string;
+  signingKey: string;
   workerId?: string;
   fetch?: DiscoveryApiFetch;
   requestTimeoutMs?: number;
@@ -98,7 +99,7 @@ export interface DiscoveryApiClientOptions {
 
 export class DiscoveryApiClient implements DiscoveryWorkerApi {
   private readonly origin: string;
-  private readonly token: string;
+  private readonly signingKey: string;
   private readonly workerId: string;
   private readonly fetcher: DiscoveryApiFetch;
   private readonly requestTimeoutMs: number;
@@ -108,8 +109,10 @@ export class DiscoveryApiClient implements DiscoveryWorkerApi {
 
   constructor(options: DiscoveryApiClientOptions) {
     this.origin = normalizeOrigin(options.origin);
-    if (!options.token) throw new Error("BLUEY_JOBS_WORKER_TOKEN is required");
-    this.token = options.token;
+    if (Buffer.byteLength(options.signingKey, "utf8") < 32) {
+      throw new Error("BLUEY_JOBS_WORKER_SIGNING_KEY must contain at least 32 bytes");
+    }
+    this.signingKey = options.signingKey;
     this.workerId = normalizedWorkerId(options.workerId ?? PROCESS_DISCOVERY_WORKER_ID);
     this.fetcher = options.fetch ?? fetch;
     this.requestTimeoutMs = boundedInteger(
@@ -188,16 +191,24 @@ export class DiscoveryApiClient implements DiscoveryWorkerApi {
   }
 
   private async request(path: string, init: RequestInit): Promise<Response> {
+    if (init.body !== undefined && init.body !== null && typeof init.body !== "string") {
+      throw new DiscoveryApiError("api_rejected", "Discovery request body is not signable");
+    }
+    const headers = new Headers(init.headers);
+    const workerHeaders = createJobsWorkerAuthHeaders({
+      signingKey: this.signingKey,
+      workerId: this.workerId,
+      method: init.method ?? "GET",
+      path,
+      body: init.body ?? undefined,
+    });
+    for (const [name, value] of Object.entries(workerHeaders)) headers.set(name, value);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
     try {
       return await this.fetcher(`${this.origin}${path}`, {
         ...init,
-        headers: {
-          ...init.headers,
-          Authorization: `Bearer ${this.token}`,
-          "x-bluey-jobs-worker-id": this.workerId,
-        },
+        headers,
         redirect: "error",
         signal: controller.signal,
       });

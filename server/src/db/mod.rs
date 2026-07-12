@@ -913,7 +913,8 @@ const MIGRATIONS: &[&str] = &[
         );
     CREATE INDEX IF NOT EXISTS idx_stripe_auto_reload_account_created
         ON stripe_auto_reload_attempts(account_id, created_at);
-    // 0019 - Bluey Jobs customer workspace.
+    "#,
+    // 0023 - Bluey Jobs customer workspace.
     //
     // Jobs is intentionally isolated from the meeting/session runtime. The
     // tenant key is present on every row, packet generation is job-specific,
@@ -1103,7 +1104,7 @@ const MIGRATIONS: &[&str] = &[
         FOREIGN KEY (application_id) REFERENCES jobs_applications(id) ON DELETE CASCADE
     );
     "#,
-    // 0020 - Bluey Jobs application identities and multi-inbox connections.
+    // 0024 - Bluey Jobs application identities and multi-inbox connections.
     //
     // Login identity remains in accounts. Application addresses and provider
     // mailboxes are independently tenant-scoped, encrypted payloads.
@@ -1146,7 +1147,7 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_mailbox_connections_account
         ON jobs_mailbox_connections(account_id, status, updated_at_ms DESC);
     "#,
-    // 0021 - immutable evidence attached to each Jobs application.
+    // 0025 - immutable evidence attached to each Jobs application.
     //
     // Resume artifacts, submission confirmations, provider email events, and
     // interview calendar events share one tenant-scoped, idempotent ledger.
@@ -1165,7 +1166,7 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_application_evidence_application
         ON jobs_application_evidence(account_id, application_id, occurred_at_ms DESC);
     "#,
-    // 0022 - capability-scoped local Bluey Browser launches.
+    // 0026 - capability-scoped local Bluey Browser launches.
     //
     // The website hands the desktop app a short-lived random ticket instead
     // of putting a reusable Bluey access token or application packet in a
@@ -1188,7 +1189,7 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_local_run_tickets_account
         ON jobs_local_run_tickets(account_id, updated_at_ms DESC);
     "#,
-    // 0023 - atomic Bluey Jobs application-attempt reservations.
+    // 0027 - atomic Bluey Jobs application-attempt reservations.
     //
     // Packet preparation and metering are intentionally separate from an
     // employer-facing attempt. A reservation is created transactionally when
@@ -1212,7 +1213,7 @@ const MIGRATIONS: &[&str] = &[
         ON jobs_attempt_reservations(account_id, company_key)
         WHERE status IN ('reserved', 'running', 'side_effect_unknown', 'submitted');
     "#,
-    // 0024 - durable Bluey Jobs discovery schedules, leases, health, and source membership.
+    // 0028 - durable Bluey Jobs discovery schedules, leases, health, and source membership.
     //
     // Discovery workers claim due sources with a short-lived lease. Successful
     // snapshots are replay-safe and keep enough membership state to close jobs
@@ -1279,7 +1280,7 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_discovery_memberships_job
         ON jobs_discovery_memberships(account_id, job_id);
     "#,
-    // 0025 - durable, fenced execution leases for cloud browser runs.
+    // 0029 - durable, fenced execution leases for cloud browser runs.
     //
     // Only prepared leases may expire or rotate. The partial unique indexes
     // make browser-profile and application ownership authoritative in the DB

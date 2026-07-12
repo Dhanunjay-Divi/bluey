@@ -1,9 +1,13 @@
+import { createHash, createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  createExecutionLeaseClientFromEnv,
   ExecutionLeaseClient,
   ExecutionLeaseError,
   runnerOwnerId,
 } from "../src/execution-lease.js";
+
+const WORKER_SIGNING_KEY = "worker-signing-key-secret-0123456789abcdef";
 
 const CLAIM = {
   accountId: "account-123",
@@ -18,7 +22,7 @@ afterEach(() => {
 });
 
 describe("execution lease client", () => {
-  it("claims with the worker credential and keeps lease data in internal requests", async () => {
+  it("signs every lease operation and keeps lease data in internal requests", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       calls.push({ url: String(input), init });
@@ -36,7 +40,7 @@ describe("execution lease client", () => {
     expect(calls).toHaveLength(3);
     expect(calls[0]?.url).toBe("https://jobs-api.example/api/jobs/internal/execution-leases/claim");
     expect(calls[0]?.init).toMatchObject({ method: "POST", redirect: "error" });
-    expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBe("Bearer worker-secret-token");
+    expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBeNull();
     expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
       account_id: "account-123",
       application_id: "application-123",
@@ -54,6 +58,9 @@ describe("execution lease client", () => {
       fence: 7,
       outcome: "submitted",
     });
+    for (const call of calls) expectSignedWorkerRequest(call, "runner-test-1");
+    expect(new Set(calls.map((call) => new Headers(call.init?.headers)
+      .get("x-bluey-jobs-worker-nonce"))).size).toBe(calls.length);
     expect(JSON.stringify(lease)).not.toContain("lease-secret-value");
   });
 
@@ -64,7 +71,7 @@ describe("execution lease client", () => {
       if (url.endsWith("/claim")) return grantResponse();
       if (url.endsWith("/irreversible")) {
         irreversibleCalls += 1;
-        throw new Error("network failure containing worker-secret-token and lease-secret-value");
+        throw new Error(`network failure containing ${WORKER_SIGNING_KEY} and lease-secret-value`);
       }
       return new Response(null, { status: 204 });
     }) as typeof globalThis.fetch;
@@ -74,7 +81,7 @@ describe("execution lease client", () => {
     const second = await lease.beforeFinalSubmit().catch((error: unknown) => error);
 
     expect(first).toBeInstanceOf(ExecutionLeaseError);
-    expect(String(first)).not.toContain("worker-secret-token");
+    expect(String(first)).not.toContain(WORKER_SIGNING_KEY);
     expect(String(first)).not.toContain("lease-secret-value");
     expect(second).toMatchObject({ code: "invalid_state" });
     expect(irreversibleCalls).toBe(1);
@@ -124,7 +131,7 @@ describe("execution lease client", () => {
 
   it("reports duplicate claims without exposing the server response", async () => {
     const fetch = vi.fn(async () => new Response(JSON.stringify({
-      error: "owner worker-secret-token lease-secret-value https://private.example",
+      error: `owner ${WORKER_SIGNING_KEY} lease-secret-value https://private.example`,
     }), {
       status: 409,
       headers: { "Content-Type": "application/json" },
@@ -133,7 +140,7 @@ describe("execution lease client", () => {
     const error = await createClient(fetch).claim(CLAIM).catch((caught: unknown) => caught);
 
     expect(error).toMatchObject({ code: "lease_unavailable", status: 409 });
-    expect(String(error)).not.toContain("worker-secret-token");
+    expect(String(error)).not.toContain(WORKER_SIGNING_KEY);
     expect(String(error)).not.toContain("lease-secret-value");
     expect(String(error)).not.toContain("private.example");
   });
@@ -218,6 +225,19 @@ describe("execution lease client", () => {
     }
     expect(() => createClient(fetch, { origin: "https://jobs.internal" })).not.toThrow();
   });
+
+  it("loads the signing key from worker auth env without accepting the legacy token", () => {
+    expect(() => createExecutionLeaseClientFromEnv({
+      BLUEY_JOBS_API_ORIGIN: "https://jobs.internal",
+      BLUEY_JOBS_WORKER_TOKEN: WORKER_SIGNING_KEY,
+      BLUEY_JOBS_RUNNER_ID: "runner-env-test",
+    })).toThrow("configuration");
+    expect(() => createExecutionLeaseClientFromEnv({
+      BLUEY_JOBS_API_ORIGIN: "https://jobs.internal",
+      BLUEY_JOBS_WORKER_SIGNING_KEY: WORKER_SIGNING_KEY,
+      BLUEY_JOBS_RUNNER_ID: "runner-env-test",
+    })).not.toThrow();
+  });
 });
 
 function createClient(
@@ -226,12 +246,44 @@ function createClient(
 ): ExecutionLeaseClient {
   return new ExecutionLeaseClient({
     origin: "https://jobs-api.example",
-    workerToken: "worker-secret-token",
+    workerSigningKey: WORKER_SIGNING_KEY,
     ownerId: "runner-test-1",
     heartbeatIntervalMs: 60_000,
     fetch,
     ...overrides,
   });
+}
+
+function expectSignedWorkerRequest(
+  call: { url: string; init?: RequestInit },
+  workerId: string,
+): void {
+  const url = new URL(call.url);
+  const headers = new Headers(call.init?.headers);
+  const body = String(call.init?.body ?? "");
+  const timestamp = headers.get("x-bluey-jobs-worker-timestamp");
+  const nonce = headers.get("x-bluey-jobs-worker-nonce");
+  const contentSha256 = createHash("sha256").update(body).digest("hex");
+  expect(headers.get("x-bluey-jobs-worker-id")).toBe(workerId);
+  expect(headers.get("x-bluey-jobs-worker-audience")).toBe("bluey-jobs-api");
+  expect(headers.get("x-bluey-jobs-worker-scope")).toBe("execution");
+  expect(headers.get("x-bluey-jobs-worker-content-sha256")).toBe(contentSha256);
+  expect(timestamp).toMatch(/^\d+$/);
+  expect(nonce).toMatch(/^[A-Za-z0-9._:-]{24,128}$/);
+  const canonical = [
+    "bluey-jobs-worker-v1",
+    timestamp,
+    nonce,
+    workerId,
+    "bluey-jobs-api",
+    "execution",
+    "POST",
+    url.pathname,
+    contentSha256,
+  ].join("\n");
+  expect(headers.get("x-bluey-jobs-worker-signature")).toBe(
+    createHmac("sha256", WORKER_SIGNING_KEY).update(canonical).digest("hex"),
+  );
 }
 
 function grantResponse(): Response {

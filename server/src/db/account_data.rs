@@ -5,8 +5,6 @@ use postgres::Row as PgRow;
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
 
-use std::collections::HashSet;
-
 use crate::db::{jobs, DbPool};
 
 #[derive(Debug, Clone, PartialEq)]

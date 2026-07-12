@@ -53,13 +53,14 @@ describe.each(["greenhouse", "lever"] as const)("local %s final review", (adapte
   });
 
   it("does not treat a caller-controlled approval parameter as authority", () => {
-    const ticket = "a".repeat(64);
+    const capability = localResumeCapability();
     const command = parseBlueyJobsProtocol(
-      `bluey-jobs://resume/run-123?ticket=${ticket}&approve_submission=true`,
+      `bluey-jobs://resume/run-123?capability=${encodeURIComponent(capability)}&approve_submission=true`,
+      1_000,
     );
     const review = localProviderFinalReview(finalReviewExecution(adapter))!;
 
-    expect(command).toEqual({ action: "resume", runId: "run-123", ticket });
+    expect(command).toEqual({ action: "resume", runId: "run-123", capability });
     expect(isApprovedLocalResumeAction(command, "run-123")).toBe(false);
     expect(reconcileLocalProviderConfirmation(
       review,
@@ -141,4 +142,19 @@ async function temporaryRunDirectory(): Promise<string> {
   const runDirectory = join(root, "identity-hash", "runs", "run-123");
   await mkdir(runDirectory, { recursive: true });
   return runDirectory;
+}
+
+function localResumeCapability(): string {
+  const claims = {
+    version: 1,
+    audience: "bluey-jobs-local-run",
+    account_id: "account-123",
+    application_id: "application-123",
+    run_id: "run-123",
+    browser_profile_id: "profile-123",
+    operation: "resume",
+    expires_at_ms: 2_000,
+    nonce: "n".repeat(32),
+  };
+  return `${Buffer.from(JSON.stringify(claims)).toString("base64url")}.${"a".repeat(64)}`;
 }

@@ -18,6 +18,10 @@
     "./interview-prep": {
       "types": "./dist/interview-prep.d.ts",
       "import": "./dist/interview-prep.js"
+    },
+    "./worker-auth": {
+      "types": "./dist/worker-auth.d.ts",
+      "import": "./dist/worker-auth.js"
     }
   },
   "scripts": {

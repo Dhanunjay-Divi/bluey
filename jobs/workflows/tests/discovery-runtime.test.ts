@@ -1,3 +1,4 @@
+import { createHash, createHmac } from "node:crypto";
 import type { FetchResponse, JobsFetch } from "@bluey/jobs-automation";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -23,6 +24,7 @@ import {
 
 const SCHEDULED_FOR_MS = Date.now();
 const SCHEDULED_FOR = new Date(SCHEDULED_FOR_MS).toISOString();
+const WORKER_SIGNING_KEY = "discovery-signing-key-0123456789abcdef";
 
 class ImmediateClock implements DiscoveryClock {
   private milliseconds = SCHEDULED_FOR_MS;
@@ -124,7 +126,7 @@ describe("discovery worker runtime", () => {
     });
     const client = new DiscoveryApiClient({
       origin: "https://jobs.internal",
-      token: "worker-token",
+      signingKey: WORKER_SIGNING_KEY,
       workerId: "discovery-worker-test",
       fetch: fetcher,
     });
@@ -134,16 +136,14 @@ describe("discovery worker runtime", () => {
 
     expect(requests).toHaveLength(1);
     expect(requests[0]?.input).toBe("https://jobs.internal/api/jobs/internal/discovery/lease");
-    expect(new Headers(requests[0]?.init?.headers).get("authorization")).toBe("Bearer worker-token");
-    expect(new Headers(requests[0]?.init?.headers).get("x-bluey-jobs-worker-id"))
-      .toBe("discovery-worker-test");
+    expectSignedDiscoveryRequest(requests[0], "discovery-worker-test");
   });
 
   it("uses one bounded process-generated worker ID when no override is supplied", async () => {
     const workerIds: Array<string | null> = [];
     const client = new DiscoveryApiClient({
       origin: "https://jobs.internal",
-      token: "worker-token",
+      signingKey: WORKER_SIGNING_KEY,
       fetch: async (_input, init) => {
         workerIds.push(new Headers(init?.headers).get("x-bluey-jobs-worker-id"));
         return new Response(null, { status: 204 });
@@ -160,11 +160,11 @@ describe("discovery worker runtime", () => {
   it("allows plaintext API traffic only for loopback development", () => {
     expect(() => new DiscoveryApiClient({
       origin: "http://jobs.internal:8080",
-      token: "worker-token",
+      signingKey: WORKER_SIGNING_KEY,
     })).toThrow("invalid");
     expect(() => new DiscoveryApiClient({
       origin: "http://127.0.0.1:8080",
-      token: "worker-token",
+      signingKey: WORKER_SIGNING_KEY,
     })).not.toThrow();
   });
 
@@ -395,21 +395,21 @@ describe("discovery worker runtime", () => {
 
   it("retries an idempotent completion with the exact same lease body", async () => {
     const requests: Array<{
+      input: string;
       body: string;
-      authorization: string | null;
-      workerId: string | null;
+      init?: RequestInit;
     }> = [];
-    const fetcher: DiscoveryApiFetch = vi.fn(async (_input, init) => {
+    const fetcher: DiscoveryApiFetch = vi.fn(async (requestInput, init) => {
       requests.push({
+        input: String(requestInput),
         body: String(init?.body),
-        authorization: new Headers(init?.headers).get("authorization"),
-        workerId: new Headers(init?.headers).get("x-bluey-jobs-worker-id"),
+        init,
       });
       return new Response(null, { status: requests.length === 1 ? 503 : 204 });
     });
     const client = new DiscoveryApiClient({
       origin: "https://jobs.internal",
-      token: "worker-token",
+      signingKey: WORKER_SIGNING_KEY,
       workerId: "discovery-worker-test",
       fetch: fetcher,
       reportRetryMs: 0,
@@ -432,7 +432,42 @@ describe("discovery worker runtime", () => {
       replay_key: "replay-key-test",
       complete_snapshot: true,
     });
-    expect(requests.every((request) => request.authorization === "Bearer worker-token")).toBe(true);
-    expect(requests.every((request) => request.workerId === "discovery-worker-test")).toBe(true);
+    for (const request of requests) expectSignedDiscoveryRequest(request, "discovery-worker-test");
+    expect(new Headers(requests[0]?.init?.headers).get("x-bluey-jobs-worker-nonce"))
+      .not.toBe(new Headers(requests[1]?.init?.headers).get("x-bluey-jobs-worker-nonce"));
   });
 });
+
+function expectSignedDiscoveryRequest(
+  request: { input: string; init?: RequestInit } | undefined,
+  workerId: string,
+): void {
+  expect(request).toBeDefined();
+  const url = new URL(request?.input ?? "https://invalid.example");
+  const headers = new Headers(request?.init?.headers);
+  const body = String(request?.init?.body ?? "");
+  const timestamp = headers.get("x-bluey-jobs-worker-timestamp");
+  const nonce = headers.get("x-bluey-jobs-worker-nonce");
+  const contentSha256 = createHash("sha256").update(body).digest("hex");
+  expect(headers.get("authorization")).toBeNull();
+  expect(headers.get("x-bluey-jobs-worker-id")).toBe(workerId);
+  expect(headers.get("x-bluey-jobs-worker-audience")).toBe("bluey-jobs-api");
+  expect(headers.get("x-bluey-jobs-worker-scope")).toBe("discovery");
+  expect(headers.get("x-bluey-jobs-worker-content-sha256")).toBe(contentSha256);
+  expect(timestamp).toMatch(/^\d+$/);
+  expect(nonce).toMatch(/^[A-Za-z0-9._:-]{24,128}$/);
+  const canonical = [
+    "bluey-jobs-worker-v1",
+    timestamp,
+    nonce,
+    workerId,
+    "bluey-jobs-api",
+    "discovery",
+    "POST",
+    url.pathname,
+    contentSha256,
+  ].join("\n");
+  expect(headers.get("x-bluey-jobs-worker-signature")).toBe(
+    createHmac("sha256", WORKER_SIGNING_KEY).update(canonical).digest("hex"),
+  );
+}

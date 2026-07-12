@@ -327,6 +327,25 @@ mod tests {
     }
 
     #[test]
+    fn worker_signature_matches_javascript_client_vector() {
+        let canonical = canonical_request(WorkerSignatureInput {
+            worker_id: "workflow-test",
+            timestamp: 1_750_000_000,
+            nonce: "abcdef0123456789abcdef0123456789",
+            audience: SIGNATURE_AUDIENCE,
+            scope: "application-state",
+            method: "POST",
+            path: "/api/jobs/internal/applications/app-123/state",
+            content_sha256: "d2bf9fe5a8a5253a3c0f969fdac700d8936d5b728770133ee502efea230979d6",
+        });
+        assert!(signature_matches(
+            KEY,
+            canonical.as_bytes(),
+            "60d14a1656e9b560ad3bdb871d92be635b68060079b566c1a8ec461a41187bfa",
+        ));
+    }
+
+    #[test]
     fn signed_request_is_bound_to_scope_and_time() {
         std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", KEY);
         let now = 1_750_000_000;

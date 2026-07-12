@@ -1,9 +1,12 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ApplicationReceiptBundle, ApplicationState, EvidenceObjectUpload, SubmissionReceipt } from "@bluey/jobs-automation";
+import { createJobsWorkerAuthHeaders } from "@bluey/jobs-automation/worker-auth";
 import type { ApplicationWorkflowInput, InterventionResolution, RunnerExecutionResult } from "./contracts.js";
 
 const apiOrigin = process.env.BLUEY_JOBS_API_ORIGIN || "http://127.0.0.1:8080";
-const serviceToken = process.env.BLUEY_JOBS_WORKER_TOKEN || "";
+const workerSigningKey = process.env.BLUEY_JOBS_WORKER_SIGNING_KEY || "";
+const workerId = process.env.BLUEY_JOBS_WORKFLOW_WORKER_ID
+  || `workflow-${process.pid}-${randomUUID()}`;
 const runnerOrigin = process.env.BLUEY_JOBS_RUNNER_ORIGIN || "http://127.0.0.1:8091";
 const runnerToken = process.env.BLUEY_JOBS_RUNNER_TOKEN || "";
 
@@ -135,11 +138,21 @@ async function event(input: ApplicationWorkflowInput, type: string, body: unknow
 }
 
 async function workerRequest<T = unknown>(path: string, body: unknown): Promise<T> {
-  if (!serviceToken) throw new Error("BLUEY_JOBS_WORKER_TOKEN is required");
+  if (!workerSigningKey) throw new Error("BLUEY_JOBS_WORKER_SIGNING_KEY is required");
+  const serializedBody = JSON.stringify(body);
   const response = await fetch(`${apiOrigin}${path}`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${serviceToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    headers: {
+      ...createJobsWorkerAuthHeaders({
+        signingKey: workerSigningKey,
+        workerId,
+        method: "POST",
+        path,
+        body: serializedBody,
+      }),
+      "Content-Type": "application/json",
+    },
+    body: serializedBody,
   });
   if (!response.ok) throw new Error(`Jobs API returned ${response.status}`);
   if (response.status === 204) return undefined as T;

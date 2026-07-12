@@ -30,14 +30,23 @@ assert.match(caddy, /@bluey_jobs_internal path \/api\/jobs\/internal\/\*/);
 assert.match(caddy, /@bluey_scrape_canary path \/\.well-known\/bluey-integrity-/);
 assert.match(caddy, /handle @bluey_scrape_canary\s*\{[\s\S]*?X-Bluey-Scrape-Canary "hit"[\s\S]*?respond 404\s*\}/);
 assert.match(caddy, /handle @bluey_jobs_internal\s*\{\s*respond 404\s*\}/s);
-assert.match(caddy, /@bluey_assets path \/assets\/\* \/jobs\/assets\/\*/);
+assert.match(caddy, /@bluey_assets path \/assets\/\*/);
+assert.match(caddy, /@bluey_jobs_assets path \/jobs\/assets\/\*/);
+assert.match(
+  caddy,
+  /handle @bluey_jobs_assets\s*\{[\s\S]*?header Cache-Control "public, max-age=31536000, immutable"[\s\S]*?file_server\s*\}/,
+);
+assert.match(
+  caddy,
+  /handle @bluey_jobs\s*\{[\s\S]*?header Cache-Control "no-cache"[\s\S]*?try_files \{path\} \{path\}\/index\.html \/jobs\/index\.html[\s\S]*?file_server\s*\}/,
+);
 assert.match(caddy, /header @bluey_noindex X-Robots-Tag "noindex, nofollow, noarchive, nosnippet"/);
 assert.match(caddy, /-Server/);
 assert.ok(
   caddy.indexOf("handle @bluey_jobs_internal") < caddy.indexOf("handle @bluey_jobs_api"),
   "private Jobs routes must be rejected before the public Jobs proxy",
 );
-const assetsHandler = caddy.indexOf("handle @bluey_assets {");
+const assetsHandler = caddy.indexOf("handle @bluey_jobs_assets {");
 const jobsSpaHandler = caddy.indexOf("handle @bluey_jobs {");
 assert.ok(
   assetsHandler >= 0 && jobsSpaHandler >= 0 && assetsHandler < jobsSpaHandler,
