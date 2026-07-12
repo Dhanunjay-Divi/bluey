@@ -1,6 +1,6 @@
 //! Trial grant and abuse ledger.
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::params;
 use serde::Serialize;
@@ -172,26 +172,34 @@ pub fn attach_grant_account(pool: &DbPool, grant_id: &str, account_id: &str) -> 
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
-            conn.execute(
+            let updated = conn.execute(
                 "UPDATE trial_grants
                     SET account_id = ?1
                   WHERE id = ?2
                     AND decision = 'granted'
-                    AND account_id IS NULL",
+                    AND (account_id IS NULL OR account_id = ?1)",
                 params![account_id, grant_id],
             )?;
+            ensure!(
+                updated == 1,
+                "trial grant is missing, denied, or attached to another account"
+            );
             Ok(())
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            conn.execute(
+            let updated = conn.execute(
                 "UPDATE trial_grants
                     SET account_id = $1
                   WHERE id = $2
                     AND decision = 'granted'
-                    AND account_id IS NULL",
+                    AND (account_id IS NULL OR account_id = $1)",
                 &[&account_id, &grant_id],
             )?;
+            ensure!(
+                updated == 1,
+                "trial grant is missing, denied, or attached to another account"
+            );
             Ok(())
         }
     })
@@ -379,10 +387,23 @@ fn evaluate_sqlite(
         {
             return Ok(Some("device_trial_already_used".to_string()));
         }
+        if count_recent_grants_sqlite_days(
+            conn,
+            "device_hash = ?1",
+            &[device_hash as &dyn rusqlite::ToSql],
+            30,
+        )? >= cfg.max_trials_per_device_per_30_days
+        {
+            return Ok(Some("device_trial_already_used".to_string()));
+        }
     }
     if let Some(ip_hash) = &signals.ip_hash {
-        if count_recent_grants_sqlite(conn, "ip_hash = ?1", &[ip_hash as &dyn rusqlite::ToSql])?
-            >= cfg.max_trials_per_ip_per_day
+        if count_recent_grants_sqlite_days(
+            conn,
+            "ip_hash = ?1",
+            &[ip_hash as &dyn rusqlite::ToSql],
+            1,
+        )? >= cfg.max_trials_per_ip_per_day
         {
             return Ok(Some("ip_trial_velocity".to_string()));
         }
@@ -432,12 +453,22 @@ fn evaluate_pg(
         {
             return Ok(Some("device_trial_already_used".to_string()));
         }
+        if count_recent_grants_pg_days(
+            conn,
+            "device_hash = $1",
+            &[device_hash as &(dyn postgres::types::ToSql + Sync)],
+            30,
+        )? >= cfg.max_trials_per_device_per_30_days
+        {
+            return Ok(Some("device_trial_already_used".to_string()));
+        }
     }
     if let Some(ip_hash) = &signals.ip_hash {
-        if count_recent_grants_pg(
+        if count_recent_grants_pg_days(
             conn,
             "ip_hash = $1",
             &[ip_hash as &(dyn postgres::types::ToSql + Sync)],
+            1,
         )? >= cfg.max_trials_per_ip_per_day
         {
             return Ok(Some("ip_trial_velocity".to_string()));
@@ -753,10 +784,20 @@ fn count_recent_grants_sqlite(
     predicate: &str,
     values: &[&dyn rusqlite::ToSql],
 ) -> Result<i64> {
+    count_recent_grants_sqlite_days(conn, predicate, values, 1)
+}
+
+fn count_recent_grants_sqlite_days(
+    conn: &rusqlite::Connection,
+    predicate: &str,
+    values: &[&dyn rusqlite::ToSql],
+    days: i64,
+) -> Result<i64> {
+    let days = days.max(1);
     let sql = format!(
         "SELECT COUNT(*) FROM trial_grants
          WHERE decision = 'granted'
-           AND created_at >= datetime('now', '-1 day')
+           AND created_at >= datetime('now', '-{days} days')
            AND {predicate}"
     );
     Ok(conn.query_row(&sql, values, |row| row.get(0))?)
@@ -778,7 +819,16 @@ fn count_recent_grants_pg(
     predicate: &str,
     values: &[&(dyn postgres::types::ToSql + Sync)],
 ) -> Result<i64> {
-    let since = Utc::now() - Duration::days(1);
+    count_recent_grants_pg_days(conn, predicate, values, 1)
+}
+
+fn count_recent_grants_pg_days(
+    conn: &mut postgres::Client,
+    predicate: &str,
+    values: &[&(dyn postgres::types::ToSql + Sync)],
+    days: i64,
+) -> Result<i64> {
+    let since = Utc::now() - Duration::days(days.max(1));
     let sql = format!(
         "SELECT COUNT(*)::bigint FROM trial_grants
          WHERE decision = 'granted'
@@ -886,12 +936,78 @@ mod tests {
     }
 
     #[test]
+    fn trial_grant_attach_is_idempotent_for_same_account_and_rejects_another() {
+        let pool = pool();
+        let signals = TrialAbuseSignals::from_raw(
+            "a@example.com",
+            Some("198.51.100.10"),
+            Some("device-1"),
+            Some("ua"),
+        );
+        let grant_id =
+            match reserve_trial_grant(&pool, TrialAbuseConfig::default(), &signals, 900).unwrap() {
+                TrialGrantReservation::Reserved { grant_id } => grant_id,
+                TrialGrantReservation::Denied { reason } => {
+                    panic!("trial should reserve, denied with {reason}")
+                }
+            };
+        let first_account = crate::db::accounts::Account::create(&pool, "a@example.com", "stub")
+            .unwrap()
+            .id;
+        let second_account = crate::db::accounts::Account::create(&pool, "b@example.com", "stub")
+            .unwrap()
+            .id;
+
+        attach_grant_account(&pool, &grant_id, &first_account).unwrap();
+        attach_grant_account(&pool, &grant_id, &first_account).unwrap();
+
+        let error = attach_grant_account(&pool, &grant_id, &second_account).unwrap_err();
+        assert!(error.to_string().contains("attached to another account"));
+    }
+
+    #[test]
+    fn allows_same_device_again_after_monthly_window_when_lifetime_cap_remains() {
+        let pool = pool();
+        let cfg = TrialAbuseConfig::default();
+        let signals = TrialAbuseSignals::from_raw(
+            "a@example.com",
+            Some("198.51.100.10"),
+            Some("device-1"),
+            Some("ua"),
+        );
+        assert!(evaluate_trial_grant(&pool, cfg, &signals).unwrap().allowed);
+        let account_id = crate::db::accounts::Account::create(&pool, "a@example.com", "stub")
+            .unwrap()
+            .id;
+        record_grant(&pool, &account_id, &signals, 900).unwrap();
+
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "UPDATE trial_grants
+                SET created_at = datetime('now', '-31 days')
+              WHERE account_id = ?1",
+            params![account_id],
+        )
+        .unwrap();
+
+        let second = TrialAbuseSignals::from_raw(
+            "b@example.com",
+            Some("198.51.100.11"),
+            Some("device-1"),
+            Some("ua"),
+        );
+        let decision = evaluate_trial_grant(&pool, cfg, &second).unwrap();
+        assert!(decision.allowed);
+    }
+
+    #[test]
     fn denies_domain_velocity_after_limit() {
         let pool = pool();
         let cfg = TrialAbuseConfig {
             max_trials_per_email: 10,
             max_trials_per_email_domain_per_day: 1,
             max_trials_per_device: 10,
+            max_trials_per_device_per_30_days: 10,
             max_trials_per_ip_per_day: 10,
             max_trials_per_ip_user_agent_per_day: 10,
         };

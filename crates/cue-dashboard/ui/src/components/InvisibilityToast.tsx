@@ -3,13 +3,10 @@ import { listen } from "@tauri-apps/api/event";
 import { Eye, EyeOff } from "lucide-react";
 
 /**
- * Codex Stage 18 follow-up: brief in-dashboard toast that confirms
- * an invisibility toggle actually took effect. The overlay shows
- * its own "Bluey hidden — press F19 to restore" toast on hide;
- * this is the symmetric feedback in the dashboard window itself.
+ * Brief in-dashboard toast that confirms an overlay visibility change.
  *
- * Subscribes to "invisibility_changed" event the daemon emits from
- * the invisibility_toggle command. Auto-dismisses after 1.6s.
+ * Subscribes to the legacy-named "invisibility_changed" event emitted by
+ * the show/hide command. Auto-dismisses after 1.6s.
  */
 export function InvisibilityToast() {
   const [state, setState] = useState<"hidden" | "visible" | null>(null);
@@ -44,7 +41,7 @@ export function InvisibilityToast() {
         <Eye className="h-4 w-4 text-blue-400" />
       )}
       <span className="text-xs font-medium text-zinc-100">
-        {isHidden ? "Bluey hidden — press F19 to restore" : "Bluey visible"}
+        {isHidden ? "Overlay hidden. Press F19 to restore." : "Overlay visible"}
       </span>
     </div>
   );

@@ -1,6 +1,6 @@
 # Bluey Owner Docs
 
-Date: 2026-06-26
+Updated: 2026-07-12
 
 This folder is the owner-facing map for Bluey's current state. It exists because
 the repo has many useful historical docs, but several older docs now conflict
@@ -25,18 +25,23 @@ Bluey should be positioned as:
 Bluey should help users answer from the live conversation, current screen/page,
 attached docs, repo/project context, prior decisions, and managed model routing.
 
-Do not lead with stealth. Capture exclusion and private overlay behavior are
-trust features, not the main product identity.
+Do not lead with stealth. Best-effort screen-share capture exclusion is an
+explicit privacy control, not the main product identity or an invisibility
+guarantee.
 
 ## Current Launch Posture
 
-Safe near-term path:
+Current public release record:
 
-- Controlled macOS-first paid alpha.
-- Manual Square reloads first.
-- Provider keys server-side only.
-- One production-shaped server is acceptable for first 100 users.
-- Windows only after the Windows paid-alpha readiness gate passes.
+- The signed manifest reports `0.1.99` for macOS Apple silicon and Windows
+  x86-64. Its release record install-smokes Windows 11; it does not claim
+  Windows 10, macOS Intel/universal, or Linux support.
+- Signed manifest and checksum verification are distinct from Apple Developer
+  ID/notarization or Windows Authenticode signing.
+- Cloud sync and Auto Reload are separate opt-in choices. Sign-in alone must not
+  enable either one.
+- Raw audio is processed transiently; there is no retained raw-audio library or
+  customer-content training option in the current product.
 
 Do not expand trial or broad marketing until AI cost reservation is closed for
 LLM, embeddings, and chunked transcription.
@@ -61,8 +66,9 @@ Known drift:
 ## Owner Decisions Needed
 
 - Confirm first ICP: engineering meetings is the recommended wedge.
-- Confirm public alpha platform: macOS-first recommended.
-- Confirm reload language: `$15 minimum` versus `$30 suggested/default`.
+- Decide whether macOS Intel/universal or Linux should enter the release matrix.
+- Keep reload amount and payment-provider copy sourced from the live product
+  configuration rather than owner-doc defaults.
 - Confirm legal-hold policy for billing/usage evidence after deletion.
 - Confirm provider daily spend budget for trial and paid alpha.
 - Confirm when public Product Hunt/social/community launch should happen.

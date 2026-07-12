@@ -24,15 +24,19 @@ pub mod device_codes;
 pub mod devices;
 pub mod diagnostic_logs;
 pub mod idempotency;
+pub mod legal_acceptances;
 pub mod link_codes;
 pub mod metrics;
+pub mod object_uploads;
 pub mod ops_audit;
 pub mod refresh_tokens;
 pub mod signup_otps;
+pub mod stripe_auto_reload;
 pub mod stt_accounting;
 pub mod sync;
 pub mod trial_abuse;
 pub mod usage;
+pub mod usage_reservations;
 pub mod webhook_events;
 
 pub type SqliteDbPool = Pool<SqliteConnectionManager>;
@@ -740,6 +744,175 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_account_devices_account_device
         ON account_devices(account_id, device_id);
     "#,
+    // 0019 - legal acceptance ledger.
+    //
+    // Product flows already require Terms/Privacy consent before signup,
+    // trial conversion, and Try Us access. This ledger records the account,
+    // purpose, policy versions, and hashed request signals so support/admin
+    // can prove consent without retaining raw IP, device, or user-agent data.
+    r#"
+    CREATE TABLE IF NOT EXISTS legal_acceptances (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        purpose               TEXT NOT NULL,
+        terms_version         TEXT NOT NULL,
+        privacy_version       TEXT NOT NULL,
+        terms_text_hash       TEXT NOT NULL DEFAULT '',
+        privacy_text_hash     TEXT NOT NULL DEFAULT '',
+        email_hash            TEXT,
+        ip_hash               TEXT,
+        user_agent_hash       TEXT,
+        device_hash           TEXT,
+        ip_user_agent_hash    TEXT,
+        metadata_json         TEXT NOT NULL DEFAULT '{}',
+        retention_expires_at  DATETIME,
+        accepted_at           DATETIME NOT NULL DEFAULT (datetime('now')),
+        created_at            DATETIME NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(account_id, purpose, terms_version, privacy_version)
+    );
+    "#,
+    // 0020 - durable object upload metadata, quota accounting, and outbox.
+    r#"
+    CREATE TABLE IF NOT EXISTS object_uploads (
+        id                  TEXT PRIMARY KEY,
+        account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        object_kind         TEXT NOT NULL CHECK(object_kind IN ('artifact', 'session_audit')),
+        logical_id          TEXT NOT NULL,
+        session_id          TEXT,
+        storage_scope       TEXT NOT NULL CHECK(storage_scope IN ('artifact', 'audit')),
+        object_key          TEXT NOT NULL,
+        size_bytes          INTEGER NOT NULL CHECK(size_bytes > 0),
+        sha256              TEXT NOT NULL CHECK(length(sha256) = 64),
+        content_type        TEXT NOT NULL,
+        expires_at_ms       INTEGER NOT NULL,
+        state               TEXT NOT NULL DEFAULT 'pending'
+            CHECK(state IN ('pending', 'ready', 'delete_pending', 'deleted')),
+        metadata_json       TEXT NOT NULL DEFAULT '{}',
+        created_at_ms       INTEGER NOT NULL,
+        updated_at_ms       INTEGER NOT NULL,
+        uploaded_at_ms      INTEGER,
+        deleted_at_ms       INTEGER,
+        UNIQUE(account_id, object_kind, logical_id),
+        UNIQUE(storage_scope, object_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_object_uploads_account_state
+        ON object_uploads(account_id, state, created_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_object_uploads_session
+        ON object_uploads(account_id, session_id, state);
+    CREATE INDEX IF NOT EXISTS idx_object_uploads_cleanup
+        ON object_uploads(storage_scope, state, expires_at_ms, updated_at_ms);
+
+    CREATE TABLE IF NOT EXISTS object_upload_daily_usage (
+        account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        day_start_ms        INTEGER NOT NULL,
+        reserved_bytes      INTEGER NOT NULL DEFAULT 0 CHECK(reserved_bytes >= 0),
+        reserved_objects    INTEGER NOT NULL DEFAULT 0 CHECK(reserved_objects >= 0),
+        updated_at_ms       INTEGER NOT NULL,
+        PRIMARY KEY(account_id, day_start_ms)
+    );
+
+    CREATE TABLE IF NOT EXISTS object_storage_outbox (
+        id                  TEXT PRIMARY KEY,
+        upload_id           TEXT NOT NULL REFERENCES object_uploads(id) ON DELETE CASCADE,
+        account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        operation           TEXT NOT NULL CHECK(operation IN ('put', 'delete')),
+        state               TEXT NOT NULL DEFAULT 'pending'
+            CHECK(state IN ('pending', 'processing', 'retry', 'completed', 'abandoned')),
+        attempt_count       INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+        next_attempt_at_ms  INTEGER NOT NULL,
+        last_error          TEXT,
+        created_at_ms       INTEGER NOT NULL,
+        updated_at_ms       INTEGER NOT NULL,
+        completed_at_ms     INTEGER,
+        UNIQUE(upload_id, operation)
+    );
+    CREATE INDEX IF NOT EXISTS idx_object_storage_outbox_due
+        ON object_storage_outbox(operation, state, next_attempt_at_ms, updated_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_object_storage_outbox_account
+        ON object_storage_outbox(account_id, operation, state);
+    "#,
+    // 0021 - atomic managed-usage reservations.
+    r#"
+    CREATE TABLE IF NOT EXISTS usage_reservations (
+        account_id                    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        request_id                    TEXT NOT NULL,
+        kind                          TEXT NOT NULL,
+        status                        TEXT NOT NULL CHECK(status IN ('reserved', 'settled', 'released')),
+        attempt                       INTEGER NOT NULL DEFAULT 1 CHECK(attempt > 0),
+        estimated_customer_cents      INTEGER NOT NULL CHECK(estimated_customer_cents >= 0),
+        estimated_upstream_cents      INTEGER NOT NULL CHECK(estimated_upstream_cents >= 0),
+        reserved_cents                INTEGER NOT NULL DEFAULT 0 CHECK(reserved_cents >= 0),
+        actual_customer_cents         INTEGER NOT NULL DEFAULT 0 CHECK(actual_customer_cents >= 0),
+        settled_cents                 INTEGER NOT NULL DEFAULT 0 CHECK(settled_cents >= 0),
+        refunded_cents                INTEGER NOT NULL DEFAULT 0 CHECK(refunded_cents >= 0),
+        reserved_trial_seconds        INTEGER NOT NULL DEFAULT 0 CHECK(reserved_trial_seconds >= 0),
+        settled_trial_seconds         INTEGER NOT NULL DEFAULT 0 CHECK(settled_trial_seconds >= 0),
+        refunded_trial_seconds        INTEGER NOT NULL DEFAULT 0 CHECK(refunded_trial_seconds >= 0),
+        created_at_ms                 INTEGER NOT NULL,
+        expires_at_ms                 INTEGER NOT NULL,
+        settled_at_ms                 INTEGER,
+        balance_cents_after           INTEGER,
+        trial_seconds_remaining_after INTEGER,
+        reservation_reason            TEXT NOT NULL,
+        terminal_reason               TEXT,
+        PRIMARY KEY(account_id, request_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_usage_reservations_status_expiry
+        ON usage_reservations(status, expires_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_usage_reservations_account_expiry
+        ON usage_reservations(account_id, status, expires_at_ms);
+    "#,
+    // 0022 - durable Stripe Auto Reload attempts.
+    //
+    // PaymentIntents are created unconfirmed, attached to one of these rows,
+    // and only then confirmed. The active-account index is the cross-process
+    // guard against opening two chargeable attempts for one account.
+    r#"
+    CREATE TABLE IF NOT EXISTS stripe_auto_reload_attempts (
+        id                          TEXT PRIMARY KEY,
+        account_id                  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        amount_cents                INTEGER NOT NULL,
+        currency                    TEXT NOT NULL DEFAULT 'usd',
+        stripe_customer_id          TEXT NOT NULL,
+        stripe_payment_method_id    TEXT NOT NULL,
+        stripe_payment_intent_id    TEXT,
+        stripe_charge_id            TEXT,
+        create_idempotency_key      TEXT NOT NULL UNIQUE,
+        confirm_idempotency_key     TEXT NOT NULL UNIQUE,
+        status                      TEXT NOT NULL,
+        failure_code                TEXT,
+        last_event_id               TEXT,
+        created_at                  DATETIME NOT NULL DEFAULT (datetime('now')),
+        updated_at                  DATETIME NOT NULL DEFAULT (datetime('now')),
+        payment_intent_created_at   DATETIME,
+        charged_at                  DATETIME,
+        credited_at                 DATETIME,
+        failed_at                   DATETIME,
+        reversed_at                 DATETIME,
+        last_reconciled_at          DATETIME,
+        CHECK (amount_cents > 0),
+        CHECK (currency = 'usd'),
+        CHECK (status IN (
+            'reserved', 'requires_confirmation', 'processing',
+            'reconciliation_required', 'succeeded', 'failed',
+            'canceled', 'reversed'
+        ))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_stripe_auto_reload_payment_intent
+        ON stripe_auto_reload_attempts(stripe_payment_intent_id)
+        WHERE stripe_payment_intent_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_stripe_auto_reload_charge
+        ON stripe_auto_reload_attempts(stripe_charge_id)
+        WHERE stripe_charge_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_stripe_auto_reload_active_account
+        ON stripe_auto_reload_attempts(account_id)
+        WHERE status IN (
+            'reserved', 'requires_confirmation', 'processing',
+            'reconciliation_required'
+        );
+    CREATE INDEX IF NOT EXISTS idx_stripe_auto_reload_account_created
+        ON stripe_auto_reload_attempts(account_id, created_at);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -833,12 +1006,46 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     )?;
     ensure_column(&conn, "trial_grants", "email_domain_hash", "TEXT")?;
     ensure_column(&conn, "trial_abuse_events", "email_domain_hash", "TEXT")?;
+    ensure_column(
+        &conn,
+        "legal_acceptances",
+        "terms_text_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &conn,
+        "legal_acceptances",
+        "privacy_text_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(&conn, "legal_acceptances", "email_hash", "TEXT")?;
+    ensure_column(&conn, "legal_acceptances", "ip_user_agent_hash", "TEXT")?;
+    ensure_column(
+        &conn,
+        "legal_acceptances",
+        "retention_expires_at",
+        "DATETIME",
+    )?;
+    ensure_column(
+        &conn,
+        "legal_acceptances",
+        "accepted_at",
+        // SQLite rejects non-constant defaults such as datetime('now') when
+        // ALTER TABLE adds a column. New writes populate this explicitly.
+        "DATETIME",
+    )?;
     conn.execute_batch(
         r#"
         CREATE INDEX IF NOT EXISTS idx_trial_grants_email_domain
             ON trial_grants(email_domain_hash, created_at);
         CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_email_domain
             ON trial_abuse_events(email_domain_hash, created_at);
+        CREATE INDEX IF NOT EXISTS idx_legal_acceptances_account_created
+            ON legal_acceptances(account_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_legal_acceptances_purpose_created
+            ON legal_acceptances(purpose, created_at);
+        CREATE INDEX IF NOT EXISTS idx_legal_acceptances_email_created
+            ON legal_acceptances(email_hash, created_at);
         "#,
     )?;
     tracing::info!(
@@ -851,6 +1058,21 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
 
 const POSTGRES_RUNTIME_SCHEMA: &str =
     include_str!("../../../infra/postgres/server-runtime/001_server_runtime_compat.sql");
+const POSTGRES_USAGE_RESERVATIONS: &str =
+    include_str!("../../../infra/postgres/server-runtime/002_usage_reservations.sql");
+const POSTGRES_OBJECT_UPLOAD_CONTROLS: &str =
+    include_str!("../../../infra/postgres/server-runtime/003_object_upload_controls.sql");
+const POSTGRES_STRIPE_AUTO_RELOAD: &str =
+    include_str!("../../../infra/postgres/server-runtime/004_stripe_auto_reload.sql");
+const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
+    ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
+    ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
+    (
+        "003_object_upload_controls.sql",
+        POSTGRES_OBJECT_UPLOAD_CONTROLS,
+    ),
+    ("004_stripe_auto_reload.sql", POSTGRES_STRIPE_AUTO_RELOAD),
+];
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
     run_blocking_db(|| run_postgres_migrations_inner(pool))
@@ -866,28 +1088,28 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
     )
     .context("ensure postgres migration ledger")?;
 
-    let version = "001_server_runtime_compat.sql";
-    let already = conn
-        .query_opt(
-            "SELECT 1 FROM bluey_schema_migrations WHERE version = $1",
-            &[&version],
-        )
-        .context("check postgres migration ledger")?
-        .is_some();
-    if !already {
-        conn.batch_execute(POSTGRES_RUNTIME_SCHEMA)
-            .context("apply postgres runtime compatibility schema")?;
-        conn.execute(
-            "INSERT INTO bluey_schema_migrations(version) VALUES ($1)
-             ON CONFLICT (version) DO NOTHING",
-            &[&version],
-        )
-        .context("record postgres migration")?;
-    } else {
-        // The schema is idempotent and should stay self-healing as columns
-        // are added before the full adapter lands.
-        conn.batch_execute(POSTGRES_RUNTIME_SCHEMA)
-            .context("refresh postgres runtime compatibility schema")?;
+    for (version, sql) in POSTGRES_MIGRATIONS {
+        let already = conn
+            .query_opt(
+                "SELECT 1 FROM bluey_schema_migrations WHERE version = $1",
+                &[version],
+            )
+            .with_context(|| format!("check postgres migration ledger for {version}"))?
+            .is_some();
+
+        // Runtime migrations are idempotent and intentionally self-healing.
+        // Replaying CREATE IF NOT EXISTS statements also repairs schema drift
+        // without mutating already-recorded application data.
+        conn.batch_execute(sql)
+            .with_context(|| format!("apply postgres migration {version}"))?;
+        if !already {
+            conn.execute(
+                "INSERT INTO bluey_schema_migrations(version) VALUES ($1)
+                 ON CONFLICT (version) DO NOTHING",
+                &[version],
+            )
+            .with_context(|| format!("record postgres migration {version}"))?;
+        }
     }
 
     let vector_ready = conn
@@ -914,7 +1136,7 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
 
     tracing::info!(
         backend = pool.backend_name(),
-        migration = version,
+        migrations = POSTGRES_MIGRATIONS.len(),
         "migrations applied"
     );
     Ok(())

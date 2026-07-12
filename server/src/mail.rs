@@ -173,15 +173,70 @@ async fn send_resend_api(
 fn signup_otp_email_html(code: &str, expires_in_minutes: i64) -> String {
     let code = escape_html(&spaced_verification_code(code));
     format!(
-        r#"<div style="margin:0;background:#111214;color:#f5f8fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;padding:36px 0">
-  <div style="max-width:430px;margin:0 auto;padding:0 22px">
-    <h1 style="margin:0 0 34px;color:#67dfff;font-size:44px;line-height:1;font-weight:800;letter-spacing:0;text-shadow:0 0 22px rgba(74,190,255,.34)">Bluey</h1>
-    <p style="margin:0 0 24px;color:#f5f8fb;font-size:26px;line-height:1.25;font-weight:500">Welcome to Bluey.</p>
-    <p style="margin:0 0 18px;color:#f5f8fb;font-size:23px;line-height:1.35">Your verification code is:</p>
-    <div style="margin:0 0 28px;background:#25282b;border-radius:14px;padding:26px 20px;text-align:center;color:#ffffff;font-size:42px;line-height:1.2;font-weight:700;letter-spacing:.22em">{code}</div>
-    <p style="margin:0;color:#9b9fa6;font-size:20px;line-height:1.4">This code expires in {expires_in_minutes} minutes.</p>
-  </div>
-</div>"#
+        r#"<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#05080d;color:#f4fbff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
+    <div style="display:none;max-height:0;overflow:hidden;color:transparent;opacity:0">Your Bluey verification code expires in {expires_in_minutes} minutes.</div>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:0;padding:0;background:#05080d">
+      <tr>
+        <td align="center" style="padding:28px 14px">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:560px;background:#08111c;border:1px solid #124d6b;border-radius:26px;box-shadow:0 18px 48px rgba(0,0,0,.42),0 0 34px rgba(80,202,255,.16);overflow:hidden">
+            <tr>
+              <td style="padding:28px 28px 18px">
+                <table role="presentation" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td width="52" height="52" align="center" valign="middle" style="width:52px;height:52px;border-radius:16px;background:#06111f;border:1px solid #1b6d8a;box-shadow:inset 0 0 0 1px rgba(103,223,255,.14),0 0 22px rgba(103,223,255,.24)">
+                      <span style="display:inline-block;color:#67dfff;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:22px;font-weight:800;line-height:52px">&gt;_</span>
+                    </td>
+                    <td style="padding-left:14px">
+                      <div style="font-size:42px;line-height:1;font-weight:850;letter-spacing:-.01em">
+                        <span style="color:#e9f7ff">blu</span><span style="color:#39c7ff">ey</span>
+                      </div>
+                      <div style="padding-top:6px;color:#8fb3c7;font-size:13px;line-height:1.35;font-weight:700;letter-spacing:.12em;text-transform:uppercase">secure sign in</div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:6px 28px 0">
+                <div style="height:1px;background:#123047"></div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:26px 28px 10px">
+                <h1 style="margin:0 0 10px;color:#f4fbff;font-size:28px;line-height:1.18;font-weight:850">Welcome to Bluey.</h1>
+                <p style="margin:0;color:#aec1ce;font-size:16px;line-height:1.55">Use this code to finish signing in. Keep it private; Bluey will never ask you to share it with anyone.</p>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:18px 28px 18px">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0b1826;border:1px solid #1f83a6;border-radius:20px;box-shadow:inset 0 0 0 1px rgba(103,223,255,.10),0 0 26px rgba(103,223,255,.14)">
+                  <tr>
+                    <td align="center" style="padding:14px 18px 0;color:#67dfff;font-size:12px;line-height:1.4;font-weight:850;letter-spacing:.16em;text-transform:uppercase">verification code</td>
+                  </tr>
+                  <tr>
+                    <td align="center" style="padding:10px 18px 22px;color:#ffffff;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:46px;line-height:1.1;font-weight:850;letter-spacing:.18em">{code}</td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 28px 26px">
+                <table role="presentation" cellspacing="0" cellpadding="0" style="background:#07131f;border:1px solid #14344a;border-radius:999px">
+                  <tr>
+                    <td style="padding:9px 13px;color:#b9cad5;font-size:14px;line-height:1.4;font-weight:700">This code expires in {expires_in_minutes} minutes.</td>
+                  </tr>
+                </table>
+                <p style="margin:18px 0 0;color:#718898;font-size:13px;line-height:1.5">If you did not request this code, you can safely ignore this email.</p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>"#
     )
 }
 

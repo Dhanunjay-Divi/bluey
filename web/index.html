@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bluey | AI Meeting Context Copilot</title>
-  <meta name="description" content="Bluey is private AI for meetings, calls, code, docs, and screen context from your terminal. Attach what matters and get answers without switching apps.">
+  <title>Bluey | Consent-First Live Context For Engineering Work</title>
+  <meta name="description" content="Bluey is a consent-first desktop assistant for live engineering work. Ask from the conversation, screen, files, code, and project context you choose.">
   <meta name="theme-color" content="#020405">
   <meta name="robots" content="index,follow">
   <link rel="canonical" href="https://bluey.sh/">
@@ -13,20 +13,20 @@
   <link rel="icon" type="image/svg+xml" href="/assets/bluey-logo.svg">
   <link rel="icon" type="image/png" sizes="512x512" href="/assets/favicon-512.png">
   <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
-  <meta property="og:title" content="Bluey | AI Meeting Context Copilot">
-  <meta property="og:description" content="Private AI for meetings, calls, code, docs, and screen context. Attach what matters and get answers without switching apps.">
+  <meta property="og:title" content="Bluey | Live Context For Engineering Work">
+  <meta property="og:description" content="Ask from the conversation, screen, files, code, and project context you choose.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://bluey.sh/">
   <meta property="og:image" content="https://bluey.sh/assets/bluey-og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Bluey | AI Meeting Context Copilot">
-  <meta name="twitter:description" content="Private AI for meetings, calls, code, docs, and screen context. Attach what matters and get answers without switching apps.">
+  <meta name="twitter:title" content="Bluey | Live Context For Engineering Work">
+  <meta name="twitter:description" content="A consent-first desktop assistant for approved live work context.">
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css?v=2026070801"
+    href="/assets/bluey-site.css?v=2026071201"
   >
   <script type="application/ld+json">
   {
@@ -54,8 +54,9 @@
         "name": "Bluey",
         "url": "https://bluey.sh/",
         "applicationCategory": "BusinessApplication",
-        "operatingSystem": "macOS, Windows",
-        "description": "Private desktop AI for meetings, calls, code, docs, screen context, and saved project memory.",
+        "operatingSystem": "macOS on Apple silicon, Windows 11 on x86-64",
+        "softwareVersion": "0.1.99",
+        "description": "A consent-first desktop assistant for live engineering conversations, screen context, files, code, and saved project memory.",
         "image": "https://bluey.sh/assets/bluey-og.png",
         "softwareHelp": "https://bluey.sh/how-bluey-works/",
         "downloadUrl": "https://bluey.sh/download",
@@ -71,7 +72,7 @@
         "@type": "Product",
         "@id": "https://bluey.sh/#product",
         "name": "Bluey",
-        "description": "A private desktop copilot that brings meetings, calls, screen context, files, code, docs, and saved project memory into one answer surface.",
+        "description": "A consent-first desktop assistant that brings approved conversation, screen, file, code, document, and project context into one answer surface.",
         "brand": { "@id": "https://bluey.sh/#organization" },
         "image": "https://bluey.sh/assets/bluey-og.png",
         "url": "https://bluey.sh/",
@@ -109,7 +110,7 @@
             </span>
           </button>
           <a href="/download">Download</a>
-          <a href="/docs/disguise">Controls</a>
+          <a href="/docs/disguise">Screen-share privacy</a>
           <a href="/privacy">Privacy</a>
           <a href="/terms">Terms</a>
           <a class="nav-cta" href="/login" data-guest-only>Log in</a>
@@ -137,51 +138,54 @@
       </nav>
 
       <article class="policy-card" id="privacyPolicy" hidden>
-        <div class="policy-updated">Last updated July 8, 2026</div>
+        <div class="policy-updated">Last updated July 12, 2026</div>
         <h1>Privacy Policy</h1>
-        <p>Bluey is an AI work assistant that runs a desktop overlay and optional cloud services. We collect only what is needed for account login, balance reloads, AI answers, saved sessions, support, and abuse prevention.</p>
+        <p>Bluey is a consent-first AI work assistant with a desktop overlay and optional cloud services. Listening, screen analysis, file attachment, cloud sync, and automatic payments are separate choices. Bluey processes only the context needed for the features you choose.</p>
 
         <h2>Information We Process</h2>
         <ul>
           <li>Account data such as email, password hash, device/session tokens, balance, reload history, and usage records.</li>
-          <li>User-approved context such as typed prompts, source-labeled transcripts, voice/audio recordings or chunks, attached files, screen-analysis results, answer-style instructions, and generated responses.</li>
+          <li>User-approved context such as typed prompts, source-labeled transcripts, temporary audio chunks needed for transcription, attached files, screen-analysis results, answer-style instructions, and generated responses.</li>
           <li>Diagnostic data such as error reports, service health, abuse controls, and support bundles. Logs are designed to avoid secrets and full user content.</li>
           <li>Payment information needed to complete reloads. Bluey does not collect or store full card numbers, CVV, or card expiration data.</li>
         </ul>
 
         <h2>How We Use Data</h2>
-        <p>We use account and session data to authenticate you, answer requests, meter paid usage, save approved context, provide searchable history, show balance and cost labels, debug failures, prevent abuse, and support export or deletion requests.</p>
+        <p>We use account and session data to authenticate you, answer requests, meter paid usage, provide the local or cloud history you choose, show balance and cost labels, debug failures, prevent abuse, and support export or deletion requests.</p>
 
         <h2>Training and Product Improvement</h2>
-        <p>When you use cloud sync, saved sessions, speech, screen, or file features, Bluey may use prompts, transcripts, voice/audio recordings or chunks, attached context, screen-analysis results, generated responses, feedback, and usage patterns to evaluate transcription and answer quality, train or tune Bluey systems, improve routing, debug product behavior, and build better safeguards. Do not submit confidential, regulated, or third-party content unless you have permission for that use.</p>
+        <p>Bluey does not use your prompts, transcripts, audio, files, screenshots, or generated answers to train or fine-tune models. A future research or training program would require a separate, clearly labeled opt-in. The current product has no such opt-in, so submitted content is not training data. We may use aggregate service metrics and feedback you deliberately submit to diagnose reliability and improve safeguards.</p>
 
         <h2>AI, Speech, and Context</h2>
-        <p>When a request needs AI or speech transcription, Bluey sends the context needed for that request: your prompt, selected transcript snippets, relevant audio chunks, attached document text, screen-analysis output, saved session memory, and request details such as task type and approximate cost. Bluey may route different requests through different answer, speech, image, or search paths depending on the task and selected context.</p>
+        <p>When a request needs AI or speech transcription, Bluey sends only the context needed for that request: your prompt, selected transcript snippets, relevant temporary audio chunks, attached document text, screen-analysis output, enabled saved-session memory, and request details such as task type and approximate cost. Bluey may route different requests through different answer, speech, image, or search services depending on the task and selected context.</p>
 
-        <h2>Files, Sessions, and Memory</h2>
-        <p>Documents, images, screenshots, and other files you attach are parsed into readable text where supported and are tied to the active Bluey session. When you sign in with saved-session sync on, Bluey may store the original synced file bytes, lightweight previews, extracted text, summaries, and search indexes so another signed-in device can restore the session and answer from the same context. You can turn cloud sync off in settings and keep using local sessions.</p>
+        <h2>Cloud Sync, Files, and Memory</h2>
+        <p>Cloud sync is off by default. If you turn it on in desktop settings, Bluey may upload the session records, transcripts, answers, attached file or screenshot bytes, extracted text, summaries, and search indexes needed to restore that approved context on another signed-in device. Turning sync off stops new automatic uploads; local sessions remain available on that device.</p>
+
+        <h2>Audio Retention</h2>
+        <p>Bluey does not offer a retained-audio library in the current release. Raw audio is processed transiently for transcription and Bluey's temporary local chunks are deleted after transcription. Transcript text may remain in the local session and may sync only when cloud sync is on. Speech providers process audio needed to return the transcript under their service terms.</p>
 
         <h2>Your Controls</h2>
-        <p>Desktop capture starts only through visible user controls. You can stop listening, hide the overlay, attach or remove documents, export account data, delete your account, and clear local state.</p>
+        <p>Desktop capture starts only through visible user controls. You can stop listening, remove attached context, turn cloud sync off, keep sessions local, export account data, delete your account, and clear local state. Auto Reload is also off until you turn it on and approve a saved card.</p>
 
         <h2>Retention</h2>
-        <p>Purchased balance remains in account records for accounting and expires up to 12 months (365 days) after purchase. Cloud-synced session records, transcripts, voice/audio recordings or chunks, document bytes, screenshots, extracted text, summaries, generated responses, and search indexes are kept for up to 90 days from their last sync or use unless you delete them earlier. Cleanup is lazy, so expired objects may remain briefly until a maintenance pass removes them, but they are no longer intended for active product use.</p>
+        <p>Purchased balance remains in account records for accounting and expires up to 12 months (365 days) after purchase. Bluey does not retain raw audio after transcription by default. Local session records remain on your device until you remove them. The current cloud product does not yet guarantee automatic deletion after a fixed number of days; synced records may remain until you delete the session or account. Contact support for a deletion review if needed.</p>
 
         <h2>Account Deletion</h2>
-        <p>Deleting your account is permanent. It removes account records, local-device authorization records, saved cloud sessions, synced files, screenshots, transcripts, voice/audio recordings or chunks, extracted text, generated answers, usage history, and related searchable indexes where deletion is technically available. Unused account balance is lost when the account is deleted, so contact support before deletion if you need a billing review.</p>
+        <p>Deleting your account is permanent and requests removal of account access, device authorizations, and account-scoped synced content. Payment, fraud-prevention, security, or backup records may be retained where required, and deletion across storage systems may not be immediate. The current product does not yet show per-object deletion status. Unused account balance is lost, so contact support before deletion if you need a billing or deletion review.</p>
 
         <h2>Security</h2>
         <p>Desktop account tokens are stored in Bluey's private local account profile so the app can reconnect without operating-system keychain prompts. Payment and AI credentials are kept outside the desktop app. Logs are designed for debugging and support, not for storing raw secrets or full user content.</p>
 
         <h2>Sharing</h2>
-        <p>We share data with infrastructure, payment, email, and AI services only to operate Bluey. We do not sell customer data. AI usage is governed by Bluey-managed accounts and product policies.</p>
+        <p>We share data with infrastructure, payment, email, speech, and AI services only to operate the features you request. We do not sell customer data, and submitted content is not used for model training.</p>
 
         <h2>Contact</h2>
         <p>For privacy, security, export, deletion, or billing questions, contact support at the address published in the product account page.</p>
       </article>
 
       <article class="policy-card" id="termsPolicy" hidden>
-        <div class="policy-updated">Last updated July 8, 2026</div>
+        <div class="policy-updated">Last updated July 12, 2026</div>
         <h1>Terms of Use</h1>
         <p>These terms cover the Bluey service. By creating an account, installing Bluey, or using Bluey Cloud, you agree to use the product responsibly and only where you have the right to capture, upload, or analyze the context you provide.</p>
 
@@ -202,10 +206,13 @@
         <p>You are responsible for the documents, transcripts, voice/audio, screenshots, repositories, and other context you attach or ask Bluey to analyze. Bluey should be used with consent where required, and it should not be used for hidden capture of people or information you are not allowed to process.</p>
 
         <h2>Training and Product Improvement</h2>
-        <p>When you submit or sync context, you give Bluey permission to host, process, copy, analyze, evaluate, and use submitted context, voice/audio recordings or chunks, transcripts, and generated responses to provide the service, improve transcription and answer quality, train or tune Bluey systems, improve routing, and build safeguards. You must only submit content that you have the right to provide for those purposes.</p>
+        <p>You authorize Bluey and its service providers to process submitted context only to provide, secure, and support the features you request. Submitted prompts, transcripts, audio, files, screenshots, and generated responses are not used to train or fine-tune models. Any future training program would require a separate opt-in.</p>
 
         <h2>Cloud Sync and Retention</h2>
-        <p>If you sign in with cloud sync or saved sessions enabled, you authorize Bluey to store synced session details, transcripts, voice/audio recordings or chunks, generated answers, original file or screenshot bytes, extracted text, summaries, and search indexes for restoration, answer context, transcription review, and the product-improvement uses described above. These synced objects are retained for up to 90 days from last sync or use unless you delete them earlier. Expired objects are removed lazily during cleanup, restore attempts, or maintenance passes.</p>
+        <p>Signing in does not by itself authorize saved-session sync. If you separately turn cloud sync on, you authorize Bluey to store session details, transcripts, generated answers, original file or screenshot bytes, extracted text, summaries, and search indexes for restoration and answer context. Turning sync off stops new automatic uploads. The current cloud product does not yet guarantee automatic deletion after a fixed number of days.</p>
+
+        <h2>Audio</h2>
+        <p>Listening starts through visible controls. Raw audio is processed for transcription and is not retained by Bluey after transcription by default; transcript text may remain in a local session or in cloud sync when you enable it.</p>
 
         <h2>AI Output</h2>
         <p>Bluey can help draft answers, summarize sessions, explain code, reason about systems, and organize context. AI output may be incomplete or wrong. You are responsible for reviewing generated output before relying on it, sending it, submitting it, or using it to make decisions.</p>
@@ -221,23 +228,23 @@
       </article>
 
       <article class="policy-card" id="disguisePolicy" hidden>
-        <div class="policy-updated">Product note for macOS</div>
-        <h1>Low-profile controls</h1>
-        <p>Bluey's desktop controls are designed to stay out of your way while you work. The overlay can hide back to a compact pill, use capture-excluded windows where the operating system supports it, and keep session controls close to the screen context you are using.</p>
+        <div class="policy-updated">Desktop privacy note</div>
+        <h1>Screen-share privacy</h1>
+        <p>Bluey's overlay stays visible to you while you work. On supported desktop paths, the operating system is asked to exclude the overlay from ordinary screen recordings and screen shares. This is a user-controlled privacy convenience, not an invisibility guarantee or a way to bypass monitoring.</p>
 
         <h2>What the controls do</h2>
         <ul>
-          <li><strong>Pill:</strong> the compact Bluey launcher. Click it to open the current session window; drag it to move it.</li>
-          <li><strong>Hide:</strong> collapses the expanded window back to the pill. Bluey keeps running until you turn it off.</li>
+          <li><strong>Visible state:</strong> the Bluey pill and status indicator show when the product is running. Listening and screen analysis have their own visible controls.</li>
+          <li><strong>Show or hide:</strong> collapses or restores the overlay for your own workspace. Hiding the window does not imply that capture, transcription, or background work has stopped.</li>
           <li><strong>Turn off:</strong> stops the daemon and closes the overlay. Run <code>bluey on</code> to start again.</li>
-          <li><strong>Capture-excluded windows:</strong> normal OS screen recording and screen-share APIs should not include the overlay. Privileged tools, managed devices, cameras, or custom capture systems may still observe the screen.</li>
+          <li><strong>Capture exclusion:</strong> ordinary OS capture APIs may omit the overlay where supported. Meeting apps, privileged tools, managed devices, cameras, or custom capture systems may still show it. Test your sharing setup before relying on this behavior.</li>
         </ul>
 
         <h2>Responsible use</h2>
-        <p>Bluey is for user-approved work context: meetings, documents, code, research, and day-to-day productivity. Do not use it to access data you are not authorized to access or to bypass third-party rules. If a workflow requires consent, get consent before capturing or uploading context.</p>
+        <p>Bluey is for user-approved work context: meetings, documents, code, research, and day-to-day productivity. Do not use it to access data you are not authorized to access, impersonate another application, or bypass third-party rules. If a workflow requires consent, get consent before listening, capturing, or uploading context.</p>
 
         <h2>Why this matters</h2>
-        <p>The product goal is calm focus, not deception. You should always know when Bluey is listening, what context is attached, and whether an answer used an AI model, screen analysis, or saved context.</p>
+        <p>The product goal is calm focus with explicit controls. Bluey does not claim to be covert or undetectable. You should always know when it is listening, what context is attached, and whether an answer used screen analysis, files, transcript, or saved context.</p>
       </article>
 
       <div class="page-footer-links">
@@ -264,7 +271,7 @@
         </div>
         <div class="account-rail-footer">
           <span>Balance is used for AI models, speech, screen analysis, and saved-session features.</span>
-          <span><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> · <a href="/docs/disguise">Controls</a></span>
+          <span><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> · <a href="/docs/disguise">Screen-share privacy</a></span>
         </div>
       </aside>
 
@@ -451,7 +458,7 @@
                     <div class="auto-reload-head">
                       <h3>Auto Reload</h3>
                       <label class="auto-reload-toggle" for="autoReloadToggle">
-                        <input id="autoReloadToggle" type="checkbox" checked />
+                        <input id="autoReloadToggle" type="checkbox" />
                         <span></span>
                       </label>
                     </div>
@@ -465,11 +472,15 @@
                         <input id="autoReloadAmount" type="text" value="15" inputmode="decimal" autocomplete="off" />
                       </label>
                     </div>
-                    <p class="auto-reload-rule" id="autoReloadRule">When balance is below $5.00, reload $15.00.</p>
-                    <p class="auto-reload-hint" id="autoReloadHint">Updates automatically.</p>
+                    <p class="auto-reload-rule" id="autoReloadRule">Auto Reload is off.</p>
+                    <p class="auto-reload-hint" id="autoReloadHint">Turn it on only if you want future automatic charges.</p>
                   </div>
                 </div>
               </div>
+            </section>
+
+            <section class="dashboard-section account-desktop-connect-section" aria-label="Connect Bluey desktop" hidden>
+              <div class="device-link-hint account-top-device-link-hint" id="accountTopDeviceLinkHint" hidden></div>
             </section>
 
             <section class="dashboard-section trial-convert-section" id="trialConvertSection" aria-label="Save temporary trial as account" hidden>
@@ -521,7 +532,7 @@
             </div>
 
             <section class="dashboard-tab-panel is-active" id="dashboardTabComputers" role="tabpanel" aria-labelledby="dashboardTabComputersButton" data-dashboard-panel="computers">
-              <section class="dashboard-section device-connect-section" aria-label="Connect Bluey desktop">
+              <section class="dashboard-section device-connect-section" aria-label="Connect Bluey desktop" hidden>
                 <div class="device-link-hint dashboard-device-link-hint" id="dashboardDeviceLinkHint" hidden></div>
               </section>
               <section class="dashboard-section device-section" aria-label="Computers">
@@ -585,7 +596,7 @@
                   <div>
                     <span>$15 balance</span>
                     <strong id="reloadEstimateValue">~2-5 hrs</strong>
-                    <em id="reloadEstimateHint">Approximate light mixed use. Audio, screen, files, and deeper routes can spend faster.</em>
+                    <em id="reloadEstimateHint">Approximate light mixed use. Audio, screen, files, and more detailed answers can spend faster.</em>
                   </div>
                   <div>
                     <span>Auto Reload</span>
@@ -593,9 +604,9 @@
                     <em id="autoReloadEstimateHint">Turn it on to add balance automatically when balance is low.</em>
                   </div>
                   <div>
-                    <span>Auto routing</span>
+                    <span>Automatic answers</span>
                     <strong>Best fit</strong>
-                    <em>Bluey chooses the route for each request by task and context, so usage varies.</em>
+                    <em>Bluey adapts each answer to the task and context, so usage varies.</em>
                   </div>
                 </div>
                 <div class="usage-list" id="usageList"></div>
@@ -694,7 +705,7 @@
           <div class="account-modal-head">
             <div>
               <h2 id="addCreditsTitle">Add balance</h2>
-              <p>Choose an amount. Keep Auto Reload on to save a card and top up before balance gets low.</p>
+              <p>Choose an amount. This charges once now; Auto Reload only saves the card for future top-ups.</p>
             </div>
             <button class="account-modal-close" id="addCreditsCancelX" type="button" aria-label="Close add balance dialog">×</button>
           </div>
@@ -718,11 +729,11 @@
             <section class="reload-setup-panel" aria-label="Auto Reload setup">
               <div class="auto-reload-head">
                 <div>
-                  <span class="reload-setup-kicker">Recommended</span>
+                  <span class="reload-setup-kicker">Optional</span>
                   <h3>Auto Reload</h3>
                 </div>
                 <label class="auto-reload-toggle" for="modalAutoReloadToggle">
-                  <input id="modalAutoReloadToggle" type="checkbox" checked />
+                  <input id="modalAutoReloadToggle" type="checkbox" />
                   <span></span>
                 </label>
               </div>
@@ -736,14 +747,14 @@
                   <input id="modalAutoReloadAmount" type="text" value="15" inputmode="decimal" autocomplete="off" />
                 </label>
               </div>
-              <p class="auto-reload-rule" id="modalAutoReloadRule">On. Adds $15 when balance is below $5.</p>
+              <p class="auto-reload-rule" id="modalAutoReloadRule">Off. This payment will not enable future automatic charges.</p>
               <div class="reload-setup-card-actions">
                 <button class="account-button ghost compact" id="reloadSetupCardButton" type="button">Add card</button>
               </div>
               <div class="square-card-setup reload-setup-square-card" id="reloadSetupSquareCardSetup" hidden>
                 <div class="square-card-copy">
                   <strong>Card</strong>
-                  <span>Use this card now. Keep Auto Reload on to use it for future reloads.</span>
+                  <span>Your card is saved for future Auto Reload only when you turn Auto Reload on.</span>
                 </div>
                 <div id="reloadSetupSquareCardContainer" class="square-card-container"></div>
               </div>
@@ -902,7 +913,8 @@
 
       <section class="download-hero">
         <h1>Install Bluey</h1>
-        <p>Install once. Run <code>bluey on</code>. Connect only when the desktop asks.</p>
+        <p>Install once. Run <code>bluey on</code>. The overlay guides permissions and sign-in only when needed.</p>
+        <div class="release-badge">Current release <strong data-release-version>0.1.99</strong></div>
       </section>
 
       <div class="download-steps-strip" aria-label="Bluey install flow">
@@ -912,7 +924,7 @@
       </div>
 
       <section class="platform-grid" aria-label="Bluey platform installers">
-        <article class="download-card" data-platform-card="mac" role="button" tabindex="0" aria-label="Show macOS terminal install instructions" aria-controls="macInstallInstructions" aria-expanded="false">
+        <article class="download-card" data-platform-card="mac" data-release-platform="darwin-arm64" role="button" tabindex="0" aria-label="Show macOS terminal install instructions" aria-controls="macInstallInstructions" aria-expanded="false">
           <div class="download-card-head">
             <div class="platform-name">
               <span class="os-icon" aria-hidden="true">
@@ -925,10 +937,10 @@
             </div>
             <span class="availability">Ready</span>
           </div>
-          <p>Apple Silicon build. Installs the signed <code>bluey</code> command.</p>
+          <p>Apple Silicon only. Release <span data-release-version>0.1.99</span> is listed in the signed, checksum-pinned manifest.</p>
           <span class="download-card-action">Show terminal steps</span>
         </article>
-        <article class="download-card" data-platform-card="windows" role="button" tabindex="0" aria-label="Show Windows PowerShell install instructions" aria-controls="windowsInstallInstructions" aria-expanded="false">
+        <article class="download-card" data-platform-card="windows" data-release-platform="windows-x86_64" role="button" tabindex="0" aria-label="Show Windows PowerShell install instructions" aria-controls="windowsInstallInstructions" aria-expanded="false">
           <div class="download-card-head">
             <div class="platform-name">
               <span class="os-icon" aria-hidden="true">
@@ -943,7 +955,7 @@
             </div>
             <span class="availability">Ready</span>
           </div>
-          <p>Windows 10/11 beta. Installs the <code>bluey</code> command and desktop helper.</p>
+          <p>x86-64 build from release <span data-release-version>0.1.99</span>, install-smoked on Windows 11.</p>
           <span class="download-card-action">Show PowerShell steps</span>
         </article>
         <article class="download-card disabled coming-soon" aria-disabled="true">
@@ -960,79 +972,9 @@
             </div>
             <span class="availability soon">Coming soon</span>
           </div>
-          <p>Linux packages are planned after the desktop builds settle.</p>
+          <p>No Linux artifact is listed in the current release manifest.</p>
           <span class="download-card-action soon">Not available yet</span>
         </article>
-      </section>
-
-      <section class="download-shortcuts" aria-label="Bluey overlay shortcuts">
-        <div class="download-section-head">
-          <h2>Overlay shortcuts</h2>
-          <p>Use these while Bluey is open. On Mac the global modifier is <strong>Ctrl+Option</strong>; on Windows it is <strong>Ctrl+Alt</strong>.</p>
-        </div>
-        <div class="shortcut-grid">
-          <div class="shortcut-card">
-            <span class="shortcut-keys">
-              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>B</kbd></span>
-              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>B</kbd></span>
-            </span>
-            <span>Minimize to pill or restore</span>
-          </div>
-          <div class="shortcut-card">
-            <span class="shortcut-keys">
-              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>T</kbd></span>
-              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>T</kbd></span>
-            </span>
-            <span>Focus Ask text input</span>
-          </div>
-          <div class="shortcut-card">
-            <span class="shortcut-keys">
-              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>L</kbd></span>
-              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>L</kbd></span>
-            </span>
-            <span>Start or stop Listen</span>
-          </div>
-          <div class="shortcut-card">
-            <span class="shortcut-keys">
-              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>S</kbd></span>
-              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>S</kbd></span>
-            </span>
-            <span>Capture screen context</span>
-          </div>
-          <div class="shortcut-card">
-            <span class="shortcut-keys">
-              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>I</kbd></span>
-              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>I</kbd></span>
-            </span>
-            <span>Toggle click-through</span>
-          </div>
-          <div class="shortcut-card">
-            <span class="shortcut-keys">
-              <span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>Enter</kbd></span>
-              <span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>Enter</kbd></span>
-            </span>
-            <span>Answer now</span>
-          </div>
-          <div class="shortcut-card">
-            <span class="shortcut-keys"><kbd>Esc</kbd></span>
-            <span>Close the active panel</span>
-          </div>
-          <div class="shortcut-card">
-            <span class="shortcut-keys"><kbd>Tab</kbd><kbd>Shift</kbd><kbd>Tab</kbd></span>
-            <span>Move between Bluey controls</span>
-          </div>
-          <div class="shortcut-card">
-            <span class="shortcut-keys">
-              <span class="shortcut-platform shortcut-platform-mac"><kbd>Option</kbd><kbd>Up</kbd><kbd>Down</kbd></span>
-              <span class="shortcut-platform shortcut-platform-windows"><kbd>Alt</kbd><kbd>Up</kbd><kbd>Down</kbd></span>
-            </span>
-            <span>Scroll answers, canvas, or history</span>
-          </div>
-        </div>
-        <div class="shortcut-notes">
-          <span><strong>Click-through off:</strong> blank Bluey space drags the window; mouse wheel scrolls the content under the pointer.</span>
-          <span><strong>Click-through on:</strong> blank clicks pass through; use global shortcuts and Bluey scroll zones.</span>
-        </div>
       </section>
 
       <section class="platform-instructions" id="macInstallInstructions" data-platform-instructions="mac" hidden>
@@ -1061,6 +1003,11 @@
           </div>
         </div>
         <div class="instruction-help">If a code appears, sign in here and press Connect.</div>
+        <div class="install-support-note">
+          <strong>Install taking longer than 5 minutes, showing any error, or Bluey not working?</strong>
+          <span>Run <code>bluey support</code> and email the generated support bundle to <a href="mailto:hello@bluey.sh">hello@bluey.sh</a>.</span>
+          <span>If that fails, run <code>bluey doctor</code> to check permissions or <code>bluey doctor --zip</code> to create the same support bundle.</span>
+        </div>
       </section>
 
       <section class="platform-instructions" id="windowsInstallInstructions" data-platform-instructions="windows" hidden>
@@ -1089,77 +1036,54 @@
           </div>
         </div>
         <div class="instruction-help">If a code appears, sign in here and press Connect.</div>
-      </section>
-
-      <div class="download-note">
-        Bluey stays quiet until you ask. Permissions appear only for features you turn on.
-      </div>
-
-      <section class="commands" aria-label="Bluey commands">
-        <h2>Useful commands</h2>
-        <div class="cmd-grid">
-          <div class="cmd">
-            <div><code>bluey on</code><span>Start Bluey, check updates, and sign in if needed</span></div>
-            <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey off</code><span>Stop Bluey</span></div>
-            <button class="copy-command" type="button" data-copy="bluey off">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey update</code><span>Check for and install the latest build</span></div>
-            <button class="copy-command" type="button" data-copy="bluey update">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey status</code><span>Show daemon state, session ID, and overlay status</span></div>
-            <button class="copy-command" type="button" data-copy="bluey status">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey login</code><span>Link or switch this device to an account</span></div>
-            <button class="copy-command" type="button" data-copy="bluey login">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey logout</code><span>Remove this device's local sign-in</span></div>
-            <button class="copy-command" type="button" data-copy="bluey logout">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey usage</code><span>Show balance, recent usage, and tier projection</span></div>
-            <button class="copy-command" type="button" data-copy="bluey usage">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey portal</code><span>Open billing and credits in your browser</span></div>
-            <button class="copy-command" type="button" data-copy="bluey portal">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey sessions</code><span>List or inspect saved local sessions</span></div>
-            <button class="copy-command" type="button" data-copy="bluey sessions">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey doctor</code><span>Check permissions, audio, setup, and logs</span></div>
-            <button class="copy-command" type="button" data-copy="bluey doctor">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey support</code><span>Create a redacted support bundle</span></div>
-            <button class="copy-command" type="button" data-copy="bluey support">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey logs export</code><span>Export local logs with redaction</span></div>
-            <button class="copy-command" type="button" data-copy="bluey logs export">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey export</code><span>Download your account data as JSON</span></div>
-            <button class="copy-command" type="button" data-copy="bluey export">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey uninstall</code><span>Remove Bluey from this computer</span></div>
-            <button class="copy-command" type="button" data-copy="bluey uninstall">Copy</button>
-          </div>
-          <div class="cmd">
-            <div><code>bluey help</code><span>Show the full command list</span></div>
-            <button class="copy-command" type="button" data-copy="bluey help">Copy</button>
-          </div>
+        <div class="install-support-note">
+          <strong>Install taking longer than 5 minutes, showing any error, or Bluey not working?</strong>
+          <span>Run <code>bluey support</code> and email the generated support bundle to <a href="mailto:hello@bluey.sh">hello@bluey.sh</a>.</span>
+          <span>If that fails, run <code>bluey doctor</code> to check permissions or <code>bluey doctor --zip</code> to create the same support bundle.</span>
         </div>
       </section>
+
+      <details class="download-help" aria-label="Optional Bluey shortcuts and support commands">
+        <summary>Optional shortcuts and support</summary>
+        <div class="download-help-body">
+          <section class="download-shortcuts" aria-label="Essential Bluey overlay shortcuts">
+            <div class="download-section-head">
+              <h2>Essential shortcuts</h2>
+              <p>Everything is clickable in the overlay. These are optional once Bluey is running.</p>
+            </div>
+            <div class="shortcut-grid compact">
+              <div class="shortcut-card">
+                <span class="shortcut-keys"><span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>B</kbd></span><span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>B</kbd></span></span>
+                <span>Show or minimize Bluey</span>
+              </div>
+              <div class="shortcut-card">
+                <span class="shortcut-keys"><span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>T</kbd></span><span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>T</kbd></span></span>
+                <span>Focus Ask</span>
+              </div>
+              <div class="shortcut-card">
+                <span class="shortcut-keys"><span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>L</kbd></span><span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>L</kbd></span></span>
+                <span>Start or stop Listen</span>
+              </div>
+              <div class="shortcut-card">
+                <span class="shortcut-keys"><span class="shortcut-platform shortcut-platform-mac"><kbd>Ctrl</kbd><kbd>Option</kbd><kbd>S</kbd></span><span class="shortcut-platform shortcut-platform-windows"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>S</kbd></span></span>
+                <span>Choose screen context</span>
+              </div>
+            </div>
+          </section>
+          <section class="commands" aria-label="Bluey support commands">
+            <div class="download-section-head">
+              <h2>Maintenance</h2>
+              <p>Normal use starts with <code>bluey on</code> and happens in the overlay.</p>
+            </div>
+            <div class="cmd-grid compact">
+              <div class="cmd"><div><code>bluey off</code><span>Stop Bluey completely</span></div><button class="copy-command" type="button" data-copy="bluey off">Copy</button></div>
+              <div class="cmd"><div><code>bluey update</code><span>Install the latest listed release</span></div><button class="copy-command" type="button" data-copy="bluey update">Copy</button></div>
+              <div class="cmd"><div><code>bluey support</code><span>Create a redacted support bundle</span></div><button class="copy-command" type="button" data-copy="bluey support">Copy</button></div>
+              <div class="cmd"><div><code>bluey help</code><span>Show the current customer command list</span></div><button class="copy-command" type="button" data-copy="bluey help">Copy</button></div>
+            </div>
+          </section>
+        </div>
+      </details>
 
       <div class="page-footer-links">
         Reach us at <a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><a class="instagram-link" href="https://www.instagram.com/bluey.sh" target="_blank" rel="noopener noreferrer" aria-label="Bluey on Instagram"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none"><rect x="3.5" y="3.5" width="17" height="17" rx="5" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="4.2" stroke="currentColor" stroke-width="2"/><circle cx="17.3" cy="6.8" r="1.15" fill="currentColor"/></svg>@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Built with open source technology</span><span class="dot">&middot;</span><a href="/terms">Terms</a><span class="dot">&middot;</span><a href="/privacy">Privacy</a>
@@ -1209,36 +1133,70 @@
     <div class="main">
       <div class="content">
         <section class="hero">
-          <h1 aria-label="Stay present, stay unseen.">Stay present,<br><span class="accent">stay unseen.</span></h1>
-          <p class="hero-lede">Private AI for meetings, calls, code, docs, and screen context from your terminal.</p>
-          <p class="hero-proof"><span>Attach what matters.</span> Bluey uses your selected context to answer without switching apps.</p>
+          <h1 aria-label="Live context for engineering work.">Live context for<br><span class="accent">engineering work.</span></h1>
+          <p class="hero-lede">Bluey is a consent-first desktop assistant for meetings, reviews, incidents, code, docs, and screen context.</p>
+          <p class="hero-proof"><span>You choose the sources.</span> Bluey answers from the conversation, screen, files, and project memory you approve.</p>
           <div class="hero-actions">
             <a class="btn btn-primary" href="/download">Get Started</a>
             <button class="btn btn-ghost" id="tryUsButton" type="button" data-guest-only>Try Us</button>
             <a class="btn btn-ghost" href="/account" data-auth-only hidden>Dashboard</a>
           </div>
-          <form class="join-bar" id="productJoinForm" action="/login" method="get" aria-label="Connect a Bluey desktop code" data-connect-code-form data-status-target="productConnectStatus">
-            <input name="user_code" type="text" placeholder="connect code" autocomplete="one-time-code" spellcheck="false" aria-label="Bluey connect code">
-            <button type="submit">Connect</button>
-          </form>
-          <div class="connect-help">Have a Bluey desktop code? Enter it to move that desktop to this account.</div>
-          <div class="connect-status" id="productConnectStatus" aria-live="polite"></div>
-          <div class="hero-note">native overlay · model routing · prepaid balance · sessions save only by choice</div>
+          <details class="hero-connect">
+            <summary>Connect an installed desktop</summary>
+            <form class="join-bar" id="productJoinForm" action="/login" method="get" aria-label="Connect a Bluey desktop code" data-connect-code-form data-status-target="productConnectStatus">
+              <input name="user_code" type="text" placeholder="connect code" autocomplete="one-time-code" spellcheck="false" aria-label="Bluey connect code">
+              <button type="submit">Connect</button>
+            </form>
+            <div class="connect-help">Enter the one-time code shown by your Bluey desktop.</div>
+            <div class="connect-status" id="productConnectStatus" aria-live="polite"></div>
+          </details>
+          <div class="hero-note">visible capture controls · session sync control in Settings · no training on your content</div>
         </section>
 
-        <aside class="product-preview terminal-preview" aria-label="Bluey terminal preview">
-          <div class="bluey-terminal">
-            <div class="bluey-terminal-bar">
-              <div class="bluey-terminal-dots" aria-hidden="true">
-                <span class="bluey-terminal-dot red"></span>
-                <span class="bluey-terminal-dot yellow"></span>
-                <span class="bluey-terminal-dot green"></span>
+        <aside class="product-preview overlay-preview" aria-label="Bluey overlay preview showing approved context and a grounded answer">
+          <div class="overlay-demo">
+            <div class="overlay-demo-header">
+              <div class="overlay-demo-brand">
+                <img src="/assets/bluey-logo.svg?v=2026070601" alt="">
+                <span>Bluey</span>
               </div>
-              <span class="bluey-terminal-title">bluey - zsh</span>
-              <span class="bluey-terminal-status">ready</span>
+              <div class="overlay-demo-state"><span aria-hidden="true"></span>Ready</div>
+              <div class="overlay-demo-session">Design review</div>
             </div>
-            <div class="bluey-terminal-code" id="blueyTerminal" aria-live="polite"></div>
+            <div class="overlay-context-ledger" aria-label="Context used by this answer">
+              <strong>Context</strong>
+              <span>Mic</span>
+              <span>System</span>
+              <span>RFC.pdf</span>
+              <span>Screen</span>
+            </div>
+            <div class="overlay-demo-feed">
+              <article class="overlay-demo-turn overlay-demo-question">
+                <div class="overlay-demo-turn-label">You</div>
+                <p>What tradeoff should we call out before we approve this?</p>
+              </article>
+              <article class="overlay-demo-turn overlay-demo-answer">
+                <div class="overlay-demo-turn-head">
+                  <div class="overlay-demo-turn-label">Bluey</div>
+                  <span>Answer</span>
+                </div>
+                <p>The main tradeoff is faster delivery now versus a harder migration later. I would approve the smaller rollout only if the team adds an ownership boundary and a rollback metric first.</p>
+                <div class="overlay-answer-points">
+                  <span><strong>1</strong> Name the rollback signal.</span>
+                  <span><strong>2</strong> Keep the storage boundary reversible.</span>
+                </div>
+                <div class="overlay-answer-sources">Used: live transcript, RFC.pdf, current screen</div>
+              </article>
+            </div>
+            <div class="overlay-listening-state"><span aria-hidden="true"></span>Listening is off</div>
+            <div class="overlay-demo-composer">
+              <span class="overlay-composer-placeholder">Ask about the current work...</span>
+              <div class="overlay-composer-actions" aria-hidden="true">
+                <span>Attach</span><span>Screen</span><span>Listen</span><strong>Send</strong>
+              </div>
+            </div>
           </div>
+          <p class="overlay-preview-note">The real product surface: visible source context, explicit capture state, and the answer beside your work.</p>
         </aside>
       </div>
     </div>
@@ -1295,6 +1253,11 @@
         </div>
       </div>
       <div class="trial-turnstile" id="trialTurnstile" hidden></div>
+      <label class="trial-consent" id="trialTermsRow" hidden>
+        <input type="checkbox" id="trialTermsConsent">
+        <span>I agree to the <a href="/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>.</span>
+      </label>
+      <button class="btn btn-primary trial-start" id="trialStartConfirm" type="button" hidden>Start 15-minute trial</button>
       <div class="trial-actions">
         <button class="btn btn-primary" id="trialCopyLogin" type="button">Copy login</button>
         <a class="btn btn-ghost" id="trialDownloadAction" href="/download">Download Bluey</a>
@@ -1305,7 +1268,7 @@
   </div>
 
   <script
-    src="/assets/bluey-site.js?v=2026070721"
+    src="/assets/bluey-site.js?v=2026071201"
   ></script>
 </body>
 </html>

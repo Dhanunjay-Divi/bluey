@@ -95,7 +95,7 @@ function toneForBalance(cents: number, lowBalanceWarning: boolean): "normal" | "
 function tooltip(snapshot: BalanceSnapshot | null, status: string): string {
   if (!snapshot) {
     return status === "signed-out"
-      ? "Bluey account is not signed in. Sign in to use credits and saved-session sync."
+      ? "Bluey account is not signed in. Sign in to use credits and saved-session sync; you can turn sync off in Settings."
       : "Credits balance unavailable.";
   }
   const threshold = formatCents(snapshot.auto_topup_threshold_cents);

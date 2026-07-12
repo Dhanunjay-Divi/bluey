@@ -1,5 +1,9 @@
 # Reference Map
 
+> Historical reference snapshot. Current distribution facts come from
+> `https://bluey.sh/latest.json`, which reports `0.1.99` with macOS Apple
+> silicon and Windows x86-64 artifacts as of July 12, 2026.
+
 These packages remain references, not the Bluey foundation.
 
 | Reference | What Bluey borrows |

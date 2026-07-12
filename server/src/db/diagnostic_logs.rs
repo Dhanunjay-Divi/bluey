@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use rusqlite::params;
+use std::collections::HashSet;
 
 use crate::db::DbPool;
 
@@ -217,7 +218,32 @@ fn object_refs_for_account_sqlite(
             sha256: row.get(3)?,
         })
     })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut refs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut seen = refs
+        .iter()
+        .map(|reference| reference.object_key.clone())
+        .collect::<HashSet<_>>();
+    let mut stmt = conn.prepare(
+        "SELECT id, object_key, size_bytes, sha256
+           FROM object_uploads
+          WHERE account_id = ?1 AND object_kind = 'session_audit' AND state <> 'deleted'",
+    )?;
+    let rows = stmt.query_map(params![account_id], |row| {
+        Ok(DiagnosticObjectRef {
+            id: format!("object-upload:{}", row.get::<_, String>(0)?),
+            object_key: row.get(1)?,
+            bytes: row.get(2)?,
+            sha256: row.get(3)?,
+        })
+    })?;
+    for row in rows {
+        let reference = row?;
+        if seen.insert(reference.object_key.clone()) {
+            refs.push(reference);
+        }
+    }
+    Ok(refs)
 }
 
 fn object_refs_for_account_postgres(
@@ -234,7 +260,8 @@ fn object_refs_for_account_postgres(
             AND object_key <> ''",
         &[&account_id],
     )?;
-    rows.into_iter()
+    let mut refs = rows
+        .into_iter()
         .map(|row| {
             Ok(DiagnosticObjectRef {
                 id: row.try_get(0)?,
@@ -243,7 +270,29 @@ fn object_refs_for_account_postgres(
                 sha256: row.try_get(3)?,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let mut seen = refs
+        .iter()
+        .map(|reference| reference.object_key.clone())
+        .collect::<HashSet<_>>();
+    let rows = conn.query(
+        "SELECT id, object_key, size_bytes, sha256
+           FROM object_uploads
+          WHERE account_id = $1 AND object_kind = 'session_audit' AND state <> 'deleted'",
+        &[&account_id],
+    )?;
+    for row in rows {
+        let reference = DiagnosticObjectRef {
+            id: format!("object-upload:{}", row.try_get::<_, String>(0)?),
+            object_key: row.try_get(1)?,
+            bytes: row.try_get(2)?,
+            sha256: row.try_get(3)?,
+        };
+        if seen.insert(reference.object_key.clone()) {
+            refs.push(reference);
+        }
+    }
+    Ok(refs)
 }
 
 fn delete_expired_before_sqlite(pool: &DbPool, now_ms: i64) -> Result<usize> {

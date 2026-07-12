@@ -279,6 +279,11 @@ pub struct MeetingRecord {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub transcript: Vec<TranscriptSegment>,
+    /// Number of finalized transcript segments already used by a live-caption
+    /// answer. The transcript remains in session history; this cursor only
+    /// prevents the next Answer action from submitting the same speech again.
+    #[serde(default)]
+    pub live_answer_transcript_cursor: usize,
     pub action_items: Vec<ActionItem>,
     pub decisions: Vec<Decision>,
     #[serde(default)]
@@ -364,6 +369,7 @@ impl MeetingRecord {
             started_at: clock::now_epoch_ms_string(),
             ended_at: None,
             transcript: Vec::new(),
+            live_answer_transcript_cursor: 0,
             action_items: Vec::new(),
             decisions: Vec::new(),
             context: Vec::new(),
@@ -388,11 +394,53 @@ impl MeetingRecord {
     }
 
     pub fn last_transcript_text_bounded(&self, count: usize, max_chars: usize) -> String {
+        self.transcript_text_bounded_from(0, count, max_chars)
+    }
+
+    pub fn unanswered_live_transcript_text_bounded(
+        &self,
+        count: usize,
+        max_chars: usize,
+    ) -> String {
+        self.transcript_text_bounded_from(self.live_answer_transcript_cursor, count, max_chars)
+    }
+
+    pub fn has_unanswered_live_transcript(&self) -> bool {
+        self.transcript
+            .get(
+                self.live_answer_transcript_cursor
+                    .min(self.transcript.len())..,
+            )
+            .is_some_and(|segments| {
+                segments
+                    .iter()
+                    .any(|segment| !segment.text.trim().is_empty())
+            })
+    }
+
+    pub fn mark_live_transcript_answered(&mut self) {
+        self.mark_live_transcript_answered_through(self.transcript.len());
+    }
+
+    /// Marks only the transcript prefix that was included in an answer.
+    /// Segments arriving while the answer is streaming remain available for
+    /// the next Answer request instead of being consumed accidentally.
+    pub fn mark_live_transcript_answered_through(&mut self, segment_count: usize) {
+        self.live_answer_transcript_cursor = segment_count.min(self.transcript.len());
+    }
+
+    fn transcript_text_bounded_from(
+        &self,
+        cursor: usize,
+        count: usize,
+        max_chars: usize,
+    ) -> String {
         if count == 0 || max_chars == 0 {
             return String::new();
         }
 
-        let start = self.transcript.len().saturating_sub(count);
+        let cursor = cursor.min(self.transcript.len());
+        let start = self.transcript.len().saturating_sub(count).max(cursor);
         let mut selected = Vec::new();
         let mut used_chars = 0usize;
 
@@ -548,6 +596,57 @@ mod tests {
         assert!(text.chars().count() <= 120);
         assert!(!text.contains("turn 0"));
         assert!(text.contains("turn 7"));
+    }
+
+    #[test]
+    fn live_answer_cursor_keeps_history_but_excludes_already_answered_speech() {
+        let mut meeting = MeetingRecord::new(Some("Live answer".to_string()));
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "explain the old question",
+            true,
+        ));
+        meeting.mark_live_transcript_answered();
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "explain the new question",
+            true,
+        ));
+
+        assert_eq!(meeting.transcript.len(), 2);
+        assert!(meeting.has_unanswered_live_transcript());
+        let text = meeting.unanswered_live_transcript_text_bounded(8, 1_000);
+        assert!(!text.contains("old question"));
+        assert!(text.contains("new question"));
+
+        meeting.mark_live_transcript_answered();
+        assert!(!meeting.has_unanswered_live_transcript());
+        assert!(meeting
+            .unanswered_live_transcript_text_bounded(8, 1_000)
+            .is_empty());
+    }
+
+    #[test]
+    fn live_answer_cursor_does_not_consume_speech_arriving_during_generation() {
+        let mut meeting = MeetingRecord::new(Some("Live answer boundary".to_string()));
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "question included in the request",
+            true,
+        ));
+        let request_high_water_mark = meeting.transcript.len();
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "follow-up spoken while Bluey was answering",
+            true,
+        ));
+
+        meeting.mark_live_transcript_answered_through(request_high_water_mark);
+
+        assert!(meeting.has_unanswered_live_transcript());
+        let remaining = meeting.unanswered_live_transcript_text_bounded(8, 1_000);
+        assert!(!remaining.contains("included in the request"));
+        assert!(remaining.contains("while Bluey was answering"));
     }
 
     #[test]

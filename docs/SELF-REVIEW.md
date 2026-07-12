@@ -1,5 +1,9 @@
 # Self Review
 
+> Historical self-review of the original macOS-first build. It is not a current
+> release certification. The public manifest now reports `0.1.99` with macOS
+> Apple silicon and Windows x86-64 artifacts.
+
 ## Current Review
 
 No blocking issues found in the current macOS arm64 local-first build after smoke testing. The current build starts with `bluey on`, opens a compact native Bluey pill, expands into the overlay feed on click/show, starts or reuses a session, accepts typed and audio-derived transcript input, attaches readable user-selected context files, stores answer instructions, supports permissioned screenshot/page analysis, streams answer cards, detects questions/action items/decisions, returns recaps, archives sessions, and shuts down cleanly with `bluey off`. The macOS overlay is draggable, resizable, opacity-adjustable, capture-excluded, frame-persistent, click-through in the readable card area, and has a composer with model/mode selection.

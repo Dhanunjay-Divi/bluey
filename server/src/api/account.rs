@@ -102,8 +102,34 @@ pub struct BillingSettingsRequest {
 
 pub async fn me(
     State(state): State<AppState>,
-    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Extension(AuthedAccount(mut account)): Extension<AuthedAccount>,
 ) -> Json<AccountMe> {
+    match crate::db::stt_accounting::release_stale_sessions(
+        &state.pool,
+        &account.id,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        Ok(released) if released > 0 => {
+            tracing::info!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                released,
+                "released stale STT reservations during account refresh"
+            );
+            if let Ok(Some(refreshed)) =
+                crate::db::accounts::Account::fetch_by_id(&state.pool, &account.id)
+            {
+                account = refreshed;
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %error,
+                "failed to reconcile stale STT reservations during account refresh"
+            );
+        }
+    }
     Json(account_me_payload(&state, account))
 }
 
@@ -477,6 +503,9 @@ pub(crate) fn account_me_payload(
     let (provider, available, reason, payment_label) = auto_topup_capability(state, &account);
     let square_public = square_public_config(state);
     let internal_or_test_billing = is_internal_or_test_billing_account(&account);
+    let auto_topup_enabled = account.auto_topup_enabled
+        && !internal_or_test_billing
+        && (provider != "stripe" || available);
     AccountMe {
         id: account.id,
         email: account.email,
@@ -484,7 +513,7 @@ pub(crate) fn account_me_payload(
         trial_seconds_remaining: account.trial_seconds_remaining,
         is_temporary: account.is_temporary,
         temporary_expires_at: account.temporary_expires_at,
-        auto_topup_enabled: account.auto_topup_enabled && !internal_or_test_billing,
+        auto_topup_enabled,
         auto_topup_threshold_cents: account.auto_topup_threshold_cents,
         auto_topup_amount_cents: account.auto_topup_amount_cents,
         is_admin: account.is_admin,
@@ -541,13 +570,17 @@ fn auto_topup_capability(
                     label,
                 );
             }
-            let available = account.stripe_customer_id.is_some()
-                && account.stripe_payment_method_id.is_some()
-                && state.config.stripe_secret_key.is_some();
-            let reason = if available {
-                None
-            } else {
+            let has_saved_method =
+                account.stripe_customer_id.is_some() && account.stripe_payment_method_id.is_some();
+            let configuration_error =
+                crate::billing::topup::stripe_auto_reload_configuration_error(&state.config);
+            let available = has_saved_method && configuration_error.is_none();
+            let reason = if !has_saved_method {
                 Some("Add balance once to save a card before enabling Auto Reload.".to_string())
+            } else if configuration_error.is_some() {
+                Some("Auto Reload is temporarily unavailable.".to_string())
+            } else {
+                None
             };
             ("stripe".to_string(), available, reason, label)
         }
@@ -830,6 +863,7 @@ pub async fn delete_account(
             .config
             .log_storage
             .clone()
+            .or_else(|| state.config.object_storage.clone())
             .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
         let storage = ObjectStorage::new(storage_config);
         for object_ref in &diagnostic_object_refs {

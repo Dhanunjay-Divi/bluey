@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use cue_core::{ContextArtifact, ContextProcessingStatus};
-use cue_rag::{Chunker, EmbeddingProvider, RagHit, VectorStore};
+use cue_rag::{Chunker, EmbeddingProvider, RagHit, RagScope, VectorStore};
 
 const MAX_CONTEXT_MARKDOWN_INDEX_CHARS: usize = 128_000;
 
@@ -18,18 +18,28 @@ pub struct RagPipeline {
     chunker: Chunker,
     embedder: Arc<dyn EmbeddingProvider>,
     store: Arc<Mutex<VectorStore>>,
+    scope: RagScope,
 }
 
 impl RagPipeline {
     /// Create a new RAG pipeline.
-    pub fn new(store_path: PathBuf, embedder: Arc<dyn EmbeddingProvider>) -> Result<Self> {
+    pub fn new(
+        store_path: PathBuf,
+        embedder: Arc<dyn EmbeddingProvider>,
+        scope: RagScope,
+    ) -> Result<Self> {
         let dim = embedder.dim();
         let store = VectorStore::open(&store_path, dim)?;
         Ok(Self {
             chunker: Chunker::new(),
             embedder,
             store: Arc::new(Mutex::new(store)),
+            scope,
         })
+    }
+
+    pub(crate) fn scope(&self) -> &RagScope {
+        &self.scope
     }
 
     /// Index a transcript segment. Chunks the text, embeds each chunk, and stores.
@@ -123,7 +133,7 @@ impl RagPipeline {
                 }
                 for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
                     let store = self.store.lock().await;
-                    if let Err(e) = store.index(session_id, chunk, embedding) {
+                    if let Err(e) = store.index(&self.scope, session_id, chunk, embedding) {
                         warn!(
                             session_id,
                             source_kind = source.kind,
@@ -166,7 +176,7 @@ impl RagPipeline {
             .await
             .map_err(|e| anyhow::anyhow!("embedding query failed: {e}"))?;
         let store = self.store.lock().await;
-        store.query(&query_embedding, limit, session_id)
+        store.query(&self.scope, &query_embedding, limit, session_id)
     }
 
     /// Query current-session and global memory using one embedding request.
@@ -183,15 +193,26 @@ impl RagPipeline {
             .await
             .map_err(|e| anyhow::anyhow!("embedding query failed: {e}"))?;
         let store = self.store.lock().await;
-        let current = store.query(&query_embedding, current_limit, Some(current_session_id))?;
-        let global = store.query(&query_embedding, global_limit, None)?;
+        let current = store.query(
+            &self.scope,
+            &query_embedding,
+            current_limit,
+            Some(current_session_id),
+        )?;
+        let global = store.query(&self.scope, &query_embedding, global_limit, None)?;
         Ok((current, global))
     }
 
     /// Delete all indexed data for a session.
     pub async fn delete_session(&self, session_id: &str) -> Result<usize> {
         let store = self.store.lock().await;
-        store.delete_session(session_id)
+        store.delete_session(&self.scope, session_id)
+    }
+
+    /// Claim pre-account-scope rows after the coordinator verifies ownership.
+    pub async fn claim_legacy_session(&self, session_id: &str) -> Result<usize> {
+        let store = self.store.lock().await;
+        store.claim_legacy_session(&self.scope, session_id)
     }
 }
 

@@ -1,13 +1,67 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+All notable Bluey changes are documented here. Historical release detail lives
+under `docs/release/`.
 
 ## [Unreleased]
 
+## [0.1.99] - 2026-07-12
+
 ### Added
-- Master plan V3 (docs/reviews/CUE-BLUEY-V3-PLAN-COMPLETE.md)
-- Phase 0 foundation: workspace structure, Cargo workspace, crate scaffolding
-- Development workflow docs: CLAUDE.md, templates, CI, .codex agents + skills
+
+- Atomic managed-usage reservations with detached stream settlement and stale
+  reservation reconciliation.
+- Account/workspace ownership for local RAG and durable quota/outbox records for
+  artifact and session-audit object uploads.
+- Durable Stripe Auto Reload attempts with exactly-once credit and reversal.
+- Bounded dynamic Windows NDJSON parsing for long and fragmented answer events.
+
+### Changed
+
+- Repositioned Bluey as a consent-first live-context assistant for engineering
+  meetings and technical work.
+- Replaced the homepage terminal simulation with the real overlay experience
+  and reduced first-run command and shortcut clutter.
+- Made cloud session sync off by default for new installs and exposed its real
+  persisted preference in desktop Settings.
+- Made Auto Reload an unselected opt-in during balance setup.
+- Reframed capture exclusion as a best-effort screen-share privacy control and
+  removed automatic app-identity disguise from the dashboard path.
+- Aligned public privacy and terms copy with current behavior: raw audio is not
+  retained after transcription by default, and submitted content is not used
+  for model training.
+- Updated platform, install, update, and help claims to the `0.1.99` public
+  release manifest.
+- Bound audio, transcripts, answers, and artifacts to the session/account that
+  dispatched the work, including a final-transcript high-water mark.
+
+See `docs/release/RELEASE-v0.1.99.md` for release detail.
+
+## [0.1.98] - 2026-07-10
+
+### Added
+
+- Signed, checksum-pinned release artifacts for macOS Apple silicon and Windows
+  x86-64.
+- Durable context, answer, transcript, artifact, and UI-event identities for
+  session sync and diagnostics.
+- Source chips, answer recovery, context readiness states, and workbench
+  follow-up continuity.
+
+### Changed
+
+- Kept `Auto` as the default answer path with optional `Quick` and `Thorough`
+  overrides.
+- Improved transcript settlement, listening idle protection, provider fallback,
+  device linking, and account-state handling.
+- Corrected packaged macOS and Windows process aliases after the rejected
+  `0.1.97` identity gate.
+
+See `docs/release/RELEASE-v0.1.98.md` for checksums and verification detail.
+
+## [0.1.0] - 2026-05-12
+
+### Added
+
+- Initial Rust workspace, native macOS overlay foundation, CLI lifecycle, and
+  development workflow documentation.

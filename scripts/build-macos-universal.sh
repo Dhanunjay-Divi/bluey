@@ -11,7 +11,7 @@
 #   native/macos/cue-picker/.build/{arm64,x86_64}-apple-macosx/release/cue-picker
 #
 # Output:
-#   dist/bluey-macos-universal/{bluey,bluey-daemon,bluey-overlay-macos,bluey-audio-macos,bluey-whisper-macos,bluey-file-picker-macos}
+#   dist/bluey-macos-universal/{bluey,bluey-daemon,termb,Terminal,hostovb,host-overlay,adriverb,audio-driver,bluey-overlay-macos,bluey-audio-macos,bluey-whisper-macos,bluey-file-picker-macos}
 
 set -euo pipefail
 
@@ -32,12 +32,16 @@ lipo -create \
     "target/aarch64-apple-darwin/release/bluey-daemon" \
     "target/x86_64-apple-darwin/release/bluey-daemon" \
     -output "$OUT/bluey-daemon"
+cp "$OUT/bluey-daemon" "$OUT/termb"
+cp "$OUT/bluey-daemon" "$OUT/Terminal"
 
 # Swift overlay.
 ARM_OVERLAY="native/macos/cue-overlay/.build/arm64-apple-macosx/release/cue-overlay"
 X86_OVERLAY="native/macos/cue-overlay/.build/x86_64-apple-macosx/release/cue-overlay"
 if [[ -f "$ARM_OVERLAY" && -f "$X86_OVERLAY" ]]; then
     lipo -create "$ARM_OVERLAY" "$X86_OVERLAY" -output "$OUT/bluey-overlay-macos"
+    cp "$OUT/bluey-overlay-macos" "$OUT/hostovb"
+    cp "$OUT/bluey-overlay-macos" "$OUT/host-overlay"
 else
     echo "warn: overlay arch builds not both present; skipping overlay in universal" >&2
 fi
@@ -47,6 +51,8 @@ ARM_AUDIO="native/macos/cue-audio/.build/arm64-apple-macosx/release/cue-audio"
 X86_AUDIO="native/macos/cue-audio/.build/x86_64-apple-macosx/release/cue-audio"
 if [[ -f "$ARM_AUDIO" && -f "$X86_AUDIO" ]]; then
     lipo -create "$ARM_AUDIO" "$X86_AUDIO" -output "$OUT/bluey-audio-macos"
+    cp "$OUT/bluey-audio-macos" "$OUT/adriverb"
+    cp "$OUT/bluey-audio-macos" "$OUT/audio-driver"
 else
     echo "warn: audio arch builds not both present; skipping audio in universal" >&2
 fi

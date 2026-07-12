@@ -29,6 +29,8 @@ pub struct OverlayContextItem {
     pub kind: String,
     #[serde(default)]
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +85,11 @@ pub enum OverlayCommand {
     ListeningStateChanged {
         state: ListeningState,
     },
+    AudioAutoStopCountdown {
+        remaining_secs: u64,
+        idle_secs: u64,
+    },
+    AudioAutoStopCountdownCleared,
     TranscriptPartial {
         source: String,
         text: String,
@@ -135,6 +142,8 @@ pub enum OverlayEvent {
         mode: Option<String>,
         #[serde(default)]
         visible_context_ids: Vec<uuid::Uuid>,
+        #[serde(default)]
+        answer_current_transcript: bool,
     },
     AttachRequested,
     AttachFilesRequested {
@@ -226,13 +235,14 @@ mod tests {
                 title: "GenAI Engineer JD.pdf".to_string(),
                 kind: "document".to_string(),
                 path: Some("/tmp/GenAI Engineer JD.pdf".to_string()),
+                processing_status: Some("ready".to_string()),
             }],
         })
         .expect("serialize overlay context command");
 
         assert_eq!(
             json,
-            r#"{"type":"set_context_items","items":[{"id":"00000000-0000-0000-0000-000000000000","title":"GenAI Engineer JD.pdf","kind":"document","path":"/tmp/GenAI Engineer JD.pdf"}]}"#
+            r#"{"type":"set_context_items","items":[{"id":"00000000-0000-0000-0000-000000000000","title":"GenAI Engineer JD.pdf","kind":"document","path":"/tmp/GenAI Engineer JD.pdf","processing_status":"ready"}]}"#
         );
     }
 
@@ -284,6 +294,28 @@ mod tests {
             json,
             r#"{"type":"listening_state_changed","state":"listening"}"#
         );
+    }
+
+    #[test]
+    fn audio_auto_stop_countdown_serializes_as_overlay_command() {
+        let json = serde_json::to_string(&OverlayCommand::AudioAutoStopCountdown {
+            remaining_secs: 10,
+            idle_secs: 60,
+        })
+        .expect("serialize audio auto-stop countdown command");
+
+        assert_eq!(
+            json,
+            r#"{"type":"audio_auto_stop_countdown","remaining_secs":10,"idle_secs":60}"#
+        );
+    }
+
+    #[test]
+    fn audio_auto_stop_countdown_clear_serializes_as_overlay_command() {
+        let json = serde_json::to_string(&OverlayCommand::AudioAutoStopCountdownCleared)
+            .expect("serialize audio auto-stop countdown clear command");
+
+        assert_eq!(json, r#"{"type":"audio_auto_stop_countdown_cleared"}"#);
     }
 
     #[test]
@@ -356,5 +388,36 @@ mod tests {
             serde_json::to_string(&OverlayEvent::SignInRequested).expect("serialize sign-in event");
 
         assert_eq!(json, r#"{"type":"sign_in_requested"}"#);
+    }
+
+    #[test]
+    fn ask_event_defaults_transcript_intent_to_false() {
+        let event: OverlayEvent =
+            serde_json::from_str(r#"{"type":"ask_requested","question":"hello"}"#)
+                .expect("deserialize legacy ask event");
+
+        assert!(matches!(
+            event,
+            OverlayEvent::AskRequested {
+                answer_current_transcript: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ask_event_preserves_explicit_transcript_intent() {
+        let event: OverlayEvent = serde_json::from_str(
+            r#"{"type":"ask_requested","question":"answer this","answer_current_transcript":true}"#,
+        )
+        .expect("deserialize transcript ask event");
+
+        assert!(matches!(
+            event,
+            OverlayEvent::AskRequested {
+                answer_current_transcript: true,
+                ..
+            }
+        ));
     }
 }

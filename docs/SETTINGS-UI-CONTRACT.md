@@ -1,124 +1,112 @@
 # Settings UI Contract
 
-Bluey settings should be driven by a single cloud profile plus local machine capability state. The desktop settings app can render this contract without knowing provider secrets or backend implementation details.
+This document separates Bluey's current, wired settings from future settings
+that require server or lifecycle support. A control must not appear interactive
+until its persisted behavior exists.
 
-## Settings Sections
+## Trust Rules
 
-- Account: login state, email, workspace, plan, billing portal.
-- Permissions: microphone, system audio, screen capture, accessibility, notifications.
-- Capture: selected mic, selected system source, visible capture indicator, active-page capture defaults, optional periodic capture interval.
-- Shortcuts: show/hide, ask, capture, attach, mute mic, pause sync.
-- Privacy: retention days, artifact retention, cloud sync toggle, local cache clear, export/delete.
-- Providers: managed routing health, current answer mode, optional development-key status.
-- Workspace: members, role, admin controls, audit log link.
-- Diagnostics: app version, device id, sync cursor, queue backlog, provider health, logs export.
+- Sign-in and cloud session sync are separate choices.
+- Listening, screen analysis, and file attachment use visible controls.
+- A toggle reflects persisted state; it is never preselected to drive consent.
+- Read-only facts are labeled as facts, not rendered as fake switches.
+- Capture exclusion is best effort and must not be described as invisibility.
+- Bluey does not expose process impersonation or automatic disguise as a
+  customer privacy control.
+- Payment Auto Reload is off until the account owner selects it and approves a
+  saved card, threshold, and amount.
 
-## Cloud Payload
+## Current Desktop Data Controls
 
-`GET /settings` returns:
-
-```json
-{
-  "workspace_id": "wsp_01",
-  "profile_version": 7,
-  "account": {
-    "email": "user@example.com",
-    "role": "admin",
-    "plan": "pro",
-    "billing_portal_available": true
-  },
-  "capture": {
-    "cloud_sync_enabled": true,
-    "retain_audio": false,
-    "periodic_capture_interval_seconds": 12,
-    "visible_capture_indicator": true
-  },
-  "privacy": {
-    "retention_days": 90,
-    "artifact_retention_days": 90,
-    "allow_workspace_memory": true,
-    "allow_provider_training": false
-  },
-  "answering": {
-    "route": "managed_auto",
-    "mode": "meeting",
-    "citation_level": "source",
-    "latency_budget_ms": 7000
-  },
-  "shortcuts": {
-    "toggle_overlay": "CmdOrCtrl+Shift+Space",
-    "ask": "CmdOrCtrl+Shift+A",
-    "capture": "CmdOrCtrl+Shift+C",
-    "attach": "CmdOrCtrl+Shift+U"
-  },
-  "limits": {
-    "max_local_queue_mb": 512,
-    "max_artifact_mb": 50,
-    "credit_balance_cents": 2743,
-    "credit_expiry_days_remaining": 365,
-    "trial_seconds_remaining": 0
-  }
-}
-```
-
-`PUT /settings` accepts partial updates with `profile_version` for optimistic concurrency. The server returns the full merged profile and a new version.
-
-## Local Capability Payload
-
-The desktop combines cloud settings with local capability status:
+The implemented local state is `CueSettings.cloud_sync_enabled` plus the
+explicit `cloud_sync_consent_granted` guard.
 
 ```json
 {
-  "device_id": "dev_01",
-  "app_version": "0.1.0",
-  "platform": "macos",
-  "permissions": {
-    "microphone": "granted",
-    "system_audio": "needs_setup",
-    "screen_capture": "granted",
-    "accessibility": "not_requested",
-    "notifications": "denied"
-  },
-  "devices": {
-    "microphones": [
-      { "id": "default", "label": "Default Microphone", "selected": true }
-    ],
-    "system_sources": [
-      { "id": "system-default", "label": "System Audio", "selected": true }
-    ]
-  },
-  "health": {
-    "cloud": "healthy",
-    "sync": "backlogged",
-    "stt": "healthy",
-    "answers": "degraded",
-    "rag": "healthy"
-  },
-  "sync": {
-    "pending_events": 14,
-    "pending_bytes": 2048000,
-    "last_ack_cursor": "cur_01",
-    "last_error": null
-  }
+  "cloud_sync_enabled": false,
+  "cloud_sync_consent_granted": false,
+  "raw_audio_retained": false,
+  "training_enabled": false
 }
 ```
 
-## UI Behavior Requirements
+Only `cloud_sync_enabled` is currently mutable:
 
-- Settings must show visible consent state before capture can start.
-- Disabling cloud sync pauses uploads but keeps local meeting capture available.
-- Changing retention warns admins that expired data will be queued for deletion.
-- Provider settings show managed route health, not raw provider keys.
-- Development provider-key mode is hidden in production builds.
-- Export and deletion actions require confirmation and show request status.
-- Workspace admin controls are hidden unless the role is `admin` or `owner`.
-- Any permission blocked by the OS links to the correct system settings page.
+- New installs default it to `false`.
+- Browser or CLI sign-in does not change it.
+- A legacy `cloud_sync_enabled: true` value without the consent guard is treated
+  as off and must be selected again in Settings.
+- Desktop Settings reads and writes the same local `CueSettings` file used by
+  automatic sync scheduling.
+- Turning it off prevents new automatic session uploads while local sessions
+  remain available on that device.
+- An explicit diagnostic `cloud sync` command may still perform a manual sync;
+  that command itself is the user's deliberate action.
+
+`raw_audio_retained` is a read-only `false` state in the current release. Bluey
+uses temporary audio chunks for transcription and deletes its temporary local
+chunk after the transcription request. The product currently has no retained
+audio library and no retained-audio setting to wire.
+
+`training_enabled` is also a read-only `false` state. The current product has no
+training opt-in or customer-content training pipeline. Submitted prompts,
+transcripts, audio, files, screenshots, and answers are not training data.
+
+## Current Screen-Share Controls
+
+The Settings surface exposes an explicit show/hide overlay checkbox backed by
+the same command as F19 and the tray/menu-bar item. This changes overlay
+visibility only. Listening and other background state remain separate.
+
+Supported desktop overlay paths request capture exclusion from the operating
+system. The UI must state that meeting apps, privileged tools, managed devices,
+cameras, or custom capture paths can still show the overlay. Users should test
+their own sharing setup.
+
+## Current Account Controls
+
+The web account surface owns:
+
+- account and device state;
+- prepaid balance and usage;
+- one-time balance reload;
+- opt-in saved-card Auto Reload;
+- synced session viewing where records exist;
+- account export and deletion requests.
+
+Auto Reload HTML, modal state, and JavaScript must initialize from the server's
+`auto_topup_enabled` value. A new or unavailable saved-card setup must render
+off. Turning it on may open the real card setup flow; it must never happen from
+opening the balance modal alone.
+
+## Not Yet A Product Control
+
+Do not add interactive UI for these items until the full persistence and
+lifecycle behavior exists:
+
+- cloud retention days with a verified deletion worker;
+- artifact-specific retention;
+- retained raw audio;
+- customer-content training opt-in;
+- workspace memory policy;
+- app/domain capture exclusions;
+- deletion progress by object store;
+- organization policy enforcement.
+
+Future server-owned settings need authentication, optimistic concurrency,
+multi-device propagation, deletion enforcement, audit events, and regression
+tests before they can replace this local contract.
 
 ## Validation
 
-- `retention_days`: 7 to 3650, or workspace enterprise override.
-- `periodic_capture_interval_seconds`: 5 to 300.
-- `latency_budget_ms`: 1000 to 30000.
-- Shortcut values must be unique after platform normalization.
-- Cloud sync cannot be enabled when account auth is missing.
-- Workspace memory cannot be enabled when retention is zero or deletion is pending.
+- A clean `CueSettings::default()` has cloud sync off until a verified account is linked.
+- Verified sign-in enables cloud sync and records the local consent guard; the user can turn it off in Settings at any time.
+- Legacy signed-in installs that already had sync enabled keep that state when the consent-guard field is introduced.
+- Linking an account does not mutate cloud sync.
+- Toggling cloud sync in desktop Settings persists across restart.
+- A disabled sync setting prevents new automatic sync scheduling.
+- Raw-audio and training rows remain read-only and off.
+- Opening Add Balance leaves Auto Reload off unless it was already active.
+- Turning Auto Reload on requires a real saved card setup or an existing saved
+  method.
+- F19 and the tray/menu-bar item say show/hide overlay, not invisible.

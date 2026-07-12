@@ -14,10 +14,11 @@ use super::AppState;
 use crate::{
     auth,
     db::{
+        account_data,
         accounts::{Account, DEFAULT_TRIAL_SECONDS},
         device_codes::{self, DeviceCodeMetadata},
         devices::{self, DeviceRegistration},
-        refresh_tokens, signup_otps, trial_abuse,
+        legal_acceptances, refresh_tokens, signup_otps, trial_abuse,
     },
 };
 
@@ -34,6 +35,8 @@ pub struct SignupStartRequest {
     pub email: String,
     pub password: String,
     #[serde(default)]
+    pub terms_accepted: bool,
+    #[serde(default)]
     pub turnstile_token: Option<String>,
     #[serde(default)]
     pub device_fingerprint: Option<String>,
@@ -43,6 +46,8 @@ pub struct SignupStartRequest {
 pub struct SignupStartResponse {
     pub email: String,
     pub expires_in_secs: i64,
+    pub trial_seconds: i64,
+    pub no_trial_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +96,8 @@ pub struct AuthAccountSummary {
 
 #[derive(Deserialize)]
 pub struct TrialStartRequest {
+    #[serde(default)]
+    pub terms_accepted: bool,
     #[serde(default)]
     pub turnstile_token: Option<String>,
     #[serde(default)]
@@ -168,6 +175,13 @@ fn allow_dev_auth_link_logs() -> bool {
 const SIGNUP_OTP_TTL_SECS: i64 = 10 * 60;
 const SIGNUP_OTP_MAX_ATTEMPTS: i64 = 5;
 const TEMPORARY_ACCOUNT_TTL_SECS: i64 = 24 * 60 * 60;
+const LEGAL_TERMS_VERSION: &str = "2026-07-09";
+const LEGAL_PRIVACY_VERSION: &str = "2026-07-09";
+const LEGAL_TERMS_TEXT_HASH: &str =
+    "sha256:fba473c03285180a8be82914ce61ad9dc4600b9c318925cf1c669590625da671";
+const LEGAL_PRIVACY_TEXT_HASH: &str =
+    "sha256:1a203a5336e8a8d3f6ff93d475d6fa90d7ad5d8de5bd924a1e6d98860a14b9c9";
+const LEGAL_ACCEPTANCE_RETENTION_DAYS: i64 = 365;
 const TEMPORARY_ACCOUNT_EMAIL_DOMAIN: &str = "try.bluey.sh";
 
 fn normalize_signup_email(email: &str) -> Result<String, (StatusCode, Json<ApiError>)> {
@@ -235,6 +249,17 @@ fn signup_otp_hash(jwt_secret: &str, email: &str, otp: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+fn trial_denial_allows_account_without_trial(reason: &str) -> bool {
+    matches!(
+        reason,
+        "email_trial_already_used"
+            | "email_domain_trial_velocity"
+            | "device_trial_already_used"
+            | "ip_trial_velocity"
+            | "ip_user_agent_trial_velocity"
+    )
+}
+
 fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
@@ -293,20 +318,8 @@ fn request_trial_identity(
     device_fingerprint: Option<&str>,
 ) -> trial_abuse::TrialAbuseSignals {
     let device = request_device_fingerprint(headers, device_fingerprint);
-    let identity = device
-        .as_deref()
-        .map(|value| format!("try-us-device:{value}"))
-        .or_else(|| {
-            request_ip(headers, peer_ip).map(|ip| {
-                format!(
-                    "try-us-ip:{ip}:{}",
-                    request_user_agent(headers).unwrap_or_default()
-                )
-            })
-        })
-        .unwrap_or_else(|| format!("try-us-random:{}", uuid::Uuid::new_v4()));
     trial_abuse::TrialAbuseSignals::from_raw(
-        &identity,
+        &format!("try-us-request:{}", uuid::Uuid::new_v4()),
         request_ip(headers, peer_ip).as_deref(),
         device.as_deref(),
         request_user_agent(headers).as_deref(),
@@ -325,6 +338,68 @@ fn signup_signals(
         request_device_fingerprint(headers, device_fingerprint).as_deref(),
         request_user_agent(headers).as_deref(),
     )
+}
+
+fn record_legal_acceptance(
+    state: &AppState,
+    account_id: &str,
+    purpose: &'static str,
+    signals: &trial_abuse::TrialAbuseSignals,
+    metadata_json: &'static str,
+) -> anyhow::Result<()> {
+    let retention_expires_at =
+        (chrono::Utc::now() + chrono::Duration::days(LEGAL_ACCEPTANCE_RETENTION_DAYS)).to_rfc3339();
+    legal_acceptances::record(
+        &state.pool,
+        legal_acceptances::LegalAcceptance {
+            account_id,
+            purpose,
+            terms_version: LEGAL_TERMS_VERSION,
+            privacy_version: LEGAL_PRIVACY_VERSION,
+            terms_text_hash: LEGAL_TERMS_TEXT_HASH,
+            privacy_text_hash: LEGAL_PRIVACY_TEXT_HASH,
+            email_hash: Some(signals.email_hash.as_str()),
+            ip_hash: signals.ip_hash.as_deref(),
+            user_agent_hash: signals.user_agent_hash.as_deref(),
+            device_hash: signals.device_hash.as_deref(),
+            ip_user_agent_hash: signals.ip_user_agent_hash.as_deref(),
+            metadata_json,
+            retention_expires_at: retention_expires_at.as_str(),
+        },
+    )
+}
+
+fn cleanup_new_account_after_setup_failure(
+    state: &AppState,
+    account_id: &str,
+    grant_id: Option<&str>,
+    stage: &'static str,
+    error: &anyhow::Error,
+) {
+    tracing::error!(
+        account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+        stage,
+        %error,
+        "account setup failed; removing newly created account"
+    );
+    if let Err(cleanup_error) = account_data::hard_delete_account(&state.pool, account_id) {
+        tracing::error!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            stage,
+            %cleanup_error,
+            "failed to remove account after setup failure"
+        );
+    }
+    if let Some(grant_id) = grant_id {
+        if let Err(cleanup_error) = trial_abuse::release_reserved_grant(&state.pool, grant_id) {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                stage,
+                %cleanup_error,
+                "failed to release trial grant after account setup failure"
+            );
+        }
+    }
 }
 
 fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -501,6 +576,10 @@ pub async fn trial_start(
         }
     }
 
+    if !req.terms_accepted {
+        return Err(err(StatusCode::BAD_REQUEST, "terms_required"));
+    }
+
     let peer_ip = connect_info.map(|ConnectInfo(addr)| addr.ip());
     let signals = request_trial_identity(&headers, peer_ip, req.device_fingerprint.as_deref());
     if let Err(error) =
@@ -584,11 +663,36 @@ pub async fn trial_start(
     };
 
     if let Err(error) = trial_abuse::attach_grant_account(&state.pool, &grant_id, &account.id) {
-        tracing::warn!(
-            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-            %error,
-            "failed to attach temporary trial grant"
+        cleanup_new_account_after_setup_failure(
+            &state,
+            &account.id,
+            Some(&grant_id),
+            "trial_grant_attach",
+            &error,
         );
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not initialize trial account",
+        ));
+    }
+    if let Err(error) = record_legal_acceptance(
+        &state,
+        &account.id,
+        "trial_terms_privacy",
+        &signals,
+        r#"{"flow":"try_us"}"#,
+    ) {
+        cleanup_new_account_after_setup_failure(
+            &state,
+            &account.id,
+            Some(&grant_id),
+            "trial_terms_privacy",
+            &error,
+        );
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not record Terms and Privacy acceptance",
+        ));
     }
 
     let auth = auth_response(&state, &account)?;
@@ -609,6 +713,8 @@ pub async fn trial_start(
 pub async fn trial_convert_start(
     State(state): State<AppState>,
     Extension(crate::auth::AuthedAccount(account)): Extension<crate::auth::AuthedAccount>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<TrialConvertStartRequest>,
 ) -> Result<Json<TrialConvertStartResponse>, (StatusCode, Json<ApiError>)> {
     if !account.is_temporary || account.is_temporary_expired() {
@@ -633,6 +739,27 @@ pub async fn trial_convert_start(
     {
         return Err(err(StatusCode::CONFLICT, "email already registered"));
     }
+    let peer_ip = connect_info.map(|ConnectInfo(addr)| addr.ip());
+    let signals = signup_signals(&email, &headers, peer_ip, None);
+    record_legal_acceptance(
+        &state,
+        &account.id,
+        "trial_convert_terms_privacy",
+        &signals,
+        r#"{"flow":"trial_convert"}"#,
+    )
+    .map_err(|error| {
+        tracing::error!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            purpose = "trial_convert_terms_privacy",
+            %error,
+            "failed to record legal acceptance"
+        );
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not record Terms and Privacy acceptance",
+        )
+    })?;
 
     let password_hash = auth::password::hash_password(&req.password)
         .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
@@ -759,6 +886,9 @@ pub async fn signup_start(
     Json(req): Json<SignupStartRequest>,
 ) -> Result<Json<SignupStartResponse>, (StatusCode, Json<ApiError>)> {
     let email = normalize_signup_email(&req.email)?;
+    if !req.terms_accepted {
+        return Err(err(StatusCode::BAD_REQUEST, "terms_required"));
+    }
     let peer_ip = connect_info.map(|ConnectInfo(addr)| addr.ip());
 
     if Account::fetch_by_email(&state.pool, &email)
@@ -791,12 +921,25 @@ pub async fn signup_start(
                     &format!("trial abuse: {e}"),
                 )
             })?;
-    if !decision.allowed {
+    let no_trial_reason = if decision.allowed {
+        None
+    } else if decision
+        .reason
+        .as_deref()
+        .is_some_and(trial_denial_allows_account_without_trial)
+    {
+        decision.reason
+    } else {
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
             decision.reason.as_deref().unwrap_or("trial limit reached"),
         ));
-    }
+    };
+    let trial_seconds = if no_trial_reason.is_some() {
+        0
+    } else {
+        DEFAULT_TRIAL_SECONDS
+    };
 
     let password_hash = auth::password::hash_password(&req.password)
         .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
@@ -842,6 +985,8 @@ pub async fn signup_start(
     Ok(Json(SignupStartResponse {
         email,
         expires_in_secs: SIGNUP_OTP_TTL_SECS,
+        trial_seconds,
+        no_trial_reason,
     }))
 }
 
@@ -898,7 +1043,7 @@ pub async fn signup_confirm(
     }
 
     let signals = signup_signals(&email, &headers, peer_ip, req.device_fingerprint.as_deref());
-    let grant_id = match trial_abuse::reserve_trial_grant(
+    let (grant_id, trial_seconds) = match trial_abuse::reserve_trial_grant(
         &state.pool,
         state.config.trial_abuse,
         &signals,
@@ -910,36 +1055,93 @@ pub async fn signup_confirm(
             &format!("trial abuse: {e}"),
         )
     })? {
-        trial_abuse::TrialGrantReservation::Reserved { grant_id } => grant_id,
+        trial_abuse::TrialGrantReservation::Reserved { grant_id } => {
+            (Some(grant_id), DEFAULT_TRIAL_SECONDS)
+        }
         trial_abuse::TrialGrantReservation::Denied { reason } => {
-            return Err(err(StatusCode::TOO_MANY_REQUESTS, &reason));
+            if trial_denial_allows_account_without_trial(&reason) {
+                (None, 0)
+            } else {
+                return Err(err(StatusCode::TOO_MANY_REQUESTS, &reason));
+            }
         }
     };
 
     let is_admin = state.config.is_admin_email(&email);
-    let account =
-        Account::create_with_admin(&state.pool, &email, &signup_otp.password_hash, is_admin)
-            .map_err(|e| {
-                let _ = trial_abuse::release_reserved_grant(&state.pool, &grant_id);
-                if matches!(
-                    e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
-                    Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
-                ) {
-                    return err(StatusCode::CONFLICT, "email already registered");
-                }
-                err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
-            })?;
+    let account = Account::create_with_admin_and_trial_seconds(
+        &state.pool,
+        &email,
+        &signup_otp.password_hash,
+        is_admin,
+        trial_seconds,
+    )
+    .map_err(|e| {
+        if let Some(grant_id) = grant_id.as_deref() {
+            let _ = trial_abuse::release_reserved_grant(&state.pool, grant_id);
+        }
+        if matches!(
+            e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
+            Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
+        ) {
+            return err(StatusCode::CONFLICT, "email already registered");
+        }
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
+    })?;
 
-    let _ = signup_otps::delete(&state.pool, &email);
-    Account::mark_email_verified(&state.pool, &account.id)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-    if let Err(error) = trial_abuse::attach_grant_account(&state.pool, &grant_id, &account.id) {
-        tracing::warn!(
+    if let Err(error) = Account::mark_email_verified(&state.pool, &account.id) {
+        cleanup_new_account_after_setup_failure(
+            &state,
+            &account.id,
+            grant_id.as_deref(),
+            "email_verification",
+            &error,
+        );
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not finish account setup",
+        ));
+    }
+    if let Some(grant_id) = grant_id.as_deref() {
+        if let Err(error) = trial_abuse::attach_grant_account(&state.pool, grant_id, &account.id) {
+            cleanup_new_account_after_setup_failure(
+                &state,
+                &account.id,
+                Some(grant_id),
+                "trial_grant_attach",
+                &error,
+            );
+            return Err(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not finish account setup",
+            ));
+        }
+    } else {
+        tracing::info!(
             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-            %error,
-            "failed to attach trial grant"
+            email_hash = %signals.email_hash,
+            "created account without fresh trial because email trial was already used"
         );
     }
+    if let Err(error) = record_legal_acceptance(
+        &state,
+        &account.id,
+        "signup_terms_privacy",
+        &signals,
+        r#"{"flow":"signup"}"#,
+    ) {
+        cleanup_new_account_after_setup_failure(
+            &state,
+            &account.id,
+            grant_id.as_deref(),
+            "signup_terms_privacy",
+            &error,
+        );
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not record Terms and Privacy acceptance",
+        ));
+    }
+    let _ = signup_otps::delete(&state.pool, &email);
 
     Ok(Json(auth_response(&state, &account)?))
 }

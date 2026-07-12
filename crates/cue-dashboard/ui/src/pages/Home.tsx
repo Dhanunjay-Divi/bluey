@@ -284,7 +284,7 @@ export function Home() {
             ) : (
               <div className="space-y-3">
                 <p className="text-sm leading-6 text-zinc-400">
-                  Sign in to use cloud answers, credits, and saved-session sync on this desktop.
+                  Sign in to use cloud answers and credits. Saved-session sync stays off until you enable it in Settings.
                 </p>
                 <button
                   type="button"

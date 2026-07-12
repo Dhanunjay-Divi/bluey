@@ -1,5 +1,10 @@
 # Commercial Path Review
 
+> Historical commercialization plan. Its macOS-only release statements are not
+> current: the public `0.1.99` manifest lists macOS Apple silicon and Windows
+> x86-64. Current consent and data-control requirements live in
+> `SETTINGS-UI-CONTRACT.md` and `PRODUCT-STRATEGY.md`.
+
 This review consolidates the remaining product path for Bluey as a commercial desktop-plus-cloud product.
 
 ## Product Boundary

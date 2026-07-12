@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 import { invoke } from "../lib/tauri";
-import { Check, Eye, EyeOff, Mail, Trash2, ExternalLink, LogOut } from "lucide-react";
+import { Cloud, Eye, EyeOff, FileAudio, GraduationCap, Mail, Trash2, ExternalLink, LogOut } from "lucide-react";
 
 /**
  * Codex Stage 24: Settings page rewrite.
  *
  * Removed all BYOK Deepgram-key prompts (pre-Stage-18 era). New layout:
  *   - Account card (email, balance, "Open billing portal", "Sign out", "Delete account")
- *   - Privacy card (disguise picker — section migrated from Stage 18)
- *   - Visibility card (invisibility hotkey + tray reminder)
+ *   - Data controls (real cloud-sync preference + current retention/training states)
+ *   - Screen-share privacy and explicit overlay visibility
  *
  * Design tokens: bg-zinc-950 surface, bg-zinc-900 cards, blue-500 brand,
  * red-500 destructive. Same palette as Onboarding.
@@ -16,30 +16,6 @@ import { Check, Eye, EyeOff, Mail, Trash2, ExternalLink, LogOut } from "lucide-r
 
 const platform = typeof navigator === "undefined" ? "" : navigator.userAgent;
 const isWindows = platform.includes("Windows");
-const isMac = platform.includes("Mac");
-
-const DISGUISE_OPTIONS = [
-  {
-    value: "none",
-    label: "Off (visible as Bluey)",
-    desc: `Bluey shows up as itself in your ${isWindows ? "taskbar tray" : "menu bar"}.`,
-  },
-  {
-    value: "activity",
-    label: isWindows ? "Task Manager" : "Activity Monitor",
-    desc: "Recommended. Uses the system process viewer identity.",
-  },
-  {
-    value: "terminal",
-    label: isWindows ? "Command Prompt" : "Terminal",
-    desc: "Uses the platform terminal identity.",
-  },
-  {
-    value: "settings",
-    label: isMac ? "System Settings" : "Settings",
-    desc: "Uses the platform settings identity.",
-  },
-];
 
 interface AccountMe {
   id: string;
@@ -57,8 +33,8 @@ export function Settings() {
       <div className="mx-auto max-w-2xl space-y-6">
         <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
         <AccountCard />
-        <DisguiseCard />
-        <VisibilityCard />
+        <DataControlsCard />
+        <ScreenSharePrivacyCard />
       </div>
     </div>
   );
@@ -164,7 +140,7 @@ function AccountCard() {
       ) : loaded ? (
         <div className="space-y-2">
           <p className="text-sm text-zinc-400">
-            Sign in once in the browser for cloud answers, credits, and saved-session sync.
+            Sign in once in the browser for cloud answers, credits, and saved-session sync. You can turn sync off below.
           </p>
           <button
             onClick={signIn}
@@ -263,74 +239,147 @@ function AccountCard() {
   );
 }
 
-function DisguiseCard() {
-  const [mode, setMode] = useState<string>("activity");
+interface DataControls {
+  cloud_sync_enabled: boolean;
+  raw_audio_retained: boolean;
+  training_enabled: boolean;
+}
+
+function DataControlsCard() {
+  const [controls, setControls] = useState<DataControls | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
   useEffect(() => {
-    invoke<string>("get_disguise").then(setMode).catch(() => {});
+    invoke<DataControls>("get_data_controls")
+      .then(setControls)
+      .catch((e) => setError(String(e)));
   }, []);
-  async function update(next: string) {
-    setMode(next);
-    try { await invoke("set_disguise", { mode: next }); }
-    catch (e) { console.warn("set_disguise failed", e); }
+
+  async function updateCloudSync(enabled: boolean) {
+    if (!controls || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const next = await invoke<DataControls>("set_cloud_sync_enabled", { enabled });
+      setControls(next);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
   }
+
   return (
-    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
+    <div className="rounded-lg bg-zinc-900 border border-zinc-800 p-5 space-y-4">
       <div>
-        <h3 className="font-semibold text-zinc-100">Disguise</h3>
-        <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
-          How Bluey appears in your {isWindows ? "taskbar tray" : "menu bar"} and to screen-shares.{" "}
-          <a href="https://bluey.sh/docs/disguise" target="_blank" rel="noreferrer"
-            className="text-blue-400 hover:text-blue-300 underline">Why?</a>
+        <h3 className="font-semibold text-zinc-100">Data controls</h3>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-400">
+          Verified sign-in enables saved-session sync for reliable history. You can turn it off here and keep future sessions local.
         </p>
       </div>
-      <div className="space-y-2">
-        {DISGUISE_OPTIONS.map((opt) => {
-          const active = opt.value === mode;
-          return (
-            <button
-              key={opt.value}
-              onClick={() => update(opt.value)}
-              className={
-                "w-full text-left rounded-lg border p-3 transition-colors " +
-                (active
-                  ? "bg-blue-500/10 border-blue-500/40"
-                  : "bg-zinc-950 border-zinc-800 hover:border-zinc-700")
-              }
-            >
-              <div className="flex items-center justify-between">
-                <span className={"text-sm font-medium " + (active ? "text-blue-300" : "text-zinc-200")}>
-                  {opt.label}
-                </span>
-                {active && <Check className="h-4 w-4 text-blue-400" />}
-              </div>
-              <p className="text-xs text-zinc-500 mt-1">{opt.desc}</p>
-            </button>
-          );
-        })}
+      <div className="divide-y divide-zinc-800 rounded-lg border border-zinc-800 bg-zinc-950">
+        <label className="flex cursor-pointer items-start justify-between gap-4 p-4">
+          <span className="flex min-w-0 gap-3">
+            <Cloud className="mt-0.5 h-4 w-4 shrink-0 text-blue-300" />
+            <span>
+              <span className="block text-sm font-medium text-zinc-200">Cloud session sync</span>
+              <span className="mt-1 block text-xs leading-5 text-zinc-500">
+                Upload new session transcripts, answers, and approved attachments for signed-in restore and memory.
+              </span>
+            </span>
+          </span>
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 shrink-0 accent-blue-500"
+            checked={controls?.cloud_sync_enabled ?? false}
+            disabled={!controls || busy}
+            onChange={(event) => updateCloudSync(event.target.checked)}
+          />
+        </label>
+        <div className="flex items-start justify-between gap-4 p-4">
+          <span className="flex min-w-0 gap-3">
+            <FileAudio className="mt-0.5 h-4 w-4 shrink-0 text-emerald-300" />
+            <span>
+              <span className="block text-sm font-medium text-zinc-200">Raw audio retention</span>
+              <span className="mt-1 block text-xs leading-5 text-zinc-500">
+                Audio is processed for transcription. Bluey does not keep a raw-audio library in this release.
+              </span>
+            </span>
+          </span>
+          <strong className="shrink-0 text-xs font-semibold text-emerald-300">
+            {controls?.raw_audio_retained ? "On" : "Off"}
+          </strong>
+        </div>
+        <div className="flex items-start justify-between gap-4 p-4">
+          <span className="flex min-w-0 gap-3">
+            <GraduationCap className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+            <span>
+              <span className="block text-sm font-medium text-zinc-200">Model training</span>
+              <span className="mt-1 block text-xs leading-5 text-zinc-500">
+                Submitted prompts, transcripts, files, screenshots, audio, and answers are not used to train models.
+              </span>
+            </span>
+          </span>
+          <strong className="shrink-0 text-xs font-semibold text-emerald-300">
+            {controls?.training_enabled ? "On" : "Off"}
+          </strong>
+        </div>
       </div>
+      {error && <p className="text-xs text-red-300" role="status">Could not update data controls: {error}</p>}
     </div>
   );
 }
 
-function VisibilityCard() {
+function ScreenSharePrivacyCard() {
+  const [hidden, setHidden] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    invoke<boolean>("invisibility_state").then(setHidden).catch(() => {});
+  }, []);
+
+  async function updateVisibility() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      setHidden(await invoke<boolean>("invisibility_toggle"));
+    } catch (e) {
+      console.warn("overlay visibility toggle failed", e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
-    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-3">
-      <h3 className="font-semibold text-zinc-100">Visibility</h3>
-      <div className="flex items-start gap-3">
-        <EyeOff className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
-        <p className="text-xs text-zinc-300 leading-relaxed">
-          <kbd className="px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-100 text-[11px] font-mono">F19</kbd>{" "}
-          toggles Bluey&apos;s overlay on or off instantly. The tray icon and
-          the {`"Invisible"`} tray entry do the same thing.
+    <div className="rounded-lg bg-zinc-900 border border-zinc-800 p-5 space-y-4">
+      <div>
+        <h3 className="font-semibold text-zinc-100">Screen-share privacy</h3>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-400">
+          Bluey requests capture exclusion where the operating system supports it. This is best effort, not an invisibility or security guarantee.
         </p>
       </div>
-      <div className="flex items-start gap-3">
-        <Eye className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
-        <p className="text-xs text-zinc-300 leading-relaxed">
-          When meeting apps (Zoom, Teams, Slack, Webex) are in front, Bluey
-          can disguise itself automatically. We&apos;ll ask you once.
-        </p>
-      </div>
+      <label className="flex cursor-pointer items-start justify-between gap-4 rounded-lg border border-zinc-800 bg-zinc-950 p-4">
+        <span className="flex min-w-0 gap-3">
+          {hidden ? <EyeOff className="mt-0.5 h-4 w-4 shrink-0 text-zinc-400" /> : <Eye className="mt-0.5 h-4 w-4 shrink-0 text-blue-300" />}
+          <span>
+            <span className="block text-sm font-medium text-zinc-200">Hide overlay now</span>
+            <span className="mt-1 block text-xs leading-5 text-zinc-500">
+              This changes only overlay visibility. Listening and background state remain separately controlled.
+            </span>
+          </span>
+        </span>
+        <input
+          type="checkbox"
+          className="mt-0.5 h-4 w-4 shrink-0 accent-blue-500"
+          checked={hidden}
+          disabled={busy}
+          onChange={updateVisibility}
+        />
+      </label>
+      <p className="text-xs leading-5 text-zinc-500">
+        Use <kbd className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[11px] text-zinc-100">F19</kbd> or the {isWindows ? "tray" : "menu-bar"} command for the same show/hide control. Test your meeting app before sharing.
+      </p>
     </div>
   );
 }

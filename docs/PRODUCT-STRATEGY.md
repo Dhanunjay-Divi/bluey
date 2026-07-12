@@ -1,17 +1,27 @@
 # Product Strategy
 
-Bluey is intended to become a commercial SaaS product, not an open-source/BYOK
-clone. The current v0.1.0 track is a macOS arm64 local-first release that should
-not be marketed as a finished SaaS until cloud auth/sync/RAG/billing are real.
+Bluey is a commercial managed product, not an open-source/BYOK clone. The
+current public release is `0.1.99` with manifest-listed artifacts for macOS
+Apple silicon and Windows x86-64. Source parity or roadmap work must not be
+presented as a shipped platform.
+
+The recommended public position is:
+
+> A consent-first live-context assistant for engineering work.
+
+Bluey should win on context quality, provenance, reliability, and useful
+follow-through. Covert-assistant, assessment-cheating, and process-impersonation
+positioning are outside the product strategy.
 
 ## Product Positioning
 
 - Paid account-credit product: customers reload non-transferable Bluey credits,
   spend them per managed request, and are not charged a monthly subscription by
   default.
-- Managed cloud account and secure sync.
+- Managed cloud account with separately controlled, opt-in session sync.
 - Managed model/provider routing by default.
-- Enterprise-grade privacy, retention, deletion, and audit controls.
+- A path toward enterprise privacy, retention, deletion, and audit controls;
+  unfinished lifecycle work must be labeled as such.
 - RAG memory across meetings, documents, screenshots, and user-provided context.
 - Live meeting intelligence for teams already using coding agents.
 - A bridge between live conversation and the work context that already exists
@@ -26,6 +36,15 @@ not be marketed as a finished SaaS until cloud auth/sync/RAG/billing are real.
 - Keep secrets out of logs and local state files.
 - Provide deletion/export controls.
 - Build visible, consent-based capture flows.
+- Keep cloud sync off until the user explicitly enables it.
+- Process raw audio transiently for transcription; do not imply retained audio
+  controls before retained-audio storage exists.
+- Do not use submitted customer content for model training without a separate,
+  implemented opt-in.
+- Keep automatic payments off until the user approves Auto Reload, a saved
+  card, threshold, and amount.
+- Describe capture exclusion as best effort, not as invisibility or a security
+  boundary.
 - Avoid product claims around bypassing monitoring, proctoring, or assessment controls.
 
 ## AI Direction
@@ -104,11 +123,12 @@ Internal feature:
 
 See `docs/CONTEXT-INTELLIGENCE-LAB.md`.
 
-## Commercial Features To Build
+## Commercial Features To Harden Or Build
 
-- Authenticated cloud sync.
+- Authenticated, opt-in cloud sync with transactional deletion and retention.
 - Workspace/team accounts.
-- Credit reloads, per-use billing, hard-stop enforcement, and receipts.
+- Credit reloads, per-use billing, hard-stop enforcement, receipts, and durable
+  Auto Reload reconciliation.
 - Cloud RAG index.
 - Meeting history dashboard.
 - Managed model routing, fallbacks, and latency budgets.

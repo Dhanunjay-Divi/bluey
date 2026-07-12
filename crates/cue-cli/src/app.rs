@@ -3,9 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-#[cfg(target_os = "macos")]
-use std::time::Instant as StdInstant;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -16,6 +14,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use cue_core::app_paths::AppPaths;
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
+#[cfg(unix)]
+use cue_core::process_aliases::is_daemon_executable_path;
+#[cfg(target_os = "macos")]
+use cue_core::process_aliases::MACOS_AUDIO_HELPER_NAMES;
+use cue_core::process_aliases::{is_daemon_identity_path, DAEMON_EXECUTABLE_STEMS};
 use cue_core::{
     load_account, load_settings, new_trace_id, save_settings, trace_id_from_env, AccountConfig,
     ActionItem, AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerRequest, AnswerResponse,
@@ -26,6 +29,42 @@ use cue_core::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration, Instant};
+
+const CLI_UNINSTALL_LINK_STEMS: &[&str] = &[
+    "bluey",
+    "bluey-daemon",
+    "termb",
+    "Terminal",
+    "hostovb",
+    "host-overlay",
+    "adriverb",
+    "audio-driver",
+    "screen-driver",
+    "bluey-overlay-macos",
+    "cue-overlay-macos",
+    "bluey-audio-macos",
+    "cue-audio-macos",
+    "bluey-whisper-macos",
+    "cue-whisper",
+    "bluey-file-picker-macos",
+    "cue-file-picker-macos",
+];
+
+const WINDOWS_INSTALL_BIN_NAMES: &[&str] = &[
+    "bluey.exe",
+    "bluey-daemon.exe",
+    "termb.exe",
+    "Terminal.exe",
+    "hostovb.exe",
+    "host-overlay.exe",
+    "adriverb.exe",
+    "audio-driver.exe",
+    "screen-driver.exe",
+    "bluey-overlay.exe",
+    "cue-overlay.exe",
+    "bluey-audio.exe",
+    "cue-audio.exe",
+];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -43,11 +82,12 @@ enum Commands {
     /// Start Bluey and open an interactive meeting session.
     #[command(hide = true)]
     Run(RunArgs),
-    /// Turn Bluey on with the overlay-first product flow.
+    /// Start Bluey, check updates, and sign in if needed.
     On(OnArgs),
-    /// Turn Bluey off.
+    /// Stop Bluey completely.
     Off,
     /// Remove Bluey from this device.
+    #[command(hide = true)]
     Uninstall(UninstallArgs),
     /// Sign in or link Bluey to a cloud account.
     #[command(hide = true)]
@@ -62,21 +102,18 @@ enum Commands {
     #[command(hide = true)]
     Settings(SettingsArgs),
     /// Show your Bluey balance, last-7-days usage, and tier projection.
-    #[command(hide = true)]
     Usage,
     /// Show your current Bluey balance and 1-year credit-validity reminder.
     /// (Per-batch expiration listing is not yet available; coming in a
     /// future release.)
     #[command(hide = true)]
     Credits,
-    /// Check for and install a Bluey desktop update.
-    #[command(hide = true)]
+    /// Install the latest Bluey desktop build.
     Update(UpdateArgs),
     /// Log out of Bluey: clear device account tokens.
     #[command(hide = true)]
     Logout,
-    /// Open the Bluey billing page in your browser to manage credits and provider-backed billing.
-    #[command(hide = true)]
+    /// Open billing, credits, and card settings in your browser.
     Portal,
     /// Export your Bluey account data as a JSON file (GDPR).
     #[command(hide = true)]
@@ -95,6 +132,9 @@ enum Commands {
         /// hashed/redacted exactly as the human-readable output is.
         #[arg(long)]
         json: bool,
+        /// Create the same redacted support zip as `bluey support`.
+        #[arg(long)]
+        zip: bool,
     },
     /// Manage Bluey logs on this device.
     #[command(hide = true)]
@@ -102,8 +142,7 @@ enum Commands {
         #[command(subcommand)]
         command: LogsCommands,
     },
-    /// Bundle bluey doctor + logs export into a single zip for support tickets.
-    #[command(hide = true)]
+    /// Create a redacted support bundle for hello@bluey.sh.
     Support {
         /// Disable redaction. By default the bundle strips bearer tokens,
         /// magic-link URLs, billing IDs, provider keys, emails, IPv4
@@ -123,8 +162,7 @@ enum Commands {
     /// Stop the Bluey daemon.
     #[command(hide = true)]
     Stop,
-    /// Show daemon status.
-    #[command(hide = true)]
+    /// Show Bluey state, overlay status, and current session.
     Status,
     /// Control the private overlay.
     #[command(hide = true)]
@@ -585,7 +623,18 @@ pub async fn cli_main() -> Result<()> {
         Commands::Portal => bluey_portal_cmd().await,
         Commands::Export => bluey_export_cmd().await,
         Commands::DeleteAccount { force } => bluey_delete_account_cmd(force).await,
-        Commands::Doctor { json } => {
+        Commands::Doctor { json, zip } => {
+            if json && zip {
+                bail!("use either `bluey doctor --json` or `bluey doctor --zip`, not both");
+            }
+            if zip {
+                crate::support::bundle(crate::support::SupportArgs {
+                    redact: true,
+                    days: 7,
+                    output: None,
+                })?;
+                return Ok(());
+            }
             if json {
                 crate::doctor::run_json()?;
             } else {
@@ -1060,19 +1109,26 @@ fn find_macos_audio_permission_helper() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = env::current_exe() {
         if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("bluey-audio-macos"));
-            candidates.push(parent.join("cue-audio-macos"));
+            push_named_path_candidates(&mut candidates, parent, MACOS_AUDIO_HELPER_NAMES);
         }
     }
     if let Some(home) = env::var_os("HOME") {
         let bluey_bin = PathBuf::from(home).join(".bluey/bin");
-        candidates.push(bluey_bin.join("bluey-audio-macos"));
-        candidates.push(bluey_bin.join("cue-audio-macos"));
+        push_named_path_candidates(&mut candidates, &bluey_bin, MACOS_AUDIO_HELPER_NAMES);
     }
-    candidates.push(PathBuf::from("./bluey-audio-macos"));
-    candidates.push(PathBuf::from("./cue-audio-macos"));
+    push_relative_path_candidates(&mut candidates, MACOS_AUDIO_HELPER_NAMES);
 
     candidates.into_iter().find(|path| is_executable_file(path))
+}
+
+#[cfg(target_os = "macos")]
+fn push_named_path_candidates(candidates: &mut Vec<PathBuf>, base: &Path, names: &[&str]) {
+    candidates.extend(names.iter().map(|name| base.join(name)));
+}
+
+#[cfg(target_os = "macos")]
+fn push_relative_path_candidates(candidates: &mut Vec<PathBuf>, names: &[&str]) {
+    candidates.extend(names.iter().map(|name| PathBuf::from(format!("./{name}"))));
 }
 
 #[cfg(target_os = "macos")]
@@ -1359,23 +1415,27 @@ fn cli_links_for_uninstall() -> Vec<PathBuf> {
     let mut links = Vec::new();
     if let Some(dir) = env::var_os("BLUEY_CLI_DIR") {
         let dir = PathBuf::from(dir);
-        links.push(dir.join(format!("bluey{}", env::consts::EXE_SUFFIX)));
-        links.push(dir.join(format!("bluey-daemon{}", env::consts::EXE_SUFFIX)));
+        for name in CLI_UNINSTALL_LINK_STEMS {
+            links.push(dir.join(format!("{name}{}", env::consts::EXE_SUFFIX)));
+        }
     }
     if let Some(home) = env::var_os("HOME") {
         let local_bin = PathBuf::from(home).join(".local/bin");
-        links.push(local_bin.join(format!("bluey{}", env::consts::EXE_SUFFIX)));
-        links.push(local_bin.join(format!("bluey-daemon{}", env::consts::EXE_SUFFIX)));
+        for name in CLI_UNINSTALL_LINK_STEMS {
+            links.push(local_bin.join(format!("{name}{}", env::consts::EXE_SUFFIX)));
+        }
     }
     #[cfg(unix)]
     {
-        links.push(PathBuf::from("/usr/local/bin/bluey"));
-        links.push(PathBuf::from("/usr/local/bin/bluey-daemon"));
+        for name in CLI_UNINSTALL_LINK_STEMS {
+            links.push(PathBuf::from("/usr/local/bin").join(name));
+        }
     }
     if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
         let bin = PathBuf::from(local_app_data).join("Bluey/bin");
-        links.push(bin.join("bluey.exe"));
-        links.push(bin.join("bluey-daemon.exe"));
+        for name in WINDOWS_INSTALL_BIN_NAMES {
+            links.push(bin.join(name));
+        }
     }
     dedup_paths(links)
 }
@@ -1446,6 +1506,10 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
         .or_else(|| env::var("BLUEY_CLOUD_REFRESH_TOKEN").ok())
         .or_else(|| env::var("CUE_CLOUD_REFRESH_TOKEN").ok());
 
+    if !args.local && !args.no_browser && token.is_none() {
+        crate::update::maybe_update_before_login().await?;
+    }
+
     let account = if args.local || args.no_browser || token.is_some() {
         let mut account = AccountConfig::local();
         account.provider = login_account_provider(args.local).to_string();
@@ -1456,18 +1520,17 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
         account.refresh_token = refresh_token;
         account
     } else {
-        browser_login(&api_url, args.user, args.workspace).await?
+        browser_login(&paths, &api_url, args.user, args.workspace).await?
     };
 
     let has_cloud_tokens = account.token_configured();
     cue_cloud_client::save_account_profile_and_tokens(&paths, &account)?;
     if has_cloud_tokens {
         let mut settings = load_settings(&paths)?;
-        if !settings.cloud_sync_enabled {
-            settings.cloud_sync_enabled = true;
-            settings.touch();
-            save_settings(&paths, &settings)?;
-        }
+        settings.cloud_sync_consent_granted = true;
+        settings.cloud_sync_enabled = true;
+        settings.touch();
+        save_settings(&paths, &settings)?;
         let _ = request(DaemonRequest::CloudStatus).await;
     }
 
@@ -1477,7 +1540,9 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
     );
     if has_cloud_tokens {
         println!("Cloud token saved in Bluey's private local account profile.");
-        println!("Saved sessions sync automatically in the background while Bluey is on.");
+        println!(
+            "Saved-session cloud sync is on for this device. You can turn it off in Settings."
+        );
     } else {
         println!("Local account linked. Run `bluey on` later to sign in when the Bluey cloud endpoint is ready.");
     }
@@ -1606,6 +1671,7 @@ fn cue_settings(args: SettingsArgs) -> Result<()> {
         settings.overlay_opacity = normalize_opacity(opacity);
     }
     if let Some(cloud_sync) = args.cloud_sync {
+        settings.cloud_sync_consent_granted = cloud_sync;
         settings.cloud_sync_enabled = cloud_sync;
     }
     if let Some(days) = args.retention_days {
@@ -1619,6 +1685,7 @@ fn cue_settings(args: SettingsArgs) -> Result<()> {
 }
 
 async fn browser_login(
+    paths: &AppPaths,
     api_url: &str,
     user_id: String,
     workspace_id: String,
@@ -1633,7 +1700,9 @@ async fn browser_login(
         Arc::new(cue_cloud_client::tokens::MemoryStore::new()),
     )
     .context("failed to initialize Bluey cloud client")?;
-    let flow = cue_cloud_client::DeviceFlow::start(&client)
+    let device_request = build_cli_cloud_device_start_request(paths)
+        .context("failed to prepare Bluey device identity")?;
+    let flow = cue_cloud_client::DeviceFlow::start_with_request(&client, device_request.clone())
         .await
         .context("failed to start browser login")?;
     let login_url = device_login_url(&flow.verification_uri, &flow.user_code);
@@ -1666,7 +1735,121 @@ async fn browser_login(
     account.workspace_id = workspace_id;
     account.access_token = Some(auth.access_token);
     account.refresh_token = Some(auth.refresh_token);
+    if let Some(device_id) = device_request
+        .device_id
+        .as_deref()
+        .filter(|value| is_persisted_cloud_device_id(value))
+    {
+        account.device_id = device_id.to_string();
+    }
     Ok(account)
+}
+
+fn build_cli_cloud_device_start_request(
+    paths: &AppPaths,
+) -> Result<cue_cloud_client::DeviceStartRequest> {
+    Ok(cue_cloud_client::DeviceStartRequest {
+        device_id: Some(ensure_cli_stable_cloud_device_id(paths)?),
+        device_name: Some(local_desktop_name()),
+        platform: Some(local_desktop_platform()),
+        arch: Some(std::env::consts::ARCH.to_string()),
+        app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+    })
+}
+
+fn ensure_cli_stable_cloud_device_id(paths: &AppPaths) -> Result<String> {
+    let device_id_path = stable_cloud_device_id_path(paths);
+    if let Ok(value) = std::fs::read_to_string(&device_id_path) {
+        let device_id = value.trim();
+        if is_persisted_cloud_device_id(device_id) {
+            return Ok(device_id.to_string());
+        }
+    }
+
+    if let Some(account) = load_account(paths).ok().flatten() {
+        let device_id = account.device_id.trim();
+        if is_persisted_cloud_device_id(device_id) {
+            write_private_text(&device_id_path, device_id)?;
+            return Ok(device_id.to_string());
+        }
+    }
+
+    let device_id = format!("bluey-{}", cue_core::new_request_id().replace('-', ""));
+    write_private_text(&device_id_path, &device_id)?;
+    Ok(device_id)
+}
+
+fn stable_cloud_device_id_path(paths: &AppPaths) -> PathBuf {
+    if env::var_os("BLUEY_CONFIG_DIR")
+        .or_else(|| env::var_os("CUE_CONFIG_DIR"))
+        .is_some()
+    {
+        return paths.config_dir.join("device_id");
+    }
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join(".bluey").join("device_id"))
+        .unwrap_or_else(|| paths.config_dir.join("device_id"))
+}
+
+fn is_persisted_cloud_device_id(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value != "local-device"
+}
+
+fn write_private_text(path: &Path, value: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        cue_core::app_paths::create_private_dir(parent)?;
+    }
+    std::fs::write(path, value).with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn local_desktop_name() -> String {
+    if let Ok(value) = env::var("BLUEY_DEVICE_NAME").or_else(|_| env::var("CUE_DEVICE_NAME")) {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.chars().take(80).collect();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        for args in [["--get", "ComputerName"], ["--get", "LocalHostName"]] {
+            if let Some(value) = command_stdout_trimmed("scutil", &args) {
+                return value.chars().take(80).collect();
+            }
+        }
+    }
+
+    command_stdout_trimmed("hostname", &[])
+        .map(|value| value.chars().take(80).collect())
+        .unwrap_or_else(|| "Bluey desktop".to_string())
+}
+
+fn command_stdout_trimmed(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn local_desktop_platform() -> String {
+    match std::env::consts::OS {
+        "macos" => "macos".to_string(),
+        "windows" => "windows".to_string(),
+        "linux" => "linux".to_string(),
+        other => other.to_string(),
+    }
 }
 
 const DEVICE_LOGIN_TIMEOUT_SECS: u64 = 600;
@@ -2679,18 +2862,17 @@ fn recorded_daemon_command_matches(command: &str, daemon_bin: Option<&Path>) -> 
         };
         return actual == *expected;
     }
-    true
+    !is_daemon_identity_executable_name(exe)
 }
 
 #[cfg(unix)]
 fn is_daemon_executable_name(path: &str) -> bool {
-    Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            let name = name.trim_end_matches(env::consts::EXE_SUFFIX);
-            name == "bluey-daemon" || name == "cue-daemon"
-        })
+    is_daemon_executable_path(Path::new(path))
+}
+
+#[cfg(unix)]
+fn is_daemon_identity_executable_name(path: &str) -> bool {
+    is_daemon_identity_path(Path::new(path))
 }
 
 async fn wait_for_daemon_ready(timeout: Duration, mut child: Option<&mut Child>) -> Result<()> {
@@ -2776,10 +2958,11 @@ fn resolve_daemon_bin() -> Result<PathBuf> {
     }
 
     let exe = env::current_exe().context("failed to resolve current executable")?;
-    let mut roots = vec![exe.clone()];
+    let mut roots = Vec::new();
     if let Ok(real_exe) = exe.canonicalize() {
         roots.push(real_exe);
     }
+    roots.push(exe.clone());
     if let Some(install_root) = env::var_os("BLUEY_INSTALL_ROOT") {
         roots.push(PathBuf::from(install_root).join("bin").join("bluey"));
     }
@@ -2792,23 +2975,90 @@ fn resolve_daemon_bin() -> Result<PathBuf> {
     }
 
     Err(anyhow!(
-        "could not find bluey-daemon in the Bluey install; reinstall with `curl -fsSL https://bluey.sh/install.sh | bash` or set BLUEY_DAEMON_BIN"
+        "could not find Bluey's daemon in the Bluey install; reinstall with `curl -fsSL https://bluey.sh/install.sh | bash` or set BLUEY_DAEMON_BIN"
     ))
 }
 
 fn resolve_daemon_bin_from_roots(roots: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     for root in roots {
-        let bluey_sibling = root.with_file_name(format!("bluey-daemon{}", env::consts::EXE_SUFFIX));
-        if bluey_sibling.exists() {
-            return Some(bluey_sibling);
-        }
-
-        let sibling = root.with_file_name(format!("cue-daemon{}", env::consts::EXE_SUFFIX));
-        if sibling.exists() {
-            return Some(sibling);
+        for name in daemon_executable_candidate_names() {
+            let sibling = root.with_file_name(name);
+            if sibling.exists() && daemon_candidate_is_bluey(&sibling) {
+                return Some(sibling);
+            }
         }
     }
     None
+}
+
+fn daemon_candidate_is_bluey(path: &Path) -> bool {
+    if is_daemon_identity_path(path)
+        && std::fs::symlink_metadata(path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+    {
+        return false;
+    }
+
+    #[cfg(test)]
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        return contents.lines().next().unwrap_or_default() == "bluey-daemon";
+    }
+
+    daemon_version_output(path, StdDuration::from_millis(800))
+        .map(|output| {
+            output
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .starts_with("bluey-daemon ")
+        })
+        .unwrap_or(false)
+}
+
+fn daemon_version_output(path: &Path, timeout: StdDuration) -> Result<String> {
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to probe daemon candidate {}", path.display()))?;
+    let deadline = StdInstant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let output = child
+                    .wait_with_output()
+                    .with_context(|| format!("failed to read daemon probe {}", path.display()))?;
+                let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+                return Ok(text);
+            }
+            Ok(None) if StdInstant::now() < deadline => {
+                std::thread::sleep(StdDuration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("daemon candidate probe timed out: {}", path.display());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error)
+                    .with_context(|| format!("failed to inspect daemon probe {}", path.display()));
+            }
+        }
+    }
+}
+
+fn daemon_executable_candidate_names() -> Vec<String> {
+    let suffix = env::consts::EXE_SUFFIX;
+    DAEMON_EXECUTABLE_STEMS
+        .iter()
+        .map(|name| format!("{name}{suffix}"))
+        .collect()
 }
 
 async fn request(message: DaemonRequest) -> Result<DaemonResponse> {
@@ -3246,7 +3496,7 @@ async fn print_cloud_sessions(limit: i64, json: bool) -> Result<()> {
         return Ok(());
     }
     if sessions.sessions.is_empty() {
-        println!("No cloud sessions yet. Start or answer in Bluey while signed in; saved sessions sync automatically in the background.");
+        println!("No cloud sessions yet. Turn on cloud sync in Settings, then start or answer in Bluey while signed in.");
         return Ok(());
     }
     println!("Cloud sessions:");
@@ -3809,6 +4059,94 @@ mod tests {
     }
 
     #[test]
+    fn resolve_daemon_bin_prefers_process_identity_sibling() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-daemon-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+
+        let bluey = bin_dir.join(format!("bluey{}", std::env::consts::EXE_SUFFIX));
+        let legacy_daemon = bin_dir.join(format!("bluey-daemon{}", std::env::consts::EXE_SUFFIX));
+        let identity_daemon = bin_dir.join(format!("termb{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&bluey, b"bluey").expect("write bluey");
+        fs::write(&legacy_daemon, b"bluey-daemon").expect("write legacy daemon");
+        fs::write(&identity_daemon, b"bluey-daemon").expect("write identity daemon");
+
+        assert_eq!(
+            resolve_daemon_bin_from_roots(vec![PathBuf::from("/missing/bluey"), bluey]),
+            Some(identity_daemon)
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn resolve_daemon_bin_rejects_non_bluey_identity_sibling() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-daemon-wrong-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+
+        let bluey = bin_dir.join(format!("bluey{}", std::env::consts::EXE_SUFFIX));
+        let legacy_daemon = bin_dir.join(format!("bluey-daemon{}", std::env::consts::EXE_SUFFIX));
+        let identity_daemon = bin_dir.join(format!("termb{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&bluey, b"bluey").expect("write bluey");
+        fs::write(&legacy_daemon, b"bluey-daemon").expect("write legacy daemon");
+        fs::write(&identity_daemon, b"pinky").expect("write wrong identity daemon");
+
+        assert_eq!(
+            resolve_daemon_bin_from_roots(vec![PathBuf::from("/missing/bluey"), bluey]),
+            Some(legacy_daemon)
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_daemon_bin_rejects_symlinked_identity_sibling() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-daemon-symlink-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+
+        let bluey = bin_dir.join("bluey");
+        let legacy_daemon = bin_dir.join("bluey-daemon");
+        let wrong_daemon = bin_dir.join("other-terminal");
+        let identity_daemon = bin_dir.join("termb");
+        fs::write(&bluey, b"bluey").expect("write bluey");
+        fs::write(&legacy_daemon, b"bluey-daemon").expect("write legacy daemon");
+        fs::write(&wrong_daemon, b"bluey-daemon").expect("write wrong daemon");
+        std::os::unix::fs::symlink(&wrong_daemon, &identity_daemon)
+            .expect("symlink identity daemon");
+
+        assert_eq!(
+            resolve_daemon_bin_from_roots(vec![PathBuf::from("/missing/bluey"), bluey]),
+            Some(legacy_daemon)
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn daemon_binary_change_check_detects_newer_installed_binary() {
         let base = std::env::temp_dir().join(format!(
             "bluey-daemon-mtime-{}-{}",
@@ -3871,16 +4209,26 @@ mod tests {
         fs::create_dir_all(&base).expect("create temp dir");
         let expected = base.join("bluey-daemon");
         let other = base.join("bluey-daemon-other");
+        let identity = base.join("termb");
         fs::write(&expected, b"daemon").expect("write expected daemon");
         fs::write(&other, b"daemon").expect("write other daemon");
+        fs::write(&identity, b"daemon").expect("write identity daemon");
 
         assert!(super::recorded_daemon_command_matches(
             &format!("{} --foreground", expected.display()),
             Some(&expected),
         ));
+        assert!(super::recorded_daemon_command_matches(
+            &format!("{} --foreground", identity.display()),
+            Some(&identity),
+        ));
         assert!(!super::recorded_daemon_command_matches(
             &format!("{} --foreground", other.display()),
             Some(&expected),
+        ));
+        assert!(!super::recorded_daemon_command_matches(
+            &format!("{} --foreground", identity.display()),
+            None,
         ));
 
         let _ = fs::remove_dir_all(base);

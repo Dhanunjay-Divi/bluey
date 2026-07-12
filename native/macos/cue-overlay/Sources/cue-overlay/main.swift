@@ -311,13 +311,13 @@ private func balanceVisualTone(for label: String) -> BalanceVisualTone {
 
 private let minimumOverlayBackgroundOpacity: CGFloat = 0.18
 private let supportedDropFormatsMessage =
-    "Supported: PDF, DOC/DOCX, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images."
+    "Supported: PDF, Word, PowerPoint, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images. Video files are not readable context yet."
 private let supportedDropExtensions: Set<String> = [
     "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc",
     "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx",
     "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh",
     "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss",
-    "pdf", "doc", "docx", "rtf", "xls", "xlsx", "xlsm", "xlsb", "ods",
+    "pdf", "doc", "docx", "rtf", "ppt", "pptx", "xls", "xlsx", "xlsm", "xlsb", "ods",
     "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif",
 ]
 private let overlayLightThemeDefaultsKey = "bluey.overlay.lightTheme"
@@ -339,6 +339,7 @@ private func blueyLightMaterialAlpha(_ base: CGFloat, opacity: CGFloat, floor: C
 private enum OverlayPlacementStore {
     private static let pillFrameKey = "bluey.overlay.pill.frame.v2"
     private static let expandedFrameKey = "bluey.overlay.expanded.frame.v2"
+    private static let firstExpandedShortcutHelpKey = "bluey.overlay.firstExpandedShortcutHelpShown.v1"
 
     static func loadPillFrame(in visibleFrame: NSRect) -> NSRect? {
         loadFrame(key: pillFrameKey).map { clampedPillFrame($0, in: visibleFrame) }
@@ -350,6 +351,15 @@ private enum OverlayPlacementStore {
 
     static func clearPillFrame() {
         UserDefaults.standard.removeObject(forKey: pillFrameKey)
+    }
+
+    static func consumeFirstExpandedShortcutHelp() -> Bool {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: firstExpandedShortcutHelpKey) else {
+            return false
+        }
+        defaults.set(true, forKey: firstExpandedShortcutHelpKey)
+        return true
     }
 
     static func loadExpandedFrame(in visibleFrame: NSRect) -> NSRect? {
@@ -1386,6 +1396,7 @@ private struct OverlayContextItem: Decodable {
     let title: String
     let kind: String
     let path: String?
+    let processingStatus: String?
 }
 
 private struct OverlaySessionItem {
@@ -1442,6 +1453,8 @@ private enum OverlayCommand {
     case setSessions([OverlaySessionItem])
     case setActiveSession(id: String?, code: String, title: String)
     case listeningStateChanged(String)
+    case audioAutoStopCountdown(remainingSecs: Int, idleSecs: Int)
+    case audioAutoStopCountdownCleared
     case transcriptPartial(source: String, text: String)
     case transcriptFinal(source: String, text: String)
     case setPassthrough(enabled: Bool, durationMs: Int?)
@@ -1487,7 +1500,8 @@ private func parseCommand(_ line: String) -> OverlayCommand {
                 id: item["id"] as? String ?? UUID().uuidString,
                 title: item["title"] as? String ?? "Attached file",
                 kind: item["kind"] as? String ?? "document",
-                path: item["path"] as? String
+                path: item["path"] as? String,
+                processingStatus: item["processing_status"] as? String
             )
         }
         return .setContextItems(items)
@@ -1511,6 +1525,12 @@ private func parseCommand(_ line: String) -> OverlayCommand {
             title: obj["title"] as? String ?? "")
     case "listening_state_changed":
         return .listeningStateChanged(obj["state"] as? String ?? "idle")
+    case "audio_auto_stop_countdown":
+        return .audioAutoStopCountdown(
+            remainingSecs: obj["remaining_secs"] as? Int ?? 0,
+            idleSecs: obj["idle_secs"] as? Int ?? 0)
+    case "audio_auto_stop_countdown_cleared":
+        return .audioAutoStopCountdownCleared
     case "transcript_partial":
         return .transcriptPartial(
             source: obj["source"] as? String ?? "audio",
@@ -1701,13 +1721,23 @@ private func emitLifecycle(_ stage: String, status: String = "ok", detail: Strin
     emitEvent(payload)
 }
 
-private func emitAsk(question: String, provider: String?, model: String?, mode: String?, visibleContextIds: [String] = []) {
+private func emitAsk(
+    question: String,
+    provider: String?,
+    model: String?,
+    mode: String?,
+    visibleContextIds: [String] = [],
+    answerCurrentTranscript: Bool = false
+) {
     var p: [String: Any] = ["type": "ask_requested", "question": question]
     if let provider = provider { p["provider"] = provider }
     if let model = model       { p["model"]    = model }
     if let mode = mode         { p["mode"]     = mode }
     if !visibleContextIds.isEmpty {
         p["visible_context_ids"] = visibleContextIds
+    }
+    if answerCurrentTranscript {
+        p["answer_current_transcript"] = true
     }
     emitEvent(p)
 }
@@ -2294,6 +2324,11 @@ private final class CanvasCardButton: NSButton {
     var cardId = ""
 }
 
+private final class RecoveryCardButton: NSButton {
+    var cardId = ""
+    var continuesPartial = false
+}
+
 private final class RemoveAttachmentButton: NSButton {
     var contextId = ""
 }
@@ -2876,6 +2911,7 @@ private final class FeedView: NSView {
     var onTranscript: ((RenderedCard) -> Void)?
     var onOpenURL: ((URL) -> Void)?
     var onOpenCanvasForCard: ((String) -> Void)?
+    var onRecoverAnswerForCard: ((String, Bool) -> Void)?
 
     private var panelColor: NSColor {
         lightThemeEnabled
@@ -3482,7 +3518,14 @@ private final class FeedView: NSView {
         let canvasButton = shouldShowCanvasButton(for: card, rightAligned: rightAligned, signInURL: signInURL)
             ? makeCanvasCardButton(cardId: card.id, artifactType: card.artifact?.artifactType, rightAligned: rightAligned)
             : nil
-        let actionButtons = [copyButton, canvasButton].compactMap { $0 }
+        let recoveryButton = recoveryAction(for: card).map {
+            makeRecoveryCardButton(
+                cardId: card.id,
+                title: $0.title,
+                continuesPartial: $0.continuesPartial,
+                rightAligned: rightAligned)
+        }
+        let actionButtons = [recoveryButton, copyButton, canvasButton].compactMap { $0 }
 
         let signInButton: NSButton? = signInURL.map { _ in
             let button = NSButton(title: "Sign in", target: self, action: #selector(signInButtonClicked(_:)))
@@ -3501,8 +3544,12 @@ private final class FeedView: NSView {
             titleLabel.alignment = .center
             bodyLabel.preferredMaxLayoutWidth = 360
         }
-        let sentAttachmentStrip = (!signInLike && rightAligned && !card.attachments.isEmpty)
-            ? makeSentAttachmentStrip(card.attachments)
+        let sourceCard = !rightAligned
+            && kind == "context"
+            && (card.title.localizedCaseInsensitiveContains("source")
+                || card.attachments.contains(where: { $0.kind.caseInsensitiveCompare("web") == .orderedSame }))
+        let sentAttachmentStrip = (!signInLike && (rightAligned || sourceCard) && !card.attachments.isEmpty)
+            ? makeSentAttachmentStrip(card.attachments, rightAligned: rightAligned)
             : nil
 
         row.addSubview(bubble)
@@ -3518,6 +3565,9 @@ private final class FeedView: NSView {
         }
         if let canvasButton {
             bubble.addSubview(canvasButton)
+        }
+        if let recoveryButton {
+            bubble.addSubview(recoveryButton)
         }
         if let signInButton {
             bubble.addSubview(signInButton)
@@ -3626,7 +3676,7 @@ private final class FeedView: NSView {
         return row
     }
 
-    private func makeSentAttachmentStrip(_ items: [OverlayContextItem]) -> NSScrollView {
+    private func makeSentAttachmentStrip(_ items: [OverlayContextItem], rightAligned: Bool) -> NSScrollView {
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.drawsBackground = false
@@ -3645,7 +3695,7 @@ private final class FeedView: NSView {
         stack.spacing = 6
         stack.edgeInsets = NSEdgeInsets(top: 1, left: 0, bottom: 1, right: 0)
         for item in items {
-            stack.addArrangedSubview(makeSentAttachmentChip(item))
+            stack.addArrangedSubview(makeSentAttachmentChip(item, rightAligned: rightAligned))
         }
 
         scroll.documentView = stack
@@ -3659,19 +3709,23 @@ private final class FeedView: NSView {
         return scroll
     }
 
-    private func makeSentAttachmentChip(_ item: OverlayContextItem) -> NSView {
+    private func makeSentAttachmentChip(_ item: OverlayContextItem, rightAligned: Bool) -> NSView {
         let isImage = feedAttachmentIsImage(item.kind)
         let chip = NSView()
         chip.translatesAutoresizingMaskIntoConstraints = false
         chip.wantsLayer = true
-        chip.layer?.backgroundColor = isImage
-            ? NSColor(red: 0.78, green: 0.90, blue: 0.98, alpha: 0.34).cgColor
-            : NSColor.black.withAlphaComponent(0.045).cgColor
+        chip.layer?.backgroundColor = rightAligned
+            ? (isImage
+                ? NSColor(red: 0.78, green: 0.90, blue: 0.98, alpha: 0.34).cgColor
+                : NSColor.black.withAlphaComponent(0.045).cgColor)
+            : BlueyTheme.cyan.withAlphaComponent(0.09).cgColor
         chip.layer?.cornerRadius = 12
         chip.layer?.borderWidth = 1
-        chip.layer?.borderColor = isImage
-            ? BlueyTheme.cyan.withAlphaComponent(0.34).cgColor
-            : NSColor.black.withAlphaComponent(0.10).cgColor
+        chip.layer?.borderColor = rightAligned
+            ? (isImage
+                ? BlueyTheme.cyan.withAlphaComponent(0.34).cgColor
+                : NSColor.black.withAlphaComponent(0.10).cgColor)
+            : BlueyTheme.cyan.withAlphaComponent(0.28).cgColor
         let titleText = item.title.isEmpty ? (isImage ? "Screen" : "Attached file") : item.title
         chip.toolTip = (["Sent with this question", titleText, item.kind.uppercased(), item.path]
             .compactMap { value -> String? in
@@ -3703,7 +3757,7 @@ private final class FeedView: NSView {
         let title = NSTextField(labelWithString: titleText)
         title.translatesAutoresizingMaskIntoConstraints = false
         title.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
-        title.textColor = NSColor.black.withAlphaComponent(0.72)
+        title.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.72) : textColor
         title.lineBreakMode = .byTruncatingMiddle
         title.maximumNumberOfLines = 1
         title.toolTip = chip.toolTip
@@ -3742,12 +3796,18 @@ private final class FeedView: NSView {
     @objc private func openSentAttachmentClicked(_ sender: AttachmentOpenButton) {
         guard let path = sender.filePath?.trimmingCharacters(in: .whitespacesAndNewlines),
               !path.isEmpty else { return }
-        onOpenURL?(URL(fileURLWithPath: path))
+        if path.hasPrefix("https://") || path.hasPrefix("http://") {
+            guard let url = URL(string: path) else { return }
+            onOpenURL?(url)
+        } else {
+            onOpenURL?(URL(fileURLWithPath: path))
+        }
     }
 
     private func feedAttachmentSymbol(for kind: String) -> String {
         switch kind {
         case "image", "diagram", "screen", "screenshot": return "photo"
+        case "web": return "globe"
         case "code": return "curlybraces"
         case "text": return "doc.plaintext"
         case "document": return "doc.text"
@@ -3769,6 +3829,8 @@ private final class FeedView: NSView {
             return NSColor(red: 1.0, green: 0.82, blue: 0.42, alpha: 1.0)
         case "document":
             return NSColor(red: 1.0, green: 0.43, blue: 0.34, alpha: 1.0)
+        case "web":
+            return BlueyTheme.cyan
         default:
             return BlueyTheme.cyan
         }
@@ -3833,8 +3895,53 @@ private final class FeedView: NSView {
         return button
     }
 
+    private func makeRecoveryCardButton(
+        cardId: String,
+        title: String,
+        continuesPartial: Bool,
+        rightAligned: Bool
+    ) -> RecoveryCardButton {
+        let button = RecoveryCardButton(title: title, target: self, action: #selector(recoverCardClicked(_:)))
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.cardId = cardId
+        button.continuesPartial = continuesPartial
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 10
+        button.layer?.backgroundColor = rightAligned
+            ? NSColor.black.withAlphaComponent(0.06).cgColor
+            : BlueyTheme.cyan.withAlphaComponent(0.12).cgColor
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = rightAligned
+            ? NSColor.black.withAlphaComponent(0.10).cgColor
+            : BlueyTheme.cyan.withAlphaComponent(0.34).cgColor
+        button.contentTintColor = rightAligned ? NSColor.black.withAlphaComponent(0.70) : BlueyTheme.cyan
+        button.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        button.toolTip = continuesPartial ? "Continue the saved partial answer" : "Retry this answer"
+        return button
+    }
+
+    private func recoveryAction(for card: RenderedCard) -> (title: String, continuesPartial: Bool)? {
+        guard card.done, normalizedCardKind(card.kind) == "answer" else { return nil }
+        let lower = card.body.lowercased()
+        if lower.contains("kept the partial answer") || lower.contains("select continue") {
+            return ("Continue", true)
+        }
+        if lower.contains("select retry")
+            || lower.contains("could not finish")
+            || lower.contains("could not complete")
+            || lower.contains("busy for a moment")
+        {
+            return ("Retry", false)
+        }
+        return nil
+    }
+
     private func actionButtonWidth(_ button: NSButton) -> CGFloat {
-        button is CopyCardButton ? 22 : 24
+        if let recovery = button as? RecoveryCardButton {
+            return recovery.continuesPartial ? 68 : 48
+        }
+        return button is CopyCardButton ? 22 : 24
     }
 
     private func shouldShowCopyButton(for card: RenderedCard, rightAligned: Bool, signInURL: URL?) -> Bool {
@@ -3861,6 +3968,10 @@ private final class FeedView: NSView {
 
     @objc private func openCanvasCardClicked(_ sender: CanvasCardButton) {
         onOpenCanvasForCard?(sender.cardId)
+    }
+
+    @objc private func recoverCardClicked(_ sender: RecoveryCardButton) {
+        onRecoverAnswerForCard?(sender.cardId, sender.continuesPartial)
     }
 
     private func flashCopySuccess(_ button: CopyCardButton) {
@@ -5070,6 +5181,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let autoSendCaptionSettleDelaySeconds: TimeInterval = 0.3
         static let autoSendCaptionPartialSettleDelayMs: Int = 900
         static let autoSendCaptionPartialSettleDelaySeconds: TimeInterval = 0.9
+        static let manualSendCaptionSettleDelayMs: Int = 600
+        static let manualSendCaptionSettleDelaySeconds: TimeInterval = 0.6
+        static let manualSendFinalCaptionSettleDelaySeconds: TimeInterval = 0.25
+        static let manualSendCaptionSettleMaxSeconds: TimeInterval = 2.0
+        static let postSendTranscriptSuppressSeconds: TimeInterval = 1.25
         static let clickThroughMoveHandleSize: CGFloat = 42
         static let clickThroughMoveHandleHitPadding: CGFloat = 26
     }
@@ -5210,6 +5326,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return mode
     }()
     private var autoSendAfterStopWorkItem: DispatchWorkItem?
+    private var manualAnswerAfterTranscriptSettleWorkItem: DispatchWorkItem?
+    private var manualAnswerTranscriptSettleStartedAt: Date?
+    private var suppressTranscriptUntil = Date.distantPast
+    private var suppressTranscriptFingerprintsBySource: [String: [String]] = [:]
     private var lastSubmittedAskFingerprint: String?
     private var lastSubmittedAskAt: CFTimeInterval = 0
     private var answerStreamStats: [String: AnswerStreamStats] = [:]
@@ -5402,6 +5522,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         feed.onOpenCanvasForCard = { [weak self] cardId in
             self?.openCanvasForCardId(cardId)
+        }
+        feed.onRecoverAnswerForCard = { [weak self] cardId, continuesPartial in
+            self?.recoverAnswerForCardId(cardId, continuesPartial: continuesPartial)
         }
 
         for view in [
@@ -8274,7 +8397,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let badgeGap: CGFloat = 6
         let middleWidth = max(0, right - left)
         let routeWidth = headerBadgeWidth(routeBadge, minimum: 74, maximum: 94)
-        let preferredDocsWidth = headerBadgeWidth(knowledgeBadge, minimum: 92, maximum: 112)
+        let preferredDocsWidth = headerBadgeWidth(knowledgeBadge, minimum: 92, maximum: 176)
         let canShowRoute = middleWidth >= routeWidth
         let docsWidth = min(preferredDocsWidth, max(0, middleWidth - (canShowRoute ? routeWidth + badgeGap : 0)))
         routeBadge.isHidden = !canShowRoute
@@ -8332,7 +8455,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         statusLabel.isHidden = true
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        modelMenu.addItems(withTitles: ["Auto", "Instant", "Balanced", "Deep"])
+        modelMenu.addItems(withTitles: ["Auto", "Quick", "Thorough"])
         modelMenu.selectItem(at: 0)
         modelMenu.isBordered = false
         modelMenu.wantsLayer = true
@@ -8357,7 +8480,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateShortcutsButtonChrome()
 
         styleHeaderBadge(routeBadge, textColor: BlueyTheme.green)
-        routeBadge.toolTip = "Auto Router classification and selected lane"
+        routeBadge.toolTip = "Bluey status"
 
         styleHeaderBadge(knowledgeBadge, textColor: BlueyTheme.text)
         knowledgeBadge.toolTip = "Show or hide attached files"
@@ -8681,7 +8804,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         navButton.toolTip = "Open or close conversation history"
         drawerCloseButton.toolTip = "Close conversation history"
         newSessionButton.toolTip = "Start a new recording"
-        modelMenu.toolTip = "Choose Auto, Instant, Balanced, or Deep"
+        modelMenu.toolTip = "Choose Auto, Quick, or Thorough"
         autoSendModeMenu.toolTip = autoSendStopMode.tooltip
         canvasToggleButton.toolTip = "Open or collapse the canvas"
         themeButton.toolTip = lightThemeEnabled ? "Switch to dark theme" : "Switch to light theme"
@@ -8899,6 +9022,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         configureCloseConfirmForShortcutList()
         presentConfirmationOverlay()
         emitLifecycle("shortcuts_overlay_opened", detail: "platform=macos")
+    }
+
+    func showShortcutHelpOverlay(source: String) {
+        pendingDeleteSessionId = nil
+        configureCloseConfirmForShortcutList()
+        presentConfirmationOverlay()
+        emitLifecycle("shortcuts_overlay_opened", detail: "source=\(source) platform=macos")
     }
 
     @objc private func closeClicked() {
@@ -9560,7 +9690,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             provider: route.provider,
             model: route.model,
             mode: route.mode,
-            visibleContextIds: sentContextIds
+            visibleContextIds: sentContextIds,
+            answerCurrentTranscript: true
         )
         consumeSentPendingContextAttachments()
         screenContextReadyForAnswer = false
@@ -9605,6 +9736,80 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func askClicked() {
         guard !handleSignedOutGateAction(action: "answer") else { return }
+        guard !scheduleManualAnswerAfterTranscriptSettleIfNeeded() else { return }
+        submitAnswerNow(origin: "manual")
+    }
+
+    private func scheduleManualAnswerAfterTranscriptSettleIfNeeded() -> Bool {
+        let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard raw.isEmpty, recordingActive else { return false }
+        if manualAnswerAfterTranscriptSettleWorkItem != nil {
+            emitLifecycle(
+                "manual_answer_settle_already_pending",
+                detail: "delay_ms=\(ChromeMetrics.manualSendCaptionSettleDelayMs)"
+            )
+            return true
+        }
+
+        autoSendAfterStopWorkItem?.cancel()
+        autoSendAfterStopWorkItem = nil
+        manualAnswerTranscriptSettleStartedAt = Date()
+        setTranscriptState("FINALIZING", active: true)
+        emitLifecycle(
+            "manual_answer_waiting_for_transcript_settle",
+            detail: "delay_ms=\(ChromeMetrics.manualSendCaptionSettleDelayMs) snippets=\(transcriptSnippets.count) live_sources=\(latestLiveTranscriptLinesBySource.count) preview_sources=\(liveTranscriptPreviewBodies.count)"
+        )
+        scheduleManualAnswerAfterTranscriptQuietPeriod(
+            delay: ChromeMetrics.manualSendCaptionSettleDelaySeconds,
+            origin: "manual_after_transcript_settle"
+        )
+        return true
+    }
+
+    private func scheduleManualAnswerAfterTranscriptQuietPeriod(delay: TimeInterval, origin: String) {
+        manualAnswerAfterTranscriptSettleWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.manualAnswerAfterTranscriptSettleWorkItem = nil
+            self.manualAnswerTranscriptSettleStartedAt = nil
+            self.submitAnswerNow(origin: origin)
+        }
+        manualAnswerAfterTranscriptSettleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, delay), execute: work)
+    }
+
+    private func rescheduleManualAnswerAfterTranscriptUpdate(final: Bool) {
+        guard manualAnswerAfterTranscriptSettleWorkItem != nil,
+              let startedAt = manualAnswerTranscriptSettleStartedAt else { return }
+        let remaining = ChromeMetrics.manualSendCaptionSettleMaxSeconds
+            - Date().timeIntervalSince(startedAt)
+        if remaining <= 0 {
+            manualAnswerAfterTranscriptSettleWorkItem?.cancel()
+            manualAnswerAfterTranscriptSettleWorkItem = nil
+            manualAnswerTranscriptSettleStartedAt = nil
+            DispatchQueue.main.async { [weak self] in
+                self?.submitAnswerNow(origin: "manual_after_transcript_settle_cap")
+            }
+            return
+        }
+        let quietDelay = final
+            ? ChromeMetrics.manualSendFinalCaptionSettleDelaySeconds
+            : ChromeMetrics.manualSendCaptionSettleDelaySeconds
+        let delay = min(quietDelay, remaining)
+        emitLifecycle(
+            "manual_answer_transcript_settle_extended",
+            detail: "final=\(final) delay_ms=\(Int(delay * 1000)) remaining_ms=\(Int(remaining * 1000))"
+        )
+        scheduleManualAnswerAfterTranscriptQuietPeriod(
+            delay: delay,
+            origin: "manual_after_transcript_update"
+        )
+    }
+
+    private func submitAnswerNow(origin: String) {
+        manualAnswerAfterTranscriptSettleWorkItem?.cancel()
+        manualAnswerAfterTranscriptSettleWorkItem = nil
+        manualAnswerTranscriptSettleStartedAt = nil
         autoSendAfterStopWorkItem?.cancel()
         autoSendAfterStopWorkItem = nil
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -9644,14 +9849,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateRouteBadge(for: q, selectedRoute: route)
         emitLifecycle(
             "ask_answer_sent",
-            detail: "typed_chars=\(raw.count) question_chars=\(q.count) transcript_context=\(hadTranscriptContext) preview_transcript_context=\(hadPreviewTranscriptContext) generic_live_prompt=\(isLiveTranscriptAnswerPrompt(q)) context_ids=\(sentContextIds.count)"
+            detail: "origin=\(origin) typed_chars=\(raw.count) question_chars=\(q.count) transcript_context=\(hadTranscriptContext) preview_transcript_context=\(hadPreviewTranscriptContext) generic_live_prompt=\(isLiveTranscriptAnswerPrompt(q)) context_ids=\(sentContextIds.count)"
         )
         emitAsk(
             question: q,
             provider: route.provider,
             model: route.model,
             mode: route.mode,
-            visibleContextIds: sentContextIds
+            visibleContextIds: sentContextIds,
+            answerCurrentTranscript: hadTranscriptContext || hadPreviewTranscriptContext
         )
         consumeSentPendingContextAttachments()
         screenContextReadyForAnswer = false
@@ -10473,6 +10679,60 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
+    func showAudioAutoStopCountdown(remainingSecs: Int, idleSecs: Int) {
+        let clampedRemaining = max(0, remainingSecs)
+        let idleLabel: String
+        if idleSecs >= 60 {
+            idleLabel = "\(max(1, idleSecs / 60)) min"
+        } else {
+            idleLabel = "\(max(1, idleSecs)) sec"
+        }
+        setAudioPulseActive(false)
+        transcriptStateLabel.stringValue = clampedRemaining > 0 ? "STOP \(clampedRemaining)s" : "STOPPED"
+        transcriptStateLabel.textColor = BlueyTheme.warning
+        transcriptActivityDot.layer?.backgroundColor = BlueyTheme.warning.cgColor
+        transcriptActivityDot.layer?.shadowColor = BlueyTheme.warning.cgColor
+        transcriptActivityDot.layer?.shadowOpacity = clampedRemaining > 0 ? 0.55 : 0.25
+        transcriptActivityDot.layer?.shadowRadius = clampedRemaining > 0 ? 8 : 4
+        transcriptStrip.layer?.backgroundColor = BlueyTheme.warning.withAlphaComponent(0.055).cgColor
+        transcriptStrip.layer?.borderColor = BlueyTheme.warning.withAlphaComponent(0.58).cgColor
+        routeBadge.stringValue = clampedRemaining > 0 ? "● Stops in \(clampedRemaining)s" : "● Auto-stopped"
+        routeBadge.textColor = BlueyTheme.warning
+        routeBadge.toolTip = clampedRemaining > 0
+            ? "No captions for \(idleLabel). Bluey will stop Listen soon to avoid STT billing."
+            : "Bluey stopped Listen to avoid STT billing."
+        let railText = clampedRemaining > 0
+            ? "No captions detected. Auto-stopping in \(clampedRemaining)s to avoid STT billing."
+            : "Listen auto-stopped to avoid STT billing."
+        updateTranscriptStripText(railText, scrollToEnd: false)
+        updateTranscriptClearButtonVisibility()
+        if clampedRemaining == 0 {
+            showSystemToast(
+                title: "Listen auto-stopped",
+                body: "Bluey stopped Listen to avoid STT billing. Start Listen again when you are ready.",
+                duration: 3.4)
+        }
+    }
+
+    func clearAudioAutoStopCountdown() {
+        guard recordingActive || recordingDesiredActive else { return }
+        let restoredSource = lastTranscriptStripSource
+        let restoredBody = restoredSource.flatMap { liveTranscriptPreviewBodies[$0] }
+        setListeningState(.listening)
+        if let label = restoredSource,
+           let body = restoredBody,
+           !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            updateLiveTranscriptStrip(
+                label: label,
+                body: body,
+                state: "TRANSCRIBING",
+                active: true,
+                scrollToEnd: true)
+        } else {
+            updateTranscriptStripText("Listening for speech...", scrollToEnd: false)
+        }
+    }
+
     func cancelAutoSendAfterExternalStop() {
         cancelAutoSendAfterManualStop(origin: "pill")
     }
@@ -10493,29 +10753,27 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if manual {
             switch (selectedRoute.mode ?? selectedRoute.model ?? selectedRoute.provider ?? "Manual").lowercased() {
             case let value where value.contains("instant"):
-                routeBadge.stringValue = "Instant"
+                routeBadge.stringValue = "Quick"
             case let value where value.contains("deep"):
-                routeBadge.stringValue = "Deep"
-            case let value where value.contains("balanced"):
-                routeBadge.stringValue = "Balanced"
+                routeBadge.stringValue = "Thorough"
             default:
-                routeBadge.stringValue = "Manual"
+                routeBadge.stringValue = "Auto"
             }
             routeBadge.textColor = BlueyTheme.text
-            routeBadge.toolTip = "Selected answer lane"
+            routeBadge.toolTip = "Answer detail preference"
             return
         }
 
         let lower = question.lowercased()
         let vision = lower.contains("screen") || lower.contains("screenshot") || lower.contains("image")
         if vision {
-            routeBadge.stringValue = "Auto · Vision"
+            routeBadge.stringValue = "Reading screen"
             routeBadge.textColor = BlueyTheme.warning
-            routeBadge.toolTip = "Bluey is using the screen/image lane"
+            routeBadge.toolTip = "Bluey is reading the attached screen"
         } else {
-            routeBadge.stringValue = "Auto · Balanced"
+            routeBadge.stringValue = "Auto"
             routeBadge.textColor = themedAccentColor
-            routeBadge.toolTip = "Bluey is answering with the balanced auto lane"
+            routeBadge.toolTip = "Bluey is choosing the best answer path"
         }
     }
 
@@ -10590,14 +10848,28 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func savedContextBadgeTitle(for count: Int, showing: Bool = false) -> String {
         let noun = count == 1 ? "file" : "files"
-        return showing ? "Hide \(count) \(noun)" : "Show \(count) \(noun)"
+        guard !showing else { return "Hide \(count) \(noun)" }
+        let labels = contextItems.prefix(2).map { item -> String in
+            if isScreenContextItem(item) {
+                return "Screen"
+            }
+            let clean = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty else { return "File" }
+            return clean.count > 18 ? String(clean.prefix(15)) + "..." : clean
+        }
+        guard !labels.isEmpty else { return "Show \(count) \(noun)" }
+        let remaining = max(0, count - labels.count)
+        return (labels + (remaining > 0 ? ["+\(remaining)"] : [])).joined(separator: " · ")
     }
 
     private func savedContextBadgeTooltip(for count: Int, showing: Bool = false) -> String {
         let noun = count == 1 ? "file" : "files"
+        let names = contextItems.map { isScreenContextItem($0) ? "Screen" : $0.title }
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: " · ")
         return showing
             ? "Hide the \(count) \(noun) attached to this conversation"
-            : "Show every file attached to this conversation"
+            : "Context used: \(names.isEmpty ? "Current conversation" : names + " · Current conversation"). Click to show files."
     }
 
     private func itemsForVisibleAttachmentStrip() -> [OverlayContextItem] {
@@ -11250,35 +11522,41 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             artifact.subtitle = canvasSubtitle(base: artifact.subtitle, followups: followupNumber)
             artifact.followupCount = followupNumber
             artifact.sourceQuestion = existing.sourceQuestion
-            canvases[index] = artifact
-            canvasCardAssignments[artifact.sourceCardId] = index
-            activeCanvasIndex = index
+            // Keep the prior complete artifact navigable while showing the
+            // replacement in the same right-hand workbench immediately.
+            canvases.append(artifact)
+            let versionIndex = canvases.count - 1
+            canvasCardAssignments[artifact.sourceCardId] = versionIndex
+            activeCanvasIndex = versionIndex
             renderActiveCanvas()
             emitLifecycle(
                 "canvas_replace_code_followup",
-                detail: "source_card=\(artifact.sourceCardId) index=\(index) followups=\(followupNumber) question_chars=\((question ?? "").count) question_words=\(wordCount(question)) question_intent=\(questionIntentLabel(question)) body_chars=\(artifact.content.count)")
+                detail: "source_card=\(artifact.sourceCardId) previous_index=\(index) index=\(versionIndex) followups=\(followupNumber) question_chars=\((question ?? "").count) question_words=\(wordCount(question)) question_intent=\(questionIntentLabel(question)) body_chars=\(artifact.content.count)")
             return
         }
 
         if shouldAppendCanvasFollowup(question: question, artifact: artifact),
            let index = activeCanvasIndex,
            canvases.indices.contains(index) {
-            let followupNumber = canvases[index].followupCount + 1
-            canvases[index].followupCount = followupNumber
-            canvases[index].subtitle = canvasSubtitle(
-                base: canvases[index].kind.subtitle,
+            var updated = canvases[index]
+            let followupNumber = updated.followupCount + 1
+            updated.followupCount = followupNumber
+            updated.subtitle = canvasSubtitle(
+                base: updated.kind.subtitle,
                 followups: followupNumber)
-            canvases[index].content = appendCanvasFollowup(
-                to: canvases[index].content,
+            updated.content = appendCanvasFollowup(
+                to: updated.content,
                 question: question,
                 artifact: artifact,
                 number: followupNumber)
-            canvasCardAssignments[artifact.sourceCardId] = index
-            activeCanvasIndex = index
+            canvases.append(updated)
+            let versionIndex = canvases.count - 1
+            canvasCardAssignments[artifact.sourceCardId] = versionIndex
+            activeCanvasIndex = versionIndex
             renderActiveCanvas()
             emitLifecycle(
                 "canvas_append_followup",
-                detail: "source_card=\(artifact.sourceCardId) index=\(index) followups=\(followupNumber) kind=\(artifact.kind.shortTitle) question_chars=\((question ?? "").count) question_words=\(wordCount(question)) question_intent=\(questionIntentLabel(question)) body_chars=\(artifact.content.count)")
+                detail: "source_card=\(artifact.sourceCardId) previous_index=\(index) index=\(versionIndex) followups=\(followupNumber) kind=\(artifact.kind.shortTitle) question_chars=\((question ?? "").count) question_words=\(wordCount(question)) question_intent=\(questionIntentLabel(question)) body_chars=\(updated.content.count)")
             return
         }
 
@@ -11339,6 +11617,28 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             detail: "source_card=\(cardId) index=\(activeCanvasIndex ?? -1) count=\(canvases.count)")
     }
 
+    private func recoverAnswerForCardId(_ cardId: String, continuesPartial: Bool) {
+        let prompt: String
+        if continuesPartial {
+            prompt = "Continue the previous answer from where it stopped. Do not repeat completed content. Finish any missing code, explanation, complexity, or conclusion."
+        } else {
+            prompt = feed.nearestQuestionBody(beforeCardId: cardId)
+                ?? "Retry the previous question and return a complete answer."
+        }
+        let route = selectedRoute()
+        updateRouteBadge(for: prompt, selectedRoute: route)
+        emitLifecycle(
+            "answer_recovery_requested",
+            detail: "action=\(continuesPartial ? "continue" : "retry") card=\(cardId)"
+        )
+        emitAsk(
+            question: prompt,
+            provider: route.provider,
+            model: route.model,
+            mode: route.mode
+        )
+    }
+
     private func showPreviousCanvas() {
         guard let index = activeCanvasIndex, index > 0 else { return }
         activeCanvasIndex = index - 1
@@ -11360,7 +11660,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func canvasSubtitle(base: String, followups: Int) -> String {
         guard followups > 0 else { return base }
         let suffix = followups == 1 ? "1 follow-up" : "\(followups) follow-ups"
-        return "\(base) · \(suffix)"
+        return "\(base) · Version \(followups + 1) · \(suffix)"
     }
 
     private func shouldCloseCanvasForPlainAnswer(question: String?) -> Bool {
@@ -12470,7 +12770,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                     detail: "card=\(card.id) kind=\(kind.shortTitle) title_chars=\(artifact.title.count) body_chars=\(artifact.body.count)")
                 return nil
             }
-            let confidence = artifact.confidence.map { "Confidence \(Int(($0 * 100).rounded()))%" }
             let artifactBody = artifact.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? body
                 : artifact.body
@@ -12484,7 +12783,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return CanvasArtifact(
                 kind: kind,
                 title: artifact.title.isEmpty ? kind.title : artifact.title,
-                subtitle: confidence ?? kind.subtitle,
+                subtitle: kind.subtitle,
                 content: content,
                 sourceCardId: card.id)
         }
@@ -12538,10 +12837,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func appendTranscriptSnippet(_ card: RenderedCard) {
         let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let body = trimConsumedTranscriptPrefix(from: displayTranscriptText(card.body))
+        let label = transcriptSourceLabel(title)
+        let rawBody = displayTranscriptText(card.body).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !shouldSuppressRecentlyConsumedTranscript(label: label, body: rawBody, final: true) else { return }
+        let body = trimConsumedTranscriptPrefix(from: rawBody)
         guard !body.isEmpty else { return }
 
-        let label = transcriptSourceLabel(title)
         if shouldSuppressCrossSourceTranscriptPreview(label: label, body: body) { return }
         let preview = mergedLiveTranscriptPreview(label: label, body: body, final: true)
         rememberTranscriptForAnswer(label: label, body: body, final: true)
@@ -12554,8 +12855,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func appendLiveTranscript(source: String, text: String, final: Bool) {
-        let body = trimConsumedTranscriptPrefix(from: displayTranscriptText(text))
         let label = transcriptSourceLabel(source)
+        let rawBody = displayTranscriptText(text).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !shouldSuppressRecentlyConsumedTranscript(label: label, body: rawBody, final: final) else { return }
+        let body = trimConsumedTranscriptPrefix(from: rawBody)
         let state = recordingActive ? "TRANSCRIBING" : (final ? "CAPTURED" : "HEARD")
         guard !body.isEmpty else {
             setTranscriptState(state, active: recordingActive)
@@ -12633,6 +12936,57 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateTranscriptClearButtonVisibility()
     }
 
+    private func rememberRecentlyConsumedTranscriptLines(_ lines: [String]) {
+        let until = Date().addingTimeInterval(ChromeMetrics.postSendTranscriptSuppressSeconds)
+        if until > suppressTranscriptUntil {
+            suppressTranscriptUntil = until
+        }
+        for line in lines {
+            let parsed = parsedTranscriptMemoryLine(line)
+            let label = transcriptSourceLabel(parsed.label)
+            let fingerprint = compactTranscriptMemoryLine(parsed.body)
+            guard fingerprint.count >= 8 else { continue }
+            var values = suppressTranscriptFingerprintsBySource[label, default: []]
+            if !values.contains(fingerprint) {
+                values.append(fingerprint)
+            }
+            if values.count > 12 {
+                values.removeFirst(values.count - 12)
+            }
+            suppressTranscriptFingerprintsBySource[label] = values
+        }
+    }
+
+    private func shouldSuppressRecentlyConsumedTranscript(label: String, body: String, final: Bool) -> Bool {
+        if Date() > suppressTranscriptUntil {
+            suppressTranscriptFingerprintsBySource.removeAll()
+            return false
+        }
+        let cleanBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanBody.isEmpty else { return false }
+        let fingerprint = compactTranscriptMemoryLine(cleanBody)
+        guard fingerprint.count >= 8 else { return false }
+        let cleanLabel = transcriptSourceLabel(label)
+        let candidates = Array(Set(
+            (suppressTranscriptFingerprintsBySource[cleanLabel] ?? [])
+                + (suppressTranscriptFingerprintsBySource["Audio"] ?? [])
+                + suppressTranscriptFingerprintsBySource.values.flatMap { $0 }
+        ))
+        for consumed in candidates {
+            guard !consumed.isEmpty else { continue }
+            if fingerprint == consumed
+                || fingerprint.contains(consumed)
+                || consumed.contains(fingerprint) {
+                emitLifecycle(
+                    "transcript_buffer_skip_late_consumed",
+                    detail: "source=\(cleanLabel) final=\(final) body_chars=\(cleanBody.count) suppress_remaining_ms=\(max(0, Int(suppressTranscriptUntil.timeIntervalSinceNow * 1000)))"
+                )
+                return true
+            }
+        }
+        return false
+    }
+
     private func rememberTranscriptForAnswer(label: String, body: String, final: Bool) {
         let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -12666,6 +13020,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             latestLiveTranscriptLine = line
             latestLiveTranscriptLinesBySource[key] = line
         }
+        rescheduleManualAnswerAfterTranscriptUpdate(final: final)
         updateTranscriptClearButtonVisibility()
     }
 
@@ -12696,6 +13051,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func clearLocalTranscriptContext(replacementText: String) {
+        manualAnswerAfterTranscriptSettleWorkItem?.cancel()
+        manualAnswerAfterTranscriptSettleWorkItem = nil
+        manualAnswerTranscriptSettleStartedAt = nil
         emitLifecycle(
             "transcript_context_cleared",
             detail: "snippets=\(transcriptSnippets.count) live_sources=\(latestLiveTranscriptLinesBySource.count) autosend_sources=\(autoSendTranscriptLinesBySource.count) preview_sources=\(liveTranscriptPreviewBodies.count) consumed_fingerprints=\(consumedTranscriptFingerprints.count)"
@@ -12707,6 +13065,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         autoSendTranscriptLinesBySource.removeAll()
         liveTranscriptPreviewBodies.removeAll()
         consumedTranscriptFingerprints.removeAll()
+        suppressTranscriptFingerprintsBySource.removeAll()
+        suppressTranscriptUntil = Date.distantPast
         lastTranscriptStripSource = nil
         updateTranscriptStripText(replacementText, scrollToEnd: false)
         updateTranscriptClearButtonVisibility()
@@ -12824,6 +13184,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if consumedTranscriptFingerprints.count > 24 {
             consumedTranscriptFingerprints.removeFirst(consumedTranscriptFingerprints.count - 24)
         }
+        rememberRecentlyConsumedTranscriptLines(lines)
         emitLifecycle(
             "transcript_buffer_consumed",
             detail: "lines=\(lines.count) new_fingerprints=\(newlyConsumed) retained_fingerprints=\(consumedTranscriptFingerprints.count) recording=\(recordingActive)"
@@ -12854,7 +13215,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if let visible = liveTranscriptVisibleQuestion(from: candidate, requireMeaningful: false) {
             return visible
         }
-        return liveTranscriptAnswerPrompt()
+        return candidate
     }
 
     private func transcriptTextReadyForAnswer() -> String? {
@@ -13343,11 +13704,26 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         chip.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.030).cgColor
         chip.layer?.cornerRadius = 12
         chip.layer?.borderWidth = 1
-        chip.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.18).cgColor
-        let titleText = item.title.isEmpty ? "Attached file" : item.title
+        let status = (item.processingStatus ?? "").lowercased()
+        let statusAccent: NSColor
+        switch status {
+        case "pending": statusAccent = BlueyTheme.warning
+        case "failed", "unsupported": statusAccent = NSColor.systemRed
+        default: statusAccent = BlueyTheme.green
+        }
+        chip.layer?.borderColor = statusAccent.withAlphaComponent(0.28).cgColor
+        let baseTitle = item.title.isEmpty ? "Attached file" : item.title
+        let titleText: String
+        switch status {
+        case "pending": titleText = "Reading \(baseTitle)..."
+        case "ready": titleText = "\(baseTitle) · Ready"
+        case "failed", "unsupported": titleText = "\(baseTitle) · Needs attention"
+        default: titleText = baseTitle
+        }
         let tooltipParts = [
             titleText,
             item.kind.uppercased(),
+            item.processingStatus,
             item.path,
         ].compactMap { value -> String? in
             guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -13378,7 +13754,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let title = NSTextField(labelWithString: titleText)
         title.translatesAutoresizingMaskIntoConstraints = false
         title.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
-        title.textColor = BlueyTheme.text
+        title.textColor = status == "failed" || status == "unsupported" ? NSColor.systemRed : BlueyTheme.text
         title.lineBreakMode = .byTruncatingMiddle
         title.maximumNumberOfLines = 1
         title.toolTip = chip.toolTip
@@ -13414,7 +13790,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         chip.addSubview(remove)
         NSLayoutConstraint.activate([
             chip.heightAnchor.constraint(equalToConstant: chipHeight),
-            chip.widthAnchor.constraint(lessThanOrEqualToConstant: isImage ? 162 : 176),
+            chip.widthAnchor.constraint(lessThanOrEqualToConstant: isImage ? 196 : 220),
             chip.widthAnchor.constraint(greaterThanOrEqualToConstant: isImage ? 104 : 96),
 
             icon.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 7),
@@ -14234,8 +14610,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         case 1:
             return ("managed", "instant", "instant")
         case 2:
-            return ("managed", "balanced", "balanced")
-        case 3:
             return ("managed", "deep", "deep")
         default:
             return ("auto", nil, "general")
@@ -14330,7 +14704,7 @@ private final class OverlayApp {
         pillView.statusText = "Bluey"
         pillView.setRunState(currentRunState)
         pillView.applyBackgroundOpacity(overlayOpacity)
-        pillView.onClick = { [weak self] in self?.expand() }
+        pillView.onClick = { [weak self] in self?.expand(showFirstRunShortcuts: true) }
         pillView.onRunToggle = { [weak self] in self?.toggleListeningFromPill() }
         pillView.onAsk = { [weak self] in self?.expandAndFocusQuestion() }
         pillView.onEnd = { [weak self] in self?.expandAndConfirmTurnOff() }
@@ -15023,7 +15397,7 @@ private final class OverlayApp {
         expandedWindow.ignoresMouseEvents = !shouldReceiveMouse
     }
 
-    private func expand() {
+    private func expand(showFirstRunShortcuts: Bool = false) {
         ensureExpandedWindow()
         guard let expandedWindow else { return }
         expandedModeActive = true
@@ -15043,6 +15417,19 @@ private final class OverlayApp {
         }
         emitSimple("shown")
         emitLifecycle("expanded")
+        if showFirstRunShortcuts,
+           expandedView?.isSignedOutGateActive != true,
+           OverlayPlacementStore.consumeFirstExpandedShortcutHelp() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+                guard
+                    let self,
+                    self.expandedModeActive,
+                    self.expandedWindow?.isVisible == true,
+                    self.expandedView?.isSignedOutGateActive != true
+                else { return }
+                self.expandedView?.showShortcutHelpOverlay(source: "first_expand")
+            }
+        }
     }
 
     private func ensureExpandedWindow() {
@@ -15222,10 +15609,18 @@ private final class OverlayApp {
                     collapse()
                 }
             } else {
+                let shouldKeepExpanded = expandedModeActive && expandedWindow?.isVisible == true
                 ensureExpandedWindow()
-                expand()
                 expandedView?.showSignedOutLogin(url: nil)
                 pillView?.setHealthState(.needsAttention)
+                if shouldKeepExpanded {
+                    expand()
+                } else {
+                    expandedModeActive = false
+                    expandedWindow?.ignoresMouseEvents = true
+                    expandedWindow?.orderOut(nil)
+                    bringPillToFront(force: true)
+                }
             }
         case .setContextItems(let items):
             expandedView?.setContextItems(items)
@@ -15236,6 +15631,12 @@ private final class OverlayApp {
         case .listeningStateChanged(let state):
             let runState = PillRunState(listeningState: state)
             setRunState(runState)
+        case .audioAutoStopCountdown(let remainingSecs, let idleSecs):
+            expandedView?.showAudioAutoStopCountdown(
+                remainingSecs: remainingSecs,
+                idleSecs: idleSecs)
+        case .audioAutoStopCountdownCleared:
+            expandedView?.clearAudioAutoStopCountdown()
         case .transcriptPartial(let source, let text):
             let runState = PillRunState(listeningState: "listening")
             setRunState(runState)
@@ -15270,12 +15671,16 @@ private final class OverlayApp {
     private func pushBootCard(title: String, lines: [String]) {
         let signInURL = loginURL(from: lines)
         let isSignInBoot = signInURL != nil || title.localizedCaseInsensitiveContains("sign in")
-        guard let view = expandedView else {
-            pendingBoot = (title, lines)
+        if expandedView == nil {
             if isSignInBoot {
                 ensureExpandedWindow()
-                expand()
+            } else {
+                pendingBoot = (title, lines)
+                return
             }
+        }
+        guard let view = expandedView else {
+            pendingBoot = (title, lines)
             return
         }
         let shouldCollapseAfterUnlock = view.isSignedOutGateActive && !isSignInBoot
@@ -15292,7 +15697,14 @@ private final class OverlayApp {
         if isSignInBoot {
             view.showSignedOutLogin(url: signInURL)
             pillView?.setHealthState(.needsAttention)
-            expand()
+            if expandedModeActive && expandedWindow?.isVisible == true {
+                expand()
+            } else {
+                expandedModeActive = false
+                expandedWindow?.ignoresMouseEvents = true
+                expandedWindow?.orderOut(nil)
+                bringPillToFront(force: true)
+            }
         } else {
             view.showSignedInReady()
             pillView?.setHealthState(.ready)

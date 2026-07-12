@@ -34,6 +34,8 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use std::sync::OnceLock;
+use std::time::Duration;
 use thiserror::Error;
 
 use crate::config::UpstreamKeys;
@@ -44,12 +46,28 @@ const ANTHROPIC_BALANCED_MODEL: &str = "claude-sonnet-4-6";
 const ANTHROPIC_DEEP_MODEL: &str = "claude-opus-4-8";
 const ANTHROPIC_FAST_MODEL: &str = "claude-haiku-4-5-20251001";
 const GEMINI_PRO_MODEL: &str = "gemini-3.1-pro-preview";
-const GEMINI_FLASH_MODEL: &str = "gemini-3-flash-preview";
+const GEMINI_FLASH_MODEL: &str = "gemini-3.5-flash";
 const GEMINI_LITE_MODEL: &str = "gemini-3.1-flash-lite";
 const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
 const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
 const ZAI_FLAGSHIP_MODEL: &str = "glm-5.2";
+const ZAI_FAST_MODEL: &str = "glm-4.7-flashx";
 const DEFAULT_DEEPGRAM_LANGUAGE: &str = "en-IN";
+
+/// Reuse upstream TCP/TLS connections across requests. Creating a new
+/// reqwest client for every completion discards connection pools and adds a
+/// fresh handshake to the first-token path.
+fn upstream_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .expect("build shared upstream HTTP client")
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoutePolicy {
@@ -349,6 +367,7 @@ fn resolve_route_candidates_for_policy_and_seed(
         (RoutePolicy::CostOptimized, "instant") => vec![
             ("deepseek", DEEPSEEK_FLASH_MODEL),
             ("gemini", GEMINI_LITE_MODEL),
+            ("zai", ZAI_FAST_MODEL),
             ("openai", OPENAI_FAST_MODEL),
             ("anthropic", ANTHROPIC_FAST_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
@@ -372,13 +391,15 @@ fn resolve_route_candidates_for_policy_and_seed(
         ],
         (RoutePolicy::CostOptimized, "local") => vec![],
         (RoutePolicy::CostOptimized, _) => vec![
-            ("zai", ZAI_FLAGSHIP_MODEL),
+            ("zai", ZAI_FAST_MODEL),
             ("deepseek", DEEPSEEK_FLASH_MODEL),
-            ("anthropic", ANTHROPIC_BALANCED_MODEL),
-            ("gemini", GEMINI_PRO_MODEL),
-            ("openai", OPENAI_ACCURATE_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
             ("openai", OPENAI_FAST_MODEL),
+            ("anthropic", ANTHROPIC_FAST_MODEL),
+            ("anthropic", ANTHROPIC_BALANCED_MODEL),
+            ("zai", ZAI_FLAGSHIP_MODEL),
+            ("gemini", GEMINI_PRO_MODEL),
+            ("openai", OPENAI_ACCURATE_MODEL),
         ],
         (RoutePolicy::QualityFirst, "instant") => vec![
             ("openai", OPENAI_FAST_MODEL),
@@ -425,7 +446,7 @@ fn resolve_provider_mix_candidates(lane: &str, seed: &str) -> Vec<(&'static str,
                 ("deepseek", DEEPSEEK_FLASH_MODEL),
                 ("gemini", GEMINI_LITE_MODEL),
                 ("anthropic", ANTHROPIC_FAST_MODEL),
-                ("zai", ZAI_FLAGSHIP_MODEL),
+                ("zai", ZAI_FAST_MODEL),
             ],
             vec![
                 ("gemini", GEMINI_FLASH_MODEL),
@@ -464,13 +485,15 @@ fn resolve_provider_mix_candidates(lane: &str, seed: &str) -> Vec<(&'static str,
             vec![
                 ("anthropic", ANTHROPIC_BALANCED_MODEL),
                 ("deepseek", DEEPSEEK_FLASH_MODEL),
-                ("zai", ZAI_FLAGSHIP_MODEL),
-                ("gemini", GEMINI_PRO_MODEL),
-                ("openai", OPENAI_ACCURATE_MODEL),
-            ],
-            vec![
                 ("gemini", GEMINI_FLASH_MODEL),
                 ("openai", OPENAI_FAST_MODEL),
+                ("zai", ZAI_FAST_MODEL),
+            ],
+            vec![
+                ("anthropic", ANTHROPIC_FAST_MODEL),
+                ("openai", OPENAI_ACCURATE_MODEL),
+                ("gemini", GEMINI_PRO_MODEL),
+                ("zai", ZAI_FLAGSHIP_MODEL),
             ],
             lane,
             seed,
@@ -1054,7 +1077,7 @@ async fn openai_compatible_complete(
         thinking,
         reasoning_effort,
     };
-    let resp = reqwest::Client::new()
+    let resp = upstream_http_client()
         .post(openai_compatible_chat_url(provider)?.as_str())
         .bearer_auth(key)
         .json(&req)
@@ -1186,7 +1209,7 @@ async fn openai_compatible_complete_stream(
         thinking,
         reasoning_effort,
     };
-    let resp = reqwest::Client::new()
+    let resp = upstream_http_client()
         .post(openai_compatible_chat_url(provider)?.as_str())
         .bearer_auth(key)
         .json(&req)
@@ -1459,7 +1482,7 @@ async fn gemini_complete(
         thinking,
         image_data_urls,
     )?;
-    let resp = reqwest::Client::new()
+    let resp = upstream_http_client()
         .post(gemini_url(model, false))
         .query(&[("key", key)])
         .json(&req)
@@ -1517,7 +1540,7 @@ async fn gemini_complete_stream(
         thinking,
         image_data_urls,
     )?;
-    let resp = reqwest::Client::new()
+    let resp = upstream_http_client()
         .post(gemini_url(model, true))
         .query(&[("key", key), ("alt", "sse")])
         .json(&req)
@@ -1812,7 +1835,7 @@ async fn anthropic_complete(
         thinking: thinking_req,
         stream: None,
     };
-    let resp = reqwest::Client::new()
+    let resp = upstream_http_client()
         .post(
             override_url(
                 "https://api.anthropic.com/v1/messages",
@@ -1927,7 +1950,7 @@ async fn anthropic_complete_stream(
         thinking: thinking_req,
         stream: Some(true),
     };
-    let resp = reqwest::Client::new()
+    let resp = upstream_http_client()
         .post(
             override_url(
                 "https://api.anthropic.com/v1/messages",
@@ -2285,7 +2308,7 @@ async fn openai_embed_batch(
         "model": model,
         "input": inputs,
     });
-    let resp = reqwest::Client::new()
+    let resp = upstream_http_client()
         .post(
             override_url(
                 "https://api.openai.com/v1/embeddings",
@@ -2429,7 +2452,7 @@ async fn deepgram_transcribe(
         default_url.push_str(&deepgram_query_escape(&language));
     }
     let url = override_url(&default_url, "BLUEY_TEST_DEEPGRAM_URL");
-    let resp = reqwest::Client::new()
+    let resp = upstream_http_client()
         .post(&url)
         .header("Authorization", format!("Token {key}"))
         .header("Content-Type", content_type)
@@ -2515,7 +2538,7 @@ async fn openai_transcribe(
     let form = Form::new()
         .text("model", model.to_string())
         .part("file", file);
-    let resp = reqwest::Client::new()
+    let resp = upstream_http_client()
         .post(
             override_url(
                 "https://api.openai.com/v1/audio/transcriptions",
@@ -2595,10 +2618,7 @@ mod tests {
             ("anthropic", "claude-sonnet-4-6"),
         );
         assert_eq!(resolve_route("deep"), ("anthropic", "claude-opus-4-8"),);
-        assert_eq!(
-            resolve_route("vision"),
-            ("gemini", "gemini-3-flash-preview")
-        );
+        assert_eq!(resolve_route("vision"), ("gemini", "gemini-3.5-flash"));
         assert_eq!(resolve_route("local"), ("unsupported", "local"));
         // Unknown → balanced default.
         assert_eq!(resolve_route("???"), ("anthropic", "claude-sonnet-4-6"),);
@@ -2613,7 +2633,7 @@ mod tests {
                 ("deepseek", "deepseek-v4-flash"),
                 ("gemini", "gemini-3.1-flash-lite"),
                 ("anthropic", "claude-haiku-4-5-20251001"),
-                ("gemini", "gemini-3-flash-preview"),
+                ("gemini", "gemini-3.5-flash"),
                 ("anthropic", "claude-sonnet-4-6")
             ]
         );
@@ -2625,7 +2645,7 @@ mod tests {
                 ("zai", "glm-5.2"),
                 ("gemini", "gemini-3.1-pro-preview"),
                 ("openai", "gpt-5.5"),
-                ("gemini", "gemini-3-flash-preview"),
+                ("gemini", "gemini-3.5-flash"),
                 ("openai", "gpt-5.4-mini")
             ]
         );
@@ -2639,7 +2659,7 @@ mod tests {
                 ("openai", "gpt-5.5"),
                 ("anthropic", "claude-sonnet-4-6"),
                 ("deepseek", "deepseek-v4-flash"),
-                ("gemini", "gemini-3-flash-preview")
+                ("gemini", "gemini-3.5-flash")
             ]
         );
         assert_eq!(
@@ -2647,7 +2667,7 @@ mod tests {
             vec![
                 ("openai", "gpt-5.5"),
                 ("gemini", "gemini-3.1-pro-preview"),
-                ("gemini", "gemini-3-flash-preview"),
+                ("gemini", "gemini-3.5-flash"),
                 ("openai", "gpt-5.4-mini")
             ]
         );
@@ -2665,9 +2685,10 @@ mod tests {
             vec![
                 ("deepseek", "deepseek-v4-flash"),
                 ("gemini", "gemini-3.1-flash-lite"),
+                ("zai", "glm-4.7-flashx"),
                 ("openai", "gpt-5.4-mini"),
                 ("anthropic", "claude-haiku-4-5-20251001"),
-                ("gemini", "gemini-3-flash-preview"),
+                ("gemini", "gemini-3.5-flash"),
                 ("anthropic", "claude-sonnet-4-6")
             ]
         );
@@ -2678,13 +2699,15 @@ mod tests {
                 ""
             ),
             vec![
-                ("zai", "glm-5.2"),
+                ("zai", "glm-4.7-flashx"),
                 ("deepseek", "deepseek-v4-flash"),
+                ("gemini", "gemini-3.5-flash"),
+                ("openai", "gpt-5.4-mini"),
+                ("anthropic", "claude-haiku-4-5-20251001"),
                 ("anthropic", "claude-sonnet-4-6"),
+                ("zai", "glm-5.2"),
                 ("gemini", "gemini-3.1-pro-preview"),
-                ("openai", "gpt-5.5"),
-                ("gemini", "gemini-3-flash-preview"),
-                ("openai", "gpt-5.4-mini")
+                ("openai", "gpt-5.5")
             ]
         );
         assert_eq!(
@@ -2697,7 +2720,7 @@ mod tests {
                 ("openai", "gpt-5.5"),
                 ("anthropic", "claude-sonnet-4-6"),
                 ("deepseek", "deepseek-v4-flash"),
-                ("gemini", "gemini-3-flash-preview")
+                ("gemini", "gemini-3.5-flash")
             ]
         );
         assert_eq!(
@@ -2731,6 +2754,52 @@ mod tests {
                 assert!(
                     first_providers.contains(&provider),
                     "provider mix should rotate {lane} first attempts across {provider}; got {first_providers:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_mix_text_top_tiers_give_each_provider_one_slot() {
+        for lane in ["instant", "balanced", "deep"] {
+            let routes =
+                resolve_route_candidates_for_policy_and_seed(lane, RoutePolicy::ProviderMix, "");
+            let mut providers = routes
+                .iter()
+                .take(5)
+                .map(|(provider, _model)| *provider)
+                .collect::<Vec<_>>();
+            providers.sort_unstable();
+            providers.dedup();
+            assert_eq!(
+                providers,
+                vec!["anthropic", "deepseek", "gemini", "openai", "zai"],
+                "{lane} preferred routes must spread first attempts evenly: {routes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_mix_never_starts_fast_lanes_on_deep_or_pro_models() {
+        for lane in ["instant", "balanced"] {
+            for idx in 0..100 {
+                let seed = format!("fast-tier-request-{idx}");
+                let routes = resolve_route_candidates_for_policy_and_seed(
+                    lane,
+                    RoutePolicy::ProviderMix,
+                    &seed,
+                );
+                let (_, model) = routes.first().expect("fast lane route");
+                assert!(
+                    !matches!(
+                        *model,
+                        ANTHROPIC_DEEP_MODEL
+                            | GEMINI_PRO_MODEL
+                            | OPENAI_ACCURATE_MODEL
+                            | DEEPSEEK_PRO_MODEL
+                            | ZAI_FLAGSHIP_MODEL
+                    ),
+                    "{lane} started on a deep/pro model for seed {seed}: {routes:?}"
                 );
             }
         }

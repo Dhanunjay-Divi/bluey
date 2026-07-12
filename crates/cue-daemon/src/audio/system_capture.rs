@@ -7,12 +7,16 @@
 //!
 //! Restart-on-crash with exponential backoff mirrors the overlay pattern.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use cue_core::pcm::{AudioChunk, AudioSource, SampleRate};
+#[cfg(target_os = "macos")]
+use cue_core::process_aliases::MACOS_AUDIO_HELPER_NAMES;
+#[cfg(target_os = "windows")]
+use cue_core::process_aliases::WINDOWS_AUDIO_HELPER_NAMES;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc::UnboundedSender;
@@ -24,6 +28,24 @@ const CHUNK_SAMPLES: usize = 320;
 const CHUNK_BYTES: usize = CHUNK_SAMPLES * 2;
 /// Maximum consecutive restart attempts before giving up.
 const MAX_RESTART_ATTEMPTS: u32 = 5;
+
+#[cfg(target_os = "macos")]
+const AUDIO_HELPER_BUILD_DIR: &str = "native/macos/cue-audio/.build";
+
+#[cfg(target_os = "macos")]
+const AUDIO_HELPER_EXE_RELATIVE_DIRS: &[&str] = &[
+    "../../native/macos/cue-audio/.build",
+    "../native/macos/cue-audio/.build",
+];
+
+#[cfg(target_os = "windows")]
+const AUDIO_HELPER_BUILD_DIR: &str = "native/windows/cue-audio/build";
+
+#[cfg(target_os = "windows")]
+const AUDIO_HELPER_EXE_RELATIVE_DIRS: &[&str] = &[
+    "../../native/windows/cue-audio/build",
+    "../native/windows/cue-audio/build",
+];
 
 /// Handle to a running system audio capture session.
 pub struct SystemAudioCapture {
@@ -65,75 +87,91 @@ impl Drop for SystemAudioCapture {
 }
 
 fn resolve_binary() -> std::io::Result<PathBuf> {
-    // Allow override for testing
-    if let Ok(path) = std::env::var("BLUEY_SYSTEM_AUDIO_BINARY") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-
-    let path = platform_binary_path();
-    if path.exists() {
-        return Ok(path);
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("system audio binary not found at {}", path.display()),
-    ))
+    find_native_audio_helper().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Bluey system audio helper was not found",
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn platform_binary_path() -> PathBuf {
-    // Look relative to the daemon binary first
-    if let Ok(exe) = std::env::current_exe() {
-        let mut dirs = Vec::new();
-        if let Some(dir) = exe.parent() {
-            dirs.push(dir.to_path_buf());
-        }
-        if let Ok(canonical) = exe.canonicalize() {
-            if let Some(dir) = canonical.parent() {
-                dirs.push(dir.to_path_buf());
-            }
-        }
-        for dir in dirs {
-            for candidate in [dir.join("bluey-audio-macos"), dir.join("cue-audio-macos")] {
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
-        }
-    }
-    PathBuf::from("native/macos/cue-audio/.build/bluey-audio-macos")
+pub(crate) fn find_native_audio_helper() -> Option<PathBuf> {
+    find_platform_audio_helper(MACOS_AUDIO_HELPER_NAMES)
 }
 
 #[cfg(target_os = "windows")]
-fn platform_binary_path() -> PathBuf {
+pub(crate) fn find_native_audio_helper() -> Option<PathBuf> {
+    find_platform_audio_helper(WINDOWS_AUDIO_HELPER_NAMES)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn find_platform_audio_helper(names: &[&str]) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for env_name in [
+        "BLUEY_SYSTEM_AUDIO_BINARY",
+        "BLUEY_AUDIO_HELPER_BIN",
+        "CUE_AUDIO_HELPER_BIN",
+    ] {
+        if let Some(path) = std::env::var_os(env_name).filter(|value| !value.is_empty()) {
+            push_unique_candidate(&mut candidates, PathBuf::from(path));
+        }
+    }
+
     if let Ok(exe) = std::env::current_exe() {
-        let mut dirs = Vec::new();
-        if let Some(dir) = exe.parent() {
-            dirs.push(dir.to_path_buf());
+        let mut executable_dirs = Vec::new();
+        if let Some(parent) = exe.parent() {
+            push_unique_candidate(&mut executable_dirs, parent.to_path_buf());
         }
         if let Ok(canonical) = exe.canonicalize() {
-            if let Some(dir) = canonical.parent() {
-                dirs.push(dir.to_path_buf());
+            if let Some(parent) = canonical.parent() {
+                push_unique_candidate(&mut executable_dirs, parent.to_path_buf());
             }
         }
-        for dir in dirs {
-            for candidate in [dir.join("bluey-audio.exe"), dir.join("cue-audio.exe")] {
-                if candidate.exists() {
-                    return candidate;
-                }
+        for dir in executable_dirs {
+            push_named_candidates(&mut candidates, &dir, names);
+            for relative_dir in AUDIO_HELPER_EXE_RELATIVE_DIRS {
+                push_named_candidates(&mut candidates, &dir.join(relative_dir), names);
             }
         }
     }
-    PathBuf::from("native/windows/cue-audio/build/bluey-audio.exe")
+
+    for home_var in ["HOME", "USERPROFILE"] {
+        if let Some(home) = std::env::var_os(home_var) {
+            push_named_candidates(
+                &mut candidates,
+                &PathBuf::from(home).join(".bluey/bin"),
+                names,
+            );
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        push_named_candidates(&mut candidates, &cwd.join(AUDIO_HELPER_BUILD_DIR), names);
+        push_named_candidates(&mut candidates, &cwd, names);
+    }
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn push_named_candidates(candidates: &mut Vec<PathBuf>, dir: &Path, names: &[&str]) {
+    for name in names {
+        push_unique_candidate(candidates, dir.join(name));
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn platform_binary_path() -> PathBuf {
-    PathBuf::from("bluey-audio")
+pub(crate) fn find_native_audio_helper() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn push_unique_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
 }
 
 async fn spawn_child(binary: &PathBuf) -> std::io::Result<Child> {

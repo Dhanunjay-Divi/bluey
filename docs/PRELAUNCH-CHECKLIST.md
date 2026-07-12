@@ -5,6 +5,12 @@
 > **Companion:** `docs/PRODUCTION-DEPLOY-RUNBOOK.md` and
 > `docs/deploy/BLUEY-SH-LAUNCH.md`
 
+> **Current release record (2026-07-12):** the signed manifest reports `0.1.99`
+> for macOS Apple silicon and Windows x86-64. Windows 11 is install-smoked in
+> the release record. Linux, macOS Intel/universal, and Windows 10 are not
+> claimed. Older gates below remain as an audit ledger, not current platform
+> copy.
+
 This is the master gate before public alpha. Every item must be ticked or explicitly waived (with rationale) before announcing the product.
 
 ## First 100 paid users gate
@@ -40,8 +46,8 @@ operating plan.
 - [x] Daemon: BalanceWatch poll + Stage 19 cost label plumbing
 - [x] CLI product entrypoint: `bluey on` / `bluey off`; `bluey on` opens sign-in when needed
 - [x] Support/admin CLI: usage / credits / logout / portal / export / delete-account
-- [x] Onboarding: deep-link wizard + tray Invisible toggle + F19 hotkey
-- [x] Disguise: 4-mode picker + tray submenu + auto-disguise heuristic + persisted prefs
+- [x] Onboarding: deep-link wizard + explicit tray/F19 show-hide control
+- [x] Screen-share privacy: best-effort capture-exclusion disclosure; disguise picker, tray submenu, and automatic app-identity prompts removed from the dashboard path
 - [x] Pipeline at tip: fmt + clippy -D + tests + builds across cue + server
 
 ### Stage 25: managed streaming + cost metadata + cloud sync + STT auth (post-`9babb20`)
@@ -67,6 +73,8 @@ operating plan.
 - [x] Billing upstream error redaction (url/client_secret/payment_method/token)
 - [x] `docs/SECURITY-HARDENING.md` reflects managed-cloud auth model + honest "what we cannot make impossible" section
 - [x] No "unbacktraceable" / "undetectable" wording in customer-facing copy
+- [x] Cloud sync defaults off and requires an explicit persisted consent marker
+- [x] Raw-audio retention and training rows are truthful read-only off states until real opt-in backends exist
 
 ### Observability Round (complete)
 
@@ -171,7 +179,7 @@ routes must exist before public alpha:
 - [x] `/docs/terms` — alpha terms of use
 - [x] OG / favicon assets
 
-### macOS terminal distribution (Pinky-style: NO Apple Developer ID required for v0.2 alpha)
+### macOS Apple silicon terminal distribution
 
 The current alpha ships as a terminal bundle: `bluey`, `bluey-daemon`,
 and native helper binaries. The installer ad-hoc signs the helper
@@ -181,7 +189,7 @@ do not advertise it until a real `Bluey.app` artifact exists.
 #### Path A: One-line installer (`curl ... | bash`)
 - [x] `ops/install/install.sh` hosted as a real static file at `https://bluey.sh/install.sh`
 - [x] `latest.json` hosted as real JSON at `https://bluey.sh/latest.json`
-- [x] Release tarball hosted at `https://bluey.sh/releases/v0.1.1/bluey-0.1.1-darwin-arm64.tar.gz`
+- [x] Release tarball hosted at `https://bluey.sh/releases/v0.1.99/bluey-0.1.99-darwin-arm64.tar.gz`
 - [x] Each release tarball contains top-level `bin/bluey` plus helper binaries
 - [x] `SHA256SUMS.txt` hosted next to the tarballs, and `install.sh` verifies it
 - [x] `bluey on` checks the signed release manifest and notifies when an update is available; silent install is disabled by default for alpha
@@ -201,20 +209,19 @@ do not advertise it until a real `Bluey.app` artifact exists.
 
 #### Optional (v1.0 GA polish, NOT v0.2 gate)
 
-Bluey is terminal-installed (`curl ... | bash`; Homebrew waits for either
-a formula or a real `.app` artifact).
-Apple Developer ID + notarization are NOT required. The install script
-ad-hoc signs the helper binaries and clears quarantine, which is sufficient for
-Gatekeeper to allow first launch. If a paid Developer ID becomes
-available later, the install path can be upgraded transparently
-without breaking existing customers (the bundle id stays the same).
+Bluey is terminal-installed (`curl ... | bash`; Homebrew waits for either a
+formula or a real `.app` artifact). The signed release manifest and checksums
+verify download integrity; they do not establish Apple Developer ID signing or
+notarization. Make those platform-signing claims only after separate
+verification.
 
 - [ ] (optional) Migrate to signed bundle via Apple Developer Program when convenient — non-blocking for v0.2 alpha
 
-### Windows paid-alpha track
+### Windows x86-64 release track
 
-Windows is a parallel launch track. It does not block a macOS-only first paid
-alpha, but it is a blocker before inviting paid Windows users.
+The `0.1.99` manifest includes a Windows x86-64 artifact and PowerShell
+installer, with a Windows 11 install smoke recorded in its release notes. The
+checks below govern broader support claims rather than artifact availability.
 
 - [ ] Canonical Windows artifact includes `bluey.exe`, `bluey-daemon.exe`, `bluey-overlay.exe`, and `bluey-audio.exe`
 - [ ] Windows installer is per-user, verifies checksums, updates PATH/shims, and documents uninstall
@@ -225,7 +232,7 @@ alpha, but it is a blocker before inviting paid Windows users.
 - [ ] Managed Answer flow streams, deducts cost, and updates balance
 - [ ] Capture exclusion verified with Snipping Tool and at least one meeting/recording app
 - [ ] Support zip/log export redacts tokens, provider keys, device codes, and sensitive local paths
-- [ ] Signed update manifest includes the Windows artifact and `bluey update` verifies it before install
+- [x] Signed update manifest includes the Windows x86-64 artifact and installer checksums
 
 ### Monitoring
 

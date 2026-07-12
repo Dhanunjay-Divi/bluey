@@ -19,26 +19,73 @@
 //!   }
 //!
 //! The actual charge is fire-and-forget (tokio::spawn) so the customer
-//! request returns immediately with the response. Stripe credits via
-//! webhook; Square credits immediately only after a COMPLETED payment
-//! response and then treats the later webhook as an idempotent no-op.
+//! request returns immediately with the response. Stripe credits from a
+//! validated success response, webhook, or reconciliation; all three share
+//! one durable exactly-once transition. Square credits immediately only after
+//! a COMPLETED payment response and treats the later webhook as a no-op.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::{BillingProvider, Config};
-use crate::db::{accounts::Account, balance, DbPool};
+use crate::db::{
+    accounts::Account,
+    balance,
+    stripe_auto_reload::{self, CreditDisposition, StripeAutoReloadAttempt},
+    DbPool,
+};
 
-/// In-flight dedupe: stops two concurrent low-balance checks from
-/// firing two top-ups for the same account in a 60-second window.
-/// Stage 10 nit (deferred): could move this to a SQLite row with a
-/// timestamp guard for multi-process safety. Single-process is fine
-/// for v0.2 because the server is single-binary.
+/// Square in-flight dedupe. Stripe uses a durable cross-process reservation.
 static AUTO_TOPUP_INFLIGHT: std::sync::OnceLock<
     tokio::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 > = std::sync::OnceLock::new();
 
 const INFLIGHT_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 const SQUARE_API_VERSION: &str = "2025-04-16";
+const STRIPE_AUTO_RELOAD_ENABLED_ENV: &str = "BLUEY_STRIPE_AUTO_RELOAD_ENABLED";
+const STRIPE_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn stripe_auto_reload_opted_in() -> bool {
+    std::env::var(STRIPE_AUTO_RELOAD_ENABLED_ENV)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn stripe_auto_reload_readiness(
+    config: &Config,
+    opted_in: bool,
+) -> std::result::Result<(), &'static str> {
+    if !opted_in {
+        return Err("BLUEY_STRIPE_AUTO_RELOAD_ENABLED is not true");
+    }
+    if config
+        .stripe_secret_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err("STRIPE_SECRET_KEY is missing");
+    }
+    if config
+        .stripe_webhook_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err("STRIPE_WEBHOOK_SECRET is missing");
+    }
+    Ok(())
+}
+
+pub(crate) fn stripe_auto_reload_configuration_error(config: &Config) -> Option<&'static str> {
+    stripe_auto_reload_readiness(config, stripe_auto_reload_opted_in()).err()
+}
 
 fn stripe_api_url(path: &str) -> String {
     let base =
@@ -136,7 +183,7 @@ pub fn maybe_spawn(
 
     match config.billing_provider() {
         BillingProvider::Stripe => {
-            let (Some(customer_id), Some(pm_id)) = (stripe_customer_id, stripe_payment_method_id)
+            let (Some(_customer_id), Some(_pm_id)) = (stripe_customer_id, stripe_payment_method_id)
             else {
                 tracing::debug!(
                     account_id,
@@ -144,22 +191,19 @@ pub fn maybe_spawn(
                 );
                 return;
             };
-            if config.stripe_secret_key.is_none() {
-                tracing::debug!("auto reload skipped: STRIPE_SECRET_KEY not configured");
+            if let Err(reason) =
+                stripe_auto_reload_readiness(&config, stripe_auto_reload_opted_in())
+            {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+                    reason,
+                    "Stripe Auto Reload disabled; no payment will be attempted"
+                );
                 return;
             }
 
             tokio::spawn(async move {
-                if let Err(e) = run_stripe_topup(
-                    pool,
-                    config,
-                    account_id.clone(),
-                    customer_id,
-                    pm_id,
-                    auto_topup_amount_cents,
-                )
-                .await
-                {
+                if let Err(e) = run_stripe_topup(pool, config, account_id.clone()).await {
                     tracing::warn!(account_id, error = %e, "auto reload failed");
                 }
             });
@@ -207,79 +251,554 @@ async fn reserve_inflight(account_id: &str) -> bool {
 }
 
 async fn run_stripe_topup(
-    _pool: DbPool,
+    pool: DbPool,
     config: std::sync::Arc<Config>,
     account_id: String,
-    stripe_customer_id: String,
-    stripe_payment_method_id: String,
-    amount_cents: i64,
 ) -> Result<()> {
-    // In-flight dedupe: do NOT fire if we already fired for this account
-    // within the last 60s. This protects against the case where a burst
-    // of cues each see the same low balance before the previous top-up
-    // webhook has credited.
-    if !reserve_inflight(&account_id).await {
+    stripe_auto_reload_readiness(&config, stripe_auto_reload_opted_in())
+        .map_err(|reason| anyhow!("Stripe Auto Reload disabled: {reason}"))?;
+
+    let Some(mut attempt) = stripe_auto_reload::reserve_if_eligible(&pool, &account_id)? else {
         return Ok(());
-    }
+    };
 
     let stripe_key = config
         .stripe_secret_key
         .as_ref()
         .ok_or_else(|| anyhow!("STRIPE_SECRET_KEY not configured"))?;
+    let client = reqwest::Client::builder()
+        .timeout(STRIPE_HTTP_TIMEOUT)
+        .build()
+        .context("build Stripe Auto Reload client")?;
 
-    // Idempotency: Stripe's Idempotency-Key header keys ON the request.
-    // Use a deterministic key per (account, hour) so a duplicate fire
-    // from the same process within the same hour will return Stripe's
-    // cached response instead of charging twice.
-    let idempotency_key = format!(
-        "bluey-topup-{account_id}-{}",
-        chrono::Utc::now().format("%Y%m%d%H")
-    );
+    if attempt.stripe_payment_intent_id.is_some() {
+        match reconcile_stripe_attempt(&pool, &client, stripe_key, &attempt).await? {
+            StripeIntentOutcome::RequiresConfirmation => {
+                attempt = stripe_auto_reload::find_by_id(&pool, &attempt.id)?
+                    .ok_or_else(|| anyhow!("Stripe Auto Reload attempt disappeared"))?;
+            }
+            StripeIntentOutcome::Terminal | StripeIntentOutcome::Pending => return Ok(()),
+        }
+    } else {
+        let intent = create_unconfirmed_stripe_intent(&pool, &client, stripe_key, &attempt).await?;
+        let payment_intent_id = required_stripe_id(&intent, "id")?;
+        attempt =
+            stripe_auto_reload::attach_payment_intent(&pool, &attempt.id, &payment_intent_id)?;
+        let outcome = match apply_stripe_intent(&pool, &attempt, &intent, None) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                stripe_auto_reload::mark_failed_and_disable(
+                    &pool,
+                    &attempt.id,
+                    "processor_response_mismatch",
+                    None,
+                )?;
+                let _ = cancel_unconfirmed_stripe_intent(&client, stripe_key, &attempt).await;
+                return Err(error);
+            }
+        };
+        match outcome {
+            StripeIntentOutcome::RequiresConfirmation => {}
+            StripeIntentOutcome::Terminal | StripeIntentOutcome::Pending => return Ok(()),
+        }
+    }
 
+    if !stripe_auto_reload::confirmation_allowed(&pool, &attempt.id)? {
+        let _ = cancel_unconfirmed_stripe_intent(&client, stripe_key, &attempt).await;
+        stripe_auto_reload::mark_abandoned(&pool, &attempt.id, "eligibility_changed")?;
+        tracing::info!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+            attempt_id = %attempt.id,
+            "Stripe Auto Reload canceled before confirmation because eligibility changed"
+        );
+        return Ok(());
+    }
+
+    confirm_stripe_intent(&pool, &client, stripe_key, &attempt).await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StripeIntentOutcome {
+    RequiresConfirmation,
+    Pending,
+    Terminal,
+}
+
+async fn create_unconfirmed_stripe_intent(
+    pool: &DbPool,
+    client: &reqwest::Client,
+    stripe_key: &str,
+    attempt: &StripeAutoReloadAttempt,
+) -> Result<serde_json::Value> {
     let form = [
-        ("amount", amount_cents.to_string()),
-        ("currency", "usd".to_string()),
-        ("customer", stripe_customer_id),
-        ("payment_method", stripe_payment_method_id),
-        ("off_session", "true".to_string()),
-        ("confirm", "true".to_string()),
-        ("metadata[bluey_account_id]", account_id.clone()),
-        ("metadata[bluey_amount_cents]", amount_cents.to_string()),
+        ("amount", attempt.amount_cents.to_string()),
+        ("currency", attempt.currency.clone()),
+        ("customer", attempt.stripe_customer_id.clone()),
+        ("payment_method", attempt.stripe_payment_method_id.clone()),
+        ("payment_method_types[]", "card".to_string()),
+        ("confirmation_method", "automatic".to_string()),
+        ("description", "Bluey Auto Reload".to_string()),
+        ("metadata[bluey_account_id]", attempt.account_id.clone()),
+        (
+            "metadata[bluey_amount_cents]",
+            attempt.amount_cents.to_string(),
+        ),
         ("metadata[bluey_kind]", "auto_topup".to_string()),
+        ("metadata[bluey_auto_reload_attempt_id]", attempt.id.clone()),
+        ("metadata[bluey_auto_reload_version]", "v1".to_string()),
     ];
-
-    let resp = reqwest::Client::new()
+    let response = match client
         .post(stripe_api_url("/v1/payment_intents"))
         .basic_auth(stripe_key, Some(""))
-        .header("Idempotency-Key", &idempotency_key)
+        .header("Idempotency-Key", &attempt.create_idempotency_key)
         .form(&form)
         .send()
         .await
-        .context("stripe payment_intents.create http")?;
-
-    let status = resp.status();
-    let _body = resp
-        .text()
-        .await
-        .unwrap_or_else(|_| "<failed to read body>".to_string());
-
+    {
+        Ok(response) => response,
+        Err(error) => {
+            stripe_auto_reload::mark_reconciliation_required(
+                pool,
+                &attempt.id,
+                "create_transport_error",
+            )?;
+            return Err(error).context("Stripe PaymentIntent create transport");
+        }
+    };
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
-        tracing::warn!(
-            account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
-            amount_cents,
-            stripe_status = %status,
-            "stripe auto reload payment failed"
-        );
-        return Err(anyhow!("stripe payment_intents.create returned {status}"));
+        let error_code = stripe_error_code(&body, "payment_intent_create_failed");
+        if status.is_server_error() || status.as_u16() == 429 {
+            stripe_auto_reload::mark_reconciliation_required(pool, &attempt.id, &error_code)?;
+        } else {
+            stripe_auto_reload::mark_failed_and_disable(pool, &attempt.id, &error_code, None)?;
+        }
+        return Err(anyhow!("Stripe PaymentIntent create returned {status}"));
     }
 
-    tracing::info!(
-        account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
-        amount_cents,
-        idempotency_key,
-        "auto reload charge initiated; webhook will credit balance"
-    );
+    Ok(body)
+}
+
+async fn confirm_stripe_intent(
+    pool: &DbPool,
+    client: &reqwest::Client,
+    stripe_key: &str,
+    attempt: &StripeAutoReloadAttempt,
+) -> Result<()> {
+    let payment_intent_id = attempt
+        .stripe_payment_intent_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("Stripe Auto Reload attempt has no PaymentIntent"))?;
+    let path = format!("/v1/payment_intents/{payment_intent_id}/confirm");
+    let response = match client
+        .post(stripe_api_url(&path))
+        .basic_auth(stripe_key, Some(""))
+        .header("Idempotency-Key", &attempt.confirm_idempotency_key)
+        .form(&[
+            ("off_session", "true"),
+            ("error_on_requires_action", "true"),
+        ])
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            stripe_auto_reload::mark_reconciliation_required(
+                pool,
+                &attempt.id,
+                "confirm_transport_error",
+            )?;
+            reconcile_after_uncertain_confirmation(pool, client, stripe_key, attempt).await?;
+            return Err(error).context("Stripe PaymentIntent confirm transport");
+        }
+    };
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        if let Some(intent) = body.pointer("/error/payment_intent") {
+            if validate_stripe_intent_identity(attempt, intent).is_ok() {
+                let outcome = apply_stripe_intent(pool, attempt, intent, None)?;
+                if outcome != StripeIntentOutcome::RequiresConfirmation {
+                    return Ok(());
+                }
+            }
+        }
+
+        let error_code = stripe_error_code(&body, "payment_intent_confirm_failed");
+        if status.is_server_error() || status.as_u16() == 429 {
+            stripe_auto_reload::mark_reconciliation_required(pool, &attempt.id, &error_code)?;
+            reconcile_after_uncertain_confirmation(pool, client, stripe_key, attempt).await?;
+        } else {
+            stripe_auto_reload::mark_failed_and_disable(pool, &attempt.id, &error_code, None)?;
+        }
+        return Err(anyhow!("Stripe PaymentIntent confirm returned {status}"));
+    }
+
+    match apply_stripe_intent(pool, attempt, &body, None)? {
+        StripeIntentOutcome::RequiresConfirmation => {
+            stripe_auto_reload::mark_reconciliation_required(
+                pool,
+                &attempt.id,
+                "confirm_returned_requires_confirmation",
+            )?;
+            Err(anyhow!(
+                "Stripe confirm response remained requires_confirmation"
+            ))
+        }
+        StripeIntentOutcome::Pending | StripeIntentOutcome::Terminal => Ok(()),
+    }
+}
+
+async fn reconcile_after_uncertain_confirmation(
+    pool: &DbPool,
+    client: &reqwest::Client,
+    stripe_key: &str,
+    attempt: &StripeAutoReloadAttempt,
+) -> Result<()> {
+    match reconcile_stripe_attempt(pool, client, stripe_key, attempt).await {
+        Ok(StripeIntentOutcome::RequiresConfirmation) => {
+            stripe_auto_reload::mark_reconciliation_required(
+                pool,
+                &attempt.id,
+                "confirmation_outcome_unknown",
+            )?;
+        }
+        Ok(StripeIntentOutcome::Pending | StripeIntentOutcome::Terminal) => {}
+        Err(error) => {
+            stripe_auto_reload::mark_reconciliation_required(
+                pool,
+                &attempt.id,
+                "reconciliation_transport_error",
+            )?;
+            return Err(error);
+        }
+    }
     Ok(())
+}
+
+async fn reconcile_stripe_attempt(
+    pool: &DbPool,
+    client: &reqwest::Client,
+    stripe_key: &str,
+    attempt: &StripeAutoReloadAttempt,
+) -> Result<StripeIntentOutcome> {
+    let payment_intent_id = attempt
+        .stripe_payment_intent_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("Stripe Auto Reload attempt has no PaymentIntent"))?;
+    let path = format!("/v1/payment_intents/{payment_intent_id}");
+    let response = client
+        .get(stripe_api_url(&path))
+        .basic_auth(stripe_key, Some(""))
+        .query(&[("expand[]", "latest_charge")])
+        .send()
+        .await
+        .context("Stripe PaymentIntent reconciliation transport")?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        stripe_auto_reload::mark_reconciliation_required(
+            pool,
+            &attempt.id,
+            &stripe_error_code(&body, "payment_intent_retrieve_failed"),
+        )?;
+        return Err(anyhow!(
+            "Stripe PaymentIntent reconciliation returned {status}"
+        ));
+    }
+    apply_stripe_intent(pool, attempt, &body, None)
+}
+
+async fn cancel_unconfirmed_stripe_intent(
+    client: &reqwest::Client,
+    stripe_key: &str,
+    attempt: &StripeAutoReloadAttempt,
+) -> Result<()> {
+    let Some(payment_intent_id) = attempt.stripe_payment_intent_id.as_deref() else {
+        return Ok(());
+    };
+    let path = format!("/v1/payment_intents/{payment_intent_id}/cancel");
+    let response = client
+        .post(stripe_api_url(&path))
+        .basic_auth(stripe_key, Some(""))
+        .header("Idempotency-Key", format!("bluey-ar-cancel-{}", attempt.id))
+        .send()
+        .await
+        .context("cancel unconfirmed Stripe PaymentIntent")?;
+    if !response.status().is_success() {
+        bail!("Stripe PaymentIntent cancel returned {}", response.status());
+    }
+    Ok(())
+}
+
+fn apply_stripe_intent(
+    pool: &DbPool,
+    attempt: &StripeAutoReloadAttempt,
+    intent: &serde_json::Value,
+    event_id: Option<&str>,
+) -> Result<StripeIntentOutcome> {
+    validate_stripe_intent_identity(attempt, intent)?;
+    let payment_intent_id = required_stripe_id(intent, "id")?;
+    let status = intent
+        .get("status")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("Stripe PaymentIntent is missing status"))?;
+    let charge_id = stripe_intent_charge_id(intent);
+
+    if stripe_intent_is_reversed(intent) {
+        let reconciliation_event = event_id
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("reconcile:{}", attempt.id));
+        stripe_auto_reload::reverse_and_restrict(
+            pool,
+            &attempt.id,
+            "stripe_reconciliation_reversal",
+            &reconciliation_event,
+        )?;
+        return Ok(StripeIntentOutcome::Terminal);
+    }
+
+    match status {
+        "requires_confirmation" => Ok(StripeIntentOutcome::RequiresConfirmation),
+        "processing" => {
+            stripe_auto_reload::mark_processing(pool, &attempt.id, charge_id.as_deref(), event_id)?;
+            Ok(StripeIntentOutcome::Pending)
+        }
+        "succeeded" => {
+            let amount_received = intent
+                .get("amount_received")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| anyhow!("succeeded Stripe PaymentIntent has no amount_received"))?;
+            if amount_received != attempt.amount_cents {
+                bail!(
+                    "Stripe Auto Reload amount_received mismatch: expected {}, got {}",
+                    attempt.amount_cents,
+                    amount_received
+                );
+            }
+            let disposition = stripe_auto_reload::credit_succeeded(
+                pool,
+                &attempt.id,
+                &payment_intent_id,
+                charge_id.as_deref(),
+                event_id,
+            )?;
+            tracing::info!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&attempt.account_id),
+                attempt_id = %attempt.id,
+                stripe_payment_intent_id = %payment_intent_id,
+                amount_cents = attempt.amount_cents,
+                credited = matches!(disposition, CreditDisposition::Credited),
+                suppressed_after_reversal = matches!(
+                    disposition,
+                    CreditDisposition::SuppressedAfterReversal
+                ),
+                "Stripe Auto Reload reached terminal success"
+            );
+            Ok(StripeIntentOutcome::Terminal)
+        }
+        "requires_payment_method" | "requires_action" | "canceled" => {
+            let code = intent
+                .pointer("/last_payment_error/code")
+                .and_then(|value| value.as_str())
+                .unwrap_or(status);
+            stripe_auto_reload::mark_failed_and_disable(pool, &attempt.id, code, event_id)?;
+            Ok(StripeIntentOutcome::Terminal)
+        }
+        "requires_capture" => {
+            stripe_auto_reload::mark_reconciliation_required(
+                pool,
+                &attempt.id,
+                "unexpected_requires_capture",
+            )?;
+            Ok(StripeIntentOutcome::Pending)
+        }
+        other => {
+            stripe_auto_reload::mark_reconciliation_required(
+                pool,
+                &attempt.id,
+                &format!("unexpected_status_{other}"),
+            )?;
+            Ok(StripeIntentOutcome::Pending)
+        }
+    }
+}
+
+fn validate_stripe_intent_identity(
+    attempt: &StripeAutoReloadAttempt,
+    intent: &serde_json::Value,
+) -> Result<()> {
+    let payment_intent_id = required_stripe_id(intent, "id")?;
+    if let Some(expected) = attempt.stripe_payment_intent_id.as_deref() {
+        if expected != payment_intent_id {
+            bail!("Stripe PaymentIntent id mismatch for durable Auto Reload attempt");
+        }
+    }
+    let amount = intent
+        .get("amount")
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| anyhow!("Stripe PaymentIntent is missing amount"))?;
+    if amount != attempt.amount_cents {
+        bail!(
+            "Stripe Auto Reload amount mismatch: expected {}, got {}",
+            attempt.amount_cents,
+            amount
+        );
+    }
+    let currency = intent
+        .get("currency")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("Stripe PaymentIntent is missing currency"))?;
+    if currency != attempt.currency {
+        bail!("Stripe Auto Reload currency mismatch");
+    }
+    let customer = intent
+        .get("customer")
+        .and_then(stripe_object_id)
+        .ok_or_else(|| anyhow!("Stripe PaymentIntent is missing customer"))?;
+    if customer != attempt.stripe_customer_id {
+        bail!("Stripe Auto Reload customer mismatch");
+    }
+    if let Some(payment_method) = intent.get("payment_method").and_then(stripe_object_id) {
+        if payment_method != attempt.stripe_payment_method_id {
+            bail!("Stripe Auto Reload payment method mismatch");
+        }
+    }
+
+    let metadata = intent
+        .get("metadata")
+        .ok_or_else(|| anyhow!("Stripe Auto Reload PaymentIntent has no metadata"))?;
+    let metadata_value = |key: &str| metadata.get(key).and_then(|value| value.as_str());
+    if metadata_value("bluey_kind") != Some("auto_topup")
+        || metadata_value("bluey_auto_reload_version") != Some("v1")
+        || metadata_value("bluey_auto_reload_attempt_id") != Some(attempt.id.as_str())
+        || metadata_value("bluey_account_id") != Some(attempt.account_id.as_str())
+        || metadata_value("bluey_amount_cents").and_then(|value| value.parse::<i64>().ok())
+            != Some(attempt.amount_cents)
+    {
+        bail!("Stripe Auto Reload metadata does not match durable attempt");
+    }
+    Ok(())
+}
+
+fn required_stripe_id(value: &serde_json::Value, key: &str) -> Result<String> {
+    value
+        .get(key)
+        .and_then(stripe_object_id)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("Stripe object is missing {key}"))
+}
+
+fn stripe_object_id(value: &serde_json::Value) -> Option<String> {
+    value.as_str().map(str::to_string).or_else(|| {
+        value
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(str::to_string)
+    })
+}
+
+pub(crate) fn stripe_intent_charge_id(intent: &serde_json::Value) -> Option<String> {
+    intent
+        .get("latest_charge")
+        .and_then(stripe_object_id)
+        .or_else(|| {
+            intent
+                .pointer("/charges/data/0/id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+}
+
+fn stripe_intent_is_reversed(intent: &serde_json::Value) -> bool {
+    let Some(charge) = intent
+        .get("latest_charge")
+        .filter(|value| value.is_object())
+    else {
+        return false;
+    };
+    charge
+        .get("refunded")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || charge
+            .get("disputed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        || charge
+            .get("amount_refunded")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0)
+            > 0
+}
+
+fn stripe_error_code(body: &serde_json::Value, fallback: &str) -> String {
+    body.pointer("/error/code")
+        .or_else(|| body.pointer("/error/decline_code"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// Apply a signed Stripe PaymentIntent webhook to a durable Auto Reload.
+/// Returns false for unrelated PaymentIntents such as manual Checkout charges.
+pub(crate) fn handle_stripe_payment_intent_event(
+    pool: &DbPool,
+    event_type: &str,
+    event_id: &str,
+    event: &serde_json::Value,
+) -> Result<bool> {
+    let intent = event
+        .pointer("/data/object")
+        .ok_or_else(|| anyhow!("Stripe PaymentIntent event has no data.object"))?;
+    let payment_intent_id = required_stripe_id(intent, "id")?;
+    let metadata_kind = intent
+        .pointer("/metadata/bluey_kind")
+        .and_then(|value| value.as_str());
+    let attempt = stripe_auto_reload::find_by_payment_intent(pool, &payment_intent_id)?;
+    let Some(attempt) = attempt else {
+        if metadata_kind == Some("auto_topup") {
+            bail!(
+                "Stripe Auto Reload PaymentIntent has no durable attempt; reconciliation required"
+            );
+        }
+        return Ok(false);
+    };
+    if metadata_kind != Some("auto_topup") {
+        bail!("durable Stripe Auto Reload PaymentIntent lost its ownership metadata");
+    }
+
+    let observed_status = intent
+        .get("status")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("Stripe PaymentIntent event has no status"))?;
+    match event_type {
+        "payment_intent.succeeded" if observed_status != "succeeded" => {
+            bail!("payment_intent.succeeded carried non-succeeded object")
+        }
+        "payment_intent.payment_failed"
+            if !matches!(
+                observed_status,
+                "requires_payment_method" | "requires_action"
+            ) =>
+        {
+            bail!("payment_intent.payment_failed carried unexpected status")
+        }
+        "payment_intent.requires_action" if observed_status != "requires_action" => {
+            bail!("payment_intent.requires_action carried unexpected status")
+        }
+        "payment_intent.canceled" if observed_status != "canceled" => {
+            bail!("payment_intent.canceled carried non-canceled object")
+        }
+        "payment_intent.processing" if observed_status != "processing" => {
+            bail!("payment_intent.processing carried non-processing object")
+        }
+        _ => {}
+    }
+    apply_stripe_intent(pool, &attempt, intent, Some(event_id))?;
+    Ok(true)
 }
 
 async fn run_square_topup(
@@ -474,7 +993,65 @@ mod tests {
     fn test_config_with_stripe() -> std::sync::Arc<Config> {
         let mut config = (*test_config()).clone();
         config.stripe_secret_key = Some("sk_test".to_string());
+        config.stripe_webhook_secret = Some("whsec_test".to_string());
         std::sync::Arc::new(config)
+    }
+
+    fn attached_stripe_attempt(
+        pool: &DbPool,
+        email: &str,
+        payment_intent_id: &str,
+    ) -> StripeAutoReloadAttempt {
+        let account = Account::create(pool, email, "password-hash").unwrap();
+        Account::mark_email_verified(pool, &account.id).unwrap();
+        Account::save_stripe_checkout_refs(
+            pool,
+            &account.id,
+            Some("cus_auto_reload"),
+            Some("pm_auto_reload"),
+        )
+        .unwrap();
+        Account::update_auto_topup_settings(pool, &account.id, true, 500, 1500).unwrap();
+        let attempt = stripe_auto_reload::reserve_if_eligible(pool, &account.id)
+            .unwrap()
+            .unwrap();
+        stripe_auto_reload::attach_payment_intent(pool, &attempt.id, payment_intent_id).unwrap()
+    }
+
+    fn stripe_intent_event(
+        attempt: &StripeAutoReloadAttempt,
+        event_id: &str,
+        event_type: &str,
+        status: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": event_id,
+            "type": event_type,
+            "data": {
+                "object": {
+                    "id": attempt.stripe_payment_intent_id,
+                    "object": "payment_intent",
+                    "amount": attempt.amount_cents,
+                    "amount_received": if status == "succeeded" {
+                        attempt.amount_cents
+                    } else {
+                        0
+                    },
+                    "currency": attempt.currency,
+                    "customer": attempt.stripe_customer_id,
+                    "payment_method": attempt.stripe_payment_method_id,
+                    "status": status,
+                    "latest_charge": "ch_auto_reload",
+                    "metadata": {
+                        "bluey_kind": "auto_topup",
+                        "bluey_auto_reload_version": "v1",
+                        "bluey_auto_reload_attempt_id": attempt.id,
+                        "bluey_account_id": attempt.account_id,
+                        "bluey_amount_cents": attempt.amount_cents.to_string()
+                    }
+                }
+            }
+        })
     }
 
     async fn inflight_contains(account_id: &str) -> bool {
@@ -580,6 +1157,166 @@ mod tests {
             !inflight_contains(&account.id).await,
             "internal/test account should skip before reserving an auto reload"
         );
+    }
+
+    #[test]
+    fn stripe_auto_reload_configuration_fails_closed() {
+        let empty = test_config();
+        assert_eq!(
+            stripe_auto_reload_readiness(&empty, false),
+            Err("BLUEY_STRIPE_AUTO_RELOAD_ENABLED is not true")
+        );
+        assert_eq!(
+            stripe_auto_reload_readiness(&empty, true),
+            Err("STRIPE_SECRET_KEY is missing")
+        );
+
+        let mut missing_webhook = (*empty).clone();
+        missing_webhook.stripe_secret_key = Some("sk_test".to_string());
+        assert_eq!(
+            stripe_auto_reload_readiness(&missing_webhook, true),
+            Err("STRIPE_WEBHOOK_SECRET is missing")
+        );
+        assert!(stripe_auto_reload_readiness(&test_config_with_stripe(), true).is_ok());
+    }
+
+    #[test]
+    fn succeeded_webhook_credits_auto_reload_exactly_once() {
+        let pool = temp_pool();
+        let attempt =
+            attached_stripe_attempt(&pool, "webhook-success@example.com", "pi_webhook_success");
+        let first = stripe_intent_event(
+            &attempt,
+            "evt_success_1",
+            "payment_intent.succeeded",
+            "succeeded",
+        );
+        let second = stripe_intent_event(
+            &attempt,
+            "evt_success_2",
+            "payment_intent.succeeded",
+            "succeeded",
+        );
+        assert!(handle_stripe_payment_intent_event(
+            &pool,
+            "payment_intent.succeeded",
+            "evt_success_1",
+            &first
+        )
+        .unwrap());
+        assert!(handle_stripe_payment_intent_event(
+            &pool,
+            "payment_intent.succeeded",
+            "evt_success_2",
+            &second
+        )
+        .unwrap());
+        let account = Account::fetch_by_id(&pool, &attempt.account_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.balance_cents, 1500);
+    }
+
+    #[test]
+    fn failed_webhook_disables_auto_reload_without_credit() {
+        let pool = temp_pool();
+        let attempt =
+            attached_stripe_attempt(&pool, "webhook-failed@example.com", "pi_webhook_failed");
+        let mut event = stripe_intent_event(
+            &attempt,
+            "evt_failed",
+            "payment_intent.payment_failed",
+            "requires_payment_method",
+        );
+        event["data"]["object"]["last_payment_error"] =
+            serde_json::json!({"code": "card_declined"});
+        assert!(handle_stripe_payment_intent_event(
+            &pool,
+            "payment_intent.payment_failed",
+            "evt_failed",
+            &event
+        )
+        .unwrap());
+        let account = Account::fetch_by_id(&pool, &attempt.account_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.balance_cents, 0);
+        assert!(!account.auto_topup_enabled);
+        assert!(account.stripe_payment_method_id.is_none());
+    }
+
+    #[test]
+    fn succeeded_webhook_rejects_identity_mismatch_without_credit() {
+        let pool = temp_pool();
+        let attempt =
+            attached_stripe_attempt(&pool, "webhook-mismatch@example.com", "pi_webhook_mismatch");
+        let mut event = stripe_intent_event(
+            &attempt,
+            "evt_mismatch",
+            "payment_intent.succeeded",
+            "succeeded",
+        );
+        event["data"]["object"]["amount"] = serde_json::json!(9999);
+        assert!(handle_stripe_payment_intent_event(
+            &pool,
+            "payment_intent.succeeded",
+            "evt_mismatch",
+            &event
+        )
+        .is_err());
+        let account = Account::fetch_by_id(&pool, &attempt.account_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.balance_cents, 0);
+    }
+
+    #[test]
+    fn reconciliation_detects_refunded_charge_before_credit() {
+        let pool = temp_pool();
+        let attempt =
+            attached_stripe_attempt(&pool, "reconcile-refund@example.com", "pi_reconcile_refund");
+        let event = stripe_intent_event(
+            &attempt,
+            "evt_reconcile",
+            "payment_intent.succeeded",
+            "succeeded",
+        );
+        let mut intent = event.pointer("/data/object").unwrap().clone();
+        intent["latest_charge"] = serde_json::json!({
+            "id": "ch_reconcile_refund",
+            "refunded": true,
+            "amount_refunded": 1500
+        });
+        assert_eq!(
+            apply_stripe_intent(&pool, &attempt, &intent, None).unwrap(),
+            StripeIntentOutcome::Terminal
+        );
+        let account = Account::fetch_by_id(&pool, &attempt.account_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.balance_cents, 0);
+        assert!(account.billing_restricted);
+        let updated = stripe_auto_reload::find_by_id(&pool, &attempt.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, stripe_auto_reload::STATUS_REVERSED);
+    }
+
+    #[test]
+    fn unrelated_payment_intent_webhook_is_ignored() {
+        let pool = temp_pool();
+        let event = serde_json::json!({
+            "id": "evt_checkout_pi",
+            "type": "payment_intent.succeeded",
+            "data": {"object": {"id": "pi_checkout", "status": "succeeded"}}
+        });
+        assert!(!handle_stripe_payment_intent_event(
+            &pool,
+            "payment_intent.succeeded",
+            "evt_checkout_pi",
+            &event
+        )
+        .unwrap());
     }
 
     #[test]

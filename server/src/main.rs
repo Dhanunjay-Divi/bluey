@@ -7,7 +7,7 @@ use anyhow::Context;
 use bluey_server::{
     api,
     config::{Config, ServerDbBackend},
-    db,
+    db, object_storage,
 };
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
@@ -45,6 +45,15 @@ async fn main() -> anyhow::Result<()> {
     };
     db::run_migrations(&pool).context("run migrations")?;
 
+    let cleanup_worker = object_storage::spawn_cleanup_worker(
+        pool.clone(),
+        config.object_storage.clone(),
+        config
+            .log_storage
+            .clone()
+            .or_else(|| config.object_storage.clone()),
+    );
+
     // Router
     let app = api::build_router(pool.clone(), config.clone());
 
@@ -56,13 +65,17 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(%addr, "listening");
 
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
-    .context("axum serve")?;
+    .context("axum serve");
+    if let Some(worker) = cleanup_worker {
+        worker.abort();
+    }
+    serve_result?;
 
     tracing::info!("bluey-server exited cleanly");
     Ok(())

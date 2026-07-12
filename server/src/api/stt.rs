@@ -36,6 +36,7 @@ use crate::pricing;
 
 const DEFAULT_MAX_SECONDS: i64 = 10 * 60;
 const MAX_SESSION_SECONDS: i64 = 20 * 60;
+const STT_ACCOUNT_LIVENESS_POLL_SECS: u64 = 2;
 const PCM16_DBFS_FLOOR: f64 = -120.0;
 const LIVE_STT_AUDIBLE_RMS_DBFS: f64 = -58.0;
 const LIVE_STT_AUDIBLE_PEAK_DBFS: f64 = -34.0;
@@ -470,7 +471,6 @@ async fn run_deepgram_relay(
         }
         result = async {
             while let Some(message) = client_rx.next().await {
-                ensure_stt_account_active(&state, &session.account_id)?;
                 match message? {
                     ClientMessage::Binary(bytes) => {
                         if !bytes.is_empty() {
@@ -524,18 +524,12 @@ async fn run_deepgram_relay(
             anyhow::Ok(())
         } => {
             if let Err(err) = result {
-                if is_account_closed_error(&err) {
-                    close_reason = "account_deleted".to_string();
-                    let _ = upstream_tx.send(UpstreamMessage::Close(None)).await;
-                } else {
-                    close_reason = "client_to_provider_error".to_string();
-                    tracing::warn!(error = %err, "STT relay client-to-provider pipe failed");
-                }
+                close_reason = "client_to_provider_error".to_string();
+                tracing::warn!(error = %err, "STT relay client-to-provider pipe failed");
             }
         }
         result = async {
             while let Some(message) = upstream_rx.next().await {
-                ensure_stt_account_active(&state, &session.account_id)?;
                 match message? {
                     UpstreamMessage::Text(text) => {
                         provider_frame_stats.observe(&session, started, &text);
@@ -554,14 +548,38 @@ async fn run_deepgram_relay(
             anyhow::Ok(())
         } => {
             if let Err(err) = result {
-                if is_account_closed_error(&err) {
-                    close_reason = "account_deleted".to_string();
-                    let _ = client_tx.send(ClientMessage::Close(None)).await;
-                } else {
-                    close_reason = "provider_to_client_error".to_string();
-                    tracing::warn!(error = %err, "STT relay provider-to-client pipe failed");
-                }
+                close_reason = "provider_to_client_error".to_string();
+                tracing::warn!(error = %err, "STT relay provider-to-client pipe failed");
             }
+        }
+        result = monitor_stt_account_liveness(&state, &session.account_id) => {
+            match result {
+                Err(SttAccountLivenessError::Deleted) => {
+                    close_reason = "account_deleted".to_string();
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
+                        "STT relay account was deleted"
+                    );
+                }
+                Err(SttAccountLivenessError::Inactive) => {
+                    close_reason = "account_inactive".to_string();
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
+                        "STT relay account is restricted or expired"
+                    );
+                }
+                Err(SttAccountLivenessError::CheckFailed(error)) => {
+                    close_reason = "account_liveness_check_error".to_string();
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
+                        error = %error,
+                        "STT relay account liveness check failed"
+                    );
+                }
+                Ok(()) => unreachable!("STT account liveness monitor only exits on failure"),
+            }
+            let _ = upstream_tx.send(UpstreamMessage::Close(None)).await;
+            let _ = client_tx.send(ClientMessage::Close(None)).await;
         }
     }
 
@@ -624,24 +642,45 @@ async fn run_deepgram_relay(
     Ok(())
 }
 
-fn ensure_stt_account_active(state: &AppState, account_id: &str) -> anyhow::Result<()> {
-    match Account::fetch_by_id(&state.pool, account_id) {
-        Ok(Some(account)) if !account.billing_restricted => Ok(()),
-        Ok(Some(_)) => anyhow::bail!("account_closed"),
-        Ok(None) => anyhow::bail!("account_closed"),
+#[derive(Debug, thiserror::Error)]
+enum SttAccountLivenessError {
+    #[error("account_deleted")]
+    Deleted,
+    #[error("account_inactive")]
+    Inactive,
+    #[error("account liveness check failed: {0}")]
+    CheckFailed(#[source] anyhow::Error),
+}
+
+fn ensure_stt_account_active(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+) -> Result<(), SttAccountLivenessError> {
+    match Account::fetch_by_id(pool, account_id) {
+        Ok(Some(account)) if !account.billing_restricted && !account.is_temporary_expired() => {
+            Ok(())
+        }
+        Ok(Some(_)) => Err(SttAccountLivenessError::Inactive),
+        Ok(None) => Err(SttAccountLivenessError::Deleted),
         Err(e) => {
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(account_id),
                 error = %e,
                 "failed to verify STT account liveness"
             );
-            anyhow::bail!("account_closed")
+            Err(SttAccountLivenessError::CheckFailed(e))
         }
     }
 }
 
-fn is_account_closed_error(error: &anyhow::Error) -> bool {
-    error.to_string().contains("account_closed")
+async fn monitor_stt_account_liveness(
+    state: &AppState,
+    account_id: &str,
+) -> Result<(), SttAccountLivenessError> {
+    loop {
+        tokio::time::sleep(Duration::from_secs(STT_ACCOUNT_LIVENESS_POLL_SECS)).await;
+        ensure_stt_account_active(&state.pool, account_id)?;
+    }
 }
 
 fn deepgram_realtime_url(session: &ClaimedSttSession) -> String {
@@ -660,10 +699,8 @@ fn deepgram_realtime_url(session: &ClaimedSttSession) -> String {
         5_000,
     );
     let no_delay = deepgram_realtime_env_bool("BLUEY_DEEPGRAM_NO_DELAY", DEFAULT_DEEPGRAM_NO_DELAY);
-    let smart_format = deepgram_realtime_env_bool(
-        "BLUEY_DEEPGRAM_SMART_FORMAT",
-        DEFAULT_DEEPGRAM_SMART_FORMAT,
-    );
+    let smart_format =
+        deepgram_realtime_env_bool("BLUEY_DEEPGRAM_SMART_FORMAT", DEFAULT_DEEPGRAM_SMART_FORMAT);
     let keyterms = deepgram_realtime_keyterms();
     let mut url = format!(
         "{base}?model={}&encoding=linear16&sample_rate=16000&channels=1&punctuate=true&smart_format={smart_format}&interim_results=true&endpointing={endpointing_ms}&vad_events=true&no_delay={no_delay}",
@@ -758,7 +795,11 @@ fn deepgram_realtime_env_optional_u32(
     ) {
         return None;
     }
-    value.parse::<u32>().ok().map(|value| value.clamp(min, max)).or(default)
+    value
+        .parse::<u32>()
+        .ok()
+        .map(|value| value.clamp(min, max))
+        .or(default)
 }
 
 fn deepgram_realtime_env_bool(name: &str, default: bool) -> bool {
@@ -1025,9 +1066,35 @@ fn finalize_relay_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{open_pool, run_migrations};
     use std::sync::Mutex;
 
     static DEEPGRAM_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn temp_pool() -> crate::db::DbPool {
+        let path = std::env::temp_dir().join(format!("bluey-stt-{}.db", uuid::Uuid::new_v4()));
+        let pool = open_pool(&path).expect("open test pool");
+        run_migrations(&pool).expect("migrate test pool");
+        pool
+    }
+
+    #[test]
+    fn stt_account_liveness_distinguishes_active_closed_and_missing_accounts() {
+        let pool = temp_pool();
+        let account =
+            Account::create(&pool, "stt-live@example.com", "hash").expect("create active account");
+        assert!(ensure_stt_account_active(&pool, &account.id).is_ok());
+
+        Account::restrict_billing(&pool, &account.id, "test", None).expect("restrict test account");
+        assert!(matches!(
+            ensure_stt_account_active(&pool, &account.id),
+            Err(SttAccountLivenessError::Inactive)
+        ));
+        assert!(matches!(
+            ensure_stt_account_active(&pool, "missing-account"),
+            Err(SttAccountLivenessError::Deleted)
+        ));
+    }
 
     #[test]
     fn random_token_is_url_safe_and_long() {

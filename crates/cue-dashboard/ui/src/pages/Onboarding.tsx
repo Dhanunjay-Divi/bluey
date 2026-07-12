@@ -1,15 +1,14 @@
 import { useEffect, useState } from "react";
 import { invoke } from "../lib/tauri";
 import { listen } from "@tauri-apps/api/event";
-import { Loader2, Shield, ArrowRight, Check, Eye, EyeOff } from "lucide-react";
+import { Loader2, Shield, ArrowRight, Check, Eye } from "lucide-react";
 
 /**
  * First-run onboarding wizard. Codex Stage 18 — deep-link Option A.
  *
  * Three focused steps, no in-app password prompt:
  *   1. Welcome — explains what Bluey is + a single "Sign in with browser" CTA.
- *      Discloses by default that the overlay runs disguised so customers
- *      know up front (transparency = trust).
+ *      Explains the visible product controls and local/cloud boundary.
  *   2. Authorizing — opens the browser, polls for the deep-link callback
  *      (handled by tauri-plugin-deep-link in lib.rs which emits
  *      "deep_link_login"), shows a clean spinner with cancel option.
@@ -99,25 +98,23 @@ function WelcomeStep({ onSignIn }: { onSignIn: () => void }) {
         </div>
         <h1 className="text-2xl font-semibold tracking-tight">Welcome to Bluey</h1>
         <p className="text-sm text-zinc-400 leading-relaxed">
-          A quiet AI copilot that listens, suggests answers, and stays out of the way.
+          A consent-first live context assistant for engineering meetings and technical work.
         </p>
       </div>
 
       <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
         <div className="flex items-start gap-3">
-          <EyeOff className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
+          <Eye className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
           <div className="text-xs text-zinc-300 leading-relaxed">
-            <span className="font-medium text-zinc-100">Hidden by default.</span>{" "}
-            Bluey runs disguised in your menu bar so screen-shares and meeting
-            recordings never see it. You can toggle visibility anytime.
+            <span className="font-medium text-zinc-100">Visible controls.</span>{" "}
+            Listening, screen analysis, attachments, and answers start from controls you can see in the overlay.
           </div>
         </div>
         <div className="flex items-start gap-3">
           <Shield className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
           <div className="text-xs text-zinc-300 leading-relaxed">
-            <span className="font-medium text-zinc-100">Sign in is browser-based.</span>{" "}
-            We&apos;ll open your browser; you sign in once. No passwords or codes
-            to type into Bluey.
+            <span className="font-medium text-zinc-100">Cloud sync stays off.</span>{" "}
+            Browser sign-in enables managed answers and account balance. Session sync remains a separate Settings choice.
           </div>
         </div>
       </div>
@@ -193,7 +190,7 @@ function LinkedStep({ email, onComplete }: { email: string; onComplete?: () => v
           <Eye className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
           <div className="text-xs text-zinc-300 leading-relaxed">
             <span className="font-medium text-zinc-100">Press F19</span> (or
-            the menu-bar icon) anytime to show or hide Bluey.
+            the menu-bar icon) anytime to show or hide the overlay. Listening has its own control.
           </div>
         </div>
       </div>

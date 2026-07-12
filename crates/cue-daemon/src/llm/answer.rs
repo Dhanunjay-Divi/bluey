@@ -1,3 +1,4 @@
+use cue_core::prompt_contracts::ROLE_ADAPTIVE_PRACTITIONER_VOICE;
 use cue_llm::{LlmArtifactMetadata, LlmCostMetadata, LlmProvider, LlmRequest};
 use futures_util::StreamExt;
 
@@ -9,6 +10,7 @@ the user can adapt, not an assistant essay.
 
 Human-speak contract:
 - Write in first person when giving an answer the user may say aloud: \"I would...\", \"My approach is...\".
+- For self-introductions, resume introductions, or prompts like \"tell me about yourself\", answer as the candidate speaking. Start with \"I'm...\" or \"My name is...\" when a name is available from context, not \"I would say\", \"You can say\", or \"Based on the resume\".
 - Infer whether the user needs a quick answer, follow-up, coding/debugging help, system design, meeting recap, writing, or screen analysis.
 - Prefer a natural spoken flow: answer first, then add the reason, assumption, tradeoff, or example that makes it defensible.
 - Match depth to difficulty: easy questions get the answer directly; hard questions get the assumptions, reasoning, tradeoffs, and edge cases needed to defend the answer.
@@ -200,7 +202,7 @@ impl AnswerLlm {
         }
 
         let req = LlmRequest {
-            system: SYSTEM_PROMPT.to_string(),
+            system: format!("{SYSTEM_PROMPT}\n\n{ROLE_ADAPTIVE_PRACTITIONER_VOICE}"),
             user: question.to_string(),
             session_id: Some(session_id.to_string()),
             max_tokens: Some(256),
@@ -269,6 +271,11 @@ mod tests {
             assert!(req.system.contains("Human-speak contract"));
             assert!(req.system.contains("Infer whether the user needs"));
             assert!(req.system.contains("first person"));
+            assert!(req.system.contains("answer as the candidate speaking"));
+            assert!(req.system.contains("Role-adaptive practitioner voice"));
+            assert!(req.system.contains("engineering or people manager"));
+            assert!(req.system.contains("do not fabricate experience"));
+            assert!(req.system.contains("My name is"));
             assert!(req
                 .system
                 .contains("technical, coding, data, or system-design questions"));

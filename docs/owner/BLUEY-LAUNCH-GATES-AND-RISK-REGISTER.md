@@ -1,13 +1,15 @@
 # Bluey Launch Gates And Risk Register
 
-Date: 2026-06-26
+Updated: 2026-07-12
 
 This is the short owner-level gate list before broader paid alpha or marketing.
 
 ## Launch Verdict
 
-Bluey can be prepared for a controlled macOS-first paid alpha, but should not
-expand trial or public marketing until the P1 cost-control gates are closed.
+The signed `0.1.99` manifest publishes macOS Apple silicon and Windows x86-64
+artifacts. The release record install-smokes Windows 11 only; it does not claim
+Windows 10, macOS Intel/universal, or Linux support. Broader marketing should
+remain bounded by the unresolved cost-control and operational gates below.
 
 ## P1 Gates Before Broad Marketing
 
@@ -137,9 +139,10 @@ Acceptance:
 
 - Deletion/export/retention jobs can be traced from enqueue to done/fail.
 
-## P1 Gates Before Windows Paid Users
+## Windows Support Gates
 
-Windows should not be included in public paid alpha until:
+Publishing a Windows artifact is not the same as broad Windows support. Before
+expanding beyond the release-recorded Windows 11 x86-64 smoke:
 
 - `docs/deploy/WINDOWS-PAID-ALPHA-READINESS.md` P0 passes on clean Windows.
 - Install/update/uninstall are verified.

@@ -1,9 +1,20 @@
 # Roadmap
 
+Current release note: the live manifest reports `0.1.99` with macOS Apple
+silicon and Windows x86-64 artifacts. The version sections below preserve the
+product's thematic roadmap; they are not a current platform support matrix.
+Linux and macOS Intel/universal are not in the current manifest.
+
+Trust gates apply to every roadmap slice: visible capture controls, opt-in
+cloud sync and automatic payments, no retained-audio claim without storage and
+deletion support, no customer-content training without a separate opt-in, and
+no covert or process-impersonation positioning.
+
 ## Version 0.1: macOS Arm64 Local-First Overlay
 
 - Native overlay sidecar.
-- Capture-excluded overlay on macOS.
+- Best-effort capture exclusion on macOS, described as a privacy convenience
+  rather than invisibility.
 - Compact pill-first launch, movable/resizable panel, click-through readable feed,
   and opacity-adjustable background glass.
 - CLI/daemon process model.
@@ -37,15 +48,17 @@
 ## Version 0.3: Platform Expansion
 
 - macOS x86_64 artifact if Intel support is required.
-- Windows whisper.cpp integration and Windows 10/11 QA for overlay, audio,
-  page capture, installer, and update paths.
+- Maintain the current Windows x86-64 artifact and expand real-hardware proof
+  beyond the release-recorded Windows 11 install smoke before claiming more.
 - Linux build decision after audio/capture feasibility review.
-- Signed installers and auto-update only after the supported platform matrix is real.
+- Continue signed-manifest and checksum verification; add platform signing or
+  notarization claims only when independently verified.
 
 ## Version 0.4: Commercial Cloud Memory And Meeting Intelligence
 
 - Authenticated Bluey cloud account.
-- Secure cloud sync for meetings, artifacts, and recaps.
+- Opt-in cloud sync for meetings, approved artifacts, and recaps, with
+  transactional deletion and retention still to harden.
 - Cloud RAG index with tenant/workspace scoped retrieval.
 - Background recap and memory extraction.
 - Meeting history dashboard.

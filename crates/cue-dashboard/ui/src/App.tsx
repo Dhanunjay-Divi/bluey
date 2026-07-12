@@ -15,7 +15,6 @@ import { PermissionBanner } from "./components/PermissionBanner";
 import { Onboarding } from "./pages/Onboarding";
 import { Settings } from "./pages/Settings";
 import { InvisibilityToast } from "./components/InvisibilityToast";
-import { AutoDisguiseToast } from "./components/AutoDisguiseToast";
 
 /** Listens for tray "navigate_to" events and routes accordingly. */
 function NavigateListener() {
@@ -127,7 +126,6 @@ function App() {
           <Route path="dev" element={<Placeholder name="Dev Tools" />} />
         </Route>
       </Routes>
-      <AutoDisguiseToast />
       <InvisibilityToast />
       <UpdateToast />
     </HashRouter>

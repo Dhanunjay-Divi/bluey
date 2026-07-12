@@ -12,6 +12,11 @@ dist/
 # Local visual QA screenshots.
 tmp-*.png
 
+# Private local evaluations, extracted context, smoke output, and scratch data.
+/tmp/
+__pycache__/
+*.pyc
+
 # bluey-server build artifacts
 server/target/
 server/Cargo.lock

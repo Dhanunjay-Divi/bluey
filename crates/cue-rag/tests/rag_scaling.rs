@@ -5,12 +5,16 @@
 //! sqlite-vec / usearch migration.
 
 use cue_rag::store::VectorStore;
-use cue_rag::Chunk;
+use cue_rag::{Chunk, RagScope};
 use std::path::Path;
 use std::time::Instant;
 
 fn make_emb(seed: f32, dim: usize) -> Vec<f32> {
     (0..dim).map(|i| (i as f32 * seed).sin()).collect()
+}
+
+fn scope() -> RagScope {
+    RagScope::new("scaling-test-account", Some("default")).unwrap()
 }
 
 #[test]
@@ -23,6 +27,7 @@ fn query_scales_under_one_second_at_ten_thousand_chunks() {
     let limit = 10;
 
     let store = VectorStore::open(Path::new(":memory:"), dim).unwrap();
+    let scope = scope();
 
     let index_start = Instant::now();
     for i in 0..n {
@@ -32,13 +37,13 @@ fn query_scales_under_one_second_at_ten_thousand_chunks() {
             end_char: (i + 1) * 10,
         };
         let emb = make_emb((i as f32 + 1.0) * 0.001, dim);
-        store.index("session-1", &chunk, &emb).unwrap();
+        store.index(&scope, "session-1", &chunk, &emb).unwrap();
     }
     let index_elapsed = index_start.elapsed();
 
     let query_emb = make_emb(0.5, dim);
     let q_start = Instant::now();
-    let hits = store.query(&query_emb, limit, None).unwrap();
+    let hits = store.query(&scope, &query_emb, limit, None).unwrap();
     let q_elapsed = q_start.elapsed();
 
     eprintln!(
@@ -61,22 +66,27 @@ fn query_scales_under_one_second_at_ten_thousand_chunks() {
 #[test]
 fn empty_limit_returns_empty() {
     let store = VectorStore::open(Path::new(":memory:"), 4).unwrap();
+    let scope = scope();
     let chunk = Chunk {
         text: "x".into(),
         start_char: 0,
         end_char: 1,
     };
-    store.index("s1", &chunk, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-    let hits = store.query(&[1.0, 0.0, 0.0, 0.0], 0, None).unwrap();
+    store
+        .index(&scope, "s1", &chunk, &[1.0, 0.0, 0.0, 0.0])
+        .unwrap();
+    let hits = store.query(&scope, &[1.0, 0.0, 0.0, 0.0], 0, None).unwrap();
     assert!(hits.is_empty());
 }
 
 #[test]
 fn limit_larger_than_corpus_returns_corpus_size() {
     let store = VectorStore::open(Path::new(":memory:"), 4).unwrap();
+    let scope = scope();
     for i in 0..3 {
         store
             .index(
+                &scope,
                 "s",
                 &Chunk {
                     text: format!("{i}"),
@@ -87,6 +97,6 @@ fn limit_larger_than_corpus_returns_corpus_size() {
             )
             .unwrap();
     }
-    let hits = store.query(&make_emb(0.5, 4), 100, None).unwrap();
+    let hits = store.query(&scope, &make_emb(0.5, 4), 100, None).unwrap();
     assert_eq!(hits.len(), 3);
 }

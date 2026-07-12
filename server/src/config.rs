@@ -161,6 +161,7 @@ pub struct TrialAbuseConfig {
     pub max_trials_per_email: i64,
     pub max_trials_per_email_domain_per_day: i64,
     pub max_trials_per_device: i64,
+    pub max_trials_per_device_per_30_days: i64,
     pub max_trials_per_ip_per_day: i64,
     pub max_trials_per_ip_user_agent_per_day: i64,
 }
@@ -182,7 +183,8 @@ impl Default for TrialAbuseConfig {
         Self {
             max_trials_per_email: 1,
             max_trials_per_email_domain_per_day: 25,
-            max_trials_per_device: 1,
+            max_trials_per_device: 6,
+            max_trials_per_device_per_30_days: 1,
             max_trials_per_ip_per_day: 3,
             max_trials_per_ip_user_agent_per_day: 5,
         }
@@ -326,7 +328,11 @@ impl Config {
                 "BLUEY_TRIAL_MAX_PER_EMAIL_DOMAIN_PER_DAY",
             )
             .unwrap_or(25),
-            max_trials_per_device: env_positive_i64("BLUEY_TRIAL_MAX_PER_DEVICE").unwrap_or(1),
+            max_trials_per_device: env_positive_i64("BLUEY_TRIAL_MAX_PER_DEVICE").unwrap_or(6),
+            max_trials_per_device_per_30_days: env_positive_i64(
+                "BLUEY_TRIAL_MAX_PER_DEVICE_PER_30_DAYS",
+            )
+            .unwrap_or(1),
             max_trials_per_ip_per_day: env_positive_i64("BLUEY_TRIAL_MAX_PER_IP_PER_DAY")
                 .unwrap_or(3),
             max_trials_per_ip_user_agent_per_day: env_positive_i64(

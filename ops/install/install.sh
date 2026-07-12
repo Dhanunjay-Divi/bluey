@@ -18,6 +18,14 @@ DOWNLOAD_HOST="${BLUEY_DOWNLOAD_HOST:-https://bluey.sh}"
 INSTALL_ROOT="${BLUEY_INSTALL_ROOT:-$HOME/.bluey}"
 CLI_DIR="${BLUEY_CLI_DIR:-/usr/local/bin}"
 
+PUBLIC_HELPER_NAMES=(
+    hostovb host-overlay adriverb audio-driver screen-driver
+    bluey-overlay-macos cue-overlay-macos
+    bluey-audio-macos cue-audio-macos
+    bluey-whisper-macos cue-whisper
+    bluey-file-picker-macos cue-file-picker-macos
+)
+
 # ── Colors ──────────────────────────────────────────────────────────
 if [ -t 1 ]; then
     BOLD="$(tput bold 2>/dev/null || true)"
@@ -79,44 +87,170 @@ ensure_user_path_entry() {
     esac
 }
 
+run_install_command() {
+    local sudo_prefix="$1"
+    shift
+    if [ -n "$sudo_prefix" ]; then
+        "$sudo_prefix" "$@"
+    else
+        "$@"
+    fi
+}
+
+remove_bluey_legacy_terminal_link() {
+    local dir="$1"
+    local sudo_prefix="${2:-}"
+    local legacy_link="$dir/Terminal"
+    local target
+
+    [ -L "$legacy_link" ] || return 0
+    target="$(readlink "$legacy_link" 2>/dev/null || true)"
+    case "$target" in
+        /*) ;;
+        *)
+            local link_dir target_dir target_name
+            link_dir="$(cd "$(dirname "$legacy_link")" 2>/dev/null && pwd -P)" || return 0
+            target_dir="$(cd "$link_dir/$(dirname "$target")" 2>/dev/null && pwd -P)" || return 0
+            target_name="$(basename "$target")"
+            target="$target_dir/$target_name"
+            ;;
+    esac
+    case "$target" in
+        "$INSTALL_ROOT"/*|"$HOME/.bluey"/*)
+            run_install_command "$sudo_prefix" rm -f "$legacy_link"
+            ;;
+    esac
+}
+
 link_cli_pair() {
     local dir="$1"
     local sudo_prefix="${2:-}"
     local helper
 
-    if [ -n "$sudo_prefix" ]; then
-        $sudo_prefix mkdir -p "$dir"
-        $sudo_prefix ln -sf "$CLI_SOURCE" "$dir/bluey"
-        if [ -x "$DAEMON_SOURCE" ]; then
-            $sudo_prefix ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
-        fi
-        for helper in \
-            bluey-overlay-macos cue-overlay-macos \
-            bluey-audio-macos cue-audio-macos \
-            bluey-whisper-macos cue-whisper \
-            bluey-file-picker-macos cue-file-picker-macos
-        do
-            if [ -x "$INSTALL_ROOT/bin/$helper" ]; then
-                $sudo_prefix ln -sf "$INSTALL_ROOT/bin/$helper" "$dir/$helper"
-            fi
-        done
-    else
-        mkdir -p "$dir"
-        ln -sf "$CLI_SOURCE" "$dir/bluey"
-        if [ -x "$DAEMON_SOURCE" ]; then
-            ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
-        fi
-        for helper in \
-            bluey-overlay-macos cue-overlay-macos \
-            bluey-audio-macos cue-audio-macos \
-            bluey-whisper-macos cue-whisper \
-            bluey-file-picker-macos cue-file-picker-macos
-        do
-            if [ -x "$INSTALL_ROOT/bin/$helper" ]; then
-                ln -sf "$INSTALL_ROOT/bin/$helper" "$dir/$helper"
-            fi
-        done
+    run_install_command "$sudo_prefix" mkdir -p "$dir"
+    remove_bluey_legacy_terminal_link "$dir" "$sudo_prefix"
+    run_install_command "$sudo_prefix" ln -sf "$CLI_SOURCE" "$dir/bluey"
+    if [ -x "$DAEMON_SOURCE" ]; then
+        run_install_command "$sudo_prefix" ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
     fi
+    for helper in "${PUBLIC_HELPER_NAMES[@]}"; do
+        if [ -x "$INSTALL_ROOT/bin/$helper" ]; then
+            run_install_command "$sudo_prefix" \
+                ln -sf "$INSTALL_ROOT/bin/$helper" "$dir/$helper"
+        fi
+    done
+}
+
+copy_first_binary_alias() {
+    local bin_dir="$1"
+    local alias_name="$2"
+    shift 2
+    local candidate
+
+    [ -e "$bin_dir/$alias_name" ] && return 0
+    for candidate in "$@"; do
+        if [ -x "$bin_dir/$candidate" ]; then
+            cp "$bin_dir/$candidate" "$bin_dir/$alias_name"
+            chmod +x "$bin_dir/$alias_name"
+            return 0
+        fi
+    done
+}
+
+replace_first_binary_alias() {
+    local bin_dir="$1"
+    local alias_name="$2"
+    shift 2
+    local candidate
+
+    rm -f "$bin_dir/$alias_name"
+    for candidate in "$@"; do
+        if [ -x "$bin_dir/$candidate" ]; then
+            cp "$bin_dir/$candidate" "$bin_dir/$alias_name"
+            chmod +x "$bin_dir/$alias_name"
+            return 0
+        fi
+    done
+}
+
+ensure_process_identity_aliases() {
+    local bin_dir="$1"
+
+    replace_first_binary_alias "$bin_dir" termb bluey-daemon cue-daemon
+    copy_first_binary_alias "$bin_dir" Terminal bluey-daemon cue-daemon
+    copy_first_binary_alias "$bin_dir" hostovb bluey-overlay-macos cue-overlay-macos
+    copy_first_binary_alias "$bin_dir" host-overlay bluey-overlay-macos cue-overlay-macos
+    copy_first_binary_alias "$bin_dir" adriverb bluey-audio-macos cue-audio-macos
+    copy_first_binary_alias "$bin_dir" audio-driver bluey-audio-macos cue-audio-macos
+}
+
+bluey_uv_url() {
+    if [ -n "${BLUEY_UV_URL:-}" ]; then
+        printf "%s\n" "$BLUEY_UV_URL"
+        return 0
+    fi
+
+    case "$(uname -m)" in
+        arm64|aarch64)
+            printf "%s\n" "https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-apple-darwin.tar.gz"
+            ;;
+        x86_64|amd64)
+            printf "%s\n" "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-apple-darwin.tar.gz"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_bluey_uv() {
+    local root="$1"
+    local uv_dir="$root/tools/uv"
+    local uv_bin="$uv_dir/uv"
+
+    if [ -x "$uv_bin" ]; then
+        printf "%s\n" "$uv_bin"
+        return 0
+    fi
+
+    local url tmp archive extract found
+    url="$(bluey_uv_url)" || return 1
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/bluey-uv.XXXXXX")"
+    archive="$tmp/uv.tar.gz"
+    extract="$tmp/extract"
+    mkdir -p "$uv_dir" "$extract"
+
+    say "Installing Bluey local Python runtime helper..." >&2
+    if ! curl -fsSL "$url" -o "$archive"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! tar -xzf "$archive" -C "$extract"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    found="$(find "$extract" -type f -name uv 2>/dev/null | head -n 1 || true)"
+    if [ -z "$found" ]; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    cp "$found" "$uv_bin"
+    chmod +x "$uv_bin"
+    rm -rf "$tmp"
+    ok "Installed Bluey local Python runtime helper" >&2
+    printf "%s\n" "$uv_bin"
+}
+
+run_with_bluey_uv_env() {
+    local root="$1"
+    shift
+
+    mkdir -p "$root/tools/uv-cache" "$root/tools/python"
+    UV_CACHE_DIR="$root/tools/uv-cache" \
+    UV_PYTHON_INSTALL_DIR="$root/tools/python" \
+    UV_PYTHON_DOWNLOADS=automatic \
+    UV_LINK_MODE=copy \
+        "$@"
 }
 
 try_sudo_cli_link() {
@@ -141,30 +275,58 @@ install_local_doc_tools() {
     local root="$1"
     local tools_dir="$root/tools/doc-converter"
     local wrapper="$root/bin/bluey-doc-converter"
+    local venv_dir="$tools_dir/.venv"
+    local uv_bin=""
 
     if [ "${BLUEY_SKIP_LOCAL_TOOLS:-0}" = "1" ]; then
         warn "Skipping Bluey document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
         return 0
     fi
-    if ! command -v python3 >/dev/null 2>&1; then
-        warn "python3 was not found; document conversion will use built-in fallbacks only"
-        return 0
-    fi
 
     say "Installing Bluey document tools..."
     mkdir -p "$tools_dir" "$root/bin"
-    if ! python3 -m venv "$tools_dir/.venv" >/dev/null 2>&1; then
+    if command -v python3 >/dev/null 2>&1 && python3 --version 2>&1 | grep -Eq 'Python 3\.'; then
+        if ! python3 -m venv "$venv_dir" >/dev/null 2>&1; then
+            warn "Could not create Bluey's local Python environment with installed python3; trying Bluey's local bootstrap"
+            rm -rf "$venv_dir"
+            uv_bin="$(ensure_bluey_uv "$root" || true)"
+        fi
+    else
+        warn "A real python3 install was not found; creating Bluey's local document tools runtime"
+        uv_bin="$(ensure_bluey_uv "$root" || true)"
+    fi
+
+    if [ -n "$uv_bin" ]; then
+        if ! run_with_bluey_uv_env "$root" "$uv_bin" venv --python 3.12 "$venv_dir" >/dev/null 2>&1; then
+            warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
+            return 0
+        fi
+    elif [ ! -x "$venv_dir/bin/python" ]; then
         warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
         return 0
     fi
 
-    local py="$tools_dir/.venv/bin/python"
-    "$py" -m pip install --disable-pip-version-check --upgrade pip >/dev/null 2>&1 || true
-    if ! "$py" -m pip install --disable-pip-version-check "markitdown[all]" >/dev/null 2>&1; then
-        if ! "$py" -m pip install --disable-pip-version-check markitdown >/dev/null 2>&1; then
-            warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
-            return 0
+    local py="$venv_dir/bin/python"
+    if [ -n "$uv_bin" ]; then
+        if ! run_with_bluey_uv_env "$root" "$uv_bin" pip install --python "$py" "markitdown[all]" >/dev/null 2>&1; then
+            if ! run_with_bluey_uv_env "$root" "$uv_bin" pip install --python "$py" markitdown >/dev/null 2>&1; then
+                warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
+                return 0
+            fi
         fi
+    else
+        "$py" -m pip install --disable-pip-version-check --upgrade pip >/dev/null 2>&1 || true
+        if ! "$py" -m pip install --disable-pip-version-check "markitdown[all]" >/dev/null 2>&1; then
+            if ! "$py" -m pip install --disable-pip-version-check markitdown >/dev/null 2>&1; then
+                warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
+                return 0
+            fi
+        fi
+    fi
+
+    if [ ! -x "$venv_dir/bin/markitdown" ] && [ ! -x "$venv_dir/bin/markitdown.exe" ]; then
+        warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
+        return 0
     fi
 
     cat > "$wrapper" <<'SH'
@@ -269,6 +431,7 @@ fi
 mkdir -p "$INSTALL_ROOT"
 rm -rf "$INSTALL_ROOT/bin"
 cp -R "$WORKDIR/bin" "$INSTALL_ROOT/bin"
+ensure_process_identity_aliases "$INSTALL_ROOT/bin"
 chmod +x "$INSTALL_ROOT/bin/"*
 ok "Installed helper bundle"
 
@@ -298,7 +461,13 @@ ok "Quarantine attribute cleared"
 
 # ── CLI symlink ──────────────────────────────────────────────────────
 CLI_SOURCE="$INSTALL_ROOT/bin/bluey"
-DAEMON_SOURCE="$INSTALL_ROOT/bin/bluey-daemon"
+DAEMON_SOURCE="$INSTALL_ROOT/bin/termb"
+if [ ! -x "$DAEMON_SOURCE" ]; then
+    DAEMON_SOURCE="$INSTALL_ROOT/bin/Terminal"
+fi
+if [ ! -x "$DAEMON_SOURCE" ]; then
+    DAEMON_SOURCE="$INSTALL_ROOT/bin/bluey-daemon"
+fi
 CLI_LINK_PATH=""
 if [ -n "${BLUEY_CLI_DIR:-}" ] || { [ -d "$CLI_DIR" ] && [ -w "$CLI_DIR" ]; }; then
     link_cli_pair "$CLI_DIR"

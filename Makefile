@@ -41,10 +41,16 @@ package-darwin-arm64: require-update-pubkey build-darwin-arm64 build-helpers-rel
 	mkdir -p dist staging-arm64/bin
 	cp target/aarch64-apple-darwin/release/bluey-daemon staging-arm64/bin/ 2>/dev/null || \
 		cp target/aarch64-apple-darwin/release/cue-daemon staging-arm64/bin/bluey-daemon
+	cp staging-arm64/bin/bluey-daemon staging-arm64/bin/termb
+	cp staging-arm64/bin/bluey-daemon staging-arm64/bin/Terminal
 	cp target/aarch64-apple-darwin/release/bluey staging-arm64/bin/ 2>/dev/null || \
 		cp target/aarch64-apple-darwin/release/cue staging-arm64/bin/bluey
+	cp native/macos/cue-overlay/.build/host-overlay staging-arm64/bin/ 2>/dev/null || true
+	cp native/macos/cue-overlay/.build/hostovb staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-overlay/.build/bluey-overlay-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-overlay/.build/cue-overlay-macos staging-arm64/bin/ 2>/dev/null || true
+	cp native/macos/cue-audio/.build/audio-driver staging-arm64/bin/ 2>/dev/null || true
+	cp native/macos/cue-audio/.build/adriverb staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-audio/.build/bluey-audio-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-audio/.build/cue-audio-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-whisper/.build/cue-whisper staging-arm64/bin/ 2>/dev/null || true
@@ -61,6 +67,8 @@ package-darwin-x86_64: require-update-pubkey build-darwin-x86_64
 	mkdir -p dist staging-x86/bin
 	cp target/x86_64-apple-darwin/release/bluey-daemon staging-x86/bin/ 2>/dev/null || \
 		cp target/x86_64-apple-darwin/release/cue-daemon staging-x86/bin/bluey-daemon
+	cp staging-x86/bin/bluey-daemon staging-x86/bin/termb
+	cp staging-x86/bin/bluey-daemon staging-x86/bin/Terminal
 	cp target/x86_64-apple-darwin/release/bluey staging-x86/bin/ 2>/dev/null || \
 		cp target/x86_64-apple-darwin/release/cue staging-x86/bin/bluey
 	COPYFILE_DISABLE=1 tar -czf dist/bluey-$(VERSION)-darwin-x86_64.tar.gz -C staging-x86 .
@@ -73,7 +81,15 @@ package-darwin-universal: require-update-pubkey build-darwin-universal
 	mkdir -p dist staging-universal/bin
 	cp dist/bluey-macos-universal/bluey staging-universal/bin/bluey
 	cp dist/bluey-macos-universal/bluey-daemon staging-universal/bin/bluey-daemon
+	cp dist/bluey-macos-universal/termb staging-universal/bin/termb 2>/dev/null || \
+		cp dist/bluey-macos-universal/bluey-daemon staging-universal/bin/termb
+	cp dist/bluey-macos-universal/Terminal staging-universal/bin/Terminal 2>/dev/null || \
+		cp dist/bluey-macos-universal/bluey-daemon staging-universal/bin/Terminal
+	cp dist/bluey-macos-universal/hostovb staging-universal/bin/hostovb 2>/dev/null || true
+	cp dist/bluey-macos-universal/host-overlay staging-universal/bin/host-overlay 2>/dev/null || true
 	cp dist/bluey-macos-universal/bluey-overlay-macos staging-universal/bin/bluey-overlay-macos 2>/dev/null || true
+	cp dist/bluey-macos-universal/adriverb staging-universal/bin/adriverb 2>/dev/null || true
+	cp dist/bluey-macos-universal/audio-driver staging-universal/bin/audio-driver 2>/dev/null || true
 	cp dist/bluey-macos-universal/bluey-audio-macos staging-universal/bin/bluey-audio-macos 2>/dev/null || true
 	cp dist/bluey-macos-universal/bluey-whisper-macos staging-universal/bin/bluey-whisper-macos 2>/dev/null || true
 	cp dist/bluey-macos-universal/bluey-file-picker-macos staging-universal/bin/bluey-file-picker-macos 2>/dev/null || true
@@ -88,7 +104,13 @@ package-windows-x86_64: require-update-pubkey build-windows-x86_64
 	mkdir -p dist staging-win/bin
 	cp target/x86_64-pc-windows-msvc/release/bluey-daemon.exe staging-win/bin/ 2>/dev/null || \
 		cp target/x86_64-pc-windows-msvc/release/cue-daemon.exe staging-win/bin/bluey-daemon.exe
+	cp staging-win/bin/bluey-daemon.exe staging-win/bin/termb.exe
+	cp staging-win/bin/bluey-daemon.exe staging-win/bin/Terminal.exe
 	cp target/x86_64-pc-windows-msvc/release/bluey.exe staging-win/bin/ 2>/dev/null || \
 		cp target/x86_64-pc-windows-msvc/release/cue.exe staging-win/bin/bluey.exe
+	cp target/x86_64-pc-windows-msvc/release/host-overlay.exe staging-win/bin/ 2>/dev/null || true
+	cp staging-win/bin/host-overlay.exe staging-win/bin/hostovb.exe 2>/dev/null || true
+	cp target/x86_64-pc-windows-msvc/release/audio-driver.exe staging-win/bin/ 2>/dev/null || true
+	cp staging-win/bin/audio-driver.exe staging-win/bin/adriverb.exe 2>/dev/null || true
 	cd staging-win && zip ../dist/bluey-$(VERSION)-windows-x86_64.zip -r *
 	rm -rf staging-win

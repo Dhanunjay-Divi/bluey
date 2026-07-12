@@ -7,9 +7,9 @@ Use it before changing layout, icons, copy, or interaction behavior.
 
 Reviewed local references:
 
-- Pinky: compact native pill, visible heartbeat/status dot, capture-excluded
-  native overlay, split between interactive chrome and readable/click-through
-  content, scroll history, explicit close/stop semantics.
+- Pinky: compact native pill, visible heartbeat/status dot, best-effort
+  capture-excluded native overlay, split between interactive chrome and
+  readable/click-through content, scroll history, explicit close/stop semantics.
 - Natively: polished chat overlay, strong markdown/code rendering, streaming
   cursor, copy affordances, meeting context folded into follow-up chat.
 - Pluely: sticky bottom composer, conversation history rhythm, clean attach and
@@ -132,7 +132,8 @@ Implemented in the macOS native overlay:
 - expanded dark panel with top status strip, feed, composer, and action row;
 - role-labeled cards with accent rails and streaming status;
 - icon-led actions for Answer, Analyse, Attach, Rules, Recap, and close;
-- capture-excluded native windows and daemon-tokenized IPC.
+- native windows that request capture exclusion and use daemon-tokenized IPC;
+  customer copy must state that capture exclusion is best effort.
 
 Still needed:
 
@@ -143,7 +144,8 @@ Still needed:
 - attachment drawer and attached-context list;
 - audio/provider/cloud health chips;
 - warning-card patterns for every permission/provider failure;
-- Windows parity after Windows becomes a supported target;
+- broader Windows hardware QA beyond the release-recorded Windows 11 x86-64
+  install smoke;
 - clean visual QA screenshots/video on real displays.
 
 ## Next UI Slice
@@ -170,3 +172,8 @@ Recommended next implementation round:
 - Do not add controls without a clear state and error path.
 - Do not make daily work depend on terminal commands.
 - Keep capture and screen context user-controlled and visible.
+- Keep sign-in separate from opt-in cloud sync.
+- Render raw-audio retention and training as off, read-only facts until real
+  opt-in backends exist.
+- Never describe show/hide or capture exclusion as covert, invisible, or
+  undetectable.

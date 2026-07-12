@@ -16,7 +16,7 @@ const MARKITDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 const PREVIEW_CHARS: usize = 16_000;
 
 pub(crate) fn supported_context_formats_message() -> &'static str {
-    "Supported formats: PDF, DOC/DOCX, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images."
+    "Supported formats: PDF, Word, PowerPoint, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images. Video files are not readable context yet."
 }
 
 #[derive(Debug, Clone)]
@@ -46,9 +46,8 @@ pub(crate) fn classify_context_path(path: &Path) -> ContextKind {
         "rs" | "swift" | "c" | "h" | "cpp" | "hpp" | "js" | "jsx" | "ts" | "tsx" | "py" | "go"
         | "java" | "kt" | "kts" | "cs" | "rb" | "php" | "sql" | "sh" | "ps1" | "toml" | "yaml"
         | "yml" | "json" | "html" | "css" | "scss" => ContextKind::Code,
-        "pdf" | "doc" | "docx" | "rtf" | "xls" | "xlsx" | "xlsm" | "xlsb" | "ods" => {
-            ContextKind::Document
-        }
+        "pdf" | "doc" | "docx" | "rtf" | "ppt" | "pptx" | "xls" | "xlsx" | "xlsm" | "xlsb"
+        | "ods" => ContextKind::Document,
         "txt" | "log" | "csv" | "tsv" | "md" | "markdown" | "rst" | "adoc" => ContextKind::Text,
         _ => ContextKind::Other,
     }
@@ -149,6 +148,12 @@ fn discover_markitdown_commands() -> Vec<ConverterCommand> {
         }
     }
 
+    for candidate in bluey_home_doc_converter_candidates() {
+        if candidate.is_file() {
+            push(candidate);
+        }
+    }
+
     // Let Command::new resolve PATH. If neither command exists, conversion
     // falls back without making users install anything manually.
     push(PathBuf::from("bluey-doc-converter"));
@@ -187,6 +192,50 @@ fn bluey_local_doc_converter_candidates(exe_dir: &Path) -> Vec<PathBuf> {
         ]);
     }
 
+    candidates
+}
+
+fn bluey_home_doc_converter_candidates() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for name in ["BLUEY_INSTALL_ROOT", "HOME", "USERPROFILE"] {
+        if let Some(value) = env::var_os(name).filter(|value| !value.is_empty()) {
+            let root = PathBuf::from(value);
+            let install_root = if name == "BLUEY_INSTALL_ROOT" {
+                root
+            } else {
+                root.join(".bluey")
+            };
+            if !roots
+                .iter()
+                .any(|existing: &PathBuf| existing == &install_root)
+            {
+                roots.push(install_root);
+            }
+        }
+    }
+
+    bluey_doc_converter_candidates_for_roots(roots)
+}
+
+fn bluey_doc_converter_candidates_for_roots<I>(roots: I) -> Vec<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    let mut candidates = Vec::new();
+    for root in roots {
+        candidates.extend([
+            root.join("bin/bluey-doc-converter"),
+            root.join("tools/doc-converter/bin/bluey-doc-converter"),
+            root.join("tools/doc-converter/.venv/bin/markitdown"),
+        ]);
+
+        #[cfg(target_os = "windows")]
+        candidates.extend([
+            root.join("bin/bluey-doc-converter.cmd"),
+            root.join("tools/doc-converter/bin/bluey-doc-converter.cmd"),
+            root.join("tools/doc-converter/.venv/Scripts/markitdown.exe"),
+        ]);
+    }
     candidates
 }
 
@@ -287,6 +336,11 @@ fn extract_document_text_preview(path: &Path, size_bytes: u64) -> Result<String>
     let text = match extension.as_str() {
         "pdf" => extract_pdf_text(path)?,
         "doc" | "docx" | "rtf" => extract_word_text(path)?,
+        "ppt" | "pptx" => {
+            return Err(anyhow!(
+                "PowerPoint conversion needs the bundled MarkItDown converter"
+            ));
+        }
         "xls" | "xlsx" | "xlsm" | "xlsb" | "ods" => {
             return Err(anyhow!(
                 "spreadsheet conversion needs the bundled MarkItDown converter"
@@ -539,6 +593,7 @@ mod tests {
     fn picker_context_filter_rejects_video_and_key_material() {
         assert!(is_supported_context_file(Path::new("plan.md")));
         assert!(is_supported_context_file(Path::new("architecture.pdf")));
+        assert!(is_supported_context_file(Path::new("deck.pptx")));
         assert!(is_supported_context_file(Path::new("budget.xlsx")));
         assert!(is_supported_context_file(Path::new("forecast.xlsm")));
         assert!(is_supported_context_file(Path::new("main.rs")));
@@ -568,6 +623,27 @@ mod tests {
     fn markdown_preview_collapses_blank_lines_and_truncates() {
         let preview = build_text_preview("a\n\n\nb\nlongline", 5);
         assert_eq!(preview, "a\n\nb\n...");
+    }
+
+    #[test]
+    fn installed_converter_candidates_cover_wrapper_and_markitdown() {
+        let root = PathBuf::from("/tmp/bluey-install-root");
+        let candidates = bluey_doc_converter_candidates_for_roots(vec![root.clone()]);
+
+        assert!(candidates.contains(&root.join("bin/bluey-doc-converter")));
+        assert!(candidates.contains(&root.join("tools/doc-converter/bin/bluey-doc-converter")));
+        assert!(candidates.contains(&root.join("tools/doc-converter/.venv/bin/markitdown")));
+
+        #[cfg(target_os = "windows")]
+        {
+            assert!(candidates.contains(&root.join("bin/bluey-doc-converter.cmd")));
+            assert!(
+                candidates.contains(&root.join("tools/doc-converter/bin/bluey-doc-converter.cmd"))
+            );
+            assert!(
+                candidates.contains(&root.join("tools/doc-converter/.venv/Scripts/markitdown.exe"))
+            );
+        }
     }
 
     #[test]
