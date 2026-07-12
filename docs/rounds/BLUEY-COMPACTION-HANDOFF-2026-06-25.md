@@ -5994,6 +5994,82 @@ Deployment status:
 - `bluey-api.service` is active with `NRestarts=0`.
 - Recent production warning/error scan after restart returned no entries.
 
+## Latest Local QA Addendum: Medha Resume Plus Otter Context
+
+Date: 2026-07-11
+
+Round doc:
+
+- `docs/rounds/ROUND-476-MEDHA-OTTER-CONTEXT-QA.md`
+
+Current local changes:
+
+- `crates/cue-daemon/src/app.rs`
+- `docs/rounds/ROUND-476-MEDHA-OTTER-CONTEXT-QA.md`
+
+Purpose:
+
+- Validate that Bluey can use a saved resume plus four Otter transcript exports
+  for interview answers without resending every full file on each answer.
+- Fix the failure where saved documents were attached but Bluey answered from
+  shallow or wrong transcript sections.
+
+Live session:
+
+- Visible Bluey is running.
+- Session id: `9d6c6ae7-4c46-4a90-87d8-adc5e1bfe282`
+- Title: `Medha Resume Otter QA`
+- Attached context items: 5
+- Screenshot: `/tmp/bluey-medha-qa-final.png`
+
+Key local changes:
+
+- Saved attachment context now builds query-focused excerpts.
+- Interview questions prioritize saved resume/transcript files when relevant.
+- Explicit Otter/transcript questions prefer transcript-like artifacts over
+  resume-like artifacts.
+- Question-specific expansion terms bridge messy transcripts, for example
+  camera/fan/RPM/heartbeat/Lambda and outside-comfort/Fannie/SaaS/AWS/business
+  logic.
+- Answer audit events now include counts for document, memory, screenshot,
+  transcript, and total answer contexts.
+- Prompt contract now preserves concrete transcript evidence and refuses to
+  invent tools, metrics, deadlines, or outcomes not present in context.
+- Answer sanitizer removes em dashes and AI-sounding filler words such as
+  `genuinely`, `honestly`, and `straightforwardly`.
+
+Verification:
+
+```bash
+git diff --check
+cargo test -p cue-daemon sanitize_answer_text
+cargo test -p cue-daemon interview_
+cargo test -p cue-daemon relevant_current_attachment_context
+./target/debug/bluey status
+```
+
+Live QA outcome:
+
+- Amazon Just Walk Out camera incident now uses the correct Otter transcript
+  facts: fan RPM, overheating, Lambda reboot logic, sustained threshold,
+  telemetry comparison, guardrail, and SLA window.
+- Outside-comfort STAR answer now uses the Fannie/SaaS/AWS/business-logic
+  transcript section without inventing Glue, Step Functions, dashboards,
+  regulatory deadlines, or numeric outcomes.
+- Self-introduction was grounded but had one filler word before sanitizer was
+  added. It was not rerun after sanitizer to avoid extra paid calls.
+
+Remaining gaps:
+
+- First visible answer token is still slow, around 8 to 10 seconds in the live
+  Medha/Otter test, while local context prep is about 23 ms. The remaining delay
+  is provider/managed-route dominated.
+- Dashboard route and download route were checked in signed-in Chrome. Session
+  History detail and saved-file visibility still need a deeper web UI pass.
+- If the owner means every helper environment should be created during install,
+  validate installer coverage beyond the recent local document-tools bootstrap
+  commit `b551afe1`.
+
 ## Latest Round 472: 50-Question Interview Quality Evaluation
 
 Backup task id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
