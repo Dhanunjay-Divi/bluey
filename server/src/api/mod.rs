@@ -329,6 +329,7 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
             ));
 
     Router::new()
+        .route("/health", get(admin::health))
         .merge(jobs::worker_router())
         .merge(jobs::local_runner_router())
         .merge(protected)

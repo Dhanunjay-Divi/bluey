@@ -31,6 +31,7 @@ use bluey_server::db::{idempotency, open_pool, run_migrations, DbPool};
 /// returns the axum Router ready for ServiceExt::oneshot.
 struct Harness {
     pub router: axum::Router,
+    pub jobs_router: axum::Router,
     pub pool: DbPool,
     pub openai: MockServer,
     pub anthropic: MockServer,
@@ -38,6 +39,39 @@ struct Harness {
     pub square: MockServer,
     pub deepgram: MockServer,
     pub mail: MockServer,
+}
+
+#[tokio::test]
+#[serial]
+async fn standalone_jobs_router_exposes_health_and_protects_customer_data() {
+    let harness = boot_harness().await;
+    let health = harness
+        .jobs_router
+        .clone()
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let workspace = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/workspace")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(workspace.status(), StatusCode::UNAUTHORIZED);
+
+    let main_api_route = harness
+        .jobs_router
+        .clone()
+        .oneshot(Request::get("/account/me").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(main_api_route.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -1865,10 +1899,12 @@ async fn boot_harness_with_config(
     std::env::set_var("BLUEY_TEST_DEEPGRAM_URL", deepgram.uri());
     std::env::set_var("BLUEY_RESEND_API_BASE_URL", mail.uri());
 
+    let jobs_router = bluey_server::api::build_jobs_router(pool.clone(), config.clone());
     let router = bluey_server::api::build_router(pool.clone(), config);
 
     Harness {
         router,
+        jobs_router,
         pool,
         openai,
         anthropic,
