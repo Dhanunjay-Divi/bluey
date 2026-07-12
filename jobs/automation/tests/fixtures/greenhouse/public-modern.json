@@ -1,0 +1,46 @@
+{
+  "tenant": "acme",
+  "url": "https://job-boards.greenhouse.io/acme/jobs/12345",
+  "title": "Job Application for Senior Software Engineer at Acme",
+  "body": "Senior Software Engineer\nApply for this job",
+  "confirmationBody": "Thank you for applying. Your application has been received.",
+  "markers": ["#submit_app"],
+  "controls": [
+    {
+      "selector": "[data-bluey-field-id='first-name']",
+      "kind": "text",
+      "label": "First name",
+      "name": "first_name",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='last-name']",
+      "kind": "text",
+      "label": "Last name",
+      "name": "last_name",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='email']",
+      "kind": "email",
+      "label": "Email address",
+      "name": "email",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='resume']",
+      "kind": "file",
+      "label": "Resume/CV",
+      "name": "resume",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    }
+  ]
+}

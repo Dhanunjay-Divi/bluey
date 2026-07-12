@@ -287,7 +287,14 @@ export class StandardAtsAdapter implements ApplicationAdapter {
 
       const submit = await firstVisible(context.page, this.definition.submitSelectors);
       if (submit) {
-        await submit.click();
+        await context.beforeFinalSubmit?.();
+        try {
+          await submit.click();
+        } catch (error) {
+          await context.afterFinalSubmit?.("activation_uncertain");
+          throw error;
+        }
+        await context.afterFinalSubmit?.("activated");
         await context.page.waitForSettled();
         const afterChallenge = await detectChallenge(context.page);
         if (afterChallenge) return interventionReceipt(afterChallenge);

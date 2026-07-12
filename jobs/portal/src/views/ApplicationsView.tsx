@@ -19,10 +19,12 @@ import {
   Play,
   Search,
   Send,
+  Sparkles,
 } from "lucide-react";
-import type { ApplicationEvidence, Intervention, JobApplication, JobsWorkspace, ResumeVersion } from "../types";
+import type { ApplicationEvidence, Intervention, JobApplication, JobEligibilityDecision, JobPosting, JobsWorkspace, ResumeVersion } from "../types";
 import { relativeTime, titleCase } from "../lib/format";
 import { Dialog } from "../components/Dialog";
+import { InterviewPrepDialog } from "../components/InterviewPrepDialog";
 import { exportResumeDocx, exportResumePdf } from "../lib/documents";
 
 interface Props {
@@ -51,6 +53,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   const [answer, setAnswer] = useState("");
   const [rememberAnswer, setRememberAnswer] = useState(true);
   const [answerScope, setAnswerScope] = useState<"account" | "track" | "company">("account");
+  const [prepTarget, setPrepTarget] = useState<{ application: JobApplication; job: JobPosting; resume: ResumeVersion } | null>(null);
   const openInterventions = workspace.interventions.filter((item) => item.status === "open");
 
   const jobs = useMemo(() => new Map(workspace.matches.map((job) => [job.id, job])), [workspace.matches]);
@@ -119,6 +122,19 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
     }
   };
 
+  const openHandoff = async () => {
+    if (!selected || !selectedJob?.canonical_url) return;
+    const target = window.open("about:blank", "_blank", "noopener,noreferrer");
+    setBusy(true);
+    try {
+      await onCommit(selected);
+      if (target) target.location.href = selectedJob.canonical_url;
+      else window.location.assign(selectedJob.canonical_url);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const submitInterventionAnswer = async () => {
     if (!selected || !selectedIntervention || !answer.trim()) return;
     setBusy(true);
@@ -169,12 +185,13 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
       <section className="application-list">
         {filtered.map((application) => {
           const job = jobs.get(application.job_id);
+          const rowResume = application.resume_version_id ? resumeVersions[application.resume_version_id] : undefined;
           return (
             <button key={application.id} className="application-row" onClick={() => setSelected(application)}>
               <div className="company-mark">{(job?.company || "BJ").slice(0, 2).toUpperCase()}</div>
               <div className="application-main"><strong>{job?.title || "Application"}</strong><span>{job?.company || "Unknown company"} · {job?.location || "Location not listed"}</span></div>
               <div className="application-stage">{stateIcon(application.state)}<span><b>{titleCase(application.state)}</b><small>{relativeTime(application.updated_at_ms)}</small></span></div>
-              <div className="application-packet"><FileText size={15} /><span>Job-specific resume<small>v1 · {titleCase(application.submission_mode)}</small></span></div>
+              <div className="application-packet"><FileText size={15} /><span>Job-specific resume<small>{rowResume ? `v${rowResume.version_no}` : "Prepared"} · {titleCase(application.submission_mode)}</small></span></div>
               <span className="icon-button" aria-hidden="true"><MoreHorizontal size={18} /></span>
             </button>
           );
@@ -198,12 +215,11 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
                 {selectedResume ? <ResumePreview resume={selectedResume} /> : <div className="resume-loading">Loading job-specific resume...</div>}
               </section>
               <section className="review-panel">
-                <div className="review-title"><div><p>PACKET REVIEW</p><h3>What Bluey changed</h3></div><FileDiff size={20} /></div>
-                <ul className="diff-list">
-                  <li><span>Summary</span><p>Focused the opening on the role's product and engineering scope.</p></li>
-                  <li><span>Skills</span><p>Moved job-description matches earlier without adding unsupported skills.</p></li>
-                  <li><span>Experience</span><p>Prioritized outcomes closest to this company's requirements.</p></li>
-                </ul>
+                <div className="review-title"><div><p>PACKET REVIEW</p><h3>Application kit</h3></div><FileDiff size={20} /></div>
+                <ApplicationKitSummary application={selected} job={selectedJob} resume={selectedResume} />
+                <DiffList resume={selectedResume} />
+                <FinalAnswers answers={selected.answers} />
+                <PauseReasons application={selected} job={selectedJob} intervention={selectedIntervention} />
                 <div className="claim-note"><CheckCircle2 size={17} /><span><b>No unsupported claims</b><small>{selectedResume?.claim_ids.length || 0} profile facts carry provenance into this version.</small></span></div>
                 {selected.state === "needs_input" && canAnswerIntervention && selectedIntervention
                   ? <div className="answer-intervention">
@@ -219,13 +235,14 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
                 <div className="download-row"><button disabled={busy || !selectedResume} onClick={() => void download("pdf")}><Download size={15} />PDF</button><button disabled={busy || !selectedResume} onClick={() => void download("docx")}><Download size={15} />DOCX</button></div>
               </section>
             </div>
-            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : "Approving counts this tailored application once. Retries do not double-charge."}</p><div>{selected.state === "needs_input" && !canAnswerIntervention && <a className="button secondary" href={selectedSession?.takeover_url || `bluey-jobs://takeover?application_id=${encodeURIComponent(selected.id)}`}><MonitorUp size={16} />Take over browser</a>}{selected.state === "awaiting_review" && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
+            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : "Approving counts this tailored application once. Retries do not double-charge."}</p><div>{selected.state === "needs_input" && !canAnswerIntervention && <a className="button secondary" href={selectedSession?.takeover_url || `bluey-jobs://takeover?application_id=${encodeURIComponent(selected.id)}`}><MonitorUp size={16} />Take over browser</a>}{selected.state === "awaiting_review" && applicationEligibility(selected, selectedJob).can_queue_local && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}{selected.state === "awaiting_review" && !applicationEligibility(selected, selectedJob).can_queue_local && ["handoff", "unknown_review"].includes(applicationEligibility(selected, selectedJob).capability) && <button className="button primary" disabled={busy} onClick={() => void openHandoff()}><Send size={16} />Open job site</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && selectedJob && selectedResume && <button className="button primary" onClick={() => { setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume }); setSelected(null); }}><Sparkles size={16} />Prepare interview</button>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
           </div>
         )}
       </Dialog>
       <Dialog open={receiptOpen} title="Submission receipt" description={selected ? `${jobs.get(selected.job_id)?.company || "Application"} · ${jobs.get(selected.job_id)?.title || ""}` : ""} onClose={() => setReceiptOpen(false)}>
         {selected && <ReceiptView application={selected} resume={selectedResume} evidence={selectedEvidence} />}
       </Dialog>
+      <InterviewPrepDialog target={prepTarget} workspace={workspace} onClose={() => setPrepTarget(null)} />
     </div>
   );
 }
@@ -234,13 +251,129 @@ function normalizeCompanyKey(company: string): string {
   return company.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
+function ApplicationKitSummary({ application, job, resume }: { application: JobApplication; job?: JobPosting; resume?: ResumeVersion }) {
+  const identity = application.receipt.application_identity && typeof application.receipt.application_identity === "object"
+    ? application.receipt.application_identity as Record<string, unknown>
+    : {};
+  const email = String(identity.email || "Not selected");
+  const eligibility = applicationEligibility(application, job);
+  const capability = capabilityLabel(eligibility.capability);
+  const metering = application.receipt.metering && typeof application.receipt.metering === "object"
+    ? application.receipt.metering as Record<string, unknown>
+    : {};
+  const meteringStatus = String(metering.status || "");
+  return (
+    <div className="kit-summary">
+      <div><b>Resume</b><span>{resume ? `v${resume.version_no} · ${titleCase(resume.mode)}` : "Loading version"}</span></div>
+      <div><b>Email</b><span>{email}</span></div>
+      <div><b>Answers</b><span>{application.answers.length ? `${application.answers.length} final answer${application.answers.length === 1 ? "" : "s"}` : "No answers required yet"}</span></div>
+      <div><b>Cover letter</b><span>{application.cover_letter?.trim() ? "Included" : "Not included"}</span></div>
+      <div><b>Site</b><span>{capability}</span></div>
+      <div><b>Metering</b><span>{meteringStatus === "counts_when_approved_or_downloaded" || application.state === "awaiting_review" ? "Counts when approved or downloaded" : application.state === "submitted" ? "Counted once" : "Counted once for this job"}</span></div>
+    </div>
+  );
+}
+
+function FinalAnswers({ answers }: { answers: Array<Record<string, unknown>> }) {
+  if (answers.length === 0) {
+    return <div className="kit-section-empty"><b>Final answers</b><span>No reusable application answers are needed yet.</span></div>;
+  }
+  return (
+    <section className="kit-detail-section">
+      <div><p>FINAL ANSWERS</p><h4>What Bluey will use</h4></div>
+      <dl>{answers.map((answer, index) => {
+        const question = String(answer.question || answer.label || answer.key || `Answer ${index + 1}`);
+        const value = String(answer.value || answer.answer || "");
+        const scope = answer.scope ? ` · ${titleCase(String(answer.scope))}` : "";
+        return <div key={`${question}-${index}`}><dt>{question}</dt><dd>{value || "Awaiting your answer"}{scope}</dd></div>;
+      })}</dl>
+    </section>
+  );
+}
+
+function PauseReasons({ application, job, intervention }: { application: JobApplication; job?: JobPosting; intervention?: Intervention }) {
+  const eligibility = applicationEligibility(application, job);
+  const reasons = [...eligibility.hard_failures, ...eligibility.review_reasons]
+    .map((reason) => reason.message);
+  if (intervention?.detail) reasons.unshift(intervention.detail);
+  const uniqueReasons = [...new Set(reasons)];
+  return (
+    <section className="kit-detail-section pause-section">
+      <div><p>PAUSE CONDITIONS</p><h4>{uniqueReasons.length ? "Bluey will stop for these checks" : "No unresolved checks"}</h4></div>
+      {uniqueReasons.length
+        ? <ul>{uniqueReasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+        : <p>The server-side rules and required facts currently pass.</p>}
+    </section>
+  );
+}
+
+function DiffList({ resume }: { resume?: ResumeVersion }) {
+  const entries = resume ? Object.entries(resume.diff).filter(([, value]) => diffHasValue(value)) : [];
+  if (!resume) return <div className="diff-empty">Loading visible diff...</div>;
+  if (entries.length === 0) {
+    return <div className="diff-empty">No visible resume changes were recorded for this version.</div>;
+  }
+  return (
+    <ul className="diff-list">
+      {entries.map(([key, value]) => <li key={key}><span>{key.replaceAll("_", " ")}</span><p>{formatDiffValue(value)}</p></li>)}
+    </ul>
+  );
+}
+
+function diffHasValue(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.keys(value).length > 0;
+  return value !== undefined && value !== null && String(value).trim().length > 0;
+}
+
+function formatDiffValue(value: unknown): string {
+  if (Array.isArray(value)) return value.map(formatDiffValue).join(", ") || "None";
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if ("before" in record || "after" in record) {
+      return `Before: ${formatDiffValue(record.before)} · After: ${formatDiffValue(record.after)}`;
+    }
+    return Object.entries(record)
+      .map(([key, nested]) => `${key.replaceAll("_", " ")}: ${formatDiffValue(nested)}`)
+      .join(" · ");
+  }
+  return String(value ?? "None");
+}
+
+function applicationEligibility(application: JobApplication, job?: JobPosting): JobEligibilityDecision {
+  const stored = application.receipt.eligibility;
+  if (stored && typeof stored === "object") return stored as unknown as JobEligibilityDecision;
+  if (job?.eligibility) return job.eligibility;
+  return {
+    capability: "unknown_review",
+    can_prepare: true,
+    can_auto_submit: false,
+    can_queue_local: false,
+    can_queue_cloud: false,
+    hard_failures: [],
+    review_reasons: [{ code: "eligibility_pending", message: "Bluey will verify this site and your rules before queueing." }],
+    passed_checks: [],
+    evaluated_at_ms: 0,
+  };
+}
+
+function capabilityLabel(capability: JobEligibilityDecision["capability"]): string {
+  if (capability === "certified") return "Certified";
+  if (capability === "beta_review") return "Beta · Review first";
+  if (capability === "handoff") return "Handoff";
+  if (capability === "blocked") return "Blocked";
+  return "Review only";
+}
+
 function ReceiptView({ application, resume, evidence }: { application: JobApplication; resume?: ResumeVersion; evidence: ApplicationEvidence[] }) {
   const orderedEvidence = [...evidence].sort((left, right) => right.occurred_at_ms - left.occurred_at_ms);
   const resumeEvidence = orderedEvidence.find((item) => item.kind === "resume" && item.resume_version_id === application.resume_version_id);
   const confirmation = orderedEvidence.find((item) => item.kind === "submission_confirmation");
   const applicationEmail = application.receipt.application_identity && typeof application.receipt.application_identity === "object"
     ? String((application.receipt.application_identity as Record<string, unknown>).email || "")
-    : "";
+    : application.receipt.packet && typeof application.receipt.packet === "object"
+      ? String((application.receipt.packet as Record<string, unknown>).applicationEmail || "")
+      : "";
   return (
     <div className="receipt-view">
       <div className={`receipt-check ${resumeEvidence && confirmation ? "verified" : "warning"}`}>

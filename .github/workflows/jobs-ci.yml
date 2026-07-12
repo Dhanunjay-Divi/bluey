@@ -1,0 +1,82 @@
+name: Bluey Jobs CI / Privacy Gate
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bluey-jobs-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CI: true
+
+jobs:
+  jobs-ci:
+    name: Jobs CI and privacy gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: jobs/package-lock.json
+
+      - name: Install server build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Ensure Rust formatter is available
+        run: rustup component add rustfmt
+
+      - name: Self-test Jobs CI guards
+        run: node jobs/scripts/ci-guards-self-test.mjs
+
+      - name: Reject committed private data and secrets
+        run: node jobs/scripts/privacy-gate.mjs
+
+      - name: Check Jobs SQLite/Postgres schema parity
+        run: node jobs/scripts/check-jobs-schema-parity.mjs
+
+      - name: Check provenance and license inventory
+        run: node jobs/scripts/check-provenance-licenses.mjs
+
+      - name: Install Jobs dependencies from lockfile
+        run: npm ci --prefix jobs --no-audit --no-fund
+
+      - name: Run all Jobs tests
+        run: npm test --prefix jobs
+
+      - name: Typecheck all Jobs workspaces
+        run: npm run typecheck --prefix jobs
+
+      - name: Build all Jobs workspaces
+        run: npm run build --prefix jobs
+
+      - name: Check server Rust formatting
+        run: cargo fmt --manifest-path server/Cargo.toml -- --check
+
+      - name: Check the Jobs API server target
+        run: cargo check --manifest-path server/Cargo.toml --bin bluey-jobs-api
+
+      - name: Run server Jobs unit tests
+        run: cargo test --manifest-path server/Cargo.toml --lib jobs
+
+      - name: Run server Jobs integration tests
+        run: cargo test --manifest-path server/Cargo.toml --test integration_e2e jobs_

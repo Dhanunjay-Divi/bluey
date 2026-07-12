@@ -6,12 +6,18 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
-    "dist"
+    "dist",
+    "assets",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./interview-prep": {
+      "types": "./dist/interview-prep.d.ts",
+      "import": "./dist/interview-prep.js"
     }
   },
   "scripts": {
@@ -22,7 +28,9 @@
     "smoke": "node -e \"import('@bluey/jobs-automation').then(m => { if (!m.PublicAtsDiscoveryProvider || !m.planApplicationForm || !m.createApplicationReceipt) process.exit(1) })\""
   },
   "dependencies": {
+    "@pdf-lib/fontkit": "^1.1.1",
     "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^5.7.284",
     "playwright": "^1.61.1"
   },
   "devDependencies": {

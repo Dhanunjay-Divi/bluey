@@ -5,6 +5,7 @@ import type {
   NormalizedJob,
   RunnerKind,
   SubmissionReceipt,
+  EvidenceObjectUpload,
 } from "@bluey/jobs-automation";
 
 export interface ApplicationWorkflowInput {
@@ -31,6 +32,7 @@ export interface ApplicationWorkflowResult {
 export interface RunnerExecutionResult {
   receipt: SubmissionReceipt;
   receiptBundle?: ApplicationReceiptBundle;
+  evidenceObjects?: EvidenceObjectUpload[];
 }
 
 export interface InterventionResolution {
@@ -49,7 +51,10 @@ export interface JobsActivities {
     requestId: string;
     resolution: InterventionResolution;
   }): Promise<RunnerExecutionResult>;
-  persistReceipt(input: ApplicationWorkflowInput & { receiptBundle: ApplicationReceiptBundle }): Promise<void>;
+  persistReceipt(input: ApplicationWorkflowInput & {
+    receiptBundle: ApplicationReceiptBundle;
+    evidenceObjects: EvidenceObjectUpload[];
+  }): Promise<void>;
   releaseBrowser(browserSessionId: string): Promise<void>;
   recordState(input: ApplicationWorkflowInput, state: ApplicationState): Promise<void>;
   createIntervention(input: ApplicationWorkflowInput, receipt: SubmissionReceipt): Promise<string>;

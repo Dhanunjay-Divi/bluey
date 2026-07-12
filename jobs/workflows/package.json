@@ -7,8 +7,10 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc -p tsconfig.json",
+    "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/worker.js",
+    "start:discovery": "node dist/discovery-worker.js",
     "start:gateway": "node dist/gateway.js"
   },
   "dependencies": {
@@ -19,6 +21,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.9"
   }
 }

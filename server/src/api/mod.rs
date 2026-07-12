@@ -17,6 +17,7 @@ pub mod admin;
 pub mod auth_routes;
 pub mod billing;
 pub mod jobs;
+pub mod jobs_interview_prep;
 pub mod metrics;
 pub mod middleware;
 pub mod pricing;

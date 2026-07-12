@@ -10,7 +10,7 @@ function response(payload: unknown, status = 200): FetchResponse {
 }
 
 describe("public ATS discovery", () => {
-  it("normalizes, filters, and deduplicates Greenhouse and Lever postings", async () => {
+  it("normalizes and filters provider-specific Greenhouse and Lever postings", async () => {
     const fetcher: JobsFetch = vi.fn(async (url, init) => {
       expect(init.redirect).toBe("error");
       if (url.includes("greenhouse")) {
@@ -45,7 +45,7 @@ describe("public ATS discovery", () => {
       ],
     });
 
-    expect(page.jobs).toHaveLength(1);
+    expect(page.jobs).toHaveLength(2);
     expect(page.jobs[0]).toMatchObject({
       company: "Acme",
       title: "Senior Software Engineer",
@@ -99,6 +99,41 @@ describe("public ATS discovery", () => {
       sources: [{ kind: "greenhouse", boardToken: "acme" }],
     });
     expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels a chunked ATS response as soon as its byte limit is exceeded", async () => {
+    let pulls = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new Uint8Array(1024 * 1024));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const provider = new PublicAtsDiscoveryProvider({
+      maxAttempts: 1,
+      fetch: async () => ({
+        ok: true,
+        status: 200,
+        body,
+        text: async () => {
+          throw new Error("streaming response must not be buffered through text()");
+        },
+      }),
+    });
+
+    await expect(provider.search({
+      roles: [],
+      locations: [],
+      remotePreference: "any",
+      excludedCompanies: [],
+      sources: [{ kind: "greenhouse", boardToken: "acme" }],
+    })).rejects.toThrow("size limit");
+    expect(pulls).toBeLessThanOrEqual(7);
+    expect(cancelled).toBe(true);
   });
 
   it("rejects source identifiers that could escape the pinned endpoint", async () => {
@@ -158,15 +193,53 @@ describe("public ATS discovery", () => {
     expect(page.warnings?.[0]).toContain("greenhouse source failed");
   });
 
-  it("drops unsafe canonical links supplied inside a trusted feed", async () => {
+  it("replaces an unsafe payload link with the configured provider URL", async () => {
     const provider = new PublicAtsDiscoveryProvider({
-      fetch: async () => response({ jobs: [{ id: "1", title: "Engineer", absolute_url: "http://127.0.0.1/admin" }] }),
+      fetch: async () => response({ jobs: [{
+        id: "1",
+        title: "Engineer",
+        absolute_url: "http://127.0.0.1/admin",
+        updated_at: new Date().toISOString(),
+      }] }),
     });
     const page = await provider.search({
       roles: [], locations: [], remotePreference: "any", excludedCompanies: [],
       sources: [{ kind: "greenhouse", boardToken: "acme" }],
     });
-    expect(page.jobs).toEqual([]);
+    expect(page.jobs[0]?.canonicalUrl).toBe("https://boards.greenhouse.io/acme/jobs/1");
+  });
+
+  it("does not treat a provider payload's custom careers URL as source authority", async () => {
+    const provider = new PublicAtsDiscoveryProvider({
+      fetch: async (url) => url.includes("greenhouse")
+        ? response({ jobs: [{
+            id: "gh-1",
+            title: "Engineer",
+            absolute_url: "https://careers.example.test/opening?gh_jid=gh-1",
+            updated_at: new Date().toISOString(),
+          }] })
+        : response([{
+            id: "lever-1",
+            text: "Designer",
+            hostedUrl: "https://careers.example.test/designer",
+            createdAt: Date.now(),
+          }]),
+    });
+    const page = await provider.search({
+      roles: [],
+      locations: [],
+      remotePreference: "any",
+      excludedCompanies: [],
+      sources: [
+        { kind: "greenhouse", boardToken: "acme", company: "Acme" },
+        { kind: "lever", site: "atlas", company: "Atlas" },
+      ],
+    });
+
+    expect(page.jobs.map((job) => job.canonicalUrl)).toEqual([
+      "https://boards.greenhouse.io/acme/jobs/gh-1",
+      "https://jobs.lever.co/atlas/lever-1",
+    ]);
   });
 
   it("keeps recent postings and skips old or undated listings", async () => {

@@ -19,6 +19,11 @@ const activities = proxyActivities<JobsActivities>({
   },
 });
 
+const irreversibleActivities = proxyActivities<Pick<JobsActivities, "runApplication" | "resumeApplication">>({
+  startToCloseTimeout: "10 minutes",
+  retry: { maximumAttempts: 1 },
+});
+
 export async function applicationWorkflow(
   input: ApplicationWorkflowInput,
 ): Promise<ApplicationWorkflowResult> {
@@ -32,7 +37,7 @@ export async function applicationWorkflow(
   await activities.recordState(input, "running");
   const { browserSessionId } = await activities.allocateBrowser(input);
   try {
-    let execution = await activities.runApplication({ ...input, browserSessionId });
+    let execution = await irreversibleActivities.runApplication({ ...input, browserSessionId });
     for (let interventionCount = 0; interventionCount < 6; interventionCount += 1) {
       // Clear the previous answer before publishing the next intervention. A
       // fast user response that arrives after createIntervention must not be
@@ -54,7 +59,7 @@ export async function applicationWorkflow(
         };
       }
       await activities.recordState(input, "running");
-      execution = await activities.resumeApplication({
+      execution = await irreversibleActivities.resumeApplication({
         ...input,
         browserSessionId,
         requestId: `${input.idempotencyKey}:resume:${interventionCount + 1}`,
@@ -71,8 +76,18 @@ export async function applicationWorkflow(
       },
     };
   } catch (error) {
-    await activities.releaseBrowser(browserSessionId);
-    throw error;
+    await activities.recordState(input, "side_effect_unknown");
+    return {
+      state: "side_effect_unknown",
+      receipt: {
+        status: "failed",
+        issues: [{
+          field: "submission",
+          message: "Bluey lost confirmation during an employer-facing step. The run is held for reconciliation and will not submit again automatically.",
+          severity: "blocking",
+        }],
+      },
+    };
   }
 }
 
@@ -89,7 +104,12 @@ async function finishOrPause(
   }
   if (receipt.status === "submitted") {
     if (!execution.receiptBundle) throw new Error("Submitted run is missing its receipt bundle");
-    await activities.persistReceipt({ ...input, receiptBundle: execution.receiptBundle });
+    if (!execution.evidenceObjects?.length) throw new Error("Submitted run is missing uploaded evidence bytes");
+    await activities.persistReceipt({
+      ...input,
+      receiptBundle: execution.receiptBundle,
+      evidenceObjects: execution.evidenceObjects,
+    });
     await activities.recordState(input, "submitted");
     await activities.releaseBrowser(browserSessionId);
     return { state: "submitted", receipt };

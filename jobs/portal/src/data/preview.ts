@@ -1,6 +1,21 @@
-import type { JobsWorkspace } from "../types";
+import type { JobEligibilityDecision, JobsWorkspace } from "../types";
 
 const now = Date.now();
+
+const betaEligibility = (extraReview: JobEligibilityDecision["review_reasons"] = []): JobEligibilityDecision => ({
+  capability: "beta_review",
+  can_prepare: true,
+  can_auto_submit: false,
+  can_queue_local: true,
+  can_queue_cloud: true,
+  hard_failures: [],
+  review_reasons: [
+    { code: "ats_review_required", message: "This application system is in beta and requires packet review." },
+    ...extraReview,
+  ],
+  passed_checks: ["job_active", "job_fresh", "location_allowed", "daily_limit_available"],
+  evaluated_at_ms: now,
+});
 
 export const previewWorkspace: JobsWorkspace = {
   profile: {
@@ -160,6 +175,7 @@ export const previewWorkspace: JobsWorkspace = {
       status: "matched",
       created_at_ms: now - 4_000,
       updated_at_ms: now - 4_000,
+      eligibility: betaEligibility(),
     },
     {
       id: "job-2",
@@ -183,6 +199,7 @@ export const previewWorkspace: JobsWorkspace = {
       status: "matched",
       created_at_ms: now - 22_000,
       updated_at_ms: now - 22_000,
+      eligibility: betaEligibility([{ code: "missing_requirements", message: "Confirm the design-systems experience before queueing." }]),
     },
     {
       id: "job-3",
@@ -206,6 +223,7 @@ export const previewWorkspace: JobsWorkspace = {
       status: "matched",
       created_at_ms: now - 38_000,
       updated_at_ms: now - 38_000,
+      eligibility: betaEligibility(),
     },
     {
       id: "job-4",
@@ -229,6 +247,7 @@ export const previewWorkspace: JobsWorkspace = {
       status: "matched",
       created_at_ms: now - 90_000,
       updated_at_ms: now - 90_000,
+      eligibility: betaEligibility([{ code: "salary_needs_review", message: "Review the listed compensation against your preference." }]),
     },
   ],
   applications: [
@@ -269,7 +288,51 @@ export const previewWorkspace: JobsWorkspace = {
       answers: [],
       cover_letter: "",
       receipt: {
-        confirmation: "Application received",
+        schemaVersion: 1,
+        receiptId: "receipt-app-3",
+        accountId: "preview-account",
+        applicationId: "app-3",
+        runId: "run-app-3",
+        generatedAt: new Date(now - 82_000_000).toISOString(),
+        runner: "cloud",
+        applicationIdentityId: "identity-primary",
+        browserProfileId: "profile-primary",
+        adapter: "greenhouse",
+        adapterVersion: "preview-1",
+        job: {
+          externalId: "92831",
+          canonicalUrl: "https://boards.greenhouse.io/northwind/jobs/92831",
+          company: "Northwind",
+          title: "Senior Product Engineer",
+          location: "New York, NY",
+          workplace: "hybrid",
+          description: "Build TypeScript and React products with a product-minded engineering team.",
+          source: "greenhouse",
+          compensation: "$175k-$205k",
+        },
+        packet: {
+          jobId: "job-1",
+          resumeVersionId: "resume-3",
+          answers: { motivation: "I enjoy building reliable product workflows with close customer feedback." },
+          verifiedClaimIds: ["fact-1", "fact-2"],
+          applicationEmail: "taylor@example.com",
+        },
+        documents: [{
+          kind: "resume",
+          versionId: "resume-3",
+          storageKey: "jobs/app-3/Taylor-Rivera-Northwind-Senior-Product-Engineer.pdf",
+          sha256: "a".repeat(64),
+        }],
+        events: [{ id: "event-app-3-submit", occurredAt: new Date(now - 82_000_000).toISOString(), type: "submitted" }],
+        result: {
+          status: "submitted",
+          confirmationText: "Application received",
+          confirmationUrl: "https://boards.greenhouse.io/northwind/jobs/92831/confirmation",
+          submittedAt: new Date(now - 82_000_000).toISOString(),
+          issues: [],
+        },
+        finalUrl: "https://boards.greenhouse.io/northwind/jobs/92831/confirmation",
+        screenshotKeys: ["jobs/app-3/confirmation.png"],
         application_identity: { email: "taylor@example.com", verified: true },
       },
       created_at_ms: now - 86_400_000,
@@ -478,6 +541,40 @@ export const previewWorkspace: JobsWorkspace = {
       updated_at_ms: now - 86_000,
     },
   ],
+  discovery_sources: [
+    {
+      id: "source-northwind-greenhouse",
+      provider: "greenhouse",
+      config: { company: "Northwind" },
+      status: "active",
+      health: "healthy",
+      last_success_at_ms: now - 12 * 60_000,
+    },
+    {
+      id: "source-arcadia-lever",
+      provider: "lever",
+      config: { company: "Arcadia Health" },
+      status: "active",
+      health: "degraded",
+      last_success_at_ms: now - 5 * 3_600_000,
+    },
+    {
+      id: "source-meridian-greenhouse",
+      provider: "greenhouse",
+      config: { company: "Meridian Financial" },
+      status: "paused",
+      health: "paused",
+      last_success_at_ms: now - 2 * 86_400_000,
+    },
+    {
+      id: "source-lattice-lever",
+      provider: "lever",
+      config: { company: "Lattice Robotics" },
+      status: "active",
+      health: "waiting",
+      last_success_at_ms: null,
+    },
+  ],
   entitlement: {
     plan: "cloud",
     track_limit: 5,
@@ -494,3 +591,52 @@ export const previewWorkspace: JobsWorkspace = {
     additional_inbox_cents: 400,
   },
 };
+
+export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: string): JobsWorkspace {
+  if (scenario !== "final-review") return workspace;
+
+  const title = "Review the Greenhouse application";
+  const detail = "Review every employer-facing field and document in the preserved form, then approve submission.";
+  const takeoverUrl = "https://jobs-browser.bluey.sh/sessions/browser-final-review";
+  return {
+    ...workspace,
+    browser_sessions: [{
+      id: "browser-final-review",
+      runner: "cloud",
+      status: "needs_input",
+      current_company: "Meridian Financial",
+      current_step: "Final application review",
+      application_id: "app-2",
+      takeover_url: takeoverUrl,
+      created_at_ms: now - 900_000,
+      updated_at_ms: now - 30_000,
+    }],
+    interventions: [{
+      id: "intervention-final-review",
+      application_id: "app-2",
+      kind: "browser_takeover",
+      status: "open",
+      title,
+      detail,
+      choices: [],
+      resolution_kind: "browser_takeover",
+      resume_after_resolution: true,
+      provider: "",
+      provider_message_id: "",
+      metadata: {
+        receipt: {
+          status: "needs_input",
+          issues: [],
+          intervention: {
+            kind: "browser_takeover",
+            title,
+            detail,
+            takeoverUrl,
+            resolution: { kind: "browser_takeover", resumeAfter: true },
+          },
+        },
+      },
+      created_at_ms: now - 30_000,
+    }],
+  };
+}

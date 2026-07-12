@@ -13,7 +13,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { accessToken, jobsApi, loginUrl } from "./api";
-import { previewWorkspace } from "./data/preview";
+import { previewWorkspace, previewWorkspaceForScenario } from "./data/preview";
 import type {
   AccountSummary,
   AnswerMemory,
@@ -29,6 +29,7 @@ import type {
   JobsWorkspace,
   MailboxConnection,
   ResumeVersion,
+  UserJobInput,
 } from "./types";
 import { AppShell } from "./components/AppShell";
 import { Onboarding } from "./components/Onboarding";
@@ -41,11 +42,16 @@ const ResumeView = lazy(() => import("./views/ResumeView").then((module) => ({ d
 const BrowserView = lazy(() => import("./views/BrowserView").then((module) => ({ default: module.BrowserView })));
 const SettingsView = lazy(() => import("./views/SettingsView").then((module) => ({ default: module.SettingsView })));
 
-const isPreview = new URLSearchParams(window.location.search).get("preview") === "1";
-const previewSearch = isPreview ? "?preview=1" : "";
+const pageQuery = new URLSearchParams(window.location.search);
+const isPreview = pageQuery.get("preview") === "1";
+const previewScenario = pageQuery.get("scenario") || "";
+const previewSearch = isPreview
+  ? `?${new URLSearchParams({ preview: "1", ...(previewScenario ? { scenario: previewScenario } : {}) })}`
+  : "";
+const initialPreviewWorkspace = previewWorkspaceForScenario(previewWorkspace, previewScenario);
 
 export default function App() {
-  const [workspace, setWorkspace] = useState<JobsWorkspace | null>(isPreview ? previewWorkspace : null);
+  const [workspace, setWorkspace] = useState<JobsWorkspace | null>(isPreview ? initialPreviewWorkspace : null);
   const [account, setAccount] = useState<AccountSummary | null>(
     isPreview ? { email: "taylor@example.com", balance_cents: 2450 } : null,
   );
@@ -133,7 +139,11 @@ export default function App() {
   }, []);
 
   const savePreferences = useCallback(async (preferences: JobPreferences) => {
-    const saved = isPreview ? preferences : await jobsApi.savePreferences(preferences);
+    const localized = {
+      ...preferences,
+      time_zone_offset_minutes: -new Date().getTimezoneOffset(),
+    };
+    const saved = isPreview ? localized : await jobsApi.savePreferences(localized);
     setWorkspace((current) => (current ? { ...current, preferences: saved } : current));
     setToast("Job preferences saved.");
   }, []);
@@ -167,18 +177,8 @@ export default function App() {
   }, []);
 
   const addJob = useCallback(
-    async (job: JobPosting) => {
-      const saved = isPreview
-        ? {
-            ...job,
-            id: `job-${Date.now()}`,
-            canonical_key: `preview-${Date.now()}`,
-            match_score: job.match_score || 84,
-            matched_reasons: job.matched_reasons.length ? job.matched_reasons : ["Matches your active Career Track"],
-            updated_at_ms: Date.now(),
-            created_at_ms: Date.now(),
-          }
-        : await jobsApi.saveMatch(job);
+    async (input: UserJobInput) => {
+      const saved = isPreview ? previewPosting(input) : await jobsApi.saveMatch(input);
       setWorkspace((current) =>
         current ? { ...current, matches: [saved, ...current.matches.filter((item) => item.id !== saved.id)] } : current,
       );
@@ -193,10 +193,7 @@ export default function App() {
       if (!workspace) return;
       if (isPreview) {
         const resume = previewResume(workspace, job, `resume-${job.id}-${Date.now()}`, mode);
-        const autoSubmitEligible = submissionMode === "auto_submit"
-          && job.match_score >= workspace.profile.auto_submit_threshold
-          && job.missing_requirements.length === 0
-          && !job.source.endsWith("_handoff");
+        const autoSubmitEligible = submissionMode === "auto_submit" && job.eligibility?.can_auto_submit === true;
         const application: JobApplication = {
           id: `application-${job.id}`,
           job_id: job.id,
@@ -206,7 +203,12 @@ export default function App() {
           match_score: job.match_score,
           answers: [],
           cover_letter: "",
-          receipt: {},
+          receipt: {
+            job_snapshot: job,
+            eligibility: job.eligibility,
+            cover_letter_status: "not_included",
+            metering: { status: autoSubmitEligible ? "counts_when_queued" : "counts_when_approved_or_downloaded" },
+          },
           created_at_ms: Date.now(),
           updated_at_ms: Date.now(),
         };
@@ -224,9 +226,7 @@ export default function App() {
         );
       } else {
         const response = await jobsApi.prepareApplication(job.id, mode, submissionMode);
-        const metering = response.application.state === "queued"
-          ? await jobsApi.commitPacket(response.application.id)
-          : null;
+        const metering = response.metering;
         setResumeVersions((current) => ({ ...current, [response.resume_version.id]: response.resume_version }));
         setWorkspace((current) =>
           current
@@ -275,8 +275,23 @@ export default function App() {
     if (isPreview) {
       updated = { ...application, state: state as JobApplication["state"], updated_at_ms: Date.now() };
     } else {
-      if (["queued", "submitted"].includes(state)) await commitApplication(application);
-      updated = await jobsApi.updateApplication(application.id, state, application.submission_mode);
+      if (state === "queued") {
+        const approved = await jobsApi.approveApplication(application.id);
+        updated = approved.application;
+        setWorkspace((current) => current ? {
+          ...current,
+          entitlement: { ...current.entitlement, used_packets: approved.metering.used_packets },
+        } : current);
+        if (approved.metering.newly_metered && approved.metering.amount_cents > 0) {
+          setAccount((current) => current ? {
+            ...current,
+            balance_cents: Math.max(0, current.balance_cents - approved.metering.amount_cents),
+          } : current);
+        }
+      } else {
+        if (state === "submitted") await commitApplication(application);
+        updated = await jobsApi.updateApplication(application.id, state, application.submission_mode);
+      }
     }
     setWorkspace((current) =>
       current
@@ -422,6 +437,9 @@ export default function App() {
     if (!workspace) return;
     const job = workspace.matches.find((item) => item.id === application.job_id);
     if (!job) throw new Error("That job is no longer available.");
+    if (application.state !== "queued") {
+      throw new Error("Approve this application before choosing a browser runner.");
+    }
     let updatedApplication = application;
     let session: BrowserSession = {
       id: "",
@@ -438,7 +456,6 @@ export default function App() {
       updatedApplication = { ...application, state: "queued", updated_at_ms: now };
       session = { ...session, id: `run-${now}`, created_at_ms: now, updated_at_ms: now };
     } else {
-      if (application.state === "awaiting_review") await commitApplication(application);
       const queued = await jobsApi.queueApplicationRun(application.id, runner);
       updatedApplication = queued.application;
       session = queued.browser_session;
@@ -452,7 +469,7 @@ export default function App() {
     setToast(runner === "local"
       ? `${job.company} is opening in Bluey Browser.`
       : `${job.company} is queued for the cloud runner.`);
-  }, [commitApplication, workspace]);
+  }, [workspace]);
 
   const queueCloudRun = useCallback(
     (application: JobApplication) => queueRun(application, "cloud"),
@@ -485,15 +502,16 @@ export default function App() {
     resolution?: { answer?: string; remember?: boolean; scope?: string; scope_id?: string },
   ) => {
     const now = Date.now();
+    const approved = action === "approve_email_otp" || action === "approve_submission";
     const result = isPreview
       ? {
           intervention: {
             ...intervention,
-            status: action === "approve_email_otp" ? "approved" : "resolved",
-            resolved_at_ms: action === "approve_email_otp" ? undefined : now,
+            status: approved ? "approved" : "resolved",
+            resolved_at_ms: approved ? undefined : now,
             metadata: {
               ...intervention.metadata,
-              ...(action === "approve_email_otp" ? { approved_at_ms: now } : { answered_at_ms: now, resolved_answer: resolution?.answer }),
+              ...(approved ? { approved_at_ms: now } : { answered_at_ms: now, resolved_answer: resolution?.answer }),
             },
           },
           answer_memory: resolution?.remember ? {
@@ -526,7 +544,7 @@ export default function App() {
         ? { ...session, status: "queued", current_step: "Resuming application", updated_at_ms: Date.now() }
         : session),
     } : current);
-    setToast(action === "approve_email_otp" ? "Email code approved. Bluey is resuming." : resolution?.remember ? "Answer saved. Bluey is resuming." : "Answer sent. Bluey is resuming.");
+    setToast(action === "approve_submission" ? "Submission approved. Bluey is completing the application." : action === "approve_email_otp" ? "Email code approved. Bluey is resuming." : resolution?.remember ? "Answer saved. Bluey is resuming." : "Answer sent. Bluey is resuming.");
   }, []);
 
   if (!isPreview && !accessToken()) return <AuthGate />;
@@ -644,7 +662,7 @@ function AuthGate() {
         <div className="entry-hero-copy">
           <p className="eyebrow">BLUEY JOBS</p>
           <h1>Every application,<br /><span>already tailored.</span></h1>
-          <p>Give Bluey your profile once. It finds fresh, high-fit roles, creates a unique application for each one, applies on your terms, and turns replies into next steps.</p>
+          <p>Give Bluey your profile once. It finds fresh, high-fit roles, creates a unique application kit for each one, and keeps the exact resume and answers together.</p>
           <div className="auth-actions">
             <a className="button primary" href="/login?mode=signup&next=%2Fjobs">Start my job search<ArrowRight size={16} /></a>
             <a className="button secondary" href={loginUrl()}>Sign in to Bluey</a>
@@ -659,16 +677,16 @@ function AuthGate() {
         <div className="entry-product-scene" aria-label="Bluey Jobs product preview">
           <header>
             <div><span className="live-dot" /><b>Product engineering</b><small>Career Track active</small></div>
-            <span>Review first&nbsp;&nbsp;·&nbsp;&nbsp;Inbox connected</span>
+            <span>Review first&nbsp;&nbsp;·&nbsp;&nbsp;Receipt ready</span>
           </header>
           <div className="entry-scene-metrics">
             <span><b>4</b><small>fresh matches</small></span>
             <span><b>89%</b><small>average fit</small></span>
-            <span><b>1</b><small>new reply</small></span>
+            <span><b>1</b><small>needs review</small></span>
           </div>
           <div className="entry-scene-jobs">
             <div><i>NO</i><span><b>Senior Product Engineer</b><small>Northwind · New York, NY · Posted today</small></span><strong>94%</strong><em>Ready to review</em></div>
-            <div><i>AR</i><span><b>Staff Frontend Engineer</b><small>Arcadia Health · Remote, US · Replied today</small></span><strong>91%</strong><em>Interview Tue</em></div>
+            <div><i>AR</i><span><b>Staff Frontend Engineer</b><small>Arcadia Health · Remote, US · Posted yesterday</small></span><strong>91%</strong><em>Needs review</em></div>
             <div><i>AT</i><span><b>Product Engineer, Platform</b><small>Atlas · New York, NY · Posted 5 days ago</small></span><strong>88%</strong><em>Application ready</em></div>
           </div>
           <footer><Sparkles size={15} /><span>Every job keeps its own resume, answers, activity, and submission receipt.</span></footer>
@@ -676,13 +694,13 @@ function AuthGate() {
       </section>
 
       <section className="entry-section entry-flow" id="how-it-works">
-        <div className="entry-section-heading"><p className="eyebrow">PROFILE TO INTERVIEW</p><h2>Set up once. Keep every stage moving.</h2><span>Bluey carries your context from the first match through the first reply.</span></div>
+        <div className="entry-section-heading"><p className="eyebrow">PROFILE TO APPLICATION</p><h2>Set up once. Review the exact packet.</h2><span>Bluey carries your context from the first match through the application receipt.</span></div>
         <ol>
           <li><span><FileText /></span><div><b>Build one Career Profile</b><p>Import your resume, then add work history, locations, preferences, and reusable answers once.</p></div></li>
           <li><span><Search /></span><div><b>Find fresh, relevant roles</b><p>Career Tracks rank recent jobs by role, location, compensation, and your hard filters.</p></div></li>
-          <li><span><Sparkles /></span><div><b>Create a unique application</b><p>Every job gets its own resume, optional cover letter, answers, and visible change summary.</p></div></li>
+          <li><span><Sparkles /></span><div><b>Create a unique application kit</b><p>Every job gets its own resume version, answer set, selected email, and visible change summary.</p></div></li>
           <li><span><BriefcaseBusiness /></span><div><b>Review or keep running</b><p>Apply with the local browser or let the cloud runner continue while your computer is off.</p></div></li>
-          <li><span><MailCheck /></span><div><b>Turn replies into next steps</b><p>Connect Gmail or Outlook to track updates, follow-ups, assessments, and interview dates.</p></div></li>
+          <li><span><MailCheck /></span><div><b>Keep the receipt</b><p>Submission evidence stays tied to the exact resume, answers, application email, and timestamp.</p></div></li>
         </ol>
       </section>
 
@@ -709,6 +727,51 @@ function normalizeAnswerKey(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
+function previewPosting(input: UserJobInput): JobPosting {
+  const now = Date.now();
+  const url = input.canonical_url.toLowerCase();
+  const capability = url.includes("linkedin.com") || url.includes("indeed.com")
+    ? "handoff"
+    : ["greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com", "workday.com", "myworkdayjobs.com"].some((host) => url.includes(host))
+      ? "beta_review"
+      : "unknown_review";
+  return {
+    id: `job-${now}`,
+    canonical_key: `preview-${now}`,
+    source: "pasted_link",
+    external_id: "",
+    company: input.company,
+    title: input.title,
+    location: input.location || "",
+    workplace: input.workplace || "Unknown",
+    canonical_url: input.canonical_url,
+    description: input.pasted_description || "",
+    compensation: input.compensation || "",
+    track_id: input.track_id,
+    match_score: 84,
+    matched_reasons: ["Matches your active Career Track"],
+    missing_requirements: [],
+    availability_status: "unknown",
+    status: "matched",
+    created_at_ms: now,
+    updated_at_ms: now,
+    eligibility: {
+      capability,
+      can_prepare: true,
+      can_auto_submit: false,
+      can_queue_local: false,
+      can_queue_cloud: false,
+      hard_failures: [],
+      review_reasons: [
+        { code: "availability_unverified", message: "Bluey has not verified that this pasted job is still accepting applications." },
+        { code: "live_verification_required", message: "Bluey must confirm this job is still open before a runner starts." },
+      ],
+      passed_checks: [],
+      evaluated_at_ms: now,
+    },
+  };
+}
+
 function previewResume(workspace: JobsWorkspace, job: JobPosting, id: string, mode: string): ResumeVersion {
   const track = workspace.tracks.find((item) => item.id === job.track_id);
   const applicationIdentity = workspace.application_identities.find((item) => item.id === track?.application_identity_id)
@@ -716,7 +779,7 @@ function previewResume(workspace: JobsWorkspace, job: JobPosting, id: string, mo
   return {
     id,
     job_id: job.id,
-    version_no: 1,
+    version_no: workspace.applications.filter((application) => application.job_id === job.id).length + 1,
     mode: mode === "enhance" ? "enhance" : "factual",
     content: {
       target: { company: job.company, title: job.title, location: job.location },
@@ -735,9 +798,12 @@ function previewResume(workspace: JobsWorkspace, job: JobPosting, id: string, mo
       certifications: workspace.profile.certifications,
     },
     diff: {
-      summary: `Focused on ${job.title}`,
-      skills: "Reordered for the job description",
+      summary: {
+        before: workspace.profile.summary,
+        after: `${workspace.profile.summary} Focused for the ${job.title} opportunity at ${job.company}.`,
+      },
       claims_added: [],
+      profile_fact_ids_used: workspace.facts.filter((fact) => fact.verification_status === "confirmed").map((fact) => fact.id),
     },
     claim_ids: workspace.facts.filter((fact) => fact.verification_status === "confirmed").map((fact) => fact.id),
     checksum: `${job.id}-${id}`,

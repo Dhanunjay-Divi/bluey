@@ -12,8 +12,15 @@ describe("Jobs submission policy", () => {
     expect(submissionPolicy("file:///etc/passwd").policy).toBe("blocked");
   });
 
-  it("allows direct employer forms", () => {
-    expect(submissionPolicy("https://jobs.acme.com/engineer").policy).toBe("automate");
+  it("allows certified ATS forms and keeps unknown forms review-only", () => {
+    expect(submissionPolicy("https://boards.greenhouse.io/acme/jobs/1")).toMatchObject({
+      policy: "automate",
+      capability: "beta_review",
+    });
+    expect(submissionPolicy("https://jobs.acme.com/engineer")).toMatchObject({
+      policy: "handoff",
+      capability: "unknown_review",
+    });
   });
 });
 

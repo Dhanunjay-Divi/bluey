@@ -1,13 +1,12 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
-import { appendFile, mkdir, open, rm, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { createWriteStream } from "node:fs";
+import { mkdir, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import * as tar from "tar";
+import { decryptFile, encryptFile } from "./crypto-envelope.js";
 
-const MAGIC = Buffer.from("BLUEYJP1");
-const IV_BYTES = 12;
-const TAG_BYTES = 16;
+export { decryptFile, encryptFile } from "./crypto-envelope.js";
 
 export interface ProfilePaths {
   scope: string;
@@ -38,55 +37,39 @@ export async function restoreProfile(paths: ProfilePaths, key: Buffer): Promise<
   await mkdir(paths.directory, { recursive: true });
   try {
     await stat(paths.encryptedSnapshot);
-  } catch {
-    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    await rm(paths.directory, { recursive: true, force: true });
+    throw error;
   }
   const archive = `${paths.directory}.restore.tar.gz`;
-  await decryptFile(paths.encryptedSnapshot, archive, key);
-  await tar.x({ cwd: paths.directory, file: archive, gzip: true, preservePaths: false });
-  await rm(archive, { force: true });
+  try {
+    await decryptFile(paths.encryptedSnapshot, archive, key, profileEncryptionContext(paths));
+    await tar.x({ cwd: paths.directory, file: archive, gzip: true, preservePaths: false });
+  } catch (error) {
+    await rm(paths.directory, { recursive: true, force: true });
+    throw error;
+  } finally {
+    await rm(archive, { force: true });
+  }
 }
 
 export async function sealProfile(paths: ProfilePaths, key: Buffer): Promise<void> {
   const archive = `${paths.directory}.seal.tar.gz`;
   await mkdir(dirname(paths.encryptedSnapshot), { recursive: true });
-  await tar.c({ cwd: paths.directory, file: archive, gzip: true, portable: true }, ["."]);
-  await encryptFile(archive, paths.encryptedSnapshot, key);
   await rm(archive, { force: true });
+  try {
+    await pipeline(
+      tar.c({ cwd: paths.directory, gzip: true, portable: true }, ["."]),
+      createWriteStream(archive, { flags: "wx", mode: 0o600 }),
+    );
+    await encryptFile(archive, paths.encryptedSnapshot, key, profileEncryptionContext(paths));
+  } finally {
+    await rm(archive, { force: true });
+  }
   await rm(paths.directory, { recursive: true, force: true });
 }
 
-export async function encryptFile(source: string, destination: string, key: Buffer): Promise<void> {
-  const iv = randomBytes(IV_BYTES);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  await mkdir(destination.slice(0, destination.lastIndexOf("/")), { recursive: true });
-  await writeFile(destination, Buffer.concat([MAGIC, iv]), { mode: 0o600 });
-  await pipeline(createReadStream(source), cipher, createWriteStream(destination, { flags: "a", mode: 0o600 }));
-  await appendFile(destination, cipher.getAuthTag());
-}
-
-export async function decryptFile(source: string, destination: string, key: Buffer): Promise<void> {
-  const metadata = await stat(source);
-  const header = await readRange(source, 0, MAGIC.length + IV_BYTES - 1);
-  if (!header.subarray(0, MAGIC.length).equals(MAGIC)) throw new Error("Invalid Bluey browser profile snapshot");
-  const iv = header.subarray(MAGIC.length);
-  const tag = await readRange(source, metadata.size - TAG_BYTES, metadata.size - 1);
-  const decipher = createDecipheriv("aes-256-gcm", key, iv);
-  decipher.setAuthTag(tag);
-  await pipeline(
-    createReadStream(source, { start: MAGIC.length + IV_BYTES, end: metadata.size - TAG_BYTES - 1 }),
-    decipher,
-    createWriteStream(destination, { mode: 0o600 }),
-  );
-}
-
-async function readRange(path: string, start: number, end: number): Promise<Buffer> {
-  const handle = await open(path, "r");
-  try {
-    const contents = Buffer.alloc(end - start + 1);
-    await handle.read(contents, 0, contents.length, start);
-    return contents;
-  } finally {
-    await handle.close();
-  }
+function profileEncryptionContext(paths: ProfilePaths) {
+  return { purpose: "profile-snapshot", scope: paths.scope } as const;
 }

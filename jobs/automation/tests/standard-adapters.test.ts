@@ -17,7 +17,7 @@ const PROVIDERS = [
 ] as const;
 
 describe("deterministic ATS application adapters", () => {
-  for (const [provider, url] of PROVIDERS) {
+  for (const [provider, url] of PROVIDERS.slice(2)) {
     it(`fills and submits a ${provider} fixture`, async () => {
       const page = new FixturePage(url, [
         field("first_name", "First name", true),
@@ -25,13 +25,15 @@ describe("deterministic ATS application adapters", () => {
         field("resume", "Resume", true, "file"),
       ]);
       const events: string[] = [];
-      const result = await executeApplication(context(page, events));
+      const submitHooks: string[] = [];
+      const result = await executeApplication(context(page, events, submitHooks));
       expect(result.adapter).toBe(provider);
       expect(result.receipt.status).toBe("submitted");
       expect(page.control("first_name").value).toBe("Ada");
       expect(page.control("email").value).toBe("ada@example.com");
       expect(page.control("resume").value).toBe("resume.pdf");
       expect(events).toContain("application_execution_finished");
+      expect(submitHooks).toEqual(["before", "after:activated"]);
     });
   }
 
@@ -41,9 +43,11 @@ describe("deterministic ATS application adapters", () => {
       field("email", "Email address", true, "email"),
       field("resume", "Resume", true, "file"),
     ]);
-    const result = await executeApplication(context(page, []));
+    const submitHooks: string[] = [];
+    const result = await executeApplication(context(page, [], submitHooks));
     expect(result.adapter).toBe("semantic");
     expect(result.receipt.status).toBe("submitted");
+    expect(submitHooks).toEqual(["before", "after:activated"]);
   });
 
   it("pauses on an unanswered required question", async () => {
@@ -54,7 +58,7 @@ describe("deterministic ATS application adapters", () => {
   });
 
   it("selects the matching option in a required radio group", async () => {
-    const page = new FixturePage(PROVIDERS[0][1], [
+    const page = new FixturePage(PROVIDERS[4][1], [
       { ...field("authorized_yes", "Authorized to work Yes", true, "radio"), name: "authorized", value: "yes" },
       { ...field("authorized_no", "Authorized to work No", true, "radio"), name: "authorized", value: "no" },
     ]);
@@ -72,7 +76,7 @@ describe("deterministic ATS application adapters", () => {
   });
 
   it("does not claim success without confirmation evidence", async () => {
-    const page = new FixturePage(PROVIDERS[0][1], [field("first_name", "First name", true)], "Application form", false);
+    const page = new FixturePage(PROVIDERS[4][1], [field("first_name", "First name", true)], "Application form", false);
     const result = await executeApplication(context(page, []));
 
     expect(result.receipt.status).toBe("needs_input");
@@ -85,9 +89,57 @@ describe("deterministic ATS application adapters", () => {
     expect(result.receipt.status).toBe("needs_input");
     expect(result.receipt.intervention?.kind).toBe("captcha");
   });
+
+  it("does not fence validation or challenge-only paths", async () => {
+    const validationHooks: string[] = [];
+    const validationPage = new FixturePage(PROVIDERS[4][1], [
+      field("non_compete", "Are you bound by a non-compete?", true),
+    ]);
+    const validation = await executeApplication(context(validationPage, [], validationHooks));
+    expect(validation.receipt.status).toBe("needs_input");
+    expect(validationHooks).toEqual([]);
+
+    const challengeHooks: string[] = [];
+    const challengePage = new FixturePage(PROVIDERS[4][1], [], "Verify you are human. CAPTCHA");
+    const challenge = await executeApplication(context(challengePage, [], challengeHooks));
+    expect(challenge.receipt.intervention?.kind).toBe("captcha");
+    expect(challengeHooks).toEqual([]);
+  });
+
+  it("does not fence Next and fences the eventual final submit exactly once", async () => {
+    const page = new FixturePage(
+      PROVIDERS[4][1],
+      [field("first_name", "First name", true)],
+      "Application form",
+      true,
+      true,
+    );
+    const submitHooks: string[] = [];
+
+    const result = await executeApplication(context(page, [], submitHooks));
+
+    expect(result.receipt.status).toBe("submitted");
+    expect(page.nextClicks).toBe(1);
+    expect(page.submitClicks).toBe(1);
+    expect(submitHooks).toEqual(["before", "after:activated"]);
+  });
+
+  it("does not click when the durable before-hook is uncertain", async () => {
+    const page = new FixturePage(PROVIDERS[4][1], [field("first_name", "First name", true)]);
+    const adapterContext = context(page, [], []);
+    let hookCalls = 0;
+    adapterContext.beforeFinalSubmit = async () => {
+      hookCalls += 1;
+      throw new Error("durable fence response unavailable");
+    };
+
+    await expect(executeApplication(adapterContext)).rejects.toThrow("durable fence response unavailable");
+    expect(hookCalls).toBe(1);
+    expect(page.submitClicks).toBe(0);
+  });
 });
 
-function context(page: BrowserPage, events: string[]): AdapterContext {
+function context(page: BrowserPage, events: string[], submitHooks?: string[]): AdapterContext {
   return {
     runner: "local",
     runId: "run-123",
@@ -100,9 +152,15 @@ function context(page: BrowserPage, events: string[]): AdapterContext {
       resumePath: "/tmp/resume.pdf",
       answers: { first_name: "Ada", email: "ada@example.com" },
       verifiedClaimIds: ["claim-1"],
+      applicationIdentityId: "identity-123",
       applicationEmail: "ada@example.com",
+      browserProfileId: "profile-123",
     },
     async log(event) { events.push(event); },
+    ...(submitHooks ? {
+      async beforeFinalSubmit() { submitHooks.push("before"); },
+      async afterFinalSubmit(outcome: string) { submitHooks.push(`after:${outcome}`); },
+    } : {}),
   };
 }
 
@@ -112,13 +170,19 @@ function field(selector: string, label: string, required: boolean, kind: FormCon
 
 class FixturePage implements BrowserPage {
   private submitted = false;
+  private finalStep: boolean;
+  submitClicks = 0;
+  nextClicks = 0;
 
   constructor(
     private readonly currentUrl: string,
     private readonly fields: FormControl[],
     private body = "Application form",
     private readonly confirmsSubmission = true,
-  ) {}
+    startBeforeFinalStep = false,
+  ) {
+    this.finalStep = !startBeforeFinalStep;
+  }
 
   url(): string { return this.currentUrl; }
   async title(): Promise<string> { return "Software Engineer | Acme"; }
@@ -130,14 +194,24 @@ class FixturePage implements BrowserPage {
 
   locator(selector: string): BrowserLocator {
     const control = this.fields.find((item) => item.selector === selector);
-    const submit = selector.includes("submit") || selector.includes("Submit");
+    const submit = this.finalStep && (selector.includes("submit") || selector.includes("Submit"));
+    const next = !this.finalStep && !/submit/i.test(selector) && /next|continue/i.test(selector);
     return {
-      count: async () => control || submit ? 1 : 0,
+      count: async () => control || submit || next ? 1 : 0,
       fill: async (value) => { if (control) control.value = value; },
-      click: async () => { if (submit) this.submitted = true; },
+      click: async () => {
+        if (next) {
+          this.nextClicks += 1;
+          this.finalStep = true;
+        }
+        if (submit) {
+          this.submitClicks += 1;
+          this.submitted = true;
+        }
+      },
       textContent: async () => "",
       getAttribute: async () => null,
-      isVisible: async () => Boolean(control || submit),
+      isVisible: async () => Boolean(control || submit || next),
       selectOption: async (value) => { if (control) control.value = value; },
       setChecked: async (checked) => { if (control) control.checked = checked; },
       setInputFiles: async (paths) => { if (control) control.value = paths[0]?.split("/").at(-1) || ""; },

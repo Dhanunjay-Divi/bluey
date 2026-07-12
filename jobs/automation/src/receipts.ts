@@ -1,4 +1,5 @@
 import type { ApplicationPacket, NormalizedJob, SubmissionReceipt } from "./contracts.js";
+import { assertSubmissionReceiptComplete } from "./packet-guards.js";
 
 export interface ReceiptDocument {
   kind: "resume" | "cover_letter" | "attachment";
@@ -14,6 +15,14 @@ export interface ReceiptEvent {
   occurredAt: string;
   type: string;
   detail?: Record<string, unknown>;
+}
+
+export interface EvidenceObjectUpload {
+  original_key: string;
+  kind: "resume" | "cover_letter" | "attachment" | "screenshot";
+  media_type: string;
+  sha256: string;
+  bytes_base64: string;
 }
 
 export interface ApplicationReceiptBundle {
@@ -89,7 +98,7 @@ export interface LinkedProviderEvidenceInput {
 }
 
 export function createApplicationReceipt(input: CreateReceiptInput): ApplicationReceiptBundle {
-  return {
+  const receipt: ApplicationReceiptBundle = {
     schemaVersion: 1,
     receiptId: input.receiptId,
     accountId: input.accountId,
@@ -115,6 +124,8 @@ export function createApplicationReceipt(input: CreateReceiptInput): Application
     finalUrl: input.finalUrl,
     screenshotKeys: [...(input.screenshotKeys ?? [])].sort(),
   };
+  assertSubmissionReceiptComplete(receipt);
+  return receipt;
 }
 
 export function applicationEvidenceFromReceipt(receipt: ApplicationReceiptBundle): ApplicationEvidenceRecord[] {
@@ -136,11 +147,13 @@ export function applicationEvidenceFromReceipt(receipt: ApplicationReceiptBundle
     created_at_ms: createdAt,
   }));
   if (receipt.result.status === "submitted") {
+    const confirmation = receipt.result.confirmationText?.trim() || receipt.result.confirmationUrl?.trim();
+    if (!confirmation) throw new Error("Submitted receipt is missing real confirmation evidence");
     documents.push({
       id: `${receipt.receiptId}:confirmation`,
       application_id: receipt.applicationId,
       kind: "submission_confirmation",
-      label: receipt.result.confirmationText || "Application submitted",
+      label: confirmation,
       provider: receipt.job.source,
       file_name: "",
       media_type: "",
@@ -149,7 +162,7 @@ export function applicationEvidenceFromReceipt(receipt: ApplicationReceiptBundle
       occurred_at_ms: occurredAt,
       metadata: {
         external_id: receipt.result.confirmationUrl || receipt.receiptId,
-        confirmation: receipt.result.confirmationText || "Application submitted",
+        confirmation,
         confirmation_url: receipt.result.confirmationUrl,
         final_url: receipt.finalUrl,
         screenshot_keys: receipt.screenshotKeys,

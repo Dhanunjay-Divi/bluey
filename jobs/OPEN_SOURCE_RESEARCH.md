@@ -35,7 +35,8 @@ The highest-value reusable capabilities were:
 
 ## Bluey implementation outcome
 
-- Five source-configured public ATS feeds normalize to one `NormalizedJob`.
+- Five source-configured public ATS connectors normalize to one `NormalizedJob`;
+  the scheduled server-leased runtime currently enables Greenhouse and Lever.
 - Discovery requests are HTTPS-only, host-pinned, redirect-free, size-bounded,
   retry-bounded, and pagination-bounded.
 - Form planning resolves confirmed profile facts and scoped answer memory in
@@ -78,11 +79,10 @@ Required research invariants:
 
 ## Adapter outcome
 
-Workday, Greenhouse, Lever, Ashby, and SmartRecruiters now use fixture-backed
-prepare, fill, validate, multi-step advance, challenge detection, and submit
-implementations through one shared executor. The same executor runs in local
-Bluey Browser and the cloud container. Live provider certification remains a
-release gate because employer tenants can enable custom fields and authentication
-that no repository fixture can fully represent. A semantic fallback remains
-constrained to direct employer forms and does not override explicit submission
-policy.
+Greenhouse and Lever now use provider-specific, review-only state machines.
+Workday, Ashby, and SmartRecruiters retain the shared fixture-backed beta form
+executor. Local Bluey Browser and the cloud container consume the same adapter
+contract. Live provider certification remains a release gate because employer
+tenants can enable custom fields and authentication that no repository fixture
+can fully represent. A semantic fallback remains constrained to direct employer
+forms and does not override explicit submission policy.

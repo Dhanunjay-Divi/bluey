@@ -1,10 +1,14 @@
+import { detectAts } from "./adapters.js";
+
 export type SubmissionPolicy = "automate" | "handoff" | "blocked";
+export type SubmissionCapability = "certified" | "beta_review" | "handoff" | "unknown_review" | "blocked";
 
 const HANDOFF_HOSTS = ["linkedin.com", "www.linkedin.com", "indeed.com", "www.indeed.com"];
 const BLOCKED_PROTOCOLS = new Set(["file:", "ftp:", "data:", "javascript:"]);
 
 export interface PolicyDecision {
   policy: SubmissionPolicy;
+  capability: SubmissionCapability;
   reason: string;
 }
 
@@ -13,26 +17,40 @@ export function submissionPolicy(rawUrl: string): PolicyDecision {
   try {
     url = new URL(rawUrl);
   } catch {
-    return { policy: "blocked", reason: "The job link is not a valid URL." };
+    return { policy: "blocked", capability: "blocked", reason: "The job link is not a valid URL." };
   }
 
   if (BLOCKED_PROTOCOLS.has(url.protocol) || !["http:", "https:"].includes(url.protocol)) {
-    return { policy: "blocked", reason: "Only public HTTP job links are supported." };
+    return { policy: "blocked", capability: "blocked", reason: "Only public HTTP job links are supported." };
   }
 
   const host = url.hostname.toLowerCase();
   if (isPrivateHost(host)) {
-    return { policy: "blocked", reason: "Private network addresses cannot be opened by Jobs." };
+    return { policy: "blocked", capability: "blocked", reason: "Private network addresses cannot be opened by Jobs." };
   }
 
   if (HANDOFF_HOSTS.some((candidate) => host === candidate || host.endsWith(`.${candidate}`))) {
     return {
       policy: "handoff",
+      capability: "handoff",
       reason: "Bluey can prepare the complete packet, then hands this site to you for submission.",
     };
   }
 
-  return { policy: "automate", reason: "This employer application can use a Bluey runner." };
+  const ats = detectAts(rawUrl);
+  if (ats === "semantic") {
+    return {
+      policy: "handoff",
+      capability: "unknown_review",
+      reason: "Bluey can prepare the packet for review; this site is not certified for runner submission yet.",
+    };
+  }
+
+  return {
+    policy: "automate",
+    capability: "beta_review",
+    reason: "This employer application system can use a Bluey runner after review.",
+  };
 }
 
 function isPrivateHost(host: string): boolean {

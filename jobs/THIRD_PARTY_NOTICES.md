@@ -9,6 +9,20 @@ projects. The source commits and adaptation map are recorded in
 - easy-job-application-filler-extension, Copyright (c) 2020 Sukhpal Saini
 - ai-job-agent, Copyright (c) 2026 Akbarjon Kamoldinov
 
+## Bundled Fonts
+
+Bluey Jobs distributes Noto Sans, Noto Sans SC, and Noto Sans KR under the SIL
+Open Font License, Version 1.1. The exact licenses and upstream provenance are
+included next to the fonts under `automation/assets/fonts/`. Generated PDFs may
+contain font subsets; the OFL does not apply to the documents themselves.
+
+## Document Runtime Dependencies
+
+- `@pdf-lib/fontkit` 1.1.1, MIT. Author: Andrew Dillon. Contributor and original
+  fontkit author: Devon Govett. The MIT terms below apply.
+- `pdfjs-dist` 5.7.284, Apache License 2.0. The dependency ships its complete
+  `LICENSE` file; Bluey uses it only to validate and extract text from PDFs.
+
 ## MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

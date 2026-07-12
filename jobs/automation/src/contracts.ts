@@ -14,6 +14,7 @@ export type ApplicationState =
   | "queued"
   | "running"
   | "needs_input"
+  | "side_effect_unknown"
   | "submitted"
   | "failed";
 
@@ -136,6 +137,8 @@ export interface SubmissionReceipt {
   intervention?: InterventionRequest;
 }
 
+export type FinalSubmitActivationOutcome = "activated" | "activation_uncertain";
+
 export interface AdapterContext {
   runner: RunnerKind;
   runId: string;
@@ -143,6 +146,8 @@ export interface AdapterContext {
   page: BrowserPage;
   packet: ApplicationPacket;
   log(event: string, details?: Record<string, unknown>): Promise<void>;
+  beforeFinalSubmit?(): Promise<void>;
+  afterFinalSubmit?(outcome: FinalSubmitActivationOutcome): Promise<void>;
 }
 
 export interface ApplicationAdapter {

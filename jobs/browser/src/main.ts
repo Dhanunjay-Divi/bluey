@@ -1,19 +1,45 @@
+import { createHash } from "node:crypto";
 import { app, BrowserWindow } from "electron";
 import { chromium, type BrowserContext, type Page } from "playwright";
-import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   PlaywrightBrowserPage,
   assertPublicApplicationUrl,
+  createDefaultAdapterRegistry,
   createApplicationReceipt,
   executeApplication,
   materializeApplicationDocuments,
   submissionPolicy,
   type ApplicationPacket,
+  type EvidenceObjectUpload,
   type ExecutionResult,
   type NormalizedJob,
 } from "@bluey/jobs-automation";
+import {
+  durableFinalSubmitHooks,
+  finalSubmitMarkerExists,
+  recordReconciledSubmitConfirmation,
+} from "./irreversible-submit.js";
+import {
+  installBrowserNetworkGuard,
+  LOCAL_BROWSER_SERVICE_WORKERS,
+} from "./browser-network.js";
+import {
+  classifyLocalFailure,
+  LocalBrowserError,
+  safeLocalFailure,
+  type LocalFailureClassification,
+} from "./local-failure.js";
 import { identityContextKey, identityProfileDirectory } from "./profile.js";
+import {
+  isApprovedLocalResumeAction,
+  localProviderFinalReview,
+  pendingProviderReviewReceipt,
+  providerOptionsForApprovedReview,
+  reconcileLocalProviderConfirmation,
+  type LocalProviderFinalReview,
+} from "./provider-final-review.js";
 import { parseBlueyJobsProtocol } from "./protocol.js";
 
 interface StartRunRequest {
@@ -36,6 +62,9 @@ interface ActiveLocalRun {
   request: StartRunRequest;
   delivery: LocalRunDelivery;
   page: Page;
+  runDirectory: string;
+  providerFinalReview?: LocalProviderFinalReview;
+  approvedSubmitActionConsumed?: boolean;
   events: Array<{ event: string; details: Record<string, unknown>; at: string }>;
 }
 
@@ -101,21 +130,20 @@ async function executeLocalRequest(
   assertIdentifier(request.runId, "runId");
   assertIdentifier(request.applicationId, "applicationId");
   if (request.packet.applicationId !== request.applicationId) {
-    throw new Error("Application bundle does not match this run");
+    throw new LocalBrowserError("run_request_invalid");
   }
   if (request.packet.applicationIdentityId
     && request.packet.applicationIdentityId !== request.applicationIdentityId) {
-    throw new Error("Application email does not match this browser profile");
+    throw new LocalBrowserError("identity_mismatch");
   }
   const decision = submissionPolicy(request.url);
   if (decision.policy === "blocked") return { status: decision.policy, reason: decision.reason };
   await assertPublicApplicationUrl(request.url);
-  const runDirectory = join(
-    identityProfileDirectory(app.getPath("userData"), request.accountId, request.applicationIdentityId),
-    "runs",
-    request.runId,
-  );
+  const runDirectory = localRunDirectory(request);
   await mkdir(runDirectory, { recursive: true });
+  if (!resume && await finalSubmitMarkerExists(runDirectory)) {
+    throw new LocalBrowserError("submit_outcome_unknown");
+  }
   const documents = await materializeApplicationDocuments({
     ...request.packet,
     applicationIdentityId: request.applicationIdentityId,
@@ -124,41 +152,114 @@ async function executeLocalRequest(
   }, join(runDirectory, "documents"));
   request.packet = documents.packet;
   const active = activeLocalRuns.get(request.runId);
-  if (resume && !active) throw new Error("This local application is no longer active");
+  if (resume && !active) throw new LocalBrowserError("run_not_active");
   if (!active && [...activeLocalRuns.values()].some((run) => (
     run.request.applicationIdentityId === request.applicationIdentityId
   ))) {
-    throw new Error("Finish the other application using this application email first");
+    throw new LocalBrowserError("identity_busy");
   }
   const context = await contextFor(request.accountId, request.applicationIdentityId);
   const page = active?.page ?? await context.newPage();
+  const events = active?.events ?? [];
+  if (!active) {
+    activeLocalRuns.set(request.runId, { request, delivery, page, runDirectory, events });
+  }
   if (!resume) await page.goto(request.url, { waitUntil: "domcontentloaded", timeout: 45_000 });
   await page.bringToFront();
   const browserPage = new PlaywrightBrowserPage(page);
-  const events = active?.events ?? [];
-  const execution = decision.policy === "handoff"
-    ? await handoffExecution(browserPage, decision.reason, resume)
-    : await executeApplication({
-        runner: "local",
-        runId: request.runId,
-        accountId: request.accountId,
-        page: browserPage,
-        packet: {
-          ...request.packet,
+  const finalSubmitHooks = durableFinalSubmitHooks(runDirectory);
+  let execution: ExecutionResult | undefined;
+  let approvedProviderReview: LocalProviderFinalReview | undefined;
+  if (resume && active?.providerFinalReview) {
+    // The resume capability proves run access, not server-side submit approval.
+    execution = reconcileLocalProviderConfirmation(
+      active.providerFinalReview,
+      await browserPage.bodyText(),
+      browserPage.url(),
+    );
+    if (execution && !await finalSubmitMarkerExists(runDirectory)) {
+      try {
+        await recordReconciledSubmitConfirmation(runDirectory);
+      } catch {
+        throw new LocalBrowserError("submit_outcome_unknown");
+      }
+    }
+    if (!execution && await finalSubmitMarkerExists(runDirectory)) {
+      throw new LocalBrowserError("submit_outcome_unknown");
+    }
+    if (!active.approvedSubmitActionConsumed) {
+      const approved = await consumeApprovedLocalSubmitAction(request.runId, delivery);
+      if (approved) active.approvedSubmitActionConsumed = true;
+      if (!approved) {
+        const pending = pendingProviderReviewReceipt();
+        pending.intervention!.takeoverUrl = localResumeUrl(request.runId, delivery.ticket);
+        await showControllerPage(interventionPage(
+          pending.intervention!.title,
+          pending.intervention!.detail,
+          localResumeUrl(request.runId, delivery.ticket),
+        ));
+        return {
+          status: pending.status,
+          runId: request.runId,
+          applicationId: request.applicationId,
           applicationIdentityId: request.applicationIdentityId,
-          browserProfileId: request.browserProfileId
-            || identityContextKey(request.accountId, request.applicationIdentityId),
-        },
-        async log(event, details = {}) {
-          events.push({ event, details, at: new Date().toISOString() });
-        },
-      });
+          receipt: pending,
+        };
+      }
+    }
+    if (!execution) {
+      approvedProviderReview = active.providerFinalReview;
+    }
+  }
+  if (!execution && decision.policy === "handoff") {
+    execution = await handoffExecution(browserPage, decision.reason, resume);
+  } else if (!execution) {
+    const adapterContext = {
+      runner: "local" as const,
+      runId: request.runId,
+      accountId: request.accountId,
+      page: browserPage,
+      packet: {
+        ...request.packet,
+        applicationIdentityId: request.applicationIdentityId,
+        browserProfileId: request.browserProfileId
+          || identityContextKey(request.accountId, request.applicationIdentityId),
+      },
+      async log(event: string, details: Record<string, unknown> = {}) {
+        events.push({ event, details, at: new Date().toISOString() });
+      },
+      beforeFinalSubmit: finalSubmitHooks.beforeFinalSubmit,
+      afterFinalSubmit: finalSubmitHooks.afterFinalSubmit,
+    };
+    execution = approvedProviderReview
+      ? await executeApplication(
+          adapterContext,
+          createDefaultAdapterRegistry(undefined, providerOptionsForApprovedReview(approvedProviderReview)),
+        )
+      : await executeApplication(adapterContext);
+  }
+  const providerReview = localProviderFinalReview(execution);
+  if (providerReview) {
+    const current = activeLocalRuns.get(request.runId);
+    if (current) current.providerFinalReview = providerReview;
+  }
+  const markerExists = await finalSubmitMarkerExists(runDirectory);
+  if (execution.receipt.status === "submitted" && !markerExists) {
+    try {
+      await recordReconciledSubmitConfirmation(runDirectory);
+    } catch {
+      throw new LocalBrowserError("submit_outcome_unknown");
+    }
+  } else if (execution.receipt.status !== "submitted" && markerExists) {
+    throw new LocalBrowserError("submit_outcome_unknown");
+  }
   if (execution.receipt.status === "needs_input" && execution.receipt.intervention) {
     execution.receipt.intervention.takeoverUrl = localResumeUrl(request.runId, delivery.ticket);
   }
   const job = request.job ?? await resolveJob(execution.adapter, browserPage);
   const screenshotPath = join(runDirectory, "final.png");
-  await writeFile(screenshotPath, await browserPage.screenshot({ fullPage: true }), { mode: 0o600 });
+  const screenshotBytes = Buffer.from(await browserPage.screenshot({ fullPage: true }));
+  await writeFile(screenshotPath, screenshotBytes, { mode: 0o600 });
   execution.receipt.screenshotPath = screenshotPath;
   const bundle = createApplicationReceipt({
     receiptId: `receipt-${request.runId}`,
@@ -197,16 +298,36 @@ async function executeLocalRequest(
   });
   const receiptPath = join(runDirectory, "receipt.json");
   await writeFile(receiptPath, `${JSON.stringify(bundle, null, 2)}\n`, { mode: 0o600 });
+  const evidenceObjects: EvidenceObjectUpload[] = [
+    await evidenceObject(documents.resume.path, "resume", "application/pdf", documents.resume.sha256),
+    ...(documents.coverLetter ? [await evidenceObject(
+      documents.coverLetter.path,
+      "cover_letter",
+      "application/pdf",
+      documents.coverLetter.sha256,
+    )] : []),
+    {
+      original_key: screenshotPath,
+      kind: "screenshot",
+      media_type: "image/png",
+      sha256: createHash("sha256").update(screenshotBytes).digest("hex"),
+      bytes_base64: screenshotBytes.toString("base64"),
+    },
+  ];
   const finalTitle = await page.title();
   const finalUrl = page.url();
   const response = await fetch(`${delivery.apiOrigin}/api/jobs/local-runs/${encodeURIComponent(request.runId)}/result`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ticket: delivery.ticket, receipt: execution.receipt, receiptBundle: bundle }),
+    body: JSON.stringify({
+      ticket: delivery.ticket,
+      receipt: execution.receipt,
+      receiptBundle: bundle,
+      evidenceObjects,
+    }),
   });
-  if (!response.ok) throw new Error(`Bluey could not save the local run (${response.status})`);
+  if (!response.ok) throw new LocalBrowserError("result_delivery_failed");
   if (execution.receipt.status === "needs_input") {
-    activeLocalRuns.set(request.runId, { request, delivery, page, events });
     await showControllerPage(interventionPage(
       execution.receipt.intervention?.title || "Application needs your input",
       execution.receipt.intervention?.detail || "Complete this step in the application browser.",
@@ -226,6 +347,21 @@ async function executeLocalRequest(
     receipt: execution.receipt,
     title: finalTitle,
     url: finalUrl,
+  };
+}
+
+async function evidenceObject(
+  path: string,
+  kind: "resume" | "cover_letter" | "attachment",
+  mediaType: string,
+  sha256: string,
+): Promise<EvidenceObjectUpload> {
+  return {
+    original_key: path,
+    kind,
+    media_type: mediaType,
+    sha256,
+    bytes_base64: (await readFile(path)).toString("base64"),
   };
 }
 
@@ -281,17 +417,14 @@ async function contextFor(accountId: string, applicationIdentityId: string): Pro
     ...(executablePath ? { executablePath } : { channel: "chromium" }),
     viewport: null,
     acceptDownloads: true,
+    serviceWorkers: LOCAL_BROWSER_SERVICE_WORKERS,
   });
-  await context.route("**/*", async (route) => {
-    const request = route.request();
-    if (!request.isNavigationRequest()) return route.continue();
-    try {
-      await assertPublicApplicationUrl(request.url());
-      await route.continue();
-    } catch {
-      await route.abort("blockedbyclient");
-    }
-  });
+  try {
+    await installBrowserNetworkGuard(context);
+  } catch {
+    await context.close().catch(() => undefined);
+    throw new LocalBrowserError("configuration_invalid");
+  }
   contexts.set(contextKey, context);
   context.on("close", () => contexts.delete(contextKey));
   return context;
@@ -305,7 +438,7 @@ async function packagedChromiumExecutable(): Promise<string> {
       ? ["chrome.exe"]
       : ["chrome", "headless_shell"];
   const found = await findExecutable(root, new Set(candidates), 0);
-  if (!found) throw new Error("Bluey Browser's bundled Chromium is missing");
+  if (!found) throw new LocalBrowserError("configuration_invalid");
   return found;
 }
 
@@ -339,8 +472,26 @@ async function resolveJob(adapter: string, page: PlaywrightBrowserPage): Promise
 }
 
 
-function assertIdentifier(value: string, label: string): void {
-  if (!/^[A-Za-z0-9_-]{3,160}$/.test(value)) throw new Error(`Invalid ${label}`);
+function localRunDirectory(request: StartRunRequest): string {
+  return join(
+    identityProfileDirectory(app.getPath("userData"), request.accountId, request.applicationIdentityId),
+    "runs",
+    request.runId,
+  );
+}
+
+function localRunDirectoryIfValid(request: StartRunRequest): string | undefined {
+  return identifiersAreValid(request.accountId, request.applicationIdentityId, request.runId)
+    ? localRunDirectory(request)
+    : undefined;
+}
+
+function identifiersAreValid(...values: unknown[]): boolean {
+  return values.every((value) => typeof value === "string" && /^[A-Za-z0-9_-]{3,160}$/.test(value));
+}
+
+function assertIdentifier(value: string, _label: string): void {
+  if (!identifiersAreValid(value)) throw new LocalBrowserError("run_request_invalid");
 }
 
 async function openProtocolUrl(rawUrl: string): Promise<void> {
@@ -361,33 +512,33 @@ async function openProtocolUrl(rawUrl: string): Promise<void> {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ticket }),
       });
-      if (!response.ok) throw new Error("This application launch expired. Start it again from Bluey Jobs.");
+      if (!response.ok) throw new LocalBrowserError("launch_expired");
       const request = await response.json() as StartRunRequest;
-      if (request.runId !== runId) throw new Error("The application launch did not match this run");
+      if (request.runId !== runId) throw new LocalBrowserError("launch_mismatch");
       const delivery = { apiOrigin, ticket };
       try {
         await executeLocalRequest(request, delivery);
       } catch (error) {
-        await reportLocalFailure(request, delivery, error);
-        throw error;
+        const failure = await reportLocalFailure(request, delivery, error);
+        await showLocalFailurePage(request.runId, delivery.ticket, failure);
       }
       return;
     }
     if (command.action === "resume") {
       const active = activeLocalRuns.get(runId);
       if (!active || active.delivery.ticket !== ticket) {
-        throw new Error("This application is no longer active. Start it again from Bluey Jobs.");
+        throw new LocalBrowserError("run_not_active");
       }
       await showControllerPage(loadingPage("Checking the application"));
       try {
         await executeLocalRequest(active.request, active.delivery, true);
       } catch (error) {
-        await reportLocalFailure(active.request, active.delivery, error);
-        throw error;
+        const failure = await reportLocalFailure(active.request, active.delivery, error);
+        await showLocalFailurePage(runId, ticket, failure);
       }
     }
   } catch (error) {
-    await showControllerPage(errorPage(error instanceof Error ? error.message : "Bluey Browser could not open this application."));
+    await showControllerPage(errorPage(safeLocalFailure(error).message));
   }
 }
 
@@ -395,22 +546,75 @@ async function reportLocalFailure(
   request: StartRunRequest,
   delivery: LocalRunDelivery,
   error: unknown,
-): Promise<void> {
+): Promise<LocalFailureClassification> {
   const active = activeLocalRuns.get(request.runId);
-  activeLocalRuns.delete(request.runId);
-  await active?.page.close().catch(() => undefined);
-  const message = error instanceof Error ? error.message : "Bluey Browser could not finish this application.";
+  const failure = await classifyLocalFailure(
+    active?.runDirectory ?? localRunDirectoryIfValid(request),
+    error,
+  );
+  if (!failure.preservePage) {
+    activeLocalRuns.delete(request.runId);
+    await active?.page.close().catch(() => undefined);
+  }
+  const intervention = failure.status === "side_effect_unknown" && active
+    ? {
+        kind: "browser_takeover",
+        title: "Confirm the application result",
+        detail: failure.message,
+        takeoverUrl: localResumeUrl(request.runId, delivery.ticket),
+        resolution: { kind: "browser_takeover", resumeAfter: true },
+      }
+    : undefined;
   await fetch(`${delivery.apiOrigin}/api/jobs/local-runs/${encodeURIComponent(request.runId)}/result`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       ticket: delivery.ticket,
       receipt: {
-        status: "failed",
-        issues: [{ field: "browser", message, severity: "blocking" }],
+        status: failure.status,
+        errorCode: failure.code,
+        issues: [{ field: "browser", message: failure.message, severity: "blocking" }],
+        ...(intervention ? { intervention } : {}),
       },
     }),
   }).catch(() => undefined);
+  return failure;
+}
+
+async function consumeApprovedLocalSubmitAction(
+  runId: string,
+  delivery: LocalRunDelivery,
+): Promise<boolean> {
+  try {
+    const response = await fetch(
+      `${delivery.apiOrigin}/api/jobs/local-runs/${encodeURIComponent(runId)}/resume`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ticket: delivery.ticket }),
+      },
+    );
+    if (!response.ok) return false;
+    return isApprovedLocalResumeAction(await response.json(), runId);
+  } catch {
+    return false;
+  }
+}
+
+async function showLocalFailurePage(
+  runId: string,
+  ticket: string,
+  failure: LocalFailureClassification,
+): Promise<void> {
+  if (failure.status === "side_effect_unknown" && activeLocalRuns.has(runId)) {
+    await showControllerPage(interventionPage(
+      "Confirm the application result",
+      failure.message,
+      localResumeUrl(runId, ticket),
+    ));
+    return;
+  }
+  await showControllerPage(errorPage(failure.message));
 }
 
 function showWindow(): void {
@@ -474,7 +678,7 @@ function jobsApiOrigin(): string {
   const value = (process.env.BLUEY_JOBS_API_ORIGIN || "https://bluey.sh").replace(/\/$/, "");
   const url = new URL(value);
   if (url.protocol !== "https:" && !(url.protocol === "http:" && ["127.0.0.1", "localhost"].includes(url.hostname))) {
-    throw new Error("Bluey Jobs API origin must use HTTPS");
+    throw new LocalBrowserError("configuration_invalid");
   }
   return url.toString().replace(/\/$/, "");
 }

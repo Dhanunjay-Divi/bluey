@@ -57,6 +57,27 @@ reviewed as read-only research material. They are not shipped with Bluey.
 | [`leopu00/job-hunter-team`](https://github.com/leopu00/job-hunter-team) | `f2575c976f8a` | MIT | Multi-agent architecture research only. |
 | [`suxrobGM/jobpilot`](https://github.com/suxrobGM/jobpilot) | `272b7aca424c` | MIT | Product and queue architecture research only. |
 
+## Bundled document fonts
+
+The automation package ships the following font files for Unicode PDF
+generation. `pdf-lib` embeds per-document subsets so generated files retain an
+extractable text layer without carrying each complete font.
+
+| Asset | Upstream revision | License | SHA-256 |
+| --- | --- | --- | --- |
+| `automation/assets/fonts/NotoSans-Regular.ttf` | [`notofonts/noto-fonts@ffebf8c1ee449e544955a7e813c54f9b73848eac`](https://github.com/notofonts/noto-fonts/tree/ffebf8c1ee449e544955a7e813c54f9b73848eac/hinted/ttf/NotoSans) | SIL Open Font License 1.1; copyright Google LLC, 2015-2021 | `b85c38ecea8a7cfb39c24e395a4007474fa5a4fc864f6ee33309eb4948d232d5` |
+| `automation/assets/fonts/NotoSansSC-Regular.ttf` | [`notofonts/noto-cjk@f8d157532fbfaeda587e826d4cd5b21a49186f7c`](https://github.com/notofonts/noto-cjk/blob/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/Variable/TTF/Subset/NotoSansSC-VF.ttf) | SIL Open Font License 1.1; source SHA-256 `d68bafcb48a2707749396aa12bbbd833cb70401f3a9a689fd2902c7e0d295964` | `f7c076d935cbe9e0a4b8c3f559ae5db01522b9cfdd77af136444f6595be09c92` |
+| `automation/assets/fonts/NotoSansKR-Regular.ttf` | [`notofonts/noto-cjk@f8d157532fbfaeda587e826d4cd5b21a49186f7c`](https://github.com/notofonts/noto-cjk/blob/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/Variable/TTF/Subset/NotoSansKR-VF.ttf) | SIL Open Font License 1.1; source SHA-256 `9e1d729e7e2b36f9ef439da102f8c134c10aabe46f1c843bf0aca5c043b86f76` | `272e1290201d9443b354a617da24424e2a8d71fb396d0816df98ca77d91cf915` |
+
+The SC and KR files are deterministic weight-400 instances created with
+FontTools 4.59.1 from those pinned variable sources. The name-table family,
+subfamily, full-name, and PostScript records were normalized to `Regular`; no
+glyph outlines or licensing metadata were removed.
+
+The exact upstream licenses and notices accompany the assets under
+`automation/assets/fonts/*-LICENSE.txt` and are included in automation package
+artifacts.
+
 ## Shipped adaptation map
 
 | Bluey file | Source lineage | Bluey changes |

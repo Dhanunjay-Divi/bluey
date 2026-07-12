@@ -8,6 +8,7 @@ export type ApplicationState =
   | "queued"
   | "running"
   | "needs_input"
+  | "side_effect_unknown"
   | "submitted"
   | "failed";
 
@@ -100,6 +101,7 @@ export interface JobPreferences {
   daily_limit: number;
   apply_once_per_company: boolean;
   max_posting_age_days: number;
+  time_zone_offset_minutes?: number;
   updated_at_ms: number;
 }
 
@@ -138,6 +140,37 @@ export interface JobPosting {
   status: string;
   created_at_ms: number;
   updated_at_ms: number;
+  eligibility?: JobEligibilityDecision;
+}
+
+export interface UserJobInput {
+  canonical_url: string;
+  pasted_description?: string;
+  company: string;
+  title: string;
+  location?: string;
+  workplace?: string;
+  compensation?: string;
+  track_id: string;
+}
+
+export interface EligibilityReason {
+  code: string;
+  message: string;
+}
+
+export type SubmissionCapability = "certified" | "beta_review" | "handoff" | "unknown_review" | "blocked";
+
+export interface JobEligibilityDecision {
+  capability: SubmissionCapability;
+  can_prepare: boolean;
+  can_auto_submit: boolean;
+  can_queue_local: boolean;
+  can_queue_cloud: boolean;
+  hard_failures: EligibilityReason[];
+  review_reasons: EligibilityReason[];
+  passed_checks: string[];
+  evaluated_at_ms: number;
 }
 
 export interface ResumeVersion {
@@ -279,6 +312,19 @@ export interface MailboxConnection {
   updated_at_ms: number;
 }
 
+export type DiscoverySourceHealth = "healthy" | "degraded" | "paused" | "waiting";
+
+export interface DiscoverySource {
+  id: string;
+  provider: string;
+  config: {
+    company: string;
+  };
+  status: "active" | "paused";
+  health: DiscoverySourceHealth;
+  last_success_at_ms: number | null;
+}
+
 export interface JobsEntitlement {
   plan: "free" | "pro" | "cloud";
   track_limit: number;
@@ -309,6 +355,7 @@ export interface JobsWorkspace {
   integrations: JobsIntegration[];
   application_identities: ApplicationIdentity[];
   mailbox_connections: MailboxConnection[];
+  discovery_sources: DiscoverySource[];
   entitlement: JobsEntitlement;
 }
 
@@ -320,6 +367,7 @@ export interface AccountSummary {
 export interface PrepareApplicationResponse {
   application: JobApplication;
   resume_version: ResumeVersion;
+  metering?: PacketCommitResult;
 }
 
 export interface PacketCommitResult {
@@ -328,6 +376,11 @@ export interface PacketCommitResult {
   amount_cents: number;
   used_packets: number;
   monthly_packet_limit: number;
+}
+
+export interface ApproveApplicationResponse {
+  application: JobApplication;
+  metering: PacketCommitResult;
 }
 
 export interface QueueApplicationRunResponse {

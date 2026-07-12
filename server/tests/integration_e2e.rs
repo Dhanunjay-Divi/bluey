@@ -8,11 +8,12 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use base64::Engine;
 use serde_json::json;
 use serial_test::serial;
 use std::io::{Cursor, Read};
 use tower::ServiceExt;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bluey_server::auth;
@@ -20,6 +21,9 @@ use bluey_server::config::{
     Config, ObjectStorageConfig, SmtpConfig, UpstreamKeys, UpstreamSpendGuard,
 };
 use bluey_server::db::accounts::Account;
+use bluey_server::db::jobs::{
+    self, BrowserSession, DiscoverySourceInput, Intervention, JobPosting, JobPreferences,
+};
 use bluey_server::db::usage::{self, UsageEvent};
 use bluey_server::db::{idempotency, open_pool, run_migrations, DbPool};
 
@@ -34,6 +38,1739 @@ struct Harness {
     pub square: MockServer,
     pub deepgram: MockServer,
     pub mail: MockServer,
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_discovery_worker_requires_auth_and_persists_a_complete_snapshot() {
+    const WORKER_TOKEN: &str = "jobs-discovery-worker-test-token";
+    std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
+    let harness = boot_harness().await;
+    let password_hash = auth::password::hash_password("valid-password-123").unwrap();
+    let account = Account::create(
+        &harness.pool,
+        "jobs-discovery-worker@example.com",
+        &password_hash,
+    )
+    .unwrap();
+    let source = jobs::upsert_discovery_source(
+        &harness.pool,
+        &account.id,
+        &DiscoverySourceInput {
+            track_id: String::new(),
+            provider: "greenhouse".to_string(),
+            source_key: "acme".to_string(),
+            company: "Acme".to_string(),
+            run_interval_ms: 15 * 60 * 1_000,
+        },
+    )
+    .unwrap();
+
+    let unauthorized = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/internal/discovery/lease")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let unauthorized_status = unauthorized.status();
+
+    let lease_response = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/internal/discovery/lease")
+                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+                .header("x-bluey-jobs-worker-id", "integration-worker")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let lease_status = lease_response.status();
+    let lease_body = axum::body::to_bytes(lease_response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let lease: serde_json::Value = serde_json::from_slice(&lease_body).unwrap();
+    let completion_body = json!({
+        "lease_token": lease["lease_token"],
+        "replay_key": lease["replay_key"],
+        "scheduled_for_ms": lease["scheduled_for_ms"],
+        "complete_snapshot": true,
+        "jobs": [{
+            "external_id": "job-123",
+            "canonical_url": "https://boards.greenhouse.io/acme/jobs/job-123?utm_source=test",
+            "company": "Worker supplied company is not authoritative",
+            "title": "Software Engineer",
+            "location": "New York, NY",
+            "workplace": "hybrid",
+            "description": "Build reliable systems.",
+            "compensation": "$170k-$200k",
+            "posted_at_ms": 1,
+            "payload_hash": "a".repeat(64)
+        }]
+    });
+    let completed = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/jobs/internal/discovery/{}/complete",
+                source.id
+            ))
+            .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&completion_body).unwrap()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let completion_status = completed.status();
+    let postings = jobs::list_postings(&harness.pool, &account.id).unwrap();
+    std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+
+    assert_eq!(unauthorized_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(lease_status, StatusCode::OK);
+    assert_eq!(lease["source"]["id"], source.id);
+    assert_eq!(completion_status, StatusCode::OK);
+    assert_eq!(postings.len(), 1);
+    assert_eq!(postings[0].company, "Acme");
+    assert_eq!(
+        postings[0].canonical_url,
+        "https://boards.greenhouse.io/acme/jobs/job-123"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_fact_route_owns_provenance_confirmation_and_timestamps() {
+    let harness = boot_harness().await;
+    let email = "jobs-facts-authority@example.com";
+    let access = signup_and_login(&harness, email, "valid-password-123").await;
+    let account = Account::fetch_by_email(&harness.pool, email)
+        .unwrap()
+        .unwrap();
+    let forged = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/facts")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "category": "employment",
+                        "label": "Forged imported claim",
+                        "value": "Shipped it",
+                        "source": "resume_import",
+                        "verification_status": "confirmed",
+                        "confirmed_by": "bluey_internal",
+                        "confirmed_at_ms": 1,
+                        "schema_version": 99,
+                        "created_at_ms": 1,
+                        "updated_at_ms": 1
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(jobs::list_facts(&harness.pool, &account.id)
+        .unwrap()
+        .is_empty());
+
+    let saved = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/facts")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "category": "employment",
+                        "label": "Direct user claim",
+                        "value": "Shipped it"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved_body = axum::body::to_bytes(saved.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let saved_fact: serde_json::Value = serde_json::from_slice(&saved_body).unwrap();
+    assert_eq!(saved_fact["source"], "user_entry");
+    assert_eq!(saved_fact["verification_status"], "confirmed");
+    assert_eq!(saved_fact["confirmed_by"], "user");
+    assert_eq!(saved_fact["schema_version"], 1);
+    assert!(saved_fact["confirmed_at_ms"].as_i64().unwrap() > 1);
+    assert!(saved_fact["created_at_ms"].as_i64().unwrap() > 1);
+
+    let imported = jobs::upsert_fact(
+        &harness.pool,
+        &account.id,
+        &jobs::CareerFact {
+            id: "server-import-proposal".to_string(),
+            category: "employment".to_string(),
+            label: "Imported proposal".to_string(),
+            value: json!("Needs review"),
+            source: "resume_import".to_string(),
+            verification_status: "needs_confirmation".to_string(),
+            confirmed_at_ms: None,
+            confirmed_by: None,
+            schema_version: 1,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .unwrap();
+    let generic_confirmation = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/facts")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "id": imported.id,
+                        "category": "employment",
+                        "label": "Imported proposal",
+                        "value": "Confirm through generic save"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(generic_confirmation.status(), StatusCode::CONFLICT);
+    let imported_after = jobs::list_facts(&harness.pool, &account.id)
+        .unwrap()
+        .into_iter()
+        .find(|fact| fact.id == "server-import-proposal")
+        .unwrap();
+    assert_eq!(imported_after.verification_status, "needs_confirmation");
+    assert_eq!(imported_after.confirmed_by, None);
+}
+
+fn setup_execution_lease_run(harness: &Harness) -> (String, String, String, String) {
+    let password_hash = auth::password::hash_password("valid-password-123").unwrap();
+    let account = Account::create(
+        &harness.pool,
+        "jobs-execution-lease@example.com",
+        &password_hash,
+    )
+    .unwrap();
+    let profile = jobs::default_profile(&account.email);
+    jobs::save_profile(&harness.pool, &account.id, &profile).unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let posting = jobs::upsert_posting(
+        &harness.pool,
+        &account.id,
+        &JobPosting {
+            id: String::new(),
+            canonical_key: String::new(),
+            source: "greenhouse".to_string(),
+            external_id: "lease-integration".to_string(),
+            company: "Acme".to_string(),
+            title: "Platform Engineer".to_string(),
+            location: "New York, NY".to_string(),
+            workplace: "hybrid".to_string(),
+            canonical_url: "https://boards.greenhouse.io/acme/jobs/lease-integration".to_string(),
+            description: "Build reliable systems.".to_string(),
+            compensation: "$170k-$200k".to_string(),
+            track_id: String::new(),
+            match_score: 92,
+            matched_reasons: Vec::new(),
+            missing_requirements: Vec::new(),
+            posted_at_ms: Some(now),
+            last_verified_at_ms: Some(now),
+            availability_status: "active".to_string(),
+            status: "matched".to_string(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            eligibility: None,
+        },
+        &profile,
+        &JobPreferences::default(),
+    )
+    .unwrap();
+    let (application, _) = jobs::prepare_application(
+        &harness.pool,
+        &account.id,
+        &posting.id,
+        "factual",
+        "review_first",
+    )
+    .unwrap();
+    let application = jobs::update_application(
+        &harness.pool,
+        &account.id,
+        &application.id,
+        "queued",
+        Some("auto_submit"),
+    )
+    .unwrap()
+    .unwrap();
+    let run_id = "cloud-run-integration-lease".to_string();
+    jobs::upsert_browser_session(
+        &harness.pool,
+        &account.id,
+        &BrowserSession {
+            id: run_id.clone(),
+            runner: "cloud".to_string(),
+            status: "queued".to_string(),
+            current_company: "Acme".to_string(),
+            current_step: "Waiting for a browser".to_string(),
+            application_id: Some(application.id.clone()),
+            takeover_url: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .unwrap();
+    let application =
+        jobs::assign_application_run(&harness.pool, &account.id, &application.id, &run_id)
+            .unwrap()
+            .unwrap();
+    let identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    let browser_profile_id = jobs::execution_browser_profile_id(&account.id, identity_id);
+    (account.id, application.id, run_id, browser_profile_id)
+}
+
+fn valid_receipt_pdf() -> Vec<u8> {
+    b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nstartxref\n0\n%%EOF\n".to_vec()
+}
+
+fn valid_receipt_png() -> Vec<u8> {
+    let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+    png.extend_from_slice(&1u32.to_be_bytes());
+    png.extend_from_slice(&1u32.to_be_bytes());
+    png.extend_from_slice(&[8, 2, 0, 0, 0]);
+    png.extend_from_slice(&[0, 0, 0, 0]);
+    png
+}
+
+fn cloud_receipt_request(
+    harness: &Harness,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+
+    let application = jobs::get_application(&harness.pool, account_id, application_id)
+        .unwrap()
+        .unwrap();
+    let posting = jobs::get_posting(&harness.pool, account_id, &application.job_id)
+        .unwrap()
+        .unwrap();
+    let resume_id = application.resume_version_id.as_deref().unwrap();
+    let identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    let application_email = application
+        .receipt
+        .pointer("/application_identity/email")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    let pdf = valid_receipt_pdf();
+    let png = valid_receipt_png();
+    let pdf_sha = hex::encode(Sha256::digest(&pdf));
+    let png_sha = hex::encode(Sha256::digest(&png));
+    let resume_key = "local-run/documents/resume.pdf";
+    let screenshot_key = "local-run/final.png";
+    json!({
+        "account_id": account_id,
+        "receipt": {
+            "schemaVersion": 1,
+            "receiptId": format!("receipt-{run_id}"),
+            "accountId": account_id,
+            "applicationId": application_id,
+            "runId": run_id,
+            "runner": "cloud",
+            "generatedAt": "2026-07-12T12:00:00Z",
+            "applicationIdentityId": identity_id,
+            "browserProfileId": jobs::execution_browser_profile_id(account_id, identity_id),
+            "adapter": "greenhouse",
+            "adapterVersion": "1.0.0",
+            "packet": {
+                "jobId": application.job_id,
+                "resumeVersionId": resume_id,
+                "applicationEmail": application_email,
+                "answers": {},
+                "verifiedClaimIds": []
+            },
+            "job": { "canonicalUrl": posting.canonical_url },
+            "documents": [{
+                "kind": "resume",
+                "versionId": resume_id,
+                "storageKey": resume_key,
+                "sha256": pdf_sha,
+                "mediaType": "application/pdf"
+            }],
+            "events": [],
+            "result": {
+                "status": "submitted",
+                "confirmationText": "Application received",
+                "confirmationUrl": "https://boards.greenhouse.io/acme/confirmation",
+                "submittedAt": "2026-07-12T12:00:00Z"
+            },
+            "screenshotKeys": [screenshot_key]
+        },
+        "evidence_objects": [{
+            "original_key": resume_key,
+            "kind": "resume",
+            "media_type": "application/pdf",
+            "sha256": pdf_sha,
+            "bytes_base64": base64::engine::general_purpose::STANDARD.encode(pdf)
+        }, {
+            "original_key": screenshot_key,
+            "kind": "screenshot",
+            "media_type": "image/png",
+            "sha256": png_sha,
+            "bytes_base64": base64::engine::general_purpose::STANDARD.encode(png)
+        }]
+    })
+}
+
+fn prepare_cloud_submission(
+    harness: &Harness,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    browser_profile_id: &str,
+) {
+    jobs::reserve_application_attempt(&harness.pool, account_id, application_id, "cloud").unwrap();
+    jobs::update_application(&harness.pool, account_id, application_id, "running", None)
+        .unwrap()
+        .unwrap();
+    let lease = jobs::claim_execution_lease(
+        &harness.pool,
+        account_id,
+        application_id,
+        run_id,
+        browser_profile_id,
+        "receipt-integration-worker",
+    )
+    .unwrap();
+    jobs::start_irreversible_submission(
+        &harness.pool,
+        account_id,
+        application_id,
+        run_id,
+        &lease.lease_token,
+        lease.fence,
+    )
+    .unwrap();
+    jobs::finish_execution_lease(
+        &harness.pool,
+        account_id,
+        application_id,
+        run_id,
+        &lease.lease_token,
+        lease.fence,
+        "submitted",
+    )
+    .unwrap();
+}
+
+async fn post_cloud_receipt(
+    harness: &Harness,
+    worker_token: &str,
+    application_id: &str,
+    body: &serde_json::Value,
+) -> axum::response::Response {
+    harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/jobs/internal/applications/{application_id}/receipt"
+            ))
+            .header("authorization", format!("Bearer {worker_token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
+    const WORKER_TOKEN: &str = "jobs-execution-lease-worker-token";
+    std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
+    let harness = boot_harness().await;
+    let (account_id, application_id, run_id, browser_profile_id) =
+        setup_execution_lease_run(&harness);
+    let claim_body = json!({
+        "account_id": account_id,
+        "application_id": application_id,
+        "run_id": run_id,
+        "browser_profile_id": browser_profile_id,
+        "owner_id": "integration-worker-one"
+    });
+
+    let unauthorized = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/internal/execution-leases/claim")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let forged_scope = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/internal/execution-leases/claim")
+                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "account_id": account_id,
+                        "application_id": application_id,
+                        "run_id": run_id,
+                        "browser_profile_id": "forged:browser-profile",
+                        "owner_id": "integration-worker-one"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forged_scope.status(), StatusCode::CONFLICT);
+
+    let invalid_claim = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/internal/execution-leases/claim")
+                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "account_id": account_id,
+                        "application_id": application_id,
+                        "run_id": run_id,
+                        "browser_profile_id": browser_profile_id,
+                        "owner_id": ""
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_claim.status(), StatusCode::BAD_REQUEST);
+
+    let missing_binding = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/internal/execution-leases/claim")
+                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "account_id": account_id,
+                        "application_id": application_id,
+                        "run_id": "different-cloud-run",
+                        "browser_profile_id": browser_profile_id,
+                        "owner_id": "integration-worker-one"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_binding.status(), StatusCode::NOT_FOUND);
+
+    let claimed = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/internal/execution-leases/claim")
+                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+    let claimed_body = axum::body::to_bytes(claimed.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let lease: serde_json::Value = serde_json::from_slice(&claimed_body).unwrap();
+    assert_eq!(lease["run_id"], run_id);
+    assert_eq!(lease["phase"], "prepared");
+    let lease_token = lease["lease_token"].as_str().unwrap();
+    let fence = lease["fence"].as_i64().unwrap();
+
+    let heartbeat = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/jobs/internal/execution-leases/{run_id}/heartbeat"
+            ))
+            .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "account_id": account_id,
+                    "application_id": application_id,
+                    "lease_token": lease_token,
+                    "fence": fence
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(heartbeat.status(), StatusCode::OK);
+
+    let running = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/jobs/internal/applications/{application_id}/state"
+            ))
+            .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "account_id": account_id,
+                    "state": "running"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(running.status(), StatusCode::OK);
+
+    let premature_failure = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/jobs/internal/applications/{application_id}/state"
+            ))
+            .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "account_id": account_id,
+                    "state": "failed"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(premature_failure.status(), StatusCode::CONFLICT);
+
+    let irreversible_body = json!({
+        "account_id": account_id,
+        "application_id": application_id,
+        "lease_token": lease_token,
+        "fence": fence,
+        "action": "submit"
+    });
+    let irreversible = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/jobs/internal/execution-leases/{run_id}/irreversible"
+            ))
+            .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&irreversible_body).unwrap()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(irreversible.status(), StatusCode::OK);
+    let irreversible_bytes = axum::body::to_bytes(irreversible.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let irreversible_value: serde_json::Value =
+        serde_json::from_slice(&irreversible_bytes).unwrap();
+    assert_eq!(irreversible_value["phase"], "click_started");
+
+    let replay = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/jobs/internal/execution-leases/{run_id}/irreversible"
+            ))
+            .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&irreversible_body).unwrap()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+
+    let reconciled_failure = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/jobs/internal/applications/{application_id}/state"
+            ))
+            .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "account_id": account_id,
+                    "state": "failed"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reconciled_failure.status(), StatusCode::OK);
+    let reconciled_bytes = axum::body::to_bytes(reconciled_failure.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let reconciled_value: serde_json::Value = serde_json::from_slice(&reconciled_bytes).unwrap();
+    assert_eq!(reconciled_value["state"], "side_effect_unknown");
+
+    let failed_finish = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/jobs/internal/execution-leases/{run_id}/finish"
+            ))
+            .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "account_id": account_id,
+                    "application_id": application_id,
+                    "lease_token": lease_token,
+                    "fence": fence,
+                    "outcome": "failed"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed_finish.status(), StatusCode::CONFLICT);
+
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_execution_leases SET lease_expires_at_ms = ?2 WHERE run_id = ?1",
+            rusqlite::params![run_id, chrono::Utc::now().timestamp_millis() - 1],
+        )
+        .unwrap();
+    let finish_body = json!({
+        "account_id": account_id,
+        "application_id": application_id,
+        "lease_token": lease_token,
+        "fence": fence,
+        "outcome": "submitted"
+    });
+    for _ in 0..2 {
+        let finished = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/jobs/internal/execution-leases/{run_id}/finish"
+                ))
+                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&finish_body).unwrap()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(finished.status(), StatusCode::NO_CONTENT);
+    }
+    std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_cloud_receipt_requires_an_exact_terminal_submitted_lease_binding() {
+    const WORKER_TOKEN: &str = "jobs-receipt-lease-test-token";
+    std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
+    let harness = boot_harness().await;
+    let (account_id, application_id, run_id, browser_profile_id) =
+        setup_execution_lease_run(&harness);
+    jobs::reserve_application_attempt(&harness.pool, &account_id, &application_id, "cloud")
+        .unwrap();
+    jobs::update_application(&harness.pool, &account_id, &application_id, "running", None)
+        .unwrap()
+        .unwrap();
+    let body = cloud_receipt_request(&harness, &account_id, &application_id, &run_id);
+
+    let missing = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+    assert_eq!(missing.status(), StatusCode::CONFLICT);
+
+    jobs::claim_execution_lease(
+        &harness.pool,
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+        "nonterminal-receipt-worker",
+    )
+    .unwrap();
+    let nonterminal = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+    assert_eq!(nonterminal.status(), StatusCode::CONFLICT);
+
+    let mut mismatched = body;
+    mismatched["receipt"]["runId"] = json!("forged-cloud-run");
+    let mismatched_response =
+        post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &mismatched).await;
+    assert_eq!(mismatched_response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
+            .unwrap()
+            .is_empty()
+    );
+    std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_cloud_receipt_is_atomic_and_exactly_idempotent() {
+    const WORKER_TOKEN: &str = "jobs-receipt-idempotency-token";
+    std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
+    let (account_id, application_id, run_id, browser_profile_id) =
+        setup_execution_lease_run(&harness);
+    prepare_cloud_submission(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+    );
+    let body = cloud_receipt_request(&harness, &account_id, &application_id, &run_id);
+    let resume_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/resume-[0-9a-f]{20}$";
+    let screenshot_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/screenshot-[0-9a-f]{20}$";
+    Mock::given(method("PUT"))
+        .and(path_regex(resume_path))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(resume_path))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(valid_receipt_pdf(), "application/pdf"),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(screenshot_path))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(screenshot_path))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(valid_receipt_png(), "image/png"))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "DELETE FROM jobs_browser_sessions WHERE id = ?1",
+            rusqlite::params![run_id],
+        )
+        .unwrap();
+    jobs::upsert_browser_session(
+        &harness.pool,
+        &account_id,
+        &BrowserSession {
+            id: "stale-cloud-session".to_string(),
+            runner: "cloud".to_string(),
+            status: "running".to_string(),
+            current_company: "Acme".to_string(),
+            current_step: "Old run".to_string(),
+            application_id: Some(application_id.clone()),
+            takeover_url: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .unwrap();
+    let missing_session = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+    assert_eq!(missing_session.status(), StatusCode::CONFLICT);
+    assert!(object_store.received_requests().await.unwrap().is_empty());
+    jobs::upsert_browser_session(
+        &harness.pool,
+        &account_id,
+        &BrowserSession {
+            id: run_id.clone(),
+            runner: "cloud".to_string(),
+            status: "running".to_string(),
+            current_company: "Acme".to_string(),
+            current_step: "Submitting application".to_string(),
+            application_id: Some(application_id.clone()),
+            takeover_url: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .unwrap();
+
+    let first = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let replay = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let mut changed = body.clone();
+    changed["receipt"]["result"]["confirmationText"] = json!("Different receipt content");
+    let conflicting = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &changed).await;
+    assert_eq!(conflicting.status(), StatusCode::CONFLICT);
+
+    let application = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(application.state, "submitted");
+    assert!(application
+        .receipt
+        .get("_bluey_server_submission_fingerprint_v1")
+        .and_then(serde_json::Value::as_str)
+        .is_some());
+    assert_eq!(
+        jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
+            .unwrap()
+            .len(),
+        2
+    );
+    let reservation = jobs::list_attempt_reservations(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|reservation| reservation.application_id == application_id)
+        .unwrap();
+    assert_eq!(reservation.status, "submitted");
+    let session = jobs::list_browser_sessions(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|session| session.id == run_id)
+        .unwrap();
+    assert_eq!(session.status, "complete");
+    std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_receipt_deletes_request_owned_uploads_after_partial_failure() {
+    const WORKER_TOKEN: &str = "jobs-receipt-cleanup-token";
+    std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
+    let (account_id, application_id, run_id, browser_profile_id) =
+        setup_execution_lease_run(&harness);
+    prepare_cloud_submission(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+    );
+    let body = cloud_receipt_request(&harness, &account_id, &application_id, &run_id);
+    let resume_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/resume-[0-9a-f]{20}$";
+    let screenshot_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/screenshot-[0-9a-f]{20}$";
+    Mock::given(method("PUT"))
+        .and(path_regex(resume_path))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(resume_path))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(valid_receipt_pdf(), "application/pdf"),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(screenshot_path))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path_regex(resume_path))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    let response = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
+            .unwrap()
+            .is_empty()
+    );
+    let application = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(application.state, "running");
+    assert!(application
+        .receipt
+        .get("_bluey_server_submission_fingerprint_v1")
+        .is_none());
+    let reservation = jobs::list_attempt_reservations(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|reservation| reservation.application_id == application_id)
+        .unwrap();
+    assert_ne!(reservation.status, "submitted");
+    std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+}
+
+async fn resolve_intervention_request(
+    harness: &Harness,
+    access_token: &str,
+    intervention_id: &str,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    harness
+        .router
+        .clone()
+        .oneshot(
+            Request::patch(format!("/api/jobs/interventions/{intervention_id}"))
+                .header("authorization", format!("Bearer {access_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_submission_approval_accepts_only_the_stored_provider_final_review() {
+    const JWT_SECRET: &str = "test-secret-at-least-32-chars-long-xxx";
+    const WORKFLOW_TOKEN: &str = "jobs-workflow-test-token";
+    let harness = boot_harness().await;
+    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness);
+    jobs::update_application(&harness.pool, &account_id, &application_id, "running", None).unwrap();
+    jobs::update_application(
+        &harness.pool,
+        &account_id,
+        &application_id,
+        "needs_input",
+        None,
+    )
+    .unwrap();
+    let access_token =
+        auth::jwt::issue(JWT_SECRET, &account_id, auth::jwt::TokenKind::Access).unwrap();
+
+    let generic = jobs::save_intervention(
+        &harness.pool,
+        &account_id,
+        &Intervention {
+            id: String::new(),
+            application_id: Some(application_id.clone()),
+            kind: "browser_takeover".to_string(),
+            status: "open".to_string(),
+            title: "Finish this application".to_string(),
+            detail: "Review the preserved browser.".to_string(),
+            choices: Vec::new(),
+            resolution_kind: "browser_takeover".to_string(),
+            resume_after_resolution: true,
+            provider: String::new(),
+            provider_message_id: String::new(),
+            expires_at_ms: None,
+            metadata: json!({
+                "_bluey_worker_receipt_v1": true,
+                "receipt": {
+                    "status": "needs_input",
+                    "issues": [],
+                    "intervention": {
+                        "kind": "browser_takeover",
+                        "title": "Finish this application",
+                        "detail": "Review the preserved browser.",
+                        "takeoverUrl": "https://takeover.example/session",
+                        "resolution": { "kind": "browser_takeover", "resumeAfter": true }
+                    }
+                }
+            }),
+            created_at_ms: 0,
+            resolved_at_ms: None,
+        },
+    )
+    .unwrap();
+    let rejected = resolve_intervention_request(
+        &harness,
+        &access_token,
+        &generic.id,
+        json!({ "status": "resolved", "action": "approve_submission" }),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let title = "Review the Greenhouse application";
+    let detail = "Review every employer-facing field and document in the preserved form, then approve submission.";
+    let final_review = jobs::save_intervention(
+        &harness.pool,
+        &account_id,
+        &Intervention {
+            id: String::new(),
+            application_id: Some(application_id.clone()),
+            kind: "browser_takeover".to_string(),
+            status: "open".to_string(),
+            title: title.to_string(),
+            detail: detail.to_string(),
+            choices: Vec::new(),
+            resolution_kind: "browser_takeover".to_string(),
+            resume_after_resolution: true,
+            provider: String::new(),
+            provider_message_id: String::new(),
+            expires_at_ms: None,
+            metadata: json!({
+                "_bluey_worker_receipt_v1": true,
+                "receipt": {
+                    "status": "needs_input",
+                    "issues": [],
+                    "intervention": {
+                        "kind": "browser_takeover",
+                        "title": title,
+                        "detail": detail,
+                        "takeoverUrl": "https://takeover.example/session",
+                        "resolution": { "kind": "browser_takeover", "resumeAfter": true }
+                    }
+                }
+            }),
+            created_at_ms: 0,
+            resolved_at_ms: None,
+        },
+    )
+    .unwrap();
+    let answer_rejected = resolve_intervention_request(
+        &harness,
+        &access_token,
+        &final_review.id,
+        json!({
+            "status": "resolved",
+            "action": "approve_submission",
+            "answer": "ignore the stored final review"
+        }),
+    )
+    .await;
+    assert_eq!(answer_rejected.status(), StatusCode::BAD_REQUEST);
+
+    std::env::set_var("BLUEY_JOBS_WORKFLOW_ORIGIN", harness.openai.uri());
+    std::env::set_var("BLUEY_JOBS_WORKFLOW_TOKEN", WORKFLOW_TOKEN);
+    let resume_path = format!("/workflows/applications/{account_id}/{run_id}/resume");
+    Mock::given(method("POST"))
+        .and(path(resume_path.as_str()))
+        .and(header(
+            "authorization",
+            format!("Bearer {WORKFLOW_TOKEN}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "resumed": true })))
+        .expect(1)
+        .mount(&harness.openai)
+        .await;
+
+    let approved = resolve_intervention_request(
+        &harness,
+        &access_token,
+        &final_review.id,
+        json!({ "status": "resolved", "action": "approve_submission" }),
+    )
+    .await;
+    let approved_status = approved.status();
+    let approved_bytes = axum::body::to_bytes(approved.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let approved_value: serde_json::Value = serde_json::from_slice(&approved_bytes).unwrap();
+    let requests = harness.openai.received_requests().await.unwrap();
+    let resume_request = requests
+        .iter()
+        .find(|request| request.url.path() == resume_path)
+        .unwrap();
+    let resume_body: serde_json::Value = serde_json::from_slice(&resume_request.body).unwrap();
+    std::env::remove_var("BLUEY_JOBS_WORKFLOW_ORIGIN");
+    std::env::remove_var("BLUEY_JOBS_WORKFLOW_TOKEN");
+
+    assert_eq!(approved_status, StatusCode::OK);
+    assert_eq!(approved_value["intervention"]["status"], "approved");
+    assert_eq!(approved_value["application"]["state"], "queued");
+    assert_eq!(resume_body["action"], "approve_submission");
+    assert_eq!(resume_body["field"], "");
+    assert_eq!(resume_body["answer"], "");
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
+    use sha2::{Digest, Sha256};
+
+    const JWT_SECRET: &str = "test-secret-at-least-32-chars-long-xxx";
+    let harness = boot_harness().await;
+    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness);
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "DELETE FROM jobs_browser_sessions WHERE id = ?1",
+            rusqlite::params![run_id],
+        )
+        .unwrap();
+    jobs::upsert_browser_session(
+        &harness.pool,
+        &account_id,
+        &BrowserSession {
+            id: run_id.clone(),
+            runner: "local".to_string(),
+            status: "queued".to_string(),
+            current_company: "Acme".to_string(),
+            current_step: "Waiting for Bluey Browser".to_string(),
+            application_id: Some(application_id.clone()),
+            takeover_url: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .unwrap();
+    let ticket = "b".repeat(64);
+    let ticket_hash = hex::encode(Sha256::digest(ticket.as_bytes()));
+    jobs::save_local_run_ticket(
+        &harness.pool,
+        &account_id,
+        &application_id,
+        &run_id,
+        &ticket_hash,
+        &ticket,
+        json!({
+            "runId": run_id,
+            "accountId": account_id,
+            "applicationId": application_id
+        }),
+        chrono::Utc::now().timestamp_millis() + 60_000,
+    )
+    .unwrap();
+
+    let claimed = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/claim"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+
+    let title = "Review the Greenhouse application";
+    let detail = "Review every employer-facing field and document in the preserved form, then approve submission.";
+    let final_review_receipt = json!({
+        "status": "needs_input",
+        "issues": [],
+        "intervention": {
+            "kind": "browser_takeover",
+            "title": title,
+            "detail": detail,
+            "takeoverUrl": format!("bluey-jobs://resume/{run_id}?ticket={ticket}"),
+            "resolution": { "kind": "browser_takeover", "resumeAfter": true }
+        }
+    });
+    let paused = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "ticket": ticket,
+                        "receipt": final_review_receipt
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(paused.status(), StatusCode::OK);
+    let intervention = jobs::list_interventions(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.title == title && item.status == "open")
+        .unwrap();
+
+    let unapproved_resume = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unapproved_resume.status(), StatusCode::CONFLICT);
+
+    let unapproved_submit = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "ticket": ticket,
+                        "receipt": { "status": "submitted", "issues": [] }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unapproved_submit.status(), StatusCode::CONFLICT);
+
+    let access_token =
+        auth::jwt::issue(JWT_SECRET, &account_id, auth::jwt::TokenKind::Access).unwrap();
+    let approved = resolve_intervention_request(
+        &harness,
+        &access_token,
+        &intervention.id,
+        json!({ "status": "resolved", "action": "approve_submission" }),
+    )
+    .await;
+    assert_eq!(approved.status(), StatusCode::OK);
+    let approved_bytes = axum::body::to_bytes(approved.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let approved_value: serde_json::Value = serde_json::from_slice(&approved_bytes).unwrap();
+    assert_eq!(
+        approved_value["local_resume"]["action"],
+        "approve_submission"
+    );
+
+    let consumed = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(consumed.status(), StatusCode::OK);
+    let consumed_bytes = axum::body::to_bytes(consumed.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let consumed_value: serde_json::Value = serde_json::from_slice(&consumed_bytes).unwrap();
+    assert_eq!(consumed_value["action"], "approve_submission");
+    assert_eq!(consumed_value["intervention_id"], intervention.id);
+    let consumed_at_ms: i64 = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT consumed_at_ms FROM jobs_local_run_resume_actions WHERE run_id = ?1",
+            rusqlite::params![run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let replayed = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed.status(), StatusCode::OK);
+    let replayed_at_ms: i64 = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT consumed_at_ms FROM jobs_local_run_resume_actions WHERE run_id = ?1",
+            rusqlite::params![run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(replayed_at_ms, consumed_at_ms);
+    let consumption_events: i64 = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_run_events
+              WHERE run_id = ?1 AND event_type = 'local_resume_approval_consumed'",
+            rusqlite::params![run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(consumption_events, 1);
+    assert!(jobs::local_submission_approval_consumed(
+        &harness.pool,
+        &account_id,
+        &application_id,
+        &run_id,
+    )
+    .unwrap());
+
+    let future_expiry = chrono::Utc::now().timestamp_millis() + 60_000;
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_local_run_resume_actions SET expires_at_ms = ?2 WHERE run_id = ?1",
+            rusqlite::params![run_id, chrono::Utc::now().timestamp_millis() - 1],
+        )
+        .unwrap();
+    let expired = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::CONFLICT);
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_local_run_resume_actions SET expires_at_ms = ?2 WHERE run_id = ?1",
+            rusqlite::params![run_id, future_expiry],
+        )
+        .unwrap();
+
+    let terminal = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "ticket": ticket,
+                        "receipt": { "status": "failed" }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(terminal.status(), StatusCode::OK);
+    let after_terminal = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_terminal.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation() {
+    use sha2::{Digest, Sha256};
+
+    let harness = boot_harness().await;
+    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness);
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "DELETE FROM jobs_browser_sessions WHERE id = ?1",
+            rusqlite::params![run_id],
+        )
+        .unwrap();
+    jobs::upsert_browser_session(
+        &harness.pool,
+        &account_id,
+        &BrowserSession {
+            id: run_id.clone(),
+            runner: "local".to_string(),
+            status: "queued".to_string(),
+            current_company: "Acme".to_string(),
+            current_step: "Waiting for Bluey Browser".to_string(),
+            application_id: Some(application_id.clone()),
+            takeover_url: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .unwrap();
+    jobs::reserve_application_attempt(&harness.pool, &account_id, &application_id, "local")
+        .unwrap();
+    let ticket = "c".repeat(64);
+    let ticket_hash = hex::encode(Sha256::digest(ticket.as_bytes()));
+    jobs::save_local_run_ticket(
+        &harness.pool,
+        &account_id,
+        &application_id,
+        &run_id,
+        &ticket_hash,
+        &ticket,
+        json!({
+            "runId": run_id,
+            "accountId": account_id,
+            "applicationId": application_id
+        }),
+        chrono::Utc::now().timestamp_millis() + 60_000,
+    )
+    .unwrap();
+    let claimed = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/claim"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+
+    let uncertain_body = json!({
+        "ticket": ticket,
+        "receipt": {
+            "status": "side_effect_unknown",
+            "issues": [{ "field": "submission", "message": "Outcome unknown" }],
+            "intervention": {
+                "kind": "browser_takeover",
+                "title": "Reconcile this submission",
+                "detail": "Check the employer portal before taking another action.",
+                "takeoverUrl": format!("bluey-jobs://resume/{run_id}?ticket={ticket}"),
+                "resolution": { "kind": "browser_takeover", "resumeAfter": false }
+            },
+            "screenshotPath": "/private/local/path.png"
+        },
+        "receiptBundle": {
+            "receiptId": "must-not-be-finalized",
+            "result": { "status": "submitted" }
+        },
+        "evidenceObjects": []
+    });
+    let uncertain = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&uncertain_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uncertain.status(), StatusCode::OK);
+    let uncertain_bytes = axum::body::to_bytes(uncertain.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let uncertain_application: serde_json::Value =
+        serde_json::from_slice(&uncertain_bytes).unwrap();
+    assert_eq!(uncertain_application["state"], "side_effect_unknown");
+    assert_eq!(
+        uncertain_application["receipt"]["local_reconciliation"]["receipt"]["intervention"]
+            ["title"],
+        "Reconcile this submission"
+    );
+    assert!(
+        uncertain_application["receipt"]["local_reconciliation"]["receipt"]
+            .get("screenshotPath")
+            .is_none()
+    );
+    assert_ne!(
+        uncertain_application["receipt"]["receiptId"],
+        "must-not-be-finalized"
+    );
+    assert!(
+        jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
+            .unwrap()
+            .is_empty()
+    );
+    let reservation = jobs::list_attempt_reservations(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|reservation| reservation.application_id == application_id)
+        .unwrap();
+    assert_eq!(reservation.status, "side_effect_unknown");
+    let session = jobs::list_browser_sessions(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|session| session.id == run_id)
+        .unwrap();
+    assert_eq!(session.status, "needs_input");
+    assert_eq!(
+        session.current_step,
+        "Submission outcome needs reconciliation"
+    );
+    let ticket_after = jobs::get_local_run_ticket_by_hash(&harness.pool, &run_id, &ticket_hash)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ticket_after.status, "side_effect_unknown");
+
+    let replay = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&uncertain_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let downgrade = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "ticket": ticket,
+                        "receipt": { "status": "failed" }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(downgrade.status(), StatusCode::CONFLICT);
+    let resume_replay = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resume_replay.status(), StatusCode::CONFLICT);
+    let stored = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, "side_effect_unknown");
 }
 
 async fn boot_harness() -> Harness {
@@ -1484,6 +3221,7 @@ async fn router_complete_reports_upstream_error_after_capacity_skip() {
 async fn router_complete_enforces_account_burst_before_second_upstream_hit() {
     std::env::set_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN", "60");
     std::env::set_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN_BURST", "1");
+    std::env::set_var("BLUEY_CAPACITY_SHORT_WAIT_MAX_SECS", "0");
     let h = boot_harness().await;
     std::env::remove_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN");
     std::env::remove_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN_BURST");
@@ -1525,6 +3263,7 @@ async fn router_complete_enforces_account_burst_before_second_upstream_hit() {
             assert!(v["retry_after_secs"].as_u64().unwrap_or(0) >= 1);
         }
     }
+    std::env::remove_var("BLUEY_CAPACITY_SHORT_WAIT_MAX_SECS");
 }
 
 #[tokio::test]
@@ -1751,10 +3490,11 @@ async fn account_delete_requires_typed_delete_and_credit_loss_consent() {
 async fn sync_batch_session_bundle_and_rag_roundtrip() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "sync@example.com", "longenoughpw").await;
+    let session_id = "550e8400-e29b-41d4-a716-446655440001";
 
     let batch = json!({
         "sessions": [{
-            "session_id": "sess-cloud-1",
+            "session_id": session_id,
             "title": "Cloud sync test",
             "status": "active",
             "created_at_ms": 1000,
@@ -1765,7 +3505,7 @@ async fn sync_batch_session_bundle_and_rag_roundtrip() {
         }],
         "transcript_segments": [{
             "segment_id": "seg-cloud-1",
-            "session_id": "sess-cloud-1",
+            "session_id": session_id,
             "speaker": "system",
             "source": "system",
             "text": "We discussed queue backpressure and cache stampede controls.",
@@ -1774,7 +3514,7 @@ async fn sync_batch_session_bundle_and_rag_roundtrip() {
         }],
         "cue_responses": [{
             "response_id": "resp-cloud-1",
-            "session_id": "sess-cloud-1",
+            "session_id": session_id,
             "kind": "answer",
             "text": "Use bounded queues, retries, and admission control.",
             "ts_ms": 1600,
@@ -1784,7 +3524,7 @@ async fn sync_batch_session_bundle_and_rag_roundtrip() {
         }],
         "context_artifacts": [{
             "artifact_id": "ctx-cloud-1",
-            "session_id": "sess-cloud-1",
+            "session_id": session_id,
             "kind": "document",
             "title": "Architecture brief",
             "text_preview": "The architecture uses bounded queues.",
@@ -1792,7 +3532,7 @@ async fn sync_batch_session_bundle_and_rag_roundtrip() {
         }],
         "rag_chunks": [{
             "chunk_id": "chunk-cloud-1",
-            "session_id": "sess-cloud-1",
+            "session_id": session_id,
             "source_kind": "transcript",
             "source_id": "seg-cloud-1",
             "chunk_index": 0,
@@ -1807,7 +3547,16 @@ async fn sync_batch_session_bundle_and_rag_roundtrip() {
         .body(Body::from(serde_json::to_vec(&batch).unwrap()))
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 200);
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        200,
+        "sync batch rejected: {}",
+        String::from_utf8_lossy(&body)
+    );
 
     let req = Request::get("/sync/sessions")
         .header("authorization", format!("Bearer {access}"))
@@ -1819,9 +3568,9 @@ async fn sync_batch_session_bundle_and_rag_roundtrip() {
         .await
         .unwrap();
     let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(listed["sessions"][0]["session_id"], "sess-cloud-1");
+    assert_eq!(listed["sessions"][0]["session_id"], session_id);
 
-    let req = Request::get("/sync/sessions/sess-cloud-1")
+    let req = Request::get(format!("/sync/sessions/{session_id}"))
         .header("authorization", format!("Bearer {access}"))
         .body(Body::empty())
         .unwrap();

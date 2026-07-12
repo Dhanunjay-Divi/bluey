@@ -1,0 +1,57 @@
+{
+  "name": "legacy hosted form",
+  "postingUrl": "https://jobs.lever.co/harbor/33333333-3333-4333-8333-333333333333",
+  "applicationUrl": "https://jobs.lever.co/harbor/33333333-3333-4333-8333-333333333333/apply",
+  "title": "Harbor - Site Reliability Engineer",
+  "startAtPosting": true,
+  "applySelector": ".last-section-apply a.postings-btn[href$='/apply']",
+  "submitSelector": "#application-form .last-section-apply button.template-btn-submit[type='submit']",
+  "controls": [
+    {
+      "selector": "[data-bluey-field-id='first-name']",
+      "kind": "text",
+      "label": "First name",
+      "name": "first_name",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='last-name']",
+      "kind": "text",
+      "label": "Last name",
+      "name": "last_name",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='email']",
+      "kind": "email",
+      "label": "Email address",
+      "name": "email",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='resume']",
+      "kind": "file",
+      "label": "Attach CV",
+      "name": "resume",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    }
+  ],
+  "answers": {
+    "first_name": "Ada",
+    "last_name": "Lovelace"
+  },
+  "expectedValues": {
+    "[data-bluey-field-id='first-name']": "Ada",
+    "[data-bluey-field-id='last-name']": "Lovelace",
+    "[data-bluey-field-id='email']": "ada@example.com",
+    "[data-bluey-field-id='resume']": "resume.pdf"
+  }
+}

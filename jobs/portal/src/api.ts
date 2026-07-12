@@ -1,5 +1,6 @@
 import type {
   AccountSummary,
+  ApproveApplicationResponse,
   ApplicationEvidence,
   ApplicationIdentity,
   BrowserSession,
@@ -11,6 +12,7 @@ import type {
   InterventionResolutionResult,
   JobApplication,
   JobPosting,
+  UserJobInput,
   JobPreferences,
   JobsIntegration,
   JobsWorkspace,
@@ -32,6 +34,28 @@ export class ApiError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+export interface InterviewPrepCompletionResponse {
+  schema_version: number;
+  id: string;
+  application_id: string;
+  content: string;
+  generated_at_ms: number;
+  provider: string;
+  model: string;
+  cost_cents: number;
+  balance_cents_after: number;
+  trial_seconds_remaining: number;
+  grounding?: {
+    receipt_id: string;
+    receipt_fingerprint: string;
+    resume_version_id: string;
+    resume_checksum: string;
+    resume_document_sha256: string;
+    answer_keys_used: string[];
+    answer_keys_omitted: string[];
+  };
 }
 
 function storageOrder(): Storage[] {
@@ -115,6 +139,11 @@ async function request<T>(path: string, init: RequestInit = {}, retried = false)
 export const jobsApi = {
   workspace: () => request<JobsWorkspace>("/api/jobs/workspace"),
   account: () => request<AccountSummary>("/account/me"),
+  prepareInterview: (applicationId: string) =>
+    request<InterviewPrepCompletionResponse>(`/api/jobs/applications/${encodeURIComponent(applicationId)}/interview-prep`, {
+      method: "POST",
+      body: "{}",
+    }),
   saveProfile: (profile: CareerProfile) =>
     request<CareerProfile>("/api/jobs/profile", { method: "PUT", body: JSON.stringify(profile) }),
   savePreferences: (preferences: JobPreferences) =>
@@ -122,8 +151,15 @@ export const jobsApi = {
       method: "PUT",
       body: JSON.stringify(preferences),
     }),
-  saveFact: (fact: CareerFact) =>
-    request<CareerFact>("/api/jobs/facts", { method: "POST", body: JSON.stringify(fact) }),
+  saveFact: (fact: CareerFact) => request<CareerFact>("/api/jobs/facts", {
+    method: "POST",
+    body: JSON.stringify({
+      id: fact.id,
+      category: fact.category,
+      label: fact.label,
+      value: fact.value,
+    }),
+  }),
   deleteFact: (id: string) => request<void>(`/api/jobs/facts/${encodeURIComponent(id)}`, { method: "DELETE" }),
   saveTrack: (track: CareerTrack) =>
     request<CareerTrack>(track.id ? `/api/jobs/tracks/${encodeURIComponent(track.id)}` : "/api/jobs/tracks", {
@@ -132,7 +168,7 @@ export const jobsApi = {
     }),
   deleteTrack: (id: string) =>
     request<void>(`/api/jobs/tracks/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  saveMatch: (job: JobPosting) =>
+  saveMatch: (job: UserJobInput) =>
     request<JobPosting>("/api/jobs/matches", { method: "POST", body: JSON.stringify(job) }),
   prepareApplication: (jobId: string, mode: string, submissionMode: string) =>
     request<PrepareApplicationResponse>("/api/jobs/applications", {
@@ -146,6 +182,10 @@ export const jobsApi = {
     }),
   commitPacket: (id: string) =>
     request<PacketCommitResult>(`/api/jobs/applications/${encodeURIComponent(id)}/commit`, {
+      method: "POST",
+    }),
+  approveApplication: (id: string) =>
+    request<ApproveApplicationResponse>(`/api/jobs/applications/${encodeURIComponent(id)}/approve`, {
       method: "POST",
     }),
   queueApplicationRun: (id: string, runner: "local" | "cloud" = "cloud") =>

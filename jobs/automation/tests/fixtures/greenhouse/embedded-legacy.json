@@ -1,0 +1,65 @@
+{
+  "tenant": "northstar",
+  "url": "https://careers.northstar.example/openings/platform-engineer?gh_jid=67890",
+  "title": "Job Application for Platform Engineer at Northstar",
+  "body": "Platform Engineer\nPowered by Greenhouse",
+  "confirmationBody": "Your application has been successfully submitted.",
+  "markers": [
+    "form[action*='greenhouse.io']",
+    "#application_form",
+    "#submit_app",
+    "input[name^='job_application[']"
+  ],
+  "controls": [
+    {
+      "selector": "[data-bluey-field-id='legacy-first-name']",
+      "kind": "text",
+      "label": "First Name",
+      "name": "job_application[first_name]",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='legacy-last-name']",
+      "kind": "text",
+      "label": "Last Name",
+      "name": "job_application[last_name]",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='legacy-email']",
+      "kind": "email",
+      "label": "Email",
+      "name": "job_application[email]",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    },
+    {
+      "selector": "[data-bluey-field-id='source']",
+      "kind": "select",
+      "label": "How did you hear about us?",
+      "name": "job_application[answers_attributes][0][answer_selected_options_attributes][0][question_option_id]",
+      "placeholder": "",
+      "required": true,
+      "value": "",
+      "options": [
+        { "label": "Select an option", "value": "" },
+        { "label": "Referral", "value": "referral" },
+        { "label": "Job board", "value": "job_board" }
+      ]
+    },
+    {
+      "selector": "[data-bluey-field-id='legacy-resume']",
+      "kind": "file",
+      "label": "Resume",
+      "name": "job_application[resume]",
+      "placeholder": "",
+      "required": true,
+      "value": ""
+    }
+  ]
+}

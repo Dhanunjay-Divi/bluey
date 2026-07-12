@@ -50,6 +50,7 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
   const [importing, setImporting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [validation, setValidation] = useState("");
+  const [resumeStart, setResumeStart] = useState<"import" | "build">("import");
   const fileRef = useRef<HTMLInputElement>(null);
 
   const progress = ((step + 1) / steps.length) * 100;
@@ -164,11 +165,15 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
                 accept=".pdf,.docx,.txt"
                 onChange={(event) => void handleFile(event.target.files?.[0])}
               />
-              <button className="resume-dropzone" onClick={() => fileRef.current?.click()}>
+              <div className="onboarding-start-choice" role="group" aria-label="Career Profile starting point">
+                <button className={resumeStart === "import" ? "active" : ""} onClick={() => setResumeStart("import")}><FileUp size={18} /><span><b>Import my resume</b><small>Start from PDF, DOCX, or TXT.</small></span></button>
+                <button className={resumeStart === "build" ? "active" : ""} onClick={() => setResumeStart("build")}><UserRound size={18} /><span><b>I do not have a resume</b><small>Build the same Career Profile from your history.</small></span></button>
+              </div>
+              {resumeStart === "import" ? <button className="resume-dropzone" onClick={() => fileRef.current?.click()}>
                 {importing ? <LoaderCircle className="spin" /> : <FileUp />}
-                <strong>{profile.source_resume_name || "Import PDF or DOCX"}</strong>
-                <span>{profile.source_resume_name ? "Resume imported. Choose another file to replace it." : "Drop-in parsing happens in your browser."}</span>
-              </button>
+                <strong>{profile.source_resume_name || "Choose PDF, DOCX, or TXT"}</strong>
+                <span>{profile.source_resume_name ? "Resume imported. Choose another file to replace it." : "Bluey extracts a baseline you can edit before anything is prepared."}</span>
+              </button> : <div className="no-resume-note"><Sparkles size={18} /><span><b>Start with the facts you know</b><small>Add roles, education, and skills in the next steps. Bluey builds the first resume from that profile.</small></span></div>}
               <div className="form-grid two">
                 <Field label="Full name" value={profile.full_name} onChange={(value) => update("full_name", value)} autoFocus />
                 <Field label="Phone" value={profile.phone} onChange={(value) => update("phone", value)} />
@@ -248,6 +253,10 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
           {step === 4 && (
             <>
               <div className="setup-heading"><p>STEP 5 OF 6</p><h2>How should Bluey work?</h2><span>Start carefully. You can loosen review rules per Career Track later.</span></div>
+              <div className="onboarding-kit-preview">
+                <div><p>YOUR FIRST APPLICATION KIT</p><h3>{track.role || profile.headline || "Target role"}</h3><span>A separate resume version, exact final answers, application email, site status, pause checks, and one metering decision.</span></div>
+                <ul><li><Check size={14} />Real before/after resume diff</li><li><Check size={14} />One candidate truth across every Track and email</li><li><Check size={14} />Review before any runner starts</li></ul>
+              </div>
               <div className="choice-section">
                 <label>Resume mode</label>
                 <div className="segmented large">
@@ -258,8 +267,8 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
               <div className="choice-section">
                 <label>Submission default</label>
                 <div className="segmented large">
-                  <button className={profile.default_submission_mode === "review_first" ? "active" : ""} onClick={() => update("default_submission_mode", "review_first")}><b>Review first</b><span>See the exact resume and answers before submission.</span></button>
-                  <button className={profile.default_submission_mode === "auto_submit" ? "active" : ""} onClick={() => update("default_submission_mode", "auto_submit")}><b>Auto-submit</b><span>Only when hard filters pass and match is at least {profile.auto_submit_threshold}%.</span></button>
+                  <button className={profile.default_submission_mode === "review_first" ? "active" : ""} onClick={() => update("default_submission_mode", "review_first")}><b>Review first · Recommended</b><span>Inspect your first five application kits and receipts before enabling automation.</span></button>
+                  <button className={profile.default_submission_mode === "auto_submit" ? "active" : ""} onClick={() => update("default_submission_mode", "auto_submit")}><b>Auto-submit later</b><span>Available per Career Track only when server rules and site certification pass.</span></button>
                 </div>
               </div>
               <div className="setting-line">

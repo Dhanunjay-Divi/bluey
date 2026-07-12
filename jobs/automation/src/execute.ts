@@ -1,5 +1,8 @@
 import { AdapterRegistry } from "./adapters.js";
 import type { AdapterContext, ApplicationAdapter, SubmissionReceipt } from "./contracts.js";
+import { assertRunnablePacket } from "./packet-guards.js";
+import { createGreenhouseAdapter, type GreenhouseAdapterOptions } from "./providers/greenhouse.js";
+import { createLeverAdapter, type LeverAdapterOptions } from "./providers/lever.js";
 import { createStandardAdapters } from "./standard-adapters.js";
 
 export interface ExecutionResult {
@@ -8,9 +11,41 @@ export interface ExecutionResult {
   receipt: SubmissionReceipt;
 }
 
-export function createDefaultAdapterRegistry(fallback?: ApplicationAdapter): AdapterRegistry {
-  const registry = new AdapterRegistry();
+export interface ProviderAdapterRegistryOptions {
+  greenhouse?: GreenhouseAdapterOptions;
+  lever?: LeverAdapterOptions;
+}
+
+class ProviderFirstAdapterRegistry extends AdapterRegistry {
+  constructor(private readonly providerAdapters: readonly ApplicationAdapter[]) {
+    super();
+  }
+
+  override resolve(rawUrl: string): ApplicationAdapter {
+    let url: URL;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return super.resolve(rawUrl);
+    }
+    const provider = this.providerAdapters.find((adapter) => adapter.detect(url));
+    if (provider) return provider;
+    return super.resolve(rawUrl);
+  }
+}
+
+export function createDefaultAdapterRegistry(
+  fallback?: ApplicationAdapter,
+  providerOptions: ProviderAdapterRegistryOptions = {},
+): AdapterRegistry {
+  const providerAdapters = [
+    createGreenhouseAdapter(providerOptions.greenhouse),
+    createLeverAdapter(providerOptions.lever),
+  ] as const;
+  const registry = new ProviderFirstAdapterRegistry(providerAdapters);
+  for (const adapter of providerAdapters) registry.register(adapter);
   for (const adapter of createStandardAdapters()) {
+    if (adapter.kind === "greenhouse" || adapter.kind === "lever") continue;
     if (fallback && adapter.kind === "semantic") continue;
     registry.register(adapter);
   }
@@ -22,6 +57,7 @@ export async function executeApplication(
   context: AdapterContext,
   registry = createDefaultAdapterRegistry(),
 ): Promise<ExecutionResult> {
+  assertRunnablePacket(context.packet);
   const adapter = registry.resolve(context.page.url());
   await context.log("adapter_selected", { kind: adapter.kind, version: adapter.version });
   await adapter.prepare(context);

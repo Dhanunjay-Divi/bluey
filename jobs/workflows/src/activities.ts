@@ -1,4 +1,5 @@
-import type { ApplicationReceiptBundle, ApplicationState, SubmissionReceipt } from "@bluey/jobs-automation";
+import { createHash } from "node:crypto";
+import type { ApplicationReceiptBundle, ApplicationState, EvidenceObjectUpload, SubmissionReceipt } from "@bluey/jobs-automation";
 import type { ApplicationWorkflowInput, InterventionResolution, RunnerExecutionResult } from "./contracts.js";
 
 const apiOrigin = process.env.BLUEY_JOBS_API_ORIGIN || "http://127.0.0.1:8080";
@@ -65,17 +66,34 @@ export async function resumeApplication(input: ApplicationWorkflowInput & {
     {
       method: "POST",
       headers: { Authorization: `Bearer ${runnerToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ ...input.resolution, requestId: input.requestId }),
+      body: JSON.stringify({
+        ...input.resolution,
+        requestId: input.requestId,
+        profileScope: runnerProfileScope(input.accountId, input.applicationIdentityId),
+      }),
     },
   );
   if (!response.ok) throw new Error(`Bluey Jobs runner resume returned ${response.status}`);
   return response.json() as Promise<RunnerExecutionResult>;
 }
 
-export async function persistReceipt(input: ApplicationWorkflowInput & { receiptBundle: ApplicationReceiptBundle }): Promise<void> {
+function runnerProfileScope(accountId: string, applicationIdentityId: string): string {
+  return createHash("sha256")
+    .update(accountId)
+    .update("\0")
+    .update(applicationIdentityId)
+    .digest("hex")
+    .slice(0, 40);
+}
+
+export async function persistReceipt(input: ApplicationWorkflowInput & {
+  receiptBundle: ApplicationReceiptBundle;
+  evidenceObjects: EvidenceObjectUpload[];
+}): Promise<void> {
   await workerRequest(`/api/jobs/internal/applications/${encodeURIComponent(input.applicationId)}/receipt`, {
     account_id: input.accountId,
     receipt: input.receiptBundle,
+    evidence_objects: input.evidenceObjects,
   });
   await event(input, "receipt_persisted", { receipt_id: input.receiptBundle.receiptId });
 }

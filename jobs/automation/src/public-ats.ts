@@ -14,6 +14,8 @@ const SAFE_IDENTIFIER = /^[a-zA-Z0-9_-]+$/;
 export interface FetchResponse {
   ok: boolean;
   status: number;
+  headers?: Pick<Headers, "get">;
+  body?: ReadableStream<Uint8Array> | null;
   text(): Promise<string>;
 }
 
@@ -91,6 +93,25 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
     };
   }
 
+  /**
+   * Returns one provider's complete public snapshot without user filters,
+   * freshness filtering, or page-size truncation. Scheduled discovery uses
+   * this path so an omitted job can be treated as provider evidence instead
+   * of a search-filter side effect.
+   */
+  async snapshot(source: PublicAtsSource): Promise<NormalizedJob[]> {
+    const jobs = await this.searchSource(source, {
+      roles: [],
+      locations: [],
+      remotePreference: "any",
+      excludedCompanies: [],
+      sources: [source],
+    });
+    return deduplicateJobs(jobs)
+      .filter((job) => job.externalId.length > 0)
+      .filter((job) => job.title.length > 0 && job.canonicalUrl.length > 0);
+  }
+
   private async searchSource(source: PublicAtsSource, query: DiscoveryQuery): Promise<NormalizedJob[]> {
     switch (source.kind) {
       case "greenhouse":
@@ -115,9 +136,12 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
     ));
     return asArray(payload.jobs).map((value) => {
       const item = asRecord(value);
+      const externalId = asString(item.id);
       return normalizeJob("greenhouse", {
-        externalId: asString(item.id),
-        canonicalUrl: asString(item.absolute_url),
+        externalId,
+        canonicalUrl: externalId
+          ? `https://boards.greenhouse.io/${encodeURIComponent(source.boardToken)}/jobs/${encodeURIComponent(externalId)}`
+          : "",
         company: source.company ?? humanizeIdentifier(source.boardToken),
         title: asString(item.title || item.name),
         location: asString(asRecord(item.location).name),
@@ -139,9 +163,12 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
     return payload.map((value) => {
       const item = asRecord(value);
       const categories = asRecord(item.categories);
+      const externalId = asString(item.id);
       return normalizeJob("lever", {
-        externalId: asString(item.id),
-        canonicalUrl: asString(item.hostedUrl || item.applyUrl),
+        externalId,
+        canonicalUrl: externalId
+          ? `https://jobs.lever.co/${encodeURIComponent(source.site)}/${encodeURIComponent(externalId)}`
+          : "",
         company: source.company ?? humanizeIdentifier(source.site),
         title: asString(item.text),
         location: asString(categories.location || item.location),
@@ -275,8 +302,7 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
           redirect: "error",
           signal: controller.signal,
         });
-        const body = await response.text();
-        if (body.length > MAX_RESPONSE_BYTES) throw new Error("ATS response exceeded the size limit");
+        const body = await boundedResponseText(response);
         if (!response.ok) {
           if ((response.status === 429 || response.status >= 500) && attempt < this.maxAttempts) {
             await this.sleep(100 * 2 ** (attempt - 1));
@@ -297,6 +323,41 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
       break;
     }
     throw lastError ?? new Error("ATS request failed");
+  }
+}
+
+async function boundedResponseText(response: FetchResponse): Promise<string> {
+  const declaredLength = Number(response.headers?.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
+    throw new Error("ATS response exceeded the size limit");
+  }
+  if (!response.body) {
+    const body = await response.text();
+    if (Buffer.byteLength(body, "utf8") > MAX_RESPONSE_BYTES) {
+      throw new Error("ATS response exceeded the size limit");
+    }
+    return body;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let received = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > MAX_RESPONSE_BYTES) {
+        await reader.cancel("response limit exceeded");
+        throw new Error("ATS response exceeded the size limit");
+      }
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    return chunks.join("");
+  } finally {
+    reader.releaseLock();
   }
 }
 

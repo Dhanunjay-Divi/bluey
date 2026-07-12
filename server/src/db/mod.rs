@@ -1016,6 +1016,147 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_local_run_tickets_account
         ON jobs_local_run_tickets(account_id, updated_at_ms DESC);
     "#,
+    // 0023 - atomic Bluey Jobs application-attempt reservations.
+    //
+    // Packet preparation and metering are intentionally separate from an
+    // employer-facing attempt. A reservation is created transactionally when
+    // an application enters the browser queue.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_attempt_reservations (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        application_id        TEXT NOT NULL REFERENCES jobs_applications(id) ON DELETE CASCADE,
+        company_key           TEXT NOT NULL,
+        period_key            TEXT NOT NULL,
+        runner                TEXT NOT NULL DEFAULT 'unassigned',
+        status                TEXT NOT NULL DEFAULT 'reserved',
+        reserved_at_ms        INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL,
+        UNIQUE(account_id, application_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_attempt_reservations_period
+        ON jobs_attempt_reservations(account_id, period_key, status, reserved_at_ms);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_attempt_reservations_active_company
+        ON jobs_attempt_reservations(account_id, company_key)
+        WHERE status IN ('reserved', 'running', 'side_effect_unknown', 'submitted');
+    "#,
+    // 0024 - durable Bluey Jobs discovery schedules, leases, health, and source membership.
+    //
+    // Discovery workers claim due sources with a short-lived lease. Successful
+    // snapshots are replay-safe and keep enough membership state to close jobs
+    // that disappear from a complete provider feed without trusting browser input.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_discovery_sources (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        track_id              TEXT NOT NULL DEFAULT '',
+        provider              TEXT NOT NULL,
+        source_key            TEXT NOT NULL,
+        source_json           TEXT NOT NULL,
+        status                TEXT NOT NULL DEFAULT 'active',
+        health                TEXT NOT NULL DEFAULT 'waiting',
+        consecutive_failures  INTEGER NOT NULL DEFAULT 0,
+        run_interval_ms       INTEGER NOT NULL DEFAULT 900000,
+        next_run_at_ms        INTEGER NOT NULL,
+        last_success_at_ms    INTEGER,
+        last_failure_at_ms    INTEGER,
+        last_error_code       TEXT,
+        lease_owner           TEXT,
+        lease_token           TEXT,
+        lease_expires_at_ms   INTEGER,
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL,
+        UNIQUE(account_id, provider, source_key, track_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_discovery_sources_due
+        ON jobs_discovery_sources(status, health, next_run_at_ms, lease_expires_at_ms);
+
+    CREATE TABLE IF NOT EXISTS jobs_discovery_runs (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        source_id             TEXT NOT NULL REFERENCES jobs_discovery_sources(id) ON DELETE CASCADE,
+        replay_key            TEXT NOT NULL,
+        status                TEXT NOT NULL DEFAULT 'running',
+        discovered_count      INTEGER NOT NULL DEFAULT 0,
+        upserted_count        INTEGER NOT NULL DEFAULT 0,
+        closed_count          INTEGER NOT NULL DEFAULT 0,
+        error_code            TEXT,
+        snapshot_hash         TEXT,
+        started_at_ms         INTEGER NOT NULL,
+        completed_at_ms       INTEGER,
+        UNIQUE(source_id, replay_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_discovery_runs_source
+        ON jobs_discovery_runs(source_id, started_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS jobs_discovery_memberships (
+        source_id             TEXT NOT NULL REFERENCES jobs_discovery_sources(id) ON DELETE CASCADE,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        external_id           TEXT NOT NULL,
+        canonical_key         TEXT NOT NULL,
+        job_id                TEXT NOT NULL REFERENCES jobs_postings(id) ON DELETE CASCADE,
+        content_hash          TEXT NOT NULL,
+        first_seen_at_ms      INTEGER NOT NULL,
+        last_seen_at_ms       INTEGER NOT NULL,
+        last_seen_run_id      TEXT NOT NULL,
+        availability_status   TEXT NOT NULL DEFAULT 'active',
+        missing_count         INTEGER NOT NULL DEFAULT 0,
+        missing_since_at_ms   INTEGER,
+        PRIMARY KEY(source_id, external_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_discovery_memberships_job
+        ON jobs_discovery_memberships(account_id, job_id);
+    "#,
+    // 0025 - durable, fenced execution leases for cloud browser runs.
+    //
+    // Only prepared leases may expire or rotate. The partial unique indexes
+    // make browser-profile and application ownership authoritative in the DB
+    // across runner replicas; click_started remains active until reconciled.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_execution_leases (
+        run_id                TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        application_id        TEXT NOT NULL REFERENCES jobs_applications(id) ON DELETE CASCADE,
+        browser_profile_id    TEXT NOT NULL,
+        owner_id              TEXT NOT NULL,
+        lease_token_sha256    TEXT NOT NULL,
+        fence                 INTEGER NOT NULL CHECK(fence > 0),
+        phase                 TEXT NOT NULL CHECK(phase IN (
+            'prepared', 'click_started', 'submitted', 'failed',
+            'side_effect_unknown', 'released'
+        )),
+        lease_expires_at_ms   INTEGER NOT NULL,
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL,
+        finished_at_ms        INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_execution_leases_binding
+        ON jobs_execution_leases(account_id, application_id, run_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_execution_leases_active_application
+        ON jobs_execution_leases(application_id)
+        WHERE phase IN ('prepared', 'click_started');
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_execution_leases_active_profile
+        ON jobs_execution_leases(browser_profile_id)
+        WHERE phase IN ('prepared', 'click_started');
+
+    CREATE TABLE IF NOT EXISTS jobs_local_run_resume_actions (
+        id                    TEXT PRIMARY KEY,
+        run_id                TEXT NOT NULL REFERENCES jobs_local_run_tickets(id) ON DELETE CASCADE,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        application_id        TEXT NOT NULL REFERENCES jobs_applications(id) ON DELETE CASCADE,
+        intervention_id       TEXT NOT NULL UNIQUE REFERENCES jobs_interventions(id) ON DELETE CASCADE,
+        action                TEXT NOT NULL CHECK(action = 'approve_submission'),
+        status                TEXT NOT NULL CHECK(status IN ('approved', 'consumed')),
+        expires_at_ms         INTEGER NOT NULL,
+        created_at_ms         INTEGER NOT NULL,
+        consumed_at_ms        INTEGER
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_local_resume_actions_active_run
+        ON jobs_local_run_resume_actions(run_id)
+        WHERE status = 'approved';
+    CREATE INDEX IF NOT EXISTS idx_jobs_local_resume_actions_application
+        ON jobs_local_run_resume_actions(account_id, application_id, created_at_ms DESC);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {

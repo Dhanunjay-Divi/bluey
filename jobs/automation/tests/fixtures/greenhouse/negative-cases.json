@@ -1,0 +1,60 @@
+{
+  "ambiguousApply": { "count": 2 },
+  "ambiguousSubmit": { "count": 2 },
+  "unknownRequired": {
+    "selector": "[data-bluey-field-id='unknown-required']",
+    "kind": "textarea",
+    "label": "Describe a fact not present in your packet",
+    "name": "job_application[answers][unknown]",
+    "placeholder": "",
+    "required": true,
+    "value": ""
+  },
+  "guardedRequired": [
+    {
+      "selector": "[data-bluey-field-id='demographic']",
+      "kind": "select",
+      "label": "Gender identity",
+      "name": "job_application[demographic]",
+      "placeholder": "",
+      "required": true,
+      "value": "",
+      "options": [
+        { "label": "Select", "value": "" },
+        { "label": "Prefer not to say", "value": "decline" }
+      ]
+    },
+    {
+      "selector": "[data-bluey-field-id='sponsorship']",
+      "kind": "radio",
+      "label": "Will you require visa sponsorship? Yes",
+      "name": "job_application[sponsorship]",
+      "placeholder": "",
+      "required": true,
+      "value": "yes",
+      "checked": false
+    },
+    {
+      "selector": "[data-bluey-field-id='sponsorship-no']",
+      "kind": "radio",
+      "label": "Will you require visa sponsorship? No",
+      "name": "job_application[sponsorship]",
+      "placeholder": "",
+      "required": true,
+      "value": "no",
+      "checked": false
+    }
+  ],
+  "challenges": [
+    { "kind": "captcha", "body": "Verify you are human. Complete the CAPTCHA to continue." },
+    { "kind": "two_factor", "body": "Enter the one-time verification code to continue." },
+    { "kind": "assessment", "body": "Complete the required skills test to continue." }
+  ],
+  "wrongHost": "https://boards.greenhouse.io.evil.example/acme/jobs/12345",
+  "unclearConfirmation": {
+    "body": "Your response is being processed.",
+    "url": "https://job-boards.greenhouse.io/acme/jobs/12345/confirmation"
+  },
+  "closedBody": "This position is no longer available and is no longer accepting applications.",
+  "unsupportedUrl": "https://boards.greenhouse.io/acme/departments/engineering"
+}

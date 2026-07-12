@@ -38,8 +38,9 @@ npm run build --workspace @bluey/jobs-browser
 npm run start --workspace @bluey/jobs-browser
 ```
 
-The cloud path runs three processes: the Jobs API, Temporal worker/gateway, and
-browser runner. Required configuration is documented in `OPERATIONS.md`.
+The cloud path runs the Jobs API, Temporal application worker, workflow
+gateway, scheduled discovery worker, and browser runner as separate processes.
+Required configuration is documented in `OPERATIONS.md`.
 Unknown required fields and verification challenges preserve the browser and
 pause the workflow for up to 24 hours; resolving the Intervention Inbox resumes
 the same application.
@@ -67,8 +68,10 @@ internal pricing and margin model.
 - Overage balance deduction and its audit entry are atomic.
 - LinkedIn and Indeed are handoff-only in background policy.
 - Local and cloud runners consume the same adapter contract.
-- Public Workday, Greenhouse, Lever, Ashby, and SmartRecruiters sources share
-  host-pinned, retry-bounded discovery and canonical deduplication.
+- Public Workday, Greenhouse, Lever, Ashby, and SmartRecruiters connectors share
+  host-pinned, retry-bounded normalization. The scheduled, server-leased beta
+  worker is enabled only for Greenhouse and Lever sources until the remaining
+  source contracts receive equivalent snapshot and closure certification.
 - Form planning uses confirmed facts and company/track/account answer memory;
   unknown required questions become interventions.
 - Company Answer Memory overrides Career Track memory, which overrides account

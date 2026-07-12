@@ -149,6 +149,7 @@ export function SettingsView({
             </div>;
           })}
         </div>
+        <p className="field-note">Application emails isolate inboxes and site sessions. They do not create separate candidate profiles or bypass company limits.</p>
       </section>
 
       <div className="settings-columns">
@@ -162,7 +163,7 @@ export function SettingsView({
             <p className="field-note">Bluey skips older listings and confirms a job is still open before applying.</p>
             <label><span>Minimum salary</span><input type="number" value={preferences.minimum_compensation || ""} onChange={(event) => setPreferences({ ...preferences, minimum_compensation: Number(event.target.value) || undefined })} /></label>
             <TagInput label="Excluded companies" values={preferences.excluded_companies} onChange={(values) => setPreferences({ ...preferences, excluded_companies: values })} />
-            <label className="setting-line simple"><div><b>One active application per company</b><span>Protects against duplicate-company submissions.</span></div><Toggle checked={preferences.apply_once_per_company} onChange={(checked) => setPreferences({ ...preferences, apply_once_per_company: checked })} /></label>
+            <div className="setting-line simple"><div><b>One application per company</b><span>Always enforced across Career Tracks, resume versions, and application emails.</span></div><span className="status-chip success">Locked</span></div>
           </div>
         </section>
 
@@ -283,7 +284,7 @@ export function SettingsView({
       <Dialog open={Boolean(connecting)} title={`Connect ${connecting ? integrationName(connecting.provider) : "account"}`} description="Email and calendar connections are being enabled for invited Jobs beta accounts." onClose={() => setConnecting(null)}>
         <div className="integration-connect-copy">
           <span className="integration-icon large">{connecting?.provider.includes("calendar") ? <CalendarDays /> : <Mail />}</span>
-          <div><h3>Keep your application timeline current</h3><p>Bluey will use provider authorization to recognize application updates, interviews, and reminders. It will never ask for your email password.</p></div>
+          <div><h3>Integration beta access</h3><p>Email and calendar sync is not active for this account yet. Request access to help test provider authorization; Bluey will never ask for your email password.</p></div>
         </div>
         <div className="dialog-actions"><button className="button secondary" onClick={() => setConnecting(null)}>Not now</button><a className="button primary" href={`mailto:hello@bluey.sh?subject=${encodeURIComponent(`Bluey Jobs ${connecting ? integrationName(connecting.provider) : "integration"} beta`)}`}>Request beta access<ArrowRight size={15} /></a></div>
       </Dialog>

@@ -29,7 +29,13 @@ authority for login, account state, billing, and balance.
 - Redis or Valkey holds rate limits, leases, and short-lived runner presence.
 - R2 or S3 holds resumes, screenshots, receipts, and encrypted browser bundles.
 - Jobs JSON payloads are authenticated-encrypted at rest with AES-256-GCM.
-- Browser cookies and cloud profiles use per-account envelope keys in production.
+- Runner browser snapshots and durable step results use `BLUEYJP2` AES-256-GCM
+  envelopes. HKDF-SHA256 derives distinct keys from the runner master key for
+  each hashed tenant/profile scope and, for durable results, each tenant/profile
+  plus request-scope pair; AAD binds the envelope version, purpose, and expected
+  hashed contexts. Ciphertext replacement fsyncs the staged file and, where
+  supported, its parent directory. Legacy, plaintext, malformed,
+  unknown-version, wrong-context, and invalid result-envelope files fail closed.
 - Raw job-site passwords are never stored by Bluey Jobs.
 
 The repository keeps SQLite parity for local development and single-node beta
