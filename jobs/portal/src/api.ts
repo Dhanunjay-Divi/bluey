@@ -26,6 +26,7 @@ import type {
 const ACCESS_TOKEN_KEY = "bluey_access_token";
 const REFRESH_TOKEN_KEY = "bluey_refresh_token";
 const AUTH_PERSISTENCE_KEY = "bluey_auth_persistence";
+let refreshAccessTokenPromise: Promise<string> | null = null;
 
 export class ApiError extends Error {
   status: number;
@@ -91,18 +92,26 @@ function persistTokens(payload: { access_token: string; refresh_token?: string }
 }
 
 async function refreshAccessToken(): Promise<string> {
-  const token = refreshToken();
-  if (!token) return "";
-  const response = await fetch("/auth/refresh", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refresh_token: token }),
-  });
-  if (!response.ok) return "";
-  const payload = (await response.json()) as { access_token?: string; refresh_token?: string };
-  if (!payload.access_token) return "";
-  persistTokens({ access_token: payload.access_token, refresh_token: payload.refresh_token });
-  return payload.access_token;
+  if (refreshAccessTokenPromise) return refreshAccessTokenPromise;
+  refreshAccessTokenPromise = (async () => {
+    const token = refreshToken();
+    if (!token) return "";
+    const response = await fetch("/auth/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: token }),
+    });
+    if (!response.ok) return "";
+    const payload = (await response.json()) as { access_token?: string; refresh_token?: string };
+    if (!payload.access_token) return "";
+    persistTokens({ access_token: payload.access_token, refresh_token: payload.refresh_token });
+    return payload.access_token;
+  })();
+  try {
+    return await refreshAccessTokenPromise;
+  } finally {
+    refreshAccessTokenPromise = null;
+  }
 }
 
 async function request<T>(path: string, init: RequestInit = {}, retried = false): Promise<T> {
