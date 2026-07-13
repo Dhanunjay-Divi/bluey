@@ -25,7 +25,8 @@ assert.match(index, /automated means to extract, reproduce, index, benchmark/i);
 assert.equal(existsSync(join(root, "web/llms.txt")), false, "web/llms.txt must not ship");
 
 assert.match(caddy, /handle \/llms\.txt\s*\{\s*respond 410\s*\}/s);
-assert.match(caddy, /handle \/JobApply\s*\{\s*redir \/jobs 308\s*\}/s);
+assert.match(caddy, /handle \/JobApply\s*\{\s*redir \* \/jobs 308\s*\}/s);
+assert.match(caddy, /handle \/JobApply\/\*\s*\{\s*redir \* \/jobs 308\s*\}/s);
 assert.match(caddy, /@bluey_jobs_internal path \/api\/jobs\/internal\/\*/);
 assert.match(caddy, /@bluey_scrape_canary path \/\.well-known\/bluey-integrity-/);
 assert.match(caddy, /handle @bluey_scrape_canary\s*\{[\s\S]*?X-Bluey-Scrape-Canary "hit"[\s\S]*?respond 404\s*\}/);

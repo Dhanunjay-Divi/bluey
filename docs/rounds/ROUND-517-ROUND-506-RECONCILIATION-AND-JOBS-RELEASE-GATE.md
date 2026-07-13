@@ -79,3 +79,15 @@ round is considered complete.
 - `cargo metadata --manifest-path server/Cargo.toml --locked --no-deps` passes.
 - Production candidates must continue to build with `cargo build --locked`;
   silently resolving newer dependencies during a release is not allowed.
+
+## Live Edge Findings
+
+- Cloudflare Free-plan Bot Fight Mode was rejected for Bluey because it placed
+  a browser JavaScript challenge in front of native API clients. It was
+  disabled while Turnstile, product rate limits, explicit crawler denial,
+  Browser Integrity Check, strict TLS, and the direct-origin firewall stayed
+  enabled.
+- The public edge matrix caught an ambiguous Caddy `redir` form: inside a
+  `handle`, `redir /jobs 308` was interpreted as a path matcher plus redirect
+  target. Both legacy Jobs routes now use `redir * /jobs 308`, and the static
+  edge test asserts the explicit form.

@@ -54,11 +54,11 @@ bluey.sh, www.bluey.sh {
     }
 
     handle /JobApply {
-        redir /jobs 308
+        redir * /jobs 308
     }
 
     handle /JobApply/* {
-        redir /jobs 308
+        redir * /jobs 308
     }
 
     handle @bluey_jobs_api {
