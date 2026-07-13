@@ -30,10 +30,47 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey engineering round doc is `ROUND-478-RELIABILITY-TRUST-AND-USAGE-HARDENING.md`; the next canonical Bluey round doc should start at `ROUND-479-...`.
+- Latest completed Bluey engineering round doc is
+  `ROUND-518-BLUEY-CLOUDFLARE-EDGE-ACTIVATION-AND-ORIGIN-LOCK.md`; the next
+  canonical Bluey round doc should start at `ROUND-519-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
+- Do not claim raw-audio retention, replay, or training from the current audit
+  bundle. The shipped `audio/audio.jsonl` path is a manifest placeholder; any
+  future source-audio retention requires an explicit privacy/consent round and
+  live lifecycle verification.
 
 ## Current State
+
+- Rounds 517-518 completed the Round 506/Jobs reconciliation and Cloudflare
+  production edge activation on branch
+  `codex/bluey-round506-release-reconcile-20260712`:
+  - deployed server source commit:
+    `16098a0014c2278c3ac38727fe2240b0d860234f`
+  - signed server release: `round517-16098a0014c2`
+  - main API SHA-256:
+    `cfd483339258f214f59add688a343f7a351ea05c9f7ec2bdec0ab3dd490bb358`
+  - Jobs API SHA-256:
+    `7201dd4f8b9b674c946ab5c301d5a4a15efbfaadc8bd8e3e4644b5cab2b86b84`
+  - Caddy SHA-256:
+    `91bfba4d2266825d3d31a81ae2c125ee279c1393370afca9ccefd2419ddeae70`
+  - native release remains signed `0.1.99`; it was not overwritten
+  - production Turnstile, Postgres/pgvector, Valkey, R2, strict TLS, AI crawler
+    denial, API burst protection, and Cloudflare-only origin HTTPS are active
+  - Free-plan Bot Fight Mode must remain disabled because its blanket browser
+    challenge breaks Bluey's native clients
+  - direct HTTP is redirect-only for certificate renewal; direct HTTPS origin
+    access is blocked
+  - API/Jobs/Caddy services are active with zero restarts; public and origin
+    acceptance matrices passed
+  - Jobs remains review-first staged beta: unattended worker services,
+    authenticated synthetics, ATS certification, and mailbox/calendar OAuth are
+    still operational gates
+  - server R2 archive is live, but no client diagnostic bundle has yet been
+    indexed in production; raw source audio is not retained by default
+  - round docs:
+    `docs/rounds/ROUND-517-ROUND-506-RECONCILIATION-AND-JOBS-RELEASE-GATE.md`
+    and
+    `docs/rounds/ROUND-518-BLUEY-CLOUDFLARE-EDGE-ACTIVATION-AND-ORIGIN-LOCK.md`
 
 - Round 478 completed the consolidated pre-release hardening pass on branch
   `codex/bluey-web-ui-parallel-20260704`:

@@ -74,8 +74,10 @@ round is considered complete.
   `server/Cargo.lock` existed only as an ignored local file.
 - Bluey Server is an application, so its resolved dependency graph is now
   committed and the explicit ignore rule was removed.
-- The lockfile uses Cargo format 3 so both the developer toolchain and the
-  isolated production builder (Cargo/Rust 1.75) can verify the same graph.
+- The lockfile uses Cargo format 3 for broad tooling compatibility. The final
+  isolated production builder uses Cargo/Rust 1.95 because resolved
+  dependencies require Edition 2024 support; the host's older system Rust was
+  not modified.
 - `cargo metadata --manifest-path server/Cargo.toml --locked --no-deps` passes.
 - Production candidates must continue to build with `cargo build --locked`;
   silently resolving newer dependencies during a release is not allowed.
@@ -97,3 +99,99 @@ round is considered complete.
   `https://bluey.sh` URL and must never expose API or static content. The live
   verifier now treats either a blocked connection or that exact redirect as
   safe, while failing any content-bearing response or off-domain redirect.
+
+## Production Release
+
+- Deployed code commit:
+  `16098a0014c2278c3ac38727fe2240b0d860234f`
+- Signed release ID: `round517-16098a0014c2`
+- Built at: `2026-07-13T00:41:27Z`
+- Builder: Cargo/Rust `1.95.0`, locked release profile
+- Release directory:
+  `/opt/bluey-releases/round517-16098a0014c2`
+- The Ed25519 manifest signature verifies both locally and from the deployed
+  bundle.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Source archive | `a6dca3871c9431dcc20a0796d70da3d7927d3b1f658ed323b16972a39c53c588` |
+| Main API | `cfd483339258f214f59add688a343f7a351ea05c9f7ec2bdec0ab3dd490bb358` |
+| Jobs API | `7201dd4f8b9b674c946ab5c301d5a4a15efbfaadc8bd8e3e4644b5cab2b86b84` |
+| Web archive | `e78e82454937d8aa78a5de0b02e5591eed7db8ad4d694b5e4a891f31c9e9ae8c` |
+| Caddyfile | `91bfba4d2266825d3d31a81ae2c125ee279c1393370afca9ccefd2419ddeae70` |
+
+The signed native release remained `0.1.99` and was not rebuilt or
+overwritten:
+
+| Platform | SHA-256 |
+| --- | --- |
+| macOS arm64 | `a0bceff0868013a0a738a6a026bd4f631fa2c29f203bf88c904832f05a1bbef8` |
+| Windows x86_64 | `dc4a6aa8def8b3d9447ec722e447ca992b2421f65db212608f5d6bef7f6f3b6d` |
+
+## Backup And Rollback
+
+- Fresh PostgreSQL backup:
+  `/var/backups/bluey-api/hourly/bluey-postgres-20260712T234050Z.pgdump`
+- Backup SHA-256:
+  `b5441827e2b96f5b1482ea0a5384c5981042ee836c8a2512b65c34f0ffb97daa`
+- Backup size: `24,016,449` bytes
+- Final pre-release rollback snapshot:
+  `/var/backups/bluey-api/releases/20260713T004312Z-before-round517-16098a0014c2`
+
+## Live Acceptance
+
+- Main and Jobs `/health` report the exact deployed commit.
+- `bluey-api`, `bluey-jobs-api`, and `caddy` are active with `NRestarts=0`.
+- The post-restart log scan found no panic, fatal, error, `429`, provider
+  capacity, or dropped-connection entries.
+- `bluey-cloud-client/0.1.99`, `bluey-cli/0.1.99`, and a browser User-Agent all
+  receive `200` from `/health` through Cloudflare.
+- Turnstile config is public and valid; unsigned account access remains `401`;
+  private Jobs discovery remains `404`.
+- GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, and PerplexityBot receive
+  `403`; conventional Googlebot receives `200`.
+- `/llms.txt` returns `410`, legacy `/JobApply` returns canonical `308`, missing
+  Jobs assets return `404`, Jobs HTML is `no-cache`, and hashed assets are
+  immutable.
+- Direct origin HTTPS times out; direct HTTP exposes only the exact canonical
+  `308` redirect required for certificate renewal.
+- Public `latest.json` signature verification passed. Installer MIME types and
+  both native artifact hashes match the signed manifest.
+- Disk usage after deployment is 48 percent (`30G` free of `58G`).
+- Round 518 contains the Cloudflare state, firewall evidence, crawler matrix,
+  and live desktop/mobile Jobs screenshots.
+
+## Storage And Diagnostic Evidence
+
+- R2 log storage is reachable and the newest object under the configured
+  archive prefix was written at `2026-07-13T00:17:07.915Z`.
+- The production `diagnostic_log_chunks` table currently contains zero
+  client-uploaded chunks. Server archive health is proven; a real desktop
+  support/session audit upload still needs an authenticated production smoke
+  before client diagnostic retrieval can be called live-verified.
+- Raw mic/system audio is not retained by the current product after
+  transcription by default. The `audio/audio.jsonl` audit entry is a manifest
+  placeholder, not replayable source audio. Historical planning docs that
+  proposed raw-audio QA/training retention are not proof of shipped behavior or
+  consent.
+
+## Remaining Operational Gates
+
+- The Jobs API and customer portal are live, but Temporal/discovery/browser
+  workers are not installed as unattended production services. Jobs remains a
+  review-first staged beta until worker rollout, ATS certification, mailbox and
+  calendar OAuth, and authenticated synthetics are complete.
+- This server/edge round reused the already signed Windows artifact; it did not
+  have a physical Windows machine for a fresh runtime smoke.
+- Add one authenticated desktop diagnostic-bundle upload/retrieval smoke before
+  claiming end-to-end production support-bundle archival.
+- Any future raw-audio retention must be bounded, account/session scoped,
+  encrypted, lifecycle-deleted, separately consented, and reflected accurately
+  in Terms and Privacy before implementation.
+
+## Result
+
+The Round 506 reconciliation, signed server deployment, production web/Caddy
+promotion, Turnstile enforcement, and Cloudflare/origin edge gate are complete.
+No GitHub Actions workflow was started. This result does not promote the staged
+Jobs worker plane or unverified raw-audio retention into production claims.

@@ -1,12 +1,15 @@
-# Round 511 - Bluey Cloudflare Edge Activation And Origin Lock
+# Round 518 - Bluey Cloudflare Edge Activation And Origin Lock
 
 Date: 2026-07-12
 
 Status: **PRODUCTION VERIFIED**
 
-Repository: `/Users/uno/Downloads/cue-bluey-jobs`
+Repository: `/Users/uno/Downloads/cue`
 
-Branch: `codex/bluey-jobs-20260710`
+Integrated branch: `codex/bluey-round506-release-reconcile-20260712`
+
+Edge evidence source: `codex/bluey-jobs-20260710` commit
+`a5467d9443ccbbe461e45f43db380448d0e503e6`
 
 Round 506's source controls and Round 508's origin release are now backed by an
 enforcing Cloudflare edge, production Turnstile, an origin firewall, and live
@@ -35,8 +38,10 @@ preserves Bluey's own API and installer traffic.
 - Original Round 506 Caddy SHA-256:
   `2b36267138ea1254746e8fd202800929b196bb3fec73f46b49c1a50ca05bf0c5`
 
-A later coordinated release updated production after Round 506. The live
-identities captured at the end of this round are:
+A later coordinated release updated production after Round 506. The final
+coordinated release is `round517-16098a0014c2`, built from source commit
+`16098a0014c2278c3ac38727fe2240b0d860234f`. The live identities captured at
+the end of this round are:
 
 | Artifact | Live SHA-256 |
 | --- | --- |
@@ -46,9 +51,9 @@ identities captured at the end of this round are:
 | `/var/www/bluey/index.html` | `2cf1ea9ce511e1d0d33e1c014eaf8eb77e628083d0a6141289ac96595692fc64` |
 | `/var/www/bluey/jobs/index.html` | `c0152f506d7c2a9526c586ce5fea6092a475f413beb149836d8f4bf7dda319cf` |
 
-The live `/health` response identifies the coordinated API source as
-`d26174d93252a94e8aafca8b9736ff44c70fc7e3`. This round did not overwrite that
-newer API and did not republish the signed native `0.1.99` artifacts.
+The live main and Jobs `/health` responses identify the coordinated API source
+as `16098a0014c2278c3ac38727fe2240b0d860234f`. The edge activation did not
+republish or overwrite the signed native `0.1.99` artifacts.
 
 ## Cloudflare Edge State
 
@@ -204,9 +209,9 @@ The live Jobs public experience was captured through Cloudflare in Chromium at
 of incoherent overlap or horizontal clipping. Neither received a Cloudflare
 challenge page.
 
-![Live Jobs desktop](ROUND-511-BLUEY-CLOUDFLARE-EDGE-ACTIVATION-AND-ORIGIN-LOCK.assets/jobs-live-desktop.png)
+![Live Jobs desktop](ROUND-518-BLUEY-CLOUDFLARE-EDGE-ACTIVATION-AND-ORIGIN-LOCK.assets/jobs-live-desktop.png)
 
-![Live Jobs mobile](ROUND-511-BLUEY-CLOUDFLARE-EDGE-ACTIVATION-AND-ORIGIN-LOCK.assets/jobs-live-mobile.png)
+![Live Jobs mobile](ROUND-518-BLUEY-CLOUDFLARE-EDGE-ACTIVATION-AND-ORIGIN-LOCK.assets/jobs-live-mobile.png)
 
 ## Backups
 
