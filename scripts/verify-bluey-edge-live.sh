@@ -75,10 +75,20 @@ if $CURL -kfsS --connect-timeout 5 --resolve "bluey.sh:443:$ORIGIN_IP" "https://
 fi
 echo "PASS direct HTTPS origin bypass blocked"
 
-if $CURL -fsS --connect-timeout 5 -H 'Host: bluey.sh' "http://$ORIGIN_IP/health" >/dev/null; then
-    echo "FAIL direct HTTP origin bypass still succeeds" >&2
-    exit 1
+direct_http_headers="$(
+    $CURL -sS --connect-timeout 5 -D - -o /dev/null \
+        -H 'Host: bluey.sh' "http://$ORIGIN_IP/health" 2>/dev/null || true
+)"
+if [ -z "$direct_http_headers" ]; then
+    echo "PASS direct HTTP origin bypass blocked"
+else
+    direct_http_status="$(printf '%s\n' "$direct_http_headers" | tr -d '\r' | awk 'NR == 1 { print $2 }')"
+    direct_http_location="$(printf '%s\n' "$direct_http_headers" | tr -d '\r' | awk 'tolower($1) == "location:" {print $2; exit}')"
+    if [ "$direct_http_status" != "308" ] || [ "$direct_http_location" != "https://bluey.sh/health" ]; then
+        echo "FAIL direct HTTP origin exposed content or an unsafe redirect status=$direct_http_status location=$direct_http_location" >&2
+        exit 1
+    fi
+    echo "PASS direct HTTP origin is redirect-only for certificate renewal"
 fi
-echo "PASS direct HTTP origin bypass blocked"
 
 echo "Bluey live edge verification passed"

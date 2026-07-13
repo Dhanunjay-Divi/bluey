@@ -91,3 +91,9 @@ round is considered complete.
   `handle`, `redir /jobs 308` was interpreted as a path matcher plus redirect
   target. Both legacy Jobs routes now use `redir * /jobs 308`, and the static
   edge test asserts the explicit form.
+- Direct HTTPS to the historical origin is blocked by the host firewall. Port
+  80 remains redirect-only so Caddy can renew the Let's Encrypt origin
+  certificate: direct requests must return exactly `308` to the canonical
+  `https://bluey.sh` URL and must never expose API or static content. The live
+  verifier now treats either a blocked connection or that exact redirect as
+  safe, while failing any content-bearing response or off-domain redirect.
