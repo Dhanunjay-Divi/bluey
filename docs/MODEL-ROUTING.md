@@ -129,7 +129,7 @@ Operator knobs:
 
 | Env var | Default | Purpose |
 | --- | ---: | --- |
-| `BLUEY_ANSWER_PLAN_AI_FALLBACK` | enabled | Set to `0` only to disable the tiny classifier fallback; local rules still run |
+| `BLUEY_ANSWER_PLAN_AI_FALLBACK` | disabled | Set to `1` only to enable the tiny classifier for ambiguous requests; local rules remain the default |
 | `BLUEY_ANSWER_PLAN_AI_CONFIDENCE_THRESHOLD` | `0.70` | Only plans below this confidence are eligible unless mixed signals are detected |
 | `BLUEY_ANSWER_PLAN_AI_TIMEOUT_MS` | `900` | Max time spent on the fallback classifier call |
 | `BLUEY_ANSWER_PLAN_AI_MAX_TOKENS` | `180` | Max completion tokens reserved for classifier JSON |
@@ -294,7 +294,7 @@ Default server knobs:
 | `BLUEY_LIMIT_PROVIDER_DEEPSEEK_LLM_PER_MIN` | 600/min, burst 120 | DeepSeek text capacity |
 | `BLUEY_LIMIT_PROVIDER_ZAI_LLM_PER_MIN` | 300/min, burst 60 | Z.AI GLM text capacity |
 | `BLUEY_ANSWER_PLAN_ROUTING` | enabled | Set to `0` only for rollback; default server AnswerPlan promotes Auto requests to instant/deep/vision/research-aware behavior before provider routing |
-| `BLUEY_ANSWER_PLAN_AI_FALLBACK` | enabled | Set to `0` only to disable the low-confidence/mixed-signal tiny classifier fallback |
+| `BLUEY_ANSWER_PLAN_AI_FALLBACK` | disabled | Set to `1` only to enable the low-confidence/mixed-signal tiny classifier fallback |
 | `BLUEY_ROUTE_POLICY` | `provider_mix` | Default rotates first attempts across configured providers. Set `quality_first` for the older static order or `cost_optimized` to prefer GLM/DeepSeek first for managed text lanes |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |

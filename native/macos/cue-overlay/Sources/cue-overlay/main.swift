@@ -2271,12 +2271,14 @@ private final class HeaderDragView: NSView {
     private func preservesHeaderHit(for view: NSView) -> Bool {
         var current: NSView? = view
         while let candidate = current, candidate !== self {
+            if let badge = candidate as? ClickableHeaderBadge {
+                return badge.hasClickAction
+            }
             if candidate is NSButton
                 || candidate is NSPopUpButton
                 || candidate is NSSlider
                 || candidate is NSScroller
                 || candidate is NSTextView
-                || candidate is ClickableHeaderBadge
             {
                 return true
             }
@@ -2297,17 +2299,20 @@ private final class HeaderShieldView: NSView {
 
 private final class ClickableHeaderBadge: NSTextField {
     var onClick: (() -> Void)?
+    var hasClickAction: Bool { onClick != nil }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard !isHidden, alphaValue > 0.01, bounds.contains(point) else { return nil }
+        guard hasClickAction, !isHidden, alphaValue > 0.01, bounds.contains(point) else { return nil }
         return self
     }
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        addCursorRect(bounds, cursor: .pointingHand)
+        if hasClickAction {
+            addCursorRect(bounds, cursor: .pointingHand)
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -5403,12 +5408,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         headerSpacer = NSView()
         statusLabel = NSTextField(labelWithString: "")
         modelMenu = NSPopUpButton(frame: .zero, pullsDown: false)
-        routeBadge = NSTextField(labelWithString: "● Ready")
+        routeBadge = ClickableHeaderBadge(labelWithString: "● Ready")
         knowledgeBadge = ClickableHeaderBadge(labelWithString: "")
         themeButton = NSButton(title: "", target: nil, action: nil)
         shortcutsButton = NSButton(title: "", target: nil, action: nil)
         moveHandleButton = HeaderMoveButton(title: "", target: nil, action: nil)
-        balanceLabel = NSTextField(labelWithString: "Balance --")
+        balanceLabel = ClickableHeaderBadge(labelWithString: "Balance --")
         fullSizeButton = NSButton(title: "", target: nil, action: nil)
         interactionModeButton = NSButton(title: "", target: nil, action: nil)
         canvasToggleButton = NSButton(title: "", target: nil, action: nil)
@@ -7891,12 +7896,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 hit = view.superview
                 continue
             }
+            if let badge = view as? ClickableHeaderBadge {
+                return badge.hasClickAction
+            }
             if view is NSButton
                 || view is NSPopUpButton
                 || view is NSSlider
                 || view is OpacityScrubberView
                 || view is CanvasDividerView
-                || view is ClickableHeaderBadge
             {
                 return true
             }
@@ -10324,6 +10331,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
         balanceLabel.stringValue = "Sign in"
         updateBalanceLabelTone()
+        setSignedOutSignInHitTargetsEnabled(true)
         setKnowledgeBadge("Docs locked", accent: BlueyTheme.textDim)
         composer.placeholder = url == nil ? "Sign in to use managed answers..." : "Sign in, then ask anything..."
         statusLabel.toolTip = "Cloud answers, balance, sync, and documents unlock after login"
@@ -10337,6 +10345,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     func showSignedInChromeReady() {
         signedOutGateActive = false
+        setSignedOutSignInHitTargetsEnabled(false)
         feed.removeSignInCards()
         applySignedOutGateControlState()
         refreshSessionHeaderSubtitle()
@@ -10359,13 +10368,31 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     @discardableResult
     private func handleSignedOutGateAction(action: String) -> Bool {
         guard signedOutGateActive else { return false }
+        requestSignInFromHeader(action: action)
+        return true
+    }
+
+    private func setSignedOutSignInHitTargetsEnabled(_ enabled: Bool) {
+        let action: (() -> Void)? = enabled ? { [weak self] in
+            self?.requestSignInFromHeader(action: "header_sign_in")
+        } : nil
+        (routeBadge as? ClickableHeaderBadge)?.onClick = action
+        (balanceLabel as? ClickableHeaderBadge)?.onClick = action
+        routeBadge.needsDisplay = true
+        balanceLabel.needsDisplay = true
+        if let window {
+            window.invalidateCursorRects(for: routeBadge)
+            window.invalidateCursorRects(for: balanceLabel)
+        }
+    }
+
+    private func requestSignInFromHeader(action: String) {
         emitSimple("sign_in_requested")
         emitLifecycle("auth_gate_action", status: "signin_requested", detail: "action=\(action)")
         showSystemToast(
-            title: "Sign in first",
-            body: "Your browser is opening. Finish sign-in there, then Bluey will unlock.",
+            title: "Opening sign in",
+            body: "Finish sign-in in the browser. Bluey will unlock as soon as this desktop connects.",
             duration: 2.4)
-        return true
     }
 
     private func applySignedOutGateControlState() {

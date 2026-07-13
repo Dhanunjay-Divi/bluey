@@ -30,9 +30,10 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey engineering round doc is
-  `ROUND-518-BLUEY-CLOUDFLARE-EDGE-ACTIVATION-AND-ORIGIN-LOCK.md`; the next
-  canonical Bluey round doc should start at `ROUND-519-...`.
+- Latest active Bluey engineering round doc is
+  `ROUND-519-INTERRUPTED-ASKS-RECONCILIATION.md`; the next canonical Bluey
+  round doc should start at `ROUND-520-...` after Round 519 release evidence is
+  complete.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 - Do not claim raw-audio retention, replay, or training from the current audit
   bundle. The shipped `audio/audio.jsonl` path is a manifest placeholder; any
@@ -40,6 +41,19 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
   live lifecycle verification.
 
 ## Current State
+
+- Round 519 is the active interrupted-work reconciliation on branch
+  `codex/bluey-interrupted-asks-round519-20260712`:
+  - closes a forged `Question:` disclosure-guard bypass across server and daemon
+  - makes session sync version-aware and deletion purge child content
+  - makes password reset revoke refresh sessions atomically
+  - keeps attachment/screen actions responsive during answer streaming
+  - makes macOS signed-out header labels real sign-in hit targets
+  - aligns the optional AI AnswerPlan fallback with its default-off code path
+  - records Windows, reserve-before-dispatch, pgvector KNN, client audit upload,
+    and reviewed Jobs handoff work as explicit remaining gates
+  - round doc:
+    `docs/rounds/ROUND-519-INTERRUPTED-ASKS-RECONCILIATION.md`
 
 - Rounds 517-518 completed the Round 506/Jobs reconciliation and Cloudflare
   production edge activation on branch

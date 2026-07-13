@@ -211,6 +211,10 @@ fn upsert_batch_sqlite(
 ) -> Result<SyncCounts> {
     let mut conn = pool.get().context("get db conn")?;
     let tx = conn.transaction().context("begin sync tx")?;
+    let mut applied_transcript_segments = 0;
+    let mut applied_cue_responses = 0;
+    let mut applied_context_artifacts = 0;
+    let mut applied_rag_chunks = 0;
 
     for record in sessions {
         let metadata = serde_json::to_string(&record.metadata)?;
@@ -223,10 +227,14 @@ fn upsert_batch_sqlite(
                 title=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
                         THEN cloud_sessions.title
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
+                        THEN cloud_sessions.title
                     ELSE excluded.title
                 END,
                 status=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.status
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
                         THEN cloud_sessions.status
                     ELSE excluded.status
                 END,
@@ -234,20 +242,28 @@ fn upsert_batch_sqlite(
                 last_active_at_ms=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
                         THEN cloud_sessions.last_active_at_ms
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
+                        THEN cloud_sessions.last_active_at_ms
                     ELSE excluded.last_active_at_ms
                 END,
                 answer_style=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.answer_style
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
                         THEN cloud_sessions.answer_style
                     ELSE excluded.answer_style
                 END,
                 metadata_json=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
                         THEN cloud_sessions.metadata_json
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
+                        THEN cloud_sessions.metadata_json
                     ELSE excluded.metadata_json
                 END,
                 deleted_at_ms=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.deleted_at_ms
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
                         THEN cloud_sessions.deleted_at_ms
                     ELSE excluded.deleted_at_ms
                 END",
@@ -267,8 +283,11 @@ fn upsert_batch_sqlite(
     }
 
     for record in transcript_segments {
+        if session_is_tombstoned_sqlite_tx(&tx, account_id, &record.session_id)? {
+            continue;
+        }
         let metadata = serde_json::to_string(&record.metadata)?;
-        tx.execute(
+        applied_transcript_segments += tx.execute(
             "INSERT INTO cloud_transcript_segments (
                 account_id, segment_id, session_id, speaker, source, text,
                 start_ms, end_ms, ts_ms, is_final, metadata_json
@@ -282,7 +301,8 @@ fn upsert_batch_sqlite(
                 end_ms=excluded.end_ms,
                 ts_ms=excluded.ts_ms,
                 is_final=excluded.is_final,
-                metadata_json=excluded.metadata_json",
+                metadata_json=excluded.metadata_json
+             WHERE excluded.ts_ms >= cloud_transcript_segments.ts_ms",
             params![
                 account_id,
                 record.segment_id,
@@ -300,8 +320,11 @@ fn upsert_batch_sqlite(
     }
 
     for record in cue_responses {
+        if session_is_tombstoned_sqlite_tx(&tx, account_id, &record.session_id)? {
+            continue;
+        }
         let metadata = serde_json::to_string(&record.metadata)?;
-        tx.execute(
+        applied_cue_responses += tx.execute(
             "INSERT INTO cloud_cue_responses (
                 account_id, response_id, session_id, kind, text, source_text, ts_ms,
                 provider, model, lane, task_type, cost_cents, balance_cents_after,
@@ -323,7 +346,8 @@ fn upsert_batch_sqlite(
                 artifact_type=excluded.artifact_type,
                 artifact_body=excluded.artifact_body,
                 artifact_confidence=excluded.artifact_confidence,
-                metadata_json=excluded.metadata_json",
+                metadata_json=excluded.metadata_json
+             WHERE excluded.ts_ms >= cloud_cue_responses.ts_ms",
             params![
                 account_id,
                 record.response_id,
@@ -348,8 +372,11 @@ fn upsert_batch_sqlite(
     }
 
     for record in context_artifacts {
+        if session_is_tombstoned_sqlite_tx(&tx, account_id, &record.session_id)? {
+            continue;
+        }
         let metadata = serde_json::to_string(&record.metadata)?;
-        tx.execute(
+        let affected = tx.execute(
             "INSERT INTO cloud_context_artifacts (
                 account_id, artifact_id, session_id, kind, title, note, source_uri,
                 content_hash, text_preview, created_at_ms, metadata_json
@@ -363,7 +390,8 @@ fn upsert_batch_sqlite(
                 content_hash=excluded.content_hash,
                 text_preview=excluded.text_preview,
                 created_at_ms=excluded.created_at_ms,
-                metadata_json=excluded.metadata_json",
+                metadata_json=excluded.metadata_json
+             WHERE excluded.created_at_ms >= cloud_context_artifacts.created_at_ms",
             params![
                 account_id,
                 record.artifact_id,
@@ -378,23 +406,31 @@ fn upsert_batch_sqlite(
                 metadata,
             ],
         )?;
-        crate::db::object_uploads::link_artifact_session_sqlite_tx(
-            &tx,
-            account_id,
-            &record.artifact_id,
-            &record.session_id,
-            now_ms(),
-        )?;
+        if affected > 0 {
+            applied_context_artifacts += affected;
+            crate::db::object_uploads::link_artifact_session_sqlite_tx(
+                &tx,
+                account_id,
+                &record.artifact_id,
+                &record.session_id,
+                now_ms(),
+            )?;
+        }
     }
 
     for record in rag_chunks {
+        if let Some(session_id) = record.session_id.as_deref() {
+            if session_is_tombstoned_sqlite_tx(&tx, account_id, session_id)? {
+                continue;
+            }
+        }
         let metadata = serde_json::to_string(&record.metadata)?;
         let embedding = record
             .embedding
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        tx.execute(
+        applied_rag_chunks += tx.execute(
             "INSERT INTO cloud_rag_chunks (
                 account_id, chunk_id, session_id, source_kind, source_id, chunk_index,
                 text, embedding_json, embedding_model, token_count, content_hash,
@@ -411,7 +447,8 @@ fn upsert_batch_sqlite(
                 token_count=excluded.token_count,
                 content_hash=excluded.content_hash,
                 updated_at_ms=excluded.updated_at_ms,
-                metadata_json=excluded.metadata_json",
+                metadata_json=excluded.metadata_json
+             WHERE excluded.updated_at_ms >= cloud_rag_chunks.updated_at_ms",
             params![
                 account_id,
                 record.chunk_id,
@@ -433,10 +470,10 @@ fn upsert_batch_sqlite(
     tx.commit().context("commit sync tx")?;
     Ok(SyncCounts {
         sessions: sessions.len(),
-        transcript_segments: transcript_segments.len(),
-        cue_responses: cue_responses.len(),
-        context_artifacts: context_artifacts.len(),
-        rag_chunks: rag_chunks.len(),
+        transcript_segments: applied_transcript_segments,
+        cue_responses: applied_cue_responses,
+        context_artifacts: applied_context_artifacts,
+        rag_chunks: applied_rag_chunks,
     })
 }
 
@@ -451,6 +488,10 @@ fn upsert_batch_postgres(
 ) -> Result<SyncCounts> {
     let mut conn = pool.get_pg().context("get postgres db conn")?;
     let mut tx = conn.transaction().context("begin sync postgres tx")?;
+    let mut applied_transcript_segments = 0;
+    let mut applied_cue_responses = 0;
+    let mut applied_context_artifacts = 0;
+    let mut applied_rag_chunks = 0;
 
     for record in sessions {
         let metadata = serde_json::to_string(&record.metadata)?;
@@ -466,10 +507,14 @@ fn upsert_batch_postgres(
                 title=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
                         THEN cloud_sessions.title
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
+                        THEN cloud_sessions.title
                     ELSE excluded.title
                 END,
                 status=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.status
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
                         THEN cloud_sessions.status
                     ELSE excluded.status
                 END,
@@ -477,20 +522,28 @@ fn upsert_batch_postgres(
                 last_active_at_ms=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
                         THEN cloud_sessions.last_active_at_ms
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
+                        THEN cloud_sessions.last_active_at_ms
                     ELSE excluded.last_active_at_ms
                 END,
                 answer_style=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.answer_style
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
                         THEN cloud_sessions.answer_style
                     ELSE excluded.answer_style
                 END,
                 metadata_json=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
                         THEN cloud_sessions.metadata_json
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
+                        THEN cloud_sessions.metadata_json
                     ELSE excluded.metadata_json
                 END,
                 deleted_at_ms=CASE
                     WHEN cloud_sessions.deleted_at_ms IS NOT NULL AND excluded.deleted_at_ms IS NULL
+                        THEN cloud_sessions.deleted_at_ms
+                    WHEN excluded.updated_at_ms < cloud_sessions.updated_at_ms
                         THEN cloud_sessions.deleted_at_ms
                     ELSE excluded.deleted_at_ms
                 END",
@@ -511,12 +564,15 @@ fn upsert_batch_postgres(
     }
 
     for record in transcript_segments {
+        if session_is_tombstoned_postgres_tx(&mut tx, account_id, &record.session_id)? {
+            continue;
+        }
         let metadata = serde_json::to_string(&record.metadata)?;
         let is_final = if record.is_final { 1_i32 } else { 0_i32 };
         let speaker = db_text(&record.speaker);
         let source = db_text(&record.source);
         let text = db_text(&record.text);
-        tx.execute(
+        applied_transcript_segments += tx.execute(
             "INSERT INTO cloud_transcript_segments (
                 account_id, segment_id, session_id, speaker, source, text,
                 start_ms, end_ms, ts_ms, is_final, metadata_json
@@ -530,7 +586,8 @@ fn upsert_batch_postgres(
                 end_ms=excluded.end_ms,
                 ts_ms=excluded.ts_ms,
                 is_final=excluded.is_final,
-                metadata_json=excluded.metadata_json",
+                metadata_json=excluded.metadata_json
+             WHERE excluded.ts_ms >= cloud_transcript_segments.ts_ms",
             &[
                 &account_id,
                 &record.segment_id,
@@ -550,10 +607,13 @@ fn upsert_batch_postgres(
                 "upsert cloud_transcript_segments segment_id={} session_id={}",
                 record.segment_id, record.session_id
             )
-        })?;
+        })? as usize;
     }
 
     for record in cue_responses {
+        if session_is_tombstoned_postgres_tx(&mut tx, account_id, &record.session_id)? {
+            continue;
+        }
         let metadata = serde_json::to_string(&record.metadata)?;
         let artifact_confidence = record.artifact_confidence.map(|v| v as f64);
         let kind = db_text(&record.kind);
@@ -566,7 +626,7 @@ fn upsert_batch_postgres(
         let cost_label = db_opt_text(&record.cost_label);
         let artifact_type = db_opt_text(&record.artifact_type);
         let artifact_body = db_opt_text(&record.artifact_body);
-        tx.execute(
+        applied_cue_responses += tx.execute(
             "INSERT INTO cloud_cue_responses (
                 account_id, response_id, session_id, kind, text, source_text, ts_ms,
                 provider, model, lane, task_type, cost_cents, balance_cents_after,
@@ -588,7 +648,8 @@ fn upsert_batch_postgres(
                 artifact_type=excluded.artifact_type,
                 artifact_body=excluded.artifact_body,
                 artifact_confidence=excluded.artifact_confidence,
-                metadata_json=excluded.metadata_json",
+                metadata_json=excluded.metadata_json
+             WHERE excluded.ts_ms >= cloud_cue_responses.ts_ms",
             &[
                 &account_id,
                 &record.response_id,
@@ -615,10 +676,13 @@ fn upsert_batch_postgres(
                 "upsert cloud_cue_responses response_id={} session_id={}",
                 record.response_id, record.session_id
             )
-        })?;
+        })? as usize;
     }
 
     for record in context_artifacts {
+        if session_is_tombstoned_postgres_tx(&mut tx, account_id, &record.session_id)? {
+            continue;
+        }
         let metadata = serde_json::to_string(&record.metadata)?;
         let kind = db_text(&record.kind);
         let title = db_text(&record.title);
@@ -626,7 +690,7 @@ fn upsert_batch_postgres(
         let source_uri = db_opt_text(&record.source_uri);
         let content_hash = db_opt_text(&record.content_hash);
         let text_preview = db_opt_text(&record.text_preview);
-        tx.execute(
+        let affected = tx.execute(
             "INSERT INTO cloud_context_artifacts (
                 account_id, artifact_id, session_id, kind, title, note, source_uri,
                 content_hash, text_preview, created_at_ms, metadata_json
@@ -640,7 +704,8 @@ fn upsert_batch_postgres(
                 content_hash=excluded.content_hash,
                 text_preview=excluded.text_preview,
                 created_at_ms=excluded.created_at_ms,
-                metadata_json=excluded.metadata_json",
+                metadata_json=excluded.metadata_json
+             WHERE excluded.created_at_ms >= cloud_context_artifacts.created_at_ms",
             &[
                 &account_id,
                 &record.artifact_id,
@@ -661,16 +726,24 @@ fn upsert_batch_postgres(
                 record.artifact_id, record.session_id
             )
         })?;
-        crate::db::object_uploads::link_artifact_session_postgres_tx(
-            &mut tx,
-            account_id,
-            &record.artifact_id,
-            &record.session_id,
-            now_ms(),
-        )?;
+        if affected > 0 {
+            applied_context_artifacts += affected as usize;
+            crate::db::object_uploads::link_artifact_session_postgres_tx(
+                &mut tx,
+                account_id,
+                &record.artifact_id,
+                &record.session_id,
+                now_ms(),
+            )?;
+        }
     }
 
     for record in rag_chunks {
+        if let Some(session_id) = record.session_id.as_deref() {
+            if session_is_tombstoned_postgres_tx(&mut tx, account_id, session_id)? {
+                continue;
+            }
+        }
         let metadata = serde_json::to_string(&record.metadata)?;
         let embedding_json = record
             .embedding
@@ -700,7 +773,7 @@ fn upsert_batch_postgres(
                 })
             })
             .transpose()?;
-        tx.execute(
+        applied_rag_chunks += tx.execute(
             "INSERT INTO cloud_rag_chunks (
                 account_id, chunk_id, session_id, source_kind, source_id, chunk_index,
                 text, embedding_json, embedding, embedding_model, token_count, content_hash,
@@ -718,7 +791,8 @@ fn upsert_batch_postgres(
                 token_count=excluded.token_count,
                 content_hash=excluded.content_hash,
                 updated_at_ms=excluded.updated_at_ms,
-                metadata_json=excluded.metadata_json",
+                metadata_json=excluded.metadata_json
+             WHERE excluded.updated_at_ms >= cloud_rag_chunks.updated_at_ms",
             &[
                 &account_id,
                 &record.chunk_id,
@@ -741,16 +815,16 @@ fn upsert_batch_postgres(
                 "upsert cloud_rag_chunks chunk_id={} source_id={}",
                 record.chunk_id, record.source_id
             )
-        })?;
+        })? as usize;
     }
 
     tx.commit().context("commit sync postgres tx")?;
     Ok(SyncCounts {
         sessions: sessions.len(),
-        transcript_segments: transcript_segments.len(),
-        cue_responses: cue_responses.len(),
-        context_artifacts: context_artifacts.len(),
-        rag_chunks: rag_chunks.len(),
+        transcript_segments: applied_transcript_segments,
+        cue_responses: applied_cue_responses,
+        context_artifacts: applied_context_artifacts,
+        rag_chunks: applied_rag_chunks,
     })
 }
 
@@ -860,6 +934,7 @@ fn tombstone_session_sqlite(pool: &DbPool, account_id: &str, session_id: &str) -
     crate::db::object_uploads::schedule_session_cleanup_sqlite_tx(
         &tx, account_id, session_id, now,
     )?;
+    purge_session_content_sqlite_tx(&tx, account_id, session_id)?;
     tx.commit().context("commit session tombstone tx")?;
     Ok(())
 }
@@ -898,9 +973,78 @@ fn tombstone_session_postgres(pool: &DbPool, account_id: &str, session_id: &str)
     crate::db::object_uploads::schedule_session_cleanup_postgres_tx(
         &mut tx, account_id, session_id, now,
     )?;
+    purge_session_content_postgres_tx(&mut tx, account_id, session_id)?;
     tx.commit()
         .context("commit postgres session tombstone tx")?;
     Ok(())
+}
+
+fn purge_session_content_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    for table in [
+        "cloud_transcript_segments",
+        "cloud_cue_responses",
+        "cloud_context_artifacts",
+        "cloud_rag_chunks",
+    ] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE account_id = ?1 AND session_id = ?2"),
+            params![account_id, session_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn session_is_tombstoned_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    session_id: &str,
+) -> Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM cloud_sessions
+             WHERE account_id = ?1 AND session_id = ?2 AND deleted_at_ms IS NOT NULL",
+            params![account_id, session_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn purge_session_content_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    for table in [
+        "cloud_transcript_segments",
+        "cloud_cue_responses",
+        "cloud_context_artifacts",
+        "cloud_rag_chunks",
+    ] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE account_id = $1 AND session_id = $2"),
+            &[&account_id, &session_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn session_is_tombstoned_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    session_id: &str,
+) -> Result<bool> {
+    Ok(tx
+        .query_opt(
+            "SELECT 1 FROM cloud_sessions
+             WHERE account_id = $1 AND session_id = $2 AND deleted_at_ms IS NOT NULL",
+            &[&account_id, &session_id],
+        )?
+        .is_some())
 }
 
 fn list_sessions_sqlite(
@@ -1800,6 +1944,139 @@ mod tests {
     }
 
     #[test]
+    fn stale_sync_records_do_not_overwrite_newer_session_or_content() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_stale_sync";
+        let session_id = "session-stale-sync";
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                rusqlite::params![account_id, "stale@example.com", "hash"],
+            )
+            .unwrap();
+
+        let session = |title: &str, updated_at_ms: i64| SyncSessionRecord {
+            session_id: session_id.into(),
+            title: title.into(),
+            status: "active".into(),
+            created_at_ms: 1,
+            updated_at_ms,
+            last_active_at_ms: Some(updated_at_ms),
+            answer_style: Some(title.into()),
+            metadata: serde_json::json!({"version": title}),
+            deleted_at_ms: None,
+        };
+        let transcript = |text: &str, ts_ms: i64| SyncTranscriptSegment {
+            segment_id: "segment-versioned".into(),
+            session_id: session_id.into(),
+            speaker: "user".into(),
+            source: "microphone".into(),
+            text: text.into(),
+            start_ms: None,
+            end_ms: None,
+            ts_ms,
+            is_final: true,
+            metadata: serde_json::json!({"version": text}),
+        };
+        let response = |text: &str, ts_ms: i64| SyncCueResponseRecord {
+            response_id: "response-versioned".into(),
+            session_id: session_id.into(),
+            kind: "answer".into(),
+            text: text.into(),
+            source_text: Some("question".into()),
+            ts_ms,
+            provider: None,
+            model: None,
+            lane: None,
+            task_type: None,
+            cost_cents: None,
+            balance_cents_after: None,
+            cost_label: None,
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
+            metadata: serde_json::json!({"version": text}),
+        };
+        let context = |title: &str, created_at_ms: i64| SyncContextArtifactRecord {
+            artifact_id: "artifact-versioned".into(),
+            session_id: session_id.into(),
+            kind: "document".into(),
+            title: title.into(),
+            note: None,
+            source_uri: None,
+            content_hash: None,
+            text_preview: Some(title.into()),
+            created_at_ms,
+            metadata: serde_json::json!({"version": title}),
+        };
+        let rag = |text: &str, updated_at_ms: i64| SyncRagChunkRecord {
+            chunk_id: "rag-versioned".into(),
+            session_id: Some(session_id.into()),
+            source_kind: "document".into(),
+            source_id: "artifact-versioned".into(),
+            chunk_index: 0,
+            text: text.into(),
+            embedding: None,
+            embedding_model: None,
+            token_count: None,
+            content_hash: None,
+            updated_at_ms,
+            metadata: serde_json::json!({"version": text}),
+        };
+
+        let initial_counts = upsert_batch(
+            &pool,
+            account_id,
+            &[session("new", 20)],
+            &[transcript("new", 20)],
+            &[response("new", 20)],
+            &[context("new", 20)],
+            &[rag("new", 20)],
+        )
+        .unwrap();
+        assert_eq!(initial_counts.transcript_segments, 1);
+        assert_eq!(initial_counts.cue_responses, 1);
+        assert_eq!(initial_counts.context_artifacts, 1);
+        assert_eq!(initial_counts.rag_chunks, 1);
+
+        let stale_counts = upsert_batch(
+            &pool,
+            account_id,
+            &[session("old", 10)],
+            &[transcript("old", 10)],
+            &[response("old", 10)],
+            &[context("old", 10)],
+            &[rag("old", 10)],
+        )
+        .unwrap();
+        assert_eq!(stale_counts.transcript_segments, 0);
+        assert_eq!(stale_counts.cue_responses, 0);
+        assert_eq!(stale_counts.context_artifacts, 0);
+        assert_eq!(stale_counts.rag_chunks, 0);
+
+        let bundle = load_session(&pool, account_id, session_id)
+            .unwrap()
+            .expect("session remains visible");
+        assert_eq!(bundle.session.title, "new");
+        assert_eq!(bundle.session.answer_style.as_deref(), Some("new"));
+        assert_eq!(bundle.transcript_segments[0].text, "new");
+        assert_eq!(bundle.cue_responses[0].text, "new");
+        assert_eq!(bundle.context_artifacts[0].title, "new");
+        let rag_text: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT text FROM cloud_rag_chunks WHERE account_id = ?1 AND chunk_id = ?2",
+                rusqlite::params![account_id, "rag-versioned"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rag_text, "new");
+    }
+
+    #[test]
     fn tombstoned_session_does_not_resurrect_on_later_sync() {
         let pool = open_pool(":memory:".as_ref()).unwrap();
         run_migrations(&pool).unwrap();
@@ -1847,10 +2124,45 @@ mod tests {
             &pool,
             account_id,
             std::slice::from_ref(&session),
-            &[],
+            &[SyncTranscriptSegment {
+                segment_id: "segment-delete-1".into(),
+                session_id: session_id.clone(),
+                speaker: "user".into(),
+                source: "microphone".into(),
+                text: "Delete this transcript".into(),
+                start_ms: None,
+                end_ms: None,
+                ts_ms: 10,
+                is_final: true,
+                metadata: serde_json::json!({}),
+            }],
             std::slice::from_ref(&response),
-            &[],
-            &[],
+            &[SyncContextArtifactRecord {
+                artifact_id: "artifact-delete-1".into(),
+                session_id: session_id.clone(),
+                kind: "document".into(),
+                title: "Delete this document".into(),
+                note: None,
+                source_uri: None,
+                content_hash: None,
+                text_preview: Some("private text".into()),
+                created_at_ms: 10,
+                metadata: serde_json::json!({}),
+            }],
+            &[SyncRagChunkRecord {
+                chunk_id: "rag-delete-1".into(),
+                session_id: Some(session_id.clone()),
+                source_kind: "document".into(),
+                source_id: "artifact-delete-1".into(),
+                chunk_index: 0,
+                text: "Delete this indexed text".into(),
+                embedding: None,
+                embedding_model: None,
+                token_count: None,
+                content_hash: None,
+                updated_at_ms: 10,
+                metadata: serde_json::json!({}),
+            }],
         )
         .unwrap();
         assert_eq!(list_sessions(&pool, account_id, 10).unwrap().len(), 1);
@@ -1863,11 +2175,46 @@ mod tests {
         assert!(load_session(&pool, account_id, &session_id)
             .unwrap()
             .is_none());
+        let conn = pool.get().unwrap();
+        for table in [
+            "cloud_transcript_segments",
+            "cloud_cue_responses",
+            "cloud_context_artifacts",
+            "cloud_rag_chunks",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} WHERE account_id = ?1 AND session_id = ?2"
+                    ),
+                    rusqlite::params![account_id, session_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} content must be purged on delete");
+        }
+        drop(conn);
 
-        upsert_batch(&pool, account_id, &[session], &[], &[response], &[], &[]).unwrap();
+        let stale_counts =
+            upsert_batch(&pool, account_id, &[session], &[], &[response], &[], &[]).unwrap();
+        assert_eq!(stale_counts.cue_responses, 0);
         assert!(
             list_sessions(&pool, account_id, 10).unwrap().is_empty(),
             "old desktop sync must not resurrect a deleted cloud session"
+        );
+        let retained_response_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM cloud_cue_responses
+                 WHERE account_id = ?1 AND session_id = ?2",
+                rusqlite::params![account_id, session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_response_count, 0,
+            "stale sync must not repopulate child data after deletion"
         );
         assert_eq!(
             list_deleted_sessions(&pool, account_id, 10).unwrap().len(),

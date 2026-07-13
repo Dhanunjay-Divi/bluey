@@ -330,11 +330,13 @@ else
 fi
 
 if [ -n "${BLUEY_ANSWER_PLAN_AI_FALLBACK:-}" ] && falsey_env "$BLUEY_ANSWER_PLAN_AI_FALLBACK"; then
-  warn "BLUEY_ANSWER_PLAN_AI_FALLBACK is disabled; ambiguous requests will use local rules only"
+  ok "AnswerPlan AI fallback disabled; deterministic local rules handle ambiguous requests without an extra provider call"
 elif [ -n "${BLUEY_ANSWER_PLAN_AI_FALLBACK:-}" ] && ! truthy_env "$BLUEY_ANSWER_PLAN_AI_FALLBACK"; then
   warn "BLUEY_ANSWER_PLAN_AI_FALLBACK has an unrecognized value; server treats only 0/false/no/off as disabled"
+elif [ -n "${BLUEY_ANSWER_PLAN_AI_FALLBACK:-}" ]; then
+  warn "AnswerPlan AI fallback enabled; ambiguous requests add a metered provider call before the answer"
 else
-  ok "AnswerPlan AI fallback enabled for low-confidence/mixed-signal requests"
+  ok "AnswerPlan AI fallback disabled by default; deterministic local rules are active"
 fi
 
 route_policy="$(normalize_route_policy "${BLUEY_ROUTE_POLICY:-${BLUEY_ROUTE_ORDER:-}}")"

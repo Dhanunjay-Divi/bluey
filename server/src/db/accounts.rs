@@ -668,6 +668,51 @@ impl Account {
         })
     }
 
+    /// Change the password and revoke every outstanding refresh session in one
+    /// database transaction. A password reset is a security boundary, so an
+    /// old browser or desktop refresh token must never survive it.
+    pub fn reset_password_and_revoke_refresh_tokens(
+        pool: &DbPool,
+        id: &str,
+        password_hash: &str,
+    ) -> Result<usize> {
+        crate::db::run_blocking_db(|| {
+            let now = Utc::now();
+            match pool {
+                DbPool::Sqlite(_) => {
+                    let mut conn = pool.get()?;
+                    let tx = conn.transaction()?;
+                    let affected = tx.execute(
+                        "UPDATE accounts SET password_hash = ?1 WHERE id = ?2",
+                        params![password_hash, id],
+                    )?;
+                    tx.execute(
+                        "UPDATE refresh_tokens SET revoked_at = ?1
+                         WHERE account_id = ?2 AND revoked_at IS NULL",
+                        params![now.to_rfc3339(), id],
+                    )?;
+                    tx.commit()?;
+                    Ok(affected)
+                }
+                DbPool::Postgres(_) => {
+                    let mut conn = pool.get_pg()?;
+                    let mut tx = conn.transaction()?;
+                    let affected = tx.execute(
+                        "UPDATE accounts SET password_hash = $1 WHERE id = $2",
+                        &[&password_hash, &id],
+                    )?;
+                    tx.execute(
+                        "UPDATE refresh_tokens SET revoked_at = $1
+                         WHERE account_id = $2 AND revoked_at IS NULL",
+                        &[&now, &id],
+                    )?;
+                    tx.commit()?;
+                    Ok(usize::try_from(affected).unwrap_or(usize::MAX))
+                }
+            }
+        })
+    }
+
     pub fn restrict_billing(
         pool: &DbPool,
         id: &str,
@@ -1004,5 +1049,35 @@ mod create_dup_tests {
             Some("processor_payment_credit")
         );
         assert_eq!(rows[0].latest_ledger_amount_cents, Some(3000));
+    }
+
+    #[test]
+    fn password_reset_replaces_hash_and_revokes_existing_refresh_sessions() {
+        let pool = temp_pool();
+        let account = Account::create(&pool, "reset@example.com", "old-hash").unwrap();
+        crate::db::refresh_tokens::store(&pool, "old-refresh", &account.id, Some("browser"))
+            .unwrap();
+        assert_eq!(
+            crate::db::refresh_tokens::list_active_for_account(&pool, &account.id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let affected = Account::reset_password_and_revoke_refresh_tokens(
+            &pool,
+            &account.id,
+            "new-hash",
+        )
+        .unwrap();
+
+        assert_eq!(affected, 1);
+        assert_eq!(
+            Account::password_hash(&pool, "reset@example.com").unwrap(),
+            Some("new-hash".to_string())
+        );
+        assert!(crate::db::refresh_tokens::list_active_for_account(&pool, &account.id)
+            .unwrap()
+            .is_empty());
     }
 }

@@ -1650,11 +1650,12 @@ pub async fn password_reset_confirm(
             error: "invalid or expired reset token".into(),
         }),
     ))?;
-    Account::update_password_hash(&state.pool, &account_id, &new_hash).map_err(|e| {
+    Account::reset_password_and_revoke_refresh_tokens(&state.pool, &account_id, &new_hash)
+        .map_err(|e| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
-                error: format!("db: {e}"),
+                error: format!("reset password: {e}"),
             }),
         )
     })?;
