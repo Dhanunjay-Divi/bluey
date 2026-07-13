@@ -9,6 +9,7 @@
 //! gated behind `#[ignore]`; CI does not exercise them. The framer + DSP
 //! helpers are unit-tested separately in `framer.rs`.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -17,13 +18,166 @@ use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{SampleFormat, StreamConfig};
 use cue_core::pcm::{AudioChunk, AudioSource, SampleRate};
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::Notify;
 
 use crate::audio::framer::{downmix_to_mono, f32_to_i16, Framer};
 
 /// One second of 20 ms chunks at the recommended capture cadence.
 const CAPTURE_QUEUE_CAPACITY: usize = 50;
+
+struct LatestQueueState<T> {
+    items: VecDeque<T>,
+    sender_count: usize,
+    receiver_open: bool,
+}
+
+struct LatestQueue<T> {
+    capacity: usize,
+    state: std::sync::Mutex<LatestQueueState<T>>,
+    ready: Notify,
+}
+
+/// Sender for a bounded realtime queue that preserves the newest item.
+pub struct LatestSender<T> {
+    shared: Arc<LatestQueue<T>>,
+}
+
+/// Single-consumer receiver for [`LatestSender`].
+pub struct LatestReceiver<T> {
+    shared: Arc<LatestQueue<T>>,
+}
+
+pub enum LatestSendResult<T> {
+    Enqueued,
+    Replaced(T),
+    Rejected(T),
+}
+
+/// Build a bounded queue where a full send evicts the oldest queued item.
+pub fn latest_channel<T>(capacity: usize) -> (LatestSender<T>, LatestReceiver<T>) {
+    assert!(capacity > 0, "latest queue capacity must be positive");
+    let shared = Arc::new(LatestQueue {
+        capacity,
+        state: std::sync::Mutex::new(LatestQueueState {
+            items: VecDeque::with_capacity(capacity),
+            sender_count: 1,
+            receiver_open: true,
+        }),
+        ready: Notify::new(),
+    });
+    (
+        LatestSender {
+            shared: Arc::clone(&shared),
+        },
+        LatestReceiver { shared },
+    )
+}
+
+impl<T> LatestSender<T> {
+    /// Enqueue `item`, returning the oldest queued item when one was evicted.
+    pub fn try_send(&self, item: T) -> Result<Option<T>, T> {
+        let evicted = {
+            let mut state = self.shared.state.lock().unwrap();
+            if !state.receiver_open {
+                return Err(item);
+            }
+            let evicted = if state.items.len() == self.shared.capacity {
+                state.items.pop_front()
+            } else {
+                None
+            };
+            state.items.push_back(item);
+            evicted
+        };
+        self.shared.ready.notify_one();
+        Ok(evicted)
+    }
+
+    /// Enqueue with a caller-selected eviction candidate. If the queue is
+    /// full and `select_eviction` returns `None`, the new item is rejected.
+    pub fn try_send_prioritized<F>(
+        &self,
+        item: T,
+        select_eviction: F,
+    ) -> Result<LatestSendResult<T>, T>
+    where
+        F: FnOnce(&VecDeque<T>) -> Option<usize>,
+    {
+        let result = {
+            let mut state = self.shared.state.lock().unwrap();
+            if !state.receiver_open {
+                return Err(item);
+            }
+            if state.items.len() < self.shared.capacity {
+                state.items.push_back(item);
+                LatestSendResult::Enqueued
+            } else if let Some(index) = select_eviction(&state.items) {
+                let evicted = state
+                    .items
+                    .remove(index)
+                    .expect("selected latest queue eviction must exist");
+                state.items.push_back(item);
+                LatestSendResult::Replaced(evicted)
+            } else {
+                LatestSendResult::Rejected(item)
+            }
+        };
+        if !matches!(result, LatestSendResult::Rejected(_)) {
+            self.shared.ready.notify_one();
+        }
+        Ok(result)
+    }
+}
+
+impl<T> Clone for LatestSender<T> {
+    fn clone(&self) -> Self {
+        self.shared.state.lock().unwrap().sender_count += 1;
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<T> Drop for LatestSender<T> {
+    fn drop(&mut self) {
+        let last_sender = {
+            let mut state = self.shared.state.lock().unwrap();
+            state.sender_count = state.sender_count.saturating_sub(1);
+            state.sender_count == 0
+        };
+        if last_sender {
+            self.shared.ready.notify_waiters();
+        }
+    }
+}
+
+impl<T> LatestReceiver<T> {
+    pub async fn recv(&mut self) -> Option<T> {
+        loop {
+            let notified = self.shared.ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.shared.state.lock().unwrap();
+                if let Some(item) = state.items.pop_front() {
+                    return Some(item);
+                }
+                if state.sender_count == 0 {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+impl<T> Drop for LatestReceiver<T> {
+    fn drop(&mut self) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.receiver_open = false;
+        state.items.clear();
+    }
+}
 
 /// Parameters for microphone capture.
 pub struct CaptureOptions {
@@ -86,7 +240,7 @@ impl MicrophoneCapture {
     ///
     /// Returns a `(handle, rx)` pair: the handle owns the capture thread;
     /// `rx` yields framed `AudioChunk`s.
-    pub fn start(opts: CaptureOptions) -> Result<(Self, Receiver<AudioChunk>)> {
+    pub fn start(opts: CaptureOptions) -> Result<(Self, LatestReceiver<AudioChunk>)> {
         let host = cpal::default_host();
         let device = resolve_input_device(&host, opts.device_name.as_deref())?;
 
@@ -101,7 +255,7 @@ impl MicrophoneCapture {
         }
         let format = config.sample_format();
 
-        let (tx, rx) = channel::<AudioChunk>(CAPTURE_QUEUE_CAPACITY);
+        let (tx, rx) = latest_channel::<AudioChunk>(CAPTURE_QUEUE_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));
         let dropped_chunks = Arc::new(AtomicU64::new(0));
         let thread_stop = stop.clone();
@@ -227,20 +381,20 @@ impl MicrophoneCapture {
 }
 
 fn try_emit_chunk(
-    sender: &Sender<AudioChunk>,
+    sender: &LatestSender<AudioChunk>,
     chunk: AudioChunk,
     dropped_chunks: &AtomicU64,
 ) -> bool {
     match sender.try_send(chunk) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
+        Ok(Some(_)) => {
             let dropped = dropped_chunks.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped.is_power_of_two() {
                 tracing::warn!(dropped, "microphone capture queue overloaded");
             }
             true
         }
-        Err(TrySendError::Closed(_)) => false,
+        Ok(None) => true,
+        Err(_) => false,
     }
 }
 
@@ -347,7 +501,7 @@ mod tests {
 
     #[tokio::test]
     async fn capture_queue_drops_on_overload_and_detects_closed_receiver() {
-        let (tx, mut rx) = channel(1);
+        let (tx, mut rx) = latest_channel(1);
         let dropped = AtomicU64::new(0);
         let chunk = AudioChunk {
             source: AudioSource::Microphone,
@@ -357,11 +511,46 @@ mod tests {
         };
 
         assert!(try_emit_chunk(&tx, chunk.clone(), &dropped));
-        assert!(try_emit_chunk(&tx, chunk.clone(), &dropped));
+        let newest = AudioChunk {
+            captured_at_ms: 1,
+            ..chunk.clone()
+        };
+        assert!(try_emit_chunk(&tx, newest, &dropped));
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
-        assert_eq!(rx.recv().await.unwrap().samples.len(), chunk.samples.len());
+        assert_eq!(rx.recv().await.unwrap().captured_at_ms, 1);
         drop(rx);
         assert!(!try_emit_chunk(&tx, chunk, &dropped));
+    }
+
+    #[tokio::test]
+    async fn latest_queue_evicts_oldest_and_closes_after_last_sender() {
+        let (tx, mut rx) = latest_channel(2);
+        assert_eq!(tx.try_send(1).unwrap(), None);
+        assert_eq!(tx.try_send(2).unwrap(), None);
+        assert_eq!(tx.try_send(3).unwrap(), Some(1));
+
+        assert_eq!(rx.recv().await, Some(2));
+        assert_eq!(rx.recv().await, Some(3));
+        drop(tx);
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn latest_queue_does_not_lose_sender_receiver_races() {
+        for value in 0..100 {
+            let (tx, mut rx) = latest_channel(1);
+            let sender = tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                tx.try_send(value).unwrap();
+            });
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                    .await
+                    .expect("latest queue lost a wakeup"),
+                Some(value)
+            );
+            sender.await.unwrap();
+        }
     }
 }
 

@@ -17,7 +17,6 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
 use std::process::Stdio;
@@ -26,15 +25,17 @@ use std::sync::Arc;
 
 use self::error::WhisperError;
 use self::parser::parse_line;
+use crate::audio::capture::{latest_channel, LatestReceiver, LatestSendResult, LatestSender};
 
 const AUDIO_QUEUE_CAPACITY: usize = 50;
 const EVENT_QUEUE_CAPACITY: usize = 64;
+const HELPER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Local Whisper STT provider using a child-process helper binary.
 pub struct LocalWhisperProvider {
     state: ConnectionState,
-    event_rx: mpsc::Receiver<Result<TranscriptEvent, SttError>>,
-    stdin_tx: Option<mpsc::Sender<Vec<u8>>>,
+    event_rx: LatestReceiver<Result<TranscriptEvent, SttError>>,
+    stdin_tx: Option<LatestSender<Vec<u8>>>,
     child_handle: Option<tokio::task::JoinHandle<()>>,
     dropped_audio_chunks: AtomicU64,
     dropped_partial_events: Arc<AtomicU64>,
@@ -44,8 +45,8 @@ impl LocalWhisperProvider {
     /// Create and start a new LocalWhisperProvider.
     pub fn connect(config: SttConfig) -> Result<Self, WhisperError> {
         let binary = resolve_binary()?;
-        let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
-        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
+        let (event_tx, event_rx) = latest_channel(EVENT_QUEUE_CAPACITY);
+        let (stdin_tx, stdin_rx) = latest_channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
         let dropped_partial_events = Arc::new(AtomicU64::new(0));
 
         let source = config.source;
@@ -166,15 +167,15 @@ fn resolve_binary() -> Result<String, WhisperError> {
 async fn run_helper_loop(
     binary: String,
     source: cue_core::pcm::AudioSource,
-    event_tx: mpsc::Sender<Result<TranscriptEvent, SttError>>,
-    mut stdin_rx: mpsc::Receiver<Vec<u8>>,
+    event_tx: LatestSender<Result<TranscriptEvent, SttError>>,
+    mut stdin_rx: LatestReceiver<Vec<u8>>,
     dropped_partial_events: Arc<AtomicU64>,
 ) {
     let mut child = match spawn_helper(&binary) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to spawn whisper helper: {e}");
-            let _ = event_tx.send(Err(SttError::Provider(e.to_string()))).await;
+            let _ = event_tx.try_send(Err(SttError::Provider(e.to_string())));
             return;
         }
     };
@@ -183,9 +184,7 @@ async fn run_helper_loop(
     let child_stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
-            let _ = event_tx
-                .send(Err(SttError::Provider("no stdout from helper".into())))
-                .await;
+            let _ = event_tx.try_send(Err(SttError::Provider("no stdout from helper".into())));
             return;
         }
     };
@@ -233,24 +232,32 @@ async fn run_helper_loop(
 }
 
 async fn send_transcript_event(
-    event_tx: &mpsc::Sender<Result<TranscriptEvent, SttError>>,
+    event_tx: &LatestSender<Result<TranscriptEvent, SttError>>,
     event: TranscriptEvent,
     dropped_partial_events: Option<&AtomicU64>,
 ) -> Result<(), ()> {
-    if matches!(event, TranscriptEvent::Partial { .. }) {
-        match event_tx.try_send(Ok(event)) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                if let Some(counter) = dropped_partial_events {
-                    count_drop(counter, "partial events");
-                }
-                Ok(())
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+    let incoming_partial = matches!(event, TranscriptEvent::Partial { .. });
+    let result = event_tx
+        .try_send_prioritized(Ok(event), |queued| {
+            queued
+                .iter()
+                .position(|queued| matches!(queued, Ok(TranscriptEvent::Partial { .. })))
+                .or_else(|| (!incoming_partial).then_some(0))
+        })
+        .map_err(|_| ())?;
+    let dropped_partial = match result {
+        LatestSendResult::Replaced(Ok(TranscriptEvent::Partial { .. }))
+        | LatestSendResult::Rejected(Ok(TranscriptEvent::Partial { .. })) => true,
+        LatestSendResult::Enqueued
+        | LatestSendResult::Replaced(_)
+        | LatestSendResult::Rejected(_) => false,
+    };
+    if dropped_partial {
+        if let Some(counter) = dropped_partial_events {
+            count_drop(counter, "partial events");
         }
-    } else {
-        event_tx.send(Ok(event)).await.map_err(|_| ())
     }
+    Ok(())
 }
 
 fn count_drop(counter: &AtomicU64, queue: &'static str) {
@@ -268,6 +275,7 @@ fn spawn_helper(binary: &str) -> Result<Child, WhisperError> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| WhisperError::SpawnFailed(format!("{binary}: {e}")))
 }
@@ -287,14 +295,12 @@ impl SttProvider for LocalWhisperProvider {
         // Convert samples to LE bytes
         let bytes: Vec<u8> = chunk.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         match tx.try_send(bytes) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Ok(Some(_)) => {
                 count_drop(&self.dropped_audio_chunks, "audio chunks");
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(SttError::Provider("helper stdin closed".into()))
-            }
+            Ok(None) => Ok(()),
+            Err(_) => Err(SttError::Provider("helper stdin closed".into())),
         }
     }
 
@@ -310,7 +316,7 @@ impl SttProvider for LocalWhisperProvider {
         self.state = ConnectionState::Closed;
         self.stdin_tx = None;
         if let Some(mut handle) = self.child_handle.take() {
-            if tokio::time::timeout(std::time::Duration::from_secs(3), &mut handle)
+            if tokio::time::timeout(HELPER_SHUTDOWN_TIMEOUT, &mut handle)
                 .await
                 .is_err()
             {
@@ -319,6 +325,14 @@ impl SttProvider for LocalWhisperProvider {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for LocalWhisperProvider {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.child_handle {
+            handle.abort();
+        }
     }
 }
 
@@ -344,9 +358,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audio_overload_drops_and_close_closes_stdin_queue() {
-        let (stdin_tx, mut stdin_rx) = mpsc::channel(1);
-        let (_event_tx, event_rx) = mpsc::channel(1);
+    async fn audio_overload_keeps_newest_and_close_closes_stdin_queue() {
+        let (stdin_tx, mut stdin_rx) = latest_channel(1);
+        let (_event_tx, event_rx) = latest_channel(1);
         let mut provider = LocalWhisperProvider {
             state: ConnectionState::Connected,
             event_rx,
@@ -356,12 +370,18 @@ mod tests {
             dropped_partial_events: Arc::new(AtomicU64::new(0)),
         };
 
-        provider.send_audio(&chunk()).await.unwrap();
-        provider.send_audio(&chunk()).await.unwrap();
+        let first = chunk();
+        let second = AudioChunk {
+            samples: vec![2; 320],
+            ..first.clone()
+        };
+        provider.send_audio(&first).await.unwrap();
+        provider.send_audio(&second).await.unwrap();
         assert_eq!(provider.dropped_audio_chunks(), 1);
         provider.close().await.unwrap();
         assert_eq!(provider.connection_state(), ConnectionState::Closed);
-        assert!(stdin_rx.recv().await.is_some());
+        let newest = stdin_rx.recv().await.unwrap();
+        assert_eq!(i16::from_le_bytes([newest[0], newest[1]]), 2);
         assert!(stdin_rx.recv().await.is_none());
         assert!(matches!(
             provider.send_audio(&chunk()).await,
@@ -370,8 +390,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_overload_drops_interim_but_final_waits_and_delivers() {
-        let (tx, mut rx) = mpsc::channel(1);
+    async fn partial_overload_yields_to_final_without_waiting() {
+        let (tx, mut rx) = latest_channel(1);
         let dropped = AtomicU64::new(0);
         let partial = TranscriptEvent::Partial {
             text: "interim".into(),
@@ -392,24 +412,36 @@ mod tests {
             source: AudioSource::Microphone,
             words: Vec::new(),
         };
-        let send_final = send_transcript_event(&tx, final_event, Some(&dropped));
-        tokio::pin!(send_final);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), &mut send_final)
-                .await
-                .is_err()
-        );
-        assert!(matches!(
-            rx.recv().await,
-            Some(Ok(TranscriptEvent::Partial { .. }))
-        ));
-        tokio::time::timeout(std::time::Duration::from_secs(1), &mut send_final)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            send_transcript_event(&tx, final_event, Some(&dropped)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
         assert!(matches!(
             rx.recv().await,
             Some(Ok(TranscriptEvent::Final { .. }))
         ));
+    }
+
+    #[tokio::test]
+    async fn close_aborts_stalled_helper_task_by_deadline() {
+        let (stdin_tx, _stdin_rx) = latest_channel(1);
+        let (_event_tx, event_rx) = latest_channel(1);
+        let mut provider = LocalWhisperProvider {
+            state: ConnectionState::Connected,
+            event_rx,
+            stdin_tx: Some(stdin_tx),
+            child_handle: Some(tokio::spawn(std::future::pending())),
+            dropped_audio_chunks: AtomicU64::new(0),
+            dropped_partial_events: Arc::new(AtomicU64::new(0)),
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), provider.close())
+            .await
+            .expect("close exceeded its helper shutdown deadline")
+            .unwrap();
     }
 }

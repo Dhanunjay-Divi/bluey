@@ -8,28 +8,35 @@ use async_trait::async_trait;
 use cue_core::pcm::AudioChunk;
 use cue_core::stt::{ConnectionState, SttError, SttProvider, TranscriptEvent};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+
+use crate::audio::capture::{latest_channel, LatestReceiver, LatestSender};
 
 const EVENT_QUEUE_CAPACITY: usize = 64;
 
 pub struct EchoProvider {
-    events_rx: Receiver<Result<TranscriptEvent, SttError>>,
-    events_tx: Option<Sender<Result<TranscriptEvent, SttError>>>,
+    events_rx: LatestReceiver<Result<TranscriptEvent, SttError>>,
+    events_tx: Option<LatestSender<Result<TranscriptEvent, SttError>>>,
     counter: AtomicU64,
+    dropped_events: AtomicU64,
     closed: AtomicBool,
     source: cue_core::pcm::AudioSource,
 }
 
 impl EchoProvider {
     pub fn new(source: cue_core::pcm::AudioSource) -> Self {
-        let (tx, rx) = channel(EVENT_QUEUE_CAPACITY);
+        let (tx, rx) = latest_channel(EVENT_QUEUE_CAPACITY);
         Self {
             events_rx: rx,
             events_tx: Some(tx),
             counter: AtomicU64::new(0),
+            dropped_events: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             source,
         }
+    }
+
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events.load(Ordering::Relaxed)
     }
 }
 
@@ -58,12 +65,16 @@ impl SttProvider for EchoProvider {
             source: self.source,
             words: Vec::new(),
         };
-        self.events_tx
+        let evicted = self
+            .events_tx
             .as_ref()
             .ok_or(SttError::NotActive)?
-            .send(Ok(event))
-            .await
-            .map_err(|_| SttError::NotActive)
+            .try_send(Ok(event))
+            .map_err(|_| SttError::NotActive)?;
+        if evicted.is_some() {
+            self.dropped_events.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     async fn finalize(&self) -> Result<(), SttError> {
@@ -118,37 +129,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_events_wait_for_capacity_instead_of_dropping() {
-        let (tx, mut rx) = channel(1);
-        let (_unused_tx, unused_rx) = channel(1);
+    async fn final_events_evict_oldest_without_waiting() {
+        let (tx, mut rx) = latest_channel(1);
+        let (_unused_tx, unused_rx) = latest_channel(1);
         let provider = EchoProvider {
             events_rx: unused_rx,
             events_tx: Some(tx),
             counter: AtomicU64::new(0),
+            dropped_events: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             source: AudioSource::Microphone,
         };
         provider.send_audio(&chunk()).await.unwrap();
-
-        let second_chunk = chunk();
-        let second_send = provider.send_audio(&second_chunk);
-        tokio::pin!(second_send);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), &mut second_send)
-                .await
-                .is_err()
-        );
-        assert!(matches!(
-            rx.recv().await,
-            Some(Ok(TranscriptEvent::Final { .. }))
-        ));
-        tokio::time::timeout(std::time::Duration::from_secs(1), &mut second_send)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            rx.recv().await,
-            Some(Ok(TranscriptEvent::Final { .. }))
-        ));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            provider.send_audio(&chunk()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(provider.dropped_events(), 1);
+        let event = rx.recv().await.unwrap().unwrap();
+        assert!(matches!(event, TranscriptEvent::Final { ref text, .. } if text == "echo:1"));
     }
 }

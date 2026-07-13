@@ -19,9 +19,10 @@ use cue_core::process_aliases::MACOS_AUDIO_HELPER_NAMES;
 use cue_core::process_aliases::WINDOWS_AUDIO_HELPER_NAMES;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+
+use crate::audio::capture::{latest_channel, LatestReceiver, LatestSender};
 
 /// Samples per 20 ms chunk at 16 kHz mono.
 const CHUNK_SAMPLES: usize = 320;
@@ -31,9 +32,10 @@ const CHUNK_BYTES: usize = CHUNK_SAMPLES * 2;
 const MAX_RESTART_ATTEMPTS: u32 = 5;
 /// One second of 20 ms chunks for bounded system-audio consumers.
 const CAPTURE_QUEUE_CAPACITY: usize = 50;
+const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
-pub fn system_audio_channel() -> (Sender<AudioChunk>, Receiver<AudioChunk>) {
-    tokio::sync::mpsc::channel(CAPTURE_QUEUE_CAPACITY)
+pub fn system_audio_channel() -> (LatestSender<AudioChunk>, LatestReceiver<AudioChunk>) {
+    latest_channel(CAPTURE_QUEUE_CAPACITY)
 }
 
 #[cfg(target_os = "macos")]
@@ -57,6 +59,7 @@ const AUDIO_HELPER_EXE_RELATIVE_DIRS: &[&str] = &[
 /// Handle to a running system audio capture session.
 pub struct SystemAudioCapture {
     stop: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
     task: Option<JoinHandle<()>>,
     dropped_chunks: Arc<AtomicU64>,
 }
@@ -64,18 +67,28 @@ pub struct SystemAudioCapture {
 impl SystemAudioCapture {
     /// Start system audio capture. Spawns the native helper and begins
     /// streaming `AudioChunk`s to `sender`.
-    pub fn start(sender: Sender<AudioChunk>) -> std::io::Result<Self> {
+    pub fn start(sender: LatestSender<AudioChunk>) -> std::io::Result<Self> {
         let binary = resolve_binary()?;
         let stop = Arc::new(AtomicBool::new(false));
+        let stop_notify = Arc::new(Notify::new());
         let dropped_chunks = Arc::new(AtomicU64::new(0));
         let stop_clone = stop.clone();
+        let task_stop_notify = Arc::clone(&stop_notify);
         let task_dropped_chunks = dropped_chunks.clone();
         let task = tokio::spawn(async move {
-            supervisor_loop(binary, sender, stop_clone, task_dropped_chunks).await;
+            supervisor_loop(
+                binary,
+                sender,
+                stop_clone,
+                task_stop_notify,
+                task_dropped_chunks,
+            )
+            .await;
         });
 
         Ok(Self {
             stop,
+            stop_notify,
             task: Some(task),
             dropped_chunks,
         })
@@ -88,8 +101,12 @@ impl SystemAudioCapture {
     /// Signal the capture to stop and wait for the task to finish.
     pub async fn stop(mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(task) = self.task.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        self.stop_notify.notify_one();
+        if let Some(mut task) = self.task.take() {
+            if tokio::time::timeout(STOP_TIMEOUT, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
         }
     }
 }
@@ -97,6 +114,10 @@ impl SystemAudioCapture {
 impl Drop for SystemAudioCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.stop_notify.notify_one();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -199,8 +220,9 @@ async fn spawn_child(binary: &PathBuf) -> std::io::Result<Child> {
 
 async fn supervisor_loop(
     binary: PathBuf,
-    sender: Sender<AudioChunk>,
+    sender: LatestSender<AudioChunk>,
     stop: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
     dropped_chunks: Arc<AtomicU64>,
 ) {
     let mut consecutive_failures: u32 = 0;
@@ -219,12 +241,17 @@ async fn supervisor_loop(
                     tracing::error!("system audio helper failed too many times; giving up");
                     return;
                 }
-                tokio::time::sleep(restart_delay(consecutive_failures - 1)).await;
+                tokio::select! {
+                    biased;
+                    _ = stop_notify.notified() => return,
+                    _ = tokio::time::sleep(restart_delay(consecutive_failures - 1)) => {}
+                }
                 continue;
             }
         };
 
-        let exited_cleanly = read_child_stdout(child, &sender, &stop, &dropped_chunks).await;
+        let exited_cleanly =
+            read_child_stdout(child, &sender, &stop, &stop_notify, &dropped_chunks).await;
 
         if stop.load(Ordering::Acquire) {
             return;
@@ -250,14 +277,19 @@ async fn supervisor_loop(
             delay_ms = delay.as_millis() as u64,
             "system audio helper exited unexpectedly; respawning"
         );
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            biased;
+            _ = stop_notify.notified() => return,
+            _ = tokio::time::sleep(delay) => {}
+        }
     }
 }
 
 async fn read_child_stdout(
     mut child: Child,
-    sender: &Sender<AudioChunk>,
+    sender: &LatestSender<AudioChunk>,
     stop: &Arc<AtomicBool>,
+    stop_notify: &Notify,
     dropped_chunks: &AtomicU64,
 ) -> bool {
     let Some(mut stdout) = child.stdout.take() else {
@@ -273,8 +305,15 @@ async fn read_child_stdout(
             return true;
         }
 
-        let n = match stdout.read(&mut buf[offset..]).await {
-            Ok(0) => break, // EOF
+        let n = match tokio::select! {
+            biased;
+            _ = stop_notify.notified() => {
+                let _ = child.kill().await;
+                return true;
+            }
+            read = stdout.read(&mut buf[offset..]) => read,
+        } {
+            Ok(0) => break,
             Ok(n) => n,
             Err(_) => break,
         };
@@ -310,20 +349,20 @@ async fn read_child_stdout(
 }
 
 fn try_emit_chunk(
-    sender: &Sender<AudioChunk>,
+    sender: &LatestSender<AudioChunk>,
     chunk: AudioChunk,
     dropped_chunks: &AtomicU64,
 ) -> bool {
     match sender.try_send(chunk) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
+        Ok(Some(_)) => {
             let dropped = dropped_chunks.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped.is_power_of_two() {
                 tracing::warn!(dropped, "system audio capture queue overloaded");
             }
             true
         }
-        Err(TrySendError::Closed(_)) => false,
+        Ok(None) => true,
+        Err(_) => false,
     }
 }
 
@@ -412,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_output_drops_on_overload_and_detects_closed_receiver() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (tx, mut rx) = latest_channel(1);
         let dropped = AtomicU64::new(0);
         let chunk = AudioChunk {
             source: AudioSource::System,
@@ -427,6 +466,36 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().samples.len(), chunk.samples.len());
         drop(rx);
         assert!(!try_emit_chunk(&tx, chunk, &dropped));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_helper_read_is_interrupted_by_stop_notification() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (tx, _rx) = latest_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_notify = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicU64::new(0));
+        let task_stop = Arc::clone(&stop);
+        let task_notify = Arc::clone(&stop_notify);
+        let task_dropped = Arc::clone(&dropped);
+        let task = tokio::spawn(async move {
+            read_child_stdout(child, &tx, &task_stop, &task_notify, &task_dropped).await
+        });
+
+        tokio::task::yield_now().await;
+        stop.store(true, Ordering::Release);
+        stop_notify.notify_one();
+        let stopped = tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("stalled helper read exceeded stop deadline")
+            .unwrap();
+        assert!(stopped);
     }
 
     fn find_stub_binary() -> PathBuf {

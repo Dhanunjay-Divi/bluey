@@ -42,7 +42,9 @@ async fn system_audio_capture_receives_chunks_from_stub() {
         }
     }
 
-    capture.stop().await;
+    tokio::time::timeout(Duration::from_secs(2), capture.stop())
+        .await
+        .expect("system audio stop exceeded its deadline");
     std::env::remove_var("BLUEY_SYSTEM_AUDIO_BINARY");
 
     assert!(
@@ -77,10 +79,35 @@ async fn system_audio_capture_stops_cleanly() {
 
     // Receive one chunk then stop
     let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
-    capture.stop().await;
+    tokio::time::timeout(Duration::from_secs(2), capture.stop())
+        .await
+        .expect("system audio stop exceeded its deadline");
 
     std::env::remove_var("BLUEY_SYSTEM_AUDIO_BINARY");
     // If we get here without hanging, the test passes
+}
+
+#[tokio::test]
+async fn saturated_system_audio_queue_preserves_newest_chunks() {
+    let (tx, mut rx) = system_audio_channel();
+    for captured_at_ms in 0..=50 {
+        tx.try_send(AudioChunk {
+            source: AudioSource::System,
+            sample_rate: SampleRate::SR_16K,
+            samples: vec![captured_at_ms as i16; 320],
+            captured_at_ms,
+        })
+        .expect("queue receiver should remain open");
+    }
+    drop(tx);
+
+    let mut received = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        received.push(chunk.captured_at_ms);
+    }
+    assert_eq!(received.len(), 50);
+    assert_eq!(received.first(), Some(&1));
+    assert_eq!(received.last(), Some(&50));
 }
 
 /// Test that system audio chunks can drive a MockStt provider, simulating

@@ -53,15 +53,18 @@ use cue_core::pcm::{AudioChunk, AudioSource};
 use cue_core::stt::{
     ConnectionState, SttConfig, SttError, SttProvider, TranscriptEvent, WordTiming,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
+
+use crate::audio::capture::{latest_channel, LatestReceiver, LatestSendResult, LatestSender};
 
 /// Upper bound on consecutive reconnect attempts before we give up and
 /// return `ConnectionState::Failed`. Backoff starts at 250 ms and doubles,
@@ -74,6 +77,14 @@ const AUDIO_QUEUE_CAPACITY: usize = 50;
 /// Transcript buffering is intentionally small. Interim events are lossy;
 /// final, error, and speaker-label events wait for capacity.
 const EVENT_QUEUE_CAPACITY: usize = 64;
+const CONTROL_QUEUE_CAPACITY: usize = 1;
+const WEBSOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy)]
+enum StreamControl {
+    Finalize,
+}
 
 /// Configuration for the provider.
 #[derive(Debug, Clone)]
@@ -365,8 +376,10 @@ impl Default for DgConnection {
 /// The live provider handle. Produced by [`DeepgramProvider::connect`].
 pub struct DeepgramProvider {
     state: Arc<DeepgramState>,
-    audio_tx: Option<Sender<Vec<u8>>>,
-    events_rx: Receiver<Result<TranscriptEvent, SttError>>,
+    audio_tx: Option<LatestSender<Vec<u8>>>,
+    control_tx: Option<MpscSender<StreamControl>>,
+    events_rx: LatestReceiver<Result<TranscriptEvent, SttError>>,
+    supervisor: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for DeepgramProvider {
@@ -377,22 +390,35 @@ impl std::fmt::Debug for DeepgramProvider {
     }
 }
 
+impl Drop for DeepgramProvider {
+    fn drop(&mut self) {
+        self.state.closed.store(true, Ordering::Release);
+        if let Some(supervisor) = &self.supervisor {
+            supervisor.abort();
+        }
+    }
+}
+
 impl DeepgramProvider {
     /// Build a provider from an existing event/audio channel pair and a
     /// starting connection state. This is the seam unit tests use to drive
     /// the provider without opening a real WebSocket.
-    pub fn from_channels(
+    #[cfg(test)]
+    fn from_channels(
         _source: AudioSource,
         initial: ConnectionState,
-        events_rx: Receiver<Result<TranscriptEvent, SttError>>,
-        audio_tx: Sender<Vec<u8>>,
+        events_rx: LatestReceiver<Result<TranscriptEvent, SttError>>,
+        audio_tx: LatestSender<Vec<u8>>,
+        control_tx: MpscSender<StreamControl>,
     ) -> Self {
         let state = Arc::new(DeepgramState::default());
         state.connection.lock().state = initial;
         Self {
             state,
             audio_tx: Some(audio_tx),
+            control_tx: Some(control_tx),
             events_rx,
+            supervisor: None,
         }
     }
 
@@ -415,23 +441,28 @@ impl DeepgramProvider {
         let state = Arc::new(DeepgramState::default());
         state.connection.lock().state = ConnectionState::Connecting;
 
-        let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
+        let (audio_tx, audio_rx) = latest_channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
+        let (control_tx, control_rx) =
+            tokio::sync::mpsc::channel::<StreamControl>(CONTROL_QUEUE_CAPACITY);
         let (events_tx, events_rx) =
-            tokio::sync::mpsc::channel::<Result<TranscriptEvent, SttError>>(EVENT_QUEUE_CAPACITY);
+            latest_channel::<Result<TranscriptEvent, SttError>>(EVENT_QUEUE_CAPACITY);
 
-        tokio::spawn(run_supervisor(
+        let supervisor = tokio::spawn(run_supervisor(
             cfg,
             stt_cfg,
             source,
             state.clone(),
             audio_rx,
+            control_rx,
             events_tx,
         ));
 
         Ok(Self {
             state,
             audio_tx: Some(audio_tx),
+            control_tx: Some(control_tx),
             events_rx,
+            supervisor: Some(supervisor),
         })
     }
 
@@ -467,8 +498,7 @@ impl SttProvider for DeepgramProvider {
         // Cheap LE byte cast (all our targets are little-endian).
         let bytes: Vec<u8> = bytemuck::cast_slice(&chunk.samples).to_vec();
         match tx.try_send(bytes) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
+            Ok(Some(_)) => {
                 count_drop(
                     &self.state.dropped_audio_chunks,
                     "deepgram_nova3",
@@ -476,18 +506,17 @@ impl SttProvider for DeepgramProvider {
                 );
                 Ok(())
             }
-            Err(TrySendError::Closed(_)) => Err(SttError::NotActive),
+            Ok(None) => Ok(()),
+            Err(_) => Err(SttError::NotActive),
         }
     }
 
     async fn finalize(&self) -> Result<(), SttError> {
-        // Empty binary frame is our in-process signal to the supervisor
-        // that the utterance ended; it turns that into Deepgram's
-        // CloseStream JSON control message on the wire.
-        if let Some(tx) = &self.audio_tx {
-            tx.send(Vec::new()).await.map_err(|_| SttError::NotActive)?;
+        let tx = self.control_tx.as_ref().ok_or(SttError::NotActive)?;
+        match tx.try_send(StreamControl::Finalize) {
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Closed(_)) => Err(SttError::NotActive),
         }
-        Ok(())
     }
 
     async fn next_event(&mut self) -> Option<Result<TranscriptEvent, SttError>> {
@@ -498,6 +527,16 @@ impl SttProvider for DeepgramProvider {
         self.state.closed.store(true, Ordering::Release);
         self.state.connection.lock().state = ConnectionState::Closed;
         self.audio_tx = None;
+        self.control_tx = None;
+        if let Some(mut supervisor) = self.supervisor.take() {
+            if tokio::time::timeout(SUPERVISOR_SHUTDOWN_TIMEOUT, &mut supervisor)
+                .await
+                .is_err()
+            {
+                supervisor.abort();
+                let _ = supervisor.await;
+            }
+        }
         Ok(())
     }
 }
@@ -520,8 +559,9 @@ async fn run_supervisor(
     stt_cfg: SttConfig,
     source: AudioSource,
     state: Arc<DeepgramState>,
-    mut audio_rx: Receiver<Vec<u8>>,
-    events_tx: Sender<Result<TranscriptEvent, SttError>>,
+    mut audio_rx: LatestReceiver<Vec<u8>>,
+    mut control_rx: MpscReceiver<StreamControl>,
+    events_tx: LatestSender<Result<TranscriptEvent, SttError>>,
 ) {
     let mut attempt: u32 = 0;
     loop {
@@ -535,7 +575,17 @@ async fn run_supervisor(
             ConnectionState::Reconnecting { attempt }
         };
 
-        match run_connection(&cfg, &stt_cfg, source, &state, &mut audio_rx, &events_tx).await {
+        match run_connection(
+            &cfg,
+            &stt_cfg,
+            source,
+            &state,
+            &mut audio_rx,
+            &mut control_rx,
+            &events_tx,
+        )
+        .await
+        {
             Ok(()) => {
                 // Clean close initiated by our side.
                 state.connection.lock().state = ConnectionState::Closed;
@@ -549,7 +599,7 @@ async fn run_supervisor(
                         error = ?e,
                         "fatal stream error"
                     );
-                    let _ = events_tx.send(Err(e)).await;
+                    let _ = send_provider_event(&events_tx, Err(e), &state.dropped_partial_events);
                     state.connection.lock().state = ConnectionState::Failed;
                     return;
                 }
@@ -561,7 +611,7 @@ async fn run_supervisor(
                         attempts = attempt,
                         "giving up after max reconnect attempts"
                     );
-                    let _ = events_tx.send(Err(e)).await;
+                    let _ = send_provider_event(&events_tx, Err(e), &state.dropped_partial_events);
                     state.connection.lock().state = ConnectionState::Failed;
                     return;
                 }
@@ -586,8 +636,9 @@ async fn run_connection(
     stt_cfg: &SttConfig,
     source: AudioSource,
     state: &Arc<DeepgramState>,
-    audio_rx: &mut Receiver<Vec<u8>>,
-    events_tx: &Sender<Result<TranscriptEvent, SttError>>,
+    audio_rx: &mut LatestReceiver<Vec<u8>>,
+    control_rx: &mut MpscReceiver<StreamControl>,
+    events_tx: &LatestSender<Result<TranscriptEvent, SttError>>,
 ) -> Result<(), SttError> {
     let url = build_url(cfg, stt_cfg)?;
     let auth_value = format!("Token {}", cfg.api_key);
@@ -611,28 +662,35 @@ async fn run_connection(
 
     loop {
         if state.closed.load(Ordering::Acquire) {
-            let _ = write.send(Message::Close(None)).await;
+            let _ = send_websocket_message(&mut write, Message::Close(None)).await;
             return Ok(());
         }
 
         tokio::select! {
+            biased;
+            control = control_rx.recv() => {
+                match control {
+                    Some(StreamControl::Finalize) => {
+                        send_websocket_message(
+                            &mut write,
+                            Message::text(r#"{"type":"CloseStream"}"#),
+                        )
+                        .await?;
+                    }
+                    None => {
+                        let _ = send_websocket_message(&mut write, Message::Close(None)).await;
+                        return Ok(());
+                    }
+                }
+            }
             maybe_audio = audio_rx.recv() => {
                 match maybe_audio {
                     Some(bytes) => {
-                        let msg = if bytes.is_empty() {
-                            // finalize(): send Deepgram's CloseStream JSON
-                            // control without actually closing the socket.
-                            Message::text(r#"{"type":"CloseStream"}"#)
-                        } else {
-                            Message::binary(bytes)
-                        };
-                        if let Err(e) = write.send(msg).await {
-                            return Err(map_ws_error(e));
-                        }
+                        send_websocket_message(&mut write, Message::binary(bytes)).await?;
                     }
                     None => {
                         // Sender dropped — provider being torn down.
-                        let _ = write.send(Message::Close(None)).await;
+                        let _ = send_websocket_message(&mut write, Message::Close(None)).await;
                         return Ok(());
                     }
                 }
@@ -652,11 +710,11 @@ async fn run_connection(
                                 // Provider-level error in the JSON body.
                                 // Surface but keep the stream alive — the
                                 // next frame may recover.
-                                if events_tx
-                                    .send(Err(SttError::Provider(text.to_string())))
-                                    .await
-                                    .is_err()
-                                {
+                                if send_provider_event(
+                                    events_tx,
+                                    Err(SttError::Provider(text.to_string())),
+                                    &state.dropped_partial_events,
+                                ).is_err() {
                                     return Ok(());
                                 }
                             }
@@ -696,22 +754,51 @@ async fn run_connection(
 }
 
 async fn send_transcript_event(
-    events_tx: &Sender<Result<TranscriptEvent, SttError>>,
+    events_tx: &LatestSender<Result<TranscriptEvent, SttError>>,
     event: TranscriptEvent,
     dropped_partial_events: &AtomicU64,
 ) -> Result<(), ()> {
-    if matches!(event, TranscriptEvent::Partial { .. }) {
-        match events_tx.try_send(Ok(event)) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
+    send_provider_event(events_tx, Ok(event), dropped_partial_events)
+}
+
+fn send_provider_event(
+    events_tx: &LatestSender<Result<TranscriptEvent, SttError>>,
+    event: Result<TranscriptEvent, SttError>,
+    dropped_partial_events: &AtomicU64,
+) -> Result<(), ()> {
+    let incoming_partial = matches!(&event, Ok(TranscriptEvent::Partial { .. }));
+    let result = events_tx
+        .try_send_prioritized(event, |queued| {
+            queued
+                .iter()
+                .position(|queued| matches!(queued, Ok(TranscriptEvent::Partial { .. })))
+                .or_else(|| (!incoming_partial).then_some(0))
+        })
+        .map_err(|_| ())?;
+    match result {
+        LatestSendResult::Enqueued => {}
+        LatestSendResult::Replaced(evicted) => {
+            if matches!(evicted, Ok(TranscriptEvent::Partial { .. })) {
                 count_drop(dropped_partial_events, "deepgram_nova3", "partial events");
-                Ok(())
             }
-            Err(TrySendError::Closed(_)) => Err(()),
         }
-    } else {
-        events_tx.send(Ok(event)).await.map_err(|_| ())
+        LatestSendResult::Rejected(rejected) => {
+            if matches!(rejected, Ok(TranscriptEvent::Partial { .. })) {
+                count_drop(dropped_partial_events, "deepgram_nova3", "partial events");
+            }
+        }
     }
+    Ok(())
+}
+
+async fn send_websocket_message<S>(write: &mut S, message: Message) -> Result<(), SttError>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    tokio::time::timeout(WEBSOCKET_WRITE_TIMEOUT, write.send(message))
+        .await
+        .map_err(|_| SttError::Network("websocket write timed out".into()))?
+        .map_err(map_ws_error)
 }
 
 fn count_drop(counter: &AtomicU64, provider: &'static str, queue: &'static str) {
@@ -734,6 +821,32 @@ mod tests {
     use super::*;
     use cue_core::pcm::{AudioSource, SampleRate};
     use tokio::sync::mpsc::channel;
+
+    fn provider_from_test_channels(
+        initial: ConnectionState,
+        capacity: usize,
+    ) -> (
+        DeepgramProvider,
+        LatestReceiver<Vec<u8>>,
+        MpscReceiver<StreamControl>,
+        LatestSender<Result<TranscriptEvent, SttError>>,
+    ) {
+        let (audio_tx, audio_rx) = latest_channel(capacity);
+        let (control_tx, control_rx) = channel(1);
+        let (event_tx, event_rx) = latest_channel(capacity);
+        (
+            DeepgramProvider::from_channels(
+                AudioSource::Microphone,
+                initial,
+                event_rx,
+                audio_tx,
+                control_tx,
+            ),
+            audio_rx,
+            control_rx,
+            event_tx,
+        )
+    }
 
     fn cfg() -> (DeepgramConfig, SttConfig) {
         let dc = DeepgramConfig {
@@ -970,27 +1083,15 @@ mod tests {
 
     #[tokio::test]
     async fn provider_reports_initial_connection_state() {
-        let (audio_tx, _audio_rx) = channel::<Vec<u8>>(1);
-        let (_ev_tx, ev_rx) = channel(1);
-        let provider = DeepgramProvider::from_channels(
-            AudioSource::Microphone,
-            ConnectionState::Connected,
-            ev_rx,
-            audio_tx,
-        );
+        let (provider, _audio_rx, _control_rx, _event_tx) =
+            provider_from_test_channels(ConnectionState::Connected, 1);
         assert_eq!(provider.connection_state(), ConnectionState::Connected);
     }
 
     #[tokio::test]
     async fn provider_close_flips_state_and_rejects_send() {
-        let (audio_tx, _audio_rx) = channel::<Vec<u8>>(1);
-        let (_ev_tx, ev_rx) = channel(1);
-        let mut provider = DeepgramProvider::from_channels(
-            AudioSource::Microphone,
-            ConnectionState::Connected,
-            ev_rx,
-            audio_tx,
-        );
+        let (mut provider, _audio_rx, _control_rx, _event_tx) =
+            provider_from_test_channels(ConnectionState::Connected, 1);
         provider.close().await.unwrap();
         assert_eq!(provider.connection_state(), ConnectionState::Closed);
 
@@ -1006,65 +1107,65 @@ mod tests {
 
     #[tokio::test]
     async fn provider_forwards_scripted_events() {
-        let (audio_tx, _audio_rx) = channel::<Vec<u8>>(1);
-        let (ev_tx, ev_rx) = channel(1);
-        let mut provider = DeepgramProvider::from_channels(
-            AudioSource::System,
-            ConnectionState::Connected,
-            ev_rx,
-            audio_tx,
-        );
+        let (mut provider, _audio_rx, _control_rx, ev_tx) =
+            provider_from_test_channels(ConnectionState::Connected, 1);
         ev_tx
-            .send(Ok(TranscriptEvent::Partial {
+            .try_send(Ok(TranscriptEvent::Partial {
                 text: "hi".into(),
                 confidence: Some(0.9),
                 source: AudioSource::System,
             }))
-            .await
             .unwrap();
         let e = provider.next_event().await.unwrap().unwrap();
         assert!(matches!(e, TranscriptEvent::Partial { ref text, .. } if text == "hi"));
     }
 
     #[tokio::test]
-    async fn audio_overload_drops_audio_but_finalize_waits_for_capacity() {
-        let (audio_tx, mut audio_rx) = channel::<Vec<u8>>(1);
-        let (_ev_tx, ev_rx) = channel(1);
-        let provider = DeepgramProvider::from_channels(
-            AudioSource::Microphone,
-            ConnectionState::Connected,
-            ev_rx,
-            audio_tx,
-        );
-        let chunk = AudioChunk {
+    async fn audio_overload_keeps_newest_and_finalize_has_priority() {
+        let (provider, mut audio_rx, mut control_rx, _event_tx) =
+            provider_from_test_channels(ConnectionState::Connected, 1);
+        let first = AudioChunk {
             source: AudioSource::Microphone,
             sample_rate: SampleRate::SR_16K,
-            samples: vec![0; 320],
+            samples: vec![1; 320],
             captured_at_ms: 0,
         };
+        let second = AudioChunk {
+            samples: vec![2; 320],
+            ..first.clone()
+        };
 
-        provider.send_audio(&chunk).await.unwrap();
-        provider.send_audio(&chunk).await.unwrap();
+        provider.send_audio(&first).await.unwrap();
+        provider.send_audio(&second).await.unwrap();
         assert_eq!(provider.dropped_audio_chunks(), 1);
+        let newest = audio_rx.recv().await.unwrap();
+        assert_eq!(i16::from_le_bytes([newest[0], newest[1]]), 2);
 
-        let finalize = provider.finalize();
-        tokio::pin!(finalize);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut finalize)
-                .await
-                .is_err()
-        );
-        assert!(!audio_rx.recv().await.unwrap().is_empty());
-        tokio::time::timeout(Duration::from_secs(1), &mut finalize)
+        tokio::time::timeout(Duration::from_millis(50), provider.finalize())
             .await
             .unwrap()
             .unwrap();
-        assert!(audio_rx.recv().await.unwrap().is_empty());
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(StreamControl::Finalize)
+        ));
     }
 
     #[tokio::test]
-    async fn partial_overload_drops_interim_but_final_waits_and_delivers() {
-        let (tx, mut rx) = channel(1);
+    async fn close_aborts_stalled_supervisor_by_deadline() {
+        let (mut provider, _audio_rx, _control_rx, _event_tx) =
+            provider_from_test_channels(ConnectionState::Connected, 1);
+        provider.supervisor = Some(tokio::spawn(std::future::pending()));
+
+        tokio::time::timeout(Duration::from_secs(1), provider.close())
+            .await
+            .expect("provider close exceeded supervisor deadline")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_event_evicts_partial_without_waiting() {
+        let (tx, mut rx) = latest_channel(1);
         let dropped = AtomicU64::new(0);
         let partial = TranscriptEvent::Partial {
             text: "interim".into(),
@@ -1083,21 +1184,14 @@ mod tests {
             source: AudioSource::Microphone,
             words: Vec::new(),
         };
-        let send_final = send_transcript_event(&tx, final_event, &dropped);
-        tokio::pin!(send_final);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut send_final)
-                .await
-                .is_err()
-        );
-        assert!(matches!(
-            rx.recv().await,
-            Some(Ok(TranscriptEvent::Partial { .. }))
-        ));
-        tokio::time::timeout(Duration::from_secs(1), &mut send_final)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            send_transcript_event(&tx, final_event, &dropped),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
         assert!(matches!(
             rx.recv().await,
             Some(Ok(TranscriptEvent::Final { .. }))

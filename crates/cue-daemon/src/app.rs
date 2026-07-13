@@ -89,6 +89,8 @@ const LIVE_STT_AUDIBLE_PEAK_DBFS: f64 = -34.0;
 const LIVE_STT_PREFACE_CHUNKS: usize = 8;
 const LIVE_STT_STARTUP_WARMUP_MS: u128 = 250;
 const LIVE_STT_FINALIZE_WAIT_MS: u64 = 850;
+const LIVE_STT_WEBSOCKET_WRITE_TIMEOUT_MS: u64 = 750;
+const LIVE_STT_SOURCE_SETTLE_TIMEOUT_MS: u64 = 2_000;
 const LIVE_STT_INTERIM_CONTEXT_MAX_AGE_MS: u64 = 10_000;
 const LIVE_STT_SILENCE_NOTICE_MS: u128 = 8_000;
 const PCM16_DBFS_FLOOR: f64 = -120.0;
@@ -4366,7 +4368,7 @@ async fn wait_for_live_caption_answer_transcript_settle(
     // Stop moves a session into a short finalizing window so the provider can
     // deliver its last words. Answer must wait for that session too, not only
     // for an actively recording session.
-    let Some(audio_session_id) = audio_transcript_session_for_segment(daemon)
+    let Some(audio_session_id) = audio_transcript_session_for_segment(daemon, None)
         .await
         .map(|session| session.session_id)
     else {
@@ -4467,7 +4469,7 @@ async fn recent_interim_live_transcript_context(daemon: &Arc<Daemon>) -> Option<
     // Stop moves the recorder into a bounded finalization window. Deepgram can
     // leave a useful interim as the last event when no final frame arrives, so
     // consult the same active-or-finalizing session used by transcript settle.
-    let audio_session_id = audio_transcript_session_for_segment(daemon)
+    let audio_session_id = audio_transcript_session_for_segment(daemon, None)
         .await?
         .session_id;
     let event = daemon.last_live_transcript.lock().await.clone()?;
@@ -4962,7 +4964,7 @@ async fn real_audio_loop(
                         last_audible_activity_at = Instant::now();
                     }
                     if let Some(segment) = captured.segment {
-                        match add_audio_transcript_segment(&daemon, &segment).await {
+                        match add_audio_transcript_segment(&daemon, &session_id, &segment).await {
                             Ok(true) => {
                                 daemon.audio.lock().await.record_stt_segment();
                             }
@@ -5219,24 +5221,14 @@ async fn real_audio_relay_loop(
     }
 
     let _ = relay_stop_tx.send(true);
-    let mut late_settlements = 0_usize;
+    let settle_deadline = Instant::now() + Duration::from_millis(LIVE_STT_SOURCE_SETTLE_TIMEOUT_MS);
+    let mut aborted_sources = 0_usize;
     for mut handle in handles {
-        if tokio::time::timeout(Duration::from_secs(5), &mut handle)
-            .await
-            .is_err()
-        {
-            late_settlements = late_settlements.saturating_add(1);
-            let daemon_for_late_settle = Arc::clone(&daemon);
-            let session_id_for_late_settle = session_id.clone();
-            tokio::spawn(async move {
-                let _ = handle.await;
-                let refreshed = refresh_overlay_balance(&daemon_for_late_settle, None).await;
-                info!(
-                    session_id = %session_id_for_late_settle,
-                    balance_refreshed = refreshed.is_some(),
-                    "live STT relay source settled after stop wait"
-                );
-            });
+        let remaining = settle_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || tokio::time::timeout(remaining, &mut handle).await.is_err() {
+            aborted_sources = aborted_sources.saturating_add(1);
+            handle.abort();
+            let _ = handle.await;
         }
     }
     let refreshed = refresh_overlay_balance(&daemon, None).await;
@@ -5245,7 +5237,7 @@ async fn real_audio_relay_loop(
         session_id = %session_id,
         completed_sources,
         source_count,
-        late_settlements,
+        aborted_sources,
         balance_refreshed = refreshed.is_some(),
         "live STT relay loop settlement refresh completed"
     );
@@ -5536,7 +5528,11 @@ async fn run_relay_audio_source(
         );
         start_ms = start_ms.saturating_add(duration_ms as u64);
         if !active_audio_session_matches(&daemon, &session_id).await {
-            let _ = ws_tx.send(WebSocketMessage::Close(None)).await;
+            let _ = timeout(
+                Duration::from_millis(LIVE_STT_WEBSOCKET_WRITE_TIMEOUT_MS),
+                ws_tx.send(WebSocketMessage::Close(None)),
+            )
+            .await;
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Ok(());
@@ -5561,15 +5557,23 @@ async fn run_relay_audio_source(
         if stats.is_audible_for_stt() {
             *last_audible_activity_at.lock().await = Instant::now();
         }
-        ws_tx
-            .send(WebSocketMessage::Binary(preface))
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to send buffered live {} audio to Bluey STT relay",
-                    source.source
-                )
-            })?;
+        timeout(
+            Duration::from_millis(LIVE_STT_WEBSOCKET_WRITE_TIMEOUT_MS),
+            ws_tx.send(WebSocketMessage::Binary(preface)),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "timed out sending buffered live {} audio to Bluey STT relay",
+                source.source
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "failed to send buffered live {} audio to Bluey STT relay",
+                source.source
+            )
+        })?;
     }
 
     loop {
@@ -5621,10 +5625,13 @@ async fn run_relay_audio_source(
                 if stats.is_audible_for_stt() {
                     *last_audible_activity_at.lock().await = Instant::now();
                 }
-                ws_tx
-                    .send(WebSocketMessage::Binary(buffer[..read].to_vec()))
-                    .await
-                    .with_context(|| format!("failed to send live {} audio to Bluey STT relay", source.source))?;
+                timeout(
+                    Duration::from_millis(LIVE_STT_WEBSOCKET_WRITE_TIMEOUT_MS),
+                    ws_tx.send(WebSocketMessage::Binary(buffer[..read].to_vec())),
+                )
+                .await
+                .with_context(|| format!("timed out sending live {} audio to Bluey STT relay", source.source))?
+                .with_context(|| format!("failed to send live {} audio to Bluey STT relay", source.source))?;
             }
             message = ws_rx.next() => {
                 match message {
@@ -5661,12 +5668,19 @@ async fn run_relay_audio_source(
     }
 
     let finalize_wait_ms = live_stt_finalize_wait_ms();
-    let _ = ws_tx
-        .send(WebSocketMessage::Text(
+    let finalize_started = Instant::now();
+    let finalize_budget = Duration::from_millis(finalize_wait_ms);
+    let finalize_send_budget =
+        finalize_budget.min(Duration::from_millis(LIVE_STT_WEBSOCKET_WRITE_TIMEOUT_MS));
+    let _ = timeout(
+        finalize_send_budget,
+        ws_tx.send(WebSocketMessage::Text(
             r#"{"type":"CloseStream"}"#.to_string(),
-        ))
-        .await;
-    let finalize_deadline = sleep(Duration::from_millis(finalize_wait_ms));
+        )),
+    )
+    .await;
+    let finalize_remaining = finalize_budget.saturating_sub(finalize_started.elapsed());
+    let finalize_deadline = sleep(finalize_remaining);
     tokio::pin!(finalize_deadline);
     let mut tail_frames = 0_u64;
     loop {
@@ -5719,7 +5733,11 @@ async fn run_relay_audio_source(
         finalize_wait_ms,
         "live STT relay tail finalize drained"
     );
-    let _ = ws_tx.send(WebSocketMessage::Close(None)).await;
+    let _ = timeout(
+        Duration::from_millis(LIVE_STT_WEBSOCKET_WRITE_TIMEOUT_MS),
+        ws_tx.send(WebSocketMessage::Close(None)),
+    )
+    .await;
     let _ = child.kill().await;
     let _ = child.wait().await;
     Ok(())
@@ -5792,7 +5810,7 @@ async fn emit_deepgram_relay_payload(
             text_words = word_count(&segment.text),
             "live STT relay transcript event received"
         );
-        match add_audio_transcript_segment(daemon, &segment).await {
+        match add_audio_transcript_segment(daemon, session_id, &segment).await {
             Ok(true) => {
                 daemon.audio.lock().await.record_stt_segment();
             }
@@ -8061,17 +8079,32 @@ async fn active_audio_session_matches(daemon: &Arc<Daemon>, session_id: &str) ->
 
 async fn audio_transcript_session_for_segment(
     daemon: &Arc<Daemon>,
+    expected_session_id: Option<&str>,
 ) -> Option<AudioTranscriptSession> {
     let mut runtime = daemon.audio_runtime.lock().await;
+    select_audio_transcript_session(&mut runtime, expected_session_id, Instant::now())
+}
+
+fn select_audio_transcript_session(
+    runtime: &mut AudioRuntime,
+    expected_session_id: Option<&str>,
+    now: Instant,
+) -> Option<AudioTranscriptSession> {
     if let (Some(session_id), Some(meeting_id)) = (runtime.session_id.clone(), runtime.meeting_id) {
-        return Some(AudioTranscriptSession {
-            session_id,
-            meeting_id,
-            finalizing: false,
-        });
+        if expected_session_id.is_none_or(|expected| expected == session_id) {
+            return Some(AudioTranscriptSession {
+                session_id,
+                meeting_id,
+                finalizing: false,
+            });
+        }
+        return None;
     }
     let finalizing = runtime.finalizing_session.as_ref()?;
-    if Instant::now() <= finalizing.expires_at {
+    if expected_session_id.is_some_and(|expected| expected != finalizing.session_id) {
+        return None;
+    }
+    if now <= finalizing.expires_at {
         return Some(AudioTranscriptSession {
             session_id: finalizing.session_id.clone(),
             meeting_id: finalizing.meeting_id,
@@ -8088,7 +8121,7 @@ async fn audio_transcript_session_for_segment(
 }
 
 async fn audio_session_accepts_transcripts(daemon: &Arc<Daemon>, session_id: &str) -> bool {
-    audio_transcript_session_for_segment(daemon)
+    audio_transcript_session_for_segment(daemon, Some(session_id))
         .await
         .is_some_and(|active| active.session_id == session_id)
 }
@@ -8110,26 +8143,32 @@ async fn clear_finalizing_audio_session(daemon: &Arc<Daemon>, session_id: &str) 
 
 async fn add_audio_transcript_segment(
     daemon: &Arc<Daemon>,
+    audio_session_id: &str,
     segment: &cue_core::audio::SttSegmentMetadata,
 ) -> Result<bool> {
-    add_audio_transcript_segment_inner(daemon, segment, false).await
+    add_audio_transcript_segment_inner(daemon, Some(audio_session_id), segment, false).await
 }
 
 async fn add_audio_transcript_segment_allowing_session_start(
     daemon: &Arc<Daemon>,
     segment: &cue_core::audio::SttSegmentMetadata,
 ) -> Result<bool> {
-    add_audio_transcript_segment_inner(daemon, segment, true).await
+    add_audio_transcript_segment_inner(daemon, None, segment, true).await
 }
 
 async fn add_audio_transcript_segment_inner(
     daemon: &Arc<Daemon>,
+    expected_audio_session_id: Option<&str>,
     segment: &cue_core::audio::SttSegmentMetadata,
     allow_session_start: bool,
 ) -> Result<bool> {
-    let audio_session = audio_transcript_session_for_segment(daemon).await;
+    let audio_session =
+        audio_transcript_session_for_segment(daemon, expected_audio_session_id).await;
     if audio_session.is_none() && !allow_session_start {
-        debug!("dropping late audio transcript segment after capture stopped");
+        debug!(
+            expected_audio_session_id = expected_audio_session_id.unwrap_or("none"),
+            "dropping late audio transcript segment after its capture session stopped"
+        );
         return Ok(false);
     }
     let audio_session_id = audio_session
@@ -20524,6 +20563,59 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
 
         std::env::remove_var("BLUEY_LIVE_STT_FINALIZE_WAIT_MS");
         std::env::remove_var("BLUEY_STT_FINALIZE_WAIT_MS");
+    }
+
+    #[test]
+    fn transcript_session_selection_rejects_previous_run_after_restart() {
+        let meeting_id = uuid::Uuid::new_v4();
+        let now = Instant::now();
+        let mut runtime = AudioRuntime {
+            stop: None,
+            session_id: None,
+            meeting_id: None,
+            finalizing_session: Some(AudioFinalizingSession {
+                session_id: "old-run".to_string(),
+                meeting_id,
+                expires_at: now + Duration::from_secs(1),
+            }),
+            start_generation: 1,
+            starting: false,
+        };
+        assert!(select_audio_transcript_session(&mut runtime, Some("old-run"), now).is_some());
+
+        runtime.session_id = Some("new-run".to_string());
+        runtime.meeting_id = Some(meeting_id);
+        assert!(select_audio_transcript_session(&mut runtime, Some("old-run"), now).is_none());
+        assert_eq!(
+            select_audio_transcript_session(&mut runtime, Some("new-run"), now)
+                .map(|session| session.session_id),
+            Some("new-run".to_string())
+        );
+    }
+
+    #[test]
+    fn transcript_session_finalization_expires_at_deadline() {
+        let now = Instant::now();
+        let mut runtime = AudioRuntime {
+            stop: None,
+            session_id: None,
+            meeting_id: None,
+            finalizing_session: Some(AudioFinalizingSession {
+                session_id: "finished-run".to_string(),
+                meeting_id: uuid::Uuid::new_v4(),
+                expires_at: now + Duration::from_millis(10),
+            }),
+            start_generation: 1,
+            starting: false,
+        };
+
+        assert!(select_audio_transcript_session(
+            &mut runtime,
+            Some("finished-run"),
+            now + Duration::from_millis(11),
+        )
+        .is_none());
+        assert!(runtime.finalizing_session.is_none());
     }
 
     #[test]
