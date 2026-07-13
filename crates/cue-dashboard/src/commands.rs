@@ -1495,6 +1495,10 @@ pub fn get_mouse_passthrough(db: State<DbState>) -> Result<bool, String> {
 
 // ===== Phase 3 Round 9: User-Rebindable Keybinds =====
 
+pub(crate) const DEFAULT_LISTENING_SHORTCUT: &str = "Ctrl+Alt+L";
+
+pub struct ListeningShortcutState(pub String);
+
 /// A keybind entry returned to the frontend.
 #[derive(Clone, Serialize)]
 pub struct KeybindEntry {
@@ -1506,19 +1510,79 @@ pub struct KeybindEntry {
 fn default_keybinds() -> Vec<(&'static str, &'static str)> {
     if cfg!(target_os = "macos") {
         vec![
-            ("toggle_listening", "CmdOrCtrl+Shift+L"),
+            ("toggle_listening", DEFAULT_LISTENING_SHORTCUT),
             ("push_to_talk", "CmdOrCtrl+Shift+P"),
             ("toggle_overlay", "CmdOrCtrl+Shift+H"),
             ("toggle_dashboard", "CmdOrCtrl+Shift+D"),
         ]
     } else {
         vec![
-            ("toggle_listening", "Ctrl+Shift+L"),
+            ("toggle_listening", DEFAULT_LISTENING_SHORTCUT),
             ("push_to_talk", "Ctrl+Shift+P"),
             ("toggle_overlay", "Ctrl+Shift+H"),
             ("toggle_dashboard", "Ctrl+Shift+D"),
         ]
     }
+}
+
+pub(crate) fn listening_shortcut_accelerator(db_state: &DbState) -> String {
+    let candidate = db_state.0.lock().ok().and_then(|db| {
+        if let Err(error) = db.ensure_keybinds_table() {
+            tracing::warn!(%error, "failed to prepare listening shortcut settings");
+            return None;
+        }
+        match db.load_keybind("toggle_listening") {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "failed to load listening shortcut");
+                None
+            }
+        }
+    });
+
+    candidate
+        .filter(|accelerator| {
+            accelerator
+                .parse::<tauri_plugin_global_shortcut::Shortcut>()
+                .is_ok()
+        })
+        .unwrap_or_else(|| DEFAULT_LISTENING_SHORTCUT.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn listening_shortcut_label(accelerator: &str) -> String {
+    accelerator
+        .split('+')
+        .map(|part| match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => "⌃".to_string(),
+            "alt" | "option" => "⌥".to_string(),
+            "shift" => "⇧".to_string(),
+            "cmd" | "command" | "meta" | "super" | "cmdorctrl" => "⌘".to_string(),
+            _ => part.trim().to_ascii_uppercase(),
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn listening_shortcut_label(accelerator: &str) -> String {
+    accelerator
+        .split('+')
+        .map(|part| {
+            if part.trim().eq_ignore_ascii_case("cmdorctrl") {
+                "Ctrl".to_string()
+            } else {
+                part.trim().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// Return the startup listening shortcut as a platform-friendly display label.
+#[tauri::command]
+pub fn get_listening_shortcut(shortcut: State<ListeningShortcutState>) -> String {
+    listening_shortcut_label(&shortcut.0)
 }
 
 /// List all keybinds (from DB, falling back to defaults).
@@ -1541,6 +1605,7 @@ pub fn list_keybinds(db: State<DbState>) -> Result<Vec<KeybindEntry>, String> {
 }
 
 /// Set a keybind for an action. Validates the accelerator string.
+/// A changed listening shortcut takes effect after Bluey restarts.
 #[tauri::command]
 pub fn set_keybind(action: String, accelerator: String, db: State<DbState>) -> Result<(), String> {
     // Validate accelerator by attempting to parse
@@ -1561,6 +1626,50 @@ pub fn reset_keybinds(db: State<DbState>) -> Result<(), String> {
     db.ensure_keybinds_table().map_err(|e| e.to_string())?;
     db.reset_keybinds().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod listening_shortcut_tests {
+    use super::*;
+
+    fn shortcut_state(accelerator: Option<&str>) -> DbState {
+        let db = cue_daemon::db::Database::open(":memory:").expect("open test database");
+        db.ensure_keybinds_table().expect("create keybind table");
+        if let Some(accelerator) = accelerator {
+            db.save_keybind("toggle_listening", accelerator)
+                .expect("save listening shortcut");
+        }
+        DbState(Mutex::new(db))
+    }
+
+    #[test]
+    fn listening_shortcut_uses_valid_persisted_value() {
+        let state = shortcut_state(Some("CmdOrCtrl+Shift+K"));
+        assert_eq!(listening_shortcut_accelerator(&state), "CmdOrCtrl+Shift+K");
+    }
+
+    #[test]
+    fn listening_shortcut_rejects_invalid_persisted_value() {
+        let state = shortcut_state(Some(""));
+        assert_eq!(
+            listening_shortcut_accelerator(&state),
+            DEFAULT_LISTENING_SHORTCUT
+        );
+    }
+
+    #[test]
+    fn listening_shortcut_default_and_label_share_one_accelerator() {
+        let default = default_keybinds()
+            .into_iter()
+            .find(|(action, _)| *action == "toggle_listening")
+            .expect("listening keybind default")
+            .1;
+        assert_eq!(default, DEFAULT_LISTENING_SHORTCUT);
+        #[cfg(target_os = "macos")]
+        assert_eq!(listening_shortcut_label(default), "⌃⌥L");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(listening_shortcut_label(default), "Ctrl+Alt+L");
+    }
 }
 
 // ===== Phase 3 Round 10: Cmd+Shift+A → request_cue =====

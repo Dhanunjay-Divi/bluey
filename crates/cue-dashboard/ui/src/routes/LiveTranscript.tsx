@@ -8,6 +8,7 @@ import {
   type PendingListeningAction,
   errorMessage,
   listeningError,
+  listeningShortcutLabel,
   listeningSourceSummary,
   listeningViewState,
   shouldAcceptAudioStatus,
@@ -31,6 +32,11 @@ export function LiveTranscript() {
   const [statusLoading, setStatusLoading] = useState(true);
   const [pendingAction, setPendingAction] = useState<PendingListeningAction>(null);
   const [boundaryError, setBoundaryError] = useState<string | null>(null);
+  const [shortcut, setShortcut] = useState(() => {
+    const isMac =
+      typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+    return listeningShortcutLabel(isMac);
+  });
 
   const rebuildFromMap = useCallback(() => {
     const sorted = Array.from(segMapRef.current.values()).sort(
@@ -88,6 +94,21 @@ export function LiveTranscript() {
     setAudioStatus(status);
     setStatusLoading(false);
     setBoundaryError(null);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    invoke<string>("get_listening_shortcut")
+      .then((label) => {
+        const next = label.trim();
+        if (!disposed && next) setShortcut(next);
+      })
+      .catch(() => {
+        // The platform fallback remains truthful for older dashboard builds.
+      });
+    return () => {
+      disposed = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -193,7 +214,10 @@ export function LiveTranscript() {
               </span>
             </div>
             <p className="mt-1 pl-[30px] text-xs text-zinc-500">
-              {view.active ? sourceSummary.label : "System audio and microphone"}
+              {view.active
+                ? `Active sources: ${sourceSummary.label}`
+                : "Starts system audio and microphone"}
+              {` · Shortcut ${shortcut}`}
             </p>
           </div>
 
@@ -236,10 +260,12 @@ export function LiveTranscript() {
           <div className="max-w-sm">
             <AudioLines aria-hidden="true" className="mx-auto text-zinc-600" size={30} />
             <p className="mt-3 text-sm font-medium text-zinc-300">
-              {view.active ? "Listening for speech" : "No live transcript"}
+              {view.active ? "Listening for speech" : "Start a live transcript in one click"}
             </p>
             <p className="mt-1 text-xs text-zinc-500">
-              {view.active ? sourceSummary.label : "Listening is off"}
+              {view.active
+                ? "Your first transcript segment will appear here and stay available after listening stops."
+                : `Use Start Listening above or press ${shortcut}.`}
             </p>
           </div>
         </div>

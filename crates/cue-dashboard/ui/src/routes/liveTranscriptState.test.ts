@@ -4,6 +4,7 @@ import {
   type AudioPipelineStatusView,
   isListening,
   listeningError,
+  listeningShortcutLabel,
   listeningSourceSummary,
   listeningViewState,
   shouldAcceptAudioStatus,
@@ -137,5 +138,10 @@ describe("live transcript listening state", () => {
     expect(listeningError(failedSystem, "Bluey's local audio service is unavailable.")).toBe(
       "Bluey's local audio service is unavailable.",
     );
+  });
+
+  it("shows the shortcut that the desktop actually registers", () => {
+    expect(listeningShortcutLabel(true)).toBe("Control+Option+L");
+    expect(listeningShortcutLabel(false)).toBe("Ctrl+Alt+L");
   });
 });

@@ -77,6 +77,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Show Bluey's machine-readable product policy and provenance notice.
+    Legal {
+        /// Emit the policy as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Start Bluey and open an interactive meeting session.
     #[command(hide = true)]
     Run(RunArgs),
@@ -604,6 +610,22 @@ pub async fn cli_main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Legal { json } => {
+            let policy = cue_core::embedded_product_policy();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&policy)?);
+            } else {
+                println!("Bluey product policy");
+                println!("License: {}", policy.license);
+                println!("Build: {}", policy.build_id);
+                println!("Terms: {}", policy.terms_url);
+                println!("Automated extraction: {}", policy.automated_extraction);
+                println!("Model training: {}", policy.model_training);
+                println!("Redistribution: {}", policy.redistribution);
+                println!("This is a policy notice, not a DRM boundary.");
+            }
+            Ok(())
+        }
         Commands::Run(args) => run(args).await,
         Commands::On(args) => cue_on(args).await,
         Commands::Off => cue_off().await,
@@ -3842,7 +3864,8 @@ mod tests {
     use super::{
         answer_request_from_args, bluey_on_boot_lines, bluey_on_boot_title,
         default_bluey_signin_url, device_login_url, install_root_from_exe, login_account_provider,
-        resolve_daemon_bin_from_roots, resolve_login_api_url_from, AskArgs, BlueyOnAuthState,
+        resolve_daemon_bin_from_roots, resolve_login_api_url_from, AskArgs, BlueyOnAuthState, Cli,
+        Commands,
     };
     use cue_core::AiProviderKind;
     use std::{
@@ -3852,6 +3875,17 @@ mod tests {
             Duration as StdDuration, SystemTime as StdSystemTime, UNIX_EPOCH as STD_UNIX_EPOCH,
         },
     };
+
+    #[test]
+    fn legal_command_accepts_optional_json_flag() {
+        let plain = <Cli as clap::Parser>::try_parse_from(["bluey", "legal"])
+            .expect("parse plain legal command");
+        assert!(matches!(plain.command, Commands::Legal { json: false }));
+
+        let json = <Cli as clap::Parser>::try_parse_from(["bluey", "legal", "--json"])
+            .expect("parse JSON legal command");
+        assert!(matches!(json.command, Commands::Legal { json: true }));
+    }
 
     #[test]
     fn bluey_on_boot_lines_offer_browser_signin_when_unlinked() {

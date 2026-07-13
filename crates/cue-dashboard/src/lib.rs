@@ -89,6 +89,7 @@ pub fn run() {
             commands::set_mouse_passthrough,
             commands::get_mouse_passthrough,
             commands::list_keybinds,
+            commands::get_listening_shortcut,
             commands::set_keybind,
             commands::reset_keybinds,
             // R10: Cue AI hotkey
@@ -117,6 +118,11 @@ pub fn run() {
             });
             app.manage(DbState(Mutex::new(db)));
             app.manage(ActiveSessionState(Mutex::new(restored)));
+            let listening_accelerator = {
+                let db_state: tauri::State<'_, DbState> = app.state();
+                commands::listening_shortcut_accelerator(&db_state)
+            };
+            app.manage(commands::ListeningShortcutState(listening_accelerator));
 
             // R7: Live transcript poller — reads daemon meeting file and emits
             // Tauri events for new segments.
@@ -239,14 +245,20 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
             }
         })?;
 
-    // Toggle listening: Ctrl+Option/Alt+L.
+    // Toggle listening: persisted accelerator, falling back to Ctrl+Option/Alt+L.
+    let listening_accelerator = {
+        let shortcut: tauri::State<'_, commands::ListeningShortcutState> = app.state();
+        shortcut.0.clone()
+    };
     let handle2 = app.handle().clone();
-    app.global_shortcut()
-        .on_shortcut("Ctrl+Alt+L", move |_app, _shortcut, event| {
+    app.global_shortcut().on_shortcut(
+        listening_accelerator.as_str(),
+        move |_app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 let _ = handle2.emit("hotkey_toggle_listening", ());
             }
-        })?;
+        },
+    )?;
 
     // Push-to-talk toggle: Ctrl+Option/Alt+P.
     // Note: tauri-plugin-global-shortcut does not expose distinct press/release

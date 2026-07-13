@@ -9,6 +9,7 @@ pub mod intelligence;
 pub mod ipc;
 pub mod ipc_auth;
 pub mod ipc_transport;
+pub mod legal;
 pub mod logging;
 pub mod meeting;
 pub mod observability;
@@ -52,6 +53,10 @@ pub use ipc_auth::{
     load_ipc_capability, publish_ipc_capability, remove_ipc_capability_if_current,
     AuthenticatedDaemonRequest, DaemonWireRequest, IpcAuthErrorCode, IpcAuthenticator,
     IpcAuthorization, IpcCapabilityRecord,
+};
+pub use legal::{
+    embedded_product_policy, EmbeddedProductPolicy, BLUEY_BUILD_ID, BLUEY_LICENSE_ID,
+    BLUEY_POLICY_SCHEMA_VERSION, BLUEY_TERMS_URL,
 };
 pub use logging::{
     init_local_json_logging, local_log_dir, log_file_prefix, retain_recent_log_files, LocalLogGuard,

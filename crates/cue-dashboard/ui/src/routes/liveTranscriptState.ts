@@ -273,3 +273,7 @@ export function errorMessage(error: unknown): string {
   }
   return "Unable to update listening.";
 }
+
+export function listeningShortcutLabel(isMac: boolean): string {
+  return isMac ? "Control+Option+L" : "Ctrl+Alt+L";
+}

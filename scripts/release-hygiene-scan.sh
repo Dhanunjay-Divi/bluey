@@ -11,6 +11,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Keep the archive-specific fail-closed checks executable even on hosts that
+# are only scanning source/web inputs in this invocation.
+python3 scripts/check-release-artifact-contents.py --self-test
+
 if [ "$#" -gt 0 ]; then
     TARGETS=("$@")
 else
