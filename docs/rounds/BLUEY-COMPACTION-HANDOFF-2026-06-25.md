@@ -30,10 +30,10 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest active Bluey engineering round doc is
-  `ROUND-519-INTERRUPTED-ASKS-RECONCILIATION.md`; the next canonical Bluey
-  round doc should start at `ROUND-520-...` after Round 519 release evidence is
-  complete.
+- Latest completed engineering round docs are
+  `ROUND-519-INTERRUPTED-ASKS-RECONCILIATION.md` and
+  `ROUND-520-BLUEY-PARALLEL-BRANCH-RECONCILIATION.md`; the next canonical
+  Bluey round doc starts at `ROUND-521-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 - Do not claim raw-audio retention, replay, or training from the current audit
   bundle. The shipped `audio/audio.jsonl` path is a manifest placeholder; any
@@ -42,18 +42,44 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 
 ## Current State
 
-- Round 519 is the active interrupted-work reconciliation on branch
-  `codex/bluey-interrupted-asks-round519-20260712`:
+- Round 519 completed the interrupted-work reconciliation and signed release on
+  branch `codex/bluey-interrupted-asks-round519-20260712`:
   - closes a forged `Question:` disclosure-guard bypass across server and daemon
   - makes session sync version-aware and deletion purge child content
   - makes password reset revoke refresh sessions atomically
   - keeps attachment/screen actions responsive during answer streaming
   - makes macOS signed-out header labels real sign-in hit targets
   - aligns the optional AI AnswerPlan fallback with its default-off code path
-  - records Windows, reserve-before-dispatch, pgvector KNN, client audit upload,
-    and reviewed Jobs handoff work as explicit remaining gates
+  - exact server source commit:
+    `f18e0deae01581bceb2e0af35894d0a95306a28a`
+  - signed server release: `round519-f18e0deae015`
+  - main API SHA-256:
+    `59660b3f816292c2c5fae107c07dd7c907be88381a9eb40f07a0b51f36edc799`
+  - signed native release: `0.1.100`
+  - macOS arm64 SHA-256:
+    `4c8afcfb80d722cfefcbf76b10c244611bcc108fd0f125173397537cfa24b65c`
+  - Windows x86-64 SHA-256:
+    `6f3df294a26645bc00084ea8d53fb565ad20f67b8362dcf4c5c71ac26ae655cf`
+  - strict production preflight, backup/restore-list, rollback snapshot,
+    signed server/native verification, edge/origin matrix, service health, and
+    post-release log scan passed
+  - no GitHub Actions, Keychain, Jobs redeploy, or Caddy restart was used
+  - Windows received a signed x86-64 package and structural/package parity
+    verification; a physical Windows launch smoke remains explicit QA
+  - records Windows native UX, reserve-before-dispatch for non-LLM provider
+    work, pgvector KNN, client audit upload, and reviewed Jobs handoff work as
+    explicit remaining gates
   - round doc:
     `docs/rounds/ROUND-519-INTERRUPTED-ASKS-RECONCILIATION.md`
+
+- Round 520 records the full parallel branch/worktree reconciliation:
+  - identifies which old branches are fully superseded
+  - lists the reviewed Jobs slices that require fresh hunk-porting rather than
+    wholesale merges
+  - preserves current main's stronger trial/device, worker-auth, and cleanup
+    paths
+  - round doc:
+    `docs/rounds/ROUND-520-BLUEY-PARALLEL-BRANCH-RECONCILIATION.md`
 
 - Rounds 517-518 completed the Round 506/Jobs reconciliation and Cloudflare
   production edge activation on branch
@@ -192,9 +218,10 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
   - no deploy, release, GitHub Actions run, commit, or push was performed
   - round doc:
     `docs/rounds/ROUND-470-END-TO-END-ANSWER-LATENCY-AND-ROUTING.md`
-- Current shared working branch is `codex/bluey-web-ui-parallel-20260704`.
-- The worktree contains substantial parallel owner/agent changes. Continue to
-  scope diffs carefully and do not revert or overwrite them.
+- Current release branch is
+  `codex/bluey-interrupted-asks-round519-20260712`. It was clean before the
+  deployment-evidence documentation update. Continue to inspect status before
+  editing because parallel branches and worktrees still exist.
 - Before any release, run a signed canary and measure request-to-first-text by
   intent. Round 470 documents target SLOs and remaining adaptive-routing,
   Redis-pooling, immediate-SSE, and runtime pgvector KNN gates.

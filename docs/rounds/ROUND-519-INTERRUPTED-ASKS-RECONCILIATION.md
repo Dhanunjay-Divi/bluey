@@ -137,5 +137,101 @@ These were found during the branch audit but are not silently claimed as fixed:
 
 ## Deployment
 
-No deployment is claimed until the exact commit, signed native artifacts,
-server release, backups, live health, and rollback evidence are appended.
+This round was committed, pushed, and deployed manually without GitHub Actions
+or Keychain access.
+
+### Source Identity
+
+- Implementation commit:
+  `3088640280decb41ab9e6984cacd2acd7c263b10`
+- Branch-reconciliation audit commit:
+  `837385584266faa23e919f28550ac1922cdac9e1`
+- Exact locked server source commit:
+  `f18e0deae01581bceb2e0af35894d0a95306a28a`
+- Branch:
+  `codex/bluey-interrupted-asks-round519-20260712`
+- `server/Cargo.lock` changed only the local `cue-core` package version from
+  `0.1.99` to `0.1.100`; the existing transitive dependency resolution was
+  intentionally preserved.
+
+### Signed Server Release
+
+- Release ID: `round519-f18e0deae015`
+- Release directory:
+  `/opt/bluey-releases/round519-f18e0deae015`
+- Actual Linux build completion: `2026-07-13T05:31:54Z`
+- Builder: Cargo/Rust `1.95.0`, locked release profile
+- Platform: Linux ELF x86-64
+- The Ed25519 manifest signature verifies locally and from the deployed
+  release directory.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Source archive | `61e68681c483d26db7fbc1e3b77f9a93a0f8e50f687fd4b2c71aa58ecdcde449` |
+| Main API | `59660b3f816292c2c5fae107c07dd7c907be88381a9eb40f07a0b51f36edc799` |
+| Jobs API, carried forward unchanged | `7201dd4f8b9b674c946ab5c301d5a4a15efbfaadc8bd8e3e4644b5cab2b86b84` |
+| Web archive, carried forward unchanged | `e78e82454937d8aa78a5de0b02e5591eed7db8ad4d694b5e4a891f31c9e9ae8c` |
+| Caddyfile, carried forward unchanged | `91bfba4d2266825d3d31a81ae2c125ee279c1393370afca9ccefd2419ddeae70` |
+
+Only `bluey-api` was promoted. Jobs and Caddy were not rebuilt or restarted.
+The health-gated promotion automatically restored the captured Round 517
+binary if the new API failed to report the exact embedded commit.
+
+### Signed Native Release
+
+- Version: `0.1.100`
+- Released at: `2026-07-13T05:49:19.026071Z`
+- macOS arm64:
+  - SHA-256:
+    `4c8afcfb80d722cfefcbf76b10c244611bcc108fd0f125173397537cfa24b65c`
+  - Size: `20,074,975` bytes
+  - unpacked `bluey`, `bluey-daemon`, `termb`, and `Terminal` report
+    `0.1.100`
+- Windows x86-64:
+  - SHA-256:
+    `6f3df294a26645bc00084ea8d53fb565ad20f67b8362dcf4c5c71ac26ae655cf`
+  - Size: `29,384,761` bytes
+  - `bluey.exe` and `bluey-daemon.exe` are PE32+ x86-64; daemon, overlay,
+    and audio identity aliases are byte-identical within each alias group
+- Both public artifact hashes match `latest.json` and
+  `SHA256SUMS.txt`. The public manifest signature, shell/PowerShell installer
+  MIME types, and macOS unpack/version smoke all passed.
+- A physical Windows launch smoke was not performed in this round. The signed
+  Windows artifact received package, PE architecture, version-marker, helper,
+  identity-alias, and live-download verification.
+- The publish path ran the release secret/dev-flag scan across 33 files and
+  found no configured secrets or capture-visible release markers.
+
+### Backup And Rollback
+
+- Fresh PostgreSQL backup:
+  `/var/backups/bluey-api/hourly/bluey-postgres-20260713T044236Z.pgdump`
+- Backup SHA-256:
+  `c7409a0ca0a078955726bb4f34435d6e7228d4ecedcec625528d23425b14e9d6`
+- Backup size: `24,037,014` bytes
+- `pg_restore --list` passed and the dump plus checksum were present in the
+  configured R2 offsite destination.
+- Pre-release rollback snapshot:
+  `/var/backups/bluey-api/releases/20260713T051225Z-before-round519-f18e0deae015`
+- Previous API SHA-256:
+  `cfd483339258f214f59add688a343f7a351ea05c9f7ec2bdec0ab3dd490bb358`
+
+### Live Acceptance
+
+- Strict production preflight passed with zero failures and zero warnings for
+  Postgres/pgvector, Valkey, R2 backup/object/log storage, Square, Turnstile,
+  SMTP, routing, providers, and signed-update reachability.
+- Public `/health` reports exact commit
+  `f18e0deae01581bceb2e0af35894d0a95306a28a` for native client, CLI, and
+  browser User-Agents.
+- `bluey-api`, `bluey-jobs-api`, and `caddy` are active with `NRestarts=0`.
+- The post-release API/Jobs/Caddy log scan found zero panic, fatal, error,
+  `429`, provider-capacity, or dropped-connection matches.
+- Turnstile config returns `200`; unsigned account access returns `401`; public
+  Jobs discovery returns `404`.
+- AI crawler denial, Googlebot allowance, Jobs cache/noindex rules,
+  `/llms.txt` `410`, and legacy redirect rules passed.
+- Direct-origin HTTPS remains blocked. Direct HTTP exposes only the exact
+  canonical `308` redirect required for certificate renewal.
+- Disk returned to 48 percent used with 30 GB free after removing the temporary
+  Linux build tree.
