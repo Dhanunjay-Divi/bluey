@@ -1,4 +1,4 @@
--- Target: Postgres
+-- Target: Postgres only
 -- Keep the zero default after backfill so the pre-revision server can be
 -- rolled back without failing inserts that omit updated_at_ms.
 

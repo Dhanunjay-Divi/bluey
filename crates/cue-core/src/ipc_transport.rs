@@ -24,6 +24,8 @@ pub const IPC_MAX_CONNECTIONS: usize = 64;
 pub const IPC_REQUEST_READ_DEADLINE: Duration = Duration::from_secs(3);
 pub const IPC_RESPONSE_WRITE_DEADLINE: Duration = Duration::from_secs(3);
 pub const IPC_CLIENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+const IPC_CLIENT_AUTH_REFRESH_LIMIT: usize = 4;
+const IPC_CAPABILITY_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 #[cfg(unix)]
 pub const IPC_SOCKET_FILE_NAME: &str = "daemon-ipc.sock";
@@ -252,49 +254,72 @@ pub async fn request_daemon_with_timeout(
     let capability = match load_ipc_capability(paths) {
         Ok(capability) => Some(capability),
         Err(error) if legacy_lifecycle_request(&request) && error_chain_has_not_found(&error) => {
-            endpoint = legacy_lifecycle_endpoint(endpoint)?;
             None
         }
         Err(error) => return Err(error).context("daemon authentication unavailable"),
     };
-    let wire_request = match capability.as_ref() {
-        Some(capability) => DaemonWireRequest::Authenticated(AuthenticatedDaemonRequest::new(
-            capability,
-            request.clone(),
-        )),
-        None => DaemonWireRequest::Public(request.clone()),
-    };
-    let response = exchange_wire_request(paths, endpoint, wire_request, deadline).await?;
+    let mut capability = capability;
+    let mut auth_refreshes = 0;
 
-    let refresh_capability = matches!(
-        (&capability, &response),
-        (
-            Some(_),
-            DaemonResponse::IpcAuthError {
-                code: IpcAuthErrorCode::StaleBoot | IpcAuthErrorCode::InvalidCredentials,
+    loop {
+        let wire_request = match capability.as_ref() {
+            Some(capability) => DaemonWireRequest::Authenticated(AuthenticatedDaemonRequest::new(
+                capability,
+                request.clone(),
+            )),
+            None => DaemonWireRequest::Public(request.clone()),
+        };
+        let response = match exchange_wire_request(paths, endpoint, wire_request, deadline).await {
+            Ok(response) => response,
+            Err(error)
+                if capability.is_none()
+                    && matches!(endpoint, ClientEndpoint::Local)
+                    && local_endpoint_unavailable(&error) =>
+            {
+                endpoint = legacy_lifecycle_endpoint(endpoint)?;
+                exchange_wire_request(
+                    paths,
+                    endpoint,
+                    DaemonWireRequest::Public(request.clone()),
+                    deadline,
+                )
+                .await?
             }
-        ) | (
-            None,
-            DaemonResponse::IpcAuthError {
-                code: IpcAuthErrorCode::AuthenticationRequired,
-            }
-        )
-    );
-    if refresh_capability {
-        let capability =
-            load_ipc_capability(paths).context("daemon authentication refresh unavailable")?;
-        let response = exchange_wire_request(
-            paths,
-            endpoint,
-            DaemonWireRequest::Authenticated(AuthenticatedDaemonRequest::new(&capability, request)),
-            deadline,
-        )
-        .await?;
-        return reject_auth_error(response);
+            Err(error) => return Err(error),
+        };
+
+        let refresh_capability = matches!(
+            (&capability, &response),
+            (
+                Some(_),
+                DaemonResponse::IpcAuthError {
+                    code: IpcAuthErrorCode::StaleBoot | IpcAuthErrorCode::InvalidCredentials,
+                }
+            ) | (
+                None,
+                DaemonResponse::IpcAuthError {
+                    code: IpcAuthErrorCode::AuthenticationRequired,
+                }
+            )
+        );
+        if !refresh_capability || auth_refreshes >= IPC_CLIENT_AUTH_REFRESH_LIMIT {
+            return reject_auth_error(response);
+        }
+
+        auth_refreshes += 1;
+        let rejected_capability = capability.clone();
+        capability = Some(
+            load_ipc_capability_after_rejection(paths, rejected_capability.as_ref(), deadline)
+                .await
+                .context("daemon authentication refresh unavailable")?,
+        );
     }
-    reject_auth_error(response)
 }
 
+/// Rolling compatibility is intentionally one-way. After a clean shutdown
+/// removes the capability, upgraded clients may inspect or stop the preceding
+/// daemon. Upgraded daemons still reject older clients' protected requests,
+/// and any present invalid capability is a hard error rather than a downgrade.
 fn legacy_lifecycle_request(request: &DaemonRequest) -> bool {
     match request {
         DaemonRequest::WithTrace { request, .. } => legacy_lifecycle_request(request),
@@ -305,14 +330,58 @@ fn legacy_lifecycle_request(request: &DaemonRequest) -> bool {
 
 fn legacy_lifecycle_endpoint(endpoint: ClientEndpoint) -> Result<ClientEndpoint> {
     match endpoint {
-        // The pre-capability release used this TCP endpoint by default. The
-        // new local socket/pipe cannot reach a daemon left running by that
-        // release after package replacement.
+        // Called only after the new local endpoint could not be opened. The
+        // pre-capability release used this TCP endpoint by default.
         ClientEndpoint::Local => Ok(ClientEndpoint::Compatibility(validated_loopback_ipc_addr(
             DEFAULT_DAEMON_ADDR,
         )?)),
         compatibility => Ok(compatibility),
     }
+}
+
+fn local_endpoint_unavailable(error: &anyhow::Error) -> bool {
+    error_chain_has_not_found(error)
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|io_error| io_error.kind() == io::ErrorKind::ConnectionRefused)
+        })
+}
+
+async fn load_ipc_capability_after_rejection(
+    paths: &AppPaths,
+    rejected: Option<&crate::ipc_auth::IpcCapabilityRecord>,
+    deadline: Instant,
+) -> Result<crate::ipc_auth::IpcCapabilityRecord> {
+    loop {
+        match load_ipc_capability(paths) {
+            Ok(capability)
+                if rejected
+                    .map(|rejected| !same_ipc_capability(rejected, &capability))
+                    .unwrap_or(true) =>
+            {
+                return Ok(capability);
+            }
+            Ok(_) => {}
+            Err(error) if error_chain_has_not_found(&error) => {}
+            Err(error) => return Err(error),
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("daemon authentication refresh timed out");
+        }
+        tokio::time::sleep_until(std::cmp::min(deadline, now + IPC_CAPABILITY_RETRY_DELAY)).await;
+    }
+}
+
+fn same_ipc_capability(
+    left: &crate::ipc_auth::IpcCapabilityRecord,
+    right: &crate::ipc_auth::IpcCapabilityRecord,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.boot_id == right.boot_id
+        && left.bearer.constant_time_eq(&right.bearer)
 }
 
 fn reject_auth_error(response: DaemonResponse) -> Result<DaemonResponse> {
@@ -924,6 +993,7 @@ mod tests {
         paths.ensure().expect("paths");
         let first = IpcCapabilityRecord::generate().expect("first capability");
         let second = IpcCapabilityRecord::generate().expect("second capability");
+        let third = IpcCapabilityRecord::generate().expect("third capability");
         publish_ipc_capability(&paths, &first).expect("publish first capability");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -931,47 +1001,51 @@ mod tests {
         let server_paths = paths.clone();
         let first_boot = first.boot_id;
         let second_boot = second.boot_id;
+        let third_boot = third.boot_id;
         let server = tokio::spawn(async move {
-            let (mut first_stream, _) = listener.accept().await.unwrap();
-            let first_frame = read_bounded_frame(
-                &mut first_stream,
-                IPC_MAX_REQUEST_BYTES,
-                Duration::from_secs(1),
-            )
-            .await
-            .unwrap();
-            let first_wire: DaemonWireRequest = serde_json::from_slice(&first_frame).unwrap();
-            let DaemonWireRequest::Authenticated(first_request) = first_wire else {
-                panic!("first request was not authenticated");
-            };
-            assert_eq!(first_request.boot_id, first_boot);
+            for (expected_boot, replacement) in [(first_boot, second), (second_boot, third)] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let frame =
+                    read_bounded_frame(&mut stream, IPC_MAX_REQUEST_BYTES, Duration::from_secs(1))
+                        .await
+                        .unwrap();
+                let wire: DaemonWireRequest = serde_json::from_slice(&frame).unwrap();
+                let DaemonWireRequest::Authenticated(authenticated) = wire else {
+                    panic!("request was not authenticated");
+                };
+                assert_eq!(authenticated.boot_id, expected_boot);
+                assert!(matches!(authenticated.request, DaemonRequest::OverlayShow));
 
-            publish_ipc_capability(&server_paths, &second).expect("publish second capability");
-            let stale = serialize_bounded_frame(
-                &DaemonResponse::IpcAuthError { code },
-                IPC_MAX_RESPONSE_BYTES,
-            )
-            .unwrap();
-            write_frame(&mut first_stream, &stale, Duration::from_secs(1))
-                .await
+                let rejected = serialize_bounded_frame(
+                    &DaemonResponse::IpcAuthError { code },
+                    IPC_MAX_RESPONSE_BYTES,
+                )
                 .unwrap();
+                write_frame(&mut stream, &rejected, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                publish_ipc_capability(&server_paths, &replacement)
+                    .expect("publish replacement capability");
+            }
 
-            let (mut second_stream, _) = listener.accept().await.unwrap();
-            let second_frame = read_bounded_frame(
-                &mut second_stream,
+            let (mut final_stream, _) = listener.accept().await.unwrap();
+            let final_frame = read_bounded_frame(
+                &mut final_stream,
                 IPC_MAX_REQUEST_BYTES,
                 Duration::from_secs(1),
             )
             .await
             .unwrap();
-            let second_wire: DaemonWireRequest = serde_json::from_slice(&second_frame).unwrap();
-            let DaemonWireRequest::Authenticated(second_request) = second_wire else {
-                panic!("refreshed request was not authenticated");
+            let final_wire: DaemonWireRequest = serde_json::from_slice(&final_frame).unwrap();
+            let DaemonWireRequest::Authenticated(final_request) = final_wire else {
+                panic!("final request was not authenticated");
             };
-            assert_eq!(second_request.boot_id, second_boot);
+            assert_eq!(final_request.boot_id, third_boot);
+            assert!(matches!(final_request.request, DaemonRequest::OverlayShow));
 
             let ok = serialize_bounded_frame(&DaemonResponse::Ok, IPC_MAX_RESPONSE_BYTES).unwrap();
-            write_frame(&mut second_stream, &ok, Duration::from_secs(1))
+            write_frame(&mut final_stream, &ok, Duration::from_secs(1))
                 .await
                 .unwrap();
         });
@@ -979,7 +1053,7 @@ mod tests {
         let response = request_daemon_with_timeout(
             &paths,
             Some(&address.to_string()),
-            DaemonRequest::Status,
+            DaemonRequest::OverlayShow,
             Duration::from_secs(2),
         )
         .await
@@ -994,14 +1068,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn client_refreshes_replaced_capability_once_for_rejected_credentials() {
+    async fn client_retries_capability_rejections_before_execution() {
         assert_client_refreshes_capability_after(IpcAuthErrorCode::StaleBoot).await;
         assert_client_refreshes_capability_after(IpcAuthErrorCode::InvalidCredentials).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn legacy_probe_retries_authenticated_when_new_daemon_publishes_capability() {
+    async fn auth_aware_compatibility_daemon_can_publish_after_legacy_probe() {
         use crate::ipc_auth::{publish_ipc_capability, IpcCapabilityRecord};
 
         let paths = test_paths("ipc-client-legacy-refresh");
@@ -1023,7 +1097,6 @@ mod tests {
             let legacy_wire: DaemonWireRequest = serde_json::from_slice(&legacy_frame).unwrap();
             assert!(matches!(legacy_wire, DaemonWireRequest::Public(_)));
 
-            publish_ipc_capability(&server_paths, &capability).expect("publish capability");
             let required = serialize_bounded_frame(
                 &DaemonResponse::IpcAuthError {
                     code: IpcAuthErrorCode::AuthenticationRequired,
@@ -1034,6 +1107,8 @@ mod tests {
             write_frame(&mut legacy_stream, &required, Duration::from_secs(1))
                 .await
                 .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            publish_ipc_capability(&server_paths, &capability).expect("publish capability");
 
             let (mut authenticated_stream, _) = listener.accept().await.unwrap();
             let authenticated_frame = read_bounded_frame(
@@ -1060,6 +1135,81 @@ mod tests {
             &paths,
             Some(&address.to_string()),
             DaemonRequest::Shutdown,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response, DaemonResponse::Ok));
+        server.await.unwrap();
+
+        crate::ipc_auth::remove_ipc_capability_if_current(&paths, capability_boot).unwrap();
+        let _ = std::fs::remove_dir_all(paths.runtime_dir.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capability_free_local_probe_stays_on_new_endpoint_during_boot() {
+        use crate::ipc_auth::{publish_ipc_capability, IpcCapabilityRecord};
+
+        let paths = test_paths("ipc-lboot");
+        paths.ensure().expect("paths");
+        let listener = OwnerOnlyUnixListener::bind(&paths).expect("listener");
+        let capability = IpcCapabilityRecord::generate().expect("capability");
+        let capability_boot = capability.boot_id;
+        let server_paths = paths.clone();
+        let server = tokio::spawn(async move {
+            let mut public_stream = listener.accept().await.expect("public probe");
+            let public_frame = read_bounded_frame(
+                &mut public_stream,
+                IPC_MAX_REQUEST_BYTES,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            let public_wire: DaemonWireRequest = serde_json::from_slice(&public_frame).unwrap();
+            assert!(matches!(
+                public_wire,
+                DaemonWireRequest::Public(DaemonRequest::Status)
+            ));
+
+            let required = serialize_bounded_frame(
+                &DaemonResponse::IpcAuthError {
+                    code: IpcAuthErrorCode::AuthenticationRequired,
+                },
+                IPC_MAX_RESPONSE_BYTES,
+            )
+            .unwrap();
+            write_frame(&mut public_stream, &required, Duration::from_secs(1))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            publish_ipc_capability(&server_paths, &capability).expect("publish capability");
+
+            let mut authenticated_stream = listener.accept().await.expect("authenticated retry");
+            let authenticated_frame = read_bounded_frame(
+                &mut authenticated_stream,
+                IPC_MAX_REQUEST_BYTES,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            let authenticated_wire: DaemonWireRequest =
+                serde_json::from_slice(&authenticated_frame).unwrap();
+            let DaemonWireRequest::Authenticated(authenticated) = authenticated_wire else {
+                panic!("retry was not authenticated");
+            };
+            assert_eq!(authenticated.boot_id, capability_boot);
+
+            let ok = serialize_bounded_frame(&DaemonResponse::Ok, IPC_MAX_RESPONSE_BYTES).unwrap();
+            write_frame(&mut authenticated_stream, &ok, Duration::from_secs(1))
+                .await
+                .unwrap();
+        });
+
+        let response = request_daemon_with_timeout(
+            &paths,
+            None,
+            DaemonRequest::Status,
             Duration::from_secs(2),
         )
         .await

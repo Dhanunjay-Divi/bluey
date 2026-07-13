@@ -24,6 +24,8 @@ pub const IPC_BEARER_BYTES: usize = 32;
 pub const IPC_REPLAY_CACHE_CAPACITY: usize = 4_096;
 pub const IPC_CAPABILITY_FILE_NAME: &str = "daemon-ipc-capability.json";
 const IPC_CAPABILITY_MAX_BYTES: u64 = 4 * 1024;
+#[cfg(unix)]
+const IPC_CAPABILITY_REPLACEMENT_RETRIES: usize = 3;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct IpcBearer([u8; IPC_BEARER_BYTES]);
@@ -513,15 +515,34 @@ fn create_private_file(path: &Path) -> Result<fs::File> {
 
 #[cfg(unix)]
 fn open_private_capability_file(path: &Path) -> Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
+    open_private_capability_file_with(path, |_| {})
+}
 
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    validate_open_capability_metadata(path, &file.metadata()?)?;
-    Ok(file)
+#[cfg(unix)]
+fn open_private_capability_file_with<F>(path: &Path, mut after_open: F) -> Result<fs::File>
+where
+    F: FnMut(usize),
+{
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    for attempt in 0..=IPC_CAPABILITY_REPLACEMENT_RETRIES {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("open {}", path.display()))?;
+        after_open(attempt);
+
+        let metadata = file.metadata()?;
+        validate_open_capability_owner_and_mode(path, &metadata)?;
+        if metadata.nlink() == 0 && attempt < IPC_CAPABILITY_REPLACEMENT_RETRIES {
+            continue;
+        }
+        validate_open_capability_metadata(path, &metadata)?;
+        return Ok(file);
+    }
+
+    unreachable!("bounded capability open loop always returns")
 }
 
 #[cfg(windows)]
@@ -613,19 +634,29 @@ fn validate_private_capability_file(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn validate_open_capability_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+fn validate_open_capability_owner_and_mode(path: &Path, metadata: &fs::Metadata) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     if !metadata.is_file()
         || metadata.mode() & 0o777 != 0o600
         || metadata.uid() != unsafe { libc::geteuid() }
-        // Atomic replacement unlinks an inode after a reader has opened it,
-        // so that safe, private handle can legitimately report zero links.
-        // More than one link still means the capability was hard-linked.
-        || metadata.nlink() > 1
     {
         return Err(anyhow!(
-            "daemon IPC capability {} failed uid/mode/nlink validation",
+            "daemon IPC capability {} failed owner/mode/type validation",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_open_capability_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    validate_open_capability_owner_and_mode(path, metadata)?;
+    if metadata.nlink() != 1 {
+        return Err(anyhow!(
+            "daemon IPC capability {} failed nlink validation",
             path.display()
         ));
     }
@@ -1054,7 +1085,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn opened_capability_survives_atomic_replacement_with_zero_links() {
+    fn capability_reader_reopens_zero_link_inode_without_relaxing_validation() {
         use std::os::unix::fs::MetadataExt;
 
         let paths = test_paths("ipc-capability-open-replace");
@@ -1069,11 +1100,21 @@ mod tests {
 
         let metadata = opened.metadata().expect("opened metadata");
         assert_eq!(metadata.nlink(), 0);
-        validate_open_capability_metadata(&path, &metadata).expect("zero-link opened inode");
-        let opened_capability =
-            read_capability_from(opened, metadata.len(), &path).expect("read opened inode");
-        assert_eq!(opened_capability.boot_id, first.boot_id);
-        assert_eq!(load_ipc_capability(&paths).unwrap().boot_id, second.boot_id);
+        assert!(validate_open_capability_metadata(&path, &metadata).is_err());
+        drop(opened);
+
+        publish_ipc_capability(&paths, &first).expect("restore first");
+        let reopened = open_private_capability_file_with(&path, |attempt| {
+            if attempt == 0 {
+                publish_ipc_capability(&paths, &second).expect("replace after open");
+            }
+        })
+        .expect("reopen replacement");
+        let reopened_metadata = reopened.metadata().expect("reopened metadata");
+        assert_eq!(reopened_metadata.nlink(), 1);
+        let reopened_capability = read_capability_from(reopened, reopened_metadata.len(), &path)
+            .expect("read replacement");
+        assert_eq!(reopened_capability.boot_id, second.boot_id);
 
         assert!(remove_ipc_capability_if_current(&paths, second.boot_id).unwrap());
         let _ = fs::remove_dir_all(paths.runtime_dir.parent().unwrap());
@@ -1081,13 +1122,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn capability_reader_still_rejects_hard_links() {
+    fn capability_reader_still_rejects_non_private_modes_and_hard_links() {
+        use std::os::unix::fs::PermissionsExt;
+
         let paths = test_paths("ipc-capability-hard-link");
         paths.ensure().expect("paths");
         let capability = IpcCapabilityRecord::generate().expect("capability");
         publish_ipc_capability(&paths, &capability).expect("publish");
 
         let path = ipc_capability_path(&paths);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("relax mode");
+        assert!(load_ipc_capability(&paths).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("restore mode");
+
         let alias = paths.runtime_dir.join("capability-hard-link.json");
         fs::hard_link(&path, &alias).expect("hard link");
         assert!(load_ipc_capability(&paths).is_err());
