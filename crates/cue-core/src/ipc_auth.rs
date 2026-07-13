@@ -417,8 +417,7 @@ where
     Ok(capability)
 }
 
-#[cfg(any(unix, windows))]
-fn error_chain_has_not_found(error: &anyhow::Error) -> bool {
+pub(crate) fn error_chain_has_not_found(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
@@ -620,7 +619,10 @@ fn validate_open_capability_metadata(path: &Path, metadata: &fs::Metadata) -> Re
     if !metadata.is_file()
         || metadata.mode() & 0o777 != 0o600
         || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
+        // Atomic replacement unlinks an inode after a reader has opened it,
+        // so that safe, private handle can legitimately report zero links.
+        // More than one link still means the capability was hard-linked.
+        || metadata.nlink() > 1
     {
         return Err(anyhow!(
             "daemon IPC capability {} failed uid/mode/nlink validation",
@@ -1047,6 +1049,51 @@ mod tests {
         assert!(!remove_ipc_capability_if_current(&paths, first.boot_id).unwrap());
         assert!(remove_ipc_capability_if_current(&paths, second.boot_id).unwrap());
         assert!(!ipc_capability_path(&paths).exists());
+        let _ = fs::remove_dir_all(paths.runtime_dir.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_capability_survives_atomic_replacement_with_zero_links() {
+        use std::os::unix::fs::MetadataExt;
+
+        let paths = test_paths("ipc-capability-open-replace");
+        paths.ensure().expect("paths");
+        let first = IpcCapabilityRecord::generate().expect("first");
+        let second = IpcCapabilityRecord::generate().expect("second");
+        publish_ipc_capability(&paths, &first).expect("publish first");
+
+        let path = ipc_capability_path(&paths);
+        let opened = open_private_capability_file(&path).expect("open first");
+        publish_ipc_capability(&paths, &second).expect("replace first");
+
+        let metadata = opened.metadata().expect("opened metadata");
+        assert_eq!(metadata.nlink(), 0);
+        validate_open_capability_metadata(&path, &metadata).expect("zero-link opened inode");
+        let opened_capability =
+            read_capability_from(opened, metadata.len(), &path).expect("read opened inode");
+        assert_eq!(opened_capability.boot_id, first.boot_id);
+        assert_eq!(load_ipc_capability(&paths).unwrap().boot_id, second.boot_id);
+
+        assert!(remove_ipc_capability_if_current(&paths, second.boot_id).unwrap());
+        let _ = fs::remove_dir_all(paths.runtime_dir.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_reader_still_rejects_hard_links() {
+        let paths = test_paths("ipc-capability-hard-link");
+        paths.ensure().expect("paths");
+        let capability = IpcCapabilityRecord::generate().expect("capability");
+        publish_ipc_capability(&paths, &capability).expect("publish");
+
+        let path = ipc_capability_path(&paths);
+        let alias = paths.runtime_dir.join("capability-hard-link.json");
+        fs::hard_link(&path, &alias).expect("hard link");
+        assert!(load_ipc_capability(&paths).is_err());
+
+        fs::remove_file(alias).expect("remove hard link");
+        assert!(remove_ipc_capability_if_current(&paths, capability.boot_id).unwrap());
         let _ = fs::remove_dir_all(paths.runtime_dir.parent().unwrap());
     }
 

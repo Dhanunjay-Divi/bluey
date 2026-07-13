@@ -9,13 +9,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::app_paths::AppPaths;
-use crate::ipc::{DaemonRequest, DaemonResponse};
+use crate::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use crate::ipc_auth::{
-    load_ipc_capability, AuthenticatedDaemonRequest, DaemonWireRequest, IpcAuthErrorCode,
-    IpcAuthorization,
+    error_chain_has_not_found, load_ipc_capability, AuthenticatedDaemonRequest, DaemonWireRequest,
+    IpcAuthErrorCode, IpcAuthorization,
 };
 
 pub const IPC_MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -228,51 +228,91 @@ pub async fn request_daemon_with_timeout(
     request: DaemonRequest,
     operation_timeout: Duration,
 ) -> Result<DaemonResponse> {
-    let endpoint = match compatibility_addr {
+    let mut endpoint = match compatibility_addr {
         Some(value) => ClientEndpoint::Compatibility(validated_loopback_ipc_addr(value)?),
         None => ClientEndpoint::Local,
     };
+    let deadline = Instant::now() + operation_timeout;
 
     if request.ipc_authorization() == IpcAuthorization::Public {
         let response = exchange_wire_request(
             paths,
             endpoint,
             DaemonWireRequest::Public(request),
-            operation_timeout,
+            deadline,
         )
         .await?;
         return reject_auth_error(response);
     }
 
-    let capability = load_ipc_capability(paths).context("daemon authentication unavailable")?;
-    let response = exchange_wire_request(
-        paths,
-        endpoint,
-        DaemonWireRequest::Authenticated(AuthenticatedDaemonRequest::new(
-            &capability,
+    // The release immediately before capability authentication can only be
+    // crossed with commands needed to inspect and stop that daemon. These
+    // requests contain no user payload, and every compatibility TCP endpoint
+    // has already been constrained to a numeric loopback address.
+    let capability = match load_ipc_capability(paths) {
+        Ok(capability) => Some(capability),
+        Err(error) if legacy_lifecycle_request(&request) && error_chain_has_not_found(&error) => {
+            endpoint = legacy_lifecycle_endpoint(endpoint)?;
+            None
+        }
+        Err(error) => return Err(error).context("daemon authentication unavailable"),
+    };
+    let wire_request = match capability.as_ref() {
+        Some(capability) => DaemonWireRequest::Authenticated(AuthenticatedDaemonRequest::new(
+            capability,
             request.clone(),
         )),
-        operation_timeout,
-    )
-    .await?;
-    if matches!(
-        response,
-        DaemonResponse::IpcAuthError {
-            code: IpcAuthErrorCode::StaleBoot
-        }
-    ) {
+        None => DaemonWireRequest::Public(request.clone()),
+    };
+    let response = exchange_wire_request(paths, endpoint, wire_request, deadline).await?;
+
+    let refresh_capability = matches!(
+        (&capability, &response),
+        (
+            Some(_),
+            DaemonResponse::IpcAuthError {
+                code: IpcAuthErrorCode::StaleBoot | IpcAuthErrorCode::InvalidCredentials,
+            }
+        ) | (
+            None,
+            DaemonResponse::IpcAuthError {
+                code: IpcAuthErrorCode::AuthenticationRequired,
+            }
+        )
+    );
+    if refresh_capability {
         let capability =
             load_ipc_capability(paths).context("daemon authentication refresh unavailable")?;
         let response = exchange_wire_request(
             paths,
             endpoint,
             DaemonWireRequest::Authenticated(AuthenticatedDaemonRequest::new(&capability, request)),
-            operation_timeout,
+            deadline,
         )
         .await?;
         return reject_auth_error(response);
     }
     reject_auth_error(response)
+}
+
+fn legacy_lifecycle_request(request: &DaemonRequest) -> bool {
+    match request {
+        DaemonRequest::WithTrace { request, .. } => legacy_lifecycle_request(request),
+        DaemonRequest::Status | DaemonRequest::Shutdown => true,
+        _ => false,
+    }
+}
+
+fn legacy_lifecycle_endpoint(endpoint: ClientEndpoint) -> Result<ClientEndpoint> {
+    match endpoint {
+        // The pre-capability release used this TCP endpoint by default. The
+        // new local socket/pipe cannot reach a daemon left running by that
+        // release after package replacement.
+        ClientEndpoint::Local => Ok(ClientEndpoint::Compatibility(validated_loopback_ipc_addr(
+            DEFAULT_DAEMON_ADDR,
+        )?)),
+        compatibility => Ok(compatibility),
+    }
 }
 
 fn reject_auth_error(response: DaemonResponse) -> Result<DaemonResponse> {
@@ -286,7 +326,7 @@ async fn exchange_wire_request(
     paths: &AppPaths,
     endpoint: ClientEndpoint,
     request: DaemonWireRequest,
-    operation_timeout: Duration,
+    deadline: Instant,
 ) -> Result<DaemonResponse> {
     let operation = async {
         match endpoint {
@@ -299,7 +339,7 @@ async fn exchange_wire_request(
             ClientEndpoint::Local => exchange_on_local_stream(paths, &request).await,
         }
     };
-    timeout(operation_timeout, operation)
+    timeout_at(deadline, operation)
         .await
         .map_err(|_| anyhow!("daemon request timed out"))?
 }
@@ -860,6 +900,238 @@ mod tests {
             read_bounded_frame(&mut server, 64, Duration::from_millis(20)).await,
             Err(IpcFrameReadError::Timeout)
         ));
+    }
+
+    #[test]
+    fn legacy_upgrade_boundary_is_lifecycle_only() {
+        assert!(legacy_lifecycle_request(&DaemonRequest::Status));
+        assert!(legacy_lifecycle_request(
+            &DaemonRequest::Shutdown.with_trace_id("upgrade")
+        ));
+        assert!(!legacy_lifecycle_request(&DaemonRequest::ContextList));
+        assert!(!legacy_lifecycle_request(&DaemonRequest::OverlayShow));
+        assert!(matches!(
+            legacy_lifecycle_endpoint(ClientEndpoint::Local).unwrap(),
+            ClientEndpoint::Compatibility(address) if address.to_string() == DEFAULT_DAEMON_ADDR
+        ));
+    }
+
+    #[cfg(unix)]
+    async fn assert_client_refreshes_capability_after(code: IpcAuthErrorCode) {
+        use crate::ipc_auth::{publish_ipc_capability, IpcCapabilityRecord};
+
+        let paths = test_paths("ipc-client-refresh");
+        paths.ensure().expect("paths");
+        let first = IpcCapabilityRecord::generate().expect("first capability");
+        let second = IpcCapabilityRecord::generate().expect("second capability");
+        publish_ipc_capability(&paths, &first).expect("publish first capability");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_paths = paths.clone();
+        let first_boot = first.boot_id;
+        let second_boot = second.boot_id;
+        let server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener.accept().await.unwrap();
+            let first_frame = read_bounded_frame(
+                &mut first_stream,
+                IPC_MAX_REQUEST_BYTES,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            let first_wire: DaemonWireRequest = serde_json::from_slice(&first_frame).unwrap();
+            let DaemonWireRequest::Authenticated(first_request) = first_wire else {
+                panic!("first request was not authenticated");
+            };
+            assert_eq!(first_request.boot_id, first_boot);
+
+            publish_ipc_capability(&server_paths, &second).expect("publish second capability");
+            let stale = serialize_bounded_frame(
+                &DaemonResponse::IpcAuthError { code },
+                IPC_MAX_RESPONSE_BYTES,
+            )
+            .unwrap();
+            write_frame(&mut first_stream, &stale, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+            let (mut second_stream, _) = listener.accept().await.unwrap();
+            let second_frame = read_bounded_frame(
+                &mut second_stream,
+                IPC_MAX_REQUEST_BYTES,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            let second_wire: DaemonWireRequest = serde_json::from_slice(&second_frame).unwrap();
+            let DaemonWireRequest::Authenticated(second_request) = second_wire else {
+                panic!("refreshed request was not authenticated");
+            };
+            assert_eq!(second_request.boot_id, second_boot);
+
+            let ok = serialize_bounded_frame(&DaemonResponse::Ok, IPC_MAX_RESPONSE_BYTES).unwrap();
+            write_frame(&mut second_stream, &ok, Duration::from_secs(1))
+                .await
+                .unwrap();
+        });
+
+        let response = request_daemon_with_timeout(
+            &paths,
+            Some(&address.to_string()),
+            DaemonRequest::Status,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response, DaemonResponse::Ok));
+        server.await.unwrap();
+
+        let current = load_ipc_capability(&paths).unwrap();
+        crate::ipc_auth::remove_ipc_capability_if_current(&paths, current.boot_id).unwrap();
+        let _ = std::fs::remove_dir_all(paths.runtime_dir.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_refreshes_replaced_capability_once_for_rejected_credentials() {
+        assert_client_refreshes_capability_after(IpcAuthErrorCode::StaleBoot).await;
+        assert_client_refreshes_capability_after(IpcAuthErrorCode::InvalidCredentials).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_probe_retries_authenticated_when_new_daemon_publishes_capability() {
+        use crate::ipc_auth::{publish_ipc_capability, IpcCapabilityRecord};
+
+        let paths = test_paths("ipc-client-legacy-refresh");
+        paths.ensure().expect("paths");
+        let capability = IpcCapabilityRecord::generate().expect("capability");
+        let capability_boot = capability.boot_id;
+        let server_paths = paths.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut legacy_stream, _) = listener.accept().await.unwrap();
+            let legacy_frame = read_bounded_frame(
+                &mut legacy_stream,
+                IPC_MAX_REQUEST_BYTES,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            let legacy_wire: DaemonWireRequest = serde_json::from_slice(&legacy_frame).unwrap();
+            assert!(matches!(legacy_wire, DaemonWireRequest::Public(_)));
+
+            publish_ipc_capability(&server_paths, &capability).expect("publish capability");
+            let required = serialize_bounded_frame(
+                &DaemonResponse::IpcAuthError {
+                    code: IpcAuthErrorCode::AuthenticationRequired,
+                },
+                IPC_MAX_RESPONSE_BYTES,
+            )
+            .unwrap();
+            write_frame(&mut legacy_stream, &required, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+            let (mut authenticated_stream, _) = listener.accept().await.unwrap();
+            let authenticated_frame = read_bounded_frame(
+                &mut authenticated_stream,
+                IPC_MAX_REQUEST_BYTES,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            let authenticated_wire: DaemonWireRequest =
+                serde_json::from_slice(&authenticated_frame).unwrap();
+            let DaemonWireRequest::Authenticated(authenticated) = authenticated_wire else {
+                panic!("retry was not authenticated");
+            };
+            assert_eq!(authenticated.boot_id, capability_boot);
+
+            let ok = serialize_bounded_frame(&DaemonResponse::Ok, IPC_MAX_RESPONSE_BYTES).unwrap();
+            write_frame(&mut authenticated_stream, &ok, Duration::from_secs(1))
+                .await
+                .unwrap();
+        });
+
+        let response = request_daemon_with_timeout(
+            &paths,
+            Some(&address.to_string()),
+            DaemonRequest::Shutdown,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response, DaemonResponse::Ok));
+        server.await.unwrap();
+
+        crate::ipc_auth::remove_ipc_capability_if_current(&paths, capability_boot).unwrap();
+        let _ = std::fs::remove_dir_all(paths.runtime_dir.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capability_free_upgrade_bridge_sends_only_legacy_lifecycle_requests() {
+        let paths = test_paths("ipc-client-legacy");
+        paths.ensure().expect("paths");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let frame =
+                read_bounded_frame(&mut stream, IPC_MAX_REQUEST_BYTES, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+            let request: DaemonRequest = serde_json::from_slice(&frame).unwrap();
+            let (request, trace_id) = request.into_trace_parts();
+            assert!(matches!(request, DaemonRequest::Status));
+            assert_eq!(trace_id.as_deref(), Some("upgrade-status"));
+
+            let ok = serialize_bounded_frame(&DaemonResponse::Ok, IPC_MAX_RESPONSE_BYTES).unwrap();
+            write_frame(&mut stream, &ok, Duration::from_secs(1))
+                .await
+                .unwrap();
+        });
+
+        let response = request_daemon_with_timeout(
+            &paths,
+            Some(&address.to_string()),
+            DaemonRequest::Status.with_trace_id("upgrade-status"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response, DaemonResponse::Ok));
+        server.await.unwrap();
+
+        std::fs::write(crate::ipc_auth::ipc_capability_path(&paths), b"not json").unwrap();
+        let error = request_daemon_with_timeout(
+            &paths,
+            Some(&address.to_string()),
+            DaemonRequest::Status,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("daemon authentication unavailable"));
+        std::fs::remove_file(crate::ipc_auth::ipc_capability_path(&paths)).unwrap();
+
+        let error = request_daemon_with_timeout(
+            &paths,
+            Some(&address.to_string()),
+            DaemonRequest::OverlayShow,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("daemon authentication unavailable"));
+        let _ = std::fs::remove_dir_all(paths.runtime_dir.parent().unwrap());
     }
 
     #[cfg(unix)]
