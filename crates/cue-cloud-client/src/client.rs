@@ -700,6 +700,8 @@ fn is_sensitive_log_key(key: &str) -> bool {
         || key.contains("authorization")
         || key == "code"
         || key.ends_with("_code")
+        || key == "nonce"
+        || key.ends_with("_nonce")
         || key == "url"
         || key.ends_with("_url")
 }
@@ -904,7 +906,7 @@ mod tests {
             "access_token": "secret-access",
             "refresh_token": "secret-refresh",
             "verification_url": "https://bluey.sh/link?token=secret",
-            "nested": { "device_code": "device-secret" }
+            "nested": { "device_code": "device-secret", "nonce": "handoff-secret" }
         })
         .to_string();
 
@@ -912,6 +914,7 @@ mod tests {
         assert!(!safe.contains("secret-access"));
         assert!(!safe.contains("secret-refresh"));
         assert!(!safe.contains("device-secret"));
+        assert!(!safe.contains("handoff-secret"));
         assert!(!safe.contains("https://bluey.sh/link"));
         assert!(safe.contains("<redacted>"));
     }

@@ -39,6 +39,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 getrandom.workspace = true
 rusqlite.workspace = true
+libc.workspace = true
 hex = "0.4"
 sha2 = "0.10"
 

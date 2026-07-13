@@ -82,6 +82,18 @@ private func scrollClipView(_ clipView: NSClipView, documentView: NSView?, delta
     clipView.enclosingScrollView?.reflectScrolledClipView(clipView)
 }
 
+@discardableResult
+private func scrollViewDirectly(_ scrollView: NSScrollView, withWheelEvent event: NSEvent) -> Bool {
+    let scale: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 12
+    var deltaY = event.scrollingDeltaY * scale
+    if event.isDirectionInvertedFromDevice {
+        deltaY = -deltaY
+    }
+    guard abs(deltaY) > 0.1 else { return false }
+    scrollClipView(scrollView.contentView, documentView: scrollView.documentView, deltaY: deltaY)
+    return true
+}
+
 private let privateInstructionRefusal = "I can’t share Bluey’s private instructions, prompts, guardrails, tokens, or internal configuration. Ask me what you want to do, and I’ll help with the answer itself."
 
 private func sanitizeOverlayOutput(kind: String, body: String) -> String {
@@ -1341,7 +1353,7 @@ private final class SessionDrawerView: NSView {
             super.scrollWheel(with: event)
             return
         }
-        scrollView.scrollWheel(with: event)
+        scrollViewDirectly(scrollView, withWheelEvent: event)
     }
 
     private func isView(_ view: NSView, inside ancestor: NSView) -> Bool {
@@ -3099,9 +3111,34 @@ private final class FeedView: NSView {
         }
     }
 
-    func forwardScrollWheel(_ event: NSEvent) {
-        scroll.scrollWheel(with: event)
+    func scrollByWheelEvent(_ event: NSEvent) {
+        scrollViewDirectly(scroll, withWheelEvent: event)
         updateScrollPinAfterUserInput()
+    }
+
+    func shouldCapturePassThroughScroll(at point: NSPoint) -> Bool {
+        guard bounds.contains(point), !cards.isEmpty else { return false }
+        let scrollPoint = scroll.convert(point, from: self)
+        guard scroll.bounds.contains(scrollPoint) else { return false }
+
+        if let scroller = scroll.verticalScroller,
+           !scroller.isHidden,
+           scroller.alphaValue > 0.01,
+           scroller.convert(scroller.bounds, to: self)
+               .insetBy(dx: -8, dy: -8)
+               .contains(point) {
+            return true
+        }
+
+        for row in stack.arrangedSubviews where !row.isHidden && row.alphaValue > 0.01 {
+            guard let bubble = row.subviews.first else { continue }
+            let bubbleRect = bubble.convert(bubble.bounds, to: self)
+                .insetBy(dx: -4, dy: -4)
+            if bubbleRect.contains(point) {
+                return true
+            }
+        }
+        return false
     }
 
     func scrollByKeyboard(direction: CGFloat) {
@@ -3123,7 +3160,7 @@ private final class FeedView: NSView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        scroll.scrollWheel(with: event)
+        scrollViewDirectly(scroll, withWheelEvent: event)
         updateScrollPinAfterUserInput()
     }
 
@@ -4971,6 +5008,14 @@ private final class CanvasPaneView: NSView {
         scrollClipView(scroll.contentView, documentView: scroll.documentView, deltaY: direction * step)
     }
 
+    func scrollByWheelEvent(_ event: NSEvent) {
+        scrollViewDirectly(scroll, withWheelEvent: event)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        scrollByWheelEvent(event)
+    }
+
     func passThroughInteractiveHit(at point: NSPoint) -> NSView? {
         guard !isHidden, alphaValue > 0.01, bounds.contains(point) else { return nil }
         guard let hit = super.hitTest(point) else { return nil }
@@ -6357,35 +6402,40 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     override func scrollWheel(with event: NSEvent) {
         let localPoint = convert(event.locationInWindow, from: nil)
         if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(localPoint) {
-            sessionScroll.scrollWheel(with: event)
+            scrollViewDirectly(sessionScroll, withWheelEvent: event)
             return
         }
         if rectForView(transcriptScroll).contains(localPoint) {
-            transcriptScroll.scrollWheel(with: event)
+            scrollViewDirectly(transcriptScroll, withWheelEvent: event)
             return
         }
         if rectForView(composerSurface).contains(localPoint) {
-            composerScroll.scrollWheel(with: event)
+            scrollViewDirectly(composerScroll, withWheelEvent: event)
             return
         }
         if passThroughMode {
             if rectForView(feed).contains(localPoint) {
-                feed.forwardScrollWheel(event)
+                let feedPoint = feed.convert(localPoint, from: self)
+                guard feed.shouldCapturePassThroughScroll(at: feedPoint) else {
+                    super.scrollWheel(with: event)
+                    return
+                }
+                feed.scrollByWheelEvent(event)
                 return
             }
             if rectForView(canvasPane).contains(localPoint) {
-                canvasPane.scrollWheel(with: event)
+                canvasPane.scrollByWheelEvent(event)
                 return
             }
             super.scrollWheel(with: event)
             return
         }
         if rectForView(feed).contains(localPoint) {
-            feed.forwardScrollWheel(event)
+            feed.scrollByWheelEvent(event)
             return
         }
         if rectForView(canvasPane).contains(localPoint) {
-            canvasPane.scrollWheel(with: event)
+            canvasPane.scrollByWheelEvent(event)
             return
         }
         super.scrollWheel(with: event)
@@ -6398,23 +6448,27 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard bounds.contains(localPoint) else { return false }
 
         if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(localPoint) {
-            sessionScroll.scrollWheel(with: event)
+            scrollViewDirectly(sessionScroll, withWheelEvent: event)
             return true
         }
         if rectForView(transcriptScroll).contains(localPoint) {
-            transcriptScroll.scrollWheel(with: event)
+            scrollViewDirectly(transcriptScroll, withWheelEvent: event)
             return true
         }
         if rectForView(composerSurface).contains(localPoint) {
-            composerScroll.scrollWheel(with: event)
+            scrollViewDirectly(composerScroll, withWheelEvent: event)
             return true
         }
         if rectForView(feed).contains(localPoint) {
-            feed.forwardScrollWheel(event)
+            let feedPoint = feed.convert(localPoint, from: self)
+            guard feed.shouldCapturePassThroughScroll(at: feedPoint) else {
+                return false
+            }
+            feed.scrollByWheelEvent(event)
             return true
         }
         if canvasOpen, rectForView(canvasPane).contains(localPoint) {
-            canvasPane.scrollWheel(with: event)
+            canvasPane.scrollByWheelEvent(event)
             return true
         }
         return false

@@ -13,7 +13,7 @@ use std::os::windows::process::CommandExt;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use cue_core::app_paths::AppPaths;
-use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
+use cue_core::ipc::{DaemonRequest, DaemonResponse};
 #[cfg(unix)]
 use cue_core::process_aliases::is_daemon_executable_path;
 #[cfg(target_os = "macos")]
@@ -26,8 +26,6 @@ use cue_core::{
     MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, PrivacyFlags, ProviderRoute,
     ProviderSelector, RouteBudget, RouteSelectionPolicy, Speaker, BLUEY_TRACE_ID_ENV,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration, Instant};
 
 const CLI_UNINSTALL_LINK_STEMS: &[&str] = &[
@@ -3062,25 +3060,14 @@ fn daemon_executable_candidate_names() -> Vec<String> {
 }
 
 async fn request(message: DaemonRequest) -> Result<DaemonResponse> {
-    let addr = env_value_any("BLUEY_DAEMON_ADDR", "CUE_DAEMON_ADDR")
-        .unwrap_or_else(|| DEFAULT_DAEMON_ADDR.to_string());
-    let stream = TcpStream::connect(&addr)
-        .await
-        .with_context(|| format!("failed to connect to Bluey daemon at {addr}"))?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-
-    let line = serde_json::to_string(&message.with_trace_id(command_trace_id()))?;
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-
-    let mut response = String::new();
-    let read = reader.read_line(&mut response).await?;
-    if read == 0 {
-        bail!("daemon closed connection without a response");
-    }
-    Ok(serde_json::from_str(response.trim_end())?)
+    let compatibility_addr = env_value_any("BLUEY_DAEMON_ADDR", "CUE_DAEMON_ADDR");
+    let paths = AppPaths::discover().context("daemon IPC path unavailable")?;
+    cue_core::ipc_transport::request_daemon(
+        &paths,
+        compatibility_addr.as_deref(),
+        message.with_trace_id(command_trace_id()),
+    )
+    .await
 }
 
 fn command_trace_id() -> String {
@@ -3167,6 +3154,9 @@ fn print_response(response: DaemonResponse) -> Result<()> {
             print_answer_response(response, false, events.len())
         }
         DaemonResponse::CloudStatus { status } => print_cloud_status(status),
+        DaemonResponse::IpcAuthError { code } => {
+            bail!("daemon IPC authentication failed: {code:?}");
+        }
         DaemonResponse::Error { message } => {
             bail!("daemon error: {message}");
         }

@@ -8,11 +8,13 @@ use async_trait::async_trait;
 use cue_core::pcm::AudioChunk;
 use cue_core::stt::{ConnectionState, SttError, SttProvider, TranscriptEvent};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+
+const EVENT_QUEUE_CAPACITY: usize = 64;
 
 pub struct EchoProvider {
-    events_rx: UnboundedReceiver<Result<TranscriptEvent, SttError>>,
-    events_tx: UnboundedSender<Result<TranscriptEvent, SttError>>,
+    events_rx: Receiver<Result<TranscriptEvent, SttError>>,
+    events_tx: Option<Sender<Result<TranscriptEvent, SttError>>>,
     counter: AtomicU64,
     closed: AtomicBool,
     source: cue_core::pcm::AudioSource,
@@ -20,10 +22,10 @@ pub struct EchoProvider {
 
 impl EchoProvider {
     pub fn new(source: cue_core::pcm::AudioSource) -> Self {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = channel(EVENT_QUEUE_CAPACITY);
         Self {
             events_rx: rx,
-            events_tx: tx,
+            events_tx: Some(tx),
             counter: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             source,
@@ -56,8 +58,12 @@ impl SttProvider for EchoProvider {
             source: self.source,
             words: Vec::new(),
         };
-        let _ = self.events_tx.send(Ok(event));
-        Ok(())
+        self.events_tx
+            .as_ref()
+            .ok_or(SttError::NotActive)?
+            .send(Ok(event))
+            .await
+            .map_err(|_| SttError::NotActive)
     }
 
     async fn finalize(&self) -> Result<(), SttError> {
@@ -70,6 +76,7 @@ impl SttProvider for EchoProvider {
 
     async fn close(&mut self) -> Result<(), SttError> {
         self.closed.store(true, Ordering::Release);
+        self.events_tx = None;
         Ok(())
     }
 }
@@ -107,5 +114,41 @@ mod tests {
         assert_eq!(provider.connection_state(), ConnectionState::Closed);
         let err = provider.send_audio(&chunk()).await.unwrap_err();
         assert!(matches!(err, SttError::NotActive));
+        assert!(provider.next_event().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn final_events_wait_for_capacity_instead_of_dropping() {
+        let (tx, mut rx) = channel(1);
+        let (_unused_tx, unused_rx) = channel(1);
+        let provider = EchoProvider {
+            events_rx: unused_rx,
+            events_tx: Some(tx),
+            counter: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            source: AudioSource::Microphone,
+        };
+        provider.send_audio(&chunk()).await.unwrap();
+
+        let second_chunk = chunk();
+        let second_send = provider.send_audio(&second_chunk);
+        tokio::pin!(second_send);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut second_send)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(Ok(TranscriptEvent::Final { .. }))
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut second_send)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(Ok(TranscriptEvent::Final { .. }))
+        ));
     }
 }

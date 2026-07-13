@@ -1,0 +1,25 @@
+# Bluey source-reference audit integrity anchors
+# Generated: 2026-07-13 America/New_York
+# No application, installer, package hook, or bundled helper was executed.
+#
+# Tree digest formula:
+#   cd <tree> && find . -type f -print0 | LC_ALL=C sort -z |
+#     xargs -0 shasum -a 256 | shasum -a 256
+#
+# Columns for source trees: SHA-256  file-count  exact-file-bytes  absolute-path
+
+777d3ba36534c99072400ff1cda308719646e93e224a37b9ab8100d41ee91ff5  61  44097523  /Users/uno/Downloads/cue/_refs/Aura-AI-master
+20243857a5974c53bb21203245b4b3646579a21466a9c040bc7686a56c53555b  40  1495748  /Users/uno/Downloads/cue/_refs/OpenCluely-main
+61c95d2ddf60ae152b1524ad74fbc47105f15831122b9ea493fe7cc3e5e0aa49  44  1595954  /Users/uno/Downloads/cue/_refs/Vysper-main
+f0557d9d3c5bb22109a65bc25d36112001aacc766918b659b99f1bf149f67e76  856  269037662  /Users/uno/Downloads/cue/_refs/natively-cluely-ai-assistant-main
+67ae2396bcb5033b927af5e95f9d86bc9cee1cc97a5cd38ce9d451938c6025ad  224  8081647  /Users/uno/Downloads/cue/_refs/pluely-master
+64d1c4e302dede6a4f7135533a75c05d8b89460dad0106965727a7af82eca3c8  239  11912865  /Users/uno/Downloads/cue/_refs/solveWatchAi-main
+
+# Prior recovery evidence anchors: SHA-256  absolute-path
+1270c7dcf4948ac58c937d77aa143145c76e10b4436e4956a30480d2cff26203  /Users/uno/Downloads/dmg_backtrack_code/recovered/INDEX.md
+f0e950eb9e1d1d59e33e9e38715a38142b5cfd295eb5323f88195d480fe4e20d  /Users/uno/Downloads/dmg_backtrack_code/reformed/INDEX.md
+111b4cb3367caac4cda0b293d6959998a10dba1a9394c2b7885f61e012efff8e  /Users/uno/Downloads/dmg_backtrack_code/reformed/SECOND-PASS-RECOVERY.md
+c8e10f0167b23e6c7a69ac720789a2e87f84ee70f6f15c2284c10f8d234fb297  /Users/uno/Downloads/dmg_backtrack_code/reformed/TOPLEVEL-SHA256SUMS.txt
+4a3d43a07e49565ac83b5478bfea4e9e3d3acef267e49f27719d6956f5aa1489  /Users/uno/Downloads/exe_backtrack_code/recovered/INDEX.md
+ff450cf83aa5eb8d0e45c111feb0fb043e113efac1be9006332bec7f414b6ceb  /Users/uno/Downloads/exe_backtrack_code/recovered/TOPLEVEL-SHA256SUMS.txt
+d1909bec3bf502c1448f879da910ba2e4ac5aa5c8198829c28e1128efae2cffd  /Users/uno/Downloads/exe_backtrack_code/reformed-windows/INDEX.md

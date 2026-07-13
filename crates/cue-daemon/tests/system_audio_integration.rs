@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use cue_core::pcm::{AudioChunk, AudioSource, SampleRate};
 use cue_core::stt::{SttConfig, SttProvider, TranscriptEvent};
-use cue_daemon::audio::system_capture::SystemAudioCapture;
+use cue_daemon::audio::system_capture::{system_audio_channel, SystemAudioCapture};
 use cue_daemon::stt::mock::MockStt;
 
 fn stub_binary_path() -> PathBuf {
@@ -29,7 +29,7 @@ async fn system_audio_capture_receives_chunks_from_stub() {
 
     std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = system_audio_channel();
     let capture = SystemAudioCapture::start(tx).expect("start capture");
 
     let mut received = Vec::new();
@@ -72,7 +72,7 @@ async fn system_audio_capture_stops_cleanly() {
 
     std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = system_audio_channel();
     let capture = SystemAudioCapture::start(tx).expect("start capture");
 
     // Receive one chunk then stop
@@ -94,7 +94,7 @@ async fn system_audio_chunks_drive_stt_provider() {
 
     std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = system_audio_channel();
     let capture = SystemAudioCapture::start(tx).expect("start capture");
 
     // Create a mock STT provider configured for System audio
@@ -170,7 +170,7 @@ async fn system_audio_handle_retained_for_shutdown() {
 
     std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = system_audio_channel();
     let capture = SystemAudioCapture::start(tx).expect("start capture");
 
     // Simulate what the daemon does: store in Option, then take + stop on shutdown
@@ -209,10 +209,8 @@ async fn single_provider_send_and_drain_production_wiring() {
     use cue_core::pcm::AudioSource;
     use cue_core::stt::{SttConfig, TranscriptEvent};
     use cue_daemon::stt::mock::MockStt;
-    use tokio::sync::mpsc;
-
     // Set up the same channel the production capture uses.
-    let (sys_tx, mut sys_rx) = mpsc::unbounded_channel::<AudioChunk>();
+    let (sys_tx, mut sys_rx) = system_audio_channel();
 
     // Build ONE provider (mirrors production: build_system_audio_stt_provider called once).
     let cfg = SttConfig {
@@ -222,7 +220,7 @@ async fn single_provider_send_and_drain_production_wiring() {
     let (mut provider, ctrl) = MockStt::new(cfg);
 
     // Downstream transcript collector (replaces add_audio_transcript_segment).
-    let (transcript_tx, mut transcript_rx) = mpsc::unbounded_channel::<SttSegmentMetadata>();
+    let (transcript_tx, mut transcript_rx) = tokio::sync::mpsc::channel::<SttSegmentMetadata>(16);
 
     // Spawn the production-equivalent select! loop with the SINGLE provider.
     let loop_handle = tokio::spawn(async move {
@@ -247,7 +245,7 @@ async fn single_provider_send_and_drain_production_wiring() {
                                 let segment = SttSegmentMetadata::new(text.clone(), 0, 0, true)
                                     .with_source(kind)
                                     .with_speaker_label(kind.default_label());
-                                let _ = transcript_tx.send(segment);
+                                let _ = transcript_tx.try_send(segment);
                             }
                         }
                         Some(Err(_)) => break,
@@ -266,9 +264,9 @@ async fn single_provider_send_and_drain_production_wiring() {
         samples: vec![0i16; 320],
         captured_at_ms: 1000,
     };
-    sys_tx.send(test_chunk.clone()).unwrap();
-    sys_tx.send(test_chunk.clone()).unwrap();
-    sys_tx.send(test_chunk).unwrap();
+    sys_tx.try_send(test_chunk.clone()).unwrap();
+    sys_tx.try_send(test_chunk.clone()).unwrap();
+    sys_tx.try_send(test_chunk).unwrap();
 
     // Give the loop time to process sends.
     tokio::time::sleep(Duration::from_millis(50)).await;

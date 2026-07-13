@@ -279,6 +279,7 @@ CREATE TABLE IF NOT EXISTS cloud_context_artifacts (
   content_hash TEXT,
   text_preview TEXT,
   created_at_ms BIGINT NOT NULL,
+  updated_at_ms BIGINT NOT NULL,
   metadata_json TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (account_id, artifact_id)
 );

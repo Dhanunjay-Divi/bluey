@@ -524,6 +524,7 @@ const MIGRATIONS: &[&str] = &[
         content_hash        TEXT,
         text_preview        TEXT,
         created_at_ms       INTEGER NOT NULL,
+        updated_at_ms       INTEGER NOT NULL,
         metadata_json       TEXT NOT NULL DEFAULT '{}',
         PRIMARY KEY (account_id, artifact_id)
     );
@@ -1445,6 +1446,18 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     )?;
     ensure_column(
         &conn,
+        "cloud_context_artifacts",
+        "updated_at_ms",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    conn.execute(
+        "UPDATE cloud_context_artifacts
+         SET updated_at_ms = created_at_ms
+         WHERE updated_at_ms < created_at_ms",
+        [],
+    )?;
+    ensure_column(
+        &conn,
         "legal_acceptances",
         "accepted_at",
         // SQLite rejects non-constant defaults such as datetime('now') when
@@ -1481,6 +1494,8 @@ const POSTGRES_OBJECT_UPLOAD_CONTROLS: &str =
     include_str!("../../../infra/postgres/server-runtime/003_object_upload_controls.sql");
 const POSTGRES_STRIPE_AUTO_RELOAD: &str =
     include_str!("../../../infra/postgres/server-runtime/004_stripe_auto_reload.sql");
+const POSTGRES_CONTEXT_ARTIFACT_REVISIONS: &str =
+    include_str!("../../../infra/postgres/server-runtime/006_context_artifact_revisions.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -1539,6 +1554,14 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
         &[&"002_jobs.sql"],
     )
     .context("record postgres Jobs migration")?;
+    conn.batch_execute(POSTGRES_CONTEXT_ARTIFACT_REVISIONS)
+        .context("apply postgres context artifact revision migration")?;
+    conn.execute(
+        "INSERT INTO bluey_schema_migrations(version) VALUES ($1)
+         ON CONFLICT (version) DO NOTHING",
+        &[&"006_context_artifact_revisions.sql"],
+    )
+    .context("record postgres context artifact revision migration")?;
 
     let vector_ready = conn
         .query_opt("SELECT 1 FROM pg_extension WHERE extname = 'vector'", &[])

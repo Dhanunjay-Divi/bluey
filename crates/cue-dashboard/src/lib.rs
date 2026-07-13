@@ -68,6 +68,7 @@ pub fn run() {
             commands::set_speaker_name,
             commands::list_speakers,
             // R5: Hotkey commands
+            commands::daemon_listening_status,
             commands::daemon_toggle_listening,
             commands::daemon_set_push_to_talk,
             commands::daemon_toggle_overlay,

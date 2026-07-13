@@ -1147,14 +1147,19 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dirs",
+ "getrandom 0.2.17",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1176,6 +1181,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "keyring",
+ "libc",
  "obfstr",
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",

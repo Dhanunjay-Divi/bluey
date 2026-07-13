@@ -7,6 +7,8 @@ pub mod cloud;
 pub mod config;
 pub mod intelligence;
 pub mod ipc;
+pub mod ipc_auth;
+pub mod ipc_transport;
 pub mod logging;
 pub mod meeting;
 pub mod observability;
@@ -46,6 +48,11 @@ pub use config::{
 };
 pub use intelligence::{analyze_segment, generate_recap, local_answer, SegmentAnalysis};
 pub use ipc::{DaemonRequest, DaemonResponse};
+pub use ipc_auth::{
+    load_ipc_capability, publish_ipc_capability, remove_ipc_capability_if_current,
+    AuthenticatedDaemonRequest, DaemonWireRequest, IpcAuthErrorCode, IpcAuthenticator,
+    IpcAuthorization, IpcCapabilityRecord,
+};
 pub use logging::{
     init_local_json_logging, local_log_dir, log_file_prefix, retain_recent_log_files, LocalLogGuard,
 };

@@ -32,6 +32,9 @@ use crate::model::ProviderRoute;
 use crate::policy::RoutingPolicy;
 use crate::TaskClassification;
 
+/// Maximum number of speculative chunks buffered between providers and callers.
+pub const SPECULATIVE_CHANNEL_CAPACITY: usize = 32;
+
 /// One unit of output from the speculative router.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpeculativeChunk {
@@ -125,8 +128,8 @@ impl SpeculativeRouter {
         let should_speculate = self.speculative_when_deep
             && matches!(primary_route.lane, crate::model::ProviderLane::Deep);
 
-        // Channel to fan in chunks from both lanes.
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // Bound fan-in so a stalled UI applies backpressure to both providers.
+        let (tx, rx) = tokio::sync::mpsc::channel(SPECULATIVE_CHANNEL_CAPACITY);
 
         if should_speculate {
             // Try to build the Instant draft lane. If the Instant provider is
@@ -156,10 +159,12 @@ impl SpeculativeRouter {
                     );
                     // Surface a non-fatal Error chunk so the UI can show a
                     // subtle "draft skipped" indicator if it wants to.
-                    let _ = tx.send(SpeculativeChunk::Error {
-                        lane: "draft",
-                        message: format!("instant lane unavailable: {e}"),
-                    });
+                    let _ = tx
+                        .send(SpeculativeChunk::Error {
+                            lane: "draft",
+                            message: format!("instant lane unavailable: {e}"),
+                        })
+                        .await;
                 }
             }
             spawn_lane(LaneRole::Deep, primary_provider, request, primary_route, tx);
@@ -176,7 +181,7 @@ impl SpeculativeRouter {
             );
         }
 
-        // Adapt the unbounded receiver into a Stream.
+        // Adapt the bounded receiver into a Stream.
         let stream = futures_util::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|chunk| (chunk, rx))
         });
@@ -206,7 +211,7 @@ fn spawn_lane(
     provider: Arc<dyn LlmProvider>,
     request: Arc<LlmRequest>,
     route: ProviderRoute,
-    tx: tokio::sync::mpsc::UnboundedSender<SpeculativeChunk>,
+    tx: tokio::sync::mpsc::Sender<SpeculativeChunk>,
 ) {
     tokio::spawn(async move {
         // Codex Stage 9 round-2 Blocker 3: lane-scoped idempotency keys.
@@ -242,6 +247,7 @@ fn spawn_lane(
                 Ok(mut stream) => {
                     let mut accumulated = String::new();
                     let mut cost = None;
+                    let mut terminal_sent = false;
                     while let Some(chunk) = stream.next().await {
                         match chunk {
                             Ok(LlmChunk {
@@ -254,14 +260,21 @@ fn spawn_lane(
                                 sources: _,
                             }) => match role {
                                 LaneRole::Draft => {
-                                    let _ = tx.send(SpeculativeChunk::Draft {
-                                        text,
-                                        finished,
-                                        cost: chunk_cost,
-                                        cost_label,
-                                        artifact,
-                                    });
+                                    if tx
+                                        .send(SpeculativeChunk::Draft {
+                                            text,
+                                            finished,
+                                            cost: chunk_cost,
+                                            cost_label,
+                                            artifact,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                     if finished {
+                                        terminal_sent = true;
                                         break;
                                     }
                                 }
@@ -271,59 +284,79 @@ fn spawn_lane(
                                         cost = chunk_cost;
                                     }
                                     if finished {
-                                        let _ = tx.send(SpeculativeChunk::Final {
-                                            text: accumulated,
-                                            cost,
-                                            cost_label,
-                                            artifact,
-                                        });
+                                        let _ = tx
+                                            .send(SpeculativeChunk::Final {
+                                                text: accumulated,
+                                                cost,
+                                                cost_label,
+                                                artifact,
+                                            })
+                                            .await;
                                         return;
                                     }
                                 }
                             },
                             Err(e) => {
-                                let _ = tx.send(SpeculativeChunk::Error {
-                                    lane: role.label(),
-                                    message: e.to_string(),
-                                });
+                                let _ = tx
+                                    .send(SpeculativeChunk::Error {
+                                        lane: role.label(),
+                                        message: e.to_string(),
+                                    })
+                                    .await;
                                 return;
                             }
                         }
                     }
+                    if !terminal_sent {
+                        let _ = tx
+                            .send(SpeculativeChunk::Error {
+                                lane: role.label(),
+                                message: "provider stream ended before a terminal chunk".into(),
+                            })
+                            .await;
+                    }
                 }
                 Err(e) => {
-                    let _ = tx.send(SpeculativeChunk::Error {
-                        lane: role.label(),
-                        message: e.to_string(),
-                    });
+                    let _ = tx
+                        .send(SpeculativeChunk::Error {
+                            lane: role.label(),
+                            message: e.to_string(),
+                        })
+                        .await;
                 }
             }
         } else {
             match provider.complete(&req).await {
                 Ok(resp) => match role {
                     LaneRole::Draft => {
-                        let _ = tx.send(SpeculativeChunk::Draft {
-                            text: resp.text,
-                            finished: true,
-                            cost: resp.cost,
-                            cost_label: resp.cost_label,
-                            artifact: resp.artifact,
-                        });
+                        let _ = tx
+                            .send(SpeculativeChunk::Draft {
+                                text: resp.text,
+                                finished: true,
+                                cost: resp.cost,
+                                cost_label: resp.cost_label,
+                                artifact: resp.artifact,
+                            })
+                            .await;
                     }
                     LaneRole::Deep => {
-                        let _ = tx.send(SpeculativeChunk::Final {
-                            text: resp.text,
-                            cost: resp.cost,
-                            cost_label: resp.cost_label,
-                            artifact: resp.artifact,
-                        });
+                        let _ = tx
+                            .send(SpeculativeChunk::Final {
+                                text: resp.text,
+                                cost: resp.cost,
+                                cost_label: resp.cost_label,
+                                artifact: resp.artifact,
+                            })
+                            .await;
                     }
                 },
                 Err(e) => {
-                    let _ = tx.send(SpeculativeChunk::Error {
-                        lane: role.label(),
-                        message: e.to_string(),
-                    });
+                    let _ = tx
+                        .send(SpeculativeChunk::Error {
+                            lane: role.label(),
+                            message: e.to_string(),
+                        })
+                        .await;
                 }
             }
         }
@@ -461,6 +494,83 @@ mod tests {
         );
         assert_eq!(provider.stream_calls.load(Ordering::Relaxed), 1);
         assert_eq!(provider.completion_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn overloaded_channel_backpressures_and_preserves_terminal_chunk() {
+        let chunk_count = SPECULATIVE_CHANNEL_CAPACITY + 8;
+        let provider = Arc::new(MockProvider::new(vec!["delta"; chunk_count], "unused"));
+        let dispatch = Arc::new(MockDispatch { provider });
+        let policy: Arc<dyn RoutingPolicy> = Arc::new(StaticPolicy::defaults());
+        let router = SpeculativeRouter::new(policy, dispatch, false);
+
+        let stream = router
+            .run(&classification(LatencyLane::Balanced), req())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let chunks = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.collect::<Vec<_>>(),
+        )
+        .await
+        .expect("bounded producer did not resume after the consumer drained");
+
+        assert_eq!(chunks.len(), chunk_count);
+        assert!(matches!(
+            chunks.last(),
+            Some(SpeculativeChunk::Draft { finished: true, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_without_terminal_chunk_emits_terminal_error() {
+        struct UnterminatedProvider;
+
+        #[async_trait]
+        impl LlmProvider for UnterminatedProvider {
+            fn name(&self) -> &'static str {
+                "unterminated"
+            }
+
+            async fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse, LlmError> {
+                unreachable!("test route streams")
+            }
+
+            async fn complete_stream(&self, _req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
+                Ok(Box::pin(stream::iter([Ok(LlmChunk {
+                    text: "partial".into(),
+                    finished: false,
+                    cost: None,
+                    cost_label: None,
+                    artifact: None,
+                    status: None,
+                    sources: Vec::new(),
+                })])))
+            }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        spawn_lane(
+            LaneRole::Draft,
+            Arc::new(UnterminatedProvider),
+            Arc::new(req()),
+            StaticPolicy::defaults().route(&classification(LatencyLane::Balanced)),
+            tx,
+        );
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(SpeculativeChunk::Draft {
+                finished: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(SpeculativeChunk::Error { lane: "draft", message })
+                if message.contains("before a terminal chunk")
+        ));
     }
 
     #[tokio::test]

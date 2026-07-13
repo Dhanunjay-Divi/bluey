@@ -9,7 +9,7 @@
 //! gated behind `#[ignore]`; CI does not exercise them. The framer + DSP
 //! helpers are unit-tested separately in `framer.rs`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -17,9 +17,13 @@ use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{SampleFormat, StreamConfig};
 use cue_core::pcm::{AudioChunk, AudioSource, SampleRate};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::audio::framer::{downmix_to_mono, f32_to_i16, Framer};
+
+/// One second of 20 ms chunks at the recommended capture cadence.
+const CAPTURE_QUEUE_CAPACITY: usize = 50;
 
 /// Parameters for microphone capture.
 pub struct CaptureOptions {
@@ -74,6 +78,7 @@ pub struct MicrophoneCapture {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     sample_rate: SampleRate,
+    dropped_chunks: Arc<AtomicU64>,
 }
 
 impl MicrophoneCapture {
@@ -81,7 +86,7 @@ impl MicrophoneCapture {
     ///
     /// Returns a `(handle, rx)` pair: the handle owns the capture thread;
     /// `rx` yields framed `AudioChunk`s.
-    pub fn start(opts: CaptureOptions) -> Result<(Self, UnboundedReceiver<AudioChunk>)> {
+    pub fn start(opts: CaptureOptions) -> Result<(Self, Receiver<AudioChunk>)> {
         let host = cpal::default_host();
         let device = resolve_input_device(&host, opts.device_name.as_deref())?;
 
@@ -96,9 +101,11 @@ impl MicrophoneCapture {
         }
         let format = config.sample_format();
 
-        let (tx, rx) = unbounded_channel::<AudioChunk>();
+        let (tx, rx) = channel::<AudioChunk>(CAPTURE_QUEUE_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));
+        let dropped_chunks = Arc::new(AtomicU64::new(0));
         let thread_stop = stop.clone();
+        let thread_dropped_chunks = dropped_chunks.clone();
         let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
         tracing::info!(
             device = %device_name,
@@ -117,7 +124,7 @@ impl MicrophoneCapture {
                 move |samples: Vec<i16>| {
                     let captured_at_ms = epoch_ms();
                     for chunk in framer.push(&samples, captured_at_ms) {
-                        if tx.send(chunk).is_err() {
+                        if !try_emit_chunk(&tx, chunk, &thread_dropped_chunks) {
                             // Receiver dropped — the capture thread can exit on the
                             // next stop check.
                             break;
@@ -190,6 +197,7 @@ impl MicrophoneCapture {
                 stop,
                 thread: Some(thread),
                 sample_rate,
+                dropped_chunks,
             },
             rx,
         ))
@@ -198,6 +206,10 @@ impl MicrophoneCapture {
     /// Detected hardware sample rate. Stable for the life of the capture.
     pub fn sample_rate(&self) -> SampleRate {
         self.sample_rate
+    }
+
+    pub fn dropped_chunks(&self) -> u64 {
+        self.dropped_chunks.load(Ordering::Relaxed)
     }
 
     /// Signal the capture thread to exit and wait for it. Called
@@ -211,6 +223,24 @@ impl MicrophoneCapture {
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
+    }
+}
+
+fn try_emit_chunk(
+    sender: &Sender<AudioChunk>,
+    chunk: AudioChunk,
+    dropped_chunks: &AtomicU64,
+) -> bool {
+    match sender.try_send(chunk) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            let dropped = dropped_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(dropped, "microphone capture queue overloaded");
+            }
+            true
+        }
+        Err(TrySendError::Closed(_)) => false,
     }
 }
 
@@ -313,6 +343,25 @@ mod tests {
             .unwrap()
             .filter(|s| !s.trim().is_empty());
         assert_eq!(val, Some("My USB Mic".to_string()));
+    }
+
+    #[tokio::test]
+    async fn capture_queue_drops_on_overload_and_detects_closed_receiver() {
+        let (tx, mut rx) = channel(1);
+        let dropped = AtomicU64::new(0);
+        let chunk = AudioChunk {
+            source: AudioSource::Microphone,
+            sample_rate: SampleRate::SR_16K,
+            samples: vec![0; 320],
+            captured_at_ms: 0,
+        };
+
+        assert!(try_emit_chunk(&tx, chunk.clone(), &dropped));
+        assert!(try_emit_chunk(&tx, chunk.clone(), &dropped));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.recv().await.unwrap().samples.len(), chunk.samples.len());
+        drop(rx);
+        assert!(!try_emit_chunk(&tx, chunk, &dropped));
     }
 }
 

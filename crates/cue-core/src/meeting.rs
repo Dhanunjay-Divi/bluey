@@ -164,6 +164,10 @@ pub struct ContextArtifact {
     #[serde(default)]
     pub processing_error: Option<String>,
     pub created_at: String,
+    /// Monotonic local revision used by cloud sync. Older records deserialize
+    /// with an empty value and fall back to `created_at` at the sync boundary.
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 impl ContextArtifact {
@@ -174,6 +178,7 @@ impl ContextArtifact {
         note: Option<String>,
         size_bytes: Option<u64>,
     ) -> Self {
+        let now = clock::now_epoch_ms_string();
         Self {
             id: Uuid::new_v4(),
             kind,
@@ -185,8 +190,21 @@ impl ContextArtifact {
             markdown_path: None,
             processing_status: ContextProcessingStatus::Pending,
             processing_error: None,
-            created_at: clock::now_epoch_ms_string(),
+            created_at: now.clone(),
+            updated_at: now,
         }
+    }
+
+    pub fn touch(&mut self) {
+        let now = clock::now_epoch_ms_string()
+            .parse::<i64>()
+            .unwrap_or_default();
+        let current = self
+            .updated_at
+            .parse::<i64>()
+            .or_else(|_| self.created_at.parse::<i64>())
+            .unwrap_or_default();
+        self.updated_at = now.max(current.saturating_add(1)).to_string();
     }
 
     pub fn with_text_preview(mut self, preview: impl Into<String>) -> Self {
@@ -198,28 +216,33 @@ impl ContextArtifact {
         self.text_preview = Some(preview);
         self.processing_status = ContextProcessingStatus::Ready;
         self.processing_error = None;
+        self.touch();
         self
     }
 
     pub fn with_markdown_path(mut self, path: impl Into<String>) -> Self {
         self.markdown_path = Some(path.into());
+        self.touch();
         self
     }
 
     pub fn with_processing_status(mut self, status: ContextProcessingStatus) -> Self {
         self.processing_status = status;
+        self.touch();
         self
     }
 
     pub fn with_processing_error(mut self, error: impl Into<String>) -> Self {
         self.processing_status = ContextProcessingStatus::Failed;
         self.processing_error = Some(error.into());
+        self.touch();
         self
     }
 
     pub fn with_unsupported_error(mut self, error: impl Into<String>) -> Self {
         self.processing_status = ContextProcessingStatus::Unsupported;
         self.processing_error = Some(error.into());
+        self.touch();
         self
     }
 }

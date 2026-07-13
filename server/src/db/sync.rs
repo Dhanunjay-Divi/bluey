@@ -94,6 +94,8 @@ pub struct SyncContextArtifactRecord {
     #[serde(default)]
     pub text_preview: Option<String>,
     pub created_at_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
     #[serde(default = "empty_json")]
     pub metadata: serde_json::Value,
 }
@@ -376,11 +378,12 @@ fn upsert_batch_sqlite(
             continue;
         }
         let metadata = serde_json::to_string(&record.metadata)?;
+        let updated_at_ms = record.updated_at_ms.max(record.created_at_ms);
         let affected = tx.execute(
             "INSERT INTO cloud_context_artifacts (
                 account_id, artifact_id, session_id, kind, title, note, source_uri,
-                content_hash, text_preview, created_at_ms, metadata_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                content_hash, text_preview, created_at_ms, updated_at_ms, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(account_id, artifact_id) DO UPDATE SET
                 session_id=excluded.session_id,
                 kind=excluded.kind,
@@ -390,8 +393,9 @@ fn upsert_batch_sqlite(
                 content_hash=excluded.content_hash,
                 text_preview=excluded.text_preview,
                 created_at_ms=excluded.created_at_ms,
+                updated_at_ms=excluded.updated_at_ms,
                 metadata_json=excluded.metadata_json
-             WHERE excluded.created_at_ms >= cloud_context_artifacts.created_at_ms",
+             WHERE excluded.updated_at_ms > cloud_context_artifacts.updated_at_ms",
             params![
                 account_id,
                 record.artifact_id,
@@ -403,6 +407,7 @@ fn upsert_batch_sqlite(
                 record.content_hash,
                 record.text_preview,
                 record.created_at_ms,
+                updated_at_ms,
                 metadata,
             ],
         )?;
@@ -690,11 +695,12 @@ fn upsert_batch_postgres(
         let source_uri = db_opt_text(&record.source_uri);
         let content_hash = db_opt_text(&record.content_hash);
         let text_preview = db_opt_text(&record.text_preview);
+        let updated_at_ms = record.updated_at_ms.max(record.created_at_ms);
         let affected = tx.execute(
             "INSERT INTO cloud_context_artifacts (
                 account_id, artifact_id, session_id, kind, title, note, source_uri,
-                content_hash, text_preview, created_at_ms, metadata_json
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                content_hash, text_preview, created_at_ms, updated_at_ms, metadata_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT(account_id, artifact_id) DO UPDATE SET
                 session_id=excluded.session_id,
                 kind=excluded.kind,
@@ -704,8 +710,9 @@ fn upsert_batch_postgres(
                 content_hash=excluded.content_hash,
                 text_preview=excluded.text_preview,
                 created_at_ms=excluded.created_at_ms,
+                updated_at_ms=excluded.updated_at_ms,
                 metadata_json=excluded.metadata_json
-             WHERE excluded.created_at_ms >= cloud_context_artifacts.created_at_ms",
+             WHERE excluded.updated_at_ms > cloud_context_artifacts.updated_at_ms",
             &[
                 &account_id,
                 &record.artifact_id,
@@ -717,6 +724,7 @@ fn upsert_batch_postgres(
                 &content_hash,
                 &text_preview,
                 &record.created_at_ms,
+                &updated_at_ms,
                 &metadata,
             ],
         )
@@ -1227,12 +1235,12 @@ fn load_context_artifact_sqlite(
     let conn = pool.get().context("get db conn")?;
     conn.query_row(
         "SELECT artifact_id, session_id, kind, title, note, source_uri,
-                content_hash, text_preview, created_at_ms, metadata_json
+                content_hash, text_preview, created_at_ms, updated_at_ms, metadata_json
          FROM cloud_context_artifacts
          WHERE account_id = ?1 AND artifact_id = ?2",
         params![account_id, artifact_id],
         |row| {
-            let metadata: String = row.get(9)?;
+            let metadata: String = row.get(10)?;
             Ok(SyncContextArtifactRecord {
                 artifact_id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -1243,6 +1251,7 @@ fn load_context_artifact_sqlite(
                 content_hash: row.get(6)?,
                 text_preview: row.get(7)?,
                 created_at_ms: row.get(8)?,
+                updated_at_ms: row.get(9)?,
                 metadata: parse_json(&metadata),
             })
         },
@@ -1259,13 +1268,13 @@ fn load_context_artifact_postgres(
     let mut conn = pool.get_pg().context("get postgres db conn")?;
     let row = conn.query_opt(
         "SELECT artifact_id, session_id, kind, title, note, source_uri,
-                content_hash, text_preview, created_at_ms, metadata_json
+                content_hash, text_preview, created_at_ms, updated_at_ms, metadata_json
          FROM cloud_context_artifacts
          WHERE account_id = $1 AND artifact_id = $2",
         &[&account_id, &artifact_id],
     )?;
     row.map(|row| {
-        let metadata: String = row.try_get(9)?;
+        let metadata: String = row.try_get(10)?;
         Ok(SyncContextArtifactRecord {
             artifact_id: row.try_get(0)?,
             session_id: row.try_get(1)?,
@@ -1276,6 +1285,7 @@ fn load_context_artifact_postgres(
             content_hash: row.try_get(6)?,
             text_preview: row.try_get(7)?,
             created_at_ms: row.try_get(8)?,
+            updated_at_ms: row.try_get(9)?,
             metadata: parse_json(&metadata),
         })
     })
@@ -1517,13 +1527,13 @@ fn load_context(
 ) -> Result<Vec<SyncContextArtifactRecord>> {
     let mut stmt = conn.prepare(
         "SELECT artifact_id, session_id, kind, title, note, source_uri,
-                content_hash, text_preview, created_at_ms, metadata_json
+                content_hash, text_preview, created_at_ms, updated_at_ms, metadata_json
          FROM cloud_context_artifacts
          WHERE account_id = ?1 AND session_id = ?2
          ORDER BY created_at_ms ASC",
     )?;
     let rows = stmt.query_map(params![account_id, session_id], |row| {
-        let metadata: String = row.get(9)?;
+        let metadata: String = row.get(10)?;
         Ok(SyncContextArtifactRecord {
             artifact_id: row.get(0)?,
             session_id: row.get(1)?,
@@ -1534,6 +1544,7 @@ fn load_context(
             content_hash: row.get(6)?,
             text_preview: row.get(7)?,
             created_at_ms: row.get(8)?,
+            updated_at_ms: row.get(9)?,
             metadata: parse_json(&metadata),
         })
     })?;
@@ -1651,7 +1662,7 @@ fn load_context_pg(
 ) -> Result<Vec<SyncContextArtifactRecord>> {
     let rows = conn.query(
         "SELECT artifact_id, session_id, kind, title, note, source_uri,
-                content_hash, text_preview, created_at_ms, metadata_json
+                content_hash, text_preview, created_at_ms, updated_at_ms, metadata_json
          FROM cloud_context_artifacts
          WHERE account_id = $1 AND session_id = $2
          ORDER BY created_at_ms ASC",
@@ -1659,7 +1670,7 @@ fn load_context_pg(
     )?;
     rows.into_iter()
         .map(|row| {
-            let metadata: String = row.try_get(9)?;
+            let metadata: String = row.try_get(10)?;
             Ok(SyncContextArtifactRecord {
                 artifact_id: row.try_get(0)?,
                 session_id: row.try_get(1)?,
@@ -1670,6 +1681,7 @@ fn load_context_pg(
                 content_hash: row.try_get(6)?,
                 text_preview: row.try_get(7)?,
                 created_at_ms: row.try_get(8)?,
+                updated_at_ms: row.try_get(9)?,
                 metadata: parse_json(&metadata),
             })
         })
@@ -1999,7 +2011,7 @@ mod tests {
             artifact_confidence: None,
             metadata: serde_json::json!({"version": text}),
         };
-        let context = |title: &str, created_at_ms: i64| SyncContextArtifactRecord {
+        let context = |title: &str, updated_at_ms: i64| SyncContextArtifactRecord {
             artifact_id: "artifact-versioned".into(),
             session_id: session_id.into(),
             kind: "document".into(),
@@ -2008,7 +2020,8 @@ mod tests {
             source_uri: None,
             content_hash: None,
             text_preview: Some(title.into()),
-            created_at_ms,
+            created_at_ms: 1,
+            updated_at_ms,
             metadata: serde_json::json!({"version": title}),
         };
         let rag = |text: &str, updated_at_ms: i64| SyncRagChunkRecord {
@@ -2064,6 +2077,24 @@ mod tests {
         assert_eq!(bundle.transcript_segments[0].text, "new");
         assert_eq!(bundle.cue_responses[0].text, "new");
         assert_eq!(bundle.context_artifacts[0].title, "new");
+        assert_eq!(bundle.context_artifacts[0].created_at_ms, 1);
+        assert_eq!(bundle.context_artifacts[0].updated_at_ms, 20);
+
+        let exact_retry_counts = upsert_batch(
+            &pool,
+            account_id,
+            &[],
+            &[],
+            &[],
+            &[context("same-revision-retry", 20)],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(exact_retry_counts.context_artifacts, 0);
+        let retried = load_session(&pool, account_id, session_id)
+            .unwrap()
+            .expect("session remains visible");
+        assert_eq!(retried.context_artifacts[0].title, "new");
         let rag_text: String = pool
             .get()
             .unwrap()
@@ -2147,6 +2178,7 @@ mod tests {
                 content_hash: None,
                 text_preview: Some("private text".into()),
                 created_at_ms: 10,
+                updated_at_ms: 10,
                 metadata: serde_json::json!({}),
             }],
             &[SyncRagChunkRecord {
@@ -2296,6 +2328,7 @@ mod tests {
                 content_hash: None,
                 text_preview: None,
                 created_at_ms,
+                updated_at_ms: created_at_ms,
                 metadata: serde_json::json!({}),
             }],
             &[],

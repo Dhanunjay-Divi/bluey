@@ -21,36 +21,62 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use self::error::WhisperError;
 use self::parser::parse_line;
 
+const AUDIO_QUEUE_CAPACITY: usize = 50;
+const EVENT_QUEUE_CAPACITY: usize = 64;
+
 /// Local Whisper STT provider using a child-process helper binary.
 pub struct LocalWhisperProvider {
     state: ConnectionState,
-    event_rx: mpsc::UnboundedReceiver<Result<TranscriptEvent, SttError>>,
-    stdin_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
-    _child_handle: Option<tokio::task::JoinHandle<()>>,
+    event_rx: mpsc::Receiver<Result<TranscriptEvent, SttError>>,
+    stdin_tx: Option<mpsc::Sender<Vec<u8>>>,
+    child_handle: Option<tokio::task::JoinHandle<()>>,
+    dropped_audio_chunks: AtomicU64,
+    dropped_partial_events: Arc<AtomicU64>,
 }
 
 impl LocalWhisperProvider {
     /// Create and start a new LocalWhisperProvider.
     pub fn connect(config: SttConfig) -> Result<Self, WhisperError> {
         let binary = resolve_binary()?;
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+        let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
+        let dropped_partial_events = Arc::new(AtomicU64::new(0));
 
         let source = config.source;
+        let task_dropped_partial_events = dropped_partial_events.clone();
         let handle = tokio::spawn(async move {
-            run_helper_loop(binary, source, event_tx, stdin_rx).await;
+            run_helper_loop(
+                binary,
+                source,
+                event_tx,
+                stdin_rx,
+                task_dropped_partial_events,
+            )
+            .await;
         });
 
         Ok(Self {
             state: ConnectionState::Connected,
             event_rx,
             stdin_tx: Some(stdin_tx),
-            _child_handle: Some(handle),
+            child_handle: Some(handle),
+            dropped_audio_chunks: AtomicU64::new(0),
+            dropped_partial_events,
         })
+    }
+
+    pub fn dropped_audio_chunks(&self) -> u64 {
+        self.dropped_audio_chunks.load(Ordering::Relaxed)
+    }
+
+    pub fn dropped_partial_events(&self) -> u64 {
+        self.dropped_partial_events.load(Ordering::Relaxed)
     }
 }
 
@@ -140,14 +166,15 @@ fn resolve_binary() -> Result<String, WhisperError> {
 async fn run_helper_loop(
     binary: String,
     source: cue_core::pcm::AudioSource,
-    event_tx: mpsc::UnboundedSender<Result<TranscriptEvent, SttError>>,
-    mut stdin_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    event_tx: mpsc::Sender<Result<TranscriptEvent, SttError>>,
+    mut stdin_rx: mpsc::Receiver<Vec<u8>>,
+    dropped_partial_events: Arc<AtomicU64>,
 ) {
     let mut child = match spawn_helper(&binary) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to spawn whisper helper: {e}");
-            let _ = event_tx.send(Err(SttError::Provider(e.to_string())));
+            let _ = event_tx.send(Err(SttError::Provider(e.to_string()))).await;
             return;
         }
     };
@@ -156,7 +183,9 @@ async fn run_helper_loop(
     let child_stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
-            let _ = event_tx.send(Err(SttError::Provider("no stdout from helper".into())));
+            let _ = event_tx
+                .send(Err(SttError::Provider("no stdout from helper".into())))
+                .await;
             return;
         }
     };
@@ -173,7 +202,10 @@ async fn run_helper_loop(
             match parse_line(&line) {
                 Ok(evt) => {
                     let te = evt.into_transcript_event(source);
-                    if event_tx2.send(Ok(te)).is_err() {
+                    if send_transcript_event(&event_tx2, te, Some(&dropped_partial_events))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -200,6 +232,37 @@ async fn run_helper_loop(
     let _ = child.wait().await;
 }
 
+async fn send_transcript_event(
+    event_tx: &mpsc::Sender<Result<TranscriptEvent, SttError>>,
+    event: TranscriptEvent,
+    dropped_partial_events: Option<&AtomicU64>,
+) -> Result<(), ()> {
+    if matches!(event, TranscriptEvent::Partial { .. }) {
+        match event_tx.try_send(Ok(event)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if let Some(counter) = dropped_partial_events {
+                    count_drop(counter, "partial events");
+                }
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
+    } else {
+        event_tx.send(Ok(event)).await.map_err(|_| ())
+    }
+}
+
+fn count_drop(counter: &AtomicU64, queue: &'static str) {
+    let dropped = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped.is_power_of_two() {
+        warn!(
+            provider = "local_whisper",
+            queue, dropped, "bounded realtime queue overloaded"
+        );
+    }
+}
+
 fn spawn_helper(binary: &str) -> Result<Child, WhisperError> {
     Command::new(binary)
         .stdin(Stdio::piped())
@@ -223,8 +286,16 @@ impl SttProvider for LocalWhisperProvider {
         let tx = self.stdin_tx.as_ref().ok_or(SttError::NotActive)?;
         // Convert samples to LE bytes
         let bytes: Vec<u8> = chunk.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        tx.send(bytes)
-            .map_err(|_| SttError::Provider("helper stdin closed".into()))
+        match tx.try_send(bytes) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                count_drop(&self.dropped_audio_chunks, "audio chunks");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(SttError::Provider("helper stdin closed".into()))
+            }
+        }
     }
 
     async fn finalize(&self) -> Result<(), SttError> {
@@ -238,6 +309,15 @@ impl SttProvider for LocalWhisperProvider {
     async fn close(&mut self) -> Result<(), SttError> {
         self.state = ConnectionState::Closed;
         self.stdin_tx = None;
+        if let Some(mut handle) = self.child_handle.take() {
+            if tokio::time::timeout(std::time::Duration::from_secs(3), &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
         Ok(())
     }
 }
@@ -247,4 +327,89 @@ pub fn is_local_whisper_enabled() -> bool {
     std::env::var("BLUEY_STT_LOCAL_WHISPER")
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cue_core::pcm::{AudioSource, SampleRate};
+
+    fn chunk() -> AudioChunk {
+        AudioChunk {
+            source: AudioSource::Microphone,
+            sample_rate: SampleRate::SR_16K,
+            samples: vec![0; 320],
+            captured_at_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_overload_drops_and_close_closes_stdin_queue() {
+        let (stdin_tx, mut stdin_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let mut provider = LocalWhisperProvider {
+            state: ConnectionState::Connected,
+            event_rx,
+            stdin_tx: Some(stdin_tx),
+            child_handle: None,
+            dropped_audio_chunks: AtomicU64::new(0),
+            dropped_partial_events: Arc::new(AtomicU64::new(0)),
+        };
+
+        provider.send_audio(&chunk()).await.unwrap();
+        provider.send_audio(&chunk()).await.unwrap();
+        assert_eq!(provider.dropped_audio_chunks(), 1);
+        provider.close().await.unwrap();
+        assert_eq!(provider.connection_state(), ConnectionState::Closed);
+        assert!(stdin_rx.recv().await.is_some());
+        assert!(stdin_rx.recv().await.is_none());
+        assert!(matches!(
+            provider.send_audio(&chunk()).await,
+            Err(SttError::NotActive)
+        ));
+    }
+
+    #[tokio::test]
+    async fn partial_overload_drops_interim_but_final_waits_and_delivers() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let dropped = AtomicU64::new(0);
+        let partial = TranscriptEvent::Partial {
+            text: "interim".into(),
+            confidence: None,
+            source: AudioSource::Microphone,
+        };
+        send_transcript_event(&tx, partial.clone(), Some(&dropped))
+            .await
+            .unwrap();
+        send_transcript_event(&tx, partial, Some(&dropped))
+            .await
+            .unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+        let final_event = TranscriptEvent::Final {
+            text: "final".into(),
+            confidence: None,
+            source: AudioSource::Microphone,
+            words: Vec::new(),
+        };
+        let send_final = send_transcript_event(&tx, final_event, Some(&dropped));
+        tokio::pin!(send_final);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut send_final)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(Ok(TranscriptEvent::Partial { .. }))
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut send_final)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(Ok(TranscriptEvent::Final { .. }))
+        ));
+    }
 }

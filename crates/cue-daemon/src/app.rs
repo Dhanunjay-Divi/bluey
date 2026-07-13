@@ -19,7 +19,13 @@ use cue_core::ai::{
 };
 use cue_core::app_paths::AppPaths;
 use cue_core::audio::{AudioPlatformCapability, AudioRuntimeMode};
-use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
+use cue_core::ipc::{DaemonRequest, DaemonResponse};
+use cue_core::ipc_auth::{DaemonWireRequest, IpcAuthErrorCode, IpcAuthenticator};
+use cue_core::ipc_transport::{
+    read_bounded_frame, serialize_daemon_response, write_frame, IpcFrameReadError,
+    IPC_MAX_CONNECTIONS, IPC_MAX_REQUEST_BYTES, IPC_REQUEST_READ_DEADLINE,
+    IPC_RESPONSE_WRITE_DEADLINE,
+};
 use cue_core::overlay_ipc::ListeningState;
 #[cfg(target_os = "windows")]
 use cue_core::process_aliases::WINDOWS_OVERLAY_BINARY_NAMES;
@@ -52,10 +58,12 @@ use cue_llm::{
 use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::process::Command as TokioCommand;
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
+use tokio::sync::{
+    broadcast, mpsc, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore,
+};
 use tokio::time::{sleep, timeout, Duration};
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, http::HeaderValue, Message as WebSocketMessage,
@@ -84,6 +92,7 @@ const LIVE_STT_FINALIZE_WAIT_MS: u64 = 850;
 const LIVE_STT_INTERIM_CONTEXT_MAX_AGE_MS: u64 = 10_000;
 const LIVE_STT_SILENCE_NOTICE_MS: u128 = 8_000;
 const PCM16_DBFS_FLOOR: f64 = -120.0;
+const OVERLAY_EVENT_QUEUE_CAPACITY: usize = 256;
 
 struct LiveProviderAnswer {
     provider: ProviderSelector,
@@ -1549,9 +1558,9 @@ struct TranscriptionResponse {
 #[derive(Debug, Parser)]
 #[command(name = "bluey-daemon", version, about = "Bluey background daemon")]
 struct Args {
-    /// Listen address for local CLI IPC.
-    #[arg(long, default_value = DEFAULT_DAEMON_ADDR)]
-    addr: String,
+    /// Explicit numeric-loopback compatibility address for local CLI IPC.
+    #[arg(long)]
+    addr: Option<String>,
     /// Do not spawn the native overlay sidecar.
     #[arg(long)]
     no_overlay: bool,
@@ -1588,7 +1597,7 @@ struct Daemon {
     overlay: Mutex<Option<OverlayProcess>>,
     overlay_enabled: bool,
     overlay_bin: Option<PathBuf>,
-    overlay_events_tx: mpsc::UnboundedSender<OverlayEvent>,
+    overlay_events_tx: mpsc::Sender<OverlayEvent>,
     capture: Mutex<CaptureRuntime>,
     audio: Mutex<AudioPipelineStatus>,
     audio_runtime: Mutex<AudioRuntime>,
@@ -1626,6 +1635,59 @@ struct Daemon {
     /// while AttachRequested + InstructionsRequested are entry-point events
     /// allowed from any state.
     overlay_ui_state: SharedOverlayUiState,
+}
+
+enum DaemonIpcListener {
+    #[cfg(unix)]
+    Unix(cue_core::ipc_transport::OwnerOnlyUnixListener),
+    Compatibility {
+        listener: TcpListener,
+        address: std::net::SocketAddr,
+    },
+    #[cfg(windows)]
+    WindowsPipe(cue_core::ipc_transport::OwnerOnlyWindowsPipeListener),
+}
+
+struct IpcCapabilityGuard {
+    paths: AppPaths,
+    boot_id: uuid::Uuid,
+}
+
+impl Drop for IpcCapabilityGuard {
+    fn drop(&mut self) {
+        if let Err(error) = cue_core::remove_ipc_capability_if_current(&self.paths, self.boot_id) {
+            warn!(%error, "failed to clean up daemon IPC capability");
+        }
+    }
+}
+
+async fn bind_daemon_ipc_listener(
+    paths: &AppPaths,
+    compatibility_addr: Option<&str>,
+) -> Result<DaemonIpcListener> {
+    if let Some(value) = compatibility_addr {
+        let (listener, address) = cue_core::ipc_transport::bind_compatibility_listener(value)
+            .await
+            .context("failed to bind daemon compatibility IPC")?;
+        return Ok(DaemonIpcListener::Compatibility { listener, address });
+    }
+
+    #[cfg(unix)]
+    {
+        return Ok(DaemonIpcListener::Unix(
+            cue_core::ipc_transport::OwnerOnlyUnixListener::bind(paths)?,
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        return Ok(DaemonIpcListener::WindowsPipe(
+            cue_core::ipc_transport::OwnerOnlyWindowsPipeListener::bind()?,
+        ));
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow!("local daemon IPC is unsupported on this platform"))
 }
 
 struct CloudLoginTask {
@@ -1764,11 +1826,15 @@ pub async fn run() -> Result<()> {
     let args = Args::parse();
     let paths = AppPaths::discover()?;
     paths.ensure()?;
+    let ipc_listener = bind_daemon_ipc_listener(&paths, args.addr.as_deref()).await?;
+    let ipc_capability = cue_core::IpcCapabilityRecord::generate()?;
+    let ipc_auth = Arc::new(IpcAuthenticator::new(ipc_capability.clone()));
     let store = MeetingStore::new(&paths)?;
     let active_meeting = store.load_active()?;
     let initial_state = state_from_active_meeting(active_meeting.as_ref());
     let cloud_status = cloud_status_from_env(&paths);
-    let (overlay_events_tx, overlay_events_rx) = mpsc::unbounded_channel();
+    let (overlay_events_tx, overlay_events_rx) =
+        mpsc::channel(OVERLAY_EVENT_QUEUE_CAPACITY);
     let overlay_bin = args.overlay_bin.clone();
     let rag_indexer = RagIndexCoordinator::from_paths(&paths);
     let balance_watch = crate::cloud::balance::BalanceWatch::default();
@@ -1843,7 +1909,7 @@ pub async fn run() -> Result<()> {
         .unwrap_or(false)
     {
         let stt_enabled = crate::audio::system_capture::is_system_audio_stt_enabled();
-        let (sys_tx, mut sys_rx) = mpsc::unbounded_channel();
+        let (sys_tx, mut sys_rx) = crate::audio::system_capture::system_audio_channel();
         match crate::audio::system_capture::SystemAudioCapture::start(sys_tx) {
             Ok(handle) => {
                 info!(
@@ -1947,46 +2013,201 @@ pub async fn run() -> Result<()> {
     }
     write_state(&daemon).await?;
 
-    let listener = TcpListener::bind(&args.addr)
-        .await
-        .with_context(|| format!("failed to bind Bluey daemon IPC at {}", args.addr))?;
-    info!("Bluey daemon listening on {}", args.addr);
+    cue_core::publish_ipc_capability(&daemon.paths, &ipc_capability)?;
+    let _ipc_capability_guard = IpcCapabilityGuard {
+        paths: daemon.paths.clone(),
+        boot_id: ipc_capability.boot_id,
+    };
+    serve_daemon_ipc(ipc_listener, daemon, ipc_auth).await
+}
 
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        debug!("accepted CLI connection from {peer}");
-        let daemon = daemon.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_client(daemon, stream).await {
-                error!("client handler failed: {error:#}");
+async fn serve_daemon_ipc(
+    listener: DaemonIpcListener,
+    daemon: Arc<Daemon>,
+    ipc_auth: Arc<IpcAuthenticator>,
+) -> Result<()> {
+    let permits = Arc::new(Semaphore::new(IPC_MAX_CONNECTIONS));
+    let shutdown = Arc::new(Notify::new());
+
+    match listener {
+        #[cfg(unix)]
+        DaemonIpcListener::Unix(listener) => {
+            info!(
+                path = %cue_core::ipc_transport::ipc_socket_path(&daemon.paths).display(),
+                "Bluey daemon listening on owner-only Unix IPC"
+            );
+            loop {
+                let stream = tokio::select! {
+                    _ = shutdown.notified() => return Ok(()),
+                    accepted = listener.accept() => match accepted {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            warn!(%error, "rejected Unix daemon IPC peer");
+                            continue;
+                        }
+                    },
+                };
+                spawn_ipc_client(
+                    daemon.clone(),
+                    ipc_auth.clone(),
+                    stream,
+                    permits.clone(),
+                    shutdown.clone(),
+                );
             }
-        });
+        }
+        DaemonIpcListener::Compatibility { listener, address } => {
+            info!(%address, "Bluey daemon listening on loopback compatibility IPC");
+            loop {
+                let (stream, peer) = tokio::select! {
+                    _ = shutdown.notified() => return Ok(()),
+                    accepted = listener.accept() => accepted?,
+                };
+                if !peer.ip().is_loopback() {
+                    warn!(%peer, "rejected non-loopback daemon IPC peer");
+                    continue;
+                }
+                debug!(%peer, "accepted loopback daemon IPC connection");
+                spawn_ipc_client(
+                    daemon.clone(),
+                    ipc_auth.clone(),
+                    stream,
+                    permits.clone(),
+                    shutdown.clone(),
+                );
+            }
+        }
+        #[cfg(windows)]
+        DaemonIpcListener::WindowsPipe(mut listener) => {
+            info!("Bluey daemon listening on owner-only Windows named pipe");
+            loop {
+                let connected = tokio::select! {
+                    _ = shutdown.notified() => return Ok(()),
+                    accepted = listener.accept() => accepted?,
+                };
+                spawn_ipc_client(
+                    daemon.clone(),
+                    ipc_auth.clone(),
+                    connected,
+                    permits.clone(),
+                    shutdown.clone(),
+                );
+            }
+        }
     }
 }
 
-async fn handle_client(daemon: Arc<Daemon>, stream: TcpStream) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let read = reader.read_line(&mut line).await?;
-    if read == 0 {
-        return Ok(());
-    }
+fn spawn_ipc_client<S>(
+    daemon: Arc<Daemon>,
+    ipc_auth: Arc<IpcAuthenticator>,
+    stream: S,
+    permits: Arc<Semaphore>,
+    shutdown: Arc<Notify>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let Ok(permit) = permits.try_acquire_owned() else {
+        warn!("rejected daemon IPC connection at capacity");
+        return;
+    };
+    tokio::spawn(async move {
+        if let Err(error) = handle_client(daemon, ipc_auth, stream, permit, shutdown).await {
+            error!("daemon IPC client handler failed: {error:#}");
+        }
+    });
+}
 
-    let request: DaemonRequest = serde_json::from_str(line.trim_end())?;
-    let shutdown = request.is_shutdown();
+async fn handle_client<S>(
+    daemon: Arc<Daemon>,
+    ipc_auth: Arc<IpcAuthenticator>,
+    mut stream: S,
+    _permit: OwnedSemaphorePermit,
+    shutdown: Arc<Notify>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let frame = match read_bounded_frame(
+        &mut stream,
+        IPC_MAX_REQUEST_BYTES,
+        IPC_REQUEST_READ_DEADLINE,
+    )
+    .await
+    {
+        Ok(frame) => frame,
+        Err(IpcFrameReadError::Closed) => return Ok(()),
+        Err(IpcFrameReadError::Timeout) => {
+            write_ipc_response(
+                &mut stream,
+                &DaemonResponse::IpcAuthError {
+                    code: IpcAuthErrorCode::ReadTimeout,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(IpcFrameReadError::TooLarge { .. }) => {
+            write_ipc_response(
+                &mut stream,
+                &DaemonResponse::IpcAuthError {
+                    code: IpcAuthErrorCode::RequestTooLarge,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(IpcFrameReadError::MissingDelimiter) => {
+            write_ipc_response(
+                &mut stream,
+                &DaemonResponse::IpcAuthError {
+                    code: IpcAuthErrorCode::MalformedRequest,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(IpcFrameReadError::Io(error)) => return Err(error.into()),
+    };
+
+    let wire: DaemonWireRequest = match serde_json::from_slice(&frame) {
+        Ok(wire) => wire,
+        Err(_) => {
+            write_ipc_response(
+                &mut stream,
+                &DaemonResponse::IpcAuthError {
+                    code: IpcAuthErrorCode::MalformedRequest,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let request = match ipc_auth.authorize(wire) {
+        Ok(request) => request,
+        Err(code) => {
+            write_ipc_response(&mut stream, &DaemonResponse::IpcAuthError { code }).await?;
+            return Ok(());
+        }
+    };
+
+    // Lifecycle decisions are made only from the successfully authorized,
+    // replay-checked typed request, never from raw frame bytes.
+    let should_shutdown = request.is_shutdown();
     let response = handle_request(&daemon, request).await;
-    let line = serde_json::to_string(&response)?;
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-
-    if shutdown {
+    write_ipc_response(&mut stream, &response).await?;
+    if should_shutdown {
         shutdown_daemon(&daemon).await;
-        std::process::exit(0);
+        shutdown.notify_one();
     }
-
     Ok(())
+}
+
+async fn write_ipc_response<W>(writer: &mut W, response: &DaemonResponse) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frame = serialize_daemon_response(response)?;
+    write_frame(writer, &frame, IPC_RESPONSE_WRITE_DEADLINE).await
 }
 
 async fn handle_request(daemon: &Arc<Daemon>, request: DaemonRequest) -> DaemonResponse {
@@ -2872,7 +3093,7 @@ fn dispose_overlay_process(process: Option<OverlayProcess>) {
 
 fn spawn_overlay_event_handler(
     daemon: Arc<Daemon>,
-    mut events: mpsc::UnboundedReceiver<OverlayEvent>,
+    mut events: mpsc::Receiver<OverlayEvent>,
 ) {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
@@ -14780,6 +15001,7 @@ fn mark_visible_image_context_used_once(
         }
         artifact.processing_status = ContextProcessingStatus::Ready;
         artifact.processing_error = None;
+        artifact.touch();
         updated.push(artifact.clone());
     }
     updated
@@ -16611,7 +16833,7 @@ async fn shutdown_daemon(daemon: &Arc<Daemon>) {
 /// - UI state-machine: AttachFilesRequested allowed from drag/drop idle or AttachOpen, etc.
 fn spawn_overlay(
     explicit: Option<&Path>,
-    events: mpsc::UnboundedSender<OverlayEvent>,
+    events: mpsc::Sender<OverlayEvent>,
     expected_token: String,
     ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
 ) -> Result<OverlayProcess> {
@@ -16661,7 +16883,7 @@ fn spawn_overlay(
 
 fn spawn_stdio_overlay(
     resolved: PathBuf,
-    events: mpsc::UnboundedSender<OverlayEvent>,
+    events: mpsc::Sender<OverlayEvent>,
     expected_token: String,
     ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
 ) -> Result<OverlayProcess> {
@@ -16699,7 +16921,7 @@ fn should_use_macos_socket_overlay(path: &Path) -> bool {
 #[cfg(target_os = "macos")]
 fn spawn_macos_socket_overlay(
     resolved: PathBuf,
-    events: mpsc::UnboundedSender<OverlayEvent>,
+    events: mpsc::Sender<OverlayEvent>,
     expected_token: String,
     ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
 ) -> Result<OverlayProcess> {
@@ -16888,7 +17110,7 @@ fn macos_overlay_capture_visible_allowed(
 
 fn spawn_overlay_reader<R>(
     reader: R,
-    events: mpsc::UnboundedSender<OverlayEvent>,
+    events: mpsc::Sender<OverlayEvent>,
     expected_token: String,
     ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
     cleanup_path: Option<PathBuf>,
@@ -16906,7 +17128,9 @@ fn spawn_overlay_reader<R>(
                         event_kind = overlay_event_label(&event),
                         "overlay event received"
                     );
-                    let _ = events.send(event);
+                    if events.blocking_send(event).is_err() {
+                        break;
+                    }
                 }
                 Err(OverlayLineReject::NotJson) => {
                     // Plain log line from overlay (non-event output).
@@ -16937,7 +17161,7 @@ fn spawn_overlay_reader<R>(
         if let Some(path) = cleanup_path {
             let _ = std::fs::remove_file(path);
         }
-        let _ = events.send(OverlayEvent::Exited);
+        let _ = events.blocking_send(OverlayEvent::Exited);
     });
 }
 
@@ -18014,6 +18238,18 @@ mod tests {
         let mut png = vec![0; byte_len.max(8)];
         png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
         std::fs::write(path, png).expect("write sized test image");
+    }
+
+    #[tokio::test]
+    async fn ipc_connection_semaphore_rejects_saturation_and_recovers() {
+        let permits = Arc::new(Semaphore::new(IPC_MAX_CONNECTIONS));
+        let mut held = Vec::with_capacity(IPC_MAX_CONNECTIONS);
+        for _ in 0..IPC_MAX_CONNECTIONS {
+            held.push(permits.clone().acquire_owned().await.unwrap());
+        }
+        assert!(permits.clone().try_acquire_owned().is_err());
+        held.pop();
+        assert!(permits.try_acquire_owned().is_ok());
     }
 
     #[test]
@@ -21369,7 +21605,7 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
         };
         paths.ensure().expect("ensure temp paths");
         let store = MeetingStore::new(&paths).expect("meeting store");
-        let (overlay_events_tx, _overlay_events_rx) = mpsc::unbounded_channel();
+        let (overlay_events_tx, _overlay_events_rx) = mpsc::channel(1);
         let daemon = Arc::new(Daemon {
             paths: paths.clone(),
             store,

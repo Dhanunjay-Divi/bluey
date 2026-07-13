@@ -7,6 +7,7 @@
 //! Transcripts arrive as `conversation.item.input_audio_transcription.delta` (partial)
 //! and `conversation.item.input_audio_transcription.completed` (final).
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,12 +17,16 @@ use cue_core::stt::{ConnectionState, SttConfig, SttError, SttProvider, Transcrip
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::Deserialize;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::deepgram::{map_ws_error, mask_api_key, reconnect_delay, MAX_RECONNECT_ATTEMPTS};
+
+const AUDIO_QUEUE_CAPACITY: usize = 50;
+const EVENT_QUEUE_CAPACITY: usize = 64;
 
 /// Configuration for the OpenAI Realtime provider.
 #[derive(Debug, Clone)]
@@ -167,14 +172,18 @@ pub fn build_session_update(model: &str) -> String {
 
 struct OpenAiState {
     connection: Mutex<ConnectionState>,
-    closed: std::sync::atomic::AtomicBool,
+    closed: AtomicBool,
+    dropped_audio_chunks: AtomicU64,
+    dropped_partial_events: AtomicU64,
 }
 
 impl OpenAiState {
     fn new() -> Self {
         Self {
             connection: Mutex::new(ConnectionState::Idle),
-            closed: std::sync::atomic::AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            dropped_audio_chunks: AtomicU64::new(0),
+            dropped_partial_events: AtomicU64::new(0),
         }
     }
 }
@@ -182,8 +191,8 @@ impl OpenAiState {
 /// OpenAI Realtime STT provider handle.
 pub struct OpenAiRealtimeProvider {
     state: Arc<OpenAiState>,
-    audio_tx: Option<UnboundedSender<Vec<u8>>>,
-    events_rx: UnboundedReceiver<Result<TranscriptEvent, SttError>>,
+    audio_tx: Option<Sender<Vec<u8>>>,
+    events_rx: Receiver<Result<TranscriptEvent, SttError>>,
 }
 
 impl std::fmt::Debug for OpenAiRealtimeProvider {
@@ -199,8 +208,8 @@ impl OpenAiRealtimeProvider {
     pub fn from_channels(
         _source: AudioSource,
         initial: ConnectionState,
-        events_rx: UnboundedReceiver<Result<TranscriptEvent, SttError>>,
-        audio_tx: UnboundedSender<Vec<u8>>,
+        events_rx: Receiver<Result<TranscriptEvent, SttError>>,
+        audio_tx: Sender<Vec<u8>>,
     ) -> Self {
         let state = Arc::new(OpenAiState::new());
         *state.connection.lock() = initial;
@@ -224,9 +233,9 @@ impl OpenAiRealtimeProvider {
         let state = Arc::new(OpenAiState::new());
         *state.connection.lock() = ConnectionState::Connecting;
 
-        let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (audio_tx, audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(AUDIO_QUEUE_CAPACITY);
         let (events_tx, events_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<TranscriptEvent, SttError>>();
+            tokio::sync::mpsc::channel::<Result<TranscriptEvent, SttError>>(EVENT_QUEUE_CAPACITY);
 
         tokio::spawn(run_supervisor(
             cfg,
@@ -242,6 +251,14 @@ impl OpenAiRealtimeProvider {
             events_rx,
         })
     }
+
+    pub fn dropped_audio_chunks(&self) -> u64 {
+        self.state.dropped_audio_chunks.load(Ordering::Relaxed)
+    }
+
+    pub fn dropped_partial_events(&self) -> u64 {
+        self.state.dropped_partial_events.load(Ordering::Relaxed)
+    }
 }
 
 #[async_trait]
@@ -255,18 +272,28 @@ impl SttProvider for OpenAiRealtimeProvider {
     }
 
     async fn send_audio(&self, chunk: &AudioChunk) -> Result<(), SttError> {
-        if self.state.closed.load(std::sync::atomic::Ordering::Acquire) {
+        if self.state.closed.load(Ordering::Acquire) {
             return Err(SttError::NotActive);
         }
         let tx = self.audio_tx.as_ref().ok_or(SttError::NotActive)?;
         let bytes: Vec<u8> = bytemuck::cast_slice(&chunk.samples).to_vec();
-        tx.send(bytes).map_err(|_| SttError::NotActive)?;
-        Ok(())
+        match tx.try_send(bytes) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                count_drop(
+                    &self.state.dropped_audio_chunks,
+                    "openai_realtime",
+                    "audio chunks",
+                );
+                Ok(())
+            }
+            Err(TrySendError::Closed(_)) => Err(SttError::NotActive),
+        }
     }
 
     async fn finalize(&self) -> Result<(), SttError> {
         if let Some(tx) = &self.audio_tx {
-            tx.send(Vec::new()).map_err(|_| SttError::NotActive)?;
+            tx.send(Vec::new()).await.map_err(|_| SttError::NotActive)?;
         }
         Ok(())
     }
@@ -276,9 +303,7 @@ impl SttProvider for OpenAiRealtimeProvider {
     }
 
     async fn close(&mut self) -> Result<(), SttError> {
-        self.state
-            .closed
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.state.closed.store(true, Ordering::Release);
         *self.state.connection.lock() = ConnectionState::Closed;
         self.audio_tx = None;
         Ok(())
@@ -291,12 +316,12 @@ async fn run_supervisor(
     cfg: OpenAiRealtimeConfig,
     source: AudioSource,
     state: Arc<OpenAiState>,
-    mut audio_rx: UnboundedReceiver<Vec<u8>>,
-    events_tx: UnboundedSender<Result<TranscriptEvent, SttError>>,
+    mut audio_rx: Receiver<Vec<u8>>,
+    events_tx: Sender<Result<TranscriptEvent, SttError>>,
 ) {
     let mut attempt: u32 = 0;
     loop {
-        if state.closed.load(std::sync::atomic::Ordering::Acquire) {
+        if state.closed.load(Ordering::Acquire) {
             break;
         }
 
@@ -319,13 +344,13 @@ async fn run_supervisor(
                         error = ?e,
                         "fatal stream error"
                     );
-                    let _ = events_tx.send(Err(e));
+                    let _ = events_tx.send(Err(e)).await;
                     *state.connection.lock() = ConnectionState::Failed;
                     return;
                 }
                 attempt += 1;
                 if attempt > MAX_RECONNECT_ATTEMPTS {
-                    let _ = events_tx.send(Err(e));
+                    let _ = events_tx.send(Err(e)).await;
                     *state.connection.lock() = ConnectionState::Failed;
                     return;
                 }
@@ -346,8 +371,8 @@ async fn run_connection(
     cfg: &OpenAiRealtimeConfig,
     source: AudioSource,
     state: &Arc<OpenAiState>,
-    audio_rx: &mut UnboundedReceiver<Vec<u8>>,
-    events_tx: &UnboundedSender<Result<TranscriptEvent, SttError>>,
+    audio_rx: &mut Receiver<Vec<u8>>,
+    events_tx: &Sender<Result<TranscriptEvent, SttError>>,
 ) -> Result<(), SttError> {
     let default_url = obfstr::obfstr!("wss://api.openai.com").to_string();
     let base = cfg.base_url.as_deref().unwrap_or(&default_url);
@@ -393,7 +418,7 @@ async fn run_connection(
     *state.connection.lock() = ConnectionState::Connected;
 
     loop {
-        if state.closed.load(std::sync::atomic::Ordering::Acquire) {
+        if state.closed.load(Ordering::Acquire) {
             let _ = write.send(Message::Close(None)).await;
             return Ok(());
         }
@@ -433,14 +458,16 @@ async fn run_connection(
                         match parse_event(&text, source) {
                             Ok(events) => {
                                 for ev in events {
-                                    if events_tx.send(Ok(ev)).is_err() {
+                                    if send_transcript_event(events_tx, ev, &state.dropped_partial_events).await.is_err() {
                                         return Ok(());
                                     }
                                 }
                             }
                             Err(e) if e.is_retryable() => return Err(e),
                             Err(e) => {
-                                let _ = events_tx.send(Err(e));
+                                if events_tx.send(Err(e)).await.is_err() {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -461,6 +488,37 @@ async fn run_connection(
                 }
             }
         }
+    }
+}
+
+async fn send_transcript_event(
+    events_tx: &Sender<Result<TranscriptEvent, SttError>>,
+    event: TranscriptEvent,
+    dropped_partial_events: &AtomicU64,
+) -> Result<(), ()> {
+    if matches!(event, TranscriptEvent::Partial { .. }) {
+        match events_tx.try_send(Ok(event)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                count_drop(dropped_partial_events, "openai_realtime", "partial events");
+                Ok(())
+            }
+            Err(TrySendError::Closed(_)) => Err(()),
+        }
+    } else {
+        events_tx.send(Ok(event)).await.map_err(|_| ())
+    }
+}
+
+fn count_drop(counter: &AtomicU64, provider: &'static str, queue: &'static str) {
+    let dropped = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped.is_power_of_two() {
+        tracing::warn!(
+            provider,
+            queue,
+            dropped,
+            "bounded realtime queue overloaded"
+        );
     }
 }
 
@@ -564,6 +622,84 @@ mod tests {
             v["session"]["input_audio_transcription"]["model"],
             "gpt-4o-mini-transcribe"
         );
+    }
+
+    #[tokio::test]
+    async fn audio_overload_drops_audio_but_commit_waits_for_capacity() {
+        let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let (_event_tx, event_rx) = tokio::sync::mpsc::channel(1);
+        let provider = OpenAiRealtimeProvider::from_channels(
+            AudioSource::Microphone,
+            ConnectionState::Connected,
+            event_rx,
+            audio_tx,
+        );
+        let chunk = AudioChunk {
+            source: AudioSource::Microphone,
+            sample_rate: SampleRate::SR_16K,
+            samples: vec![0; 320],
+            captured_at_ms: 0,
+        };
+
+        provider.send_audio(&chunk).await.unwrap();
+        provider.send_audio(&chunk).await.unwrap();
+        assert_eq!(provider.dropped_audio_chunks(), 1);
+
+        let finalize = provider.finalize();
+        tokio::pin!(finalize);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut finalize)
+                .await
+                .is_err()
+        );
+        assert!(!audio_rx.recv().await.unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(1), &mut finalize)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(audio_rx.recv().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_overload_drops_interim_but_final_waits_and_delivers() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let dropped = AtomicU64::new(0);
+        let partial = TranscriptEvent::Partial {
+            text: "interim".into(),
+            confidence: None,
+            source: AudioSource::Microphone,
+        };
+        send_transcript_event(&tx, partial.clone(), &dropped)
+            .await
+            .unwrap();
+        send_transcript_event(&tx, partial, &dropped).await.unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+        let final_event = TranscriptEvent::Final {
+            text: "final".into(),
+            confidence: None,
+            source: AudioSource::Microphone,
+            words: Vec::new(),
+        };
+        let send_final = send_transcript_event(&tx, final_event, &dropped);
+        tokio::pin!(send_final);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut send_final)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(Ok(TranscriptEvent::Partial { .. }))
+        ));
+        tokio::time::timeout(Duration::from_secs(1), &mut send_final)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(Ok(TranscriptEvent::Final { .. }))
+        ));
     }
 
     // ========== Mock WebSocket tests ==========

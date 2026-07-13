@@ -1,6 +1,9 @@
-use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
+use cue_core::ipc::{DaemonRequest, DaemonResponse};
 use cue_core::session::Session;
+use cue_core::{AudioCaptureState, AudioPipelineStatus, AudioSourceState};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -71,49 +74,39 @@ async fn daemon_ipc_with_trace(
     request: DaemonRequest,
     trace_id: &str,
 ) -> Result<DaemonResponse, String> {
-    daemon_ipc_with_trace_to_addr(request, trace_id, &daemon_addr()).await
+    let compatibility_addr = daemon_addr();
+    daemon_ipc_with_trace_to_endpoint(request, trace_id, compatibility_addr.as_deref()).await
 }
 
+#[cfg(test)]
 async fn daemon_ipc_with_trace_to_addr(
     request: DaemonRequest,
     trace_id: &str,
     addr: &str,
 ) -> Result<DaemonResponse, String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpStream;
-
-    let stream = TcpStream::connect(addr)
-        .await
-        .map_err(|e| format!("failed to connect to daemon: {e}"))?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-
-    let line = serde_json::to_string(&request.with_trace_id(trace_id.to_string()))
-        .map_err(|e| e.to_string())?;
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    writer.write_all(b"\n").await.map_err(|e| e.to_string())?;
-    writer.flush().await.map_err(|e| e.to_string())?;
-
-    let mut response = String::new();
-    let read = reader
-        .read_line(&mut response)
-        .await
-        .map_err(|e| e.to_string())?;
-    if read == 0 {
-        return Err("daemon closed connection without a response".to_string());
-    }
-    serde_json::from_str(response.trim_end()).map_err(|e| e.to_string())
+    daemon_ipc_with_trace_to_endpoint(request, trace_id, Some(addr)).await
 }
 
-fn daemon_addr() -> String {
+async fn daemon_ipc_with_trace_to_endpoint(
+    request: DaemonRequest,
+    trace_id: &str,
+    compatibility_addr: Option<&str>,
+) -> Result<DaemonResponse, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|error| error.to_string())?;
+    cue_core::ipc_transport::request_daemon(
+        &paths,
+        compatibility_addr,
+        request.with_trace_id(trace_id.to_string()),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+fn daemon_addr() -> Option<String> {
     std::env::var("BLUEY_DAEMON_ADDR")
         .or_else(|_| std::env::var("CUE_DAEMON_ADDR"))
         .ok()
         .filter(|addr| !addr.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_DAEMON_ADDR.to_string())
 }
 
 fn dashboard_trace_id() -> String {
@@ -719,30 +712,248 @@ pub fn list_speakers(
 
 // ===== Phase 3 Round 6: Hotkey → daemon action commands =====
 
-/// Toggle listening: if a meeting/audio session is active, end it; otherwise start one.
-/// Sends the appropriate IPC request to the running daemon.
-#[tauri::command]
-pub async fn daemon_toggle_listening() -> Result<String, String> {
-    let trace_id = dashboard_trace_id();
-    // Query daemon status to decide start vs stop.
-    let status = daemon_ipc_with_trace(DaemonRequest::Status, &trace_id).await?;
-    let is_active = match &status {
-        DaemonResponse::Status { state } => {
-            matches!(state.meeting, cue_core::MeetingState::InMeeting { .. })
-        }
-        _ => false,
-    };
-    let resp = if is_active {
-        daemon_ipc_with_trace(DaemonRequest::MeetingEnd, &trace_id).await?
+type DaemonResponseFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DaemonResponse, String>> + Send + 'a>>;
+
+trait DaemonRequester {
+    fn request(&mut self, request: DaemonRequest) -> DaemonResponseFuture<'_>;
+}
+
+struct AuthenticatedDaemonRequester<'a> {
+    trace_id: &'a str,
+}
+
+impl DaemonRequester for AuthenticatedDaemonRequester<'_> {
+    fn request(&mut self, request: DaemonRequest) -> DaemonResponseFuture<'_> {
+        Box::pin(daemon_ipc_with_trace(request, self.trace_id))
+    }
+}
+
+fn audio_pipeline_is_active(status: &AudioPipelineStatus) -> bool {
+    status.capture.is_active()
+        || (status.session_id.is_some()
+            && !matches!(
+                status.capture.state,
+                AudioCaptureState::Stopped | AudioCaptureState::Failed
+            ))
+}
+
+fn audio_pipeline_has_dual_sources(status: &AudioPipelineStatus) -> bool {
+    status.config.system.enabled
+        && status.config.microphone.enabled
+        && status.capture.system.state != AudioSourceState::Failed
+        && status.capture.microphone.state != AudioSourceState::Failed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicAudioErrorKind {
+    SignIn,
+    Permission,
+    Source,
+    Timeout,
+    Unavailable,
+    Generic,
+}
+
+fn classify_audio_error(message: &str) -> PublicAudioErrorKind {
+    let message = message.to_ascii_lowercase();
+    if ["permission", "screen recording", "tcc", "access denied"]
+        .iter()
+        .any(|needle| message.contains(needle))
+    {
+        PublicAudioErrorKind::Permission
+    } else if [
+        "sign in",
+        "signin",
+        "not signed",
+        "unauthorized",
+        "login required",
+        "account required",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        PublicAudioErrorKind::SignIn
+    } else if ["timed out", "timeout", "deadline"]
+        .iter()
+        .any(|needle| message.contains(needle))
+    {
+        PublicAudioErrorKind::Timeout
+    } else if [
+        "audio source",
+        "microphone",
+        "system audio",
+        "audio device",
+        "audio backend",
+        "source unavailable",
+        "source failed",
+        "coreaudio",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        PublicAudioErrorKind::Source
+    } else if [
+        "daemon",
+        "ipc",
+        "connection",
+        "transport",
+        "closed",
+        "offline",
+        "refused",
+        "broken pipe",
+        "not running",
+        "unexpected eof",
+        "authentication failed",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        PublicAudioErrorKind::Unavailable
     } else {
-        daemon_ipc_with_trace(DaemonRequest::MeetingStart { title: None }, &trace_id).await?
+        PublicAudioErrorKind::Generic
+    }
+}
+
+fn public_audio_error(message: &str) -> String {
+    match classify_audio_error(message) {
+        PublicAudioErrorKind::SignIn => "Sign in to Bluey to start listening.",
+        PublicAudioErrorKind::Permission => {
+            "Allow microphone and system audio access, then try again."
+        }
+        PublicAudioErrorKind::Source => {
+            "A required audio source is unavailable. Check audio settings and try again."
+        }
+        PublicAudioErrorKind::Timeout => "Bluey took too long to respond. Try again.",
+        PublicAudioErrorKind::Unavailable => {
+            "Bluey's local audio service is unavailable. Try again."
+        }
+        PublicAudioErrorKind::Generic => "Bluey couldn't update listening. Try again.",
+    }
+    .to_string()
+}
+
+fn public_audio_failure(operation: &str, message: &str) -> String {
+    tracing::warn!(
+        operation,
+        kind = ?classify_audio_error(message),
+        error_length = message.len(),
+        "audio operation failed"
+    );
+    public_audio_error(message)
+}
+
+fn sanitize_audio_pipeline_status(mut status: AudioPipelineStatus) -> AudioPipelineStatus {
+    let sanitize = |value: &mut Option<String>| {
+        if let Some(message) = value.take() {
+            *value = Some(public_audio_error(&message));
+        }
     };
-    match resp {
-        DaemonResponse::Text { text } => Ok(text),
-        DaemonResponse::Recap { recap } => Ok(format!("Session ended: {}", recap.summary)),
-        DaemonResponse::Ok => Ok("ok".to_string()),
-        DaemonResponse::Error { message } => Err(message),
-        _ => Ok("ok".to_string()),
+
+    sanitize(&mut status.capture.last_error);
+    sanitize(&mut status.capture.system.last_error);
+    sanitize(&mut status.capture.microphone.last_error);
+    if status.capture.state == AudioCaptureState::Failed {
+        sanitize(&mut status.note);
+    }
+    status
+}
+
+fn audio_status_from_response(
+    response: DaemonResponse,
+    operation: &str,
+) -> Result<AudioPipelineStatus, String> {
+    match response {
+        DaemonResponse::AudioStatus { status } => Ok(sanitize_audio_pipeline_status(status)),
+        DaemonResponse::Error { message } => Err(public_audio_failure(operation, &message)),
+        _ => Err(public_audio_failure(operation, "unexpected response")),
+    }
+}
+
+async fn daemon_listening_status_with<R: DaemonRequester + ?Sized>(
+    requester: &mut R,
+) -> Result<AudioPipelineStatus, String> {
+    let response = requester
+        .request(DaemonRequest::AudioStatus)
+        .await
+        .map_err(|message| public_audio_failure("query audio status", &message))?;
+    audio_status_from_response(response, "query audio status")
+}
+
+async fn daemon_toggle_listening_with<R: DaemonRequester + ?Sized>(
+    requester: &mut R,
+    mic_device_id: Option<String>,
+) -> Result<AudioPipelineStatus, String> {
+    let current = daemon_listening_status_with(requester).await?;
+    let was_active = audio_pipeline_is_active(&current);
+    let (request, operation) = if was_active {
+        (DaemonRequest::AudioStop, "stop audio capture")
+    } else {
+        (
+            DaemonRequest::AudioStart {
+                enable_system: true,
+                enable_microphone: true,
+                mic_device_id,
+            },
+            "start audio capture",
+        )
+    };
+
+    let response = requester
+        .request(request)
+        .await
+        .map_err(|message| public_audio_failure(operation, &message))?;
+    let status = audio_status_from_response(response, operation)?;
+
+    if !was_active && audio_pipeline_is_active(&status) && !audio_pipeline_has_dual_sources(&status)
+    {
+        if let Err(message) = requester.request(DaemonRequest::AudioStop).await {
+            tracing::warn!(
+                kind = ?classify_audio_error(&message),
+                "failed to stop partial audio capture"
+            );
+        }
+        return Err(
+            "Bluey couldn't start both audio sources, so listening was stopped. Check audio settings and try again."
+                .to_string(),
+        );
+    }
+
+    Ok(status)
+}
+
+/// Return the daemon's current audio pipeline status.
+#[tauri::command]
+pub async fn daemon_listening_status() -> Result<AudioPipelineStatus, String> {
+    let trace_id = dashboard_trace_id();
+    let mut requester = AuthenticatedDaemonRequester {
+        trace_id: &trace_id,
+    };
+    daemon_listening_status_with(&mut requester).await
+}
+
+/// Toggle dual-source audio capture without ending the active meeting.
+#[tauri::command]
+pub async fn daemon_toggle_listening(
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<AudioPipelineStatus, String> {
+    let trace_id = dashboard_trace_id();
+    let mic_device_id = load_mic_device_from_settings(&db);
+    let mut requester = AuthenticatedDaemonRequester {
+        trace_id: &trace_id,
+    };
+    let result = daemon_toggle_listening_with(&mut requester, mic_device_id).await;
+
+    match result {
+        Ok(status) => {
+            let _ = app.emit("audio_pipeline_status", &status);
+            Ok(status)
+        }
+        Err(error) => {
+            let _ = app.emit("audio_pipeline_error", &error);
+            Err(error)
+        }
     }
 }
 
@@ -959,6 +1170,36 @@ pub fn set_llm_chain(providers: Vec<String>, db: State<DbState>) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    struct FakeDaemon {
+        responses: VecDeque<Result<DaemonResponse, String>>,
+        requests: Vec<DaemonRequest>,
+    }
+
+    impl FakeDaemon {
+        fn with_responses(responses: Vec<DaemonResponse>) -> Self {
+            Self {
+                responses: responses.into_iter().map(Ok).collect(),
+                requests: Vec::new(),
+            }
+        }
+    }
+
+    impl DaemonRequester for FakeDaemon {
+        fn request(&mut self, request: DaemonRequest) -> DaemonResponseFuture<'_> {
+            self.requests.push(request);
+            let response = self
+                .responses
+                .pop_front()
+                .expect("fake daemon response for request");
+            Box::pin(std::future::ready(response))
+        }
+    }
+
+    fn active_audio_status() -> AudioPipelineStatus {
+        AudioPipelineStatus::simulated("session-active", cue_core::AudioCaptureConfig::default())
+    }
 
     #[tokio::test]
     async fn daemon_ipc_wraps_dashboard_request_with_trace() {
@@ -995,9 +1236,97 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn listening_toggle_starts_dual_source_audio_with_saved_mic() {
+        let started = active_audio_status();
+        let mut daemon = FakeDaemon::with_responses(vec![
+            DaemonResponse::AudioStatus {
+                status: AudioPipelineStatus::idle(),
+            },
+            DaemonResponse::AudioStatus {
+                status: started.clone(),
+            },
+        ]);
+
+        let result = daemon_toggle_listening_with(&mut daemon, Some("saved-mic-id".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(result, started);
+        assert_eq!(daemon.requests.len(), 2);
+        assert!(matches!(&daemon.requests[0], DaemonRequest::AudioStatus));
+        assert!(matches!(
+            &daemon.requests[1],
+            DaemonRequest::AudioStart {
+                enable_system: true,
+                enable_microphone: true,
+                mic_device_id: Some(mic_device_id),
+            } if mic_device_id == "saved-mic-id"
+        ));
+    }
+
+    #[tokio::test]
+    async fn listening_toggle_stops_starting_audio_without_a_session_id() {
+        let mut starting = AudioPipelineStatus::idle();
+        starting.capture.state = AudioCaptureState::Starting;
+        let mut stopped = starting.clone();
+        stopped.capture.state = AudioCaptureState::Stopped;
+        let mut daemon = FakeDaemon::with_responses(vec![
+            DaemonResponse::AudioStatus { status: starting },
+            DaemonResponse::AudioStatus {
+                status: stopped.clone(),
+            },
+        ]);
+
+        let result = daemon_toggle_listening_with(&mut daemon, None)
+            .await
+            .unwrap();
+        assert_eq!(result, stopped);
+        assert_eq!(daemon.requests.len(), 2);
+        assert!(matches!(&daemon.requests[0], DaemonRequest::AudioStatus));
+        assert!(matches!(&daemon.requests[1], DaemonRequest::AudioStop));
+    }
+
+    #[tokio::test]
+    async fn listening_toggle_stops_a_partial_dual_source_start() {
+        let mut partial = active_audio_status();
+        partial.config.system.enabled = false;
+        let mut stopped = partial.clone();
+        stopped.capture.state = AudioCaptureState::Stopped;
+        let mut daemon = FakeDaemon::with_responses(vec![
+            DaemonResponse::AudioStatus {
+                status: AudioPipelineStatus::idle(),
+            },
+            DaemonResponse::AudioStatus { status: partial },
+            DaemonResponse::AudioStatus { status: stopped },
+        ]);
+
+        let error = daemon_toggle_listening_with(&mut daemon, Some("saved-mic-id".to_string()))
+            .await
+            .unwrap_err();
+        assert!(error.contains("both audio sources"));
+        assert!(!error.contains("saved-mic-id"));
+        assert_eq!(daemon.requests.len(), 3);
+        assert!(matches!(&daemon.requests[2], DaemonRequest::AudioStop));
+    }
+
+    #[tokio::test]
+    async fn listening_status_returns_a_public_error() {
+        let mut daemon = FakeDaemon::with_responses(vec![DaemonResponse::Error {
+            message: "audio backend unavailable at /private/tmp/device".to_string(),
+        }]);
+
+        let error = daemon_listening_status_with(&mut daemon).await.unwrap_err();
+        assert_eq!(
+            error,
+            "A required audio source is unavailable. Check audio settings and try again."
+        );
+        assert!(!error.contains("/private/tmp"));
+        assert!(matches!(&daemon.requests[0], DaemonRequest::AudioStatus));
+    }
+
     #[test]
-    fn daemon_addr_defaults_to_standard_addr() {
-        assert_eq!(DEFAULT_DAEMON_ADDR, "127.0.0.1:57321");
+    fn legacy_compatibility_addr_remains_stable() {
+        assert_eq!(cue_core::ipc::DEFAULT_DAEMON_ADDR, "127.0.0.1:57321");
     }
 
     #[test]

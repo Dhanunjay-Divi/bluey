@@ -22,7 +22,7 @@ use cue_core::{
     TranscriptSegment,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -116,7 +116,7 @@ pub fn append_session_audit_event(
         "kind": kind,
         "created_at_ms": current_epoch_ms(),
         "source": "desktop_ui",
-        "payload": payload,
+        "payload": metadata_only_audit_payload(payload),
     });
     let mut file = OpenOptions::new()
         .create(true)
@@ -130,6 +130,115 @@ pub fn append_session_audit_event(
     file.flush()
         .with_context(|| format!("flush {}", event_path.display()))?;
     Ok(())
+}
+
+/// Diagnostic bundles deliberately contain operational metadata only. The
+/// product session sync already owns questions, answers, transcripts, and
+/// attachments; duplicating those values into diagnostics creates a second,
+/// harder-to-govern copy of private customer content.
+fn metadata_only_audit_payload(payload: Value) -> Value {
+    let Value::Object(payload) = payload else {
+        return json!({
+            "content_policy": "metadata_only",
+            "payload_redacted": true,
+        });
+    };
+
+    let mut metadata = Map::new();
+    let mut redacted_fields = Vec::new();
+    for (key, value) in payload {
+        if audit_metadata_key_is_safe(&key) {
+            metadata.insert(key, value);
+            continue;
+        }
+
+        redacted_fields.push(key.clone());
+        match value {
+            Value::String(value) => {
+                metadata.insert(
+                    format!("{key}_chars"),
+                    Value::from(value.chars().count() as u64),
+                );
+            }
+            Value::Array(values) => {
+                metadata.insert(format!("{key}_count"), Value::from(values.len() as u64));
+            }
+            Value::Object(values) => {
+                metadata.insert(
+                    format!("{key}_field_count"),
+                    Value::from(values.len() as u64),
+                );
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+    metadata.insert(
+        "content_policy".into(),
+        Value::String("metadata_only".into()),
+    );
+    if !redacted_fields.is_empty() {
+        metadata.insert("payload_redacted".into(), Value::Bool(true));
+        metadata.insert(
+            "redacted_fields".into(),
+            Value::Array(redacted_fields.into_iter().map(Value::String).collect()),
+        );
+    }
+    Value::Object(metadata)
+}
+
+fn audit_metadata_key_is_safe(key: &str) -> bool {
+    matches!(
+        key,
+        "schema_version"
+            | "sequence"
+            | "generation"
+            | "provider"
+            | "model"
+            | "route"
+            | "route_primary"
+            | "task_type"
+            | "question_intent"
+            | "artifact_type"
+            | "processing_status"
+            | "speaker"
+            | "status"
+            | "state"
+            | "kind"
+            | "source"
+            | "error_category"
+            | "reason_code"
+            | "http_status"
+            | "stream"
+            | "streaming"
+            | "is_final"
+            | "retryable"
+            | "terminal"
+            | "success"
+            | "context_was_empty"
+            | "cost_cents"
+            | "balance_cents_after"
+            | "input_tokens"
+            | "output_tokens"
+            | "artifact_confidence"
+            | "audio_chunk_storage"
+            | "content_policy"
+            | "listen_runs"
+            | "stt_parse_errors"
+            | "stt_provider_errors"
+            | "audio_start_errors"
+            | "audio_source_errors"
+            | "last_stt_provider"
+            | "last_error_kind"
+    ) || key.ends_with("_id")
+        || key.ends_with("_ids")
+        || key.ends_with("_count")
+        || key.ends_with("_chars")
+        || key.ends_with("_bytes")
+        || key.ends_with("_ms")
+        || key.ends_with("_pct")
+        || key.starts_with("is_")
+        || key.starts_with("has_")
+        || key.starts_with("had_")
 }
 
 impl LocalSyncSummary {
@@ -602,8 +711,8 @@ fn build_local_session_audit_bundle(
             "session_code": short_session_code(meeting.id),
             "kind": "audio_capture_manifest",
             "created_at_ms": current_epoch_ms(),
-            "audio_chunk_storage": "not_present_in_this_local_record",
-            "note": "Audio chunks are uploaded through the live STT/diagnostic path when present; this manifest keeps the session audit directory shape stable.",
+            "audio_chunk_storage": "not_collected",
+            "content_policy": "metadata_only",
         })],
     )?;
     write_json_file(&local_dir.join("bundle.json"), &bundle)?;
@@ -667,13 +776,21 @@ fn assemble_session_audit_bundle(
         &mut sequence,
         "session",
         json!({
-            "title": meeting.title,
             "started_at_ms": parse_ms(&meeting.started_at),
             "ended_at_ms": meeting.ended_at.as_deref().map(parse_ms),
             "updated_at_ms": updated_at,
-            "summary": meeting.summary,
-            "answer_style": meeting.answer_instructions,
-            "diagnostics": meeting.diagnostics,
+            "listen_runs": meeting.diagnostics.listen_runs,
+            "stt_parse_errors": meeting.diagnostics.stt_parse_errors,
+            "stt_provider_errors": meeting.diagnostics.stt_provider_errors,
+            "audio_start_errors": meeting.diagnostics.audio_start_errors,
+            "audio_source_errors": meeting.diagnostics.audio_source_errors,
+            "last_audio_session_id": meeting.diagnostics.last_audio_session_id,
+            "last_stt_provider": meeting.diagnostics.last_stt_provider,
+            "last_error_kind": meeting.diagnostics.last_error_kind,
+            "last_error_at_ms": meeting.diagnostics.last_error_at.as_deref().map(parse_ms),
+            "title_chars": meeting.title.chars().count(),
+            "summary_chars": meeting.summary.as_deref().map(|value| value.chars().count()),
+            "answer_style_chars": meeting.answer_instructions.as_deref().map(|value| value.chars().count()),
         }),
     );
 
@@ -974,7 +1091,7 @@ fn push_audit_record(
         "kind": kind,
         "created_at_ms": current_epoch_ms(),
         "source": "desktop_sync",
-        "payload": payload,
+        "payload": metadata_only_audit_payload(payload),
     }));
 }
 
@@ -1538,6 +1655,7 @@ async fn context_artifact_from_cloud(
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
         created_at: record.created_at_ms.to_string(),
+        updated_at: record.updated_at_ms.max(record.created_at_ms).to_string(),
     })
 }
 
@@ -1920,6 +2038,11 @@ fn context_record(
             .as_deref()
             .map(|text| truncate_chars(text, MAX_TEXT_PREVIEW_CHARS)),
         created_at_ms: parse_ms(&artifact.created_at),
+        updated_at_ms: parse_ms(if artifact.updated_at.trim().is_empty() {
+            &artifact.created_at
+        } else {
+            &artifact.updated_at
+        }),
         metadata: json!({
             "size_bytes": artifact.size_bytes,
             "processing_status": artifact.processing_status.to_string(),
@@ -2302,6 +2425,20 @@ mod tests {
         assert!(!built.bundle.screen.is_empty());
         assert!(!built.bundle.artifacts.is_empty());
         assert!(!built.bundle.costs.is_empty());
+        let serialized = String::from_utf8(built.bytes.clone()).expect("audit bundle utf-8");
+        for private_value in [
+            "Explain LRU cache",
+            "Use a hashmap plus a doubly linked list.",
+            "class LRUCache: pass",
+            "/tmp/screen.png",
+            "Captured screen",
+        ] {
+            assert!(
+                !serialized.contains(private_value),
+                "diagnostic bundle leaked private content: {private_value}"
+            );
+        }
+        assert!(serialized.contains("metadata_only"));
 
         let response = SessionAuditBundleResponse {
             session_id: meeting.id.to_string(),
@@ -2328,7 +2465,7 @@ mod tests {
     }
 
     #[test]
-    fn session_audit_bundle_includes_append_only_ui_events() {
+    fn session_audit_bundle_includes_metadata_only_ui_events() {
         let root = std::env::temp_dir().join(format!("bluey-audit-events-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("audit test root");
 
@@ -2378,10 +2515,15 @@ mod tests {
             event.get("kind").and_then(Value::as_str) == Some("ui_answer_error")
                 && event
                     .get("payload")
-                    .and_then(|payload| payload.get("visible_message"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|message| message.contains("could not complete"))
+                    .and_then(|payload| payload.get("visible_message_chars"))
+                    .and_then(Value::as_u64)
+                    .is_some_and(|chars| chars > 0)
         }));
+        let serialized = String::from_utf8(built.bytes.clone()).expect("audit bundle utf-8");
+        assert!(!serialized.contains("Reading screen context"));
+        assert!(!serialized.contains("Bluey could not complete that answer yet."));
+        assert!(!serialized.contains("Partial answer before the visible error."));
+        assert!(!serialized.contains("Why did it fail?"));
         assert_eq!(
             built
                 .bundle
@@ -2591,6 +2733,7 @@ mod tests {
                 content_hash: None,
                 text_preview: Some("NBCUniversal DAVD dashboard experience".into()),
                 created_at_ms: 13,
+                updated_at_ms: 13,
                 metadata: json!({
                     "size_bytes": 1234,
                     "processing_status": "ready"

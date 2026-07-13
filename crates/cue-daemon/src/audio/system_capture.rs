@@ -8,7 +8,7 @@
 //! Restart-on-crash with exponential backoff mirrors the overlay pattern.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +19,8 @@ use cue_core::process_aliases::MACOS_AUDIO_HELPER_NAMES;
 use cue_core::process_aliases::WINDOWS_AUDIO_HELPER_NAMES;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 
 /// Samples per 20 ms chunk at 16 kHz mono.
@@ -28,6 +29,12 @@ const CHUNK_SAMPLES: usize = 320;
 const CHUNK_BYTES: usize = CHUNK_SAMPLES * 2;
 /// Maximum consecutive restart attempts before giving up.
 const MAX_RESTART_ATTEMPTS: u32 = 5;
+/// One second of 20 ms chunks for bounded system-audio consumers.
+const CAPTURE_QUEUE_CAPACITY: usize = 50;
+
+pub fn system_audio_channel() -> (Sender<AudioChunk>, Receiver<AudioChunk>) {
+    tokio::sync::mpsc::channel(CAPTURE_QUEUE_CAPACITY)
+}
 
 #[cfg(target_os = "macos")]
 const AUDIO_HELPER_BUILD_DIR: &str = "native/macos/cue-audio/.build";
@@ -51,24 +58,31 @@ const AUDIO_HELPER_EXE_RELATIVE_DIRS: &[&str] = &[
 pub struct SystemAudioCapture {
     stop: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,
+    dropped_chunks: Arc<AtomicU64>,
 }
 
 impl SystemAudioCapture {
     /// Start system audio capture. Spawns the native helper and begins
     /// streaming `AudioChunk`s to `sender`.
-    pub fn start(sender: UnboundedSender<AudioChunk>) -> std::io::Result<Self> {
+    pub fn start(sender: Sender<AudioChunk>) -> std::io::Result<Self> {
         let binary = resolve_binary()?;
         let stop = Arc::new(AtomicBool::new(false));
+        let dropped_chunks = Arc::new(AtomicU64::new(0));
         let stop_clone = stop.clone();
-
+        let task_dropped_chunks = dropped_chunks.clone();
         let task = tokio::spawn(async move {
-            supervisor_loop(binary, sender, stop_clone).await;
+            supervisor_loop(binary, sender, stop_clone, task_dropped_chunks).await;
         });
 
         Ok(Self {
             stop,
             task: Some(task),
+            dropped_chunks,
         })
+    }
+
+    pub fn dropped_chunks(&self) -> u64 {
+        self.dropped_chunks.load(Ordering::Relaxed)
     }
 
     /// Signal the capture to stop and wait for the task to finish.
@@ -185,8 +199,9 @@ async fn spawn_child(binary: &PathBuf) -> std::io::Result<Child> {
 
 async fn supervisor_loop(
     binary: PathBuf,
-    sender: UnboundedSender<AudioChunk>,
+    sender: Sender<AudioChunk>,
     stop: Arc<AtomicBool>,
+    dropped_chunks: Arc<AtomicU64>,
 ) {
     let mut consecutive_failures: u32 = 0;
 
@@ -209,7 +224,7 @@ async fn supervisor_loop(
             }
         };
 
-        let exited_cleanly = read_child_stdout(child, &sender, &stop).await;
+        let exited_cleanly = read_child_stdout(child, &sender, &stop, &dropped_chunks).await;
 
         if stop.load(Ordering::Acquire) {
             return;
@@ -241,8 +256,9 @@ async fn supervisor_loop(
 
 async fn read_child_stdout(
     mut child: Child,
-    sender: &UnboundedSender<AudioChunk>,
+    sender: &Sender<AudioChunk>,
     stop: &Arc<AtomicBool>,
+    dropped_chunks: &AtomicU64,
 ) -> bool {
     let Some(mut stdout) = child.stdout.take() else {
         return false;
@@ -278,7 +294,7 @@ async fn read_child_stdout(
                 captured_at_ms: epoch_ms(),
             };
 
-            if sender.send(chunk).is_err() {
+            if !try_emit_chunk(sender, chunk, dropped_chunks) {
                 // Receiver dropped
                 let _ = child.kill().await;
                 return true;
@@ -291,6 +307,24 @@ async fn read_child_stdout(
 
     let status = child.wait().await;
     matches!(status, Ok(s) if s.success())
+}
+
+fn try_emit_chunk(
+    sender: &Sender<AudioChunk>,
+    chunk: AudioChunk,
+    dropped_chunks: &AtomicU64,
+) -> bool {
+    match sender.try_send(chunk) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            let dropped = dropped_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(dropped, "system audio capture queue overloaded");
+            }
+            true
+        }
+        Err(TrySendError::Closed(_)) => false,
+    }
 }
 
 fn epoch_ms() -> u64 {
@@ -349,7 +383,7 @@ mod tests {
             std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &candidate);
         }
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = system_audio_channel();
         let capture = SystemAudioCapture::start(tx).unwrap();
 
         // Wait for at least 2 chunks (40ms of audio)
@@ -374,6 +408,25 @@ mod tests {
         if stub.is_none() {
             std::env::remove_var("BLUEY_SYSTEM_AUDIO_BINARY");
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_output_drops_on_overload_and_detects_closed_receiver() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let dropped = AtomicU64::new(0);
+        let chunk = AudioChunk {
+            source: AudioSource::System,
+            sample_rate: SampleRate::SR_16K,
+            samples: vec![0; CHUNK_SAMPLES],
+            captured_at_ms: 0,
+        };
+
+        assert!(try_emit_chunk(&tx, chunk.clone(), &dropped));
+        assert!(try_emit_chunk(&tx, chunk.clone(), &dropped));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.recv().await.unwrap().samples.len(), chunk.samples.len());
+        drop(rx);
+        assert!(!try_emit_chunk(&tx, chunk, &dropped));
     }
 
     fn find_stub_binary() -> PathBuf {

@@ -163,6 +163,9 @@ pub enum DaemonResponse {
     CloudStatus {
         status: CloudSyncStatus,
     },
+    IpcAuthError {
+        code: crate::ipc_auth::IpcAuthErrorCode,
+    },
     Error {
         message: String,
     },

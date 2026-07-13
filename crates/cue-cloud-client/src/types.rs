@@ -298,6 +298,8 @@ pub struct SyncContextArtifactRecord {
     pub text_preview: Option<String>,
     pub created_at_ms: i64,
     #[serde(default)]
+    pub updated_at_ms: i64,
+    #[serde(default)]
     pub metadata: serde_json::Value,
 }
 

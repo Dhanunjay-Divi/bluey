@@ -11,10 +11,14 @@ use cue_core::overlay_ipc::{
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task::JoinHandle;
 
 pub const MAX_RESTART_ATTEMPTS: u32 = 5;
+/// Maximum daemon-to-overlay messages waiting to be written to child stdin.
+pub const OVERLAY_OUTBOUND_CHANNEL_CAPACITY: usize = 64;
+/// Maximum privileged overlay commands waiting for the daemon to consume them.
+pub const OVERLAY_COMMAND_CHANNEL_CAPACITY: usize = 32;
 
 /// Length of the hex session token (32 bytes = 64 hex chars).
 pub const SESSION_TOKEN_HEX_LEN: usize = 64;
@@ -256,8 +260,8 @@ impl Shared {
 }
 
 pub struct NativeOverlayHandle {
-    send_tx: UnboundedSender<OverlayMessage>,
-    recv_rx: UnboundedReceiver<OverlayIpcCommand>,
+    send_tx: Sender<OverlayMessage>,
+    recv_rx: Receiver<OverlayIpcCommand>,
     shared: Arc<Shared>,
     _tasks: Vec<JoinHandle<()>>,
 }
@@ -265,8 +269,8 @@ pub struct NativeOverlayHandle {
 impl NativeOverlayHandle {
     pub async fn spawn(opts: OverlaySpawnOptions) -> std::io::Result<Self> {
         let shared = Arc::new(Shared::new());
-        let (send_tx, send_rx) = unbounded_channel::<OverlayMessage>();
-        let (recv_tx, recv_rx) = unbounded_channel::<OverlayIpcCommand>();
+        let (send_tx, send_rx) = channel::<OverlayMessage>(OVERLAY_OUTBOUND_CHANNEL_CAPACITY);
+        let (recv_tx, recv_rx) = channel::<OverlayIpcCommand>(OVERLAY_COMMAND_CHANNEL_CAPACITY);
 
         shared.set_state(OverlayProcessState::Starting);
         let child = spawn_child(&opts).await?;
@@ -282,7 +286,7 @@ impl NativeOverlayHandle {
     }
 
     pub fn send(&self, msg: OverlayMessage) -> Result<(), OverlayMessage> {
-        self.send_tx.send(msg).map_err(|e| e.0)
+        self.send_tx.try_send(msg).map_err(|e| e.into_inner())
     }
 
     pub async fn next_command(&mut self) -> Option<OverlayIpcCommand> {
@@ -315,7 +319,7 @@ impl NativeOverlayHandle {
         self.shared.set_state(OverlayProcessState::ShuttingDown);
         // Drop send_tx so the supervisor's send_rx.recv() returns None,
         // which triggers stdin close → child sees EOF → exits cleanly.
-        let (dead_tx, _dead_rx) = unbounded_channel();
+        let (dead_tx, _dead_rx) = channel(1);
         let _ = std::mem::replace(&mut self.send_tx, dead_tx);
         let tasks = std::mem::take(&mut self._tasks);
         for handle in tasks {
@@ -350,8 +354,8 @@ fn wire_child(
     initial_child: Child,
     opts: OverlaySpawnOptions,
     shared: Arc<Shared>,
-    send_rx: UnboundedReceiver<OverlayMessage>,
-    recv_tx: UnboundedSender<OverlayIpcCommand>,
+    send_rx: Receiver<OverlayMessage>,
+    recv_tx: Sender<OverlayIpcCommand>,
 ) -> Vec<JoinHandle<()>> {
     vec![tokio::spawn(run_supervisor(
         initial_child,
@@ -375,15 +379,11 @@ fn validate_token(event: &OverlayEvent, expected: &str) -> bool {
 async fn run_one_child(
     mut child: Child,
     shared: Arc<Shared>,
-    mut send_rx: UnboundedReceiver<OverlayMessage>,
-    recv_tx: UnboundedSender<OverlayIpcCommand>,
+    mut send_rx: Receiver<OverlayMessage>,
+    recv_tx: Sender<OverlayIpcCommand>,
     carryover_in: Option<OverlayMessage>,
     session_token: &str,
-) -> (
-    UnboundedReceiver<OverlayMessage>,
-    Option<OverlayMessage>,
-    bool,
-) {
+) -> (Receiver<OverlayMessage>, Option<OverlayMessage>, bool) {
     tracing::debug!("run_one_child: starting new generation");
     let mut stdin = child.stdin.take().expect("stdin piped");
     let stdout = child.stdout.take().expect("stdout piped");
@@ -416,52 +416,17 @@ async fn run_one_child(
                             );
                             continue;
                         }
-                        match &event.command {
-                            OverlayIpcCommand::Pong => {
-                                let _ = recv_tx_reader.send(OverlayIpcCommand::Pong);
-                            }
-                            OverlayIpcCommand::Echo { payload } => {
-                                let _ = recv_tx_reader.send(OverlayIpcCommand::Echo {
-                                    payload: payload.clone(),
-                                });
-                            }
-                            OverlayIpcCommand::RequestSync => {
-                                let _ = recv_tx_reader.send(OverlayIpcCommand::RequestSync);
-                            }
-                            OverlayIpcCommand::AskRequested { question } => {
-                                let _ = recv_tx_reader.send(OverlayIpcCommand::AskRequested {
-                                    question: question.clone(),
-                                });
-                            }
-                            OverlayIpcCommand::AttachFilesRequested { paths } => {
-                                let _ =
-                                    recv_tx_reader.send(OverlayIpcCommand::AttachFilesRequested {
-                                        paths: paths.clone(),
-                                    });
-                            }
-                            OverlayIpcCommand::InstructionsUpdated { instructions } => {
-                                let _ =
-                                    recv_tx_reader.send(OverlayIpcCommand::InstructionsUpdated {
-                                        instructions: instructions.clone(),
-                                    });
-                            }
-                            OverlayIpcCommand::PasteTextRequested {
-                                text,
-                                target_bundle_id,
-                            } => {
-                                let _ =
-                                    recv_tx_reader.send(OverlayIpcCommand::PasteTextRequested {
-                                        text: text.clone(),
-                                        target_bundle_id: target_bundle_id.clone(),
-                                    });
-                            }
+                        if recv_tx_reader.send(event.command).await.is_err() {
+                            break;
                         }
                         continue;
                     }
                     // Fallback: try legacy format (no token wrapper)
                     match decode_ndjson(&line) {
                         Ok(OverlayMessage::Ping) => {
-                            let _ = recv_tx_reader.send(OverlayIpcCommand::Pong);
+                            if recv_tx_reader.send(OverlayIpcCommand::Pong).await.is_err() {
+                                break;
+                            }
                         }
                         Ok(_) => {
                             tracing::warn!(line = %line, "overlay sent message on reverse pipe");
@@ -473,7 +438,9 @@ async fn run_one_child(
                                     tracing::warn!("overlay event rejected: no token field");
                                     continue;
                                 }
-                                let _ = recv_tx_reader.send(cmd);
+                                if recv_tx_reader.send(cmd).await.is_err() {
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, line = %line, "bad overlay stdout line");
@@ -580,8 +547,8 @@ async fn run_supervisor(
     initial_child: Child,
     opts: OverlaySpawnOptions,
     shared: Arc<Shared>,
-    mut send_rx: UnboundedReceiver<OverlayMessage>,
-    recv_tx: UnboundedSender<OverlayIpcCommand>,
+    mut send_rx: Receiver<OverlayMessage>,
+    recv_tx: Sender<OverlayIpcCommand>,
 ) {
     let mut current_child = initial_child;
     let mut consecutive_failures: u32 = 0;
@@ -686,6 +653,49 @@ pub fn restart_delay(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbound_channel_returns_terminal_event_on_overload() {
+        let (send_tx, send_rx) = channel(OVERLAY_OUTBOUND_CHANNEL_CAPACITY);
+        let (_recv_tx, recv_rx) = channel(1);
+        let handle = NativeOverlayHandle {
+            send_tx,
+            recv_rx,
+            shared: Arc::new(Shared::new()),
+            _tasks: Vec::new(),
+        };
+
+        for _ in 0..OVERLAY_OUTBOUND_CHANNEL_CAPACITY {
+            handle
+                .send(OverlayMessage::TranscriptPartial {
+                    source: "mic".into(),
+                    text: "delta".into(),
+                })
+                .expect("queue has space");
+        }
+        let terminal = OverlayMessage::TranscriptFinal {
+            source: "mic".into(),
+            text: "complete".into(),
+        };
+        assert_eq!(handle.send(terminal.clone()), Err(terminal));
+        assert_eq!(send_rx.len(), OVERLAY_OUTBOUND_CHANNEL_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn privileged_command_waits_for_capacity_instead_of_dropping() {
+        let (sender, mut receiver) = channel(1);
+        sender.send(OverlayIpcCommand::Pong).await.unwrap();
+
+        let blocked = tokio::spawn(async move {
+            sender.send(OverlayIpcCommand::RequestSync).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+
+        assert_eq!(receiver.recv().await, Some(OverlayIpcCommand::Pong));
+        blocked.await.unwrap();
+        assert_eq!(receiver.recv().await, Some(OverlayIpcCommand::RequestSync));
+    }
 
     #[test]
     fn token_is_64_hex_chars() {
