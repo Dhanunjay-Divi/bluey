@@ -84,6 +84,13 @@ pub struct UpstreamHttpError {
     pub retry_after_secs: Option<u64>,
 }
 
+#[derive(Debug, Error)]
+#[error("{provider} explicitly rejected image/media input (http {status})")]
+pub struct UpstreamMediaRejectionError {
+    pub provider: String,
+    pub status: u16,
+}
+
 pub fn upstream_retry_after(error: &anyhow::Error) -> Option<u64> {
     error
         .downcast_ref::<UpstreamHttpError>()
@@ -100,6 +107,64 @@ fn upstream_http_error(
         status: status.as_u16(),
         retry_after_secs: retry_after_secs(status, headers),
     })
+}
+
+fn upstream_http_error_with_body(
+    provider: &str,
+    status: reqwest::StatusCode,
+    retry_after_secs: Option<u64>,
+    body: &str,
+) -> anyhow::Error {
+    if matches!(status.as_u16(), 400 | 415 | 422) && explicit_media_rejection_body(body) {
+        return anyhow!(UpstreamMediaRejectionError {
+            provider: provider.to_string(),
+            status: status.as_u16(),
+        });
+    }
+    anyhow!(UpstreamHttpError {
+        provider: provider.to_string(),
+        status: status.as_u16(),
+        retry_after_secs,
+    })
+}
+
+fn explicit_media_rejection_body(body: &str) -> bool {
+    let normalized = body.to_lowercase().replace(['-', ' '], "_");
+    let media_target = [
+        "image",
+        "media",
+        "multimodal",
+        "modality",
+        "image_url",
+        "inline_data",
+        "mime_type",
+    ]
+    .iter()
+    .any(|target| normalized.contains(target));
+    let explicit_rejection = [
+        "unsupported",
+        "not_supported",
+        "does_not_support",
+        "only_supported",
+        "not_allowed",
+        "invalid_image",
+        "image_is_invalid",
+        "image_is_not_valid",
+        "invalid_media",
+        "invalid_mime",
+        "invalid_content_type",
+        "cannot_process",
+        "can't_process",
+        "unable_to_process",
+        "cannot_accept",
+        "unable_to_accept",
+        "failed_to_decode",
+        "unable_to_decode",
+        "too_large",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    media_target && explicit_rejection
 }
 
 fn retry_after_secs(status: reqwest::StatusCode, headers: &HeaderMap) -> Option<u64> {
@@ -1086,9 +1151,14 @@ async fn openai_compatible_complete(
         .with_context(|| format!("{provider} http"))?;
     let status = resp.status();
     if !status.is_success() {
-        let error = upstream_http_error(provider, status, resp.headers());
-        let _ = resp.text().await.unwrap_or_default();
-        return Err(error);
+        let retry_after = retry_after_secs(status, resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(upstream_http_error_with_body(
+            provider,
+            status,
+            retry_after,
+            &body,
+        ));
     }
     let parsed: OpenAiChatResp = resp
         .json()
@@ -1218,9 +1288,14 @@ async fn openai_compatible_complete_stream(
         .with_context(|| format!("{provider} stream http"))?;
     let status = resp.status();
     if !status.is_success() {
-        let error = upstream_http_error(provider, status, resp.headers());
-        let _ = resp.text().await.unwrap_or_default();
-        return Err(error);
+        let retry_after = retry_after_secs(status, resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(upstream_http_error_with_body(
+            provider,
+            status,
+            retry_after,
+            &body,
+        ));
     }
 
     let provider_string = provider.to_string();
@@ -1309,6 +1384,12 @@ fn parse_openai_stream_chunk(
             .unwrap_or_else(|| "unknown upstream error".to_string());
         if let Some(capacity) = provider_stream_capacity_error(provider, &message, None) {
             return Err(capacity);
+        }
+        if explicit_media_rejection_body(data) {
+            return Err(anyhow!(UpstreamMediaRejectionError {
+                provider: provider.to_string(),
+                status: 400,
+            }));
         }
         return Err(anyhow!("openai stream error: {message}"));
     }
@@ -1491,19 +1572,28 @@ async fn gemini_complete(
         .context("gemini http")?;
     let status = resp.status();
     if !status.is_success() {
-        let error = upstream_http_error("gemini", status, resp.headers());
-        let _ = resp.text().await.unwrap_or_default();
-        return Err(error);
+        let retry_after = retry_after_secs(status, resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(upstream_http_error_with_body(
+            "gemini",
+            status,
+            retry_after,
+            &body,
+        ));
     }
     let parsed: GeminiGenerateResp = resp.json().await.context("gemini json")?;
     if let Some(error) = parsed.error {
-        return Err(anyhow!(
-            "gemini error: {}",
-            error
-                .message
-                .or(error.status)
-                .unwrap_or_else(|| "unknown upstream error".to_string())
-        ));
+        let message = error
+            .message
+            .or(error.status)
+            .unwrap_or_else(|| "unknown upstream error".to_string());
+        if explicit_media_rejection_body(&message) {
+            return Err(anyhow!(UpstreamMediaRejectionError {
+                provider: "gemini".to_string(),
+                status: 400,
+            }));
+        }
+        return Err(anyhow!("gemini error: {message}"));
     }
     let fallback_input = fallback_input_tokens.unwrap_or(0);
     let (input_tokens, output_tokens) = parsed
@@ -1549,9 +1639,14 @@ async fn gemini_complete_stream(
         .context("gemini stream http")?;
     let status = resp.status();
     if !status.is_success() {
-        let error = upstream_http_error("gemini", status, resp.headers());
-        let _ = resp.text().await.unwrap_or_default();
-        return Err(error);
+        let retry_after = retry_after_secs(status, resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(upstream_http_error_with_body(
+            "gemini",
+            status,
+            retry_after,
+            &body,
+        ));
     }
 
     let provider = "gemini".to_string();
@@ -1721,6 +1816,12 @@ fn parse_gemini_stream_chunk(
             provider_stream_capacity_error("gemini", &message, error.status.as_deref())
         {
             return Err(capacity);
+        }
+        if explicit_media_rejection_body(data) {
+            return Err(anyhow!(UpstreamMediaRejectionError {
+                provider: "gemini".to_string(),
+                status: 400,
+            }));
         }
         return Err(anyhow!("gemini stream error: {message}"));
     }
@@ -2932,6 +3033,22 @@ mod tests {
     }
 
     #[test]
+    fn gemini_stream_media_rejection_gets_dedicated_error_type() {
+        let mut usage = None;
+        let mut seen_terminal = false;
+        let err = parse_gemini_stream_chunk(
+            r#"{"error":{"message":"model does not support image input","status":"INVALID_ARGUMENT"}}"#,
+            &mut usage,
+            &mut seen_terminal,
+        )
+        .unwrap_err();
+
+        let rejection = err.downcast_ref::<UpstreamMediaRejectionError>().unwrap();
+        assert_eq!(rejection.provider, "gemini");
+        assert_eq!(rejection.status, 400);
+    }
+
+    #[test]
     fn gemini_stream_chunk_tracks_final_usage() {
         let mut usage = None;
         let mut seen_terminal = false;
@@ -2962,6 +3079,21 @@ mod tests {
         assert_eq!(capacity.status, 429);
         assert!(capacity.retry_after_secs.is_some());
         assert!(usage.is_none());
+    }
+
+    #[test]
+    fn openai_stream_media_rejection_gets_dedicated_error_type() {
+        let mut usage = None;
+        let err = parse_openai_stream_chunk(
+            "openai",
+            r#"{"error":{"message":"unsupported image media type","type":"invalid_request_error"}}"#,
+            &mut usage,
+        )
+        .unwrap_err();
+
+        let rejection = err.downcast_ref::<UpstreamMediaRejectionError>().unwrap();
+        assert_eq!(rejection.provider, "openai");
+        assert_eq!(rejection.status, 400);
     }
 
     #[test]
@@ -3030,6 +3162,42 @@ mod tests {
             .to_string();
         let parsed = parse_retry_after_value(&future).unwrap();
         assert!((1..=30).contains(&parsed));
+    }
+
+    #[test]
+    fn generic_bad_request_is_not_typed_as_media_rejection() {
+        for body in [
+            r#"{"error":{"message":"invalid request: context window exceeded"}}"#,
+            r#"{"error":{"message":"unsupported temperature for gpt-vision model"}}"#,
+        ] {
+            let error = upstream_http_error_with_body(
+                "openai",
+                reqwest::StatusCode::BAD_REQUEST,
+                None,
+                body,
+            );
+
+            assert!(error.downcast_ref::<UpstreamHttpError>().is_some());
+            assert!(error
+                .downcast_ref::<UpstreamMediaRejectionError>()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_image_rejection_gets_dedicated_error_type() {
+        let error = upstream_http_error_with_body(
+            "gemini",
+            reqwest::StatusCode::BAD_REQUEST,
+            None,
+            r#"{"error":{"code":"unsupported_image","message":"model does not support image input"}}"#,
+        );
+
+        let rejection = error
+            .downcast_ref::<UpstreamMediaRejectionError>()
+            .expect("explicit image rejection should be typed");
+        assert_eq!(rejection.provider, "gemini");
+        assert_eq!(rejection.status, 400);
     }
 
     #[tokio::test]
