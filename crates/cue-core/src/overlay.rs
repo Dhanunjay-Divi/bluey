@@ -317,6 +317,13 @@ pub enum OverlayCommand {
         kind: String,
         models: Vec<String>,
     },
+    /// Upgrade the speaker label of an already-pushed transcript line.
+    /// Diarization resolves "who said this" seconds AFTER the line was first
+    /// pushed (the live tier labels on its own tick cadence), so the original
+    /// push carries no speaker and this patches it in place. `id` is the segment
+    /// id carried on the original push_card; `speaker` is the display label
+    /// (e.g. "Speaker 2").
+    TranscriptSpeaker { id: String, speaker: String },
     /// Snapshot of the active meeting for rehydration (Fix B). `transcript` is
     /// the finalized spoken lines; `conversation` is the prior Q&A turns. Both
     /// empty when no meeting is active (so the UI's request promise still

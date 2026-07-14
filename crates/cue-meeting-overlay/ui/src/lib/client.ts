@@ -89,6 +89,11 @@ export interface MeetingClient {
   // ---- the live loop ----
   /** Subscribe to live transcript lines; returns an unsubscribe fn. */
   onTranscript(cb: (line: TranscriptLine) => void): () => void;
+  /** Subscribe to diarization speaker-label upgrades for already-delivered
+   *  transcript lines. Labels lag lines: the daemon's live diarize tick
+   *  resolves "who said it" a few seconds after the text streamed in, then
+   *  pushes (segmentId, label) so the UI patches the line in place. */
+  onSpeakerUpdate(cb: (segmentId: string, speaker: string) => void): () => void;
   /** Subscribe to daemon-detected "for-me" questions (master doc §6) — the
    *  distinct signal that drives the Ask view's "They asked…" hero card.
    *  Returns an unsubscribe fn. */

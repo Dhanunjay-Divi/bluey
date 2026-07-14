@@ -70,6 +70,12 @@ export interface TranscriptGrouper {
    *  same-speaker persisted fragments group into one flowing line. A segment
    *  whose id is already folded in is a no-op ({ history, caption:null }). */
   foldSegment(seg: TranscriptLine, paused: boolean): FoldResult;
+  /** Patch the diarized speaker label of the grouped line containing
+   *  `segmentId` (labels arrive AFTER the text — the daemon's live diarize
+   *  tick pushes upgrades by segment id). Returns the fresh history, or null
+   *  when no line contains that id (stale id, line rotated out) or the label
+   *  is already set — callers skip the re-render then. */
+  setSpeaker(segmentId: string, speaker: string): TranscriptLine[] | null;
   /** The current grouped history projected to the render shape. */
   history(): TranscriptLine[];
 }
@@ -85,7 +91,14 @@ export function createTranscriptGrouper(): TranscriptGrouper {
     if (seg.id) seen.add(seg.id);
 
     const last = lines.length > 0 ? lines[lines.length - 1] : null;
-    const continues = last != null && last.source === seg.source && !paused;
+    // Same channel, no live gap, and no CONFLICTING diarized speaker labels.
+    // (Seeded past-meeting lines carry labels on the segments themselves; two
+    // different voices on the same channel must not fold into one line.)
+    const continues =
+      last != null &&
+      last.source === seg.source &&
+      !paused &&
+      !(last.speaker && seg.speaker && last.speaker !== seg.speaker);
 
     let next: GroupedLine[];
     if (continues && last) {
@@ -94,6 +107,9 @@ export function createTranscriptGrouper(): TranscriptGrouper {
       const merged: GroupedLine = {
         ...last,
         text: last.text + seg.text,
+        // Adopt the segment's label when the line has none yet (a seed whose
+        // first fragment predates the diarize tick that labeled the rest).
+        speaker: last.speaker ?? seg.speaker,
         ids: seg.id ? [...last.ids, seg.id] : last.ids,
       };
       next = [...lines.slice(0, -1), merged];
@@ -113,8 +129,21 @@ export function createTranscriptGrouper(): TranscriptGrouper {
     };
   };
 
+  const setSpeaker = (
+    segmentId: string,
+    speaker: string,
+  ): TranscriptLine[] | null => {
+    const idx = lines.findIndex((l) => l.ids.includes(segmentId));
+    if (idx < 0 || lines[idx].speaker === speaker) return null;
+    const next = [...lines];
+    next[idx] = { ...next[idx], speaker };
+    lines = next;
+    return toHistory(next);
+  };
+
   return {
     foldSegment,
+    setSpeaker,
     history: () => toHistory(lines),
   };
 }

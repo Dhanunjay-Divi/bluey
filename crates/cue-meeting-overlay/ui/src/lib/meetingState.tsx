@@ -275,6 +275,20 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
     [client],
   );
 
+  // ---- diarized speaker-label upgrades (single owner) ----
+  // Labels lag lines: the daemon's live diarize tick resolves "who said it" a
+  // few seconds after the text streamed in, then pushes (segmentId, label).
+  // Patch the grouped line containing that segment in place; a null return
+  // (stale id / label unchanged) skips the re-render.
+  useEffect(
+    () =>
+      client.onSpeakerUpdate((segmentId, speaker) => {
+        const next = grouperRef.current?.setSpeaker(segmentId, speaker);
+        if (next) setHistory(next);
+      }),
+    [client],
+  );
+
   // ---- detected for-me question (single owner) ----
   useEffect(() => client.onForMeQuestion((q) => setDetectedQ(q)), [client]);
 

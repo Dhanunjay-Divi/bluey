@@ -256,7 +256,10 @@ function MeetingViewer({
                   <div key={i} style={captionWrap}>
                     <span style={captionDot} />
                     <span style={captionWho}>
-                      {line.source === "mic" ? "You" : "They"}
+                      {/* Diarized label when the meeting's post-pass resolved
+                          one; channel fallback otherwise. */}
+                      {line.speaker ??
+                        (line.source === "mic" ? "You" : "They")}
                     </span>
                     <span style={captionText}>
                       {line.text.replace(/^\s+/, "")}

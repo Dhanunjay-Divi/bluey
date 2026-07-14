@@ -17,12 +17,11 @@ use tracing::{debug, info, warn};
 
 use crate::app::Daemon;
 
-/// Rolling window the live tier re-diarizes (seconds). 30s is the diart-style
-/// "local segmentation buffer": long enough for speakrs's VBx to separate ≤4
-/// speakers reliably, short enough that after 30s the window is genuinely ROLLING
-/// (fixed length) rather than growing-from-0 — which, combined with the persistent
-/// arrival-ordered speaker set in `LiveDiarizer`, is what keeps ids stable.
-pub const LIVE_WINDOW_SECS: usize = 30;
+/// Rolling window the live tier re-diarizes (seconds). 90s is the measured
+/// anchor-pinned recipe (docs/work/STT-DIARIZATION-FINDINGS.md): shorter windows
+/// make the clusterer MERGE voices (anchors pin identity but cannot force
+/// splits). Also the retention rolling-buffer length.
+pub const LIVE_WINDOW_SECS: usize = cue_diarize::ANCHOR_WINDOW_SECS;
 
 /// How often the live tier re-diarizes, in seconds. Overridable via
 /// `BLUEY_DIARIZE_INTERVAL_SECS`. Default 15s → 30s window / 15s step: labels firm
@@ -79,9 +78,9 @@ pub(crate) fn spawn_live_diarizer() -> Option<LiveDiarizerHandle> {
         .name("diarize-live".into())
         .spawn(move || {
             let mut diarizer =
-                match cue_diarize::LiveDiarizer::load(cue_diarize::Backend::preferred()) {
+                match cue_diarize::AnchorLiveDiarizer::load(cue_diarize::Backend::preferred()) {
                     Ok(d) => {
-                        info!("diarize: live diarizer loaded (worker thread)");
+                        info!("diarize: anchor-pinned live diarizer loaded (worker thread)");
                         d
                     }
                     Err(e) => {
@@ -126,23 +125,21 @@ pub(crate) fn live_tick(daemon: &Arc<Daemon>, handle: &mut LiveDiarizerHandle) {
         });
     }
 
-    // 2) Grab + submit the FULL meeting audio (from t=0) on a detached task.
-    //    Re-diarizing the whole meeting each tick — not a 30s rolling window — is
-    //    what lets the live tier re-label EARLY segments correctly: with a rolling
-    //    window, a segment labelled when only one speaker had spoken freezes at
-    //    that id once the window scrolls past it (it can never see the later
-    //    speakers). The full buffer always contains every speaker, and
-    //    `label_segments_by_overlap` overwrites every segment each tick, so labels
-    //    converge to the whole-meeting picture. Runs on the diarizer's dedicated
-    //    thread, so the growing per-tick cost never touches STT. (retention lock +
-    //    clone must NOT run on the audio select! loop.)
+    // 2) Grab + submit the ROLLING WINDOW (last ~90s) on a detached task. The
+    //    anchor-pinned diarizer carries every enrolled speaker forward as an
+    //    audio anchor, so a bounded window is all it needs — per-tick cost stays
+    //    CONSTANT for the whole meeting. (The previous design re-submitted the
+    //    FULL buffer each tick; its growing cost saturated the worker ~15 min in
+    //    and live labels went stale.) A speaker's early segments keep their live
+    //    labels; the post-meeting pass remains the authoritative corrector.
+    //    (retention lock + clone must NOT run on the audio select! loop.)
     let d = daemon.clone();
     let tx = handle.window_tx.clone();
     tokio::spawn(async move {
         let submit = {
             let guard = d.audio_retention.lock().await;
             match guard.as_ref() {
-                Some(r) if r.duration_secs() >= 3.0 => Some((r.full().to_vec(), 0.0_f64)),
+                Some(r) if r.duration_secs() >= 3.0 => Some(r.rolling_window()),
                 _ => None,
             }
         };
@@ -150,7 +147,7 @@ pub(crate) fn live_tick(daemon: &Arc<Daemon>, handle: &mut LiveDiarizerHandle) {
             debug!(
                 samples = window.len(),
                 start_secs = start,
-                "diarize: live_tick submitting FULL meeting audio"
+                "diarize: live_tick submitting rolling window"
             );
             let _ = tx.try_send((window, start));
         }
@@ -166,7 +163,7 @@ async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize
     // Collect what changed while holding the meeting lock; broadcast after
     // releasing it (broadcast::send is sync and non-blocking, but keep the
     // lock scope tight).
-    let mut updates: Vec<(String, String, i64, u64)> = Vec::new();
+    let mut updates: Vec<(String, String, String, i64, u64)> = Vec::new();
     let session_id;
     // Snapshot to persist AFTER releasing the meeting lock. Saving under the lock
     // is a ~50-200ms synchronous disk write that would block the STT sink from
@@ -188,7 +185,13 @@ async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize
                 if seg.speaker_id != Some(speaker) {
                     seg.speaker_id = Some(speaker);
                     let ts_ms = seg.created_at.parse::<u64>().unwrap_or(0);
-                    updates.push((seg.text.clone(), seg.speaker.to_string(), speaker, ts_ms));
+                    updates.push((
+                        seg.id.to_string(),
+                        seg.text.clone(),
+                        seg.speaker.to_string(),
+                        speaker,
+                        ts_ms,
+                    ));
                 }
             }
         }
@@ -204,7 +207,11 @@ async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize
         }
     }
 
-    for (text, source, speaker_id, ts_ms) in updates {
+    for (seg_id, text, source, speaker_id, ts_ms) in updates {
+        // Upgrade the OVERLAY's already-rendered line in place ("Speaker N").
+        crate::app::push_transcript_speaker(daemon, seg_id, format!("Speaker {}", speaker_id + 1))
+            .await;
+        // Dev-view WebSocket (bluey listen) gets the same upgrade.
         crate::app::broadcast_speaker_update(
             daemon,
             session_id.clone(),

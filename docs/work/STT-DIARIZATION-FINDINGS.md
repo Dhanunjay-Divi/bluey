@@ -1,6 +1,6 @@
 # STT & Diarization — validated findings + port plan
 
-**Status:** research + isolated-probe validation DONE. Production port NOT started (except unrelated answer-style work). This doc exists so we never re-research this.
+**Status:** research + isolated-probe validation DONE. Production port DONE (2026-07-14): sentence recipe committed earlier; anchor-pinned diarization + overlay speaker labels ported (see §5). This doc exists so we never re-research this.
 
 **Date of investigation:** 2026-07 (session on `agent/meeting-build-separation`).
 
@@ -88,10 +88,76 @@ The probe used **Sortformer** (`parakeet-rs::sortformer`), which is **hard-cappe
 
 ### Test data available
 - **`6_speakers.wav`** (16kHz mono, 41s, 6 speakers): `~/Documents/antigravity/nifty-brahmagupta/6_speakers.wav`
-- **VoxConverse RTTM ground truth** (232 files, 2–13 speakers): `~/Downloads/voxconverse-master/{dev,test}/*.rttm` — **AUDIO NOT downloaded** (Oxford zip: `robots.ox.ac.uk/~vgg/data/voxconverse/data/voxconverse_{dev,test}_wav.zip`)
+- **VoxConverse: BOTH halves present** — RTTM ground truth at `~/Downloads/voxconverse-master/test/*.rttm` AND the matching **audio** at `~/Downloads/voxconverse_test_wav/*.wav` (232 matched pairs, 2–21 speakers).
 
-### Next diarization step (NOT done)
-Test `cue-diarize`/`speakrs` (offline + live) on `6_speakers.wav` → does it correctly find 6? Then decide streaming approach. Only after that, touch production diarization.
+### MEASURED (2026-07-14): DER benchmark on VoxConverse (probe: `scratchpad/diar-test`)
+
+Custom DER scorer (10ms frames, 0.25s collar, greedy optimal mapping). Batch = 15
+files balanced across speaker counts.
+
+**Round 1 — full files, offline vs the shipping `LiveDiarizer`:**
+| | mean DER | spk-count exact |
+|---|---|---|
+| OFFLINE `Diarizer` | **6.7%** | 8/15 |
+| LIVE `LiveDiarizer` (30s windows, time-overlap stitch) | **47.9%** | 3/15 — hallucinated up to **28 speakers** on a 7-speaker file |
+
+→ **Offline speakrs is excellent (matches its claimed 7.8%). The live window-stitcher
+is BROKEN and unusable** — every 30s window re-clusters from scratch; failed overlap
+mappings mint phantom speakers that compound with meeting length. Do not ship it.
+(The earlier "4/6 on 6_speakers.wav" scare was the stress clip — ~5s of speech per
+speaker is too little to cluster; on realistic files offline is near-SOTA.)
+
+**Round 2/3 — the ANCHOR-PINNED architecture, DEFINITIVE 4-way result
+(first-240s spans, 15 files, 1–11 speakers, empty-ref files excluded):**
+| | mean DER | spk-count exact |
+|---|---|---|
+| OFFLINE (plain full-clip) | 8.7% | 7/15 |
+| LIVE-WIN (shipping window-stitcher) | 26.6% (→47.9% on full files; errors compound) | 4/15 |
+| **ANCH-LIVE (simple ticks — SHIP THIS for live labels)** | **12.3%** | **8/15** |
+| **ANCH-FIN (anchor-pinned final pass — the record)** | **8.2% — BEATS plain offline** | **10/15 (best)** |
+
+Standout per-file: `fzwtp` (11 speakers): ANCH-LIVE found **exactly 11** (offline
+found 10; the shipping stitcher: 62% DER). `tpnyf` 5/5, `qadia` 7/7. On
+meeting-realistic files (≤4 spk), ANCH-FIN averages **~6%**.
+
+**The validated architecture:** keep a gallery of one ~8s clean "anchor" clip per
+known speaker; every tick (~10-30s) diarize
+`[anchor₀ + gap + anchor₁ + … + last ~90s window]` as ONE clip with the OFFLINE
+clusterer. The cluster containing anchor_i's time-span IS speaker i — identity
+pinned by construction (no cross-run centroid matching, no window-overlap
+guessing). A window cluster overlapping no anchor = new voice → mint id + cut its
+8s anchor. Tick labels only its new span (label-once). Periodically (and at
+meeting end) run the SAME pinned pass over the full audio → the authoritative
+record (ANCH-FIN), with ids consistent with the live gallery; unmapped clusters
+in that pass mint fresh ids (dropping them = 56% miss, was a bug). Constant cost
+per tick (~5-8s at CoreML 18×); error does NOT compound with meeting length.
+
+**Tuning that matters (all measured, don't re-learn):**
+- **8s anchors + 90s window is load-bearing.** 4-5s anchors or 60s windows →
+  the clusterer merges voices (20-36% DER). Anchors pin identity but cannot force
+  splits — give the clusterer context.
+- **FAILED variants (measured WORSE — do not re-add):** (a) per-tick retroactive
+  re-labeling — naive "last tick wins" lets one bad tick destroy 90s of good
+  labels; confidence-gating it (tick-level conf from anchors-merged detection)
+  still lost. (b) A GLOBAL "under-split pass" guard that suppresses minting —
+  with 5+ anchors some pair merges almost every pass, so enrollment stops and
+  speaker counts collapse (3-of-5, 4-of-7). (c) Anchor refresh (2nd sub-clip)
+  gave no measurable win once retro-relabel was gone.
+- The live↔final gap (12.3→8.2) is early-tick labels before full enrollment;
+  production closes it with the periodic pinned full-pass re-label (labels are
+  already revisable in Bluey's model), NOT with per-tick retro machinery.
+
+### Next diarization step
+Port to production in `cue-diarize`: replace `LiveDiarizer`'s window-stitching
+with anchor-pinning — gallery + simple label-once ticks (live labels) + periodic
+pinned full-prefix pass + end-of-meeting pinned pass (the record). Bluey-specific
+boosters: mic channel = "You" needs no diarization (only system audio does);
+cross-meeting anchor gallery doubles as the voice-print DB that
+`cue-daemon/db/diarize.rs` already stores; optional screen-OCR of the meeting
+app's active-speaker tile → real names bound to clusters.
+Benchmark harness (keep!): `scratchpad/diar-test` — `diarprobe ascore <wav> <rttm>`
+and `abatch <wav_dir> <rttm_dir> [N] [TRIM_S]`; VoxConverse pairs in
+`~/Downloads/voxconverse_test_wav` + `~/Downloads/voxconverse-master/test`.
 
 ---
 
@@ -116,18 +182,50 @@ Test `cue-diarize`/`speakrs` (offline + live) on `6_speakers.wav` → does it co
 
 ---
 
-## 5. Port plan (NOT started)
+## 5. Port plan — DONE (Phases 1–2 shipped; Phase 3 open)
 
-Do on a FRESH branch (`agent/stt-boundary-fixes`), per git rules. Build/test with `--target aarch64-apple-darwin`.
+Build/test with `--target aarch64-apple-darwin` and
+`PKG_CONFIG_PATH=/opt/homebrew/opt/openblas/lib/pkgconfig`, features
+`parakeet-stt local-memory diarize`.
 
-**Phase 1 — sentence-boundary recipe (validated, do first):**
-1. Swap English Nemotron → Multilingual 3.5 in `cue-transcribe` (better punctuation).
-2. Add hold-the-tip buffer per-source in `parakeet.rs` `run_worker`.
-3. Add the assembler (silence gate + dangling-word + coalesce-not-drop) into BOTH commit seams in `app.rs`, reusing `dedup_partial_on_final`'s same-speaker lookup. Test the IPC path first via `bluey listen`.
+**Phase 1 — sentence-boundary recipe: PORTED + committed** (hold-the-tip +
+SentenceAssembler in `cue-daemon/src/stt/parakeet.rs`; Multilingual 3.5 stays
+opt-in via `BLUEY_PARAKEET_MODEL_DIR`).
 
-**Phase 2 — diarization (validate first, then port):**
-4. Test `cue-diarize`/speakrs on `6_speakers.wav` (offline + live). Confirm it finds all speakers unlimited.
-5. Only then wire/tune the daemon's `diarize.rs` live path.
+**Phase 2 — anchor-pinned diarization: PORTED (2026-07-14).** What landed where:
+- `crates/cue-diarize/src/anchor.rs` — `AnchorLiveDiarizer` (gallery + pinned
+  window ticks + minting) + pure `map_raw_to_gallery` with unit tests.
+  `ANCHOR_WINDOW_SECS = 90`, 8s pins, 0.75s gaps, 3s enroll / 1s claim minimums
+  — all measured, do not shrink (§3). Old `LiveDiarizer` kept but marked
+  SUPERSEDED in `lib.rs` docs.
+- `crates/cue-daemon/src/diarize.rs` — worker loads `AnchorLiveDiarizer`;
+  `live_tick` submits `retention.rolling_window()` (CONSTANT per-tick cost)
+  instead of the growing full buffer (which saturated the worker ~15 min in).
+  `LIVE_WINDOW_SECS = cue_diarize::ANCHOR_WINDOW_SECS` also sets the retention
+  rolling cap. `post_process_meeting` unchanged (plain authoritative offline
+  pass + centroid persist).
+- Speaker labels → overlay, live: labels lag lines by up to one tick, so the
+  daemon pushes `OverlayCommand::TranscriptSpeaker { id: segment_id, speaker }`
+  (`cue-core/src/overlay.rs`) via `app.rs::push_transcript_speaker`;
+  `app.rs::to_wire_line` maps `speaker_id` → `"Speaker N"` for the
+  rehydrate/past-meeting snapshots.
+- Overlay UI: `tauriClient.ts` handles `transcript_speaker` →
+  `MeetingClient.onSpeakerUpdate`; `transcriptGrouping.ts` gets `setSpeaker`
+  (patch by segment id — `GroupedLine.ids` is the hook) + a
+  split-on-conflicting-speaker fold rule; `meetingState.tsx` owns the
+  subscription; AskScreen/MeetingsScreen render
+  `line.speaker ?? (mic ? "You" : "They")`. NOTE: the live transcript card's
+  `title` is the CHANNEL ("System"/"Mic"), never a speaker — `onTranscript`
+  must keep `speaker: undefined`.
 
-**Phase 3 — the real limitation (schedule separately):**
-6. Investigate a `parakeet-rs` version exposing `att_context_size`/right-context, or plan a vendored-encoder patch (~480ms lookahead at 8×/80ms-per-frame) to fix mid-word splits at the model level.
+**Phase 2 leftovers (deliberate, small):**
+- End-of-meeting pinned full pass through the worker gallery (id-consistent
+  record; today's post pass re-clusters from scratch so final ids can differ
+  from live ids).
+- Cross-meeting anchor gallery (voice-print DB), OCR name binding — boosters
+  from §3, not started.
+
+**Phase 3 — the real limitation (still open):**
+Investigate a `parakeet-rs` version exposing `att_context_size`/right-context,
+or plan a vendored-encoder patch (~480ms lookahead at 8×/80ms-per-frame) to fix
+mid-word splits at the model level.

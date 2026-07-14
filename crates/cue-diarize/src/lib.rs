@@ -6,19 +6,24 @@
 //!
 //!   * [`Diarizer`] — offline/post-process. Diarize a whole recording in one
 //!     pass (authoritative labels, ~6-8% DER). Run at meeting end.
-//!   * [`LiveDiarizer`] — near-real-time. Re-diarize a rolling window every few
-//!     seconds and stitch each window's speakers into STABLE, arrival-ordered
-//!     global ids by TIME OVERLAP with the previous window's labels. speakrs
-//!     renumbers speakers per run AND its per-run embeddings aren't comparable
-//!     across runs, so time overlap of the shared audio prefix — not centroid
-//!     matching — is what keeps "Speaker 2" the same person across windows.
+//!   * [`AnchorLiveDiarizer`] — near-real-time, anchor-pinned. The live tier the
+//!     daemon uses: carries each speaker's voice forward AS an ~8s audio anchor
+//!     and re-identifies speakers by construction each tick. Measured 12.3% DER
+//!     live on VoxConverse vs 26.6% for the old window stitcher (see
+//!     docs/work/STT-DIARIZATION-FINDINGS.md). Constant per-tick cost.
+//!   * [`LiveDiarizer`] — the SUPERSEDED window stitcher (time-overlap mapping
+//!     across rolling windows). Kept for reference/tests; measured to hallucinate
+//!     phantom speakers as windows accumulate. Prefer [`AnchorLiveDiarizer`].
 //!
-//! Both take 16 kHz mono f32 samples (the daemon's capture format). Speaker
+//! All take 16 kHz mono f32 samples (the daemon's capture format). Speaker
 //! identity is a per-meeting integer id, orthogonal to the coarse mic-vs-system
 //! `Speaker` channel tag.
 
 use anyhow::{Context, Result};
 use speakrs::{ExecutionMode, OwnedDiarizationPipeline};
+
+mod anchor;
+pub use anchor::{AnchorLiveDiarizer, ANCHOR_WINDOW_SECS};
 
 /// One diarized speech span with a per-meeting speaker id.
 #[derive(Debug, Clone)]

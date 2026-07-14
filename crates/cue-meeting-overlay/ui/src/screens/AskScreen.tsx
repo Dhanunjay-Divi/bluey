@@ -398,7 +398,9 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
             <div key={i} style={captionWrap}>
               <span style={captionDot} />
               <span style={captionWho}>
-                {line.source === "mic" ? "You" : "They"}
+                {/* Diarized label ("Speaker 2") when resolved; channel fallback
+                    until then (labels lag lines by up to one diarize tick). */}
+                {line.speaker ?? (line.source === "mic" ? "You" : "They")}
               </span>
               <span style={captionText}>{line.text.replace(/^\s+/, "")}</span>
             </div>

@@ -146,6 +146,10 @@ type OverlayCommand =
   | { type: "set_meetings"; meetings: WireMeetingSummary[] }
   | { type: "listening_state_changed"; state: string }
   | { type: "push_card"; card: WireCueCard }
+  // Diarization resolved a speaker for an already-pushed transcript line
+  // (labels lag lines by up to one live-diarize tick). `id` is the segment id
+  // the transcript card was pushed with; `speaker` is the display label.
+  | { type: "transcript_speaker"; id: string; speaker: string }
   | {
       type: "update_card";
       id: string;
@@ -620,12 +624,28 @@ export function createTauriClient(): MeetingClient {
           // the SAME channel the snapshot's MeetingTranscriptLine.source uses, so
           // the seed/live seam agrees; fall back to "system" when absent.
           source: card.source ?? "system",
-          speaker: card.title || undefined,
+          // card.title is the CHANNEL label ("System" | "Mic"), not a diarized
+          // speaker — the UI already renders the channel from `source`. Real
+          // speaker labels arrive later via transcript_speaker upgrades.
+          speaker: undefined,
           text: card.body,
           // push_card carries a fully-formed (finalized) line.
           final: true,
         };
         cb(line);
+      };
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+
+    onSpeakerUpdate(cb) {
+      // Diarization label upgrades for already-rendered transcript lines. The
+      // daemon's live diarize tick resolves "who said it" a few seconds after
+      // the text was pushed; this patches the label in place by segment id.
+      const handler = (cmd: OverlayCommand) => {
+        if (cmd.type !== "transcript_speaker") return;
+        const c = cmd as Extract<OverlayCommand, { type: "transcript_speaker" }>;
+        if (c.id && c.speaker) cb(c.id, c.speaker);
       };
       handlers.add(handler);
       return () => handlers.delete(handler);

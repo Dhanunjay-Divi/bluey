@@ -975,6 +975,25 @@ impl LiveTranscriptEvent {
 /// stamps `speaker_id` (the segment was first broadcast with `speaker=None`, so
 /// this is what lets the view show real per-speaker labels live). No-op if there
 /// are no subscribers.
+/// Push a live speaker-label upgrade to the OVERLAY for an already-rendered
+/// transcript line (diarization resolves the speaker seconds after the line was
+/// pushed with no label). Best-effort: the overlay may be closed.
+#[cfg(feature = "diarize")]
+pub(crate) async fn push_transcript_speaker(
+    daemon: &Arc<Daemon>,
+    segment_id: String,
+    speaker: String,
+) {
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::TranscriptSpeaker {
+            id: segment_id,
+            speaker,
+        },
+    )
+    .await;
+}
+
 #[cfg(feature = "diarize")]
 pub(crate) fn broadcast_speaker_update(
     daemon: &Daemon,
@@ -4254,7 +4273,10 @@ fn to_wire_line(segment: &TranscriptSegment) -> MeetingTranscriptLine {
     MeetingTranscriptLine {
         id: segment.id.to_string(),
         source: speaker_channel(segment.speaker).to_string(),
-        speaker: None,
+        // Diarized display label when the live/post pass has resolved one (the
+        // rehydrate/past-meeting paths carry labels this way; live lines get
+        // theirs via OverlayCommand::TranscriptSpeaker upgrades instead).
+        speaker: segment.speaker_id.map(|id| format!("Speaker {}", id + 1)),
         text: segment.text.clone(),
         is_final: true,
     }
