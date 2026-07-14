@@ -35,6 +35,12 @@ const ASK_RECENT_QUESTION =
   "transcript. If the last lines contain no question, briefly answer what " +
   "would be most useful about what was just discussed.";
 
+// The human-readable label shown in the feed for an "ask recent" turn — the
+// ASK_RECENT_QUESTION text above is an internal instruction to the agent and
+// must NEVER be shown as if the user asked it. Kept in sync with the daemon's
+// visible_question_for_source mapping.
+const ASK_RECENT_LABEL = "Answering the question just asked in the meeting.";
+
 export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   const client = getClient();
   // Session state (transcript, history, Q&A feed, detected question) lives in
@@ -139,8 +145,17 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   const connectorNames = connectors.slice(0, 2);
   const extraConnectors = Math.max(0, connectors.length - 2);
 
-  const runAsk = (question: string) => {
+  // `question` is what we SEND the agent; `displayQuestion` (when given) is what
+  // we SHOW in the feed. They differ for the "ask recent" path, where the sent
+  // text is an internal instruction that must never surface as the user's words.
+  const runAsk = (question: string, displayQuestion?: string) => {
     askRef.current?.cancel();
+    // Asking ANYTHING (typed, ask-recent, or a detected tap) makes any pending
+    // detected-question suggestion moot — clear the hero so it can't linger on
+    // screen next to the new turn. (askDetected already nulls it before calling
+    // us; this covers the typed-Composer path, which previously left a stale
+    // hero card up with its Ask/Dismiss buttons.)
+    setDetectedQ(null);
     setPhase("thinking");
     // A fresh ask always follows initially (re-pin), even if the user had
     // scrolled up while reading a prior answer.
@@ -161,7 +176,10 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
     let statusDone = false;
     appendTurn({
       id,
-      question,
+      question: displayQuestion ?? question,
+      // Remember the real send-text so a retry re-sends the instruction, not the
+      // display label (only meaningfully differs for the ask-recent path).
+      sendQuestion: displayQuestion ? question : undefined,
       answer: { ...draft },
       statusSteps: steps,
       statusDone,
@@ -202,10 +220,17 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   };
 
   const askDetected = () => {
-    const q = detectedQ?.text ?? transcript?.text;
-    if (!q) return;
+    // The hero card DISPLAYS the detected question (readable), but what we ASK
+    // is ASK_RECENT_QUESTION — the detected text is only a FRAGMENT of the
+    // spoken question (STT splits one question across several finalized
+    // segments), so asking it verbatim ships the agent a truncated "are there
+    // any" and it replies "your message looks cut off". The context envelope
+    // already carries the recent transcript, so pointing the agent at the
+    // transcript tail lets it read the COMPLETE question itself. Falls back to
+    // asking nothing when there's neither a detected question nor a caption.
+    if (!detectedQ?.text && !transcript?.text) return;
     setDetectedQ(null);
-    runAsk(q);
+    runAsk(ASK_RECENT_QUESTION, ASK_RECENT_LABEL);
   };
 
   // True while an ask is streaming: the newest turn exists and hasn't received
@@ -321,7 +346,9 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
                     navigator.clipboard?.writeText(turn.answer.text)
                   }
                   onRetry={
-                    turn.answer.error ? () => runAsk(turn.question) : undefined
+                    turn.answer.error
+                      ? () => runAsk(turn.sendQuestion ?? turn.question, turn.sendQuestion ? turn.question : undefined)
+                      : undefined
                   }
                 />
               )}
@@ -382,8 +409,8 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
       <Composer
         placeholder="Ask a follow-up while Bluey listens…"
         contextLabel={transcript ? "live transcript · in context" : undefined}
-        onSubmit={runAsk}
-        onAskRecent={() => runAsk(ASK_RECENT_QUESTION)}
+        onSubmit={(q) => runAsk(q)}
+        onAskRecent={() => runAsk(ASK_RECENT_QUESTION, ASK_RECENT_LABEL)}
         askRecentDisabled={askStreaming}
         mode={mode}
         onModeChange={setMode}

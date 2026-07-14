@@ -48,7 +48,12 @@ import type { AnswerStatusStep, MeetingState, TranscriptLine } from "./types";
  *  last. */
 export interface Turn {
   id: number;
+  /** What is SHOWN in the feed for this turn. */
   question: string;
+  /** What is SENT to the agent on (re)ask — differs from `question` only for the
+   *  "ask recent" path, where the sent text is an internal instruction and the
+   *  shown text is a readable label. Absent → send `question` verbatim. */
+  sendQuestion?: string;
   answer: AnswerState;
   statusSteps: AnswerStatusStep[];
   statusDone: boolean;

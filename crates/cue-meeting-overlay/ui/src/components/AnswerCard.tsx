@@ -106,11 +106,16 @@ export function AnswerCard({
         }}
       >
         {answer.agentLabel.toUpperCase()}
-        <span
-          style={{ fontWeight: 430, letterSpacing: 0, color: "var(--ink-4)" }}
-        >
-          grounded in your repo &amp; tickets
-        </span>
+        {/* Only claim grounding when the answer actually carries source rows —
+            otherwise the subtitle is dishonest (it showed on every answer,
+            including ungrounded ones). */}
+        {answer.sources.length > 0 && (
+          <span
+            style={{ fontWeight: 430, letterSpacing: 0, color: "var(--ink-4)" }}
+          >
+            grounded in your repo &amp; tickets
+          </span>
+        )}
       </div>
 
       <div
