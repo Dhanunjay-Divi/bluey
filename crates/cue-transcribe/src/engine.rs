@@ -22,6 +22,14 @@ const SAMPLE_RATE: f64 = 16_000.0;
 pub struct SttEngine {
     asr: Nemotron,
     samples_seen: usize,
+    /// Hold-the-tip buffer (word-integrity fix): the last whitespace-delimited
+    /// token of each chunk is PROVISIONAL — a word whose audio straddles the
+    /// ~560ms chunk boundary is emitted half ("month") before the model has seen
+    /// the rest ("ly"). We hold that trailing fragment back and prepend it to the
+    /// next chunk's text, so "month" + "ly" reunite into "monthly" before either
+    /// is committed. Flushed by `finalize_tip`. This is the local mitigation for
+    /// the fully-causal encoder (no future right-context; see the crate notes).
+    tip: String,
 }
 
 impl SttEngine {
@@ -71,6 +79,7 @@ impl SttEngine {
         Ok(Self {
             asr,
             samples_seen: 0,
+            tip: String::new(),
         })
     }
 
@@ -86,10 +95,45 @@ impl SttEngine {
             .asr
             .transcribe_chunk(pcm)
             .map_err(|e| anyhow!("Nemotron transcribe_chunk failed: {e:?}"))?;
-        if text.trim().is_empty() {
+        if text.is_empty() {
             return Ok(None);
         }
-        Ok(Some(TranscriptChunk { text, at }))
+
+        // Hold-the-tip: reunite the previously-held fragment with this chunk's
+        // text (keeping the model's own spacing), then split off the NEW trailing
+        // token as the next tip. A word split across the boundary reassembles here
+        // ("month" held + "ly" -> "monthly") before anything downstream sees it.
+        let mut combined = std::mem::take(&mut self.tip);
+        combined.push_str(&text);
+        let emit = match combined.rfind(char::is_whitespace) {
+            // Confirmed = everything up to (and incl.) the last space; hold the rest.
+            Some(idx) => {
+                let (confirmed, tip) = combined.split_at(idx + 1);
+                self.tip = tip.to_string();
+                confirmed.to_string()
+            }
+            // No space yet — the whole thing is still one unfinished word; keep holding.
+            None => {
+                self.tip = combined;
+                String::new()
+            }
+        };
+        if emit.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(TranscriptChunk { text: emit, at }))
+    }
+
+    /// Flush the held tip (the last provisional word). Call this when speech ends
+    /// / on close, so a final word isn't stranded in the buffer. Returns the held
+    /// text (may be empty).
+    pub fn finalize_tip(&mut self) -> Option<TranscriptChunk> {
+        let held = std::mem::take(&mut self.tip);
+        if held.trim().is_empty() {
+            return None;
+        }
+        let at = self.samples_seen as f64 / SAMPLE_RATE;
+        Some(TranscriptChunk { text: held, at })
     }
 
     /// The full accumulated transcript so far.
