@@ -8,10 +8,67 @@ if (Test-Path $CargoBin) {
   $env:Path = "$CargoBin;$env:Path"
 }
 
-cargo build --release
-powershell -ExecutionPolicy Bypass -File native\windows\cue-overlay\build.ps1 | Out-Null
-powershell -ExecutionPolicy Bypass -File native\windows\cue-audio\build.ps1 | Out-Null
-powershell -ExecutionPolicy Bypass -File native\windows\cue-whisper\build.ps1 | Out-Null
+function Invoke-CheckedCommand {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Name,
+    [Parameter(Mandatory = $true)]
+    [scriptblock]$Command
+  )
+
+  Write-Host "Building $Name..."
+  & $Command
+  if ($LASTEXITCODE -ne 0) {
+    throw "$Name failed with exit code $LASTEXITCODE."
+  }
+}
+
+function Assert-BuildOutput {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Name,
+    [Parameter(Mandatory = $true)]
+    [string[]]$Paths
+  )
+
+  foreach ($Path in $Paths) {
+    $Resolved = Join-Path $Root $Path
+    if (-not (Test-Path -LiteralPath $Resolved -PathType Leaf)) {
+      throw "$Name did not produce required output: $Path"
+    }
+  }
+}
+
+Invoke-CheckedCommand "Rust release binaries" { cargo build --release }
+Invoke-CheckedCommand "Windows overlay" {
+  powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+    -File native\windows\cue-overlay\build.ps1
+}
+Assert-BuildOutput "Windows overlay" @(
+  "native\windows\cue-overlay\build\bluey-overlay.exe",
+  "native\windows\cue-overlay\build\cue-overlay.exe",
+  "native\windows\cue-overlay\build\hostovb.exe",
+  "native\windows\cue-overlay\build\host-overlay.exe"
+)
+
+Invoke-CheckedCommand "Windows audio driver" {
+  powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+    -File native\windows\cue-audio\build.ps1
+}
+Assert-BuildOutput "Windows audio driver" @(
+  "native\windows\cue-audio\build\bluey-audio.exe",
+  "native\windows\cue-audio\build\cue-audio.exe",
+  "native\windows\cue-audio\build\adriverb.exe",
+  "native\windows\cue-audio\build\audio-driver.exe"
+)
+
+Invoke-CheckedCommand "Windows local speech helper" {
+  powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+    -File native\windows\cue-whisper\build.ps1
+}
+Assert-BuildOutput "Windows local speech helper" @(
+  "native\windows\cue-whisper\cue-whisper.exe"
+)
 
 $Dist = Join-Path $Root "dist\bluey-windows-x64"
 if (Test-Path $Dist) {

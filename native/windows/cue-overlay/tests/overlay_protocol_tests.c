@@ -40,16 +40,14 @@ static void dispose_capture(RecordCapture *capture) {
 }
 
 static char *make_body(size_t body_len, unsigned seed) {
+    static const unsigned char rocket_utf8[] = {0xf0u, 0x9fu, 0x9au, 0x80u};
     char *body = (char *)malloc(body_len + 1);
     CHECK(body != NULL);
     for (size_t i = 0; i < body_len; i++) {
         body[i] = (char)('a' + (int)((i + seed) % 26));
     }
-    if (body_len >= 4) {
-        body[body_len - 4] = (char)0xf0;
-        body[body_len - 3] = (char)0x9f;
-        body[body_len - 2] = (char)0x9a;
-        body[body_len - 1] = (char)0x80;
+    if (body_len >= sizeof(rocket_utf8)) {
+        memcpy(body + body_len - sizeof(rocket_utf8), rocket_utf8, sizeof(rocket_utf8));
     }
     body[body_len] = '\0';
     return body;

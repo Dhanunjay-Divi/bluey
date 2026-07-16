@@ -229,15 +229,15 @@ jobs:
             Copy-Item "target/${{ matrix.target }}/release/cue.exe" staging/bin/bluey.exe
           }
           # Native helpers
-          Copy-Item native/windows/cue-overlay/build/bluey-overlay.exe staging/bin/ -ErrorAction SilentlyContinue
-          Copy-Item native/windows/cue-overlay/build/cue-overlay.exe staging/bin/ -ErrorAction SilentlyContinue
-          Copy-Item native/windows/cue-overlay/build/hostovb.exe staging/bin/ -ErrorAction SilentlyContinue
-          Copy-Item native/windows/cue-overlay/build/host-overlay.exe staging/bin/ -ErrorAction SilentlyContinue
-          Copy-Item native/windows/cue-audio/build/bluey-audio.exe staging/bin/ -ErrorAction SilentlyContinue
-          Copy-Item native/windows/cue-audio/build/cue-audio.exe staging/bin/ -ErrorAction SilentlyContinue
-          Copy-Item native/windows/cue-audio/build/adriverb.exe staging/bin/ -ErrorAction SilentlyContinue
-          Copy-Item native/windows/cue-audio/build/audio-driver.exe staging/bin/ -ErrorAction SilentlyContinue
-          Copy-Item native/windows/cue-whisper/cue-whisper.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-overlay/build/bluey-overlay.exe staging/bin/
+          Copy-Item native/windows/cue-overlay/build/cue-overlay.exe staging/bin/
+          Copy-Item native/windows/cue-overlay/build/hostovb.exe staging/bin/
+          Copy-Item native/windows/cue-overlay/build/host-overlay.exe staging/bin/
+          Copy-Item native/windows/cue-audio/build/bluey-audio.exe staging/bin/
+          Copy-Item native/windows/cue-audio/build/cue-audio.exe staging/bin/
+          Copy-Item native/windows/cue-audio/build/adriverb.exe staging/bin/
+          Copy-Item native/windows/cue-audio/build/audio-driver.exe staging/bin/
+          Copy-Item native/windows/cue-whisper/cue-whisper.exe staging/bin/
           Compress-Archive -Path staging/* -DestinationPath "bluey-${VERSION}-${{ matrix.platform }}.zip"
 
       - name: Compute SHA256

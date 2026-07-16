@@ -88,6 +88,18 @@ No remaining non-Sashreek branch is safe or useful to merge wholesale:
 - The click actions are disabled immediately after authentication so signed-in
   header dragging remains unchanged.
 
+### Windows Release Integrity
+
+- The native overlay protocol fixture now writes UTF-8 test bytes without
+  implementation-defined signed-character casts, so strict MSVC `/WX` builds
+  remain portable.
+- The top-level Windows packager no longer suppresses native helper output or
+  ignores failed child-process exit codes.
+- Packaging now verifies every required overlay, audio, speech, daemon, and
+  stable process-identity artifact before creating the release archive.
+- The GitHub release workflow also fails closed when a required Windows helper
+  is absent instead of publishing a partial package.
+
 ## Verification Before Commit
 
 - Full root workspace tests passed.
@@ -98,6 +110,9 @@ No remaining non-Sashreek branch is safe or useful to merge wholesale:
 - macOS overlay parsed successfully with `swiftc`.
 - Release hygiene scan passed all clean and rejection self-tests.
 - Shell syntax, Rust formatting, whitespace, and `git diff --check` passed.
+- A clean Windows builder completed the full `scripts/build-windows.ps1` path:
+  Rust release binaries, overlay protocol tests, native overlay, audio driver,
+  local speech helper, alias verification, and ZIP packaging.
 - The release secret/dev-flag scan is rerun against the staged artifacts before
   publish.
 
