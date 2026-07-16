@@ -710,6 +710,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .resume-dropzone:hover { border-color: var(--accent); background: var(--accent-soft); }
 .resume-dropzone strong { color: var(--text); font-size: 12px; }
 .resume-dropzone span { color: var(--muted); font-size: 10px; }
+.resume-import-summary { margin: -8px 0 20px; padding: 11px 12px; display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 9px; align-items: start; border: 1px solid color-mix(in srgb, var(--green) 42%, var(--border)); border-radius: 7px; background: color-mix(in srgb, var(--green) 8%, var(--surface-2)); color: var(--green); }
+.resume-import-summary > div { min-width: 0; display: grid; gap: 3px; }
+.resume-import-summary b { color: var(--text); font-size: 11px; }
+.resume-import-summary span { color: var(--text-soft); font-size: 10px; }
+.resume-import-summary small { color: var(--muted); font-size: 9px; line-height: 1.45; }
 .onboarding-start-choice { margin-bottom: 12px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .onboarding-start-choice > button { min-height: 64px; padding: 11px; display: flex; align-items: center; gap: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); color: var(--muted); text-align: left; }
 .onboarding-start-choice > button.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
@@ -773,6 +778,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .setup-review b { font-size: 11px; }
 .setup-review small { color: var(--muted); font-size: 9px; }
 .inline-error { margin-top: 15px; padding: 10px 12px; border: 1px solid; border-radius: 7px; font-size: 11px; }
+.setup-repair-actions { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 7px; }
 .setup-actions { margin-top: auto; padding-top: 24px; display: flex; justify-content: space-between; }
 
 .jobs-entry { min-height: 100vh; background: var(--bg); }

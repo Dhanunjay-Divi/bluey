@@ -593,6 +593,21 @@ export const previewWorkspace: JobsWorkspace = {
 };
 
 export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: string): JobsWorkspace {
+  if (scenario === "onboarding") {
+    return {
+      ...workspace,
+      profile: {
+        ...workspace.profile,
+        onboarding_step: 0,
+        onboarding_complete: false,
+      },
+      tracks: [],
+      matches: [],
+      applications: [],
+      browser_sessions: [],
+      interventions: [],
+    };
+  }
   if (scenario !== "final-review") return workspace;
 
   const title = "Review the Greenhouse application";
