@@ -46,6 +46,7 @@ const MAX_RECEIPT_EVIDENCE_BYTES: usize = 40 * 1024 * 1024;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/jobs/workspace", get(workspace))
+        .route("/api/jobs/onboarding/complete", post(complete_onboarding))
         .route("/api/jobs/profile", get(profile).put(save_profile))
         .route("/api/jobs/facts", get(facts).post(save_fact))
         .route("/api/jobs/facts/:fact_id", delete(delete_fact))
@@ -274,6 +275,40 @@ pub async fn save_profile(
         .map_err(internal)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteOnboardingRequest {
+    pub profile: CareerProfile,
+    pub preferences: JobPreferences,
+    pub track: CareerTrack,
+}
+
+pub async fn complete_onboarding(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(mut input): Json<CompleteOnboardingRequest>,
+) -> Result<Json<JobsWorkspace>, ApiError> {
+    input.profile.email = account.email.clone();
+    input.profile.onboarding_step = 6;
+    input.profile.onboarding_complete = true;
+    validate_profile(&input.profile)?;
+    validate_preferences(&input.preferences)?;
+    validate_track(&input.track)?;
+
+    let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
+    let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
+    enforce_track_limit(&input.track, &current, &entitlement)?;
+
+    jobs::save_preferences(&state.pool, &account.id, &input.preferences).map_err(internal)?;
+    jobs::upsert_track(&state.pool, &account.id, &input.track).map_err(internal)?;
+    // Persist completion last. Retrying after any earlier write is idempotent,
+    // while a partial request can never make the portal skip onboarding.
+    jobs::save_profile(&state.pool, &account.id, &input.profile).map_err(internal)?;
+    jobs::workspace(&state.pool, &account.id, &account.email)
+        .map(Json)
+        .map_err(internal)
+}
+
 pub async fn facts(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -366,17 +401,7 @@ pub async fn save_track(
     validate_track(&track)?;
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
     let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
-    if track.id.is_empty()
-        && current.iter().filter(|item| item.active).count() as i64 >= entitlement.track_limit
-    {
-        return Err((
-            StatusCode::PAYMENT_REQUIRED,
-            format!(
-                "Your {} plan includes {} Career Track Agent(s).",
-                entitlement.plan, entitlement.track_limit
-            ),
-        ));
-    }
+    enforce_track_limit(&track, &current, &entitlement)?;
     jobs::upsert_track(&state.pool, &account.id, &track)
         .map(Json)
         .map_err(internal)
@@ -390,6 +415,10 @@ pub async fn update_track(
 ) -> Result<Json<CareerTrack>, ApiError> {
     track.id = track_id;
     validate_track(&track)?;
+    let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
+    if !current.iter().any(|item| item.id == track.id) {
+        return Err((StatusCode::NOT_FOUND, "Career Track not found.".to_string()));
+    }
     jobs::upsert_track(&state.pool, &account.id, &track)
         .map(Json)
         .map_err(internal)
@@ -3676,6 +3705,25 @@ fn validate_track(track: &CareerTrack) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn enforce_track_limit(
+    track: &CareerTrack,
+    current: &[CareerTrack],
+    entitlement: &JobsEntitlement,
+) -> Result<(), ApiError> {
+    let is_new = track.id.is_empty() || !current.iter().any(|item| item.id == track.id);
+    let active_tracks = current.iter().filter(|item| item.active).count() as i64;
+    if is_new && track.active && active_tracks >= entitlement.track_limit {
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            format!(
+                "Your {} plan includes {} Career Track Agent(s).",
+                entitlement.plan, entitlement.track_limit
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_posting(posting: &JobPosting) -> Result<(), ApiError> {
     if posting.company.trim().is_empty() || posting.title.trim().is_empty() {
         return bad_request("Add the company and role for this job.");
@@ -3973,6 +4021,59 @@ fn internal(error: anyhow::Error) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_entitlement(track_limit: i64) -> JobsEntitlement {
+        JobsEntitlement {
+            plan: "free".to_string(),
+            track_limit,
+            monthly_packet_limit: 5,
+            used_packets: 0,
+            period_start_ms: 0,
+            period_end_ms: 0,
+            local_browser: false,
+            cloud_browser: false,
+            overage_cents: 50,
+            monthly_price_cents: 0,
+            application_identity_limit: 2,
+            connected_inbox_limit: 1,
+            additional_inbox_cents: 500,
+        }
+    }
+
+    fn test_track(id: &str) -> CareerTrack {
+        CareerTrack {
+            id: id.to_string(),
+            name: "Software engineering".to_string(),
+            role: "Software Engineer".to_string(),
+            locations: vec!["Austin, TX".to_string()],
+            remote_preference: "hybrid_ok".to_string(),
+            application_identity_id: None,
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn client_supplied_track_id_cannot_bypass_plan_limit() {
+        let current = vec![test_track("existing-track")];
+        let error =
+            enforce_track_limit(&test_track("new-client-id"), &current, &test_entitlement(1))
+                .unwrap_err();
+        assert_eq!(error.0, StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[test]
+    fn retrying_the_same_onboarding_track_is_idempotent() {
+        let current = vec![test_track("stable-onboarding-track")];
+        enforce_track_limit(
+            &test_track("stable-onboarding-track"),
+            &current,
+            &test_entitlement(1),
+        )
+        .unwrap();
+    }
 
     fn strict_receipt_fixture() -> (
         JobApplication,

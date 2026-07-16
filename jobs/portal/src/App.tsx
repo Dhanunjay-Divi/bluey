@@ -88,16 +88,49 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  const saveOnboardingProgress = useCallback(
+    async (profile: CareerProfile, preferences: JobPreferences) => {
+      setError("");
+      const localizedPreferences = {
+        ...preferences,
+        time_zone_offset_minutes: -new Date().getTimezoneOffset(),
+      };
+      if (isPreview) {
+        setWorkspace((current) =>
+          current ? { ...current, profile, preferences: localizedPreferences } : current,
+        );
+        return;
+      }
+      try {
+        const [savedProfile, savedPreferences] = await Promise.all([
+          jobsApi.saveProfile(profile),
+          jobsApi.savePreferences(localizedPreferences),
+        ]);
+        setWorkspace((current) =>
+          current ? { ...current, profile: savedProfile, preferences: savedPreferences } : current,
+        );
+      } catch (requestError) {
+        setError(requestError instanceof Error ? requestError.message : "Could not save setup progress.");
+        throw requestError;
+      }
+    },
+    [],
+  );
+
   const saveOnboarding = useCallback(
     async (profile: CareerProfile, preferences: JobPreferences, track: CareerTrack) => {
       setError("");
+      const localizedPreferences = {
+        ...preferences,
+        time_zone_offset_minutes: -new Date().getTimezoneOffset(),
+      };
       if (isPreview) {
         setWorkspace((current) =>
           current
             ? {
                 ...current,
                 profile,
-                preferences,
+                preferences: localizedPreferences,
                 tracks: current.tracks.some((item) => item.id === track.id)
                   ? current.tracks.map((item) => (item.id === track.id ? track : item))
                   : [track, ...current.tracks],
@@ -108,21 +141,12 @@ export default function App() {
         return;
       }
       try {
-        const [savedProfile, savedPreferences, savedTrack] = await Promise.all([
-          jobsApi.saveProfile(profile),
-          jobsApi.savePreferences(preferences),
-          jobsApi.saveTrack(track),
-        ]);
-        setWorkspace((current) =>
-          current
-            ? {
-                ...current,
-                profile: savedProfile,
-                preferences: savedPreferences,
-                tracks: [savedTrack, ...current.tracks.filter((item) => item.id !== savedTrack.id)],
-              }
-            : current,
+        const completedWorkspace = await jobsApi.completeOnboarding(
+          profile,
+          localizedPreferences,
+          track,
         );
+        setWorkspace(completedWorkspace);
         setToast("Career Profile ready. Bluey is finding your first matches.");
         navigate("/matches");
       } catch (requestError) {
@@ -552,7 +576,14 @@ export default function App() {
   if (loading && !workspace) return <LoadingScreen />;
   if (!workspace) return <LoadError message={error} onRetry={refresh} />;
   if (!workspace.profile.onboarding_complete) {
-    return <Onboarding workspace={workspace} error={error} onComplete={saveOnboarding} />;
+    return (
+      <Onboarding
+        workspace={workspace}
+        error={error}
+        onProgress={saveOnboardingProgress}
+        onComplete={saveOnboarding}
+      />
+    );
   }
 
   return (

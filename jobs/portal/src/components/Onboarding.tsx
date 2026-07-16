@@ -23,13 +23,19 @@ import type {
   JobPreferences,
   JobsWorkspace,
 } from "../types";
-import { importResume, inferProfileFromResume } from "../lib/documents";
+import {
+  importResume,
+  inferProfileFromResume,
+  summarizeResumeImport,
+  type ResumeImportSummary,
+} from "../lib/documents";
 import blueyIcon from "../../../../web/assets/bluey-logo.svg";
 import blueyWordmark from "../../../../web/assets/bluey-wordmark.svg";
 
 interface Props {
   workspace: JobsWorkspace;
   error: string;
+  onProgress(profile: CareerProfile, preferences: JobPreferences): Promise<void>;
   onComplete(profile: CareerProfile, preferences: JobPreferences, track: CareerTrack): Promise<void>;
 }
 
@@ -42,7 +48,7 @@ const steps = [
   { label: "Ready", icon: Check },
 ];
 
-export function Onboarding({ workspace, error, onComplete }: Props) {
+export function Onboarding({ workspace, error, onProgress, onComplete }: Props) {
   const [step, setStep] = useState(Math.min(workspace.profile.onboarding_step || 0, steps.length - 1));
   const [profile, setProfile] = useState<CareerProfile>(workspace.profile);
   const [preferences, setPreferences] = useState<JobPreferences>(workspace.preferences);
@@ -50,13 +56,17 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
   const [importing, setImporting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [validation, setValidation] = useState("");
+  const [importSummary, setImportSummary] = useState<ResumeImportSummary | null>(
+    workspace.profile.source_resume_name ? summarizeResumeImport(workspace.profile) : null,
+  );
   const [resumeStart, setResumeStart] = useState<"import" | "build">("import");
   const fileRef = useRef<HTMLInputElement>(null);
+  const trackId = useRef(workspace.tracks[0]?.id || "onboarding-primary-track");
 
   const progress = ((step + 1) / steps.length) * 100;
   const track = useMemo<CareerTrack>(
     () => ({
-      id: workspace.tracks[0]?.id || "",
+      id: trackId.current,
       name: preferences.desired_roles[0] || "Primary search",
       role: preferences.desired_roles[0] || profile.headline,
       locations: preferences.desired_locations,
@@ -80,7 +90,11 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
     setValidation("");
     try {
       const imported = await importResume(file);
-      setProfile((current) => inferProfileFromResume(current, imported));
+      setProfile((current) => {
+        const inferred = inferProfileFromResume(current, imported);
+        setImportSummary(summarizeResumeImport(inferred));
+        return inferred;
+      });
     } catch (fileError) {
       setValidation(fileError instanceof Error ? fileError.message : "That resume could not be read.");
     } finally {
@@ -88,28 +102,44 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
     }
   };
 
-  const next = () => {
+  const moveToStep = async (nextStep: number) => {
+    const boundedStep = Math.max(0, Math.min(nextStep, steps.length - 1));
+    const nextProfile = {
+      ...profile,
+      onboarding_step: boundedStep,
+      onboarding_complete: false,
+    };
+    setSaving(true);
+    setValidation("");
+    try {
+      await onProgress(nextProfile, preferences);
+      setProfile(nextProfile);
+      setStep(boundedStep);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch {
+      // App owns the request error shown below the active step.
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const next = async () => {
     const message = validateStep(step, profile, preferences);
     if (message) {
       setValidation(message);
       return;
     }
-    setValidation("");
-    setProfile((current) => ({ ...current, onboarding_step: Math.min(step + 1, steps.length - 1) }));
-    setStep((current) => Math.min(current + 1, steps.length - 1));
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    await moveToStep(step + 1);
   };
 
   const finish = async () => {
     if (profile.employment.length === 0 && profile.education.length === 0) {
-      setValidation("Add at least one role or education entry before launching your first Career Track.");
-      setStep(1);
+      setValidation("Bluey could not confirm a role or education entry. Review either section before launching your first Career Track.");
       return;
     }
     const message = validateStep(3, profile, preferences);
     if (message) {
       setValidation(message);
-      setStep(3);
       return;
     }
     setSaving(true);
@@ -172,8 +202,23 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
               {resumeStart === "import" ? <button className="resume-dropzone" onClick={() => fileRef.current?.click()}>
                 {importing ? <LoaderCircle className="spin" /> : <FileUp />}
                 <strong>{profile.source_resume_name || "Choose PDF, DOCX, or TXT"}</strong>
-                <span>{profile.source_resume_name ? "Resume imported. Choose another file to replace it." : "Bluey extracts a baseline you can edit before anything is prepared."}</span>
+                <span>{profile.source_resume_name ? "Resume imported. Existing edits stay in place if you choose another file." : "Bluey extracts a baseline you can edit before anything is prepared."}</span>
               </button> : <div className="no-resume-note"><Sparkles size={18} /><span><b>Start with the facts you know</b><small>Add roles, education, and skills in the next steps. Bluey builds the first resume from that profile.</small></span></div>}
+              {importSummary && (
+                <div className="resume-import-summary" aria-live="polite">
+                  <Check size={17} />
+                  <div>
+                    <b>Baseline extracted</b>
+                    <span>
+                      {importSummary.employment} role{importSummary.employment === 1 ? "" : "s"} ·{" "}
+                      {importSummary.education} school{importSummary.education === 1 ? "" : "s"} ·{" "}
+                      {importSummary.skills} skill{importSummary.skills === 1 ? "" : "s"} ·{" "}
+                      {importSummary.projects} project{importSummary.projects === 1 ? "" : "s"}
+                    </span>
+                    <small>Review the next sections. Bluey never submits the imported draft by itself.</small>
+                  </div>
+                </div>
+              )}
               <div className="form-grid two">
                 <Field label="Full name" value={profile.full_name} onChange={(value) => update("full_name", value)} autoFocus />
                 <Field label="Phone" value={profile.phone} onChange={(value) => update("phone", value)} />
@@ -303,10 +348,16 @@ export function Onboarding({ workspace, error, onComplete }: Props) {
           )}
 
           {(validation || error) && <div className="inline-error">{validation || error}</div>}
+          {step === steps.length - 1 && profile.employment.length === 0 && profile.education.length === 0 && validation && (
+            <div className="setup-repair-actions">
+              <button className="button secondary compact" disabled={saving} onClick={() => void moveToStep(1)}>Review experience</button>
+              <button className="button secondary compact" disabled={saving} onClick={() => void moveToStep(2)}>Review education</button>
+            </div>
+          )}
           <div className="setup-actions">
-            <button className="button ghost" disabled={step === 0 || saving} onClick={() => setStep((current) => current - 1)}><ArrowLeft size={16} />Back</button>
+            <button className="button ghost" disabled={step === 0 || saving} onClick={() => void moveToStep(step - 1)}><ArrowLeft size={16} />Back</button>
             {step < steps.length - 1 ? (
-              <button className="button primary" onClick={next}>Continue<ArrowRight size={16} /></button>
+              <button className="button primary" disabled={saving} onClick={() => void next()}>{saving ? <LoaderCircle className="spin" size={16} /> : null}Continue<ArrowRight size={16} /></button>
             ) : (
               <button className="button primary" disabled={saving} onClick={() => void finish()}>{saving ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}Find my matches</button>
             )}

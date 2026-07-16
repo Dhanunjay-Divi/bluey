@@ -148,6 +148,11 @@ async function request<T>(path: string, init: RequestInit = {}, retried = false)
 export const jobsApi = {
   workspace: () => request<JobsWorkspace>("/api/jobs/workspace"),
   account: () => request<AccountSummary>("/account/me"),
+  completeOnboarding: (profile: CareerProfile, preferences: JobPreferences, track: CareerTrack) =>
+    request<JobsWorkspace>("/api/jobs/onboarding/complete", {
+      method: "POST",
+      body: JSON.stringify({ profile, preferences, track }),
+    }),
   prepareInterview: (applicationId: string) =>
     request<InterviewPrepCompletionResponse>(`/api/jobs/applications/${encodeURIComponent(applicationId)}/interview-prep`, {
       method: "POST",
