@@ -4,7 +4,7 @@
 //! this module tries the managed cloud. Sync batches are idempotent and small
 //! enough for the server's request limits, so retries are safe.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -21,8 +21,9 @@ use cue_core::{
     ConversationTurn, CueCardArtifact, MeetingDiagnostics, MeetingRecord, Speaker,
     TranscriptSegment,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -41,6 +42,8 @@ const DEFAULT_AUDIT_LOCAL_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const SESSION_AUDIT_DIR: &str = "session-audit";
 const SESSION_AUDIT_EVENTS_DIR: &str = "session-audit-events";
 const SESSION_AUDIT_UPLOADED_DIR: &str = "session-audit-uploaded";
+const CLOUD_SYNC_STATE_DIR: &str = "cloud-sync-state";
+const CLOUD_SYNC_STATE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 struct SyncedObjectMetadata {
@@ -49,6 +52,56 @@ struct SyncedObjectMetadata {
     sha256: String,
     content_type: String,
     expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloudSyncState {
+    schema_version: u32,
+    remote_session_id: String,
+    #[serde(default = "empty_metadata")]
+    session_metadata: Value,
+    #[serde(default)]
+    transcript_segments: BTreeMap<String, CloudTranscriptState>,
+    #[serde(default)]
+    context_artifacts: BTreeMap<String, CloudContextState>,
+    #[serde(default)]
+    responses: BTreeMap<String, CloudResponseState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloudTranscriptState {
+    record_id: String,
+    speaker: String,
+    source: String,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    ts_ms: i64,
+    #[serde(default = "empty_metadata")]
+    metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloudContextState {
+    record_id: String,
+    source_uri: Option<String>,
+    content_hash: Option<String>,
+    #[serde(default = "empty_metadata")]
+    metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloudResponseState {
+    record_id: String,
+    kind: String,
+    ts_ms: i64,
+    model: Option<String>,
+    lane: Option<String>,
+    task_type: Option<String>,
+    cost_cents: Option<i64>,
+    balance_cents_after: Option<i64>,
+    cost_label: Option<String>,
+    #[serde(default = "empty_metadata")]
+    metadata: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -305,8 +358,10 @@ pub async fn sync_local_meetings(
     }
 
     let response_map = load_local_responses(data_dir, &meetings);
-    let uploaded_objects = upload_context_objects(data_dir, &meetings, client).await;
-    let batches = build_sync_batches(&meetings, &response_map, &uploaded_objects);
+    let sync_states = load_cloud_sync_states(data_dir, &meetings);
+    let uploaded_objects = upload_context_objects(data_dir, &meetings, &sync_states, client).await;
+    let batches =
+        build_sync_batches_with_states(&meetings, &response_map, &uploaded_objects, &sync_states);
     if batches.is_empty() {
         return Ok(LocalSyncSummary::empty());
     }
@@ -336,10 +391,7 @@ pub async fn hydrate_missing_cloud_meetings(
         .context("list cloud sessions")?;
     let mut summary = CloudHydrationSummary::default();
     for deleted in response.deleted_sessions {
-        let Ok(session_id) = Uuid::parse_str(&deleted.session_id) else {
-            summary.skipped_sessions += 1;
-            continue;
-        };
+        let session_id = local_uuid_for_cloud_id("session", "account-session", &deleted.session_id);
         let Some(local_meeting) = store.load_by_id(session_id)? else {
             continue;
         };
@@ -349,6 +401,16 @@ pub async fn hydrate_missing_cloud_meetings(
         }
         remove_bluey_owned_context_files(data_dir, &local_meeting);
         if store.delete(session_id)? {
+            let state_path = cloud_sync_state_path(data_dir, session_id);
+            if let Err(error) = fs::remove_file(&state_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    debug!(
+                        path = %state_path.display(),
+                        error = %error,
+                        "cloud-delete cleanup could not remove sync state"
+                    );
+                }
+            }
             summary.purged_deleted_sessions += 1;
         }
     }
@@ -358,11 +420,12 @@ pub async fn hydrate_missing_cloud_meetings(
     }
 
     for session in response.sessions {
-        let Ok(session_id) = Uuid::parse_str(&session.session_id) else {
-            summary.skipped_sessions += 1;
-            continue;
-        };
-        if store.load_by_id(session_id)?.is_some() {
+        let session_id = local_uuid_for_cloud_id("session", "account-session", &session.session_id);
+        let existing = store.load_by_id(session_id)?;
+        if existing
+            .as_ref()
+            .is_some_and(|meeting| !meeting_belongs_to_owner(meeting, owner_account_id))
+        {
             summary.skipped_sessions += 1;
             continue;
         }
@@ -371,12 +434,260 @@ pub async fn hydrate_missing_cloud_meetings(
             .load_cloud_session(&session.session_id)
             .await
             .with_context(|| format!("load cloud session {}", session.session_id))?;
-        let mut meeting = meeting_from_cloud_bundle(data_dir, Some(client), bundle).await?;
-        meeting.owner_account_id = owner_account_id.map(ToString::to_string);
-        store.save_archived(&meeting)?;
+        if bundle.session.session_id != session.session_id {
+            anyhow::bail!(
+                "cloud session list/bundle identity mismatch: expected {}, got {}",
+                session.session_id,
+                bundle.session.session_id
+            );
+        }
+        let mut cloud_meeting = meeting_from_cloud_bundle(data_dir, Some(client), bundle).await?;
+        cloud_meeting.owner_account_id = owner_account_id.map(ToString::to_string);
+        if !meeting_has_syncable_content(&cloud_meeting, None) {
+            summary.skipped_sessions += 1;
+            continue;
+        }
+
+        if let Some(existing) = existing {
+            let active = store
+                .load_active()?
+                .is_some_and(|meeting| meeting.id == existing.id);
+            let (meeting, changed) = reconcile_cloud_meeting(existing, cloud_meeting)?;
+            if !changed {
+                summary.skipped_sessions += 1;
+                continue;
+            }
+            if active {
+                store.save_active(&meeting)?;
+            } else {
+                store.save_archived(&meeting)?;
+            }
+        } else {
+            store.save_archived(&cloud_meeting)?;
+        }
         summary.restored_sessions += 1;
     }
     Ok(summary)
+}
+
+fn reconcile_cloud_meeting(
+    mut local: MeetingRecord,
+    cloud: MeetingRecord,
+) -> Result<(MeetingRecord, bool)> {
+    if local.id != cloud.id {
+        anyhow::bail!(
+            "cannot reconcile cloud session {} into local session {}",
+            cloud.id,
+            local.id
+        );
+    }
+    let before = serde_json::to_value(&local)?;
+    let local_was_shell = !meeting_has_syncable_content(&local, None);
+
+    if local_was_shell || session_title_is_placeholder(&local.title) {
+        local.title = cloud.title;
+    }
+    if parse_ms(&local.started_at) <= 0 {
+        local.started_at = cloud.started_at;
+    }
+    if local_was_shell && local.ended_at.is_none() {
+        local.ended_at = cloud.ended_at;
+    }
+    if local
+        .answer_instructions
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        local.answer_instructions = cloud.answer_instructions;
+    }
+    if local
+        .summary
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        local.summary = cloud.summary;
+    }
+
+    let mut transcript_by_id = local
+        .transcript
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| (segment.id, index))
+        .collect::<HashMap<_, _>>();
+    for cloud_segment in cloud.transcript {
+        if let Some(index) = transcript_by_id.get(&cloud_segment.id).copied() {
+            let segment = &mut local.transcript[index];
+            if segment.text.trim().is_empty() {
+                segment.text = cloud_segment.text;
+            }
+            if matches!(segment.speaker, Speaker::Unknown)
+                && !matches!(cloud_segment.speaker, Speaker::Unknown)
+            {
+                segment.speaker = cloud_segment.speaker;
+            }
+            if parse_ms(&segment.created_at) <= 0 {
+                segment.created_at = cloud_segment.created_at;
+            }
+            segment.is_final |= cloud_segment.is_final;
+        } else {
+            let index = local.transcript.len();
+            transcript_by_id.insert(cloud_segment.id, index);
+            local.transcript.push(cloud_segment);
+        }
+    }
+
+    let mut context_by_id = local
+        .context
+        .iter()
+        .enumerate()
+        .map(|(index, artifact)| (artifact.id, index))
+        .collect::<HashMap<_, _>>();
+    for cloud_artifact in cloud.context {
+        if let Some(index) = context_by_id.get(&cloud_artifact.id).copied() {
+            merge_missing_context_fields(&mut local.context[index], cloud_artifact);
+        } else {
+            let index = local.context.len();
+            context_by_id.insert(cloud_artifact.id, index);
+            local.context.push(cloud_artifact);
+        }
+    }
+
+    let mut conversation_by_id = local
+        .conversation
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| (turn.id, index))
+        .collect::<HashMap<_, _>>();
+    for cloud_turn in cloud.conversation {
+        if let Some(index) = conversation_by_id.get(&cloud_turn.id).copied() {
+            merge_missing_turn_fields(&mut local.conversation[index], cloud_turn);
+        } else {
+            let index = local.conversation.len();
+            conversation_by_id.insert(cloud_turn.id, index);
+            local.conversation.push(cloud_turn);
+        }
+    }
+
+    merge_diagnostics(&mut local.diagnostics, cloud.diagnostics);
+    if local_was_shell {
+        local.live_answer_transcript_cursor = local.transcript.len();
+    } else {
+        local.live_answer_transcript_cursor = local
+            .live_answer_transcript_cursor
+            .min(local.transcript.len());
+    }
+    let changed = before != serde_json::to_value(&local)?;
+    Ok((local, changed))
+}
+
+fn merge_missing_context_fields(local: &mut ContextArtifact, cloud: ContextArtifact) {
+    if local.path.trim().is_empty() {
+        local.path = cloud.path;
+    }
+    if local.title.trim().is_empty() {
+        local.title = cloud.title;
+    }
+    if local
+        .note
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        local.note = cloud.note;
+    }
+    if local.size_bytes.is_none() {
+        local.size_bytes = cloud.size_bytes;
+    }
+    if local
+        .text_preview
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        local.text_preview = cloud.text_preview;
+    }
+    if local
+        .markdown_path
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        local.markdown_path = cloud.markdown_path;
+    }
+    if matches!(local.processing_status, ContextProcessingStatus::Pending) {
+        local.processing_status = cloud.processing_status;
+    }
+    if local.processing_error.is_none() {
+        local.processing_error = cloud.processing_error;
+    }
+    if parse_ms(&local.created_at) <= 0 {
+        local.created_at = cloud.created_at;
+    }
+    if parse_ms(&cloud.updated_at) > parse_ms(&local.updated_at) {
+        local.updated_at = cloud.updated_at;
+    }
+}
+
+fn merge_missing_turn_fields(local: &mut ConversationTurn, cloud: ConversationTurn) {
+    if local.question.trim().is_empty() {
+        local.question = cloud.question;
+    }
+    if local.answer.trim().is_empty() {
+        local.answer = cloud.answer;
+    }
+    let mut attachment_ids = local.attachment_ids.iter().copied().collect::<HashSet<_>>();
+    for attachment_id in cloud.attachment_ids {
+        if attachment_ids.insert(attachment_id) {
+            local.attachment_ids.push(attachment_id);
+        }
+    }
+    if local.artifact.is_none() {
+        local.artifact = cloud.artifact;
+    }
+    if local
+        .source
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        local.source = cloud.source;
+    }
+    if local
+        .provider
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        local.provider = cloud.provider;
+    }
+    if parse_ms(&local.created_at) <= 0 {
+        local.created_at = cloud.created_at;
+    }
+}
+
+fn merge_diagnostics(local: &mut MeetingDiagnostics, cloud: MeetingDiagnostics) {
+    local.listen_runs = local.listen_runs.max(cloud.listen_runs);
+    local.stt_parse_errors = local.stt_parse_errors.max(cloud.stt_parse_errors);
+    local.stt_provider_errors = local.stt_provider_errors.max(cloud.stt_provider_errors);
+    local.audio_start_errors = local.audio_start_errors.max(cloud.audio_start_errors);
+    local.audio_source_errors = local.audio_source_errors.max(cloud.audio_source_errors);
+    if local.last_audio_session_id.is_none() {
+        local.last_audio_session_id = cloud.last_audio_session_id;
+    }
+    if local.last_stt_provider.is_none() {
+        local.last_stt_provider = cloud.last_stt_provider;
+    }
+    if local.last_error_kind.is_none() {
+        local.last_error_kind = cloud.last_error_kind;
+    }
+    if local.last_error_message.is_none() {
+        local.last_error_message = cloud.last_error_message;
+    }
+    if local.last_error_at.is_none() {
+        local.last_error_at = cloud.last_error_at;
+    }
+}
+
+fn session_title_is_placeholder(title: &str) -> bool {
+    matches!(
+        title.trim().to_ascii_lowercase().as_str(),
+        "" | "new recording" | "untitled session" | "untitled"
+    )
 }
 
 fn meeting_belongs_to_owner(meeting: &MeetingRecord, owner_account_id: Option<&str>) -> bool {
@@ -513,11 +824,13 @@ fn load_local_responses(
 async fn upload_context_objects(
     data_dir: &Path,
     meetings: &[MeetingRecord],
+    sync_states: &HashMap<Uuid, CloudSyncState>,
     client: &CloudClient,
 ) -> HashMap<Uuid, SyncedObjectMetadata> {
     let mut uploaded = HashMap::new();
     let mut seen = HashSet::new();
     for meeting in meetings {
+        let sync_state = sync_states.get(&meeting.id);
         for artifact in &meeting.context {
             if !seen.insert(artifact.id) {
                 continue;
@@ -541,9 +854,20 @@ async fn upload_context_objects(
                 continue;
             }
             let content_type = content_type_for_path(&path);
+            let artifact_id = wire_context_artifact_id(meeting, artifact.id, sync_state);
+            if Uuid::parse_str(&artifact_id).is_err() {
+                // The object endpoint is UUID-keyed. Legacy non-UUID record IDs
+                // still round-trip through JSON sync, but their unavailable
+                // object bytes are intentionally not attached to a new ID.
+                debug!(
+                    artifact_id = %artifact_id,
+                    "cloud object sync skipped legacy non-UUID artifact id"
+                );
+                continue;
+            }
             match tokio::fs::read(&path).await {
                 Ok(bytes) => match client
-                    .upload_artifact_object(&artifact.id.to_string(), bytes, &content_type)
+                    .upload_artifact_object(&artifact_id, bytes, &content_type)
                     .await
                 {
                     Ok(response) => {
@@ -734,7 +1058,7 @@ fn assemble_session_audit_bundle(
     let session_code = short_session_code(meeting.id);
     let generated_at_ms = current_epoch_ms();
     let event_log_fingerprint = audit_event_log_fingerprint(data_dir, meeting.id);
-    let updated_at = updated_at_ms(meeting)
+    let updated_at = updated_at_ms(meeting, Some(responses))
         .max(
             event_log_fingerprint
                 .map(|(modified_ms, _)| modified_ms)
@@ -1368,6 +1692,141 @@ fn current_epoch_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn empty_metadata() -> Value {
+    json!({})
+}
+
+fn stable_entity_uuid(entity: &str, session_id: &str, source_id: &str) -> Uuid {
+    let mut hasher = Sha256::new();
+    for part in ["bluey-cloud-sync-v1", entity, session_id, source_id] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // UUIDv8 reserves this layout for application-defined deterministic IDs.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn local_uuid_for_cloud_id(entity: &str, session_id: &str, source_id: &str) -> Uuid {
+    Uuid::parse_str(source_id).unwrap_or_else(|_| stable_entity_uuid(entity, session_id, source_id))
+}
+
+fn local_turn_uuid(session_id: &str, response_id: &str) -> Uuid {
+    response_id
+        .strip_prefix("turn-")
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .or_else(|| Uuid::parse_str(response_id).ok())
+        .unwrap_or_else(|| stable_entity_uuid("turn", session_id, response_id))
+}
+
+fn stable_wire_record_id(entity: &str, session_id: &str, source_id: &str) -> String {
+    let trimmed = source_id.trim();
+    let valid = !trimmed.is_empty()
+        && trimmed.len() <= 192
+        && trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if valid {
+        trimmed.to_string()
+    } else {
+        stable_entity_uuid(entity, session_id, source_id).to_string()
+    }
+}
+
+fn cloud_sync_state_path(data_dir: &Path, session_id: Uuid) -> PathBuf {
+    data_dir
+        .join(CLOUD_SYNC_STATE_DIR)
+        .join(format!("{session_id}.json"))
+}
+
+fn load_cloud_sync_state(data_dir: &Path, session_id: Uuid) -> Option<CloudSyncState> {
+    let path = cloud_sync_state_path(data_dir, session_id);
+    let bytes = fs::read(&path).ok()?;
+    match serde_json::from_slice::<CloudSyncState>(&bytes) {
+        Ok(state)
+            if state.schema_version == CLOUD_SYNC_STATE_SCHEMA_VERSION
+                && !state.remote_session_id.trim().is_empty() =>
+        {
+            Some(state)
+        }
+        Ok(_) => None,
+        Err(error) => {
+            debug!(
+                path = %path.display(),
+                error = %error,
+                "cloud sync state could not be read"
+            );
+            None
+        }
+    }
+}
+
+fn load_cloud_sync_states(
+    data_dir: &Path,
+    meetings: &[MeetingRecord],
+) -> HashMap<Uuid, CloudSyncState> {
+    meetings
+        .iter()
+        .filter_map(|meeting| {
+            load_cloud_sync_state(data_dir, meeting.id).map(|state| (meeting.id, state))
+        })
+        .collect()
+}
+
+fn write_cloud_sync_state(data_dir: &Path, session_id: Uuid, state: &CloudSyncState) -> Result<()> {
+    let dir = data_dir.join(CLOUD_SYNC_STATE_DIR);
+    cue_core::app_paths::create_private_dir(&dir)?;
+    write_json_file(&cloud_sync_state_path(data_dir, session_id), state)
+}
+
+fn wire_session_id(meeting: &MeetingRecord, state: Option<&CloudSyncState>) -> String {
+    state
+        .map(|state| state.remote_session_id.trim())
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| meeting.id.to_string())
+}
+
+fn wire_context_artifact_id(
+    meeting: &MeetingRecord,
+    artifact_id: Uuid,
+    state: Option<&CloudSyncState>,
+) -> String {
+    let session_id = wire_session_id(meeting, state);
+    state
+        .and_then(|state| state.context_artifacts.get(&artifact_id.to_string()))
+        .map(|record| stable_wire_record_id("context-artifact", &session_id, &record.record_id))
+        .unwrap_or_else(|| artifact_id.to_string())
+}
+
+fn wire_transcript_segment_id(
+    meeting: &MeetingRecord,
+    segment_id: Uuid,
+    state: Option<&CloudSyncState>,
+) -> String {
+    let session_id = wire_session_id(meeting, state);
+    state
+        .and_then(|state| state.transcript_segments.get(&segment_id.to_string()))
+        .map(|record| stable_wire_record_id("transcript-segment", &session_id, &record.record_id))
+        .unwrap_or_else(|| segment_id.to_string())
+}
+
+fn merge_metadata(mut preserved: Value, current: Value) -> Value {
+    let Value::Object(current) = current else {
+        return preserved;
+    };
+    if !preserved.is_object() {
+        preserved = json!({});
+    }
+    let target = preserved.as_object_mut().expect("object initialized above");
+    target.extend(current);
+    preserved
+}
+
 fn artifact_object_path(data_dir: &Path, artifact: &ContextArtifact) -> Option<PathBuf> {
     let restored_preview_dir = data_dir.join("cloud-restored-context");
     let candidates = std::iter::once(Some(artifact.path.as_str()))
@@ -1418,16 +1877,26 @@ fn content_type_for_path(path: &Path) -> String {
     .to_string()
 }
 
+#[cfg(test)]
 fn build_sync_batches(
     meetings: &[MeetingRecord],
     response_map: &HashMap<String, Vec<crate::llm::CueResponse>>,
     uploaded_objects: &HashMap<Uuid, SyncedObjectMetadata>,
 ) -> Vec<SyncBatchRequest> {
+    build_sync_batches_with_states(meetings, response_map, uploaded_objects, &HashMap::new())
+}
+
+fn build_sync_batches_with_states(
+    meetings: &[MeetingRecord],
+    response_map: &HashMap<String, Vec<crate::llm::CueResponse>>,
+    uploaded_objects: &HashMap<Uuid, SyncedObjectMetadata>,
+    sync_states: &HashMap<Uuid, CloudSyncState>,
+) -> Vec<SyncBatchRequest> {
     let mut batches = Vec::new();
 
     for meeting in meetings {
-        let session_id = meeting.id.to_string();
-        let responses = response_map.get(&session_id);
+        let local_session_id = meeting.id.to_string();
+        let responses = response_map.get(&local_session_id);
         if !meeting_has_syncable_content(meeting, responses) {
             debug!(
                 session_id = %meeting.id,
@@ -1437,7 +1906,9 @@ fn build_sync_batches(
             continue;
         }
 
-        let session = session_record(meeting);
+        let sync_state = sync_states.get(&meeting.id);
+        let session_id = wire_session_id(meeting, sync_state);
+        let session = session_record(meeting, responses.map(Vec::as_slice), sync_state);
         let mut batch = SyncBatchRequest::default();
         batch.sessions.push(session.clone());
 
@@ -1447,10 +1918,10 @@ fn build_sync_batches(
             maybe_flush(&mut batches, &mut batch, &session);
             batch
                 .transcript_segments
-                .push(transcript_record(meeting, segment));
+                .push(transcript_record(meeting, segment, sync_state));
 
             if segment.is_final {
-                if let Some(chunk) = transcript_rag_chunk(meeting, segment) {
+                if let Some(chunk) = transcript_rag_chunk(meeting, segment, sync_state) {
                     maybe_flush(&mut batches, &mut batch, &session);
                     batch.rag_chunks.push(chunk);
                 }
@@ -1459,10 +1930,13 @@ fn build_sync_batches(
 
         for artifact in &meeting.context {
             maybe_flush(&mut batches, &mut batch, &session);
-            batch
-                .context_artifacts
-                .push(context_record(meeting, artifact, uploaded_objects));
-            if let Some(chunk) = context_rag_chunk(meeting, artifact) {
+            batch.context_artifacts.push(context_record(
+                meeting,
+                artifact,
+                uploaded_objects,
+                sync_state,
+            ));
+            if let Some(chunk) = context_rag_chunk(meeting, artifact, sync_state) {
                 maybe_flush(&mut batches, &mut batch, &session);
                 batch.rag_chunks.push(chunk);
             }
@@ -1471,17 +1945,17 @@ fn build_sync_batches(
         if let Some(summary) = meeting.summary.as_deref().and_then(truncate_nonempty) {
             maybe_flush(&mut batches, &mut batch, &session);
             batch.rag_chunks.push(SyncRagChunkRecord {
-                chunk_id: format!("{}:summary:0", meeting.id),
-                session_id: Some(meeting.id.to_string()),
+                chunk_id: format!("{session_id}:summary:0"),
+                session_id: Some(session_id.clone()),
                 source_kind: "summary".into(),
-                source_id: meeting.id.to_string(),
+                source_id: session_id.clone(),
                 chunk_index: 0,
                 text: summary,
                 embedding: None,
                 embedding_model: None,
                 token_count: None,
                 content_hash: None,
-                updated_at_ms: updated_at_ms(meeting),
+                updated_at_ms: updated_at_ms(meeting, responses.map(Vec::as_slice)),
                 metadata: json!({}),
             });
         }
@@ -1493,27 +1967,30 @@ fn build_sync_batches(
         {
             maybe_flush(&mut batches, &mut batch, &session);
             batch.rag_chunks.push(SyncRagChunkRecord {
-                chunk_id: format!("{}:instructions:0", meeting.id),
-                session_id: Some(meeting.id.to_string()),
+                chunk_id: format!("{session_id}:instructions:0"),
+                session_id: Some(session_id.clone()),
                 source_kind: "answer_instructions".into(),
-                source_id: meeting.id.to_string(),
+                source_id: session_id.clone(),
                 chunk_index: 0,
                 text: instructions,
                 embedding: None,
                 embedding_model: None,
                 token_count: None,
                 content_hash: None,
-                updated_at_ms: updated_at_ms(meeting),
+                updated_at_ms: updated_at_ms(meeting, responses.map(Vec::as_slice)),
                 metadata: json!({}),
             });
         }
 
         if let Some(responses) = responses {
             for response in responses {
-                seen_response_ids.insert(response.id.clone());
+                let response_record = cue_response_record(meeting, response, sync_state);
+                let response_id = response_record.response_id.clone();
+                seen_response_ids.insert(response_id.clone());
                 maybe_flush(&mut batches, &mut batch, &session);
-                batch.cue_responses.push(cue_response_record(response));
-                if let Some(chunk) = response_rag_chunk(meeting, response) {
+                batch.cue_responses.push(response_record);
+                if let Some(chunk) = response_rag_chunk(meeting, response, &response_id, sync_state)
+                {
                     maybe_flush(&mut batches, &mut batch, &session);
                     batch.rag_chunks.push(chunk);
                 }
@@ -1521,15 +1998,13 @@ fn build_sync_batches(
         }
 
         for turn in &meeting.conversation {
-            let fallback_id = format!("turn-{}", turn.id);
-            if seen_response_ids.contains(&fallback_id) {
+            let response_record = conversation_response_record(meeting, turn, sync_state);
+            if seen_response_ids.contains(&response_record.response_id) {
                 continue;
             }
             maybe_flush(&mut batches, &mut batch, &session);
-            batch
-                .cue_responses
-                .push(conversation_response_record(meeting, turn));
-            if let Some(chunk) = conversation_rag_chunk(meeting, turn) {
+            batch.cue_responses.push(response_record);
+            if let Some(chunk) = conversation_rag_chunk(meeting, turn, sync_state) {
                 maybe_flush(&mut batches, &mut batch, &session);
                 batch.rag_chunks.push(chunk);
             }
@@ -1562,12 +2037,48 @@ async fn meeting_from_cloud_bundle(
     client: Option<&CloudClient>,
     bundle: CloudSessionBundle,
 ) -> Result<MeetingRecord> {
-    let id = Uuid::parse_str(&bundle.session.session_id)
-        .with_context(|| format!("invalid cloud session id {}", bundle.session.session_id))?;
+    validate_cloud_bundle_parentage(&bundle)?;
+    let CloudSessionBundle {
+        session,
+        transcript_segments,
+        cue_responses,
+        context_artifacts,
+    } = bundle;
+    let remote_session_id = session.session_id.clone();
+    let id = local_uuid_for_cloud_id("session", "account-session", &remote_session_id);
+    let mut sync_state = CloudSyncState {
+        schema_version: CLOUD_SYNC_STATE_SCHEMA_VERSION,
+        remote_session_id: remote_session_id.clone(),
+        session_metadata: session.metadata.clone(),
+        transcript_segments: BTreeMap::new(),
+        context_artifacts: BTreeMap::new(),
+        responses: BTreeMap::new(),
+    };
+
     let mut transcript = Vec::new();
-    for segment in bundle.transcript_segments {
+    for segment in transcript_segments {
+        let local_id = local_uuid_for_cloud_id(
+            "transcript-segment",
+            &remote_session_id,
+            &segment.segment_id,
+        );
+        // MeetingRecord intentionally has no STT source/start/end fields. Keep
+        // those exact cloud values in the sync sidecar so a hydrate-upload
+        // cycle does not replace them with speaker-derived guesses.
+        sync_state.transcript_segments.insert(
+            local_id.to_string(),
+            CloudTranscriptState {
+                record_id: segment.segment_id.clone(),
+                speaker: segment.speaker.clone(),
+                source: segment.source.clone(),
+                start_ms: segment.start_ms,
+                end_ms: segment.end_ms,
+                ts_ms: segment.ts_ms,
+                metadata: segment.metadata.clone(),
+            },
+        );
         transcript.push(TranscriptSegment {
-            id: Uuid::parse_str(&segment.segment_id).unwrap_or_else(|_| Uuid::new_v4()),
+            id: local_id,
             speaker: speaker_from_cloud(&segment.speaker, &segment.source),
             text: segment.text,
             created_at: segment.ts_ms.to_string(),
@@ -1576,27 +2087,57 @@ async fn meeting_from_cloud_bundle(
     }
 
     let mut context = Vec::new();
-    for artifact in bundle.context_artifacts {
-        context.push(context_artifact_from_cloud(data_dir, client, artifact).await?);
+    for artifact in context_artifacts {
+        let local_id = local_uuid_for_cloud_id(
+            "context-artifact",
+            &remote_session_id,
+            &artifact.artifact_id,
+        );
+        sync_state.context_artifacts.insert(
+            local_id.to_string(),
+            CloudContextState {
+                record_id: artifact.artifact_id.clone(),
+                source_uri: artifact.source_uri.clone(),
+                content_hash: artifact.content_hash.clone(),
+                metadata: artifact.metadata.clone(),
+            },
+        );
+        context.push(context_artifact_from_cloud(data_dir, client, local_id, artifact).await?);
     }
 
     let mut conversation = Vec::new();
-    for response in bundle.cue_responses {
-        if let Some(turn) = conversation_turn_from_cloud(response) {
+    for response in cue_responses {
+        let local_id = local_turn_uuid(&remote_session_id, &response.response_id);
+        if let Some(turn) = conversation_turn_from_cloud(response.clone(), local_id) {
+            sync_state.responses.insert(
+                local_id.to_string(),
+                CloudResponseState {
+                    record_id: response.response_id,
+                    kind: response.kind,
+                    ts_ms: response.ts_ms,
+                    model: response.model,
+                    lane: response.lane,
+                    task_type: response.task_type,
+                    cost_cents: response.cost_cents,
+                    balance_cents_after: response.balance_cents_after,
+                    cost_label: response.cost_label,
+                    metadata: response.metadata,
+                },
+            );
             conversation.push(turn);
         }
     }
 
     let live_answer_transcript_cursor = transcript.len();
-    Ok(MeetingRecord {
+    let meeting = MeetingRecord {
         id,
         owner_account_id: None,
-        title: bundle.session.title,
-        started_at: bundle.session.created_at_ms.to_string(),
-        ended_at: if bundle.session.status == "active" {
+        title: session.title,
+        started_at: session.created_at_ms.to_string(),
+        ended_at: if session.status == "active" {
             None
         } else {
-            Some(bundle.session.updated_at_ms.to_string())
+            Some(session.updated_at_ms.to_string())
         },
         transcript,
         // A restored cloud transcript is historical context. Only speech
@@ -1606,24 +2147,93 @@ async fn meeting_from_cloud_bundle(
         decisions: Vec::new(),
         context,
         conversation,
-        answer_instructions: bundle.session.answer_style,
-        diagnostics: MeetingDiagnostics::default(),
-        summary: bundle
-            .session
+        answer_instructions: session.answer_style,
+        diagnostics: session
+            .metadata
+            .get("diagnostics")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
+        summary: session
             .metadata
             .get("summary")
-            .and_then(|value| value.as_str())
+            .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .map(ToString::to_string),
-    })
+    };
+    write_cloud_sync_state(data_dir, id, &sync_state)?;
+    Ok(meeting)
+}
+
+fn validate_cloud_bundle_parentage(bundle: &CloudSessionBundle) -> Result<()> {
+    let session_id = bundle.session.session_id.as_str();
+    for child_session_id in bundle
+        .transcript_segments
+        .iter()
+        .map(|record| record.session_id.as_str())
+        .chain(
+            bundle
+                .cue_responses
+                .iter()
+                .map(|record| record.session_id.as_str()),
+        )
+        .chain(
+            bundle
+                .context_artifacts
+                .iter()
+                .map(|record| record.session_id.as_str()),
+        )
+    {
+        if child_session_id != session_id {
+            anyhow::bail!(
+                "cloud session bundle child parent mismatch: expected {session_id}, got {child_session_id}"
+            );
+        }
+    }
+
+    let artifact_ids = bundle
+        .context_artifacts
+        .iter()
+        .map(|record| record.artifact_id.as_str())
+        .collect::<HashSet<_>>();
+    for response in &bundle.cue_responses {
+        let Some(value) = response.metadata.get("attachment_ids") else {
+            continue;
+        };
+        let Some(values) = value.as_array() else {
+            if value.is_null() {
+                continue;
+            }
+            anyhow::bail!(
+                "cloud response {} has invalid attachment metadata",
+                response.response_id
+            );
+        };
+        for value in values {
+            let Some(artifact_id) = value.as_str() else {
+                anyhow::bail!(
+                    "cloud response {} has a non-string attachment id",
+                    response.response_id
+                );
+            };
+            if !artifact_ids.contains(artifact_id) {
+                anyhow::bail!(
+                    "cloud response {} references attachment {} outside its parent session",
+                    response.response_id,
+                    artifact_id
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn context_artifact_from_cloud(
     data_dir: &Path,
     client: Option<&CloudClient>,
+    id: Uuid,
     record: SyncContextArtifactRecord,
 ) -> Result<ContextArtifact> {
-    let id = Uuid::parse_str(&record.artifact_id).unwrap_or_else(|_| Uuid::new_v4());
     let kind = context_kind_from_cloud(&record.kind);
     let status = processing_status_from_metadata(&record.metadata, record.text_preview.as_deref());
     let preview_path = write_restored_context_preview(data_dir, id, &record)?;
@@ -1633,7 +2243,6 @@ async fn context_artifact_from_cloud(
             .unwrap_or_else(|| preview_path.clone()),
         None => preview_path.clone(),
     };
-    let restored_original = object_path != preview_path;
     let size_bytes = record
         .metadata
         .get("object_size_bytes")
@@ -1644,7 +2253,9 @@ async fn context_artifact_from_cloud(
         kind,
         path: object_path.display().to_string(),
         title: record.title,
-        note: restored_note(record.note, record.source_uri, restored_original),
+        // `source_uri` and object restoration status are transport metadata,
+        // not user-authored notes. The sidecar preserves the former exactly.
+        note: record.note,
         size_bytes,
         text_preview: record.text_preview,
         markdown_path: Some(preview_path.display().to_string()),
@@ -1739,26 +2350,6 @@ async fn download_restored_context_object(
     Some(path)
 }
 
-fn restored_note(
-    note: Option<String>,
-    source_uri: Option<String>,
-    restored_original: bool,
-) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(note) = note.filter(|value| !value.trim().is_empty()) {
-        parts.push(note);
-    }
-    if let Some(source_uri) = source_uri.filter(|value| !value.trim().is_empty()) {
-        parts.push(format!("Original path on synced device: {source_uri}"));
-    }
-    if restored_original {
-        parts.push("Restored from Bluey Cloud with the original synced file bytes.".to_string());
-    } else {
-        parts.push("Restored from Bluey Cloud using answer-ready text preview because original file bytes were unavailable.".to_string());
-    }
-    Some(parts.join("\n"))
-}
-
 fn restored_object_filename(id: Uuid, record: &SyncContextArtifactRecord) -> String {
     let mut title = sanitize_filename(&record.title);
     if title.is_empty() {
@@ -1814,29 +2405,29 @@ fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
     }
 }
 
-fn conversation_turn_from_cloud(response: SyncCueResponseRecord) -> Option<ConversationTurn> {
-    if response.kind != "answer" {
+fn conversation_turn_from_cloud(
+    response: SyncCueResponseRecord,
+    id: Uuid,
+) -> Option<ConversationTurn> {
+    if response.text.trim().is_empty() {
         return None;
     }
-    let question = response.source_text?;
-    if question.trim().is_empty() || response.text.trim().is_empty() {
-        return None;
-    }
-    let id = response
-        .response_id
-        .strip_prefix("turn-")
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .unwrap_or_else(Uuid::new_v4);
+    // Some response kinds have no source question. An empty local question is
+    // the faithful representation; synthesizing one would alter user history.
+    let question = response.source_text.unwrap_or_default();
+    let attachment_ids = attachment_ids_from_metadata(&response.metadata, &response.session_id);
+    let artifact = cloud_response_artifact(
+        response.artifact_type,
+        response.artifact_body,
+        response.artifact_confidence,
+        &response.metadata,
+    );
     Some(ConversationTurn {
         id,
         question,
         answer: response.text,
-        attachment_ids: attachment_ids_from_metadata(&response.metadata),
-        artifact: cloud_response_artifact(
-            response.artifact_type,
-            response.artifact_body,
-            response.artifact_confidence,
-        ),
+        attachment_ids,
+        artifact,
         source: response
             .metadata
             .get("source")
@@ -1851,6 +2442,7 @@ fn cloud_response_artifact(
     artifact_type: Option<String>,
     artifact_body: Option<String>,
     artifact_confidence: Option<f32>,
+    metadata: &Value,
 ) -> Option<CueCardArtifact> {
     let body = artifact_body?.trim().to_string();
     if body.is_empty() {
@@ -1866,13 +2458,21 @@ fn cloud_response_artifact(
         "structured" => CardArtifactType::Structured,
         _ => return None,
     };
-    let title = match artifact_type {
+    let fallback_title = match artifact_type {
         CardArtifactType::Code => "Code canvas",
         CardArtifactType::SystemDesign => "System design canvas",
         CardArtifactType::Screen => "Screen context",
         CardArtifactType::Document => "Document context",
         CardArtifactType::Structured => "Details",
     };
+    // Legacy response rows did not carry a canvas title. New uploads preserve
+    // it in metadata; the fallback is only a type label, not reconstructed
+    // customer content.
+    let title = metadata
+        .get("canvas_artifact_title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback_title);
     Some(CueCardArtifact {
         artifact_type,
         title: title.to_string(),
@@ -1881,14 +2481,14 @@ fn cloud_response_artifact(
     })
 }
 
-fn attachment_ids_from_metadata(metadata: &serde_json::Value) -> Vec<Uuid> {
+fn attachment_ids_from_metadata(metadata: &Value, session_id: &str) -> Vec<Uuid> {
     metadata
         .get("attachment_ids")
         .and_then(|value| value.as_array())
         .into_iter()
         .flatten()
         .filter_map(|value| value.as_str())
-        .filter_map(|value| Uuid::parse_str(value).ok())
+        .map(|value| local_uuid_for_cloud_id("context-artifact", session_id, value))
         .collect()
 }
 
@@ -1961,21 +2561,19 @@ fn batch_total(batch: &SyncBatchRequest) -> usize {
         + batch.rag_chunks.len()
 }
 
-fn session_record(meeting: &MeetingRecord) -> SyncSessionRecord {
-    SyncSessionRecord {
-        session_id: meeting.id.to_string(),
-        title: meeting.title.clone(),
-        status: if meeting.ended_at.is_some() {
-            "archived".into()
-        } else {
-            "active".into()
-        },
-        created_at_ms: parse_ms(&meeting.started_at),
-        updated_at_ms: updated_at_ms(meeting),
-        last_active_at_ms: Some(updated_at_ms(meeting)),
-        answer_style: meeting.answer_instructions.clone(),
-        metadata: json!({
+fn session_record(
+    meeting: &MeetingRecord,
+    responses: Option<&[crate::llm::CueResponse]>,
+    state: Option<&CloudSyncState>,
+) -> SyncSessionRecord {
+    let updated_at_ms = updated_at_ms(meeting, responses);
+    let metadata = merge_metadata(
+        state
+            .map(|state| state.session_metadata.clone())
+            .unwrap_or_else(empty_metadata),
+        json!({
             "session_code": short_session_code(meeting.id),
+            "sync_revision": session_content_revision(meeting, responses, state),
             "summary": meeting.summary.as_deref(),
             "action_items": meeting.action_items.len(),
             "decisions": meeting.decisions.len(),
@@ -1992,6 +2590,20 @@ fn session_record(meeting: &MeetingRecord) -> SyncSessionRecord {
                 "last_error_at": meeting.diagnostics.last_error_at.as_deref(),
             },
         }),
+    );
+    SyncSessionRecord {
+        session_id: wire_session_id(meeting, state),
+        title: meeting.title.clone(),
+        status: if meeting.ended_at.is_some() {
+            "archived".into()
+        } else {
+            "active".into()
+        },
+        created_at_ms: parse_ms(&meeting.started_at),
+        updated_at_ms,
+        last_active_at_ms: Some(updated_at_ms),
+        answer_style: meeting.answer_instructions.clone(),
+        metadata,
         deleted_at_ms: None,
     }
 }
@@ -1999,23 +2611,31 @@ fn session_record(meeting: &MeetingRecord) -> SyncSessionRecord {
 fn transcript_record(
     meeting: &MeetingRecord,
     segment: &TranscriptSegment,
+    state: Option<&CloudSyncState>,
 ) -> SyncTranscriptSegment {
+    let preserved = state.and_then(|state| state.transcript_segments.get(&segment.id.to_string()));
     SyncTranscriptSegment {
-        segment_id: segment.id.to_string(),
-        session_id: meeting.id.to_string(),
-        speaker: segment.speaker.to_string(),
-        source: match segment.speaker {
-            cue_core::Speaker::System => "system",
-            cue_core::Speaker::User => "microphone",
-            cue_core::Speaker::Other | cue_core::Speaker::Unknown => "unknown",
-        }
-        .to_string(),
+        segment_id: wire_transcript_segment_id(meeting, segment.id, state),
+        session_id: wire_session_id(meeting, state),
+        speaker: preserved
+            .map(|record| record.speaker.clone())
+            .unwrap_or_else(|| segment.speaker.to_string()),
+        // Local MeetingRecord stores speaker but not the capture source. Keep
+        // unknown explicit for local-only rows instead of inventing microphone
+        // or system provenance from the speaker label.
+        source: preserved
+            .map(|record| record.source.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
         text: truncate_chars(&segment.text, MAX_TEXT_PREVIEW_CHARS),
-        start_ms: None,
-        end_ms: None,
-        ts_ms: parse_ms(&segment.created_at),
+        start_ms: preserved.and_then(|record| record.start_ms),
+        end_ms: preserved.and_then(|record| record.end_ms),
+        ts_ms: preserved
+            .map(|record| record.ts_ms)
+            .unwrap_or_else(|| parse_ms(&segment.created_at)),
         is_final: segment.is_final,
-        metadata: json!({}),
+        metadata: preserved
+            .map(|record| record.metadata.clone())
+            .unwrap_or_else(empty_metadata),
     }
 }
 
@@ -2023,16 +2643,40 @@ fn context_record(
     meeting: &MeetingRecord,
     artifact: &ContextArtifact,
     uploaded_objects: &HashMap<Uuid, SyncedObjectMetadata>,
+    state: Option<&CloudSyncState>,
 ) -> SyncContextArtifactRecord {
     let uploaded = uploaded_objects.get(&artifact.id);
+    let preserved = state.and_then(|state| state.context_artifacts.get(&artifact.id.to_string()));
+    let mut current_metadata = json!({
+        "size_bytes": artifact.size_bytes,
+        "processing_status": artifact.processing_status.to_string(),
+        "processing_error": artifact.processing_error.as_deref(),
+    });
+    if let Some(uploaded) = uploaded {
+        current_metadata["object_key"] = Value::String(uploaded.object_key.clone());
+        current_metadata["object_size_bytes"] = Value::from(uploaded.size_bytes);
+        current_metadata["object_sha256"] = Value::String(uploaded.sha256.clone());
+        current_metadata["object_content_type"] = Value::String(uploaded.content_type.clone());
+        current_metadata["object_expires_at_ms"] = Value::from(uploaded.expires_at_ms);
+    }
+    let metadata = merge_metadata(
+        preserved
+            .map(|record| record.metadata.clone())
+            .unwrap_or_else(empty_metadata),
+        current_metadata,
+    );
     SyncContextArtifactRecord {
-        artifact_id: artifact.id.to_string(),
-        session_id: meeting.id.to_string(),
+        artifact_id: wire_context_artifact_id(meeting, artifact.id, state),
+        session_id: wire_session_id(meeting, state),
         kind: artifact.kind.to_string(),
         title: artifact.title.clone(),
         note: artifact.note.clone(),
-        source_uri: Some(artifact.path.clone()),
-        content_hash: uploaded.map(|object| object.sha256.clone()),
+        source_uri: preserved
+            .and_then(|record| record.source_uri.clone())
+            .or_else(|| Some(artifact.path.clone())),
+        content_hash: uploaded
+            .map(|object| object.sha256.clone())
+            .or_else(|| preserved.and_then(|record| record.content_hash.clone())),
         text_preview: artifact
             .text_preview
             .as_deref()
@@ -2043,23 +2687,31 @@ fn context_record(
         } else {
             &artifact.updated_at
         }),
-        metadata: json!({
-            "size_bytes": artifact.size_bytes,
-            "processing_status": artifact.processing_status.to_string(),
-            "processing_error": artifact.processing_error.as_deref(),
-            "object_key": uploaded.map(|object| object.object_key.as_str()),
-            "object_size_bytes": uploaded.map(|object| object.size_bytes),
-            "object_sha256": uploaded.map(|object| object.sha256.as_str()),
-            "object_content_type": uploaded.map(|object| object.content_type.as_str()),
-            "object_expires_at_ms": uploaded.map(|object| object.expires_at_ms),
-        }),
+        metadata,
     }
 }
 
-fn cue_response_record(response: &crate::llm::CueResponse) -> SyncCueResponseRecord {
+fn cue_response_record(
+    meeting: &MeetingRecord,
+    response: &crate::llm::CueResponse,
+    state: Option<&CloudSyncState>,
+) -> SyncCueResponseRecord {
+    let session_id = wire_session_id(meeting, state);
+    let response_id = stable_wire_record_id("response", &session_id, &response.id);
+    let mut metadata = json!({
+        "input_tokens": response.input_tokens,
+        "output_tokens": response.output_tokens,
+    });
+    if response.artifact_type.is_some() || response.artifact_body.is_some() {
+        metadata["canvas_artifact_id"] = Value::String(
+            stable_entity_uuid("canvas-artifact", &session_id, &response_id).to_string(),
+        );
+    }
     SyncCueResponseRecord {
-        response_id: response.id.clone(),
-        session_id: response.source_session_id.clone(),
+        response_id,
+        // The response DB is queried per meeting. Bind its parent to that
+        // authenticated upload unit instead of trusting a stale source field.
+        session_id,
         kind: response.kind.clone(),
         text: truncate_chars(&response.text, MAX_RESPONSE_CHARS),
         source_text: response
@@ -2075,33 +2727,70 @@ fn cue_response_record(response: &crate::llm::CueResponse) -> SyncCueResponseRec
         balance_cents_after: response.balance_cents_after,
         cost_label: response.cost_label.clone(),
         artifact_type: response.artifact_type.clone(),
-        artifact_body: response.artifact_body.clone(),
+        artifact_body: response
+            .artifact_body
+            .as_deref()
+            .map(|body| truncate_chars(body, MAX_RESPONSE_CHARS)),
         artifact_confidence: response.artifact_confidence,
-        metadata: json!({
-            "input_tokens": response.input_tokens,
-            "output_tokens": response.output_tokens,
-        }),
+        metadata,
     }
 }
 
 fn conversation_response_record(
     meeting: &MeetingRecord,
     turn: &ConversationTurn,
+    state: Option<&CloudSyncState>,
 ) -> SyncCueResponseRecord {
+    let session_id = wire_session_id(meeting, state);
+    let preserved = state.and_then(|state| state.responses.get(&turn.id.to_string()));
+    let response_id = preserved
+        .map(|record| stable_wire_record_id("response", &session_id, &record.record_id))
+        .unwrap_or_else(|| format!("turn-{}", turn.id));
+    let attachment_ids = turn
+        .attachment_ids
+        .iter()
+        .map(|id| wire_context_artifact_id(meeting, *id, state))
+        .collect::<Vec<_>>();
+    let mut metadata = merge_metadata(
+        preserved
+            .map(|record| record.metadata.clone())
+            .unwrap_or_else(empty_metadata),
+        json!({
+            "turn_id": turn.id.to_string(),
+            "source": turn.source.as_deref(),
+            "attachment_ids": attachment_ids,
+        }),
+    );
+    if let Some(artifact) = &turn.artifact {
+        let canvas_id = metadata
+            .get("canvas_artifact_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                stable_entity_uuid("canvas-artifact", &session_id, &response_id).to_string()
+            });
+        metadata["canvas_artifact_id"] = Value::String(canvas_id);
+        metadata["canvas_artifact_title"] = Value::String(artifact.title.clone());
+    }
     SyncCueResponseRecord {
-        response_id: format!("turn-{}", turn.id),
-        session_id: meeting.id.to_string(),
-        kind: "answer".into(),
+        response_id,
+        session_id,
+        kind: preserved
+            .map(|record| record.kind.clone())
+            .unwrap_or_else(|| "answer".into()),
         text: truncate_chars(&turn.answer, MAX_RESPONSE_CHARS),
         source_text: Some(truncate_chars(&turn.question, MAX_TEXT_PREVIEW_CHARS)),
-        ts_ms: parse_ms(&turn.created_at),
+        ts_ms: preserved
+            .map(|record| record.ts_ms)
+            .unwrap_or_else(|| parse_ms(&turn.created_at)),
         provider: turn.provider.clone(),
-        model: None,
-        lane: None,
-        task_type: None,
-        cost_cents: None,
-        balance_cents_after: None,
-        cost_label: None,
+        model: preserved.and_then(|record| record.model.clone()),
+        lane: preserved.and_then(|record| record.lane.clone()),
+        task_type: preserved.and_then(|record| record.task_type.clone()),
+        cost_cents: preserved.and_then(|record| record.cost_cents),
+        balance_cents_after: preserved.and_then(|record| record.balance_cents_after),
+        cost_label: preserved.and_then(|record| record.cost_label.clone()),
         artifact_type: turn
             .artifact
             .as_ref()
@@ -2111,14 +2800,7 @@ fn conversation_response_record(
             .as_ref()
             .map(|artifact| truncate_chars(&artifact.body, MAX_RESPONSE_CHARS)),
         artifact_confidence: turn.artifact.as_ref().map(|artifact| artifact.confidence),
-        metadata: json!({
-            "source": turn.source.as_deref(),
-            "attachment_ids": turn
-                .attachment_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>(),
-        }),
+        metadata,
     }
 }
 
@@ -2135,12 +2817,15 @@ fn cloud_artifact_type_value(artifact_type: CardArtifactType) -> &'static str {
 fn transcript_rag_chunk(
     meeting: &MeetingRecord,
     segment: &TranscriptSegment,
+    state: Option<&CloudSyncState>,
 ) -> Option<SyncRagChunkRecord> {
+    let session_id = wire_session_id(meeting, state);
+    let segment_id = wire_transcript_segment_id(meeting, segment.id, state);
     Some(SyncRagChunkRecord {
-        chunk_id: format!("{}:transcript:{}:0", meeting.id, segment.id),
-        session_id: Some(meeting.id.to_string()),
+        chunk_id: format!("{session_id}:transcript:{segment_id}:0"),
+        session_id: Some(session_id),
         source_kind: "transcript".into(),
-        source_id: segment.id.to_string(),
+        source_id: segment_id,
         chunk_index: 0,
         text: truncate_nonempty(&segment.text)?,
         embedding: None,
@@ -2155,19 +2840,26 @@ fn transcript_rag_chunk(
 fn context_rag_chunk(
     meeting: &MeetingRecord,
     artifact: &ContextArtifact,
+    state: Option<&CloudSyncState>,
 ) -> Option<SyncRagChunkRecord> {
+    let session_id = wire_session_id(meeting, state);
+    let artifact_id = wire_context_artifact_id(meeting, artifact.id, state);
     Some(SyncRagChunkRecord {
-        chunk_id: format!("{}:context:{}:0", meeting.id, artifact.id),
-        session_id: Some(meeting.id.to_string()),
+        chunk_id: format!("{session_id}:context:{artifact_id}:0"),
+        session_id: Some(session_id),
         source_kind: "context".into(),
-        source_id: artifact.id.to_string(),
+        source_id: artifact_id,
         chunk_index: 0,
         text: truncate_nonempty(artifact.text_preview.as_deref()?)?,
         embedding: None,
         embedding_model: None,
         token_count: None,
         content_hash: None,
-        updated_at_ms: parse_ms(&artifact.created_at),
+        updated_at_ms: parse_ms(if artifact.updated_at.trim().is_empty() {
+            &artifact.created_at
+        } else {
+            &artifact.updated_at
+        }),
         metadata: json!({ "title": artifact.title, "kind": artifact.kind.to_string() }),
     })
 }
@@ -2175,12 +2867,15 @@ fn context_rag_chunk(
 fn response_rag_chunk(
     meeting: &MeetingRecord,
     response: &crate::llm::CueResponse,
+    response_id: &str,
+    state: Option<&CloudSyncState>,
 ) -> Option<SyncRagChunkRecord> {
+    let session_id = wire_session_id(meeting, state);
     Some(SyncRagChunkRecord {
-        chunk_id: format!("{}:response:{}:0", meeting.id, response.id),
-        session_id: Some(meeting.id.to_string()),
+        chunk_id: format!("{session_id}:response:{response_id}:0"),
+        session_id: Some(session_id),
         source_kind: "response".into(),
-        source_id: response.id.clone(),
+        source_id: response_id.to_string(),
         chunk_index: 0,
         text: truncate_nonempty(&response.text)?,
         embedding: None,
@@ -2198,10 +2893,12 @@ fn response_rag_chunk(
 fn conversation_rag_chunk(
     meeting: &MeetingRecord,
     turn: &ConversationTurn,
+    state: Option<&CloudSyncState>,
 ) -> Option<SyncRagChunkRecord> {
+    let session_id = wire_session_id(meeting, state);
     Some(SyncRagChunkRecord {
-        chunk_id: format!("{}:conversation:{}:0", meeting.id, turn.id),
-        session_id: Some(meeting.id.to_string()),
+        chunk_id: format!("{session_id}:conversation:{}:0", turn.id),
+        session_id: Some(session_id),
         source_kind: "conversation".into(),
         source_id: turn.id.to_string(),
         chunk_index: 0,
@@ -2218,7 +2915,7 @@ fn conversation_rag_chunk(
     })
 }
 
-fn updated_at_ms(meeting: &MeetingRecord) -> i64 {
+fn updated_at_ms(meeting: &MeetingRecord, responses: Option<&[crate::llm::CueResponse]>) -> i64 {
     let mut latest = parse_ms(&meeting.started_at);
     if let Some(ended_at) = meeting.ended_at.as_deref() {
         latest = latest.max(parse_ms(ended_at));
@@ -2227,12 +2924,39 @@ fn updated_at_ms(meeting: &MeetingRecord) -> i64 {
         latest = latest.max(parse_ms(&segment.created_at));
     }
     for artifact in &meeting.context {
-        latest = latest.max(parse_ms(&artifact.created_at));
+        latest = latest.max(parse_ms(if artifact.updated_at.trim().is_empty() {
+            &artifact.created_at
+        } else {
+            &artifact.updated_at
+        }));
     }
     for turn in &meeting.conversation {
         latest = latest.max(parse_ms(&turn.created_at));
     }
+    for response in responses.into_iter().flatten() {
+        latest = latest.max(response.ts_ms as i64);
+    }
     latest
+}
+
+fn session_content_revision(
+    meeting: &MeetingRecord,
+    responses: Option<&[crate::llm::CueResponse]>,
+    state: Option<&CloudSyncState>,
+) -> String {
+    let revision_input = json!({
+        "title": meeting.title,
+        "ended_at": meeting.ended_at,
+        "transcript": meeting.transcript,
+        "context": meeting.context,
+        "conversation": meeting.conversation,
+        "answer_instructions": meeting.answer_instructions,
+        "summary": meeting.summary,
+        "responses": responses.unwrap_or(&[]),
+        "preserved_cloud_state": state,
+    });
+    let bytes = serde_json::to_vec(&revision_input).unwrap_or_default();
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn parse_ms(value: &str) -> i64 {
@@ -2547,7 +3271,7 @@ mod tests {
         let turn = ConversationTurn::new("question", "answer", None, Some("test".into()))
             .with_attachment_ids(vec![attachment_id]);
 
-        let record = conversation_response_record(&meeting, &turn);
+        let record = conversation_response_record(&meeting, &turn, None);
         let ids = record
             .metadata
             .get("attachment_ids")
@@ -2576,7 +3300,7 @@ mod tests {
         let turn = ConversationTurn::new("code?", "Here is code.", None, Some("test".into()))
             .with_artifact(Some(artifact));
 
-        let record = conversation_response_record(&meeting, &turn);
+        let record = conversation_response_record(&meeting, &turn, None);
         assert_eq!(record.artifact_type.as_deref(), Some("code"));
         assert_eq!(
             record.artifact_body.as_deref(),
@@ -2584,7 +3308,7 @@ mod tests {
         );
         assert_eq!(record.artifact_confidence, Some(0.95));
 
-        let restored = conversation_turn_from_cloud(record).expect("restored turn");
+        let restored = conversation_turn_from_cloud(record, turn.id).expect("restored turn");
         assert_eq!(
             restored
                 .artifact

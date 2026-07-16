@@ -822,20 +822,22 @@ mod tests {
     use cue_core::pcm::{AudioSource, SampleRate};
     use tokio::sync::mpsc::channel;
 
+    struct TestProviderChannels {
+        provider: DeepgramProvider,
+        audio_rx: LatestReceiver<Vec<u8>>,
+        control_rx: MpscReceiver<StreamControl>,
+        event_tx: LatestSender<Result<TranscriptEvent, SttError>>,
+    }
+
     fn provider_from_test_channels(
         initial: ConnectionState,
         capacity: usize,
-    ) -> (
-        DeepgramProvider,
-        LatestReceiver<Vec<u8>>,
-        MpscReceiver<StreamControl>,
-        LatestSender<Result<TranscriptEvent, SttError>>,
-    ) {
+    ) -> TestProviderChannels {
         let (audio_tx, audio_rx) = latest_channel(capacity);
         let (control_tx, control_rx) = channel(1);
         let (event_tx, event_rx) = latest_channel(capacity);
-        (
-            DeepgramProvider::from_channels(
+        TestProviderChannels {
+            provider: DeepgramProvider::from_channels(
                 AudioSource::Microphone,
                 initial,
                 event_rx,
@@ -845,7 +847,7 @@ mod tests {
             audio_rx,
             control_rx,
             event_tx,
-        )
+        }
     }
 
     fn cfg() -> (DeepgramConfig, SttConfig) {
@@ -1083,15 +1085,21 @@ mod tests {
 
     #[tokio::test]
     async fn provider_reports_initial_connection_state() {
-        let (provider, _audio_rx, _control_rx, _event_tx) =
-            provider_from_test_channels(ConnectionState::Connected, 1);
-        assert_eq!(provider.connection_state(), ConnectionState::Connected);
+        let channels = provider_from_test_channels(ConnectionState::Connected, 1);
+        assert_eq!(
+            channels.provider.connection_state(),
+            ConnectionState::Connected
+        );
     }
 
     #[tokio::test]
     async fn provider_close_flips_state_and_rejects_send() {
-        let (mut provider, _audio_rx, _control_rx, _event_tx) =
-            provider_from_test_channels(ConnectionState::Connected, 1);
+        let TestProviderChannels {
+            mut provider,
+            audio_rx: _audio_rx,
+            control_rx: _control_rx,
+            event_tx: _event_tx,
+        } = provider_from_test_channels(ConnectionState::Connected, 1);
         provider.close().await.unwrap();
         assert_eq!(provider.connection_state(), ConnectionState::Closed);
 
@@ -1107,9 +1115,13 @@ mod tests {
 
     #[tokio::test]
     async fn provider_forwards_scripted_events() {
-        let (mut provider, _audio_rx, _control_rx, ev_tx) =
-            provider_from_test_channels(ConnectionState::Connected, 1);
-        ev_tx
+        let TestProviderChannels {
+            mut provider,
+            audio_rx: _audio_rx,
+            control_rx: _control_rx,
+            event_tx,
+        } = provider_from_test_channels(ConnectionState::Connected, 1);
+        event_tx
             .try_send(Ok(TranscriptEvent::Partial {
                 text: "hi".into(),
                 confidence: Some(0.9),
@@ -1122,8 +1134,12 @@ mod tests {
 
     #[tokio::test]
     async fn audio_overload_keeps_newest_and_finalize_has_priority() {
-        let (provider, mut audio_rx, mut control_rx, _event_tx) =
-            provider_from_test_channels(ConnectionState::Connected, 1);
+        let TestProviderChannels {
+            provider,
+            mut audio_rx,
+            mut control_rx,
+            event_tx: _event_tx,
+        } = provider_from_test_channels(ConnectionState::Connected, 1);
         let first = AudioChunk {
             source: AudioSource::Microphone,
             sample_rate: SampleRate::SR_16K,
@@ -1153,8 +1169,12 @@ mod tests {
 
     #[tokio::test]
     async fn close_aborts_stalled_supervisor_by_deadline() {
-        let (mut provider, _audio_rx, _control_rx, _event_tx) =
-            provider_from_test_channels(ConnectionState::Connected, 1);
+        let TestProviderChannels {
+            mut provider,
+            audio_rx: _audio_rx,
+            control_rx: _control_rx,
+            event_tx: _event_tx,
+        } = provider_from_test_channels(ConnectionState::Connected, 1);
         provider.supervisor = Some(tokio::spawn(std::future::pending()));
 
         tokio::time::timeout(Duration::from_secs(1), provider.close())

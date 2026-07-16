@@ -1652,13 +1652,13 @@ pub async fn password_reset_confirm(
     ))?;
     Account::reset_password_and_revoke_refresh_tokens(&state.pool, &account_id, &new_hash)
         .map_err(|e| {
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError {
-                error: format!("reset password: {e}"),
-            }),
-        )
-    })?;
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("reset password: {e}"),
+                }),
+            )
+        })?;
     Ok(axum::http::StatusCode::OK)
 }
 

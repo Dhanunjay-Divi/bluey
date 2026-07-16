@@ -1064,20 +1064,19 @@ mod create_dup_tests {
             1
         );
 
-        let affected = Account::reset_password_and_revoke_refresh_tokens(
-            &pool,
-            &account.id,
-            "new-hash",
-        )
-        .unwrap();
+        let affected =
+            Account::reset_password_and_revoke_refresh_tokens(&pool, &account.id, "new-hash")
+                .unwrap();
 
         assert_eq!(affected, 1);
         assert_eq!(
             Account::password_hash(&pool, "reset@example.com").unwrap(),
             Some("new-hash".to_string())
         );
-        assert!(crate::db::refresh_tokens::list_active_for_account(&pool, &account.id)
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::db::refresh_tokens::list_active_for_account(&pool, &account.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

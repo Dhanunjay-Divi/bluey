@@ -4,6 +4,8 @@
 //! desktop can write locally first, then retry sync batches until the server
 //! acknowledges them.
 
+use std::collections::HashSet;
+
 use axum::{
     body::{Body, Bytes},
     extract::{Path, Query, State},
@@ -108,7 +110,7 @@ pub async fn batch(
         &req.context_artifacts,
         &req.rag_chunks,
     )
-    .map_err(internal)?;
+    .map_err(sync_write_error)?;
     Ok(Json(SyncBatchResponse {
         accepted,
         server_time_ms: now_ms(),
@@ -148,7 +150,7 @@ pub async fn delete_session(
     Path(session_id): Path<String>,
 ) -> Result<Json<SyncBatchResponse>, (StatusCode, String)> {
     validate_session_id(&session_id)?;
-    sync::tombstone_session(&state.pool, &account.id, &session_id).map_err(internal)?;
+    sync::tombstone_session(&state.pool, &account.id, &session_id).map_err(sync_write_error)?;
     if let Some(config) = state.config.object_storage.clone() {
         drain_cleanup_jobs(
             &state,
@@ -469,7 +471,18 @@ fn validate_batch(req: &SyncBatchRequest) -> Result<(), (StatusCode, String)> {
             "sync batch cannot exceed 500 records".to_string(),
         ));
     }
+
+    let mut session_ids = HashSet::new();
+    for session in &req.sessions {
+        validate_session_id(&session.session_id)?;
+        ensure_unique_sync_id(&mut session_ids, &session.session_id, "session")?;
+    }
+
+    let mut segment_ids = HashSet::new();
     for segment in &req.transcript_segments {
+        validate_session_id(&segment.session_id)?;
+        validate_sync_record_id(&segment.segment_id, "transcript segment", false)?;
+        ensure_unique_sync_id(&mut segment_ids, &segment.segment_id, "transcript segment")?;
         if segment.text.len() > 16_000 {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -477,7 +490,14 @@ fn validate_batch(req: &SyncBatchRequest) -> Result<(), (StatusCode, String)> {
             ));
         }
     }
+
+    let mut response_ids = HashSet::new();
+    let mut canvas_ids = HashSet::new();
     for response in &req.cue_responses {
+        validate_session_id(&response.session_id)?;
+        validate_sync_record_id(&response.response_id, "response", false)?;
+        ensure_unique_sync_id(&mut response_ids, &response.response_id, "response")?;
+        validate_response_artifact_ids(response, &mut canvas_ids)?;
         if response.text.len() > 128_000 {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -485,7 +505,22 @@ fn validate_batch(req: &SyncBatchRequest) -> Result<(), (StatusCode, String)> {
             ));
         }
     }
+
+    let mut artifact_ids = HashSet::new();
+    for artifact in &req.context_artifacts {
+        validate_session_id(&artifact.session_id)?;
+        validate_sync_record_id(&artifact.artifact_id, "context artifact", false)?;
+        ensure_unique_sync_id(&mut artifact_ids, &artifact.artifact_id, "context artifact")?;
+    }
+
+    let mut chunk_ids = HashSet::new();
     for chunk in &req.rag_chunks {
+        if let Some(session_id) = chunk.session_id.as_deref() {
+            validate_session_id(session_id)?;
+        }
+        validate_sync_record_id(&chunk.chunk_id, "RAG chunk", true)?;
+        validate_sync_record_id(&chunk.source_id, "RAG source", true)?;
+        ensure_unique_sync_id(&mut chunk_ids, &chunk.chunk_id, "RAG chunk")?;
         if chunk.text.len() > 16_000 {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -500,6 +535,85 @@ fn validate_batch(req: &SyncBatchRequest) -> Result<(), (StatusCode, String)> {
         }
     }
     Ok(())
+}
+
+fn validate_response_artifact_ids(
+    response: &SyncCueResponseRecord,
+    canvas_ids: &mut HashSet<String>,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(value) = response.metadata.get("attachment_ids") {
+        let values = if value.is_null() {
+            &[][..]
+        } else if let Some(values) = value.as_array() {
+            values.as_slice()
+        } else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "response attachment_ids must be an array".to_string(),
+            ));
+        };
+        let mut response_attachment_ids = HashSet::new();
+        for value in values {
+            let Some(artifact_id) = value.as_str() else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "response attachment id must be a string".to_string(),
+                ));
+            };
+            validate_sync_record_id(artifact_id, "attachment", false)?;
+            ensure_unique_sync_id(&mut response_attachment_ids, artifact_id, "attachment")?;
+        }
+    }
+
+    if let Some(value) = response.metadata.get("canvas_artifact_id") {
+        let Some(canvas_id) = value.as_str() else {
+            if value.is_null() {
+                return Ok(());
+            }
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "canvas_artifact_id must be a string".to_string(),
+            ));
+        };
+        validate_sync_record_id(canvas_id, "canvas artifact", false)?;
+        ensure_unique_sync_id(canvas_ids, canvas_id, "canvas artifact")?;
+    }
+    Ok(())
+}
+
+fn validate_sync_record_id(
+    value: &str,
+    label: &str,
+    allow_colon: bool,
+) -> Result<(), (StatusCode, String)> {
+    let value = value.trim();
+    let valid = !value.is_empty()
+        && value.len() <= 192
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_')
+                || (allow_colon && byte == b':')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err((StatusCode::BAD_REQUEST, format!("invalid {label} id")))
+    }
+}
+
+fn ensure_unique_sync_id(
+    seen: &mut HashSet<String>,
+    value: &str,
+    label: &str,
+) -> Result<(), (StatusCode, String)> {
+    if seen.insert(value.to_string()) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            format!("duplicate {label} id in sync batch"),
+        ))
+    }
 }
 
 fn validate_session_id(session_id: &str) -> Result<(), (StatusCode, String)> {
@@ -547,6 +661,14 @@ fn internal(e: anyhow::Error) -> (StatusCode, String) {
         .join(" | ");
     tracing::warn!(error = %e, error_chain = %error_chain, "sync endpoint failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "sync failed".to_string())
+}
+
+fn sync_write_error(e: anyhow::Error) -> (StatusCode, String) {
+    if let Some(conflict) = e.downcast_ref::<sync::SyncWriteError>() {
+        tracing::warn!(error = %conflict, "sync write rejected");
+        return (StatusCode::CONFLICT, conflict.to_string());
+    }
+    internal(e)
 }
 
 async fn reserve_put_and_finalize(
@@ -879,6 +1001,79 @@ mod tests {
         assert!(validate_session_id("../other-account").is_err());
         assert!(validate_session_id("session/child").is_err());
         assert!(validate_session_id("session\nchild").is_err());
+    }
+
+    #[test]
+    fn sync_batch_rejects_duplicate_child_ids_before_order_can_choose_a_winner() {
+        let response = SyncCueResponseRecord {
+            response_id: "stable-response".into(),
+            session_id: "session-a".into(),
+            kind: "answer".into(),
+            text: "answer".into(),
+            source_text: Some("question".into()),
+            ts_ms: 10,
+            provider: None,
+            model: None,
+            lane: None,
+            task_type: None,
+            cost_cents: None,
+            balance_cents_after: None,
+            cost_label: None,
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
+            metadata: serde_json::json!({}),
+        };
+        let mut conflicting = response.clone();
+        conflicting.session_id = "session-b".into();
+        let request = SyncBatchRequest {
+            sessions: vec![],
+            transcript_segments: vec![],
+            cue_responses: vec![response, conflicting],
+            context_artifacts: vec![],
+            rag_chunks: vec![],
+        };
+
+        let error = validate_batch(&request).unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("duplicate response id"));
+    }
+
+    #[test]
+    fn response_attachment_and_canvas_ids_must_be_stable_safe_identifiers() {
+        let mut canvas_ids = HashSet::new();
+        let mut response = SyncCueResponseRecord {
+            response_id: "stable-response".into(),
+            session_id: "stable-session".into(),
+            kind: "answer".into(),
+            text: "answer".into(),
+            source_text: Some("question".into()),
+            ts_ms: 10,
+            provider: None,
+            model: None,
+            lane: None,
+            task_type: None,
+            cost_cents: None,
+            balance_cents_after: None,
+            cost_label: None,
+            artifact_type: Some("code".into()),
+            artifact_body: Some("fn main() {}".into()),
+            artifact_confidence: Some(0.9),
+            metadata: serde_json::json!({
+                "attachment_ids": ["stable-attachment"],
+                "canvas_artifact_id": "stable-canvas"
+            }),
+        };
+        validate_response_artifact_ids(&response, &mut canvas_ids).unwrap();
+
+        response.metadata["attachment_ids"] = serde_json::json!(["../other-session"]);
+        assert!(validate_response_artifact_ids(&response, &mut HashSet::new()).is_err());
+
+        response.metadata = serde_json::json!({
+            "attachment_ids": ["stable-attachment"],
+            "canvas_artifact_id": "stable-canvas"
+        });
+        assert!(validate_response_artifact_ids(&response, &mut canvas_ids).is_err());
     }
 
     #[test]

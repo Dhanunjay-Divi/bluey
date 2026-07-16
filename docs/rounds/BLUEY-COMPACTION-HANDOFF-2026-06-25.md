@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-12 EDT
+Latest checkpoint: 2026-07-16 CDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,10 +30,8 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed engineering round docs are
-  `ROUND-519-INTERRUPTED-ASKS-RECONCILIATION.md` and
-  `ROUND-520-BLUEY-PARALLEL-BRANCH-RECONCILIATION.md`; the next canonical
-  Bluey round doc starts at `ROUND-521-...`.
+- Latest completed engineering round docs are Rounds 519-523. Round 524 is the
+  active mainline-convergence and signed-release round.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 - Do not claim raw-audio retention, replay, or training from the current audit
   bundle. The shipped `audio/audio.jsonl` path is a manifest placeholder; any
@@ -41,6 +39,29 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
   live lifecycle verification.
 
 ## Current State
+
+- Round 524 is the active release convergence on branch
+  `codex/bluey-interrupted-asks-round519-20260712`:
+  - all reviewed non-Sashreek branch/worktree material is represented or
+    deliberately deferred by Rounds 520-523
+  - account credentials use generation-aware writes and stale-refresh
+    protection
+  - local and cloud sessions are account-owned and fail closed on cross-account
+    reparenting
+  - audio stop drains final STT output before session persistence/settlement
+  - Deepgram relay credentials no longer appear in request URLs
+  - safe partial answers survive provider/stream failures
+  - signed-out macOS status/balance labels open sign-in without breaking
+    signed-in dragging
+  - forged `Question:` disclosure envelopes are blocked across server and
+    daemon paths
+  - full workspace/server tests, strict Clippy, dashboard tests/build, native
+    parse, release hygiene, formatting, and whitespace gates are green
+  - release version is `0.1.101`
+  - commit, main fast-forward, signed manual deploy, and live hashes remain the
+    final Round 524 steps; do not claim them complete until evidence is appended
+  - round doc:
+    `docs/rounds/ROUND-524-BLUEY-MAINLINE-CONVERGENCE-AND-SIGNED-RELEASE.md`
 
 - Round 519 completed the interrupted-work reconciliation and signed release on
   branch `codex/bluey-interrupted-asks-round519-20260712`:

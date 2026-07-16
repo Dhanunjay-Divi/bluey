@@ -110,7 +110,20 @@ pub struct CloudClient {
     pub config: ClientConfig,
     http: Client,
     tokens: Arc<dyn TokenStore>,
-    cached: Arc<Mutex<Option<Tokens>>>,
+    cached: Arc<Mutex<CachedCredentials>>,
+}
+
+#[derive(Debug)]
+struct CachedCredentials {
+    generation: u64,
+    tokens: Option<Tokens>,
+}
+
+impl CachedCredentials {
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.tokens = None;
+    }
 }
 
 impl CloudClient {
@@ -119,7 +132,10 @@ impl CloudClient {
             .user_agent(&config.user_agent)
             .timeout(config.timeout)
             .build()?;
-        let cached = Arc::new(Mutex::new(tokens.load()?));
+        let cached = Arc::new(Mutex::new(CachedCredentials {
+            generation: 0,
+            tokens: tokens.load()?,
+        }));
         Ok(Self {
             config,
             http,
@@ -142,14 +158,19 @@ impl CloudClient {
 
     /// Save tokens both to the persistent store and the in-memory cache.
     pub fn save_tokens(&self, tokens: Tokens) -> Result<()> {
+        let mut cached = self.cached.lock().unwrap();
+        cached.invalidate();
+        // A normal save represents login/account replacement. Clear the old
+        // bearer first so a failed replacement cannot leave it active.
+        self.tokens.clear()?;
         self.tokens.save(&tokens)?;
-        *self.cached.lock().unwrap() = Some(tokens);
+        cached.tokens = Some(tokens);
         Ok(())
     }
 
     /// Load tokens from cache (no I/O on the hot path).
     pub fn current_tokens(&self) -> Option<Tokens> {
-        self.cached.lock().unwrap().clone()
+        self.cached.lock().unwrap().tokens.clone()
     }
 
     /// Reload tokens from the persistent store into the in-memory cache.
@@ -159,9 +180,11 @@ impl CloudClient {
     /// store while that client still holds stale cached tokens. This gives those
     /// background tasks a safe recovery path without restarting Bluey.
     pub fn reload_tokens_from_store(&self) -> Result<bool> {
+        let mut cached = self.cached.lock().unwrap();
+        cached.invalidate();
         let loaded = self.tokens.load()?;
         let present = loaded.is_some();
-        *self.cached.lock().unwrap() = loaded;
+        cached.tokens = loaded;
         Ok(present)
     }
 
@@ -174,8 +197,9 @@ impl CloudClient {
 
     /// Forget tokens in store + cache. Used by `bluey logout`.
     pub fn logout(&self) -> Result<()> {
+        let mut cached = self.cached.lock().unwrap();
+        cached.invalidate();
         self.tokens.clear()?;
-        *self.cached.lock().unwrap() = None;
         Ok(())
     }
 
@@ -436,8 +460,8 @@ impl CloudClient {
 
     /// Try to refresh the token pair. Returns true on success.
     async fn refresh_tokens(&self) -> Result<bool> {
-        let cur = match self.current_tokens() {
-            Some(t) => t,
+        let (generation, cur) = match self.credential_snapshot() {
+            Some(snapshot) => snapshot,
             None => return Ok(false),
         };
         if cur.refresh.is_empty() {
@@ -453,12 +477,47 @@ impl CloudClient {
             return Ok(false);
         }
         let auth: AuthResponse = resp.json().await?;
-        self.save_tokens(Tokens {
+        if auth.account.email.trim() != cur.email.trim() {
+            return Err(Error::Other(
+                "refresh response account identity did not match current credentials".to_string(),
+            ));
+        }
+        let replacement = Tokens {
             access: auth.access_token,
             refresh: auth.refresh_token,
-            email: auth.account.email,
-        })?;
-        Ok(true)
+            email: cur.email.clone(),
+        };
+
+        let mut cached = self.cached.lock().unwrap();
+        if cached.generation != generation || cached.tokens.as_ref() != Some(&cur) {
+            return Ok(false);
+        }
+        match self.tokens.compare_and_swap(&cur, &replacement) {
+            Ok(true) => {
+                cached.invalidate();
+                cached.tokens = Some(replacement);
+                Ok(true)
+            }
+            Ok(false) => {
+                // Another client/process changed the persistent account. Do
+                // not retry the original request with that account's bearer.
+                cached.invalidate();
+                cached.tokens = self.tokens.load()?;
+                Ok(false)
+            }
+            Err(error) => {
+                cached.invalidate();
+                Err(error)
+            }
+        }
+    }
+
+    fn credential_snapshot(&self) -> Option<(u64, Tokens)> {
+        let cached = self.cached.lock().unwrap();
+        cached
+            .tokens
+            .clone()
+            .map(|tokens| (cached.generation, tokens))
     }
 
     /// Map server response to either parsed JSON or a typed error.
@@ -569,9 +628,7 @@ impl CloudClient {
     /// Codex Stage 16: bluey logout — forget tokens both in-cache and
     /// in the persistent store.
     pub fn clear_tokens(&self) -> Result<()> {
-        self.tokens.clear()?;
-        *self.cached.lock().unwrap() = None;
-        Ok(())
+        self.logout()
     }
 
     /// Codex Stage 18 commit 2: public POST without bearer auth (used
@@ -724,6 +781,42 @@ mod tests {
     use wiremock::matchers::{header, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    struct FailingReplacementStore {
+        inner: Mutex<Option<Tokens>>,
+    }
+
+    impl FailingReplacementStore {
+        fn with_tokens(tokens: Tokens) -> Self {
+            Self {
+                inner: Mutex::new(Some(tokens)),
+            }
+        }
+    }
+
+    impl TokenStore for FailingReplacementStore {
+        fn save(&self, _tokens: &Tokens) -> Result<()> {
+            Err(Error::TokenStore("injected save failure".to_string()))
+        }
+
+        fn load(&self) -> Result<Option<Tokens>> {
+            Ok(self.inner.lock().unwrap().clone())
+        }
+
+        fn clear(&self) -> Result<()> {
+            *self.inner.lock().unwrap() = None;
+            Ok(())
+        }
+
+        fn compare_and_swap(&self, expected: &Tokens, replacement: &Tokens) -> Result<bool> {
+            let mut current = self.inner.lock().unwrap();
+            if current.as_ref() != Some(expected) {
+                return Ok(false);
+            }
+            *current = Some(replacement.clone());
+            Ok(true)
+        }
+    }
+
     fn client_for(server_url: String) -> CloudClient {
         let config = ClientConfig {
             base_url: server_url,
@@ -733,6 +826,25 @@ mod tests {
         };
         let store = Arc::new(MemoryStore::new());
         CloudClient::new(config, store).unwrap()
+    }
+
+    async fn wait_for_request(server: &MockServer, request_path: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.path() == request_path)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("request was not received before timeout");
     }
 
     #[test]
@@ -814,6 +926,167 @@ mod tests {
             client.current_tokens().unwrap().access.as_str(),
             "new-access"
         );
+    }
+
+    #[test]
+    fn failed_account_switch_preserves_no_old_bearer() {
+        let old = Tokens {
+            access: "old-access".to_string(),
+            refresh: "old-refresh".to_string(),
+            email: "old@example.com".to_string(),
+        };
+        let store = Arc::new(FailingReplacementStore::with_tokens(old));
+        let client = CloudClient::new(
+            ClientConfig {
+                base_url: "https://bluey.test".to_string(),
+                user_agent: "test".to_string(),
+                timeout: Duration::from_secs(10),
+                trace_id: None,
+            },
+            store.clone(),
+        )
+        .unwrap();
+
+        let error = client
+            .save_tokens(Tokens {
+                access: "new-access".to_string(),
+                refresh: "new-refresh".to_string(),
+                email: "new@example.com".to_string(),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, Error::TokenStore(_)));
+        assert_eq!(client.current_tokens(), None);
+        assert_eq!(store.load().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn logout_invalidates_a_delayed_refresh_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/account/me"))
+            .and(header("authorization", "Bearer old-access"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({
+                        "access_token": "late-access",
+                        "refresh_token": "late-refresh",
+                        "expires_in": 3600,
+                        "account": {
+                            "id": "account-a",
+                            "email": "a@example.com",
+                            "balance_cents": 100,
+                            "trial_seconds_remaining": 0
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = Arc::new(MemoryStore::new());
+        let client = CloudClient::new(
+            ClientConfig {
+                base_url: server.uri(),
+                user_agent: "test".to_string(),
+                timeout: Duration::from_secs(10),
+                trace_id: None,
+            },
+            store.clone(),
+        )
+        .unwrap();
+        client
+            .save_tokens(Tokens {
+                access: "old-access".to_string(),
+                refresh: "old-refresh".to_string(),
+                email: "a@example.com".to_string(),
+            })
+            .unwrap();
+
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move { client.auth_get::<serde_json::Value>("/account/me").await }
+        });
+        wait_for_request(&server, "/auth/refresh").await;
+        client.logout().unwrap();
+
+        assert!(matches!(request.await.unwrap(), Err(Error::Unauthorized)));
+        assert_eq!(client.current_tokens(), None);
+        assert_eq!(store.load().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn account_switch_wins_over_a_delayed_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/account/me"))
+            .and(header("authorization", "Bearer old-access"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({
+                        "access_token": "late-access-a",
+                        "refresh_token": "late-refresh-a",
+                        "expires_in": 3600,
+                        "account": {
+                            "id": "account-a",
+                            "email": "a@example.com",
+                            "balance_cents": 100,
+                            "trial_seconds_remaining": 0
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = Arc::new(MemoryStore::new());
+        let client = CloudClient::new(
+            ClientConfig {
+                base_url: server.uri(),
+                user_agent: "test".to_string(),
+                timeout: Duration::from_secs(10),
+                trace_id: None,
+            },
+            store.clone(),
+        )
+        .unwrap();
+        client
+            .save_tokens(Tokens {
+                access: "old-access".to_string(),
+                refresh: "old-refresh".to_string(),
+                email: "a@example.com".to_string(),
+            })
+            .unwrap();
+
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move { client.auth_get::<serde_json::Value>("/account/me").await }
+        });
+        wait_for_request(&server, "/auth/refresh").await;
+        let linked = Tokens {
+            access: "access-b".to_string(),
+            refresh: "refresh-b".to_string(),
+            email: "b@example.com".to_string(),
+        };
+        client.save_tokens(linked.clone()).unwrap();
+
+        assert!(matches!(request.await.unwrap(), Err(Error::Unauthorized)));
+        assert_eq!(client.current_tokens(), Some(linked.clone()));
+        assert_eq!(store.load().unwrap(), Some(linked));
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ import {
   listeningViewState,
   shouldAcceptAudioStatus,
 } from "./liveTranscriptState";
+import { shouldRunLivePollers, transcriptHistoryView } from "./LiveTranscript";
 
 function status(
   state: AudioCaptureState,
@@ -23,6 +24,27 @@ function status(
 }
 
 describe("live transcript listening state", () => {
+  it("renders explicit loading, error, empty, and populated history states", () => {
+    expect(transcriptHistoryView("loading", 0)).toBe("loading");
+    expect(transcriptHistoryView("error", 0)).toBe("error");
+    expect(transcriptHistoryView("ready", 0)).toBe("empty");
+    expect(transcriptHistoryView("loading", 2)).toBe("content");
+    expect(transcriptHistoryView("error", 2)).toBe("content");
+  });
+
+  it("runs live pollers only for an available signed-in owner", () => {
+    expect(
+      shouldRunLivePollers({ owner_key: "account:a", signed_in: true, available: true }),
+    ).toBe(true);
+    expect(
+      shouldRunLivePollers({ owner_key: "local", signed_in: false, available: true }),
+    ).toBe(false);
+    expect(
+      shouldRunLivePollers({ owner_key: "unavailable", signed_in: false, available: false }),
+    ).toBe(false);
+    expect(shouldRunLivePollers(null)).toBe(false);
+  });
+
   it("distinguishes initial loading from an idle pipeline", () => {
     expect(listeningViewState(null, null, true)).toEqual({
       active: false,

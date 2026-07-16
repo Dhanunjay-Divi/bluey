@@ -11,11 +11,70 @@ use tauri::{
     Emitter, Manager,
 };
 
-use crate::commands::ActiveSessionState;
+use crate::commands::{
+    ActiveSessionState, DashboardOwner, DashboardOwnerCache, DashboardOwnerState,
+};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 /// Shared database state accessible from Tauri commands.
 pub struct DbState(pub Mutex<Database>);
+
+#[derive(Default)]
+struct LiveTranscriptPollCursor {
+    owner: Option<DashboardOwner>,
+    session_id: Option<String>,
+    count: usize,
+}
+
+impl LiveTranscriptPollCursor {
+    fn next_start(&mut self, owner: &DashboardOwner, session_id: &str, total: usize) -> usize {
+        if self.owner.as_ref() != Some(owner)
+            || self.session_id.as_deref() != Some(session_id)
+            || total < self.count
+        {
+            self.owner = Some(owner.clone());
+            self.session_id = Some(session_id.to_string());
+            self.count = 0;
+        }
+        let start = self.count;
+        self.count = total;
+        start
+    }
+
+    fn clear_session(&mut self, owner: Option<&DashboardOwner>) {
+        self.owner = owner.cloned();
+        self.session_id = None;
+        self.count = 0;
+    }
+}
+
+#[cfg(test)]
+mod live_transcript_poller_tests {
+    use super::*;
+
+    #[test]
+    fn poll_cursor_resets_for_account_and_session_changes() {
+        let owner_a = DashboardOwner::SignedIn("account-a".to_string());
+        let owner_b = DashboardOwner::SignedIn("account-b".to_string());
+        let mut cursor = LiveTranscriptPollCursor::default();
+
+        assert_eq!(cursor.next_start(&owner_a, "meeting-1", 2), 0);
+        assert_eq!(cursor.next_start(&owner_a, "meeting-1", 2), 2);
+        assert_eq!(cursor.next_start(&owner_a, "meeting-1", 3), 2);
+        assert_eq!(cursor.next_start(&owner_b, "meeting-1", 3), 0);
+        assert_eq!(cursor.next_start(&owner_b, "meeting-2", 4), 0);
+    }
+
+    #[test]
+    fn poll_cursor_clears_count_when_visible_meeting_disappears() {
+        let owner = DashboardOwner::SignedIn("account-a".to_string());
+        let mut cursor = LiveTranscriptPollCursor::default();
+
+        assert_eq!(cursor.next_start(&owner, "meeting-1", 5), 0);
+        cursor.clear_session(Some(&owner));
+        assert_eq!(cursor.next_start(&owner, "meeting-1", 5), 0);
+    }
+}
 
 pub fn run() {
     let _log_guard = cue_core::init_local_json_logging(
@@ -38,6 +97,7 @@ pub fn run() {
             commands::get_app_version,
             commands::get_balance_snapshot,
             commands::account_me,
+            commands::get_dashboard_owner,
             commands::billing_portal_url,
             commands::sign_out,
             commands::delete_account_now,
@@ -70,6 +130,7 @@ pub fn run() {
             // R5: Hotkey commands
             commands::daemon_listening_status,
             commands::daemon_toggle_listening,
+            commands::daemon_end_session,
             commands::daemon_set_push_to_talk,
             commands::daemon_toggle_overlay,
             // R5: Update check
@@ -112,12 +173,17 @@ pub fn run() {
                 .join("sessions.db");
             let db = Database::open(db_path.to_str().unwrap_or("bluey.db"))
                 .expect("failed to open database");
-            let restored = db.load_active_session().unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "failed to restore active session id");
-                None
-            });
+            let initial_owner = commands::current_dashboard_owner()
+                .map(Some)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "dashboard owner unavailable during startup");
+                    None
+                });
             app.manage(DbState(Mutex::new(db)));
-            app.manage(ActiveSessionState(Mutex::new(restored)));
+            app.manage(DashboardOwnerState(Mutex::new(DashboardOwnerCache::new(
+                initial_owner,
+            ))));
+            app.manage(ActiveSessionState(Mutex::new(None)));
             let listening_accelerator = {
                 let db_state: tauri::State<'_, DbState> = app.state();
                 commands::listening_shortcut_accelerator(&db_state)
@@ -129,10 +195,19 @@ pub fn run() {
             {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
-                    let mut last_count: usize = 0;
-                    let mut last_session_id = String::new();
+                    let mut cursor = LiveTranscriptPollCursor::default();
                     loop {
                         std::thread::sleep(std::time::Duration::from_millis(500));
+                        let owner = handle
+                            .state::<DashboardOwnerState>()
+                            .0
+                            .lock()
+                            .ok()
+                            .and_then(|owner| owner.owner.clone());
+                        let Some(owner) = owner else {
+                            cursor.clear_session(None);
+                            continue;
+                        };
                         let Ok(paths) = cue_core::app_paths::AppPaths::discover() else {
                             continue;
                         };
@@ -140,22 +215,20 @@ pub fn run() {
                             continue;
                         };
                         let Ok(Some(meeting)) = store.load_active() else {
-                            if last_count > 0 {
-                                last_count = 0;
-                                last_session_id.clear();
-                            }
+                            cursor.clear_session(Some(&owner));
                             continue;
                         };
-                        let sid = meeting.id.to_string();
-                        if sid != last_session_id {
-                            last_count = 0;
-                            last_session_id = sid.clone();
-                        }
-                        let total = meeting.transcript.len();
-                        if total <= last_count {
+                        if !owner.owns_meeting(meeting.owner_account_id.as_deref()) {
+                            cursor.clear_session(Some(&owner));
                             continue;
                         }
-                        for (i, seg) in meeting.transcript.iter().enumerate().skip(last_count) {
+                        let sid = meeting.id.to_string();
+                        let total = meeting.transcript.len();
+                        let start = cursor.next_start(&owner, &sid, total);
+                        if total <= start {
+                            continue;
+                        }
+                        for (i, seg) in meeting.transcript.iter().enumerate().skip(start) {
                             let source = match seg.speaker {
                                 cue_core::Speaker::System => "system",
                                 cue_core::Speaker::User => "microphone",
@@ -172,7 +245,6 @@ pub fn run() {
                             };
                             let _ = handle.emit("live_transcript", &payload);
                         }
-                        last_count = total;
                     }
                 });
             }
@@ -496,18 +568,68 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
         .await
     {
         Ok(resp) => {
-            if let Err(e) = client.save_tokens(cue_cloud_client::Tokens {
-                access: resp.access_token,
-                refresh: resp.refresh_token,
-                email: resp.account.email.clone(),
-            }) {
+            // Account replacement is a hard visibility boundary. Ask the
+            // daemon to stop audio and clear its active meeting/context before
+            // installing the new identity.
+            if let Err(error) = commands::begin_dashboard_owner_change(&app) {
+                tracing::warn!(%error, "failed to suspend dashboard owner before account switch");
+            }
+            if let Err(error) =
+                commands::daemon_ipc(cue_core::ipc::DaemonRequest::CloudLogout).await
+            {
+                tracing::warn!(%error, "daemon cleanup failed before dashboard account switch");
+            }
+
+            let paths = match cue_core::app_paths::AppPaths::discover() {
+                Ok(paths) => paths,
+                Err(e) => {
+                    let _ = commands::refresh_dashboard_owner_after_account_change(&app);
+                    let _ = app.emit(
+                        "deep_link_login",
+                        DeepLinkLoginResult {
+                            success: false,
+                            email: Some(resp.account.email),
+                            error: Some(format!("account store: {e}")),
+                        },
+                    );
+                    return;
+                }
+            };
+            let mut account = cue_core::load_account(&paths)
+                .ok()
+                .flatten()
+                .unwrap_or_else(cue_core::AccountConfig::local);
+            account.provider = "bluey".to_string();
+            account.cloud_account_id = Some(resp.account.id.clone());
+            account.user_id = resp.account.email.clone();
+            if account.workspace_id.trim().is_empty() || account.workspace_id == "local-workspace" {
+                account.workspace_id = "default".to_string();
+            }
+            account.linked_at = cue_core::clock::now_epoch_ms_string();
+            account.access_token = Some(resp.access_token);
+            account.refresh_token = Some(resp.refresh_token);
+
+            if let Err(e) = cue_cloud_client::save_account_profile_and_tokens(&paths, &account) {
                 tracing::warn!(error = %e, "save_tokens failed");
+                let _ = commands::refresh_dashboard_owner_after_account_change(&app);
                 let _ = app.emit(
                     "deep_link_login",
                     DeepLinkLoginResult {
                         success: false,
                         email: Some(resp.account.email),
                         error: Some(format!("account store: {e}")),
+                    },
+                );
+                return;
+            }
+            if let Err(e) = commands::refresh_dashboard_owner_after_account_change(&app) {
+                tracing::warn!(error = %e, "dashboard owner refresh failed after login");
+                let _ = app.emit(
+                    "deep_link_login",
+                    DeepLinkLoginResult {
+                        success: false,
+                        email: Some(resp.account.email),
+                        error: Some(e),
                     },
                 );
                 return;

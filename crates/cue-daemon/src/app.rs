@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1603,6 +1603,7 @@ struct Daemon {
     capture: Mutex<CaptureRuntime>,
     audio: Mutex<AudioPipelineStatus>,
     audio_runtime: Mutex<AudioRuntime>,
+    meeting_end_in_progress: AtomicBool,
     cloud: Mutex<CloudSyncStatus>,
     cloud_login: Mutex<Option<CloudLoginTask>>,
     listen_account_verified_until: Mutex<Option<Instant>>,
@@ -1746,6 +1747,32 @@ struct AudioFinalizingSession {
     expires_at: Instant,
 }
 
+struct AudioStopTransition {
+    stop: Option<oneshot::Sender<()>>,
+    stopped_session_id: Option<String>,
+    finalizing_session_id: Option<String>,
+    tail_deadline: Option<Instant>,
+    was_active_or_starting: bool,
+}
+
+struct MeetingEndInProgressGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> MeetingEndInProgressGuard<'a> {
+    fn try_acquire(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { flag })
+    }
+}
+
+impl Drop for MeetingEndInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AudioTranscriptSession {
     session_id: String,
@@ -1835,8 +1862,7 @@ pub async fn run() -> Result<()> {
     let active_meeting = store.load_active()?;
     let initial_state = state_from_active_meeting(active_meeting.as_ref());
     let cloud_status = cloud_status_from_env(&paths);
-    let (overlay_events_tx, overlay_events_rx) =
-        mpsc::channel(OVERLAY_EVENT_QUEUE_CAPACITY);
+    let (overlay_events_tx, overlay_events_rx) = mpsc::channel(OVERLAY_EVENT_QUEUE_CAPACITY);
     let overlay_bin = args.overlay_bin.clone();
     let rag_indexer = RagIndexCoordinator::from_paths(&paths);
     let balance_watch = crate::cloud::balance::BalanceWatch::default();
@@ -1863,6 +1889,7 @@ pub async fn run() -> Result<()> {
             start_generation: 0,
             starting: false,
         }),
+        meeting_end_in_progress: AtomicBool::new(false),
         cloud: Mutex::new(cloud_status),
         cloud_login: Mutex::new(None),
         listen_account_verified_until: Mutex::new(None),
@@ -2326,14 +2353,28 @@ async fn handle_request_inner(
             })
         }
         DaemonRequest::MeetingEnd => {
-            let mut meeting = {
+            let Some(_meeting_end_guard) =
+                MeetingEndInProgressGuard::try_acquire(&daemon.meeting_end_in_progress)
+            else {
+                return Ok(DaemonResponse::Text {
+                    text: "Meeting end is already in progress.".to_string(),
+                });
+            };
+
+            let stopped_audio = settle_audio_before_meeting_end(daemon).await;
+            if stopped_audio {
+                set_overlay_listening_state(daemon, ListeningState::Paused).await;
+            }
+
+            let meeting = {
                 let mut meeting_guard = daemon.meeting.lock().await;
-                let Some(meeting) = meeting_guard.take() else {
-                    return Ok(DaemonResponse::Text {
-                        text: "No meeting is active.".to_string(),
-                    });
-                };
-                meeting
+                meeting_guard.take()
+            };
+            let Some(mut meeting) = meeting else {
+                set_overlay_listening_state(daemon, ListeningState::Idle).await;
+                return Ok(DaemonResponse::Text {
+                    text: "No meeting is active.".to_string(),
+                });
             };
 
             if !meeting_has_recording_content(&meeting) {
@@ -2344,6 +2385,7 @@ async fn handle_request_inner(
                     send_overlay(daemon, OverlayCommand::SetContextItems { items: vec![] }).await;
                 refresh_overlay_sessions(daemon).await;
                 write_state(daemon).await?;
+                set_overlay_listening_state(daemon, ListeningState::Idle).await;
                 return Ok(DaemonResponse::Recap { recap });
             }
 
@@ -2368,6 +2410,7 @@ async fn handle_request_inner(
             // R10: Auto-recap via LLM (best-effort, fire-and-forget).
             spawn_auto_recap(daemon, &meeting);
             spawn_auto_cloud_sync(daemon, "meeting_end", Some(trace_id.to_string()));
+            set_overlay_listening_state(daemon, ListeningState::Idle).await;
             Ok(DaemonResponse::Recap { recap })
         }
         DaemonRequest::TranscriptAdd {
@@ -3093,10 +3136,7 @@ fn dispose_overlay_process(process: Option<OverlayProcess>) {
     }
 }
 
-fn spawn_overlay_event_handler(
-    daemon: Arc<Daemon>,
-    mut events: mpsc::Receiver<OverlayEvent>,
-) {
+fn spawn_overlay_event_handler(daemon: Arc<Daemon>, mut events: mpsc::Receiver<OverlayEvent>) {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             let event_kind = overlay_event_label(&event);
@@ -3832,8 +3872,19 @@ async fn start_audio_capture(
     daemon: &Arc<Daemon>,
     config: AudioCaptureConfig,
 ) -> Result<AudioPipelineStatus> {
+    if daemon.meeting_end_in_progress.load(Ordering::Acquire) {
+        return Err(anyhow!(
+            "the current session is still finishing; wait a moment before starting Listen again"
+        ));
+    }
+
     let start_generation = {
         let mut runtime = daemon.audio_runtime.lock().await;
+        if daemon.meeting_end_in_progress.load(Ordering::Acquire) {
+            return Err(anyhow!(
+                "the current session is still finishing; wait a moment before starting Listen again"
+            ));
+        }
         if runtime.starting || runtime.session_id.is_some() || runtime.stop.is_some() {
             let status = daemon.audio.lock().await.clone();
             info!(
@@ -3928,12 +3979,21 @@ async fn start_audio_capture(
 
     {
         let mut runtime = daemon.audio_runtime.lock().await;
-        if runtime.start_generation != start_generation || !runtime.starting {
+        if runtime.start_generation != start_generation
+            || !runtime.starting
+            || daemon.meeting_end_in_progress.load(Ordering::Acquire)
+        {
+            if runtime.start_generation == start_generation {
+                runtime.start_generation = runtime.start_generation.wrapping_add(1);
+                runtime.starting = false;
+            }
             info!(
                 session_id = %session_id,
                 "audio start canceled before capture runtime became active"
             );
-            return Ok(daemon.audio.lock().await.clone());
+            return Err(anyhow!(
+                "the current session finished while Listen was starting; start Listen again"
+            ));
         }
         runtime.stop = Some(stop_tx);
         runtime.session_id = Some(session_id.clone());
@@ -5468,12 +5528,15 @@ async fn run_relay_audio_source(
             .websocket_url
             .as_deref()
             .context("Bluey STT session did not include a websocket URL")?,
-        &stt_session.session_token,
     )?;
     let mut request = websocket_url.into_client_request()?;
     request.headers_mut().insert(
         "Authorization",
         HeaderValue::from_str(&format!("Bearer {access_token}"))?,
+    );
+    request.headers_mut().insert(
+        "x-bluey-stt-session",
+        HeaderValue::from_str(&stt_session.session_token)?,
     );
 
     let (socket, _) = match tokio_tungstenite::connect_async(request).await {
@@ -5826,22 +5889,18 @@ async fn emit_deepgram_relay_payload(
     Ok(())
 }
 
-fn stt_relay_websocket_url(endpoint: &str, session_token: &str) -> Result<String> {
+fn stt_relay_websocket_url(endpoint: &str) -> Result<String> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
         return Err(anyhow!("empty Bluey STT relay URL"));
     }
-    let mut url = if let Some(rest) = endpoint.strip_prefix("https://") {
+    let url = if let Some(rest) = endpoint.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = endpoint.strip_prefix("http://") {
         format!("ws://{rest}")
     } else {
         endpoint.to_string()
     };
-    let sep = if url.contains('?') { '&' } else { '?' };
-    url.push(sep);
-    url.push_str("session_token=");
-    url.push_str(&url_component(session_token));
     Ok(url)
 }
 
@@ -8025,30 +8084,73 @@ async fn transcribe_audio_file(
     Ok(Some(segment))
 }
 
-async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
-    let (stop, finalizing_session_id) = {
+fn request_audio_stop_transition(
+    runtime: &mut AudioRuntime,
+    now: Instant,
+    tail_window: Duration,
+) -> AudioStopTransition {
+    let was_active_or_starting =
+        runtime.starting || runtime.session_id.is_some() || runtime.stop.is_some();
+    runtime.start_generation = runtime.start_generation.wrapping_add(1);
+    runtime.starting = false;
+
+    if runtime
+        .finalizing_session
+        .as_ref()
+        .is_some_and(|finalizing| finalizing.expires_at <= now)
+    {
+        runtime.finalizing_session = None;
+    }
+
+    let stopped_session_id = runtime.session_id.take();
+    let stopped_meeting_id = runtime.meeting_id.take();
+    if let (Some(session_id), Some(meeting_id)) = (stopped_session_id.as_ref(), stopped_meeting_id)
+    {
+        runtime.finalizing_session = Some(AudioFinalizingSession {
+            session_id: session_id.clone(),
+            meeting_id,
+            expires_at: now + tail_window,
+        });
+    } else if let Some(finalizing) = runtime.finalizing_session.as_mut() {
+        finalizing.expires_at = finalizing.expires_at.min(now + tail_window);
+    }
+
+    let finalizing_session_id = runtime
+        .finalizing_session
+        .as_ref()
+        .map(|finalizing| finalizing.session_id.clone());
+    let tail_deadline = runtime
+        .finalizing_session
+        .as_ref()
+        .map(|finalizing| finalizing.expires_at.min(now + tail_window));
+
+    AudioStopTransition {
+        stop: runtime.stop.take(),
+        stopped_session_id,
+        finalizing_session_id,
+        tail_deadline,
+        was_active_or_starting,
+    }
+}
+
+async fn request_audio_stop(daemon: &Arc<Daemon>) -> (AudioPipelineStatus, AudioStopTransition) {
+    let (status, mut transition) = {
         let mut runtime = daemon.audio_runtime.lock().await;
-        runtime.start_generation = runtime.start_generation.wrapping_add(1);
-        runtime.starting = false;
-        let finalizing_session_id = runtime.session_id.take();
-        let finalizing_meeting_id = runtime.meeting_id.take();
-        if let (Some(session_id), Some(meeting_id)) =
-            (finalizing_session_id.as_ref(), finalizing_meeting_id)
-        {
-            runtime.finalizing_session = Some(AudioFinalizingSession {
-                session_id: session_id.clone(),
-                meeting_id,
-                expires_at: Instant::now() + live_stt_tail_acceptance_window(),
-            });
-        } else {
-            runtime.finalizing_session = None;
-        }
-        (runtime.stop.take(), finalizing_session_id)
+        let transition = request_audio_stop_transition(
+            &mut runtime,
+            Instant::now(),
+            live_stt_tail_acceptance_window(),
+        );
+        let mut audio = daemon.audio.lock().await;
+        let status = audio.clone().stopped();
+        *audio = status.clone();
+        (status, transition)
     };
-    if let Some(stop) = stop {
+
+    if let Some(stop) = transition.stop.take() {
         let _ = stop.send(());
     }
-    if let Some(session_id) = finalizing_session_id {
+    if let Some(session_id) = transition.stopped_session_id.as_ref() {
         info!(
             session_id = %session_id,
             tail_acceptance_ms = live_stt_tail_acceptance_window().as_millis() as u64,
@@ -8056,10 +8158,58 @@ async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
         );
     }
 
-    let mut audio = daemon.audio.lock().await;
-    let status = audio.clone().stopped();
-    *audio = status.clone();
-    status
+    (status, transition)
+}
+
+async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
+    request_audio_stop(daemon).await.0
+}
+
+async fn settle_audio_before_meeting_end(daemon: &Arc<Daemon>) -> bool {
+    let (_, transition) = request_audio_stop(daemon).await;
+    let stopped_audio = transition.was_active_or_starting;
+    let (Some(session_id), Some(deadline)) =
+        (transition.finalizing_session_id, transition.tail_deadline)
+    else {
+        return stopped_audio;
+    };
+
+    let wait_started_at = Instant::now();
+    loop {
+        let remaining = {
+            let runtime = daemon.audio_runtime.lock().await;
+            runtime
+                .finalizing_session
+                .as_ref()
+                .filter(|finalizing| finalizing.session_id == session_id)
+                .map(|finalizing| finalizing.expires_at.min(deadline))
+                .and_then(|expires_at| expires_at.checked_duration_since(Instant::now()))
+        };
+        let Some(remaining) = remaining.filter(|remaining| !remaining.is_zero()) else {
+            break;
+        };
+        sleep(remaining.min(Duration::from_millis(25))).await;
+    }
+
+    {
+        let mut runtime = daemon.audio_runtime.lock().await;
+        if runtime
+            .finalizing_session
+            .as_ref()
+            .is_some_and(|finalizing| {
+                finalizing.session_id == session_id && finalizing.expires_at <= Instant::now()
+            })
+        {
+            runtime.finalizing_session = None;
+        }
+    }
+    info!(
+        session_id = %session_id,
+        waited_ms = wait_started_at.elapsed().as_millis() as u64,
+        "meeting end waited for live STT tail settlement"
+    );
+
+    stopped_audio
 }
 
 fn live_stt_tail_acceptance_window() -> Duration {
@@ -20469,22 +20619,20 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
     }
 
     #[test]
-    fn stt_relay_websocket_url_converts_http_and_appends_token() {
-        let url =
-            stt_relay_websocket_url("https://bluey.sh/stt/relay", "tok /1").expect("websocket URL");
+    fn stt_relay_websocket_url_converts_http_without_credentials() {
+        let url = stt_relay_websocket_url("https://bluey.sh/stt/relay").expect("websocket URL");
 
-        assert_eq!(url, "wss://bluey.sh/stt/relay?session_token=tok%20%2F1");
+        assert_eq!(url, "wss://bluey.sh/stt/relay");
+        assert!(!url.contains("token"));
     }
 
     #[test]
     fn stt_relay_websocket_url_preserves_existing_query() {
-        let url = stt_relay_websocket_url("http://127.0.0.1:8787/stt/relay?debug=1", "tok")
+        let url = stt_relay_websocket_url("http://127.0.0.1:8787/stt/relay?debug=1")
             .expect("websocket URL");
 
-        assert_eq!(
-            url,
-            "ws://127.0.0.1:8787/stt/relay?debug=1&session_token=tok"
-        );
+        assert_eq!(url, "ws://127.0.0.1:8787/stt/relay?debug=1");
+        assert!(!url.contains("session_token"));
     }
 
     #[test]
@@ -20616,6 +20764,95 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
         )
         .is_none());
         assert!(runtime.finalizing_session.is_none());
+    }
+
+    #[test]
+    fn audio_stop_transition_preserves_session_for_final_stt_tail() {
+        let now = Instant::now();
+        let tail_window = Duration::from_millis(850);
+        let meeting_id = uuid::Uuid::new_v4();
+        let (stop_tx, _stop_rx) = oneshot::channel();
+        let mut runtime = AudioRuntime {
+            stop: Some(stop_tx),
+            session_id: Some("active-run".to_string()),
+            meeting_id: Some(meeting_id),
+            finalizing_session: None,
+            start_generation: 7,
+            starting: true,
+        };
+
+        let transition = request_audio_stop_transition(&mut runtime, now, tail_window);
+
+        assert!(transition.stop.is_some());
+        assert_eq!(transition.stopped_session_id.as_deref(), Some("active-run"));
+        assert_eq!(
+            transition.finalizing_session_id.as_deref(),
+            Some("active-run")
+        );
+        assert_eq!(transition.tail_deadline, Some(now + tail_window));
+        assert!(transition.was_active_or_starting);
+        assert_eq!(runtime.start_generation, 8);
+        assert!(!runtime.starting);
+        assert!(runtime.stop.is_none());
+        assert!(runtime.session_id.is_none());
+        assert!(runtime.meeting_id.is_none());
+        let finalizing = runtime
+            .finalizing_session
+            .as_ref()
+            .expect("final STT tail must remain addressable");
+        assert_eq!(finalizing.session_id, "active-run");
+        assert_eq!(finalizing.meeting_id, meeting_id);
+        assert_eq!(finalizing.expires_at, now + tail_window);
+    }
+
+    #[test]
+    fn audio_stop_transition_keeps_existing_tail_but_never_extends_it() {
+        let now = Instant::now();
+        let meeting_id = uuid::Uuid::new_v4();
+        let original_deadline = now + Duration::from_millis(400);
+        let mut runtime = AudioRuntime {
+            stop: None,
+            session_id: None,
+            meeting_id: None,
+            finalizing_session: Some(AudioFinalizingSession {
+                session_id: "finishing-run".to_string(),
+                meeting_id,
+                expires_at: original_deadline,
+            }),
+            start_generation: 2,
+            starting: false,
+        };
+
+        let transition =
+            request_audio_stop_transition(&mut runtime, now, Duration::from_millis(850));
+
+        assert!(!transition.was_active_or_starting);
+        assert_eq!(
+            transition.finalizing_session_id.as_deref(),
+            Some("finishing-run")
+        );
+        assert_eq!(transition.tail_deadline, Some(original_deadline));
+        assert_eq!(
+            runtime
+                .finalizing_session
+                .as_ref()
+                .map(|session| session.expires_at),
+            Some(original_deadline)
+        );
+    }
+
+    #[test]
+    fn meeting_end_guard_serializes_and_releases_requests() {
+        let flag = AtomicBool::new(false);
+        let first =
+            MeetingEndInProgressGuard::try_acquire(&flag).expect("first end request acquires");
+
+        assert!(flag.load(Ordering::Acquire));
+        assert!(MeetingEndInProgressGuard::try_acquire(&flag).is_none());
+
+        drop(first);
+        assert!(!flag.load(Ordering::Acquire));
+        assert!(MeetingEndInProgressGuard::try_acquire(&flag).is_some());
     }
 
     #[test]
@@ -21720,6 +21957,7 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
                 start_generation: 0,
                 starting: false,
             }),
+            meeting_end_in_progress: AtomicBool::new(false),
             cloud: Mutex::new(cloud_status_from_env(&paths)),
             cloud_login: Mutex::new(None),
             listen_account_verified_until: Mutex::new(Some(

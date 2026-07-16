@@ -3,6 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
+    owner_account_id TEXT,
     title TEXT NOT NULL DEFAULT 'Untitled session',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'archived')),
     created_at INTEGER NOT NULL,

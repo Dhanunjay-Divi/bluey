@@ -10,7 +10,7 @@ use axum::{
         ws::{Message as ClientMessage, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -46,6 +46,7 @@ const DEFAULT_DEEPGRAM_LANGUAGE: &str = "en-IN";
 const DEFAULT_DEEPGRAM_NO_DELAY: bool = true;
 const DEFAULT_DEEPGRAM_SMART_FORMAT: bool = false;
 const MAX_DEEPGRAM_KEYTERMS: usize = 64;
+const BLUEY_STT_SESSION_HEADER: &str = "x-bluey-stt-session";
 const DEFAULT_DEEPGRAM_KEYTERMS: &[&str] = &[
     "LRU",
     "FIFO",
@@ -142,7 +143,8 @@ pub struct SttSessionCancelResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct SttRelayQuery {
-    pub session_token: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
 }
 
 pub async fn create_session(
@@ -272,9 +274,11 @@ pub async fn relay(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Query(query): Query<SttRelayQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, (StatusCode, String)> {
-    let session = claim_relay_session(&state, &account.id, &query.session_token)?;
+    let session_token = stt_relay_session_token(&headers, query.session_token.as_deref())?;
+    let session = claim_relay_session(&state, &account.id, session_token)?;
     let deepgram_key = state
         .config
         .upstream
@@ -293,6 +297,34 @@ pub async fn relay(
             }
         })
         .into_response())
+}
+
+fn stt_relay_session_token<'a>(
+    headers: &'a HeaderMap,
+    query_token: Option<&'a str>,
+) -> Result<&'a str, (StatusCode, String)> {
+    let header_token = headers
+        .get(BLUEY_STT_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let query_token = query_token.map(str::trim).filter(|value| !value.is_empty());
+
+    if let (Some(header_token), Some(query_token)) = (header_token, query_token) {
+        if header_token != query_token {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "conflicting STT session credentials".to_string(),
+            ));
+        }
+    }
+
+    header_token.or(query_token).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "STT session credential is required".to_string(),
+        )
+    })
 }
 
 fn default_source() -> String {
@@ -1068,6 +1100,43 @@ mod tests {
     use super::*;
     use crate::db::{open_pool, run_migrations};
     use std::sync::Mutex;
+
+    #[test]
+    fn relay_session_token_prefers_header_without_query_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            BLUEY_STT_SESSION_HEADER,
+            HeaderValue::from_static("header-token"),
+        );
+
+        assert_eq!(
+            stt_relay_session_token(&headers, None).expect("header token"),
+            "header-token"
+        );
+    }
+
+    #[test]
+    fn relay_session_token_keeps_legacy_query_compatibility() {
+        assert_eq!(
+            stt_relay_session_token(&HeaderMap::new(), Some("legacy-token"))
+                .expect("legacy query token"),
+            "legacy-token"
+        );
+    }
+
+    #[test]
+    fn relay_session_token_rejects_conflicting_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            BLUEY_STT_SESSION_HEADER,
+            HeaderValue::from_static("header-token"),
+        );
+
+        let (status, message) =
+            stt_relay_session_token(&headers, Some("query-token")).expect_err("conflict");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(message, "conflicting STT session credentials");
+    }
 
     static DEEPGRAM_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
 

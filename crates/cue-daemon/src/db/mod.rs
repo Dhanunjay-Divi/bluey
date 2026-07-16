@@ -71,9 +71,13 @@ impl Database {
             include_str!("../../../../infra/migrations/008_fts_cascade_fix.sql");
         const MIGRATION_009: &str =
             include_str!("../../../../infra/migrations/009_cue_responses.sql");
+        const MIGRATION_012: &str =
+            include_str!("../../../../infra/migrations/012_session_ownership.sql");
         self.conn
             .execute_batch(MIGRATION_002)
             .context("failed to run session migration")?;
+        self.ensure_session_owner_column()
+            .context("failed to ensure session owner column")?;
         self.conn
             .execute_batch(MIGRATION_003)
             .context("failed to run turns unique index migration")?;
@@ -95,8 +99,26 @@ impl Database {
         self.conn
             .execute_batch(MIGRATION_009)
             .context("failed to run cue_responses migration")?;
+        self.conn
+            .execute_batch(MIGRATION_012)
+            .context("failed to run session ownership migration")?;
         self.ensure_cue_response_billing_columns()
             .context("failed to ensure cue_response billing columns")?;
+        Ok(())
+    }
+
+    fn ensure_session_owner_column(&self) -> Result<()> {
+        let has_owner_column = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(sessions)")?;
+            let columns = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            columns.iter().any(|column| column == "owner_account_id")
+        };
+        if !has_owner_column {
+            self.conn
+                .execute("ALTER TABLE sessions ADD COLUMN owner_account_id TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -128,20 +150,40 @@ impl Database {
     }
 
     pub fn create_session(&self, title: Option<String>) -> Result<Session> {
+        self.create_session_for_owner(None, title)
+    }
+
+    pub fn create_session_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        title: Option<String>,
+    ) -> Result<Session> {
         let id = Uuid::new_v4();
         let now = now_ms();
         let title = title.unwrap_or_else(|| "Untitled session".to_string());
         self.conn.execute(
-            "INSERT INTO sessions (id, title, status, created_at, updated_at, last_active_at) \
-             VALUES (?1, ?2, 'active', ?3, ?3, ?3)",
-            params![id.to_string(), title, now],
+            "INSERT INTO sessions (
+                id, owner_account_id, title, status, created_at, updated_at, last_active_at
+             ) VALUES (?1, ?2, ?3, 'active', ?4, ?4, ?4)",
+            params![id.to_string(), owner_account_id, title, now],
         )?;
-        self.get_session(id)?
+        self.get_session_for_owner(owner_account_id, id)?
             .context("session not found after insert")
     }
 
     pub fn ensure_session_record(
         &self,
+        id: Uuid,
+        title: &str,
+        created_at: i64,
+        updated_at: i64,
+    ) -> Result<()> {
+        self.ensure_session_record_for_owner(None, id, title, created_at, updated_at)
+    }
+
+    pub fn ensure_session_record_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
         id: Uuid,
         title: &str,
         created_at: i64,
@@ -155,28 +197,49 @@ impl Database {
         };
         let created_at = if created_at > 0 { created_at } else { now_ms() };
         let updated_at = updated_at.max(created_at);
-        self.conn.execute(
-            "INSERT INTO sessions (id, title, status, created_at, updated_at, last_active_at)
-             VALUES (?1, ?2, 'active', ?3, ?4, ?4)
+        let changed = self.conn.execute(
+            "INSERT INTO sessions (
+                id, owner_account_id, title, status, created_at, updated_at, last_active_at
+             ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?5)
              ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 updated_at = MAX(sessions.updated_at, excluded.updated_at),
                 last_active_at = MAX(
                     COALESCE(sessions.last_active_at, 0),
                     COALESCE(excluded.last_active_at, 0)
-                )",
-            params![id.to_string(), title, created_at, updated_at],
+                )
+             WHERE sessions.owner_account_id IS excluded.owner_account_id",
+            params![
+                id.to_string(),
+                owner_account_id,
+                title,
+                created_at,
+                updated_at
+            ],
         )?;
+        if changed == 0 {
+            return Err(anyhow::anyhow!(
+                "session {id} not found for requested owner scope"
+            ));
+        }
         Ok(())
     }
 
     pub fn get_session(&self, id: Uuid) -> Result<Option<Session>> {
+        self.get_session_for_owner(None, id)
+    }
+
+    pub fn get_session_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        id: Uuid,
+    ) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, status, created_at, updated_at, last_active_at, \
              archived_at, token_count, compressed_summary, active_skill, metadata \
-             FROM sessions WHERE id = ?1",
+             FROM sessions WHERE id = ?1 AND owner_account_id IS ?2",
         )?;
-        let mut rows = stmt.query_map(params![id.to_string()], row_to_session)?;
+        let mut rows = stmt.query_map(params![id.to_string(), owner_account_id], row_to_session)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -184,62 +247,111 @@ impl Database {
     }
 
     pub fn list_sessions(&self, status: Option<SessionStatus>, limit: u32) -> Result<Vec<Session>> {
-        let (sql, p): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status {
-            Some(s) => (
+        self.list_sessions_for_owner(None, status, limit)
+    }
+
+    pub fn list_sessions_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        status: Option<SessionStatus>,
+        limit: u32,
+    ) -> Result<Vec<Session>> {
+        if let Some(status) = status {
+            let mut stmt = self.conn.prepare(
                 "SELECT id, title, status, created_at, updated_at, last_active_at, \
                  archived_at, token_count, compressed_summary, active_skill, metadata \
-                 FROM sessions WHERE status = ?1 ORDER BY updated_at DESC LIMIT ?2"
-                    .to_string(),
-                vec![Box::new(s.as_str().to_string()), Box::new(limit)],
-            ),
-            None => (
-                "SELECT id, title, status, created_at, updated_at, last_active_at, \
-                 archived_at, token_count, compressed_summary, active_skill, metadata \
-                 FROM sessions ORDER BY updated_at DESC LIMIT ?1"
-                    .to_string(),
-                vec![Box::new(limit)],
-            ),
-        };
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(p.iter()), row_to_session)?;
+                 FROM sessions \
+                 WHERE owner_account_id IS ?1 AND status = ?2 \
+                 ORDER BY updated_at DESC LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![owner_account_id, status.as_str(), limit],
+                row_to_session,
+            )?;
+            return rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, status, created_at, updated_at, last_active_at, \
+             archived_at, token_count, compressed_summary, active_skill, metadata \
+             FROM sessions WHERE owner_account_id IS ?1 \
+             ORDER BY updated_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![owner_account_id, limit], row_to_session)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 
     pub fn update_session_status(&self, id: Uuid, status: SessionStatus) -> Result<()> {
+        self.update_session_status_for_owner(None, id, status)
+    }
+
+    pub fn update_session_status_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        id: Uuid,
+        status: SessionStatus,
+    ) -> Result<()> {
         let now = now_ms();
         self.conn.execute(
             "UPDATE sessions SET status = ?1, updated_at = ?2, \
-             archived_at = CASE WHEN ?1 = 'archived' THEN ?2 ELSE NULL END WHERE id = ?3",
-            params![status.as_str(), now, id.to_string()],
+             archived_at = CASE WHEN ?1 = 'archived' THEN ?2 ELSE NULL END \
+             WHERE id = ?3 AND owner_account_id IS ?4",
+            params![status.as_str(), now, id.to_string(), owner_account_id],
         )?;
         Ok(())
     }
 
     pub fn update_session_title(&self, id: Uuid, title: &str) -> Result<()> {
+        self.update_session_title_for_owner(None, id, title)
+    }
+
+    pub fn update_session_title_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        id: Uuid,
+        title: &str,
+    ) -> Result<()> {
         let title = title.trim();
         if title.is_empty() {
             return Err(anyhow::anyhow!("session title cannot be empty"));
         }
         let now = now_ms();
         let changed = self.conn.execute(
-            "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
-            params![title, now, id.to_string()],
+            "UPDATE sessions SET title = ?1, updated_at = ?2 \
+             WHERE id = ?3 AND owner_account_id IS ?4",
+            params![title, now, id.to_string(), owner_account_id],
         )?;
         if changed == 0 {
-            return Err(anyhow::anyhow!("session {id} not found"));
+            return Err(anyhow::anyhow!(
+                "session {id} not found for requested owner scope"
+            ));
         }
         Ok(())
     }
 
     pub fn archive_session(&self, id: Uuid) -> Result<()> {
-        self.update_session_status(id, SessionStatus::Archived)
+        self.archive_session_for_owner(None, id)
+    }
+
+    pub fn archive_session_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        id: Uuid,
+    ) -> Result<()> {
+        self.update_session_status_for_owner(owner_account_id, id, SessionStatus::Archived)
     }
 
     pub fn delete_session(&self, id: Uuid) -> Result<()> {
+        self.delete_session_for_owner(None, id)
+    }
+
+    pub fn delete_session_for_owner(&self, owner_account_id: Option<&str>, id: Uuid) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM sessions WHERE id = ?1",
-            params![id.to_string()],
+            "DELETE FROM sessions WHERE id = ?1 AND owner_account_id IS ?2",
+            params![id.to_string(), owner_account_id],
         )?;
         Ok(())
     }
@@ -311,13 +423,29 @@ impl Database {
     }
 
     pub fn list_turns(&self, session_id: Uuid, limit: Option<u32>) -> Result<Vec<Turn>> {
+        self.list_turns_for_owner(None, session_id, limit)
+    }
+
+    pub fn list_turns_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        session_id: Uuid,
+        limit: Option<u32>,
+    ) -> Result<Vec<Turn>> {
         let limit = limit.unwrap_or(1000);
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, turn_index, user_message, model_response, lane, \
-             provider, model, created_at, duration_ms, input_tokens, output_tokens, \
-             cost_cents FROM turns WHERE session_id = ?1 ORDER BY turn_index ASC LIMIT ?2",
+            "SELECT turns.id, turns.session_id, turns.turn_index, turns.user_message, \
+             turns.model_response, turns.lane, turns.provider, turns.model, turns.created_at, \
+             turns.duration_ms, turns.input_tokens, turns.output_tokens, turns.cost_cents \
+             FROM turns \
+             INNER JOIN sessions ON sessions.id = turns.session_id \
+             WHERE turns.session_id = ?1 AND sessions.owner_account_id IS ?2 \
+             ORDER BY turns.turn_index ASC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![session_id.to_string(), limit], row_to_turn)?;
+        let rows = stmt.query_map(
+            params![session_id.to_string(), owner_account_id, limit],
+            row_to_turn,
+        )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -359,14 +487,22 @@ impl Database {
     /// it still points at a real session. Invalid / stale ids return `None`
     /// so the caller can fall back to "no selection" cleanly.
     pub fn load_active_session(&self) -> Result<Option<Uuid>> {
-        let raw = match self.get_app_state("active_session_id")? {
+        self.load_active_session_for_owner(None)
+    }
+
+    pub fn load_active_session_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+    ) -> Result<Option<Uuid>> {
+        let key = active_session_state_key(owner_account_id);
+        let raw = match self.get_app_state(&key)? {
             Some(s) => s,
             None => return Ok(None),
         };
         let Ok(id) = Uuid::parse_str(&raw) else {
             return Ok(None);
         };
-        if self.get_session(id)?.is_none() {
+        if self.get_session_for_owner(owner_account_id, id)?.is_none() {
             return Ok(None);
         }
         Ok(Some(id))
@@ -374,9 +510,18 @@ impl Database {
 
     /// Persist the active session id. Pass `None` to clear.
     pub fn save_active_session(&self, id: Option<Uuid>) -> Result<()> {
+        self.save_active_session_for_owner(None, id)
+    }
+
+    pub fn save_active_session_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        id: Option<Uuid>,
+    ) -> Result<()> {
+        let key = active_session_state_key(owner_account_id);
         match id {
-            Some(u) => self.set_app_state("active_session_id", Some(&u.to_string())),
-            None => self.set_app_state("active_session_id", None),
+            Some(u) => self.set_app_state(&key, Some(&u.to_string())),
+            None => self.set_app_state(&key, None),
         }
     }
 
@@ -536,6 +681,13 @@ impl Database {
     pub fn reset_keybinds(&self) -> Result<()> {
         self.conn.execute_batch("DELETE FROM user_keybinds;")?;
         Ok(())
+    }
+}
+
+fn active_session_state_key(owner_account_id: Option<&str>) -> String {
+    match owner_account_id {
+        Some(owner_account_id) => format!("active_session_id:owner:{owner_account_id}"),
+        None => "active_session_id:local".to_string(),
     }
 }
 
@@ -753,6 +905,249 @@ mod tests {
 
         let all = db.list_sessions(None, 10).unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_owner_scoped_sessions_isolate_two_owners_and_local() {
+        let db = test_db();
+        let owner_a = "acct-a";
+        let owner_b = "acct-b";
+        let local = db.create_session(Some("Local".into())).unwrap();
+        let session_a = db
+            .create_session_for_owner(Some(owner_a), Some("Owner A".into()))
+            .unwrap();
+        let session_b = db
+            .create_session_for_owner(Some(owner_b), Some("Owner B".into()))
+            .unwrap();
+
+        assert!(db.get_session(session_a.id).unwrap().is_none());
+        assert!(db
+            .get_session_for_owner(Some(owner_a), local.id)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_session_for_owner(Some(owner_b), session_a.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.get_session_for_owner(Some(owner_a), session_a.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "Owner A"
+        );
+
+        let local_sessions = db.list_sessions(None, 10).unwrap();
+        assert_eq!(local_sessions.len(), 1);
+        assert_eq!(local_sessions[0].id, local.id);
+
+        let owner_a_sessions = db.list_sessions_for_owner(Some(owner_a), None, 10).unwrap();
+        assert_eq!(owner_a_sessions.len(), 1);
+        assert_eq!(owner_a_sessions[0].id, session_a.id);
+
+        let owner_b_sessions = db
+            .list_sessions_for_owner(Some(owner_b), Some(SessionStatus::Active), 10)
+            .unwrap();
+        assert_eq!(owner_b_sessions.len(), 1);
+        assert_eq!(owner_b_sessions[0].id, session_b.id);
+
+        let ensured_id = Uuid::new_v4();
+        db.ensure_session_record_for_owner(Some(owner_a), ensured_id, "Ensured A", 10, 20)
+            .unwrap();
+        assert!(db
+            .get_session_for_owner(Some(owner_a), ensured_id)
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get_session_for_owner(Some(owner_b), ensured_id)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .ensure_session_record_for_owner(Some(owner_b), ensured_id, "Hijacked", 10, 30)
+            .is_err());
+        assert_eq!(
+            db.get_session_for_owner(Some(owner_a), ensured_id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "Ensured A"
+        );
+    }
+
+    #[test]
+    fn test_owner_scoped_mutations_and_turn_reads_do_not_cross_owners() {
+        let db = test_db();
+        let owner_a = "acct-a";
+        let owner_b = "acct-b";
+        let local = db.create_session(Some("Local".into())).unwrap();
+        let session_a = db
+            .create_session_for_owner(Some(owner_a), Some("Owner A".into()))
+            .unwrap();
+        let session_b = db
+            .create_session_for_owner(Some(owner_b), Some("Owner B".into()))
+            .unwrap();
+
+        assert!(db
+            .update_session_title_for_owner(Some(owner_b), session_a.id, "Wrong owner")
+            .is_err());
+        db.update_session_status_for_owner(Some(owner_b), session_a.id, SessionStatus::Paused)
+            .unwrap();
+        db.archive_session_for_owner(None, session_a.id).unwrap();
+        db.delete_session_for_owner(Some(owner_b), session_a.id)
+            .unwrap();
+
+        let untouched = db
+            .get_session_for_owner(Some(owner_a), session_a.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.title, "Owner A");
+        assert_eq!(untouched.status, SessionStatus::Active);
+
+        db.append_turn(
+            session_a.id,
+            NewTurn {
+                user_message: "private question".into(),
+                model_response: "private answer".into(),
+                lane: Lane::Solve,
+                provider: "test".into(),
+                model: "test".into(),
+                created_at: 100,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cost_cents: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.list_turns_for_owner(Some(owner_a), session_a.id, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .list_turns_for_owner(Some(owner_b), session_a.id, None)
+            .unwrap()
+            .is_empty());
+        assert!(db.list_turns(session_a.id, None).unwrap().is_empty());
+
+        db.update_session_title_for_owner(Some(owner_a), session_a.id, "Renamed A")
+            .unwrap();
+        db.update_session_status_for_owner(Some(owner_a), session_a.id, SessionStatus::Paused)
+            .unwrap();
+        assert_eq!(
+            db.get_session_for_owner(Some(owner_a), session_a.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Paused
+        );
+        db.archive_session_for_owner(Some(owner_a), session_a.id)
+            .unwrap();
+        assert_eq!(
+            db.get_session_for_owner(Some(owner_a), session_a.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Archived
+        );
+
+        db.delete_session_for_owner(Some(owner_a), session_a.id)
+            .unwrap();
+        assert!(db
+            .get_session_for_owner(Some(owner_a), session_a.id)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_session_for_owner(Some(owner_b), session_b.id)
+            .unwrap()
+            .is_some());
+        assert!(db.get_session(local.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_existing_session_database_migrates_rows_and_active_pointer_to_local() {
+        let dir = std::env::temp_dir().join(format!("bluey-owner-migration-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.db");
+        let session_id = Uuid::new_v4();
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT 'Untitled session',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    last_active_at INTEGER,
+                    archived_at INTEGER,
+                    token_count INTEGER NOT NULL DEFAULT 0,
+                    compressed_summary TEXT,
+                    active_skill TEXT,
+                    metadata TEXT
+                 );
+                 CREATE TABLE app_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, title, status, created_at, updated_at)
+                 VALUES (?1, 'Legacy local', 'active', 1, 1)",
+                params![session_id.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at)
+                 VALUES ('active_session_id', ?1, 1)",
+                params![session_id.to_string()],
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        let owner: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT owner_account_id FROM sessions WHERE id = ?1",
+                params![session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, None);
+        assert!(db.get_session(session_id).unwrap().is_some());
+        assert!(db
+            .get_session_for_owner(Some("acct-a"), session_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(db.load_active_session().unwrap(), Some(session_id));
+        assert_eq!(
+            db.load_active_session_for_owner(Some("acct-a")).unwrap(),
+            None
+        );
+        assert_eq!(db.get_app_state("active_session_id").unwrap(), None);
+
+        let owner_index_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name IN ('idx_sessions_owner_updated', 'idx_sessions_owner_status_updated')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner_index_count, 2);
+
+        drop(db);
+        let reopened = Database::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.load_active_session().unwrap(), Some(session_id));
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -976,6 +1371,72 @@ mod tests {
         // And we can clear explicitly
         db.save_active_session(None).unwrap();
         assert_eq!(db.load_active_session().unwrap(), None);
+    }
+
+    #[test]
+    fn test_active_session_pointers_are_isolated_and_validate_ownership() {
+        let db = test_db();
+        let owner_a = "local";
+        let owner_b = "acct-b";
+        let local = db.create_session(Some("Local".into())).unwrap();
+        let session_a = db
+            .create_session_for_owner(Some(owner_a), Some("Owner A".into()))
+            .unwrap();
+        let session_b = db
+            .create_session_for_owner(Some(owner_b), Some("Owner B".into()))
+            .unwrap();
+
+        db.save_active_session(Some(local.id)).unwrap();
+        db.save_active_session_for_owner(Some(owner_a), Some(session_a.id))
+            .unwrap();
+        db.save_active_session_for_owner(Some(owner_b), Some(session_b.id))
+            .unwrap();
+
+        assert_eq!(db.load_active_session().unwrap(), Some(local.id));
+        assert_eq!(
+            db.load_active_session_for_owner(Some(owner_a)).unwrap(),
+            Some(session_a.id)
+        );
+        assert_eq!(
+            db.load_active_session_for_owner(Some(owner_b)).unwrap(),
+            Some(session_b.id)
+        );
+        assert_eq!(
+            db.get_app_state("active_session_id:local").unwrap(),
+            Some(local.id.to_string())
+        );
+        assert_eq!(
+            db.get_app_state("active_session_id:owner:local").unwrap(),
+            Some(session_a.id.to_string())
+        );
+        assert_eq!(
+            db.get_app_state("active_session_id:owner:acct-b").unwrap(),
+            Some(session_b.id.to_string())
+        );
+
+        db.save_active_session_for_owner(Some(owner_a), Some(session_b.id))
+            .unwrap();
+        assert_eq!(
+            db.load_active_session_for_owner(Some(owner_a)).unwrap(),
+            None
+        );
+        assert_eq!(
+            db.load_active_session_for_owner(Some(owner_b)).unwrap(),
+            Some(session_b.id)
+        );
+        assert_eq!(db.load_active_session().unwrap(), Some(local.id));
+
+        db.save_active_session_for_owner(Some(owner_a), None)
+            .unwrap();
+        assert_eq!(
+            db.load_active_session_for_owner(Some(owner_a)).unwrap(),
+            None
+        );
+        assert_eq!(
+            db.load_active_session_for_owner(Some(owner_b)).unwrap(),
+            Some(session_b.id)
+        );
+        assert_eq!(db.load_active_session().unwrap(), Some(local.id));
     }
 
     #[test]

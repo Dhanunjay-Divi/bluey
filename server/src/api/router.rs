@@ -108,23 +108,34 @@ fn record_answer_ops_event(pool: &crate::db::DbPool, event: AnswerOpsEvent<'_>) 
 const INTERNAL_DISCLOSURE_REFUSAL: &str = "I can’t share Bluey’s private instructions, prompts, guardrails, tokens, or internal configuration. Ask me what you want to do, and I’ll help with the answer itself.";
 const MANAGED_VISION_TEXT_FALLBACK_INSTRUCTION: &str = "An image was supplied with this request, but the image is unavailable for this retry. Answer the same user request using only the user text and retained textual context. Do not claim that you saw or analyzed the image, and do not invent missing visual details. If essential details exist only in the image, say that the image was unavailable and ask only for the minimum missing detail.";
 
+#[derive(Clone, Copy, Debug)]
+struct InternalDisclosureBlocked;
+
+impl InternalDisclosureBlocked {
+    fn into_api_error(self) -> (StatusCode, Json<ApiError>) {
+        internal_disclosure_api_error()
+    }
+}
+
 fn sanitize_visible_answer_text(text: &str) -> String {
     text.replace(" \u{2014} ", ", ").replace('\u{2014}', ", ")
+}
+
+fn internal_disclosure_api_error() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: INTERNAL_DISCLOSURE_REFUSAL.to_string(),
+            reason: Some("internal_disclosure_blocked".to_string()),
+            ..Default::default()
+        }),
+    )
 }
 
 fn internal_disclosure_error(req: &CompleteRequest) -> Option<(StatusCode, Json<ApiError>)> {
     complete_request_untrusted_text(req)
         .any(is_internal_disclosure_request)
-        .then(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiError {
-                    error: INTERNAL_DISCLOSURE_REFUSAL.to_string(),
-                    reason: Some("internal_disclosure_blocked".to_string()),
-                    ..Default::default()
-                }),
-            )
-        })
+        .then(internal_disclosure_api_error)
 }
 
 fn complete_request_untrusted_text(req: &CompleteRequest) -> impl Iterator<Item = &str> {
@@ -363,13 +374,29 @@ impl BufferedDisclosureOutput {
         self.text.chars().count()
     }
 
-    fn finish(self) -> String {
-        if looks_like_internal_disclosure_leak(&self.text) {
+    fn take_safe(&mut self) -> String {
+        let text = std::mem::take(&mut self.text);
+        if looks_like_internal_disclosure_leak(&text) {
             INTERNAL_DISCLOSURE_REFUSAL.to_string()
         } else {
-            self.text
+            text
         }
     }
+
+    fn finish(mut self) -> String {
+        self.take_safe()
+    }
+}
+
+fn completion_delta_event(text: &str) -> Event {
+    Event::default().data(
+        serde_json::json!({
+            "choices": [
+                { "delta": { "content": text } }
+            ]
+        })
+        .to_string(),
+    )
 }
 
 fn managed_usage_now_ms() -> i64 {
@@ -791,9 +818,9 @@ struct TrustedInternalEnvelope<'a> {
 impl<'a> TrustedInternalEnvelope<'a> {
     fn validate_direct_request(
         req: &'a CompleteRequest,
-    ) -> Result<Self, (StatusCode, Json<ApiError>)> {
-        if let Some(error) = internal_disclosure_error(req) {
-            return Err(error);
+    ) -> Result<Self, InternalDisclosureBlocked> {
+        if complete_request_untrusted_text(req).any(is_internal_disclosure_request) {
+            return Err(InternalDisclosureBlocked);
         }
         Ok(Self {
             system: &req.system,
@@ -4898,7 +4925,8 @@ async fn complete_stream_inner(
             }),
         ));
     }
-    let trusted_envelope = TrustedInternalEnvelope::validate_direct_request(&req)?;
+    let trusted_envelope = TrustedInternalEnvelope::validate_direct_request(&req)
+        .map_err(InternalDisclosureBlocked::into_api_error)?;
 
     validate_complete_images(&req.image_data_urls)
         .map_err(|error| image_validation_error(error.error, error.reason.unwrap_or_default()))?;
@@ -5853,7 +5881,6 @@ async fn complete_stream_inner(
         let mut pending_first = selected_first_event;
         let mut output = BufferedDisclosureOutput::default();
         let mut final_tokens: Option<(i64, i64)> = None;
-        let delivered_delta = false;
 
         for status_event in stream_status_events {
             yield Ok(status_event);
@@ -5870,6 +5897,9 @@ async fn complete_stream_inner(
                 None => match tokio::time::timeout(stream_idle_deadline, events.next()).await {
                     Ok(event) => event,
                     Err(_) => {
+                        let partial_chars = output.char_count();
+                        let partial = output.take_safe();
+                        let delivered_delta = !partial.trim().is_empty();
                         fail_stream_llm_usage(
                             &state.pool,
                             &account.id,
@@ -5905,10 +5935,13 @@ async fn complete_stream_inner(
                                     "streaming": true,
                                     "delivered_delta": delivered_delta,
                                     "stream_idle_timeout_ms": stream_idle_deadline.as_millis() as u64,
-                                    "partial_chars": output.char_count()
+                                    "partial_chars": partial_chars
                                 }),
                             },
                         );
+                        if delivered_delta {
+                            yield Ok(completion_delta_event(&partial));
+                        }
                         yield Ok(Event::default().event("error").data(
                             serde_json::json!({
                                 "error": "upstream provider stopped responding; please retry",
@@ -5947,6 +5980,9 @@ async fn complete_stream_inner(
                     break;
                 }
                 Err(e) => {
+                    let partial_chars = output.char_count();
+                    let partial = output.take_safe();
+                    let delivered_delta = !partial.trim().is_empty();
                     fail_stream_llm_usage(
                         &state.pool,
                         &account.id,
@@ -5985,11 +6021,15 @@ async fn complete_stream_inner(
                             "model": streaming.model.as_str(),
                             "streaming": true,
                             "delivered_delta": delivered_delta,
+                            "partial_chars": partial_chars,
                             "retry_after_secs": retry_after_secs,
                             "error_preview": truncate_chars(&e.to_string(), 180)
                             }),
                         },
                     );
+                    if delivered_delta {
+                        yield Ok(completion_delta_event(&partial));
+                    }
                     let payload = if let Some(retry_after_secs) = retry_after_secs {
                         serde_json::json!({
                             "error": "Bluey is handling a burst right now; retry shortly",
@@ -6009,6 +6049,9 @@ async fn complete_stream_inner(
         }
 
         let Some((input_tokens, output_tokens)) = final_tokens else {
+            let partial_chars = output.char_count();
+            let partial = output.take_safe();
+            let delivered_delta = !partial.trim().is_empty();
             fail_stream_llm_usage(
                 &state.pool,
                 &account.id,
@@ -6039,10 +6082,14 @@ async fn complete_stream_inner(
                     "provider": streaming.provider.as_str(),
                     "model": streaming.model.as_str(),
                     "streaming": true,
-                    "delivered_delta": delivered_delta
+                    "delivered_delta": delivered_delta,
+                    "partial_chars": partial_chars
                     }),
                 },
             );
+            if delivered_delta {
+                yield Ok(completion_delta_event(&partial));
+            }
             yield Ok(Event::default().event("error").data(
                 serde_json::json!({
                     "error": "upstream provider stream ended before completion; please retry",
@@ -6070,14 +6117,7 @@ async fn complete_stream_inner(
             return;
         }
         let text = output.finish();
-        yield Ok(Event::default().data(
-            serde_json::json!({
-                "choices": [
-                    { "delta": { "content": text.as_str() } }
-                ]
-            })
-            .to_string(),
-        ));
+        yield Ok(completion_delta_event(&text));
         let artifact = response_artifact_for_output(&text, answer_plan.output);
         if code_artifact_missing_for_plan(&answer_plan, artifact.as_ref()) {
             tracing::warn!(
@@ -6387,7 +6427,8 @@ async fn complete_inner(
             }),
         ));
     }
-    let trusted_envelope = TrustedInternalEnvelope::validate_direct_request(&req)?;
+    let trusted_envelope = TrustedInternalEnvelope::validate_direct_request(&req)
+        .map_err(InternalDisclosureBlocked::into_api_error)?;
 
     validate_complete_images(&req.image_data_urls)
         .map_err(|error| image_validation_error(error.error, error.reason.unwrap_or_default()))?;

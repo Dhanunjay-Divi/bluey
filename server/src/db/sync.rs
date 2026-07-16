@@ -3,6 +3,8 @@
 //! The SQLite path backs local/dev alpha installs, while the Postgres path is
 //! the server-side sync and cloud RAG runtime target.
 
+use std::collections::{BTreeSet, HashMap, HashSet};
+
 use anyhow::{Context, Result};
 use postgres::{Client, Row as PgRow};
 use rusqlite::{params, OptionalExtension};
@@ -171,6 +173,197 @@ pub struct RagMatch {
     pub embedding_model: Option<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum SyncWriteError {
+    #[error("{entity} id {id} is already owned by another account")]
+    CrossAccountIdentity { entity: &'static str, id: String },
+    #[error("{entity} id {id} already belongs to session {existing_session_id}")]
+    ParentMismatch {
+        entity: &'static str,
+        id: String,
+        existing_session_id: String,
+    },
+    #[error("parent session {session_id} does not exist for this account")]
+    MissingParent { session_id: String },
+    #[error("attachment id {artifact_id} on response {response_id} does not belong to its parent session")]
+    AttachmentMismatch {
+        response_id: String,
+        artifact_id: String,
+    },
+    #[error("response {response_id} has invalid attachment metadata")]
+    InvalidAttachmentMetadata { response_id: String },
+    #[error("duplicate {entity} id {id} appears in one sync batch")]
+    DuplicateIdentity { entity: &'static str, id: String },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChildIdentity<'a> {
+    entity: &'static str,
+    table: &'static str,
+    id_column: &'static str,
+    id: &'a str,
+    session_id: Option<&'a str>,
+}
+
+fn child_identities<'a>(
+    transcript_segments: &'a [SyncTranscriptSegment],
+    cue_responses: &'a [SyncCueResponseRecord],
+    context_artifacts: &'a [SyncContextArtifactRecord],
+    rag_chunks: &'a [SyncRagChunkRecord],
+) -> Vec<ChildIdentity<'a>> {
+    let mut identities = Vec::with_capacity(
+        transcript_segments.len()
+            + cue_responses.len()
+            + context_artifacts.len()
+            + rag_chunks.len(),
+    );
+    identities.extend(transcript_segments.iter().map(|record| ChildIdentity {
+        entity: "transcript segment",
+        table: "cloud_transcript_segments",
+        id_column: "segment_id",
+        id: &record.segment_id,
+        session_id: Some(&record.session_id),
+    }));
+    identities.extend(cue_responses.iter().map(|record| ChildIdentity {
+        entity: "response",
+        table: "cloud_cue_responses",
+        id_column: "response_id",
+        id: &record.response_id,
+        session_id: Some(&record.session_id),
+    }));
+    identities.extend(context_artifacts.iter().map(|record| ChildIdentity {
+        entity: "context artifact",
+        table: "cloud_context_artifacts",
+        id_column: "artifact_id",
+        id: &record.artifact_id,
+        session_id: Some(&record.session_id),
+    }));
+    identities.extend(rag_chunks.iter().map(|record| ChildIdentity {
+        entity: "RAG chunk",
+        table: "cloud_rag_chunks",
+        id_column: "chunk_id",
+        id: &record.chunk_id,
+        session_id: record.session_id.as_deref(),
+    }));
+    identities
+}
+
+fn response_attachment_ids(record: &SyncCueResponseRecord) -> Result<Vec<&str>> {
+    let Some(value) = record.metadata.get("attachment_ids") else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(values) = value.as_array() else {
+        return Err(SyncWriteError::InvalidAttachmentMetadata {
+            response_id: record.response_id.clone(),
+        }
+        .into());
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    SyncWriteError::InvalidAttachmentMetadata {
+                        response_id: record.response_id.clone(),
+                    }
+                    .into()
+                })
+        })
+        .collect()
+}
+
+fn validate_incoming_identities(
+    sessions: &[SyncSessionRecord],
+    transcript_segments: &[SyncTranscriptSegment],
+    cue_responses: &[SyncCueResponseRecord],
+    context_artifacts: &[SyncContextArtifactRecord],
+    rag_chunks: &[SyncRagChunkRecord],
+) -> Result<()> {
+    let mut session_ids = HashSet::new();
+    for record in sessions {
+        if !session_ids.insert(record.session_id.as_str()) {
+            return Err(SyncWriteError::DuplicateIdentity {
+                entity: "session",
+                id: record.session_id.clone(),
+            }
+            .into());
+        }
+    }
+
+    let identities = child_identities(
+        transcript_segments,
+        cue_responses,
+        context_artifacts,
+        rag_chunks,
+    );
+    let mut child_ids = HashSet::new();
+    for identity in identities {
+        if !child_ids.insert((identity.entity, identity.id)) {
+            return Err(SyncWriteError::DuplicateIdentity {
+                entity: identity.entity,
+                id: identity.id.to_string(),
+            }
+            .into());
+        }
+    }
+
+    let mut canvas_ids = HashSet::new();
+    for response in cue_responses {
+        response_attachment_ids(response)?;
+        let Some(canvas_id) = response
+            .metadata
+            .get("canvas_artifact_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+        else {
+            continue;
+        };
+        if !canvas_ids.insert(canvas_id) {
+            return Err(SyncWriteError::DuplicateIdentity {
+                entity: "canvas artifact",
+                id: canvas_id.to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn sync_lock_keys(
+    sessions: &[SyncSessionRecord],
+    transcript_segments: &[SyncTranscriptSegment],
+    cue_responses: &[SyncCueResponseRecord],
+    context_artifacts: &[SyncContextArtifactRecord],
+    rag_chunks: &[SyncRagChunkRecord],
+) -> Result<BTreeSet<String>> {
+    let mut keys = BTreeSet::new();
+    for session in sessions {
+        keys.insert(format!("session:{}", session.session_id));
+    }
+    for identity in child_identities(
+        transcript_segments,
+        cue_responses,
+        context_artifacts,
+        rag_chunks,
+    ) {
+        keys.insert(format!("{}:{}", identity.entity, identity.id));
+        if let Some(session_id) = identity.session_id {
+            keys.insert(format!("session:{session_id}"));
+        }
+    }
+    for response in cue_responses {
+        for artifact_id in response_attachment_ids(response)? {
+            keys.insert(format!("context artifact:{artifact_id}"));
+        }
+    }
+    Ok(keys)
+}
+
 pub fn upsert_batch(
     pool: &DbPool,
     account_id: &str,
@@ -180,6 +373,13 @@ pub fn upsert_batch(
     context_artifacts: &[SyncContextArtifactRecord],
     rag_chunks: &[SyncRagChunkRecord],
 ) -> Result<SyncCounts> {
+    validate_incoming_identities(
+        sessions,
+        transcript_segments,
+        cue_responses,
+        context_artifacts,
+        rag_chunks,
+    )?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => upsert_batch_sqlite(
             pool,
@@ -202,6 +402,314 @@ pub fn upsert_batch(
     })
 }
 
+fn session_owned_by_account_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    session_id: &str,
+) -> Result<bool> {
+    let mut stmt = tx.prepare("SELECT account_id FROM cloud_sessions WHERE session_id = ?1")?;
+    let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+    let mut owned = false;
+    for row in rows {
+        if row? == account_id {
+            owned = true;
+        } else {
+            return Err(SyncWriteError::CrossAccountIdentity {
+                entity: "session",
+                id: session_id.to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(owned)
+}
+
+fn validate_child_identity_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    identity: ChildIdentity<'_>,
+) -> Result<bool> {
+    let sql = format!(
+        "SELECT account_id, session_id FROM {} WHERE {} = ?1",
+        identity.table, identity.id_column
+    );
+    let mut stmt = tx.prepare(&sql)?;
+    let rows = stmt.query_map(params![identity.id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let expected_parent = identity.session_id.map(ToString::to_string);
+    let mut matched = false;
+    for row in rows {
+        let (owner, existing_parent) = row?;
+        if owner != account_id {
+            return Err(SyncWriteError::CrossAccountIdentity {
+                entity: identity.entity,
+                id: identity.id.to_string(),
+            }
+            .into());
+        }
+        if existing_parent != expected_parent {
+            return Err(SyncWriteError::ParentMismatch {
+                entity: identity.entity,
+                id: identity.id.to_string(),
+                existing_session_id: existing_parent.unwrap_or_else(|| "<none>".to_string()),
+            }
+            .into());
+        }
+        matched = true;
+    }
+    Ok(matched)
+}
+
+fn validate_batch_ownership_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    sessions: &[SyncSessionRecord],
+    transcript_segments: &[SyncTranscriptSegment],
+    cue_responses: &[SyncCueResponseRecord],
+    context_artifacts: &[SyncContextArtifactRecord],
+    rag_chunks: &[SyncRagChunkRecord],
+) -> Result<()> {
+    let identities = child_identities(
+        transcript_segments,
+        cue_responses,
+        context_artifacts,
+        rag_chunks,
+    );
+    let incoming_sessions = sessions
+        .iter()
+        .map(|record| record.session_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut all_sessions = incoming_sessions.iter().copied().collect::<BTreeSet<_>>();
+    for identity in &identities {
+        if let Some(session_id) = identity.session_id {
+            all_sessions.insert(session_id);
+        }
+    }
+
+    for session_id in all_sessions {
+        let owned = session_owned_by_account_sqlite_tx(tx, account_id, session_id)?;
+        if !incoming_sessions.contains(session_id) && !owned {
+            return Err(SyncWriteError::MissingParent {
+                session_id: session_id.to_string(),
+            }
+            .into());
+        }
+    }
+
+    for identity in identities {
+        validate_child_identity_sqlite_tx(tx, account_id, identity)?;
+    }
+
+    let incoming_context = context_artifacts
+        .iter()
+        .map(|record| (record.artifact_id.as_str(), record.session_id.as_str()))
+        .collect::<HashMap<_, _>>();
+    for response in cue_responses {
+        for artifact_id in response_attachment_ids(response)? {
+            if let Some(parent) = incoming_context.get(artifact_id) {
+                if *parent == response.session_id {
+                    continue;
+                }
+                return Err(SyncWriteError::AttachmentMismatch {
+                    response_id: response.response_id.clone(),
+                    artifact_id: artifact_id.to_string(),
+                }
+                .into());
+            }
+            let matched = validate_child_identity_sqlite_tx(
+                tx,
+                account_id,
+                ChildIdentity {
+                    entity: "attachment",
+                    table: "cloud_context_artifacts",
+                    id_column: "artifact_id",
+                    id: artifact_id,
+                    session_id: Some(&response.session_id),
+                },
+            )?;
+            if !matched {
+                return Err(SyncWriteError::AttachmentMismatch {
+                    response_id: response.response_id.clone(),
+                    artifact_id: artifact_id.to_string(),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lock_sync_identities_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    sessions: &[SyncSessionRecord],
+    transcript_segments: &[SyncTranscriptSegment],
+    cue_responses: &[SyncCueResponseRecord],
+    context_artifacts: &[SyncContextArtifactRecord],
+    rag_chunks: &[SyncRagChunkRecord],
+) -> Result<()> {
+    for key in sync_lock_keys(
+        sessions,
+        transcript_segments,
+        cue_responses,
+        context_artifacts,
+        rag_chunks,
+    )? {
+        tx.query(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))",
+            &[&key],
+        )?;
+    }
+    Ok(())
+}
+
+fn session_owned_by_account_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    session_id: &str,
+) -> Result<bool> {
+    let rows = tx.query(
+        "SELECT account_id FROM cloud_sessions WHERE session_id = $1",
+        &[&session_id],
+    )?;
+    let mut owned = false;
+    for row in rows {
+        let owner: String = row.try_get(0)?;
+        if owner == account_id {
+            owned = true;
+        } else {
+            return Err(SyncWriteError::CrossAccountIdentity {
+                entity: "session",
+                id: session_id.to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(owned)
+}
+
+fn validate_child_identity_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    identity: ChildIdentity<'_>,
+) -> Result<bool> {
+    let sql = format!(
+        "SELECT account_id, session_id FROM {} WHERE {} = $1",
+        identity.table, identity.id_column
+    );
+    let rows = tx.query(&sql, &[&identity.id])?;
+    let expected_parent = identity.session_id.map(ToString::to_string);
+    let mut matched = false;
+    for row in rows {
+        let owner: String = row.try_get(0)?;
+        let existing_parent: Option<String> = row.try_get(1)?;
+        if owner != account_id {
+            return Err(SyncWriteError::CrossAccountIdentity {
+                entity: identity.entity,
+                id: identity.id.to_string(),
+            }
+            .into());
+        }
+        if existing_parent != expected_parent {
+            return Err(SyncWriteError::ParentMismatch {
+                entity: identity.entity,
+                id: identity.id.to_string(),
+                existing_session_id: existing_parent.unwrap_or_else(|| "<none>".to_string()),
+            }
+            .into());
+        }
+        matched = true;
+    }
+    Ok(matched)
+}
+
+fn validate_batch_ownership_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    sessions: &[SyncSessionRecord],
+    transcript_segments: &[SyncTranscriptSegment],
+    cue_responses: &[SyncCueResponseRecord],
+    context_artifacts: &[SyncContextArtifactRecord],
+    rag_chunks: &[SyncRagChunkRecord],
+) -> Result<()> {
+    lock_sync_identities_postgres_tx(
+        tx,
+        sessions,
+        transcript_segments,
+        cue_responses,
+        context_artifacts,
+        rag_chunks,
+    )?;
+    let identities = child_identities(
+        transcript_segments,
+        cue_responses,
+        context_artifacts,
+        rag_chunks,
+    );
+    let incoming_sessions = sessions
+        .iter()
+        .map(|record| record.session_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut all_sessions = incoming_sessions.iter().copied().collect::<BTreeSet<_>>();
+    for identity in &identities {
+        if let Some(session_id) = identity.session_id {
+            all_sessions.insert(session_id);
+        }
+    }
+
+    for session_id in all_sessions {
+        let owned = session_owned_by_account_postgres_tx(tx, account_id, session_id)?;
+        if !incoming_sessions.contains(session_id) && !owned {
+            return Err(SyncWriteError::MissingParent {
+                session_id: session_id.to_string(),
+            }
+            .into());
+        }
+    }
+
+    for identity in identities {
+        validate_child_identity_postgres_tx(tx, account_id, identity)?;
+    }
+
+    let incoming_context = context_artifacts
+        .iter()
+        .map(|record| (record.artifact_id.as_str(), record.session_id.as_str()))
+        .collect::<HashMap<_, _>>();
+    for response in cue_responses {
+        for artifact_id in response_attachment_ids(response)? {
+            if let Some(parent) = incoming_context.get(artifact_id) {
+                if *parent == response.session_id {
+                    continue;
+                }
+                return Err(SyncWriteError::AttachmentMismatch {
+                    response_id: response.response_id.clone(),
+                    artifact_id: artifact_id.to_string(),
+                }
+                .into());
+            }
+            let matched = validate_child_identity_postgres_tx(
+                tx,
+                account_id,
+                ChildIdentity {
+                    entity: "attachment",
+                    table: "cloud_context_artifacts",
+                    id_column: "artifact_id",
+                    id: artifact_id,
+                    session_id: Some(&response.session_id),
+                },
+            )?;
+            if !matched {
+                return Err(SyncWriteError::AttachmentMismatch {
+                    response_id: response.response_id.clone(),
+                    artifact_id: artifact_id.to_string(),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn upsert_batch_sqlite(
     pool: &DbPool,
     account_id: &str,
@@ -212,11 +720,23 @@ fn upsert_batch_sqlite(
     rag_chunks: &[SyncRagChunkRecord],
 ) -> Result<SyncCounts> {
     let mut conn = pool.get().context("get db conn")?;
-    let tx = conn.transaction().context("begin sync tx")?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .context("begin sync tx")?;
     let mut applied_transcript_segments = 0;
     let mut applied_cue_responses = 0;
     let mut applied_context_artifacts = 0;
     let mut applied_rag_chunks = 0;
+
+    validate_batch_ownership_sqlite_tx(
+        &tx,
+        account_id,
+        sessions,
+        transcript_segments,
+        cue_responses,
+        context_artifacts,
+        rag_chunks,
+    )?;
 
     for record in sessions {
         let metadata = serde_json::to_string(&record.metadata)?;
@@ -295,7 +815,6 @@ fn upsert_batch_sqlite(
                 start_ms, end_ms, ts_ms, is_final, metadata_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(account_id, segment_id) DO UPDATE SET
-                session_id=excluded.session_id,
                 speaker=excluded.speaker,
                 source=excluded.source,
                 text=excluded.text,
@@ -304,7 +823,8 @@ fn upsert_batch_sqlite(
                 ts_ms=excluded.ts_ms,
                 is_final=excluded.is_final,
                 metadata_json=excluded.metadata_json
-             WHERE excluded.ts_ms >= cloud_transcript_segments.ts_ms",
+             WHERE excluded.ts_ms >= cloud_transcript_segments.ts_ms
+               AND cloud_transcript_segments.session_id = excluded.session_id",
             params![
                 account_id,
                 record.segment_id,
@@ -333,7 +853,6 @@ fn upsert_batch_sqlite(
                 cost_label, artifact_type, artifact_body, artifact_confidence, metadata_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(account_id, response_id) DO UPDATE SET
-                session_id=excluded.session_id,
                 kind=excluded.kind,
                 text=excluded.text,
                 source_text=excluded.source_text,
@@ -349,7 +868,8 @@ fn upsert_batch_sqlite(
                 artifact_body=excluded.artifact_body,
                 artifact_confidence=excluded.artifact_confidence,
                 metadata_json=excluded.metadata_json
-             WHERE excluded.ts_ms >= cloud_cue_responses.ts_ms",
+             WHERE excluded.ts_ms >= cloud_cue_responses.ts_ms
+               AND cloud_cue_responses.session_id = excluded.session_id",
             params![
                 account_id,
                 record.response_id,
@@ -385,7 +905,6 @@ fn upsert_batch_sqlite(
                 content_hash, text_preview, created_at_ms, updated_at_ms, metadata_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(account_id, artifact_id) DO UPDATE SET
-                session_id=excluded.session_id,
                 kind=excluded.kind,
                 title=excluded.title,
                 note=excluded.note,
@@ -395,7 +914,8 @@ fn upsert_batch_sqlite(
                 created_at_ms=excluded.created_at_ms,
                 updated_at_ms=excluded.updated_at_ms,
                 metadata_json=excluded.metadata_json
-             WHERE excluded.updated_at_ms > cloud_context_artifacts.updated_at_ms",
+             WHERE excluded.updated_at_ms > cloud_context_artifacts.updated_at_ms
+               AND cloud_context_artifacts.session_id = excluded.session_id",
             params![
                 account_id,
                 record.artifact_id,
@@ -442,7 +962,6 @@ fn upsert_batch_sqlite(
                 updated_at_ms, metadata_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(account_id, chunk_id) DO UPDATE SET
-                session_id=excluded.session_id,
                 source_kind=excluded.source_kind,
                 source_id=excluded.source_id,
                 chunk_index=excluded.chunk_index,
@@ -453,7 +972,8 @@ fn upsert_batch_sqlite(
                 content_hash=excluded.content_hash,
                 updated_at_ms=excluded.updated_at_ms,
                 metadata_json=excluded.metadata_json
-             WHERE excluded.updated_at_ms >= cloud_rag_chunks.updated_at_ms",
+             WHERE excluded.updated_at_ms >= cloud_rag_chunks.updated_at_ms
+               AND cloud_rag_chunks.session_id IS excluded.session_id",
             params![
                 account_id,
                 record.chunk_id,
@@ -497,6 +1017,16 @@ fn upsert_batch_postgres(
     let mut applied_cue_responses = 0;
     let mut applied_context_artifacts = 0;
     let mut applied_rag_chunks = 0;
+
+    validate_batch_ownership_postgres_tx(
+        &mut tx,
+        account_id,
+        sessions,
+        transcript_segments,
+        cue_responses,
+        context_artifacts,
+        rag_chunks,
+    )?;
 
     for record in sessions {
         let metadata = serde_json::to_string(&record.metadata)?;
@@ -577,13 +1107,13 @@ fn upsert_batch_postgres(
         let speaker = db_text(&record.speaker);
         let source = db_text(&record.source);
         let text = db_text(&record.text);
-        applied_transcript_segments += tx.execute(
-            "INSERT INTO cloud_transcript_segments (
+        applied_transcript_segments += tx
+            .execute(
+                "INSERT INTO cloud_transcript_segments (
                 account_id, segment_id, session_id, speaker, source, text,
                 start_ms, end_ms, ts_ms, is_final, metadata_json
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT(account_id, segment_id) DO UPDATE SET
-                session_id=excluded.session_id,
                 speaker=excluded.speaker,
                 source=excluded.source,
                 text=excluded.text,
@@ -592,27 +1122,28 @@ fn upsert_batch_postgres(
                 ts_ms=excluded.ts_ms,
                 is_final=excluded.is_final,
                 metadata_json=excluded.metadata_json
-             WHERE excluded.ts_ms >= cloud_transcript_segments.ts_ms",
-            &[
-                &account_id,
-                &record.segment_id,
-                &record.session_id,
-                &speaker,
-                &source,
-                &text,
-                &record.start_ms,
-                &record.end_ms,
-                &record.ts_ms,
-                &is_final,
-                &metadata,
-            ],
-        )
-        .with_context(|| {
-            format!(
-                "upsert cloud_transcript_segments segment_id={} session_id={}",
-                record.segment_id, record.session_id
+             WHERE excluded.ts_ms >= cloud_transcript_segments.ts_ms
+               AND cloud_transcript_segments.session_id = excluded.session_id",
+                &[
+                    &account_id,
+                    &record.segment_id,
+                    &record.session_id,
+                    &speaker,
+                    &source,
+                    &text,
+                    &record.start_ms,
+                    &record.end_ms,
+                    &record.ts_ms,
+                    &is_final,
+                    &metadata,
+                ],
             )
-        })? as usize;
+            .with_context(|| {
+                format!(
+                    "upsert cloud_transcript_segments segment_id={} session_id={}",
+                    record.segment_id, record.session_id
+                )
+            })? as usize;
     }
 
     for record in cue_responses {
@@ -638,7 +1169,6 @@ fn upsert_batch_postgres(
                 cost_label, artifact_type, artifact_body, artifact_confidence, metadata_json
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
              ON CONFLICT(account_id, response_id) DO UPDATE SET
-                session_id=excluded.session_id,
                 kind=excluded.kind,
                 text=excluded.text,
                 source_text=excluded.source_text,
@@ -654,7 +1184,8 @@ fn upsert_batch_postgres(
                 artifact_body=excluded.artifact_body,
                 artifact_confidence=excluded.artifact_confidence,
                 metadata_json=excluded.metadata_json
-             WHERE excluded.ts_ms >= cloud_cue_responses.ts_ms",
+             WHERE excluded.ts_ms >= cloud_cue_responses.ts_ms
+               AND cloud_cue_responses.session_id = excluded.session_id",
             &[
                 &account_id,
                 &record.response_id,
@@ -696,13 +1227,13 @@ fn upsert_batch_postgres(
         let content_hash = db_opt_text(&record.content_hash);
         let text_preview = db_opt_text(&record.text_preview);
         let updated_at_ms = record.updated_at_ms.max(record.created_at_ms);
-        let affected = tx.execute(
-            "INSERT INTO cloud_context_artifacts (
+        let affected = tx
+            .execute(
+                "INSERT INTO cloud_context_artifacts (
                 account_id, artifact_id, session_id, kind, title, note, source_uri,
                 content_hash, text_preview, created_at_ms, updated_at_ms, metadata_json
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT(account_id, artifact_id) DO UPDATE SET
-                session_id=excluded.session_id,
                 kind=excluded.kind,
                 title=excluded.title,
                 note=excluded.note,
@@ -712,28 +1243,29 @@ fn upsert_batch_postgres(
                 created_at_ms=excluded.created_at_ms,
                 updated_at_ms=excluded.updated_at_ms,
                 metadata_json=excluded.metadata_json
-             WHERE excluded.updated_at_ms > cloud_context_artifacts.updated_at_ms",
-            &[
-                &account_id,
-                &record.artifact_id,
-                &record.session_id,
-                &kind,
-                &title,
-                &note,
-                &source_uri,
-                &content_hash,
-                &text_preview,
-                &record.created_at_ms,
-                &updated_at_ms,
-                &metadata,
-            ],
-        )
-        .with_context(|| {
-            format!(
-                "upsert cloud_context_artifacts artifact_id={} session_id={}",
-                record.artifact_id, record.session_id
+             WHERE excluded.updated_at_ms > cloud_context_artifacts.updated_at_ms
+               AND cloud_context_artifacts.session_id = excluded.session_id",
+                &[
+                    &account_id,
+                    &record.artifact_id,
+                    &record.session_id,
+                    &kind,
+                    &title,
+                    &note,
+                    &source_uri,
+                    &content_hash,
+                    &text_preview,
+                    &record.created_at_ms,
+                    &updated_at_ms,
+                    &metadata,
+                ],
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "upsert cloud_context_artifacts artifact_id={} session_id={}",
+                    record.artifact_id, record.session_id
+                )
+            })?;
         if affected > 0 {
             applied_context_artifacts += affected as usize;
             crate::db::object_uploads::link_artifact_session_postgres_tx(
@@ -781,14 +1313,14 @@ fn upsert_batch_postgres(
                 })
             })
             .transpose()?;
-        applied_rag_chunks += tx.execute(
-            "INSERT INTO cloud_rag_chunks (
+        applied_rag_chunks += tx
+            .execute(
+                "INSERT INTO cloud_rag_chunks (
                 account_id, chunk_id, session_id, source_kind, source_id, chunk_index,
                 text, embedding_json, embedding, embedding_model, token_count, content_hash,
                 updated_at_ms, metadata_json
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector, $10, $11, $12, $13, $14)
              ON CONFLICT(account_id, chunk_id) DO UPDATE SET
-                session_id=excluded.session_id,
                 source_kind=excluded.source_kind,
                 source_id=excluded.source_id,
                 chunk_index=excluded.chunk_index,
@@ -800,30 +1332,31 @@ fn upsert_batch_postgres(
                 content_hash=excluded.content_hash,
                 updated_at_ms=excluded.updated_at_ms,
                 metadata_json=excluded.metadata_json
-             WHERE excluded.updated_at_ms >= cloud_rag_chunks.updated_at_ms",
-            &[
-                &account_id,
-                &record.chunk_id,
-                &record.session_id,
-                &source_kind,
-                &source_id,
-                &chunk_index,
-                &text,
-                &embedding_json,
-                &embedding_vector,
-                &embedding_model,
-                &token_count,
-                &content_hash,
-                &record.updated_at_ms,
-                &metadata,
-            ],
-        )
-        .with_context(|| {
-            format!(
-                "upsert cloud_rag_chunks chunk_id={} source_id={}",
-                record.chunk_id, record.source_id
+             WHERE excluded.updated_at_ms >= cloud_rag_chunks.updated_at_ms
+               AND cloud_rag_chunks.session_id IS NOT DISTINCT FROM excluded.session_id",
+                &[
+                    &account_id,
+                    &record.chunk_id,
+                    &record.session_id,
+                    &source_kind,
+                    &source_id,
+                    &chunk_index,
+                    &text,
+                    &embedding_json,
+                    &embedding_vector,
+                    &embedding_model,
+                    &token_count,
+                    &content_hash,
+                    &record.updated_at_ms,
+                    &metadata,
+                ],
             )
-        })? as usize;
+            .with_context(|| {
+                format!(
+                    "upsert cloud_rag_chunks chunk_id={} source_id={}",
+                    record.chunk_id, record.source_id
+                )
+            })? as usize;
     }
 
     tx.commit().context("commit sync postgres tx")?;
@@ -916,7 +1449,10 @@ fn list_deleted_sessions_postgres(
 
 fn tombstone_session_sqlite(pool: &DbPool, account_id: &str, session_id: &str) -> Result<()> {
     let mut conn = pool.get().context("get db conn")?;
-    let tx = conn.transaction().context("begin session tombstone tx")?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .context("begin session tombstone tx")?;
+    session_owned_by_account_sqlite_tx(&tx, account_id, session_id)?;
     let now = now_ms();
     tx.execute(
         "INSERT INTO cloud_sessions (
@@ -952,6 +1488,12 @@ fn tombstone_session_postgres(pool: &DbPool, account_id: &str, session_id: &str)
     let mut tx = conn
         .transaction()
         .context("begin postgres session tombstone tx")?;
+    let lock_key = format!("session:{session_id}");
+    tx.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))",
+        &[&lock_key],
+    )?;
+    session_owned_by_account_postgres_tx(&mut tx, account_id, session_id)?;
     let now = now_ms();
     let title = db_text("Deleted session");
     let status = db_text("deleted");
@@ -1062,7 +1604,19 @@ fn list_sessions_sqlite(
 ) -> Result<Vec<CloudSessionSummary>> {
     let conn = pool.get().context("get db conn")?;
     let mut stmt = conn.prepare(
-        "SELECT s.session_id, s.title, s.status, s.updated_at_ms, s.last_active_at_ms,
+        "SELECT s.session_id, s.title, s.status,
+                MAX(
+                    s.updated_at_ms,
+                    COALESCE((SELECT MAX(t.ts_ms) FROM cloud_transcript_segments t
+                        WHERE t.account_id = s.account_id AND t.session_id = s.session_id), 0),
+                    COALESCE((SELECT MAX(r.ts_ms) FROM cloud_cue_responses r
+                        WHERE r.account_id = s.account_id AND r.session_id = s.session_id), 0),
+                    COALESCE((SELECT MAX(c.updated_at_ms) FROM cloud_context_artifacts c
+                        WHERE c.account_id = s.account_id AND c.session_id = s.session_id), 0),
+                    COALESCE((SELECT MAX(g.updated_at_ms) FROM cloud_rag_chunks g
+                        WHERE g.account_id = s.account_id AND g.session_id = s.session_id), 0)
+                ) AS content_updated_at_ms,
+                s.last_active_at_ms,
                 s.answer_style,
                 (SELECT COUNT(*) FROM cloud_transcript_segments t
                     WHERE t.account_id = s.account_id AND t.session_id = s.session_id),
@@ -1079,8 +1633,11 @@ fn list_sessions_sqlite(
                     WHERE r.account_id = s.account_id AND r.session_id = s.session_id)
                 OR EXISTS (SELECT 1 FROM cloud_context_artifacts c
                     WHERE c.account_id = s.account_id AND c.session_id = s.session_id)
+                OR EXISTS (SELECT 1 FROM cloud_rag_chunks g
+                    WHERE g.account_id = s.account_id AND g.session_id = s.session_id
+                      AND TRIM(g.text) <> '')
            )
-         ORDER BY s.updated_at_ms DESC
+         ORDER BY content_updated_at_ms DESC
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![account_id, limit], |row| {
@@ -1107,7 +1664,19 @@ fn list_sessions_postgres(
 ) -> Result<Vec<CloudSessionSummary>> {
     let mut conn = pool.get_pg().context("get postgres db conn")?;
     let rows = conn.query(
-        "SELECT s.session_id, s.title, s.status, s.updated_at_ms, s.last_active_at_ms,
+        "SELECT s.session_id, s.title, s.status,
+                GREATEST(
+                    s.updated_at_ms,
+                    COALESCE((SELECT MAX(t.ts_ms) FROM cloud_transcript_segments t
+                        WHERE t.account_id = s.account_id AND t.session_id = s.session_id), 0),
+                    COALESCE((SELECT MAX(r.ts_ms) FROM cloud_cue_responses r
+                        WHERE r.account_id = s.account_id AND r.session_id = s.session_id), 0),
+                    COALESCE((SELECT MAX(c.updated_at_ms) FROM cloud_context_artifacts c
+                        WHERE c.account_id = s.account_id AND c.session_id = s.session_id), 0),
+                    COALESCE((SELECT MAX(g.updated_at_ms) FROM cloud_rag_chunks g
+                        WHERE g.account_id = s.account_id AND g.session_id = s.session_id), 0)
+                ) AS content_updated_at_ms,
+                s.last_active_at_ms,
                 s.answer_style,
                 (SELECT COUNT(*)::bigint FROM cloud_transcript_segments t
                     WHERE t.account_id = s.account_id AND t.session_id = s.session_id),
@@ -1124,8 +1693,11 @@ fn list_sessions_postgres(
                     WHERE r.account_id = s.account_id AND r.session_id = s.session_id)
                 OR EXISTS (SELECT 1 FROM cloud_context_artifacts c
                     WHERE c.account_id = s.account_id AND c.session_id = s.session_id)
+                OR EXISTS (SELECT 1 FROM cloud_rag_chunks g
+                    WHERE g.account_id = s.account_id AND g.session_id = s.session_id
+                      AND BTRIM(g.text) <> '')
            )
-         ORDER BY s.updated_at_ms DESC
+         ORDER BY content_updated_at_ms DESC
          LIMIT $2",
         &[&account_id, &limit],
     )?;
@@ -1774,6 +2346,30 @@ mod tests {
     use super::*;
     use crate::db::{open_pool, run_migrations};
 
+    fn insert_test_account(pool: &DbPool, account_id: &str, email: &str) {
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash) VALUES (?1, ?2, ?3)",
+                rusqlite::params![account_id, email, "hash"],
+            )
+            .unwrap();
+    }
+
+    fn test_session(session_id: &str, updated_at_ms: i64) -> SyncSessionRecord {
+        SyncSessionRecord {
+            session_id: session_id.into(),
+            title: "Test session".into(),
+            status: "active".into(),
+            created_at_ms: 1,
+            updated_at_ms,
+            last_active_at_ms: Some(updated_at_ms),
+            answer_style: None,
+            metadata: serde_json::json!({}),
+            deleted_at_ms: None,
+        }
+    }
+
     #[test]
     fn db_text_removes_nul_bytes_before_postgres_bind() {
         assert_eq!(db_text("Resume\0.pdf"), "Resume.pdf");
@@ -2360,5 +2956,387 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lifecycle, ("delete_pending".into(), "pending".into()));
+    }
+
+    #[test]
+    fn sync_rejects_cross_account_missing_parent_and_child_reparenting() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        insert_test_account(&pool, "acct_owner_a", "owner-a@example.com");
+        insert_test_account(&pool, "acct_owner_b", "owner-b@example.com");
+
+        upsert_batch(
+            &pool,
+            "acct_owner_a",
+            &[
+                test_session("session-a", 10),
+                test_session("session-a-2", 10),
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        upsert_batch(
+            &pool,
+            "acct_owner_b",
+            &[test_session("session-b", 10)],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let cross_account_session = upsert_batch(
+            &pool,
+            "acct_owner_b",
+            &[test_session("session-a", 11)],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            cross_account_session.downcast_ref::<SyncWriteError>(),
+            Some(SyncWriteError::CrossAccountIdentity {
+                entity: "session",
+                ..
+            })
+        ));
+
+        let segment = SyncTranscriptSegment {
+            segment_id: "stable-segment".into(),
+            session_id: "session-a".into(),
+            speaker: "user".into(),
+            source: "microphone".into(),
+            text: "owned transcript".into(),
+            start_ms: Some(1),
+            end_ms: Some(2),
+            ts_ms: 12,
+            is_final: true,
+            metadata: serde_json::json!({}),
+        };
+        upsert_batch(
+            &pool,
+            "acct_owner_a",
+            &[],
+            std::slice::from_ref(&segment),
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let mut moved = segment.clone();
+        moved.session_id = "session-a-2".into();
+        let reparented =
+            upsert_batch(&pool, "acct_owner_a", &[], &[moved], &[], &[], &[]).unwrap_err();
+        assert!(matches!(
+            reparented.downcast_ref::<SyncWriteError>(),
+            Some(SyncWriteError::ParentMismatch {
+                entity: "transcript segment",
+                ..
+            })
+        ));
+
+        let mut reused = segment.clone();
+        reused.session_id = "session-b".into();
+        let cross_account_child =
+            upsert_batch(&pool, "acct_owner_b", &[], &[reused], &[], &[], &[]).unwrap_err();
+        assert!(matches!(
+            cross_account_child.downcast_ref::<SyncWriteError>(),
+            Some(SyncWriteError::CrossAccountIdentity {
+                entity: "transcript segment",
+                ..
+            })
+        ));
+
+        let mut dangling = segment;
+        dangling.segment_id = "dangling-segment".into();
+        dangling.session_id = "missing-session".into();
+        let missing_parent =
+            upsert_batch(&pool, "acct_owner_a", &[], &[dangling], &[], &[], &[]).unwrap_err();
+        assert!(matches!(
+            missing_parent.downcast_ref::<SyncWriteError>(),
+            Some(SyncWriteError::MissingParent { .. })
+        ));
+
+        upsert_batch(
+            &pool,
+            "acct_owner_a",
+            &[],
+            &[],
+            &[],
+            &[SyncContextArtifactRecord {
+                artifact_id: "owned-attachment".into(),
+                session_id: "session-a".into(),
+                kind: "document".into(),
+                title: "Owned".into(),
+                note: None,
+                source_uri: None,
+                content_hash: None,
+                text_preview: Some("owned".into()),
+                created_at_ms: 10,
+                updated_at_ms: 10,
+                metadata: serde_json::json!({}),
+            }],
+            &[],
+        )
+        .unwrap();
+        let wrong_parent_attachment = upsert_batch(
+            &pool,
+            "acct_owner_a",
+            &[],
+            &[],
+            &[SyncCueResponseRecord {
+                response_id: "response-with-wrong-attachment".into(),
+                session_id: "session-a-2".into(),
+                kind: "answer".into(),
+                text: "answer".into(),
+                source_text: Some("question".into()),
+                ts_ms: 20,
+                provider: None,
+                model: None,
+                lane: None,
+                task_type: None,
+                cost_cents: None,
+                balance_cents_after: None,
+                cost_label: None,
+                artifact_type: None,
+                artifact_body: None,
+                artifact_confidence: None,
+                metadata: serde_json::json!({"attachment_ids": ["owned-attachment"]}),
+            }],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            wrong_parent_attachment.downcast_ref::<SyncWriteError>(),
+            Some(SyncWriteError::ParentMismatch {
+                entity: "attachment",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn exact_retry_keeps_one_owned_row_and_preserves_stt_metadata() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        insert_test_account(&pool, "acct_retry", "retry@example.com");
+
+        let session = test_session("retry-session", 10);
+        let transcript = SyncTranscriptSegment {
+            segment_id: "retry-segment".into(),
+            session_id: "retry-session".into(),
+            speaker: "other".into(),
+            source: "system_audio".into(),
+            text: "retry transcript".into(),
+            start_ms: Some(101),
+            end_ms: Some(202),
+            ts_ms: 20,
+            is_final: true,
+            metadata: serde_json::json!({"stt_provider": "deepgram", "channel": 2}),
+        };
+        let context = SyncContextArtifactRecord {
+            artifact_id: "retry-artifact".into(),
+            session_id: "retry-session".into(),
+            kind: "document".into(),
+            title: "Retry document".into(),
+            note: None,
+            source_uri: Some("/original/retry.pdf".into()),
+            content_hash: Some("abc123".into()),
+            text_preview: Some("retry context".into()),
+            created_at_ms: 30,
+            updated_at_ms: 30,
+            metadata: serde_json::json!({"processing_status": "ready"}),
+        };
+        let response = SyncCueResponseRecord {
+            response_id: "retry-response".into(),
+            session_id: "retry-session".into(),
+            kind: "answer".into(),
+            text: "retry answer".into(),
+            source_text: Some("retry question".into()),
+            ts_ms: 40,
+            provider: Some("bluey_managed".into()),
+            model: Some("balanced".into()),
+            lane: Some("balanced".into()),
+            task_type: Some("general".into()),
+            cost_cents: None,
+            balance_cents_after: None,
+            cost_label: None,
+            artifact_type: Some("code".into()),
+            artifact_body: Some("fn retry() {}".into()),
+            artifact_confidence: Some(0.9),
+            metadata: serde_json::json!({
+                "attachment_ids": ["retry-artifact"],
+                "canvas_artifact_id": "retry-canvas"
+            }),
+        };
+        let rag = SyncRagChunkRecord {
+            chunk_id: "retry-session:response:retry-response:0".into(),
+            session_id: Some("retry-session".into()),
+            source_kind: "response".into(),
+            source_id: "retry-response".into(),
+            chunk_index: 0,
+            text: "retry answer".into(),
+            embedding: None,
+            embedding_model: None,
+            token_count: None,
+            content_hash: None,
+            updated_at_ms: 40,
+            metadata: serde_json::json!({}),
+        };
+
+        for _ in 0..2 {
+            upsert_batch(
+                &pool,
+                "acct_retry",
+                std::slice::from_ref(&session),
+                std::slice::from_ref(&transcript),
+                std::slice::from_ref(&response),
+                std::slice::from_ref(&context),
+                std::slice::from_ref(&rag),
+            )
+            .unwrap();
+        }
+
+        let conn = pool.get().unwrap();
+        for table in [
+            "cloud_sessions",
+            "cloud_transcript_segments",
+            "cloud_cue_responses",
+            "cloud_context_artifacts",
+            "cloud_rag_chunks",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE account_id = ?1"),
+                    rusqlite::params!["acct_retry"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "retry duplicated {table}");
+        }
+        drop(conn);
+
+        let bundle = load_session(&pool, "acct_retry", "retry-session")
+            .unwrap()
+            .unwrap();
+        let restored = &bundle.transcript_segments[0];
+        assert_eq!(restored.source, "system_audio");
+        assert_eq!(restored.start_ms, Some(101));
+        assert_eq!(restored.end_ms, Some(202));
+        assert_eq!(restored.ts_ms, 20);
+        assert_eq!(restored.metadata["stt_provider"], "deepgram");
+        assert_eq!(bundle.cue_responses[0].session_id, "retry-session");
+        assert_eq!(bundle.context_artifacts[0].session_id, "retry-session");
+    }
+
+    #[test]
+    fn listed_session_revision_includes_transcript_response_context_and_rag() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        insert_test_account(&pool, "acct_revision", "revision@example.com");
+
+        upsert_batch(
+            &pool,
+            "acct_revision",
+            &[test_session("revision-session", 10)],
+            &[SyncTranscriptSegment {
+                segment_id: "revision-segment".into(),
+                session_id: "revision-session".into(),
+                speaker: "user".into(),
+                source: "unknown".into(),
+                text: "transcript".into(),
+                start_ms: None,
+                end_ms: None,
+                ts_ms: 20,
+                is_final: true,
+                metadata: serde_json::json!({}),
+            }],
+            &[SyncCueResponseRecord {
+                response_id: "revision-response".into(),
+                session_id: "revision-session".into(),
+                kind: "answer".into(),
+                text: "answer".into(),
+                source_text: Some("question".into()),
+                ts_ms: 30,
+                provider: None,
+                model: None,
+                lane: None,
+                task_type: None,
+                cost_cents: None,
+                balance_cents_after: None,
+                cost_label: None,
+                artifact_type: None,
+                artifact_body: None,
+                artifact_confidence: None,
+                metadata: serde_json::json!({}),
+            }],
+            &[SyncContextArtifactRecord {
+                artifact_id: "revision-artifact".into(),
+                session_id: "revision-session".into(),
+                kind: "document".into(),
+                title: "revision context".into(),
+                note: None,
+                source_uri: None,
+                content_hash: None,
+                text_preview: Some("context".into()),
+                created_at_ms: 1,
+                updated_at_ms: 40,
+                metadata: serde_json::json!({}),
+            }],
+            &[SyncRagChunkRecord {
+                chunk_id: "revision-rag".into(),
+                session_id: Some("revision-session".into()),
+                source_kind: "context".into(),
+                source_id: "revision-artifact".into(),
+                chunk_index: 0,
+                text: "rag".into(),
+                embedding: None,
+                embedding_model: None,
+                token_count: None,
+                content_hash: None,
+                updated_at_ms: 35,
+                metadata: serde_json::json!({}),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            list_sessions(&pool, "acct_revision", 10).unwrap()[0].updated_at_ms,
+            40
+        );
+
+        upsert_batch(
+            &pool,
+            "acct_revision",
+            &[],
+            &[],
+            &[],
+            &[SyncContextArtifactRecord {
+                artifact_id: "revision-artifact".into(),
+                session_id: "revision-session".into(),
+                kind: "document".into(),
+                title: "newer context".into(),
+                note: None,
+                source_uri: None,
+                content_hash: None,
+                text_preview: Some("newer context".into()),
+                created_at_ms: 1,
+                updated_at_ms: 50,
+                metadata: serde_json::json!({}),
+            }],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            list_sessions(&pool, "acct_revision", 10).unwrap()[0].updated_at_ms,
+            50
+        );
     }
 }

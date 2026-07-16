@@ -270,6 +270,31 @@ private enum BalanceVisualTone: Equatable {
     case signedOut
 }
 
+private enum OverlayAccountUIState: Equatable {
+    case unknown
+    case signedOut
+    case signedIn
+}
+
+private func resolvedAccountUIState(authoritativeSignedIn signedIn: Bool) -> OverlayAccountUIState {
+    signedIn ? .signedIn : .signedOut
+}
+
+private func allowsAuthenticatedChromeUpdates(for state: OverlayAccountUIState) -> Bool {
+    state == .signedIn
+}
+
+private func enablesSignInHeaderActions(for state: OverlayAccountUIState) -> Bool {
+    state == .signedOut
+}
+
+private func establishesSignedInChrome(
+    from current: OverlayAccountUIState,
+    to next: OverlayAccountUIState
+) -> Bool {
+    current != .signedIn && next == .signedIn
+}
+
 private func parsedBalanceCents(from label: String) -> Int? {
     let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let dollar = clean.firstIndex(of: "$") else { return nil }
@@ -5407,6 +5432,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var windowFullSize = false
     private var preWindowFullSizeFrame: NSRect?
     private var passThroughMode = false
+    private var accountUIState: OverlayAccountUIState = .unknown
     private var signedOutGateActive = false
     private var headerDragInProgress = false
     private var manualWindowDragActive = false
@@ -9929,9 +9955,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard !handleSignedOutGateAction(action: "screen") else { return }
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
         let question = composedQuestionForAnswer(typed: raw)
-        routeBadge.stringValue = "Screen · ready"
-        routeBadge.textColor = themedAccentColor
-        routeBadge.toolTip = "Screen capture is ready for the next answer"
+        setAuthenticatedRouteBadge(
+            "Screen · ready",
+            color: themedAccentColor,
+            toolTip: "Screen capture is ready for the next answer")
         setHeaderSubtitle("Capturing screen")
         screenContextReadyForAnswer = true
         expectContextMutationForPendingSend()
@@ -10296,12 +10323,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func setBalanceLabel(_ label: String) {
+        guard allowsAuthenticatedChromeUpdates(for: accountUIState) else { return }
         let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
         balanceLabel.stringValue = clean.isEmpty ? "Balance --" : clean
-        let tone = balanceVisualTone(for: balanceLabel.stringValue)
-        if tone != .signedOut && tone != .unknown {
-            showSignedInChromeReady()
-        }
         updateBalanceLabelTone()
     }
 
@@ -10351,7 +10375,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func refreshSessionHeaderSubtitle() {
-        guard !signedOutGateActive else { return }
+        guard allowsAuthenticatedChromeUpdates(for: accountUIState) else { return }
         let code = (activeSessionCode ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !code.isEmpty else {
             setHeaderSubtitle()
@@ -10376,6 +10400,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func showSignedOutLogin(url: URL?) {
+        accountUIState = .signedOut
         signedOutGateActive = true
         setHeaderSubtitle("Local ready")
         routeBadge.stringValue = "Sign in"
@@ -10385,7 +10410,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
         balanceLabel.stringValue = "Sign in"
         updateBalanceLabelTone()
-        setSignedOutSignInHitTargetsEnabled(true)
+        setSignedOutSignInHitTargetsEnabled(
+            enablesSignInHeaderActions(for: accountUIState))
         setKnowledgeBadge("Docs locked", accent: BlueyTheme.textDim)
         composer.placeholder = url == nil ? "Sign in to use managed answers..." : "Sign in, then ask anything..."
         statusLabel.toolTip = "Cloud answers, balance, sync, and documents unlock after login"
@@ -10398,8 +10424,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func showSignedInChromeReady() {
+        accountUIState = .signedIn
         signedOutGateActive = false
-        setSignedOutSignInHitTargetsEnabled(false)
+        setSignedOutSignInHitTargetsEnabled(
+            enablesSignInHeaderActions(for: accountUIState))
         feed.removeSignInCards()
         applySignedOutGateControlState()
         refreshSessionHeaderSubtitle()
@@ -10697,7 +10725,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             recordingButton.title = "Starting"
             setHeaderSubtitle()
             composer.placeholder = "Connecting audio..."
-            updateAudioRouteBadge("● Starting", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
             setTranscriptState("STARTING", active: true)
             seedTranscriptPreviewIfEmpty("Mic + System: starting audio...")
@@ -10709,7 +10736,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             recordingButton.title = "Stop"
             setHeaderSubtitle()
             composer.placeholder = "Listening... type a follow-up anytime"
-            updateAudioRouteBadge("● Listening", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "stop.fill", accent: true)
             setTranscriptState("LISTENING", active: true)
             seedTranscriptPreviewIfEmpty("Mic + System: captions appear here.")
@@ -10722,7 +10748,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             recordingButton.title = "Listen"
             setHeaderSubtitle()
             composer.placeholder = "Ask anything..."
-            updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
             setTranscriptState("READY", active: false)
             seedTranscriptPreviewIfEmpty("Live captions preview")
@@ -10738,7 +10763,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             recordingButton.title = "Listen"
             setHeaderSubtitle("Audio issue")
             composer.placeholder = "Ask anything..."
-            updateAudioRouteBadge("● Audio", accent: BlueyTheme.warning)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
             setTranscriptState("FAILED", active: false)
         case .ready:
@@ -10753,10 +10777,23 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             recordingButton.title = "Listen"
             setHeaderSubtitle()
             composer.placeholder = "Ask anything..."
-            updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
             setTranscriptState("READY", active: false)
             seedTranscriptPreviewIfEmpty("Live captions preview")
+        }
+        refreshAudioRouteBadge(for: state)
+    }
+
+    func refreshAudioRouteBadge(for state: PillRunState) {
+        switch state {
+        case .connecting:
+            updateAudioRouteBadge("● Starting", accent: BlueyTheme.green)
+        case .listening:
+            updateAudioRouteBadge("● Listening", accent: BlueyTheme.green)
+        case .paused, .ready:
+            updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
+        case .failed:
+            updateAudioRouteBadge("● Audio", accent: BlueyTheme.warning)
         }
     }
 
@@ -10777,11 +10814,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         transcriptActivityDot.layer?.shadowRadius = clampedRemaining > 0 ? 8 : 4
         transcriptStrip.layer?.backgroundColor = BlueyTheme.warning.withAlphaComponent(0.055).cgColor
         transcriptStrip.layer?.borderColor = BlueyTheme.warning.withAlphaComponent(0.58).cgColor
-        routeBadge.stringValue = clampedRemaining > 0 ? "● Stops in \(clampedRemaining)s" : "● Auto-stopped"
-        routeBadge.textColor = BlueyTheme.warning
-        routeBadge.toolTip = clampedRemaining > 0
-            ? "No captions for \(idleLabel). Bluey will stop Listen soon to avoid STT billing."
-            : "Bluey stopped Listen to avoid STT billing."
+        setAuthenticatedRouteBadge(
+            clampedRemaining > 0 ? "● Stops in \(clampedRemaining)s" : "● Auto-stopped",
+            color: BlueyTheme.warning,
+            toolTip: clampedRemaining > 0
+                ? "No captions for \(idleLabel). Bluey will stop Listen soon to avoid STT billing."
+                : "Bluey stopped Listen to avoid STT billing.")
         let railText = clampedRemaining > 0
             ? "No captions detected. Auto-stopping in \(clampedRemaining)s to avoid STT billing."
             : "Listen auto-stopped to avoid STT billing."
@@ -10819,9 +10857,23 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func updateAudioRouteBadge(_ text: String, accent: NSColor) {
+        setAuthenticatedRouteBadge(
+            text,
+            color: accent,
+            toolTip: text.replacingOccurrences(of: "● ", with: ""))
+    }
+
+    private func setAuthenticatedRouteBadge(
+        _ text: String,
+        color: NSColor? = nil,
+        toolTip: String
+    ) {
+        guard allowsAuthenticatedChromeUpdates(for: accountUIState) else { return }
         routeBadge.stringValue = text
-        routeBadge.textColor = accent
-        routeBadge.toolTip = text.replacingOccurrences(of: "● ", with: "")
+        if let color {
+            routeBadge.textColor = color
+        }
+        routeBadge.toolTip = toolTip
         routeBadge.layer?.borderColor = NSColor.clear.cgColor
         routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
     }
@@ -10830,6 +10882,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         for question: String,
         selectedRoute: (provider: String?, model: String?, mode: String?)
     ) {
+        guard allowsAuthenticatedChromeUpdates(for: accountUIState) else { return }
         let manual = (selectedRoute.provider ?? "auto").lowercased() != "auto"
         if manual {
             switch (selectedRoute.mode ?? selectedRoute.model ?? selectedRoute.provider ?? "Manual").lowercased() {
@@ -11195,8 +11248,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateTranscriptStripText("Live captions preview", scrollToEnd: false)
         updateTranscriptClearButtonVisibility()
         setTranscriptState("READY", active: false)
-        routeBadge.stringValue = "● Ready"
-        routeBadge.textColor = BlueyTheme.green
+        setAuthenticatedRouteBadge(
+            "● Ready",
+            color: BlueyTheme.green,
+            toolTip: "Ready")
         canvases.removeAll()
         activeCanvasIndex = nil
         canvasCardAssignments.removeAll()
@@ -11228,21 +11283,25 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 if !done {
                     setHeaderSubtitle("Answer streaming")
                 } else {
-                    routeBadge.stringValue = "● Ready"
-                    routeBadge.textColor = BlueyTheme.green
-                    routeBadge.toolTip = "Ready"
+                    setAuthenticatedRouteBadge(
+                        "● Ready",
+                        color: BlueyTheme.green,
+                        toolTip: "Ready")
                     refreshSessionHeaderSubtitle()
                 }
             } else {
-                routeBadge.stringValue = routeBadgeText(for: artifact)
-                routeBadge.toolTip = "Answer opened a \(routeBadgeText(for: artifact).lowercased()) workbench"
+                let badgeText = routeBadgeText(for: artifact)
+                setAuthenticatedRouteBadge(
+                    badgeText,
+                    toolTip: "Answer opened a \(badgeText.lowercased()) workbench")
             }
         } else if !done {
             setHeaderSubtitle("Answer streaming")
         } else {
-            routeBadge.stringValue = "● Ready"
-            routeBadge.textColor = BlueyTheme.green
-            routeBadge.toolTip = "Ready"
+            setAuthenticatedRouteBadge(
+                "● Ready",
+                color: BlueyTheme.green,
+                toolTip: "Ready")
             refreshSessionHeaderSubtitle()
             if card.kind == "answer" {
                 let question = feed.nearestQuestionBody(beforeCardId: id)
@@ -14729,6 +14788,7 @@ private final class OverlayApp {
     private var stickyPillFrame: NSRect?
     private var stickyExpandedFrame: NSRect?
     private var lastTargetBundleIdentifier: String?
+    private var accountUIState: OverlayAccountUIState = .unknown
 
     /// Pending boot card, if a Boot command arrived before windows materialised.
     private var pendingBoot: (title: String, lines: [String])?
@@ -15556,6 +15616,15 @@ private final class OverlayApp {
         expandedView = view
         view.setListeningState(currentRunState)
         view.applyOpacity(overlayOpacity)
+        switch accountUIState {
+        case .signedIn:
+            view.showSignedInChromeReady()
+            view.refreshAudioRouteBadge(for: currentRunState)
+        case .signedOut:
+            view.showSignedOutLogin(url: nil)
+        case .unknown:
+            break
+        }
         if let pending = pendingBoot {
             pushBootCard(title: pending.title, lines: pending.lines)
             pendingBoot = nil
@@ -15679,12 +15748,24 @@ private final class OverlayApp {
         case .setPosition(let pos):
             applyPosition(pos)
         case .setBalance(let label):
-            expandedView?.setBalanceLabel(label)
-            pillView?.setBalanceLabel(label)
+            if allowsAuthenticatedChromeUpdates(for: accountUIState) {
+                expandedView?.setBalanceLabel(label)
+                pillView?.setBalanceLabel(label)
+            }
         case .setAccountState(let signedIn):
+            let previousAccountUIState = accountUIState
+            let nextAccountUIState = resolvedAccountUIState(authoritativeSignedIn: signedIn)
+            accountUIState = nextAccountUIState
             if signedIn {
-                let shouldCollapseAfterUnlock = expandedView?.isSignedOutGateActive == true
-                expandedView?.showSignedInChromeReady()
+                let establishesSignedIn = establishesSignedInChrome(
+                    from: previousAccountUIState,
+                    to: nextAccountUIState)
+                let shouldCollapseAfterUnlock = establishesSignedIn
+                    && expandedView?.isSignedOutGateActive == true
+                if establishesSignedIn {
+                    expandedView?.showSignedInChromeReady()
+                    expandedView?.refreshAudioRouteBadge(for: currentRunState)
+                }
                 pillView?.setHealthState(.ready)
                 if shouldCollapseAfterUnlock {
                     collapse()
@@ -15752,6 +15833,9 @@ private final class OverlayApp {
     private func pushBootCard(title: String, lines: [String]) {
         let signInURL = loginURL(from: lines)
         let isSignInBoot = signInURL != nil || title.localizedCaseInsensitiveContains("sign in")
+        if isSignInBoot {
+            accountUIState = .signedOut
+        }
         if expandedView == nil {
             if isSignInBoot {
                 ensureExpandedWindow()
@@ -15764,7 +15848,9 @@ private final class OverlayApp {
             pendingBoot = (title, lines)
             return
         }
-        let shouldCollapseAfterUnlock = view.isSignedOutGateActive && !isSignInBoot
+        let shouldCollapseAfterUnlock = view.isSignedOutGateActive
+            && !isSignInBoot
+            && allowsAuthenticatedChromeUpdates(for: accountUIState)
         let body = lines.joined(separator: "\n")
         let card = RenderedCard(
             id: UUID().uuidString,
@@ -15786,7 +15872,7 @@ private final class OverlayApp {
                 expandedWindow?.orderOut(nil)
                 bringPillToFront(force: true)
             }
-        } else {
+        } else if allowsAuthenticatedChromeUpdates(for: accountUIState) {
             view.showSignedInReady()
             pillView?.setHealthState(.ready)
         }
@@ -15962,6 +16048,32 @@ private func blueyTrustedRemoteInputEventTapCallback(
 
 // MARK: - Entry point
 
+#if BLUEY_AUTH_UI_POLICY_TESTS
+private func runAuthUIPolicyTests() {
+    precondition(!allowsAuthenticatedChromeUpdates(for: .unknown))
+    precondition(!allowsAuthenticatedChromeUpdates(for: .signedOut))
+    precondition(allowsAuthenticatedChromeUpdates(for: .signedIn))
+
+    precondition(!enablesSignInHeaderActions(for: .unknown))
+    precondition(enablesSignInHeaderActions(for: .signedOut))
+    precondition(!enablesSignInHeaderActions(for: .signedIn))
+
+    precondition(establishesSignedInChrome(from: .unknown, to: .signedIn))
+    precondition(establishesSignedInChrome(from: .signedOut, to: .signedIn))
+    precondition(!establishesSignedInChrome(from: .signedIn, to: .signedIn))
+    precondition(!establishesSignedInChrome(from: .signedOut, to: .signedOut))
+
+    var state = resolvedAccountUIState(authoritativeSignedIn: true)
+    precondition(allowsAuthenticatedChromeUpdates(for: state))
+    state = resolvedAccountUIState(authoritativeSignedIn: false)
+    precondition(!allowsAuthenticatedChromeUpdates(for: state))
+    precondition(enablesSignInHeaderActions(for: state))
+
+    print("Auth UI policy tests passed")
+}
+
+runAuthUIPolicyTests()
+#else
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let coord = OverlayApp()
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -15978,3 +16090,4 @@ if captureVisibleForDebug {
     app.activate(ignoringOtherApps: true)
 }
 app.run()
+#endif
