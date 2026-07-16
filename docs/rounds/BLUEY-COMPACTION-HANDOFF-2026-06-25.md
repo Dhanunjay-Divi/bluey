@@ -30,8 +30,8 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed engineering round docs are Rounds 519-523. Round 524 is the
-  active mainline-convergence and signed-release round.
+- Latest completed engineering round is Round 524, the mainline-convergence and
+  signed `0.1.101` release.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 - Do not claim raw-audio retention, replay, or training from the current audit
   bundle. The shipped `audio/audio.jsonl` path is a manifest placeholder; any
@@ -40,7 +40,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 
 ## Current State
 
-- Round 524 is the active release convergence on branch
+- Round 524 completed release convergence on branch
   `codex/bluey-interrupted-asks-round519-20260712`:
   - all reviewed non-Sashreek branch/worktree material is represented or
     deliberately deferred by Rounds 520-523
@@ -57,9 +57,26 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
     daemon paths
   - full workspace/server tests, strict Clippy, dashboard tests/build, native
     parse, release hygiene, formatting, and whitespace gates are green
-  - release version is `0.1.101`
-  - commit, main fast-forward, signed manual deploy, and live hashes remain the
-    final Round 524 steps; do not claim them complete until evidence is appended
+  - deployed source/mainline commit:
+    `5cf31b9d56660c2d65b8fd2dc706260ee543f656`
+  - signed server release: `round524-5cf31b9d5666`
+  - production API SHA-256:
+    `fd3ff9f92b30a1420e6cf8aa4ae9597af66fab7ca8321138f9d2d39d291fbbd2`
+  - signed native release: `0.1.101`
+  - macOS arm64 SHA-256:
+    `23e9aafbf33c7838426a1181dc2a15a5bbe0b3eff3c9650b190fa12ad8a0ed57`
+  - Windows x86-64 SHA-256:
+    `25393722e4a18721bd7b82820000f198022c60cfcf92a478238305f4c621cbb7`
+  - strict preflight, PostgreSQL backup/restore-list, R2 backup copy, rollback
+    snapshot, signed manifest/artifact verification, edge/origin matrix,
+    service health, and post-release log scan passed
+  - no GitHub Actions, Keychain, Jobs redeploy, or Caddy restart was used
+  - `origin/main` contains all reviewed launch-ready non-Sashreek work; the
+    remaining old Codex worktrees are preserved experimental archives, not
+    missing mainline patches
+  - deliberate gates remain: physical Windows runtime canary, source-audio
+    retention, dependency-complete Jobs/Coach/Workspaces, external OAuth/ATS
+    certification, and measured pgvector KNN rollout
   - round doc:
     `docs/rounds/ROUND-524-BLUEY-MAINLINE-CONVERGENCE-AND-SIGNED-RELEASE.md`
 
