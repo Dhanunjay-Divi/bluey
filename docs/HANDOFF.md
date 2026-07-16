@@ -1,8 +1,8 @@
 # Bluey Handoff
 
-> Historical implementation handoff. Its `0.1.0` packaging statements are not
-> current release claims. The public `0.1.101` manifest lists macOS Apple silicon
-> and Windows x86-64 artifacts.
+> Current implementation handoff for `0.1.102`. Release acceptance and runtime
+> boundaries are recorded in
+> `docs/rounds/ROUND-527-CONTEXT-RECOVERY-UX-AND-ATOMIC-RELEASE.md`.
 
 This document is the quick-start map for the next agent or engineer picking up Bluey.
 
@@ -22,6 +22,12 @@ This document is the quick-start map for the next agent or engineer picking up B
 - The overlay feed is chronological: `SYSTEM` and `MIC` transcript rows stream in as compact source-labeled cards, a submitted question appears as `YOU`, and the generated response appears next as `BLUEY`.
 - Recent `YOU`/`BLUEY` Q&A turns are stored in the active session and included as `MeetingMemory` context for follow-up answers.
 - Empty Answer/send asks Bluey to answer the latest clear question from transcript, page context, and attached files.
+- Context Watch is explicit and consent-first. It observes the foreground
+  supported browser, prefers semantic page text, strips URL query/fragment
+  data, deduplicates unchanged content, and stores only a bounded owner-private
+  local history. Screenshot fallback is off by default.
+- Meeting detection observes supported local process/audio evidence and offers
+  Start, Ignore, and Settings. It does not start recording by detection alone.
 - Answers create a `BLUEY / Thinking...` card immediately. Live OpenAI-compatible providers stream deltas into that card through `OverlayCommand::UpdateCard`; local fallback and non-streaming paths replay the completed answer word by word.
 - Provider context is compacted before every model call: transcript, recent Q&A, documents, screenshots, and notes are capped per item and then capped again as a total context block.
 - Recap uses the daemon recap path.
@@ -31,8 +37,16 @@ This document is the quick-start map for the next agent or engineer picking up B
 - PDF uses local `pdftotext` if installed.
 - macOS DOC/DOCX/RTF uses `textutil`.
 - Windows DOCX uses a PowerShell XML extraction path; legacy DOC/RTF needs the cloud parser.
-- Native audio helper paths exist for macOS and Windows source builds. v0.1.0 ships the macOS arm64 path; without a configured remote/local STT path, the daemon can still fall back to dev-only mock/echo transcript flow for testing.
-- v0.1.0 packaging is macOS arm64-only: `make package-darwin-arm64` creates a terminal tarball with CLI, daemon, overlay helper, audio helper, and whisper helper; `scripts/install.sh` installs it into a versioned local prefix.
+- macOS packages contain the Rust CLI/daemon plus native overlay, dual-audio,
+  file-picker, and real local-Whisper helpers. Apple silicon, Intel, and
+  universal archives are built and verified separately.
+- Windows x86-64 packages contain the Rust CLI/daemon plus native overlay,
+  dual-audio, and capture helpers. Managed live captions are the supported STT
+  path; no placeholder or fabricated local transcript helper is shipped.
+- Jobs has a separate Web portal and local/cloud runner architecture for
+  discovery, ranking, factual resume tailoring, answer memory, final review,
+  ATS-specific execution, handoff-only sites, receipts, interview preparation,
+  and encrypted crash recovery.
 
 ## Keys And Local Models Needed For Real Testing
 
@@ -87,16 +101,20 @@ Product smoke:
 ./target/debug/bluey off
 ```
 
-## Next Engineering Slices
+## Remaining Runtime And Dependency Gates
 
-- Clean-machine validate `scripts/install.sh` + `bluey on/off` on Apple Silicon.
-- Replace local RAG linear cosine with sqlite-vec / ANN.
-- Port real whisper.cpp to Windows and QA overlay/audio/page capture on Windows hardware.
-- Add richer OCR/vision extraction with citations, thumbnail previews, queueing, and cloud processing status. The first screenshot-to-vision fallback path is wired for Analyse Screen.
-- Add cloud auth/device registration, artifact upload, document parsing, embeddings, and tenant-scoped RAG.
-- Add settings/onboarding UI for account, permissions, audio devices, models, hotkeys, retention, export, and deletion.
-- Add a history/dashboard UI for sessions, transcripts, recaps, answers, and attachments.
-- Add signed macOS/Windows installers, auto-update, telemetry opt-in, and support diagnostics when ready for public distribution.
+- Run physical Windows launch, overlay, dual-audio, UI Automation context,
+  update, DPAPI checkpoint, and managed-live-caption canaries before broad
+  Windows rollout.
+- Run macOS Intel and clean-machine universal install/update canaries.
+- Validate Chrome/Edge semantic capture under customer browser permission
+  policies; unsupported policies fail closed instead of silently taking
+  screenshots.
+- Jobs mailbox/calendar OAuth, outcome ingestion, and provider certification
+  remain disabled until provider credentials, review, and live test accounts
+  are available.
+- Measure tenant-filtered vector retrieval before replacing the current bounded
+  retrieval strategy with a production ANN index.
 
 ## Review Notes
 

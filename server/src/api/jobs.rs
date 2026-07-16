@@ -245,13 +245,33 @@ async fn require_jobs_beta(request: Request<Body>, next: Next) -> Result<Respons
     Ok(next.run(request).await)
 }
 
+fn jobs_local_browser_distribution_enabled() -> bool {
+    cfg!(debug_assertions)
+        || std::env::var("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
+            .unwrap_or(false)
+}
+
+fn apply_jobs_distribution_gates(entitlement: &mut JobsEntitlement, local_browser: bool) {
+    entitlement.local_browser &= local_browser;
+}
+
 pub async fn workspace(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
 ) -> Result<Json<JobsWorkspace>, ApiError> {
-    jobs::workspace(&state.pool, &account.id, &account.email)
-        .map(Json)
-        .map_err(internal)
+    let mut workspace =
+        jobs::workspace(&state.pool, &account.id, &account.email).map_err(internal)?;
+    apply_jobs_distribution_gates(
+        &mut workspace.entitlement,
+        jobs_local_browser_distribution_enabled(),
+    );
+    Ok(Json(workspace))
 }
 
 pub async fn profile(
@@ -834,6 +854,13 @@ pub async fn queue_application_run(
     if !matches!(req.runner.as_str(), "local" | "cloud") {
         return bad_request("Choose the local or cloud runner.");
     }
+    if req.runner == "local" && !jobs_local_browser_distribution_enabled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Browser is still an invited beta and is not distributed in this release."
+                .to_string(),
+        ));
+    }
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
     if (req.runner == "local" && !entitlement.local_browser)
         || (req.runner == "cloud" && !entitlement.cloud_browser)
@@ -1174,6 +1201,13 @@ pub async fn save_browser_session(
 ) -> Result<Json<BrowserSession>, ApiError> {
     if !matches!(session.runner.as_str(), "local" | "cloud") {
         return bad_request("Choose the local or cloud browser.");
+    }
+    if session.runner == "local" && !jobs_local_browser_distribution_enabled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Browser is still an invited beta and is not distributed in this release."
+                .to_string(),
+        ));
     }
     if !matches!(
         session.status.as_str(),
@@ -1844,8 +1878,13 @@ pub async fn request_mailbox_connection(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(mut connection): Json<MailboxConnection>,
 ) -> Result<Json<MailboxConnection>, ApiError> {
+    // This records a beta-access request only. It must not look like an OAuth
+    // grant or advertise sync capabilities before provider authorization,
+    // revocation, ingestion workers, and deletion are deployed.
     connection.id.clear();
     connection.status = "pending".to_string();
+    connection.aliases.clear();
+    connection.capabilities.clear();
     connection.created_at_ms = 0;
     connection.updated_at_ms = 0;
     let provider_subject = connection.account_label.clone();
@@ -4038,6 +4077,17 @@ mod tests {
             connected_inbox_limit: 1,
             additional_inbox_cents: 500,
         }
+    }
+
+    #[test]
+    fn unavailable_local_browser_distribution_masks_plan_entitlement() {
+        let mut entitlement = test_entitlement(3);
+        entitlement.local_browser = true;
+
+        apply_jobs_distribution_gates(&mut entitlement, false);
+
+        assert!(!entitlement.local_browser);
+        assert!(!entitlement.cloud_browser);
     }
 
     fn test_track(id: &str) -> CareerTrack {

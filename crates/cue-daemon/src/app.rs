@@ -1831,7 +1831,7 @@ impl Drop for IpcCapabilityGuard {
 }
 
 async fn bind_daemon_ipc_listener(
-    paths: &AppPaths,
+    _paths: &AppPaths,
     compatibility_addr: Option<&str>,
 ) -> Result<DaemonIpcListener> {
     if let Some(value) = compatibility_addr {
@@ -1844,7 +1844,7 @@ async fn bind_daemon_ipc_listener(
     #[cfg(unix)]
     {
         return Ok(DaemonIpcListener::Unix(
-            cue_core::ipc_transport::OwnerOnlyUnixListener::bind(paths)?,
+            cue_core::ipc_transport::OwnerOnlyUnixListener::bind(_paths)?,
         ));
     }
 
@@ -16987,6 +16987,28 @@ async fn attach_context_watch_artifact(
         );
     }
     refresh_overlay_context_items(daemon, &meeting_snapshot).await;
+    let watched = meeting_snapshot
+        .context
+        .iter()
+        .filter(|item| context_artifact_is_from_watch(item))
+        .collect::<Vec<_>>();
+    if watched.len() == 1 {
+        let title = watched[0].title.trim();
+        push_system_card(
+            daemon,
+            CardKind::System,
+            "Work context ready",
+            if title.is_empty() {
+                "Bluey learned the first readable page in this explicit Context session. Ask about the work whenever you are ready.".to_string()
+            } else {
+                format!(
+                    "Bluey learned the first readable page in this explicit Context session: “{}”. Ask about it whenever you are ready.",
+                    compact_snippet(title, 140)
+                )
+            },
+        )
+        .await;
+    }
     record_visible_audit_event(
         daemon,
         "ui_context_watch_observation",
@@ -20590,11 +20612,6 @@ fn is_reasonable_bundle_identifier(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_')
-}
-
-#[cfg(target_os = "windows")]
-fn powershell_single_quoted(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "''"))
 }
 
 fn enrich_context_artifact(

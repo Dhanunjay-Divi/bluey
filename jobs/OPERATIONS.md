@@ -16,6 +16,10 @@ On a Bluey production host, install `ops/bluey-jobs.env.example` as
 secret, and set mode `0640` with owner `root:bluey`. The Jobs systemd unit also
 loads the shared API, Valkey, and Postgres environment files. Keep
 `BLUEY_JOBS_BETA_ENABLED=0` until the restricted beta is intentionally opened.
+Keep `BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0` until versioned Bluey
+Browser packages and updater metadata are published and physical macOS/Windows
+install, launch, protocol, and rollback canaries pass. Plan entitlement alone
+must never expose an undistributed client.
 Install `ops/bluey-api-jobs-env.conf.example` as the main API service drop-in so
 account export, account deletion, and Jobs admin routes use the same data key.
 The standalone Jobs API binds to loopback by default; container deployments
@@ -30,6 +34,7 @@ and browser pool share `BLUEY_JOBS_RUNNER_TOKEN`. Use independently generated
 
 ```text
 BLUEY_JOBS_BETA_ENABLED=1
+BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0
 BLUEY_JOBS_WORKFLOW_ORIGIN=https://jobs-workflows.internal
 BLUEY_JOBS_WORKFLOW_TOKEN=<random secret>
 BLUEY_JOBS_WORKER_TOKEN=<random secret>

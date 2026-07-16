@@ -221,8 +221,8 @@ export function SettingsView({
       </section>
 
       <section className="settings-section">
-        <div className="settings-section-title"><span><Mail /></span><div><p>INBOXES & CALENDARS</p><h2>Keep every application timeline current</h2><small>One inbox connection includes its aliases. Connect another slot only for a separate Gmail or Outlook mailbox.</small></div><button className="button secondary compact" onClick={() => setMailboxOpen(true)} disabled={workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length >= workspace.entitlement.connected_inbox_limit}><Plus size={15} />Connect inbox</button></div>
-        <div className="connection-usage"><span><b>{workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length}</b> of {workspace.entitlement.connected_inbox_limit} inbox connections</span><span>Extra inbox slot: {money(workspace.entitlement.additional_inbox_cents)}/month</span></div>
+        <div className="settings-section-title"><span><Mail /></span><div><p>INBOX & CALENDAR BETA</p><h2>Request outcome-sync access</h2><small>Provider authorization and timeline ingestion are not active yet. A request does not connect, read, or bill an inbox.</small></div><button className="button secondary compact" onClick={() => setMailboxOpen(true)} disabled={workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length >= workspace.entitlement.connected_inbox_limit}><Plus size={15} />Request inbox beta</button></div>
+        <div className="connection-usage"><span><b>{workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length}</b> beta request{workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length === 1 ? "" : "s"}</span><span>No mailbox access or slot charge while pending</span></div>
         <div className="integration-list">
           {workspace.mailbox_connections.map((connection) => <div key={connection.id}>
             <span className="integration-icon"><Mail /></span>
@@ -237,11 +237,11 @@ export function SettingsView({
       <section className="settings-section" id="plans">
         <div className="settings-section-title"><span><CreditCard /></span><div><p>PLAN</p><h2>{titleCase(workspace.entitlement.plan)} Jobs</h2><small>{workspace.entitlement.used_packets} of {workspace.entitlement.monthly_packet_limit} included applications used this month.</small></div><a className="button secondary compact" href="/account#billing">Shared balance<ArrowRight size={15} /></a></div>
         <div className="plan-grid">
-          <Plan name="Free" price="$0" details="1 agent · 5 reviewed applications · 2 application emails · 1 inbox" active={workspace.entitlement.plan === "free"} />
-          <Plan name="Pro" price="$29" details="3 agents · 50 applications · 10 application emails · 2 inboxes · invited local runner beta" active={workspace.entitlement.plan === "pro"} />
-          <Plan name="Cloud" price="$49" details="5 agents · 100 applications · 25 application emails · 5 inboxes · invited cloud runner beta" active={workspace.entitlement.plan === "cloud"} />
+          <Plan name="Free" price="$0" details="1 agent · 5 reviewed applications · 2 application emails" active={workspace.entitlement.plan === "free"} />
+          <Plan name="Pro" price="$29" details="3 agents · 50 applications · 10 application emails · local runner beta waitlist" active={workspace.entitlement.plan === "pro"} />
+          <Plan name="Cloud" price="$49" details="5 agents · 100 applications · 25 application emails · invited cloud runner beta" active={workspace.entitlement.plan === "cloud"} />
         </div>
-        <p className="plan-footnote">Application emails and aliases are included. Separate inboxes use connection slots; additional slots are {money(workspace.entitlement.additional_inbox_cents)}/month. After the included applications, each additional completed application is {money(workspace.entitlement.overage_cents)} from your shared Bluey balance. Retries and browser handoffs do not count again.</p>
+        <p className="plan-footnote">Application emails are included. Inbox/calendar sync stays an unbilled request-only beta until provider authorization and ingestion are enabled. After the included applications, each additional completed application is {money(workspace.entitlement.overage_cents)} from your shared Bluey balance. Retries and browser handoffs do not count again.</p>
       </section>
 
       <ApplicationEmailDialog
@@ -301,7 +301,7 @@ export function SettingsView({
       </Dialog>
       <ConfirmDialog open={Boolean(disconnecting)} title={`Disconnect ${disconnecting ? integrationName(disconnecting.provider) : "integration"}?`} description="Bluey will stop syncing new status updates from this account. Existing application history stays in Jobs." confirmLabel="Disconnect" tone="danger" onClose={() => setDisconnecting(null)} onConfirm={() => { const integration = disconnecting; setDisconnecting(null); if (integration) void onSaveIntegration({ ...integration, status: "disconnected", account_label: "" }).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingIdentity)} title={`Remove ${deletingIdentity?.email || "application email"}?`} description="Bluey will keep existing application receipts, but this address will no longer be available for new Career Tracks." confirmLabel="Remove email" tone="danger" onClose={() => setDeletingIdentity(null)} onConfirm={() => { const identity = deletingIdentity; setDeletingIdentity(null); if (identity) void onDeleteIdentity(identity).catch(showError(setLocalError)); }} />
-      <ConfirmDialog open={Boolean(disconnectingMailbox)} title={`${disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} ${disconnectingMailbox?.account_label || "inbox"}?`} description="Bluey will stop reading new application updates from this inbox. Existing application history stays in Jobs." confirmLabel={disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} tone="danger" onClose={() => setDisconnectingMailbox(null)} onConfirm={() => { const connection = disconnectingMailbox; setDisconnectingMailbox(null); if (connection) void onDeleteMailbox(connection).catch(showError(setLocalError)); }} />
+      <ConfirmDialog open={Boolean(disconnectingMailbox)} title={`${disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} ${disconnectingMailbox?.account_label || "inbox"}?`} description={disconnectingMailbox?.status === "pending" ? "This removes only the beta request. Bluey has not connected to or read this inbox." : "Bluey will stop reading new application updates from this inbox. Existing application history stays in Jobs."} confirmLabel={disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} tone="danger" onClose={() => setDisconnectingMailbox(null)} onConfirm={() => { const connection = disconnectingMailbox; setDisconnectingMailbox(null); if (connection) void onDeleteMailbox(connection).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingTrack)} title={`Delete ${deletingTrack?.name || "Career Track"}?`} description="This stops discovery for the track. Existing matches and applications stay in your history." confirmLabel="Delete track" tone="danger" onClose={() => setDeletingTrack(null)} onConfirm={() => { const track = deletingTrack; setDeletingTrack(null); if (track) void onDeleteTrack(track).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingAnswer)} title="Remove this saved answer?" description="Bluey will ask again the next time this question appears. Existing application receipts stay unchanged." confirmLabel="Remove answer" tone="danger" onClose={() => setDeletingAnswer(null)} onConfirm={() => { const answer = deletingAnswer; setDeletingAnswer(null); if (answer) void onDeleteAnswerMemory(answer).catch(showError(setLocalError)); }} />
     </div>
@@ -459,14 +459,14 @@ function MailboxDialog({ open, onClose, onSave }: { open: boolean; onClose(): vo
       setSaving(false);
     }
   };
-  return <Dialog open={open} title="Connect an inbox" description="Connect each independent mailbox once. Addresses that deliver into the same inbox count as aliases." onClose={onClose}>
+  return <Dialog open={open} title="Request inbox beta" description="Tell Bluey which provider you want to test. This records a request only; it does not start OAuth or mailbox access." onClose={onClose}>
     <div className="dialog-form">
       <label><span>Provider</span><div className="segmented"><button className={provider === "gmail" ? "active" : ""} onClick={() => setProvider("gmail")}>Gmail</button><button className={provider === "outlook" ? "active" : ""} onClick={() => setProvider("outlook")}>Outlook</button></div></label>
-      <label><span>Inbox email</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@company.com" /></label>
-      <p className="field-note">Bluey uses provider authorization. Your mailbox password is never requested or stored.</p>
+      <label><span>Inbox for beta eligibility</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@company.com" /></label>
+      <p className="field-note">No authorization, inbox reading, timeline sync, or charge begins from this request. Bluey will never ask for your mailbox password.</p>
       {error && <div className="inline-error">{error}</div>}
     </div>
-    <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !email.includes("@")} onClick={() => void submit()}>{saving ? "Preparing..." : `Continue with ${provider === "gmail" ? "Gmail" : "Outlook"}`}</button></div>
+    <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !email.includes("@")} onClick={() => void submit()}>{saving ? "Requesting..." : `Request ${provider === "gmail" ? "Gmail" : "Outlook"} beta`}</button></div>
   </Dialog>;
 }
 

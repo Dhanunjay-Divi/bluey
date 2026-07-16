@@ -3,7 +3,7 @@
 > **Step-by-step procedure for cutting a new Bluey release.**
 > Mirrors Pinky's `RELEASE-RUNBOOK.md`.
 >
-> Last updated: 2026-06-13, post signed-updater hardening.
+> Last updated: 2026-07-16, four-platform immutable publisher hardening.
 
 For the high-level lifecycle (environments, branches, promotion gates),
 read `docs/DELIVERY-LIFECYCLE.md` first. This doc is the concrete
@@ -153,11 +153,14 @@ native helpers. The dashboard UI must still pass its source tests/build in the
 pipeline gate, but no Tauri `Bluey.app` bundle is built or published.
 
 ```bash
+export BLUEY_UPDATE_PUBKEY="$(
+  tr -d '\r\n' < /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64
+)"
+export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
 make package-darwin-arm64
+make package-darwin-x86_64
 make package-darwin-universal
-BLUEY_UPDATE_PUBKEY="$(
-  cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64
-)" make package-windows-x86_64-gnu
+make package-windows-x86_64-gnu
 ls -la \
   dist/bluey-*-darwin-*.tar.gz \
   dist/bluey-*-darwin-*.tar.gz.sha256 \
@@ -170,6 +173,8 @@ Expected outputs:
 ```
 dist/bluey-X.Y.Z-darwin-arm64.tar.gz
 dist/bluey-X.Y.Z-darwin-arm64.tar.gz.sha256
+dist/bluey-X.Y.Z-darwin-x86_64.tar.gz
+dist/bluey-X.Y.Z-darwin-x86_64.tar.gz.sha256
 dist/bluey-X.Y.Z-darwin-universal.tar.gz
 dist/bluey-X.Y.Z-darwin-universal.tar.gz.sha256
 dist/bluey-X.Y.Z-windows-x86_64.zip

@@ -5,6 +5,41 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+## [0.1.102] - 2026-07-16
+
+### Added
+
+- Consent-first continuous work context with semantic browser capture,
+  app/domain exclusions, bounded local retention, and an explicit screenshot
+  fallback.
+- Local meeting detection and a native start/ignore/settings banner without
+  recording until the user chooses to start.
+- Durable encrypted Jobs checkpoints for safe crash recovery, with terminal
+  `side_effect_unknown` handling across irreversible submission boundaries.
+- Terminal controls for context privacy, meeting suggestions, exclusions,
+  retention, cadence, and screenshot fallback.
+- macOS Intel and universal release artifacts alongside Apple silicon and
+  Windows x86-64.
+
+### Changed
+
+- Rebuilt the overlay lifecycle around generation-fenced restart and complete
+  state rehydration.
+- Hardened microphone/system-audio routing, local VAD, STT retry, final-segment
+  deduplication, and explicit exhaustion errors.
+- Made cloud processing require both persisted enablement and consent at every
+  upload/index boundary.
+- Made page text and screenshots owner-private, atomic, and symlink/reparse
+  resistant.
+- Merged the Jobs resume-import onboarding, accessible modal UX, visible error
+  handling, and production Web build with the recovery work.
+- Made signed release publication immutable and ordered: versioned assets and
+  signature first, signed manifest second, convenience installer aliases last.
+- Removed the Windows placeholder-transcription helper from release packages;
+  Windows now fails closed when a real local STT capability is unavailable.
+
+See `docs/release/RELEASE-v0.1.102.md` for release detail.
+
 ## [0.1.99] - 2026-07-12
 
 ### Added

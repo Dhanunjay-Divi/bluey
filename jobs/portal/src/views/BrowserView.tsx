@@ -28,6 +28,8 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
   const [cloudOpen, setCloudOpen] = useState(false);
   const [queueing, setQueueing] = useState("");
   const [resolving, setResolving] = useState(false);
+  const [sessionBusy, setSessionBusy] = useState(false);
+  const [localError, setLocalError] = useState("");
   const [approvalOpen, setApprovalOpen] = useState(false);
   const [reviewConfirmed, setReviewConfirmed] = useState(false);
   const active = workspace.browser_sessions.find((session) => !["complete", "failed"].includes(session.status));
@@ -40,12 +42,58 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
   const localCopy = localRunnerAccessCopy(workspace.entitlement.local_browser);
   const cloudCopy = cloudRunnerAccessCopy(workspace.entitlement.cloud_browser);
 
+  const updateActiveSession = async () => {
+    if (!active || sessionBusy) return;
+    setSessionBusy(true);
+    setLocalError("");
+    try {
+      await onUpdateSession(active, active.status === "paused" ? "queued" : "paused");
+    } catch (cause) {
+      setLocalError(errorMessage(cause));
+    } finally {
+      setSessionBusy(false);
+    }
+  };
+
+  const resolve = async (item: Intervention, action: string, closeApproval = false) => {
+    setResolving(true);
+    setLocalError("");
+    try {
+      await onResolveIntervention(item, action);
+      if (closeApproval) setApprovalOpen(false);
+    } catch (cause) {
+      setLocalError(errorMessage(cause));
+    } finally {
+      setResolving(false);
+    }
+  };
+
+  const queue = async (application: JobApplication, runner: "local" | "cloud") => {
+    setQueueing(application.id);
+    setLocalError("");
+    try {
+      if (runner === "local") {
+        await onQueueLocal(application);
+        setLocalOpen(false);
+      } else {
+        await onQueueCloud(application);
+        setCloudOpen(false);
+      }
+    } catch (cause) {
+      setLocalError(errorMessage(cause));
+    } finally {
+      setQueueing("");
+    }
+  };
+
   return (
     <div className="view-shell browser-view">
       <section className="view-heading">
         <div><p className="eyebrow">APPLICATION RUNNERS</p><h1>Browser</h1><span>Use the same tailored application locally or in Bluey's isolated cloud runner.</span></div>
         <div className="security-note"><ShieldCheck size={17} /><span><b>Separate and private</b><small>Your job-site sign-ins stay inside the Jobs browser.</small></span></div>
       </section>
+
+      {localError && <div className="inline-error" role="alert">{localError}</div>}
 
       {active && (
         <section className="active-browser-run">
@@ -64,9 +112,9 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
                 <TakeoverAction url={takeoverUrl} label="Review form" compact />
                 <button className="button primary" disabled={resolving} onClick={() => { setReviewConfirmed(false); setApprovalOpen(true); }}><ShieldCheck size={16} />Approve submission</button>
               </> : emailCodeReady && intervention
-                ? <><button className="button primary" disabled={resolving} onClick={() => { setResolving(true); void onResolveIntervention(intervention, "approve_email_otp").finally(() => setResolving(false)); }}><MailCheck size={16} />{resolving ? "Approving..." : "Use email code"}</button><TakeoverAction url={takeoverUrl} label="Take over" compact /></>
+                ? <><button className="button primary" disabled={resolving} onClick={() => void resolve(intervention, "approve_email_otp")}><MailCheck size={16} />{resolving ? "Approving..." : "Use email code"}</button><TakeoverAction url={takeoverUrl} label="Take over" compact /></>
                 : <TakeoverAction url={takeoverUrl} label="Take over" primary />}
-              <button className="icon-button" title={active.status === "paused" ? "Resume run" : "Pause run"} onClick={() => void onUpdateSession(active, active.status === "paused" ? "queued" : "paused")}>{active.status === "paused" ? <Play size={18} /> : <PauseCircle size={18} />}</button>
+              <button className="icon-button" disabled={sessionBusy} title={active.status === "paused" ? "Resume run" : "Pause run"} onClick={() => void updateActiveSession()}>{active.status === "paused" ? <Play size={18} /> : <PauseCircle size={18} />}</button>
             </div>
           </div>
         </section>
@@ -97,12 +145,12 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
       </Dialog>
 
       <Dialog open={cloudOpen} title="Queue a cloud application" description="Cloud runs start only after a packet is approved or marked Auto-submit eligible." onClose={() => setCloudOpen(false)}>
-        <div className="cloud-queue-list">{queuedApplications.map((application) => { const job = workspace.matches.find((item) => item.id === application.job_id); return <button key={application.id} disabled={Boolean(queueing)} onClick={() => { setQueueing(application.id); void onQueueCloud(application).then(() => setCloudOpen(false)).finally(() => setQueueing("")); }}><div className="company-mark">{job?.company.slice(0, 2).toUpperCase()}</div><span><b>{job?.title}</b><small>{job?.company} · {application.match_score}% match</small></span>{queueing === application.id ? <small>Queuing...</small> : <Play size={17} />}</button>; })}{queuedApplications.length === 0 && <div className="empty-state small"><KeyRound /><h3>No queued applications</h3><p>Approve a packet in Applications first.</p></div>}</div>
+        <div className="cloud-queue-list">{queuedApplications.map((application) => { const job = workspace.matches.find((item) => item.id === application.job_id); return <button key={application.id} disabled={Boolean(queueing)} onClick={() => void queue(application, "cloud")}><div className="company-mark">{job?.company.slice(0, 2).toUpperCase()}</div><span><b>{job?.title}</b><small>{job?.company} · {application.match_score}% match</small></span>{queueing === application.id ? <small>Queuing...</small> : <Play size={17} />}</button>; })}{queuedApplications.length === 0 && <div className="empty-state small"><KeyRound /><h3>No queued applications</h3><p>Approve a packet in Applications first.</p></div>}</div>
         <div className="dialog-actions"><button className="button secondary" onClick={() => setCloudOpen(false)}>Close</button><a className="button primary" href="/jobs/applications">Go to Applications<ArrowRight size={16} /></a></div>
       </Dialog>
 
       <Dialog open={localOpen} title="Open a local application" description="Choose a reviewed application. Bluey opens the frozen resume and answers in your isolated browser profile." onClose={() => setLocalOpen(false)}>
-        <div className="cloud-queue-list">{queuedApplications.map((application) => { const job = workspace.matches.find((item) => item.id === application.job_id); return <button key={application.id} disabled={Boolean(queueing)} onClick={() => { setQueueing(application.id); void onQueueLocal(application).then(() => setLocalOpen(false)).finally(() => setQueueing("")); }}><div className="company-mark">{job?.company.slice(0, 2).toUpperCase()}</div><span><b>{job?.title}</b><small>{job?.company} · {application.match_score}% match</small></span>{queueing === application.id ? <small>Opening...</small> : <Play size={17} />}</button>; })}{queuedApplications.length === 0 && <div className="empty-state small"><KeyRound /><h3>No queued applications</h3><p>Approve a packet in Applications first.</p></div>}</div>
+        <div className="cloud-queue-list">{queuedApplications.map((application) => { const job = workspace.matches.find((item) => item.id === application.job_id); return <button key={application.id} disabled={Boolean(queueing)} onClick={() => void queue(application, "local")}><div className="company-mark">{job?.company.slice(0, 2).toUpperCase()}</div><span><b>{job?.title}</b><small>{job?.company} · {application.match_score}% match</small></span>{queueing === application.id ? <small>Opening...</small> : <Play size={17} />}</button>; })}{queuedApplications.length === 0 && <div className="empty-state small"><KeyRound /><h3>No queued applications</h3><p>Approve a packet in Applications first.</p></div>}</div>
         <div className="dialog-actions"><button className="button secondary" onClick={() => setLocalOpen(false)}>Close</button><button className="button secondary" onClick={() => { setLocalOpen(false); setInstallOpen(true); }}>Set up Bluey Browser</button></div>
       </Dialog>
 
@@ -112,7 +160,7 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
           <div><h3>Confirm the preserved form</h3><p>Check every employer-facing answer, attachment, contact detail, and consent on the live form before continuing.</p></div>
           <label><input type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.target.checked)} /><span>I reviewed the final application and want Bluey to submit it.</span></label>
         </div>
-        <div className="dialog-actions"><button className="button secondary" disabled={resolving} onClick={() => setApprovalOpen(false)}>Cancel</button><button className="button primary" disabled={!reviewConfirmed || resolving || !intervention} onClick={() => { if (!intervention) return; setResolving(true); void onResolveIntervention(intervention, "approve_submission").then(() => setApprovalOpen(false)).finally(() => setResolving(false)); }}><ShieldCheck size={16} />{resolving ? "Submitting..." : "Approve and submit"}</button></div>
+        <div className="dialog-actions"><button className="button secondary" disabled={resolving} onClick={() => setApprovalOpen(false)}>Cancel</button><button className="button primary" disabled={!reviewConfirmed || resolving || !intervention} onClick={() => { if (intervention) void resolve(intervention, "approve_submission", true); }}><ShieldCheck size={16} />{resolving ? "Submitting..." : "Approve and submit"}</button></div>
       </Dialog>
     </div>
   );
@@ -128,4 +176,10 @@ function TakeoverAction({ url, label, primary = false, compact = false }: {
   return url
     ? <a className={className} href={url}><MonitorUp size={compact ? 15 : 16} />{label}</a>
     : <button className={className} disabled title="A scoped takeover capability is not available for this run"><MonitorUp size={compact ? 15 : 16} />Takeover unavailable</button>;
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error && cause.message.trim()
+    ? cause.message
+    : "Bluey could not finish that browser action. Please try again.";
 }

@@ -7,7 +7,9 @@
 
 use crate::error::{Error, Result};
 
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 

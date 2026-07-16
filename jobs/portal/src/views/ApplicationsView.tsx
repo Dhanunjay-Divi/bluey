@@ -50,6 +50,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   const [selectedResume, setSelectedResume] = useState<ResumeVersion | undefined>();
   const [receiptOpen, setReceiptOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [localError, setLocalError] = useState("");
   const [answer, setAnswer] = useState("");
   const [rememberAnswer, setRememberAnswer] = useState(true);
   const [answerScope, setAnswerScope] = useState<"account" | "track" | "company">("account");
@@ -80,16 +81,34 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   });
 
   useEffect(() => {
+    let cancelled = false;
+    setLocalError("");
     if (!selected?.resume_version_id) {
       setSelectedResume(undefined);
-      return;
+      return () => {
+        cancelled = true;
+      };
     }
     const cached = resumeVersions[selected.resume_version_id];
     if (cached) {
       setSelectedResume(cached);
-      return;
+      return () => {
+        cancelled = true;
+      };
     }
-    void onLoadResume(selected.resume_version_id).then(setSelectedResume);
+    setSelectedResume(undefined);
+    void onLoadResume(selected.resume_version_id)
+      .then((resume) => {
+        if (cancelled) return;
+        if (resume) setSelectedResume(resume);
+        else setLocalError("The job-specific resume is unavailable. Close this application and try again.");
+      })
+      .catch((cause) => {
+        if (!cancelled) setLocalError(errorMessage(cause));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [selected, resumeVersions, onLoadResume]);
 
   useEffect(() => {
@@ -101,9 +120,12 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   const update = async (state: string) => {
     if (!selected) return;
     setBusy(true);
+    setLocalError("");
     try {
       await onUpdate(selected, state);
       setSelected((current) => current ? { ...current, state: state as JobApplication["state"] } : current);
+    } catch (cause) {
+      setLocalError(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -112,11 +134,14 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   const download = async (format: "pdf" | "docx") => {
     if (!selected || !selectedResume) return;
     setBusy(true);
+    setLocalError("");
     try {
       await onCommit(selected);
       const filename = `bluey-${jobs.get(selected.job_id)?.company || "resume"}`;
       if (format === "pdf") await exportResumePdf(selectedResume.content, filename);
       else await exportResumeDocx(selectedResume.content, filename);
+    } catch (cause) {
+      setLocalError(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -126,10 +151,14 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
     if (!selected || !selectedJob?.canonical_url) return;
     const target = window.open("about:blank", "_blank", "noopener,noreferrer");
     setBusy(true);
+    setLocalError("");
     try {
       await onCommit(selected);
       if (target) target.location.href = selectedJob.canonical_url;
       else window.location.assign(selectedJob.canonical_url);
+    } catch (cause) {
+      target?.close();
+      setLocalError(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -138,6 +167,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   const submitInterventionAnswer = async () => {
     if (!selected || !selectedIntervention || !answer.trim()) return;
     setBusy(true);
+    setLocalError("");
     try {
       const scopeId = answerScope === "track"
         ? selectedJob?.track_id
@@ -151,6 +181,8 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
         scope_id: scopeId,
       });
       setSelected((current) => current ? { ...current, state: "queued", updated_at_ms: Date.now() } : current);
+    } catch (cause) {
+      setLocalError(errorMessage(cause));
     } finally {
       setBusy(false);
     }
@@ -162,6 +194,8 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
         <div><p className="eyebrow">APPLICATION CONTROL</p><h1>Applications</h1><span>Every tailored application, browser run, intervention, and receipt in one timeline.</span></div>
         <div className="heading-stat"><b>{workspace.applications.filter((item) => item.state === "submitted").length}</b><span>submitted this month</span></div>
       </section>
+
+      {localError && <div className="inline-error" role="alert">{localError}</div>}
 
       {openInterventions.length > 0 && (
         <section className="intervention-banner">
@@ -210,6 +244,15 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
                 ["Receipt", selected.state === "submitted"],
               ].map(([label, complete], index) => <div key={String(label)} className={complete ? "complete" : ""}><span>{complete ? <Check size={13} /> : index + 1}</span><b>{label}</b></div>)}
             </div>
+            {selected.state === "side_effect_unknown" && (
+              <div className="input-needed" role="alert">
+                <AlertCircle size={17} />
+                <div>
+                  <b>Submission outcome needs reconciliation</b>
+                  <p>Bluey stopped because the final employer action may have happened. Do not submit again. Check the employer confirmation page or email, then reconcile this run from its preserved evidence.</p>
+                </div>
+              </div>
+            )}
             <div className="application-detail-grid">
               <section className="resume-sheet compact-sheet">
                 {selectedResume ? <ResumePreview resume={selectedResume} /> : <div className="resume-loading">Loading job-specific resume...</div>}
@@ -235,7 +278,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
                 <div className="download-row"><button disabled={busy || !selectedResume} onClick={() => void download("pdf")}><Download size={15} />PDF</button><button disabled={busy || !selectedResume} onClick={() => void download("docx")}><Download size={15} />DOCX</button></div>
               </section>
             </div>
-            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : "Approving counts this tailored application once. Retries do not double-charge."}</p><div>{selected.state === "needs_input" && !canAnswerIntervention && selectedSession?.takeover_url && <a className="button secondary" href={selectedSession.takeover_url}><MonitorUp size={16} />Take over browser</a>}{selected.state === "needs_input" && !canAnswerIntervention && !selectedSession?.takeover_url && <button className="button secondary" disabled title="A scoped resume link is not available for this run"><MonitorUp size={16} />Takeover unavailable</button>}{selected.state === "awaiting_review" && applicationEligibility(selected, selectedJob).can_queue_local && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}{selected.state === "awaiting_review" && !applicationEligibility(selected, selectedJob).can_queue_local && ["handoff", "unknown_review"].includes(applicationEligibility(selected, selectedJob).capability) && <button className="button primary" disabled={busy} onClick={() => void openHandoff()}><Send size={16} />Open job site</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && selectedJob && selectedResume && <button className="button primary" onClick={() => { setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume }); setSelected(null); }}><Sparkles size={16} />Prepare interview</button>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
+            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : selected.state === "side_effect_unknown" ? "Automatic retry is disabled until the employer-facing outcome is reconciled." : "Approving counts this tailored application once. Retries do not double-charge."}</p><div>{selected.state === "needs_input" && !canAnswerIntervention && selectedSession?.takeover_url && <a className="button secondary" href={selectedSession.takeover_url}><MonitorUp size={16} />Take over browser</a>}{selected.state === "needs_input" && !canAnswerIntervention && !selectedSession?.takeover_url && <button className="button secondary" disabled title="A scoped resume link is not available for this run"><MonitorUp size={16} />Takeover unavailable</button>}{selected.state === "awaiting_review" && applicationEligibility(selected, selectedJob).can_queue_local && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}{selected.state === "awaiting_review" && !applicationEligibility(selected, selectedJob).can_queue_local && ["handoff", "unknown_review"].includes(applicationEligibility(selected, selectedJob).capability) && <button className="button primary" disabled={busy} onClick={() => void openHandoff()}><Send size={16} />Open job site</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && selectedJob && selectedResume && <button className="button primary" onClick={() => { setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume }); setSelected(null); }}><Sparkles size={16} />Prepare interview</button>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
           </div>
         )}
       </Dialog>
@@ -249,6 +292,12 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
 
 function normalizeCompanyKey(company: string): string {
   return company.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error && cause.message.trim()
+    ? cause.message
+    : "Bluey could not finish that application action. Please try again.";
 }
 
 function ApplicationKitSummary({ application, job, resume }: { application: JobApplication; job?: JobPosting; resume?: ResumeVersion }) {
