@@ -560,15 +560,22 @@ signed_any=0
 for bin in "$INSTALL_ROOT"/bin/*; do
     [ -f "$bin" ] || continue
     [ -x "$bin" ] || continue
-    if codesign --force --sign - "$bin" 2>/dev/null; then
-        signed_any=1
-    fi
+    codesign --force --sign - "$bin" 2>/dev/null \
+        || fail "Could not ad-hoc sign $(basename "$bin")"
+    codesign --verify --strict "$bin" 2>/dev/null \
+        || fail "Ad-hoc signature verification failed for $(basename "$bin")"
+    signed_any=1
 done
-if [ "$signed_any" = "1" ]; then
-    ok "Ad-hoc signed"
-else
-    warn "codesign did not sign any helper binaries; continuing."
-fi
+for app_bundle in "$INSTALL_ROOT"/bin/*.app; do
+    [ -d "$app_bundle" ] || continue
+    codesign --force --deep --sign - "$app_bundle" 2>/dev/null \
+        || fail "Could not ad-hoc sign $(basename "$app_bundle")"
+    codesign --verify --deep --strict "$app_bundle" 2>/dev/null \
+        || fail "Ad-hoc signature verification failed for $(basename "$app_bundle")"
+    signed_any=1
+done
+[ "$signed_any" = "1" ] || fail "Release did not contain any signable native binaries"
+ok "Ad-hoc signatures verified"
 
 # ── Remove quarantine ────────────────────────────────────────────────
 # Strip the com.apple.quarantine extended attribute if the tarball arrived

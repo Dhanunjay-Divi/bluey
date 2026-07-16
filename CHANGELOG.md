@@ -35,6 +35,8 @@ under `docs/release/`.
   handling, and production Web build with the recovery work.
 - Made signed release publication immutable and ordered: versioned assets and
   signature first, signed manifest second, convenience installer aliases last.
+- Made the macOS installer ad-hoc sign and strictly verify both top-level
+  executables and nested helper application bundles before reporting success.
 - Removed the Windows placeholder-transcription helper from release packages;
   Windows now fails closed when a real local STT capability is unavailable.
 

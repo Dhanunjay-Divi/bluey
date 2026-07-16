@@ -71,6 +71,7 @@ this round:
 | Browser distribution entitlement and execution gates | `server/src/api/jobs.rs:248-273,857-866,1205-1214,4079-4091`; `jobs/portal/src/lib/runner-access.ts:1-44`; `jobs/portal/src/views/BrowserView.tsx:142-145` |
 | Request-only mailbox beta | `server/src/api/jobs.rs:1876-1894`; `jobs/portal/src/views/SettingsView.tsx:223-245,295-304,443-470` |
 | Immutable signed release ordering and client verification | `scripts/publish-bluey-release.sh:45-49,58-107,123-197,208-311`; `crates/cue-cli/src/update.rs:218-356,405-421,459-523` |
+| macOS installer executable and nested-bundle verification | `ops/install/install.sh:557-580` |
 | Private account-file default and explicit Keychain opt-in | `crates/cue-cloud-client/src/tokens.rs:1-6,44-179,182-298`; `crates/cue-core/src/app_paths.rs:114-200` |
 
 ## P0/P1/P2 Result
@@ -100,6 +101,8 @@ this round:
 - Source/sequence-aware transcript deduplication.
 - Deterministic package member and placeholder-transcript guards.
 - Versioned installer checksum verification and deterministic publisher fixture.
+- Fail-closed ad-hoc signature verification for installed macOS executables and
+  the nested file-picker application bundle.
 
 ## Pre-Release Verification
 
@@ -123,6 +126,9 @@ this round:
 - Release shell syntax, artifact-scanner self-test, release hygiene, signed
   deterministic publisher fixture, workflow YAML, and all `24` immutable
   action pins passed.
+- An isolated production-installer smoke downloaded the immutable artifact,
+  verified its checksum, installed it without Keychain access, and strictly
+  verified all top-level Mach-O signatures plus the nested file-picker bundle.
 - Rust formatting and `git diff --check` passed.
 
 ## Deliberately Gated Follow-On Work

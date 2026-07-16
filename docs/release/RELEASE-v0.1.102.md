@@ -71,6 +71,8 @@ distribution, updater, and physical install/launch canaries are approved.
 - Release manifests use Ed25519 signatures and immutable versioned asset URLs.
   Publication moves the signed `latest.json` only after versioned assets,
   checksums, installers, and signature are visible.
+- The macOS installer ad-hoc signs and verifies every installed executable and
+  the nested file-picker application bundle before it reports success.
 - Raw microphone/system-audio bytes are not retained after transcription by
   default.
 

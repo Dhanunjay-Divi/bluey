@@ -194,6 +194,7 @@ binary and then publish a different archive.
 
 ```bash
 tmp=$(mktemp -d)
+BLUEY_VERSION=X.Y.Z \
 BLUEY_ARCHIVE=dist/bluey-X.Y.Z-darwin-universal.tar.gz \
   BLUEY_INSTALL_DIR="$tmp/bluey" \
   BLUEY_BIN_DIR="$tmp/bin" \
