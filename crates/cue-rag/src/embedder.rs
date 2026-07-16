@@ -21,6 +21,13 @@ pub enum EmbeddingError {
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     fn name(&self) -> &'static str;
+    /// Stable model identity used to prevent cross-model vector searches.
+    ///
+    /// Existing providers default to their provider name for compatibility;
+    /// providers that can change models should override this explicitly.
+    fn model(&self) -> &'static str {
+        self.name()
+    }
     fn dim(&self) -> usize;
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
 
@@ -55,6 +62,10 @@ impl OpenAiEmbedder {
 impl EmbeddingProvider for OpenAiEmbedder {
     fn name(&self) -> &'static str {
         "openai"
+    }
+
+    fn model(&self) -> &'static str {
+        Self::MODEL
     }
 
     fn dim(&self) -> usize {

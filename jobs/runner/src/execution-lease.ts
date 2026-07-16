@@ -56,6 +56,7 @@ export class ExecutionLeaseError extends Error {
 interface LeaseGrant {
   leaseToken: string;
   fence: number;
+  expiresAtMs: number;
 }
 
 interface LeaseOperations {
@@ -77,7 +78,13 @@ export class ActiveExecutionLease {
   #finalSubmitAuthorized = false;
   #activationOutcome?: "activated" | "activation_uncertain";
 
-  constructor(operations: LeaseOperations, heartbeatIntervalMs: number) {
+  constructor(
+    operations: LeaseOperations,
+    heartbeatIntervalMs: number,
+    readonly fence: number = 1,
+    readonly expiresAtMs: number = Date.now() + heartbeatIntervalMs,
+    readonly ownerId: string = "runner-unknown",
+  ) {
     this.#operations = operations;
     this.#heartbeatIntervalMs = heartbeatIntervalMs;
     this.scheduleHeartbeat();
@@ -234,7 +241,13 @@ export class ExecutionLeaseClient {
         });
       },
     };
-    return new ActiveExecutionLease(operations, this.#heartbeatIntervalMs);
+    return new ActiveExecutionLease(
+      operations,
+      this.#heartbeatIntervalMs,
+      grant.fence,
+      grant.expiresAtMs,
+      this.#ownerId,
+    );
   }
 
   private async request(
@@ -366,6 +379,7 @@ function parseGrant(value: unknown, expectedRunId: string): LeaseGrant {
   const record = value as Record<string, unknown>;
   const leaseToken = record.lease_token;
   const fence = record.fence;
+  const expiresAtMs = record.lease_expires_at_ms;
   if (record.run_id !== expectedRunId
     || record.phase !== "prepared"
     || typeof leaseToken !== "string"
@@ -373,10 +387,13 @@ function parseGrant(value: unknown, expectedRunId: string): LeaseGrant {
     || Buffer.byteLength(leaseToken) > MAX_LEASE_TOKEN_BYTES
     || typeof fence !== "number"
     || !Number.isSafeInteger(fence)
-    || fence <= 0) {
+    || fence <= 0
+    || typeof expiresAtMs !== "number"
+    || !Number.isSafeInteger(expiresAtMs)
+    || expiresAtMs <= Date.now()) {
     throw new ExecutionLeaseError("claim", "invalid_response");
   }
-  return { leaseToken, fence };
+  return { leaseToken, fence, expiresAtMs };
 }
 
 function parseLeaseRecord(

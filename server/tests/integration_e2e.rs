@@ -4178,6 +4178,109 @@ async fn account_export_zip_contains_readable_bundle() {
 
 #[tokio::test]
 #[serial]
+async fn legacy_artifact_upload_derives_only_an_existing_live_parent() {
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let h = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
+    let email = "legacy-object-parent@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let artifact_id = uuid::Uuid::new_v4().to_string();
+    let bytes = b"legacy artifact bytes";
+    let hash = bluey_server::object_storage::sha256_hex(bytes);
+    let object_key = format!(
+        "bluey-cloud/accounts/{}/context/{artifact_id}/sha256/{hash}",
+        account.id
+    );
+    h.pool
+        .get()
+        .unwrap()
+        .execute(
+            "INSERT INTO cloud_sessions (
+                account_id, session_id, title, status, created_at_ms, updated_at_ms,
+                metadata_json
+             ) VALUES (?1, ?2, 'Legacy parent', 'active', 1, 1, '{}')",
+            rusqlite::params![account.id, session_id],
+        )
+        .unwrap();
+
+    let legacy_upload = || {
+        Request::post(format!("/sync/artifacts/{artifact_id}/object"))
+            .header("authorization", format!("Bearer {access}"))
+            .header("content-type", "text/plain")
+            .body(Body::from(bytes.as_slice()))
+            .unwrap()
+    };
+    let response = h.router.clone().oneshot(legacy_upload()).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "missing-header clients must sync metadata before bytes"
+    );
+    let staged_count: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM object_uploads
+              WHERE account_id = ?1 AND logical_id = ?2",
+            rusqlite::params![account.id, artifact_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(staged_count, 0, "unbound bytes must never be staged");
+
+    h.pool
+        .get()
+        .unwrap()
+        .execute(
+            "INSERT INTO cloud_context_artifacts (
+                account_id, artifact_id, session_id, kind, title,
+                created_at_ms, updated_at_ms, metadata_json
+             ) VALUES (?1, ?2, ?3, 'document', 'Legacy artifact', 1, 1, '{}')",
+            rusqlite::params![account.id, artifact_id, session_id],
+        )
+        .unwrap();
+    Mock::given(method("PUT"))
+        .and(path(format!("/bucket/{object_key}")))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    let response = h.router.clone().oneshot(legacy_upload()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored_parent: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT session_id FROM object_uploads
+              WHERE account_id = ?1 AND logical_id = ?2",
+            rusqlite::params![account.id, artifact_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_parent, session_id);
+}
+
+#[tokio::test]
+#[serial]
 async fn artifact_upload_retries_from_durable_outbox_and_is_idempotent() {
     let object_store = MockServer::start().await;
     let endpoint = object_store.uri();
@@ -4199,6 +4302,24 @@ async fn artifact_upload_retries_from_durable_outbox_and_is_idempotent() {
     let account = Account::fetch_by_email(&h.pool, email)
         .unwrap()
         .expect("account should exist");
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let other_session_id = uuid::Uuid::new_v4().to_string();
+    {
+        let conn = h.pool.get().unwrap();
+        for (id, title) in [
+            (&session_id, "Artifact parent"),
+            (&other_session_id, "Other parent"),
+        ] {
+            conn.execute(
+                "INSERT INTO cloud_sessions (
+                    account_id, session_id, title, status, created_at_ms, updated_at_ms,
+                    metadata_json
+                 ) VALUES (?1, ?2, ?3, 'active', 1, 1, '{}')",
+                rusqlite::params![account.id, id, title],
+            )
+            .unwrap();
+        }
+    }
     let artifact_id = uuid::Uuid::new_v4().to_string();
     let bytes = b"stable artifact bytes";
     let hash = bluey_server::object_storage::sha256_hex(bytes);
@@ -4218,6 +4339,7 @@ async fn artifact_upload_retries_from_durable_outbox_and_is_idempotent() {
         Request::post(format!("/sync/artifacts/{artifact_id}/object"))
             .header("authorization", format!("Bearer {access}"))
             .header("content-type", "text/plain")
+            .header("x-bluey-session-id", &session_id)
             .body(Body::from(bytes.as_slice()))
             .unwrap()
     };
@@ -4257,10 +4379,24 @@ async fn artifact_upload_retries_from_durable_outbox_and_is_idempotent() {
     let conflicting = Request::post(format!("/sync/artifacts/{artifact_id}/object"))
         .header("authorization", format!("Bearer {access}"))
         .header("content-type", "text/plain")
+        .header("x-bluey-session-id", &session_id)
         .body(Body::from("different bytes"))
         .unwrap();
     let resp = h.router.clone().oneshot(conflicting).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let conflicting_parent = Request::post(format!("/sync/artifacts/{artifact_id}/object"))
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "text/plain")
+        .header("x-bluey-session-id", &other_session_id)
+        .body(Body::from(bytes.as_slice()))
+        .unwrap();
+    let resp = h.router.clone().oneshot(conflicting_parent).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "an idempotent object id cannot change parent sessions"
+    );
 
     let final_state: (String, String, i64, i64) = h
         .pool

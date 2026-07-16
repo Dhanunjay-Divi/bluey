@@ -114,6 +114,31 @@ runner fsyncs each `0600` ciphertext staging file before atomic replacement and
 syncs the parent directory where the platform supports directory fsync. These
 records make Temporal activity retries idempotent even when a submit response
 is lost in transit.
+
+Nonterminal browser work is also checkpointed in authenticated `BLUEYJP2`
+`run-checkpoint` envelopes under `run-checkpoints/<profile-scope>/`. The AAD and
+HKDF context bind both the hashed profile scope and hashed browser-session
+scope. A checkpoint contains the frozen request, bounded events, safe workflow
+phase, provider-review state, and non-secret lease fence/expiry/owner metadata;
+it never serializes the lease token or worker signing key. On startup the
+runner seals every valid crash-left `active/<profile-scope>` directory into its
+encrypted profile snapshot (or removes it if sealing fails) before opening the
+HTTP listener. It rehydrates only unexpired `prepared`, `needs_input`, and
+`provider_review` checkpoints. `final_submit_started`, activated, uncertain,
+and otherwise ambiguous checkpoints remain `side_effect_unknown` and are never
+automatically replayed. Configure a stable `BLUEY_JOBS_RUNNER_ID` so a restarted
+replica can rotate its still-prepared server lease immediately; without one,
+recovery waits for the old prepared lease to expire.
+
+Bluey Browser uses the same conservative phase policy for local runs. Its
+operation-scoped result/resume capabilities and frozen request are held only in
+an AES-256-GCM checkpoint under Electron's per-user data directory; the root
+claim ticket is never persisted. On macOS/Linux the random installation key is
+an owner-only `0600` file under a `0700` recovery directory, deliberately
+avoiding Keychain prompts. On Windows the installation key is additionally
+wrapped with Electron `safeStorage` (DPAPI) and the recovery paths receive a
+current-user ACL. A durable local final-submit marker always overrides a stale
+safe checkpoint and forces manual reconciliation.
 Production should replicate the encrypted snapshot and receipt directory to
 R2/S3 with lifecycle and tenant-deletion jobs.
 

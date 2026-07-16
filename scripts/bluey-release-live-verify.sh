@@ -12,6 +12,7 @@
 set -euo pipefail
 
 BASE_URL="${BLUEY_PUBLIC_BASE:-https://bluey.sh}"
+BASE_URL="${BASE_URL%/}"
 EXPECTED_VERSION="${1:-${BLUEY_EXPECTED_VERSION:-}}"
 PUBKEY_FILE="${BLUEY_RELEASE_PUBKEY_FILE:-}"
 SIGNING_KEY_FILE="${BLUEY_RELEASE_SIGNING_KEY_FILE:-}"
@@ -111,6 +112,65 @@ check_content_type() {
 
 check_content_type install.sh application/x-shellscript
 check_content_type install.ps1 application/x-powershell
+
+checksums="$TMP_DIR/SHA256SUMS.txt"
+curl -fsSL "$BASE_URL/releases/v$version/SHA256SUMS.txt" -o "$checksums"
+python3 - "$manifest" "$BASE_URL" "$version" "$checksums" <<'PY' > "$TMP_DIR/installers.tsv"
+import json
+import re
+import sys
+from urllib.parse import urljoin
+
+manifest_path, base_url, version, checksums_path = sys.argv[1:]
+with open(manifest_path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+checksums = {}
+with open(checksums_path, "r", encoding="utf-8") as fh:
+    for line in fh:
+        match = re.fullmatch(r"([0-9a-fA-F]{64}) [ *]([^\r\n]+)\r?\n?", line)
+        if match:
+            checksums[match.group(2)] = match.group(1).lower()
+
+expected = {
+    "install": (f"releases/v{version}/install.sh", "application/x-shellscript"),
+    "windows_install": (
+        f"releases/v{version}/install.ps1",
+        "application/x-powershell",
+    ),
+}
+for key, (expected_path, content_type) in expected.items():
+    entry = data.get(key)
+    if not isinstance(entry, dict):
+        raise SystemExit(f"missing installer metadata: {key}")
+    path = entry.get("url")
+    if path != expected_path:
+        raise SystemExit(
+            f"{key} must use immutable URL {expected_path!r}, got {path!r}"
+        )
+    digest = entry.get("sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+        raise SystemExit(f"{key} has invalid sha256")
+    if checksums.get(expected_path.rsplit("/", 1)[-1]) != digest.lower():
+        raise SystemExit(f"{key} does not match immutable SHA256SUMS.txt")
+    size = entry.get("size_bytes")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        raise SystemExit(f"{key} has invalid size_bytes")
+    url = urljoin(base_url.rstrip("/") + "/latest.json", path)
+    print("\t".join((key, path, url, digest.lower(), str(size), content_type)))
+PY
+
+while IFS=$'\t' read -r label path url expected_sha expected_size content_type; do
+    installer="$TMP_DIR/$label"
+    check_content_type "$path" "$content_type"
+    curl -fsSL "$url" -o "$installer"
+    actual_sha="$(shasum -a 256 "$installer" | awk '{print $1}')"
+    [ "$actual_sha" = "$expected_sha" ] \
+        || fail "$label sha mismatch: $actual_sha != $expected_sha"
+    actual_size="$(wc -c < "$installer" | tr -d '[:space:]')"
+    [ "$actual_size" = "$expected_size" ] \
+        || fail "$label size mismatch: $actual_size != $expected_size"
+    ok "$label immutable installer sha and size verified"
+done < "$TMP_DIR/installers.tsv"
 
 archive="$TMP_DIR/bluey-release"
 curl -fsSL "$ARTIFACT_URL" -o "$archive"

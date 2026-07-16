@@ -1,6 +1,8 @@
 //! Integration test for `SystemAudioCapture` using the mock stub binary.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use cue_core::pcm::{AudioChunk, AudioSource, SampleRate};
@@ -17,6 +19,38 @@ fn stub_binary_path() -> PathBuf {
     path
 }
 
+fn system_audio_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+struct SystemAudioBinaryOverride {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+    previous: Option<OsString>,
+}
+
+impl SystemAudioBinaryOverride {
+    async fn acquire(path: &PathBuf) -> Self {
+        let guard = system_audio_env_lock().lock().await;
+        let previous = std::env::var_os("BLUEY_SYSTEM_AUDIO_BINARY");
+        std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", path);
+        Self {
+            _guard: guard,
+            previous,
+        }
+    }
+}
+
+impl Drop for SystemAudioBinaryOverride {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", previous);
+        } else {
+            std::env::remove_var("BLUEY_SYSTEM_AUDIO_BINARY");
+        }
+    }
+}
+
 #[tokio::test]
 async fn system_audio_capture_receives_chunks_from_stub() {
     let stub = stub_binary_path();
@@ -27,7 +61,7 @@ async fn system_audio_capture_receives_chunks_from_stub() {
         );
     }
 
-    std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
+    let _override = SystemAudioBinaryOverride::acquire(&stub).await;
 
     let (tx, mut rx) = system_audio_channel();
     let capture = SystemAudioCapture::start(tx).expect("start capture");
@@ -45,8 +79,6 @@ async fn system_audio_capture_receives_chunks_from_stub() {
     tokio::time::timeout(Duration::from_secs(2), capture.stop())
         .await
         .expect("system audio stop exceeded its deadline");
-    std::env::remove_var("BLUEY_SYSTEM_AUDIO_BINARY");
-
     assert!(
         received.len() >= 5,
         "expected at least 5 AudioChunks, got {}",
@@ -72,7 +104,7 @@ async fn system_audio_capture_stops_cleanly() {
         return; // skip if not built
     }
 
-    std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
+    let _override = SystemAudioBinaryOverride::acquire(&stub).await;
 
     let (tx, mut rx) = system_audio_channel();
     let capture = SystemAudioCapture::start(tx).expect("start capture");
@@ -83,7 +115,6 @@ async fn system_audio_capture_stops_cleanly() {
         .await
         .expect("system audio stop exceeded its deadline");
 
-    std::env::remove_var("BLUEY_SYSTEM_AUDIO_BINARY");
     // If we get here without hanging, the test passes
 }
 
@@ -119,7 +150,7 @@ async fn system_audio_chunks_drive_stt_provider() {
         return; // skip if not built
     }
 
-    std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
+    let _override = SystemAudioBinaryOverride::acquire(&stub).await;
 
     let (tx, mut rx) = system_audio_channel();
     let capture = SystemAudioCapture::start(tx).expect("start capture");
@@ -147,8 +178,6 @@ async fn system_audio_chunks_drive_stt_provider() {
     }
 
     capture.stop().await;
-    std::env::remove_var("BLUEY_SYSTEM_AUDIO_BINARY");
-
     assert!(
         chunks_sent >= 3,
         "expected at least 3 chunks sent to STT, got {chunks_sent}"
@@ -195,7 +224,7 @@ async fn system_audio_handle_retained_for_shutdown() {
         return;
     }
 
-    std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
+    let _override = SystemAudioBinaryOverride::acquire(&stub).await;
 
     let (tx, mut rx) = system_audio_channel();
     let capture = SystemAudioCapture::start(tx).expect("start capture");
@@ -218,8 +247,6 @@ async fn system_audio_handle_retained_for_shutdown() {
 
     // After stop, the channel should eventually close (no new production).
     while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {}
-
-    std::env::remove_var("BLUEY_SYSTEM_AUDIO_BINARY");
 }
 
 /// Production-path test: exercises the REAL daemon wiring where a single STT

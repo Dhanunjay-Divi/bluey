@@ -61,6 +61,8 @@ Required before preprod:
 - [ ] Release artifact is built with the production updater public key.
 - [ ] `scripts/publish-bluey-release.sh` artifact scan passes locally before
   any publish.
+- [ ] `bash scripts/test-publish-bluey-release.sh` passes the deterministic
+  stage, immutable-installer checksum, and publication-order fixture.
 - [ ] No secrets, dev capture-visible flags, local-only auth bypass flags, or
   plaintext provider keys are present in repo, docs, logs, or artifacts.
 - [ ] If the release touches sign-in, account deletion, credits, auto-reload,
@@ -90,6 +92,9 @@ Required immediately after production:
   public key or signing key available to the operator.
 - [ ] `https://bluey.sh/latest.json` reports the intended version.
 - [ ] `latest.json.sig` verifies against the release Ed25519 public key.
+- [ ] The signed manifest points to `/releases/vX.Y.Z/install.sh` and
+  `/releases/vX.Y.Z/install.ps1`; both immutable bytes match their manifest
+  SHA256 and `SHA256SUMS.txt` entries.
 - [ ] `/install.sh` returns `application/x-shellscript`.
 - [ ] `/install.ps1` returns `application/x-powershell`.
 - [ ] Live artifact SHA matches `SHA256SUMS.txt`.
@@ -143,10 +148,21 @@ If anything fails, fix on a feature branch and merge before tagging.
 
 ## 2. Build artifacts
 
+Production release archives contain only the terminal CLI, daemon, and trusted
+native helpers. The dashboard UI must still pass its source tests/build in the
+pipeline gate, but no Tauri `Bluey.app` bundle is built or published.
+
 ```bash
 make package-darwin-arm64
 make package-darwin-universal
-ls -la dist/bluey-*-darwin-*.tar.gz dist/bluey-*-darwin-*.tar.gz.sha256
+BLUEY_UPDATE_PUBKEY="$(
+  cat /Users/uno/.bluey/release/bluey-release-ed25519.pub.b64
+)" make package-windows-x86_64-gnu
+ls -la \
+  dist/bluey-*-darwin-*.tar.gz \
+  dist/bluey-*-darwin-*.tar.gz.sha256 \
+  dist/bluey-*-windows-x86_64.zip \
+  dist/bluey-*-windows-x86_64.zip.sha256
 ```
 
 Expected outputs:
@@ -156,7 +172,13 @@ dist/bluey-X.Y.Z-darwin-arm64.tar.gz
 dist/bluey-X.Y.Z-darwin-arm64.tar.gz.sha256
 dist/bluey-X.Y.Z-darwin-universal.tar.gz
 dist/bluey-X.Y.Z-darwin-universal.tar.gz.sha256
+dist/bluey-X.Y.Z-windows-x86_64.zip
+dist/bluey-X.Y.Z-windows-x86_64.zip.sha256
 ```
+
+The GNU cross-package command is the macOS/Linux fallback when a clean
+Windows/MSVC builder is unavailable. `scripts/build-windows.ps1` and the
+Windows release runner remain the canonical native Windows validation path.
 
 ---
 
@@ -262,9 +284,11 @@ BLUEY_RELEASE_MIRROR_DESTINATION=s3://bluey-prod/releases/bluey-sh \
 BLUEY_RELEASE_MIRROR_ENDPOINT_URL=https://<cloudflare-account-id>.r2.cloudflarestorage.com
 ```
 
-The mirror stores `install.sh`, `install.ps1`, `latest.json`,
-`latest.json.sig`, and the versioned release directory. It must not replace the
-signed manifest/checksum verification path used by the installer.
+The mirror stores root convenience copies of `install.sh` and `install.ps1`,
+`latest.json`, `latest.json.sig`, and the versioned release directory. The
+versioned directory contains the installer copies pinned by the signed
+manifest and `SHA256SUMS.txt`; root installers are never part of that mutable
+trust path.
 
 The matching raw Ed25519 public key must be embedded in the CLI build:
 
@@ -279,8 +303,11 @@ cargo build --release -p cue-cli --bin bluey
 `latest.json.sig` is a detached signature over the exact bytes of
 `latest.json`. The signed manifest also pins the platform installer
 (`install.sh` on macOS/Linux, `install.ps1` on Windows) and archive
-SHA256 values. Do not publish with `BLUEY_RELEASE_ALLOW_UNSIGNED=1`
-outside local release testing.
+SHA256 values. Installer URLs in the manifest are immutable under
+`releases/vX.Y.Z/`. The publisher exposes the detached signature and manifest
+before replacing the root curl/irm convenience aliases, so a previously served
+manifest can never checksum-pin newly replaced root bytes. Do not publish with
+`BLUEY_RELEASE_ALLOW_UNSIGNED=1` outside local release testing.
 
 Serve `latest.json` and `latest.json.sig` as static byte-identical files.
 Do not run them through any CDN/proxy layer that rewrites, minifies,
@@ -319,8 +346,13 @@ BLUEY_RELEASE_SIGNING_KEY_FILE=/secure/off-repo/bluey-release-ed25519.pem \
 ```
 
 This command verifies `latest.json.sig`, installer MIME types, live artifact
-SHA, unpacked binary versions for macOS, and absence of configured
-capture-visible dev markers in the shipped daemon.
+SHA, both immutable installer SHA/size values, unpacked binary versions for
+macOS, and absence of configured capture-visible dev markers in the shipped
+daemon. `scripts/deploy-bluey-sh-manual.sh` fails before production mutation
+unless `BLUEY_RELEASE_SIGNING_KEY_FILE` is available. Its existing
+`BLUEY_RELEASE_ALLOW_UNSIGNED=1` escape is for explicit local/dev publishing
+only, requires a non-production `PUBLISH_HOST` and `BLUEY_PUBLIC_BASE`, and
+skips the live-signature gate with a visible warning.
 
 For preprod -> prod promotion (after preprod soak):
 

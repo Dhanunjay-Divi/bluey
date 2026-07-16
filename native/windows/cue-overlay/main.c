@@ -25,6 +25,9 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <commctrl.h>
+#include <tlhelp32.h>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
 
 #ifdef DrawText
 #undef DrawText
@@ -40,6 +43,9 @@
 #include <string.h>
 #include <wchar.h>
 #include <wctype.h>
+#include "answer_snapshot_recovery.h"
+#include "meeting_banner_protocol.h"
+#include "meeting_detection_protocol.h"
 #include "ask_event_protocol.h"
 #include "json_type_extract.h"
 #include "ndjson_stream.h"
@@ -70,6 +76,27 @@ static HWND g_theme_button;
 static HWND g_shortcuts_button;
 static HWND g_close_button;
 static HWND g_tooltip;
+static HWND g_meeting_banner;
+static HWND g_meeting_banner_title;
+static HWND g_meeting_banner_app;
+static HWND g_meeting_banner_reason;
+static HWND g_meeting_banner_countdown;
+static HWND g_meeting_banner_start;
+static HWND g_meeting_banner_snooze;
+static HWND g_meeting_banner_dismiss;
+static HWND g_meeting_banner_ignore;
+static HWND g_meeting_banner_settings;
+static wchar_t g_meeting_candidate_id[260] = L"";
+static wchar_t g_meeting_candidate_app_id[260] = L"";
+static wchar_t g_meeting_candidate_provider[96] = L"";
+static int g_meeting_candidate_confidence = 0;
+static ULONGLONG g_meeting_banner_started_ms = 0;
+static ULONGLONG g_meeting_banner_deadline_ms = 0;
+static HANDLE g_meeting_detector_stop = NULL;
+static HANDLE g_meeting_detector_thread = NULL;
+static SRWLOCK g_meeting_detector_lock = SRWLOCK_INIT;
+static volatile LONG g_meeting_detection_enabled =
+    BLUEY_MEETING_DETECTION_DEFAULT_ENABLED;
 static wchar_t g_title[256] = L"bluey";
 static wchar_t g_initial_body[] = L"Waiting for meeting intelligence...";
 static wchar_t *g_body = g_initial_body;
@@ -77,6 +104,7 @@ static SRWLOCK g_body_lock = SRWLOCK_INIT;
 static wchar_t g_kind[64] = L"system";
 static wchar_t g_source[256] = L"";
 static wchar_t g_card_id[80] = L"";
+static ULONGLONG g_card_update_sequence = 0;
 static wchar_t g_last_question[2048] = L"";
 static int g_recovery_mode = 0; /* 0 none, 1 continue partial, 2 retry */
 static bool g_visible = true;
@@ -148,6 +176,119 @@ static void toggle_interactive_mode(void);
 static bool handle_overlay_shortcut_key(WPARAM key, bool local_key);
 static bool focus_next_keyboard_control(bool backward);
 static bool activate_focused_keyboard_control(void);
+static void hide_meeting_banner(const wchar_t *candidate_id);
+static bool safe_extract_json_to_wide(
+    const char *json,
+    size_t json_len,
+    const char *key,
+    wchar_t *dest,
+    size_t dest_wchars);
+static bool safe_extract_json_number(
+    const char *json,
+    size_t json_len,
+    const char *key,
+    double *dest);
+
+typedef struct MeetingEvidencePayload {
+    wchar_t app_name[160];
+    wchar_t app_id[260];
+    wchar_t provider[96];
+    wchar_t window_title[520];
+    DWORD process_id;
+    bool audio_input_active;
+    bool audio_output_active;
+    bool app_foreground;
+    bool browser;
+    bool dedicated_meeting_app;
+    LONGLONG observed_at_unix_ms;
+} MeetingEvidencePayload;
+
+static void reset_card_update_sequence(void) {
+    g_card_update_sequence = 0;
+}
+
+static bool json_read_optional_bool(
+    const char *json,
+    size_t json_len,
+    const char *key,
+    bool *dest
+) {
+    if (!dest) return false;
+    *dest = false;
+
+    const char *value = NULL;
+    size_t value_len = 0;
+    if (!json_find_top_level_value(json, json_len, key, &value, &value_len)) {
+        return true;
+    }
+    if (value_len == 4 && memcmp(value, "true", 4) == 0) {
+        *dest = true;
+        return true;
+    }
+    return value_len == 5 && memcmp(value, "false", 5) == 0;
+}
+
+static bool json_read_optional_u64(
+    const char *json,
+    size_t json_len,
+    const char *key,
+    ULONGLONG *dest,
+    bool *present
+) {
+    if (!dest || !present) return false;
+    *dest = 0;
+    *present = false;
+
+    const char *value = NULL;
+    size_t value_len = 0;
+    if (!json_find_top_level_value(json, json_len, key, &value, &value_len)) {
+        return true;
+    }
+    *present = true;
+    if (value_len == 0) return false;
+
+    ULONGLONG parsed = 0;
+    for (size_t index = 0; index < value_len; index++) {
+        unsigned char digit = (unsigned char)value[index];
+        if (digit < '0' || digit > '9') return false;
+        ULONGLONG numeric_digit = (ULONGLONG)(digit - '0');
+        if (parsed > (ULLONG_MAX - numeric_digit) / 10ULL) return false;
+        parsed = parsed * 10ULL + numeric_digit;
+    }
+    *dest = parsed;
+    return true;
+}
+
+static bool should_apply_card_update(
+    const char *json,
+    size_t json_len,
+    bool snapshot
+) {
+    ULONGLONG sequence = 0;
+    bool sequence_present = false;
+    if (!json_read_optional_u64(
+            json,
+            json_len,
+            "sequence",
+            &sequence,
+            &sequence_present)) {
+        return false;
+    }
+
+    if (snapshot) {
+        if (sequence_present && sequence > g_card_update_sequence) {
+            g_card_update_sequence = sequence;
+        }
+        return true;
+    }
+    if (!sequence_present) {
+        /* Keep compatibility with daemons predating sequenced card frames. */
+        return true;
+    }
+    if (sequence <= g_card_update_sequence) return false;
+    g_card_update_sequence = sequence;
+    return true;
+}
 
 #define MAX_CONTEXT_CHIPS 16
 typedef struct OverlayContextChip {
@@ -296,6 +437,11 @@ static void update_recovery_action_from_current_card(void) {
 #define ID_THEME_BUTTON 1012
 #define ID_SHORTCUTS_BUTTON 1016
 #define ID_ANSWER_DETAIL_BUTTON 1017
+#define ID_MEETING_START_BUTTON 1101
+#define ID_MEETING_SNOOZE_BUTTON 1102
+#define ID_MEETING_DISMISS_BUTTON 1103
+#define ID_MEETING_IGNORE_BUTTON 1104
+#define ID_MEETING_SETTINGS_BUTTON 1105
 #define COLLAPSED_DRAG_THRESHOLD 4
 #define ID_HOTKEY_TOGGLE_OVERLAY 2001
 #define ID_HOTKEY_FOCUS_ASK 2002
@@ -307,6 +453,9 @@ static void update_recovery_action_from_current_card(void) {
 #define ID_HOTKEY_FILES 2008
 #define ID_AUTOSEND_TIMER 3001
 #define ID_MANUAL_SEND_TIMER 3002
+#define ID_MEETING_BANNER_TIMER 3003
+#define WM_BLUEY_MEETING_EVIDENCE (WM_APP + 41)
+#define WM_BLUEY_MEETING_DETECTION_DISABLED (WM_APP + 42)
 #define AUTOSEND_CAPTION_SETTLE_DELAY_MS 300
 #define MANUAL_CAPTION_SETTLE_DELAY_MS 600
 #define MANUAL_FINAL_CAPTION_SETTLE_DELAY_MS 250
@@ -647,6 +796,565 @@ static void emit_paste_text_event(const wchar_t *text) {
     fflush(stdout);
 }
 
+static void json_print_wide_escaped(const wchar_t *text) {
+    char *utf8 = wide_to_utf8_alloc(text ? text : L"");
+    if (!utf8) return;
+    json_print_escaped(utf8);
+    free(utf8);
+}
+
+static void emit_meeting_banner_action(const char *action) {
+    fputs("{\"type\":\"meeting_banner_action\",\"candidate_id\":\"", stdout);
+    json_print_wide_escaped(g_meeting_candidate_id);
+    fputs("\",\"action\":\"", stdout);
+    json_print_escaped(action ? action : "dismiss");
+    fputs("\",\"app_id\":\"", stdout);
+    json_print_wide_escaped(g_meeting_candidate_app_id);
+    fputc('"', stdout);
+    if (g_meeting_candidate_provider[0] != L'\0') {
+        fputs(",\"provider\":\"", stdout);
+        json_print_wide_escaped(g_meeting_candidate_provider);
+        fputc('"', stdout);
+    }
+    emit_token_field();
+    fputs("}\n", stdout);
+    fflush(stdout);
+}
+
+static void emit_meeting_evidence_event(const MeetingEvidencePayload *evidence) {
+    if (!evidence || evidence->app_id[0] == L'\0') return;
+    fputs(
+        "{\"type\":\"meeting_evidence_observed\",\"evidence\":{"
+        "\"source\":\"wasapi_session\",\"app_name\":\"",
+        stdout);
+    json_print_wide_escaped(evidence->app_name);
+    fputs("\",\"app_id\":\"", stdout);
+    json_print_wide_escaped(evidence->app_id);
+    fprintf(
+        stdout,
+        "\",\"process_id\":%lu,\"audio_input_active\":%s,"
+        "\"audio_output_active\":%s,\"app_foreground\":%s,"
+        "\"browser\":%s,\"dedicated_meeting_app\":%s,"
+        "\"observed_at_unix_ms\":%lld",
+        (unsigned long)evidence->process_id,
+        evidence->audio_input_active ? "true" : "false",
+        evidence->audio_output_active ? "true" : "false",
+        evidence->app_foreground ? "true" : "false",
+        evidence->browser ? "true" : "false",
+        evidence->dedicated_meeting_app ? "true" : "false",
+        evidence->observed_at_unix_ms);
+    if (evidence->provider[0] != L'\0') {
+        fputs(",\"provider\":\"", stdout);
+        json_print_wide_escaped(evidence->provider);
+        fputc('"', stdout);
+    }
+    if (evidence->window_title[0] != L'\0') {
+        fputs(",\"window_title\":\"", stdout);
+        json_print_wide_escaped(evidence->window_title);
+        fputc('"', stdout);
+    }
+    fputc('}', stdout);
+    emit_token_field();
+    fputs("}\n", stdout);
+    fflush(stdout);
+}
+
+typedef struct MeetingAppIdentity {
+    wchar_t app_name[160];
+    wchar_t app_id[260];
+    bool browser;
+    bool dedicated_meeting_app;
+} MeetingAppIdentity;
+
+static bool process_image_basename(DWORD process_id, wchar_t *dest, size_t dest_len) {
+    if (!dest || dest_len == 0 || process_id == 0) return false;
+    dest[0] = L'\0';
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+    if (!process) return false;
+    DWORD length = (DWORD)dest_len;
+    bool ok = QueryFullProcessImageNameW(process, 0, dest, &length) != FALSE;
+    CloseHandle(process);
+    if (!ok || dest[0] == L'\0') return false;
+    const wchar_t *backslash = wcsrchr(dest, L'\\');
+    const wchar_t *slash = wcsrchr(dest, L'/');
+    const wchar_t *base = backslash;
+    if (!base || (slash && slash > base)) base = slash;
+    if (base) {
+        memmove(dest, base + 1, (wcslen(base + 1) + 1) * sizeof(wchar_t));
+    }
+    return true;
+}
+
+static bool classify_meeting_process(DWORD process_id, MeetingAppIdentity *identity) {
+    if (!identity) return false;
+    ZeroMemory(identity, sizeof(*identity));
+    wchar_t executable[260];
+    if (!process_image_basename(process_id, executable, 260)) return false;
+
+    const wchar_t *app_name = NULL;
+    const wchar_t *app_id = NULL;
+    bool browser = false;
+    bool dedicated = false;
+    if (_wcsicmp(executable, L"chrome.exe") == 0) {
+        app_name = L"Google Chrome";
+        app_id = L"chrome.exe";
+        browser = true;
+    } else if (_wcsicmp(executable, L"msedge.exe") == 0) {
+        app_name = L"Microsoft Edge";
+        app_id = L"msedge.exe";
+        browser = true;
+    } else if (_wcsicmp(executable, L"firefox.exe") == 0) {
+        app_name = L"Firefox";
+        app_id = L"firefox.exe";
+        browser = true;
+    } else if (_wcsicmp(executable, L"brave.exe") == 0) {
+        app_name = L"Brave";
+        app_id = L"brave.exe";
+        browser = true;
+    } else if (_wcsicmp(executable, L"arc.exe") == 0) {
+        app_name = L"Arc";
+        app_id = L"arc.exe";
+        browser = true;
+    } else if (_wcsicmp(executable, L"zoom.exe") == 0) {
+        app_name = L"Zoom";
+        app_id = L"zoom.exe";
+        dedicated = true;
+    } else if (_wcsicmp(executable, L"teams.exe") == 0
+               || _wcsicmp(executable, L"ms-teams.exe") == 0
+               || _wcsicmp(executable, L"msteams.exe") == 0) {
+        app_name = L"Microsoft Teams";
+        app_id = L"ms-teams.exe";
+        dedicated = true;
+    } else if (_wcsicmp(executable, L"slack.exe") == 0) {
+        app_name = L"Slack";
+        app_id = L"slack.exe";
+        dedicated = true;
+    } else if (wide_contains_ci(executable, L"webex")
+               || _wcsicmp(executable, L"CiscoCollabHost.exe") == 0) {
+        app_name = L"Webex";
+        app_id = L"webex.exe";
+        dedicated = true;
+    } else if (wide_contains_ci(executable, L"gotomeeting")) {
+        app_name = L"GoTo Meeting";
+        app_id = L"gotomeeting.exe";
+        dedicated = true;
+    } else if (wide_contains_ci(executable, L"whereby")) {
+        app_name = L"Whereby";
+        app_id = L"whereby.exe";
+        dedicated = true;
+    } else {
+        return false;
+    }
+
+    wcscpy_s(identity->app_name, 160, app_name);
+    wcscpy_s(identity->app_id, 260, app_id);
+    identity->browser = browser;
+    identity->dedicated_meeting_app = dedicated;
+    return true;
+}
+
+static bool meeting_provider_from_text(
+    const wchar_t *text,
+    wchar_t *provider,
+    size_t provider_len
+) {
+    if (!text || !provider || provider_len == 0) return false;
+    provider[0] = L'\0';
+    const wchar_t *value = NULL;
+    if (wide_contains_ci(text, L"meet.google.com")
+        || wide_contains_ci(text, L"google meet")) {
+        value = L"google_meet";
+    } else if (wide_contains_ci(text, L"zoom.us")
+               || wide_contains_ci(text, L"zoom meeting")) {
+        value = L"zoom";
+    } else if (wide_contains_ci(text, L"teams.microsoft")
+               || wide_contains_ci(text, L"microsoft teams")
+               || wide_contains_ci(text, L"teams meeting")) {
+        value = L"microsoft_teams";
+    } else if (wide_contains_ci(text, L"webex")) {
+        value = L"webex";
+    } else if (wide_contains_ci(text, L"slack huddle")
+               || wide_contains_ci(text, L"huddle | slack")) {
+        value = L"slack_huddle";
+    } else if (wide_contains_ci(text, L"whereby")) {
+        value = L"whereby";
+    } else if (wide_contains_ci(text, L"gotomeeting")
+               || wide_contains_ci(text, L"go to meeting")) {
+        value = L"gotomeeting";
+    }
+    if (!value) return false;
+    wcscpy_s(provider, provider_len, value);
+    return true;
+}
+
+static void dedicated_provider(const wchar_t *app_id, wchar_t *provider, size_t provider_len) {
+    if (!provider || provider_len == 0) return;
+    provider[0] = L'\0';
+    if (wide_contains_ci(app_id, L"zoom")) {
+        wcscpy_s(provider, provider_len, L"zoom");
+    } else if (wide_contains_ci(app_id, L"teams")) {
+        wcscpy_s(provider, provider_len, L"microsoft_teams");
+    } else if (wide_contains_ci(app_id, L"slack")) {
+        wcscpy_s(provider, provider_len, L"slack_huddle");
+    } else if (wide_contains_ci(app_id, L"webex")) {
+        wcscpy_s(provider, provider_len, L"webex");
+    } else if (wide_contains_ci(app_id, L"whereby")) {
+        wcscpy_s(provider, provider_len, L"whereby");
+    } else if (wide_contains_ci(app_id, L"gotomeeting")) {
+        wcscpy_s(provider, provider_len, L"gotomeeting");
+    }
+}
+
+typedef struct MeetingWindowSearch {
+    const wchar_t *app_id;
+    wchar_t provider[96];
+    wchar_t title[520];
+} MeetingWindowSearch;
+
+static BOOL CALLBACK find_meeting_window_callback(HWND hwnd, LPARAM context_ptr) {
+    MeetingWindowSearch *search = (MeetingWindowSearch *)context_ptr;
+    if (!search || search->provider[0] != L'\0' || !IsWindowVisible(hwnd)) return TRUE;
+    DWORD process_id = 0;
+    GetWindowThreadProcessId(hwnd, &process_id);
+    MeetingAppIdentity identity;
+    if (!classify_meeting_process(process_id, &identity)
+        || _wcsicmp(identity.app_id, search->app_id) != 0) {
+        return TRUE;
+    }
+    wchar_t title[520];
+    if (GetWindowTextW(hwnd, title, 520) <= 0) return TRUE;
+    if (!meeting_provider_from_text(title, search->provider, 96)) return TRUE;
+    wcscpy_s(search->title, 520, title);
+    return FALSE;
+}
+
+static void find_meeting_window(
+    const wchar_t *app_id,
+    wchar_t *provider,
+    size_t provider_len,
+    wchar_t *title,
+    size_t title_len
+) {
+    MeetingWindowSearch search;
+    ZeroMemory(&search, sizeof(search));
+    search.app_id = app_id;
+    EnumWindows(find_meeting_window_callback, (LPARAM)&search);
+    if (provider && provider_len > 0) wcscpy_s(provider, provider_len, search.provider);
+    if (title && title_len > 0) wcscpy_s(title, title_len, search.title);
+}
+
+typedef struct AudioPidActivity {
+    DWORD process_id;
+    bool input_active;
+    bool output_active;
+} AudioPidActivity;
+
+static void merge_audio_pid(
+    AudioPidActivity *activities,
+    size_t *count,
+    size_t capacity,
+    DWORD process_id,
+    bool input_active,
+    bool output_active
+) {
+    if (!activities || !count || process_id == 0) return;
+    for (size_t i = 0; i < *count; i++) {
+        if (activities[i].process_id == process_id) {
+            activities[i].input_active = activities[i].input_active || input_active;
+            activities[i].output_active = activities[i].output_active || output_active;
+            return;
+        }
+    }
+    if (*count >= capacity) return;
+    activities[*count].process_id = process_id;
+    activities[*count].input_active = input_active;
+    activities[*count].output_active = output_active;
+    (*count)++;
+}
+
+static void collect_device_audio_sessions(
+    IMMDevice *device,
+    bool input,
+    AudioPidActivity *activities,
+    size_t *activity_count,
+    size_t activity_capacity
+) {
+    if (!device) return;
+    IAudioSessionManager2 *manager = NULL;
+    HRESULT hr = device->Activate(
+        __uuidof(IAudioSessionManager2),
+        CLSCTX_ALL,
+        NULL,
+        (void **)&manager);
+    if (FAILED(hr) || !manager) return;
+
+    IAudioSessionEnumerator *session_enumerator = NULL;
+    hr = manager->GetSessionEnumerator(&session_enumerator);
+    manager->Release();
+    if (FAILED(hr) || !session_enumerator) return;
+
+    int session_count = 0;
+    if (FAILED(session_enumerator->GetCount(&session_count))) {
+        session_enumerator->Release();
+        return;
+    }
+    for (int index = 0; index < session_count; index++) {
+        IAudioSessionControl *control = NULL;
+        if (FAILED(session_enumerator->GetSession(index, &control)) || !control) continue;
+        AudioSessionState state = AudioSessionStateInactive;
+        bool active = SUCCEEDED(control->GetState(&state)) && state == AudioSessionStateActive;
+        if (active) {
+            IAudioSessionControl2 *control2 = NULL;
+            if (SUCCEEDED(control->QueryInterface(
+                    __uuidof(IAudioSessionControl2),
+                    (void **)&control2))
+                && control2) {
+                DWORD process_id = 0;
+                if (SUCCEEDED(control2->GetProcessId(&process_id))) {
+                    merge_audio_pid(
+                        activities,
+                        activity_count,
+                        activity_capacity,
+                        process_id,
+                        input,
+                        !input);
+                }
+                control2->Release();
+            }
+        }
+        control->Release();
+    }
+    session_enumerator->Release();
+}
+
+static void collect_endpoint_audio_sessions(
+    IMMDeviceEnumerator *device_enumerator,
+    EDataFlow flow,
+    bool input,
+    AudioPidActivity *activities,
+    size_t *activity_count,
+    size_t activity_capacity
+) {
+    if (!device_enumerator) return;
+    const ERole roles[] = { eCommunications, eMultimedia };
+    wchar_t previous_device_id[520] = L"";
+    for (size_t role_index = 0; role_index < sizeof(roles) / sizeof(roles[0]); role_index++) {
+        IMMDevice *device = NULL;
+        HRESULT hr = device_enumerator->GetDefaultAudioEndpoint(
+            flow,
+            roles[role_index],
+            &device);
+        if (FAILED(hr) || !device) continue;
+
+        LPWSTR device_id = NULL;
+        bool duplicate = false;
+        if (SUCCEEDED(device->GetId(&device_id)) && device_id) {
+            duplicate = previous_device_id[0] != L'\0'
+                && _wcsicmp(previous_device_id, device_id) == 0;
+            if (!duplicate) {
+                wcsncpy_s(previous_device_id, 520, device_id, _TRUNCATE);
+            }
+            CoTaskMemFree(device_id);
+        }
+        if (!duplicate) {
+            collect_device_audio_sessions(
+                device,
+                input,
+                activities,
+                activity_count,
+                activity_capacity);
+        }
+        device->Release();
+    }
+}
+
+static LONGLONG unix_time_millis(void) {
+    FILETIME file_time;
+    GetSystemTimeAsFileTime(&file_time);
+    ULARGE_INTEGER ticks;
+    ticks.LowPart = file_time.dwLowDateTime;
+    ticks.HighPart = file_time.dwHighDateTime;
+    const ULONGLONG windows_to_unix_epoch_100ns = 116444736000000000ULL;
+    if (ticks.QuadPart <= windows_to_unix_epoch_100ns) return 0;
+    return (LONGLONG)((ticks.QuadPart - windows_to_unix_epoch_100ns) / 10000ULL);
+}
+
+static bool meeting_detection_enabled(void) {
+    return InterlockedCompareExchange(&g_meeting_detection_enabled, 0, 0) != 0;
+}
+
+static void sample_windows_meeting_evidence(IMMDeviceEnumerator *device_enumerator) {
+    if (!meeting_detection_enabled()) return;
+    AudioPidActivity activities[64];
+    size_t activity_count = 0;
+    ZeroMemory(activities, sizeof(activities));
+    collect_endpoint_audio_sessions(
+        device_enumerator,
+        eCapture,
+        true,
+        activities,
+        &activity_count,
+        64);
+    collect_endpoint_audio_sessions(
+        device_enumerator,
+        eRender,
+        false,
+        activities,
+        &activity_count,
+        64);
+
+    HWND foreground = GetForegroundWindow();
+    DWORD foreground_pid = 0;
+    if (foreground) GetWindowThreadProcessId(foreground, &foreground_pid);
+    MeetingAppIdentity foreground_identity;
+    bool has_foreground_identity = classify_meeting_process(
+        foreground_pid,
+        &foreground_identity);
+    LONGLONG observed_at = unix_time_millis();
+
+    MeetingEvidencePayload candidates[16];
+    size_t candidate_count = 0;
+    ZeroMemory(candidates, sizeof(candidates));
+    for (size_t index = 0; index < activity_count; index++) {
+        MeetingAppIdentity identity;
+        if (!classify_meeting_process(activities[index].process_id, &identity)) continue;
+
+        size_t candidate_index = candidate_count;
+        for (size_t existing = 0; existing < candidate_count; existing++) {
+            if (_wcsicmp(candidates[existing].app_id, identity.app_id) == 0) {
+                candidate_index = existing;
+                break;
+            }
+        }
+        if (candidate_index == candidate_count) {
+            if (candidate_count >= 16) continue;
+            wcscpy_s(candidates[candidate_index].app_name, 160, identity.app_name);
+            wcscpy_s(candidates[candidate_index].app_id, 260, identity.app_id);
+            candidates[candidate_index].process_id = activities[index].process_id;
+            candidates[candidate_index].browser = identity.browser;
+            candidates[candidate_index].dedicated_meeting_app =
+                identity.dedicated_meeting_app;
+            candidates[candidate_index].observed_at_unix_ms = observed_at;
+            candidate_count++;
+        }
+        candidates[candidate_index].audio_input_active =
+            candidates[candidate_index].audio_input_active
+            || activities[index].input_active;
+        candidates[candidate_index].audio_output_active =
+            candidates[candidate_index].audio_output_active
+            || activities[index].output_active;
+        candidates[candidate_index].app_foreground =
+            has_foreground_identity
+            && _wcsicmp(foreground_identity.app_id, identity.app_id) == 0;
+    }
+
+    for (size_t index = 0; index < candidate_count; index++) {
+        if (!meeting_detection_enabled()) return;
+        if (candidates[index].browser) {
+            find_meeting_window(
+                candidates[index].app_id,
+                candidates[index].provider,
+                96,
+                candidates[index].window_title,
+                520);
+        } else {
+            dedicated_provider(
+                candidates[index].app_id,
+                candidates[index].provider,
+                96);
+        }
+        MeetingEvidencePayload *copy =
+            (MeetingEvidencePayload *)malloc(sizeof(MeetingEvidencePayload));
+        if (!copy) continue;
+        *copy = candidates[index];
+        if (!meeting_detection_enabled()
+            || !PostMessageW(g_hwnd, WM_BLUEY_MEETING_EVIDENCE, 0, (LPARAM)copy)) {
+            free(copy);
+        }
+    }
+}
+
+static DWORD WINAPI meeting_detector_thread(LPVOID unused) {
+    HANDLE stop_event = (HANDLE)unused;
+    HRESULT com_status = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    IMMDeviceEnumerator *device_enumerator = NULL;
+    HRESULT create_status = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator),
+        NULL,
+        CLSCTX_INPROC_SERVER,
+        __uuidof(IMMDeviceEnumerator),
+        (void **)&device_enumerator);
+    if (SUCCEEDED(create_status) && device_enumerator) {
+        sample_windows_meeting_evidence(device_enumerator);
+        while (meeting_detection_enabled()
+            && WaitForSingleObject(stop_event, 750) == WAIT_TIMEOUT) {
+            sample_windows_meeting_evidence(device_enumerator);
+        }
+        device_enumerator->Release();
+    }
+    if (SUCCEEDED(com_status)) CoUninitialize();
+    return 0;
+}
+
+static bool start_meeting_detector(void) {
+    InterlockedExchange(&g_meeting_detection_enabled, 1);
+    AcquireSRWLockExclusive(&g_meeting_detector_lock);
+    if (g_meeting_detector_thread) {
+        ReleaseSRWLockExclusive(&g_meeting_detector_lock);
+        return true;
+    }
+    HANDLE stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!stop_event) {
+        InterlockedExchange(&g_meeting_detection_enabled, 0);
+        ReleaseSRWLockExclusive(&g_meeting_detector_lock);
+        return false;
+    }
+    HANDLE thread = CreateThread(
+        NULL,
+        0,
+        meeting_detector_thread,
+        stop_event,
+        0,
+        NULL);
+    if (!thread) {
+        CloseHandle(stop_event);
+        InterlockedExchange(&g_meeting_detection_enabled, 0);
+        ReleaseSRWLockExclusive(&g_meeting_detector_lock);
+        return false;
+    }
+    g_meeting_detector_stop = stop_event;
+    g_meeting_detector_thread = thread;
+    ReleaseSRWLockExclusive(&g_meeting_detector_lock);
+    return true;
+}
+
+static void stop_meeting_detector(void) {
+    InterlockedExchange(&g_meeting_detection_enabled, 0);
+    AcquireSRWLockExclusive(&g_meeting_detector_lock);
+    HANDLE stop_event = g_meeting_detector_stop;
+    HANDLE thread = g_meeting_detector_thread;
+    g_meeting_detector_stop = NULL;
+    g_meeting_detector_thread = NULL;
+    if (stop_event) SetEvent(stop_event);
+    ReleaseSRWLockExclusive(&g_meeting_detector_lock);
+
+    if (thread) {
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+    }
+    if (stop_event) CloseHandle(stop_event);
+}
+
+static void set_meeting_detection_enabled(bool enabled) {
+    if (enabled) {
+        start_meeting_detector();
+    } else {
+        InterlockedExchange(&g_meeting_detection_enabled, 0);
+        PostMessageW(g_hwnd, WM_BLUEY_MEETING_DETECTION_DISABLED, 0, 0);
+        stop_meeting_detector();
+    }
+}
+
 static wchar_t *drag_query_path_alloc(HDROP drop, UINT index) {
     UINT len = DragQueryFileW(drop, index, NULL, 0);
     if (len == 0) return NULL;
@@ -706,6 +1414,7 @@ static void show_unsupported_drop_message(UINT skipped, UINT total) {
     wcscpy_s(g_kind, 64, L"warning");
     wcscpy_s(g_source, 256, L"");
     wcscpy_s(g_card_id, 80, L"");
+    reset_card_update_sequence();
     if (g_visible && !g_collapsed) show_full_overlay(false);
     InvalidateRect(g_hwnd, NULL, TRUE);
 }
@@ -717,6 +1426,7 @@ static void show_supported_drop_loading(UINT count) {
     wcscpy_s(g_kind, 64, L"context");
     wcscpy_s(g_source, 256, L"");
     wcscpy_s(g_card_id, 80, L"");
+    reset_card_update_sequence();
     if (g_visible && !g_collapsed) show_full_overlay(false);
     InvalidateRect(g_hwnd, NULL, TRUE);
 }
@@ -1224,6 +1934,284 @@ static void hide_overlay_completely(bool emit_event) {
     set_controls_visible(false);
     ShowWindow(g_hwnd, SW_HIDE);
     if (emit_event) emit_simple_event("hidden");
+}
+
+static void update_meeting_banner_countdown(void) {
+    if (!g_meeting_banner || !IsWindowVisible(g_meeting_banner)) return;
+    if (!meeting_detection_enabled()) {
+        hide_meeting_banner(NULL);
+        return;
+    }
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG remaining_ms =
+        now >= g_meeting_banner_deadline_ms ? 0 : g_meeting_banner_deadline_ms - now;
+    wchar_t label[128];
+    swprintf_s(
+        label,
+        128,
+        L"%d%% confidence  \x2022  closes in %llus",
+        g_meeting_candidate_confidence,
+        (unsigned long long)((remaining_ms + 999) / 1000));
+    SetWindowTextW(g_meeting_banner_countdown, label);
+    InvalidateRect(g_meeting_banner, NULL, FALSE);
+    if (remaining_ms == 0) {
+        emit_meeting_banner_action(bluey_meeting_banner_timeout_action());
+        hide_meeting_banner(NULL);
+    }
+}
+
+static void hide_meeting_banner(const wchar_t *candidate_id) {
+    if (!g_meeting_banner) return;
+    if (candidate_id && candidate_id[0] != L'\0'
+        && _wcsicmp(candidate_id, g_meeting_candidate_id) != 0) {
+        return;
+    }
+    KillTimer(g_meeting_banner, ID_MEETING_BANNER_TIMER);
+    ShowWindow(g_meeting_banner, SW_HIDE);
+    g_meeting_candidate_id[0] = L'\0';
+    g_meeting_candidate_app_id[0] = L'\0';
+    g_meeting_candidate_provider[0] = L'\0';
+    g_meeting_banner_started_ms = 0;
+    g_meeting_banner_deadline_ms = 0;
+}
+
+static const wchar_t *meeting_provider_display_name(const wchar_t *provider) {
+    if (!provider) return NULL;
+    if (_wcsicmp(provider, L"google_meet") == 0) return L"Google Meet detected";
+    if (_wcsicmp(provider, L"zoom") == 0) return L"Zoom detected";
+    if (_wcsicmp(provider, L"microsoft_teams") == 0) return L"Microsoft Teams detected";
+    if (_wcsicmp(provider, L"webex") == 0) return L"Webex detected";
+    if (_wcsicmp(provider, L"slack_huddle") == 0) return L"Slack Huddle detected";
+    if (_wcsicmp(provider, L"whereby") == 0) return L"Whereby detected";
+    if (_wcsicmp(provider, L"gotomeeting") == 0) return L"GoTo Meeting detected";
+    return NULL;
+}
+
+static void show_meeting_banner_from_json(const char *line, size_t line_len) {
+    if (!g_meeting_banner) return;
+    const char *candidate = NULL;
+    size_t candidate_len = 0;
+    if (!json_extract_object(line, line_len, "candidate", &candidate, &candidate_len)) return;
+
+    wchar_t candidate_id[260] = L"";
+    wchar_t app_name[160] = L"Meeting app";
+    wchar_t app_id[260] = L"";
+    wchar_t provider[96] = L"";
+    wchar_t reason[620] = L"Bluey detected corroborated meeting activity.";
+    safe_extract_json_to_wide(candidate, candidate_len, "candidate_id", candidate_id, 260);
+    safe_extract_json_to_wide(candidate, candidate_len, "app_name", app_name, 160);
+    safe_extract_json_to_wide(candidate, candidate_len, "app_id", app_id, 260);
+    safe_extract_json_to_wide(candidate, candidate_len, "provider", provider, 96);
+    safe_extract_json_to_wide(candidate, candidate_len, "reason", reason, 620);
+    if (candidate_id[0] == L'\0' || app_id[0] == L'\0') return;
+
+    double confidence = 0;
+    double timeout_secs = 12;
+    safe_extract_json_number(candidate, candidate_len, "confidence", &confidence);
+    safe_extract_json_number(line, line_len, "timeout_secs", &timeout_secs);
+    int timeout = clamp_int((int)timeout_secs, 3, 60);
+    g_meeting_candidate_confidence = clamp_int((int)confidence, 0, 100);
+    wcscpy_s(g_meeting_candidate_id, 260, candidate_id);
+    wcscpy_s(g_meeting_candidate_app_id, 260, app_id);
+    wcscpy_s(g_meeting_candidate_provider, 96, provider);
+
+    const wchar_t *provider_title = meeting_provider_display_name(provider);
+    SetWindowTextW(
+        g_meeting_banner_title,
+        provider_title ? provider_title : L"Meeting detected");
+    SetWindowTextW(g_meeting_banner_app, app_name);
+    SetWindowTextW(g_meeting_banner_reason, reason);
+    g_meeting_banner_started_ms = GetTickCount64();
+    g_meeting_banner_deadline_ms =
+        g_meeting_banner_started_ms + (ULONGLONG)timeout * 1000ULL;
+
+    POINT cursor;
+    GetCursorPos(&cursor);
+    MONITORINFO monitor;
+    ZeroMemory(&monitor, sizeof(monitor));
+    monitor.cbSize = sizeof(monitor);
+    HMONITOR active_monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    RECT work = {0, 0, 1920, 1080};
+    if (GetMonitorInfoW(active_monitor, &monitor)) work = monitor.rcWork;
+    int width = 570;
+    int height = 164;
+    int margin = 18;
+    SetWindowPos(
+        g_meeting_banner,
+        HWND_TOPMOST,
+        work.right - width - margin,
+        work.top + margin,
+        width,
+        height,
+        SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    apply_capture_exclusion(g_meeting_banner);
+    SetTimer(g_meeting_banner, ID_MEETING_BANNER_TIMER, 100, NULL);
+    update_meeting_banner_countdown();
+}
+
+static LRESULT CALLBACK meeting_banner_wnd_proc(
+    HWND hwnd,
+    UINT message,
+    WPARAM wparam,
+    LPARAM lparam
+) {
+    switch (message) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wparam;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(
+            hdc,
+            (HWND)lparam == g_meeting_banner_reason
+                || (HWND)lparam == g_meeting_banner_countdown
+                || (HWND)lparam == g_meeting_banner_app
+                ? RGB(164, 177, 188)
+                : RGB(236, 249, 255));
+        return (LRESULT)GetStockObject(HOLLOW_BRUSH);
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT paint;
+        HDC hdc = BeginPaint(hwnd, &paint);
+        RECT rect;
+        GetClientRect(hwnd, &rect);
+        HBRUSH background = CreateSolidBrush(RGB(18, 23, 29));
+        HBRUSH accent = CreateSolidBrush(RGB(102, 242, 140));
+        HPEN border = CreatePen(PS_SOLID, 1, RGB(45, 91, 104));
+        HGDIOBJ old_pen = SelectObject(hdc, border);
+        HGDIOBJ old_brush = SelectObject(hdc, background);
+        RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 24, 24);
+        SelectObject(hdc, accent);
+        RoundRect(hdc, 12, 15, 18, rect.bottom - 14, 6, 6);
+
+        if (g_meeting_banner_deadline_ms > g_meeting_banner_started_ms) {
+            ULONGLONG now = GetTickCount64();
+            ULONGLONG total =
+                g_meeting_banner_deadline_ms - g_meeting_banner_started_ms;
+            ULONGLONG remaining =
+                now >= g_meeting_banner_deadline_ms
+                    ? 0
+                    : g_meeting_banner_deadline_ms - now;
+            int progress_width =
+                (int)(((ULONGLONG)(rect.right - rect.left - 24) * remaining) / total);
+            RECT progress_rect = {
+                rect.left + 12,
+                rect.bottom - 5,
+                rect.left + 12 + progress_width,
+                rect.bottom - 2,
+            };
+            FillRect(hdc, &progress_rect, accent);
+        }
+
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        DeleteObject(border);
+        DeleteObject(accent);
+        DeleteObject(background);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    case WM_TIMER:
+        if (wparam == ID_MEETING_BANNER_TIMER) {
+            update_meeting_banner_countdown();
+            return 0;
+        }
+        break;
+    case WM_COMMAND:
+        switch (LOWORD(wparam)) {
+        case ID_MEETING_START_BUTTON:
+            emit_meeting_banner_action("start");
+            emit_simple_event("recording_start_requested");
+            hide_meeting_banner(NULL);
+            return 0;
+        case ID_MEETING_SNOOZE_BUTTON:
+            emit_meeting_banner_action("snooze");
+            hide_meeting_banner(NULL);
+            return 0;
+        case ID_MEETING_DISMISS_BUTTON:
+            emit_meeting_banner_action("dismiss");
+            hide_meeting_banner(NULL);
+            return 0;
+        case ID_MEETING_IGNORE_BUTTON:
+            emit_meeting_banner_action("ignore");
+            hide_meeting_banner(NULL);
+            return 0;
+        case ID_MEETING_SETTINGS_BUTTON:
+            emit_meeting_banner_action("settings");
+            hide_meeting_banner(NULL);
+            return 0;
+        default:
+            break;
+        }
+        break;
+    case WM_CLOSE:
+        emit_meeting_banner_action("dismiss");
+        hide_meeting_banner(NULL);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+static void create_meeting_banner(HINSTANCE instance) {
+    const wchar_t *class_name = L"BlueyMeetingBannerWindow";
+    WNDCLASSW window_class;
+    ZeroMemory(&window_class, sizeof(window_class));
+    window_class.lpfnWndProc = meeting_banner_wnd_proc;
+    window_class.hInstance = instance;
+    window_class.lpszClassName = class_name;
+    window_class.hCursor = LoadCursor(NULL, IDC_ARROW);
+    RegisterClassW(&window_class);
+
+    g_meeting_banner = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        class_name,
+        L"Bluey meeting detection",
+        WS_POPUP,
+        0,
+        0,
+        570,
+        164,
+        NULL,
+        NULL,
+        instance,
+        NULL);
+    if (!g_meeting_banner) return;
+
+    g_meeting_banner_title = CreateWindowExW(
+        0, L"STATIC", L"Meeting detected", WS_CHILD | WS_VISIBLE,
+        34, 16, 250, 22, g_meeting_banner, NULL, instance, NULL);
+    g_meeting_banner_app = CreateWindowExW(
+        0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_RIGHT,
+        330, 18, 220, 20, g_meeting_banner, NULL, instance, NULL);
+    g_meeting_banner_reason = CreateWindowExW(
+        0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+        34, 44, 516, 34, g_meeting_banner, NULL, instance, NULL);
+    g_meeting_banner_countdown = CreateWindowExW(
+        0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+        34, 84, 215, 20, g_meeting_banner, NULL, instance, NULL);
+    g_meeting_banner_start = CreateWindowExW(
+        0, L"BUTTON", L"Start recording", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        260, 82, 126, 30, g_meeting_banner,
+        (HMENU)(INT_PTR)ID_MEETING_START_BUTTON, instance, NULL);
+    g_meeting_banner_snooze = CreateWindowExW(
+        0, L"BUTTON", L"Snooze", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        394, 82, 74, 30, g_meeting_banner,
+        (HMENU)(INT_PTR)ID_MEETING_SNOOZE_BUTTON, instance, NULL);
+    g_meeting_banner_dismiss = CreateWindowExW(
+        0, L"BUTTON", L"Dismiss", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        476, 82, 74, 30, g_meeting_banner,
+        (HMENU)(INT_PTR)ID_MEETING_DISMISS_BUTTON, instance, NULL);
+    g_meeting_banner_ignore = CreateWindowExW(
+        0, L"BUTTON", L"Ignore app", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        394, 118, 76, 26, g_meeting_banner,
+        (HMENU)(INT_PTR)ID_MEETING_IGNORE_BUTTON, instance, NULL);
+    g_meeting_banner_settings = CreateWindowExW(
+        0, L"BUTTON", L"Settings", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        478, 118, 72, 26, g_meeting_banner,
+        (HMENU)(INT_PTR)ID_MEETING_SETTINGS_BUTTON, instance, NULL);
+    apply_capture_exclusion(g_meeting_banner);
 }
 
 static void collapse_to_pill(HWND hwnd, bool emit_event) {
@@ -2312,6 +3300,7 @@ static bool process_stdin_record(const char *line, size_t line_len, void *contex
         wcscpy_s(g_kind, 64, L"system");
         wcscpy_s(g_source, 256, L"");
         wcscpy_s(g_card_id, 80, L"");
+        reset_card_update_sequence();
         g_sent_chip_count = 0;
         set_recovery_mode(0);
         update_paste_answer_button();
@@ -2322,6 +3311,7 @@ static bool process_stdin_record(const char *line, size_t line_len, void *contex
         wcscpy_s(g_kind, 64, L"system");
         wcscpy_s(g_source, 256, L"");
         wcscpy_s(g_card_id, 80, L"");
+        reset_card_update_sequence();
         safe_extract_json_to_wide(line, line_len, "title", g_title, 256);
         set_recovery_mode(0);
         show_full_overlay(false);
@@ -2343,6 +3333,7 @@ static bool process_stdin_record(const char *line, size_t line_len, void *contex
         set_context_chips_from_json(line, line_len);
         InvalidateRect(g_hwnd, NULL, TRUE);
     } else if (strcmp(msg_type, "push_card") == 0) {
+        reset_card_update_sequence();
         const char *card = line;
         size_t card_len = line_len;
         json_extract_object(line, line_len, "card", &card, &card_len);
@@ -2373,7 +3364,40 @@ static bool process_stdin_record(const char *line, size_t line_len, void *contex
     } else if (strcmp(msg_type, "update_card") == 0) {
         wchar_t id[80] = L"";
         safe_extract_json_to_wide(line, line_len, "id", id, 80);
-        if (wcslen(g_card_id) == 0 || wcscmp(id, g_card_id) == 0) {
+        bool snapshot = false;
+        bool valid_snapshot = json_read_optional_bool(
+            line,
+            line_len,
+            "snapshot",
+            &snapshot);
+        bool card_matches = wcscmp(id, g_card_id) == 0 && id[0] != L'\0';
+        bool snapshot_recovery =
+            snapshot && g_card_id[0] == L'\0' && id[0] != L'\0';
+        if (valid_snapshot
+            && (card_matches || snapshot_recovery)
+            && should_apply_card_update(line, line_len, snapshot)) {
+            if (snapshot_recovery) {
+                /*
+                 * A restarted overlay has no preceding push_card frame. Rebuild
+                 * the answer presentation state from the authoritative daemon
+                 * snapshot so it renders and behaves like a normal answer card.
+                 */
+                if (!recover_answer_snapshot_state(
+                        id,
+                        g_card_id,
+                        80,
+                        g_kind,
+                        64,
+                        g_title,
+                        256,
+                        g_source,
+                        256,
+                        &g_sent_chip_count,
+                        &g_recovery_mode)) {
+                    return true;
+                }
+                set_recovery_mode(g_recovery_mode);
+            }
             bool is_answer = _wcsicmp(g_kind, L"answer") == 0;
             bool updated = set_body_from_json(line, line_len, "body", is_answer);
             const char *artifact = NULL;
@@ -2413,6 +3437,9 @@ static bool process_stdin_record(const char *line, size_t line_len, void *contex
         char state[32] = "idle";
         json_extract_string(line, line_len, "state", state, sizeof(state));
         g_recording = strcmp(state, "listening") == 0;
+        if (g_recording || strcmp(state, "connecting") == 0) {
+            hide_meeting_banner(NULL);
+        }
         g_audio_auto_stop_remaining_secs = -1;
         update_record_button();
         InvalidateRect(g_hwnd, NULL, TRUE);
@@ -2427,7 +3454,21 @@ static bool process_stdin_record(const char *line, size_t line_len, void *contex
     } else if (strcmp(msg_type, "audio_auto_stop_countdown_cleared") == 0) {
         g_audio_auto_stop_remaining_secs = -1;
         InvalidateRect(g_hwnd, NULL, TRUE);
+    } else if (strcmp(msg_type, "set_meeting_detection_enabled") == 0) {
+        bool enabled = false;
+        if (bluey_parse_meeting_detection_enabled(line, line_len, &enabled)) {
+            set_meeting_detection_enabled(enabled);
+        }
+    } else if (strcmp(msg_type, "show_meeting_banner") == 0) {
+        if (meeting_detection_enabled() && !g_recording) {
+            show_meeting_banner_from_json(line, line_len);
+        }
+    } else if (strcmp(msg_type, "hide_meeting_banner") == 0) {
+        wchar_t candidate_id[260] = L"";
+        safe_extract_json_to_wide(line, line_len, "candidate_id", candidate_id, 260);
+        hide_meeting_banner(candidate_id[0] == L'\0' ? NULL : candidate_id);
     } else if (strcmp(msg_type, "session_switched") == 0) {
+        reset_card_update_sequence();
         if (g_auto_send_timer_armed) cancel_auto_send_timer("session_switched");
         safe_extract_json_to_wide(line, line_len, "title", g_session_banner, 256);
         if (wcslen(g_session_banner) == 0) wcscpy_s(g_session_banner, 256, L"New session");
@@ -2439,9 +3480,14 @@ static bool process_stdin_record(const char *line, size_t line_len, void *contex
         update_paste_answer_button();
         InvalidateRect(g_hwnd, NULL, TRUE);
     } else if (strcmp(msg_type, "set_active_session") == 0) {
+        wchar_t previous_session_id[80] = L"";
+        wcscpy_s(previous_session_id, 80, g_active_session_id);
         safe_extract_json_to_wide(line, line_len, "id", g_active_session_id, 80);
         safe_extract_json_to_wide(line, line_len, "code", g_active_session_code, 32);
         safe_extract_json_to_wide(line, line_len, "title", g_active_session_title, 160);
+        if (wcscmp(previous_session_id, g_active_session_id) != 0) {
+            reset_card_update_sequence();
+        }
         if (wcslen(g_active_session_code) == 0 && wcslen(g_active_session_id) >= 8) {
             wcsncpy_s(g_active_session_code, 32, g_active_session_id, 8);
         }
@@ -3134,6 +4180,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
         break;
     }
+    case WM_BLUEY_MEETING_EVIDENCE: {
+        MeetingEvidencePayload *evidence = (MeetingEvidencePayload *)lparam;
+        if (evidence) {
+            if (meeting_detection_enabled()) {
+                emit_meeting_evidence_event(evidence);
+            }
+            free(evidence);
+        }
+        return 0;
+    }
+    case WM_BLUEY_MEETING_DETECTION_DISABLED:
+        hide_meeting_banner(NULL);
+        return 0;
     case WM_TIMER:
         if (wparam == ID_AUTOSEND_TIMER) {
             KillTimer(hwnd, ID_AUTOSEND_TIMER);
@@ -3715,6 +4774,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         collapse_to_pill(hwnd, true);
         return 0;
     case WM_DESTROY:
+        stop_meeting_detector();
+        hide_meeting_banner(NULL);
+        if (g_meeting_banner) {
+            DestroyWindow(g_meeting_banner);
+            g_meeting_banner = NULL;
+        }
         UnregisterHotKey(hwnd, ID_HOTKEY_TOGGLE_OVERLAY);
         UnregisterHotKey(hwnd, ID_HOTKEY_FOCUS_ASK);
         UnregisterHotKey(hwnd, ID_HOTKEY_LISTEN);
@@ -3781,6 +4846,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     );
 
     create_controls(g_hwnd);
+    create_meeting_banner(instance);
     DragAcceptFiles(g_hwnd, TRUE);
     set_window_opacity(g_opacity);
     apply_capture_exclusion(g_hwnd);
@@ -3805,12 +4871,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         snprintf(hotkey_detail, sizeof(hotkey_detail), "modifier=ctrl_alt registered=%d", hotkeys_registered);
         emit_lifecycle_event("global_shortcuts", "ready", hotkey_detail);
     }
-    CreateThread(NULL, 0, stdin_thread, NULL, 0, NULL);
-
+    HANDLE stdin_worker = CreateThread(NULL, 0, stdin_thread, NULL, 0, NULL);
+    if (stdin_worker) CloseHandle(stdin_worker);
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+    stop_meeting_detector();
     return 0;
 }

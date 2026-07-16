@@ -10,6 +10,32 @@ use crate::object_storage::{sha256_hex, UploadLimits};
 const DAY_MS: i64 = 86_400_000;
 const PROCESSING_LEASE_MS: i64 = 5 * 60 * 1000;
 
+pub(crate) fn context_artifact_advisory_lock_key(artifact_id: &str) -> String {
+    format!("context artifact:{artifact_id}")
+}
+
+pub(crate) fn session_advisory_lock_key(session_id: &str) -> String {
+    format!("session:{session_id}")
+}
+
+fn lock_context_artifact_postgres_tx(tx: &mut PgTransaction<'_>, artifact_id: &str) -> Result<()> {
+    let lock_key = context_artifact_advisory_lock_key(artifact_id);
+    tx.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))",
+        &[&lock_key],
+    )?;
+    Ok(())
+}
+
+fn lock_session_postgres_tx(tx: &mut PgTransaction<'_>, session_id: &str) -> Result<()> {
+    let lock_key = session_advisory_lock_key(session_id);
+    tx.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))",
+        &[&lock_key],
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
     Artifact,
@@ -101,7 +127,7 @@ pub enum UploadControlError {
     AccountObjectQuotaExceeded,
     #[error("daily account upload quota exceeded")]
     DailyQuotaExceeded,
-    #[error("the stable object id is already bound to different content")]
+    #[error("the stable object id is already bound to different content or parent session")]
     IdempotencyConflict,
     #[error("the object upload is already in progress")]
     UploadInProgress,
@@ -316,6 +342,104 @@ pub(crate) fn schedule_session_cleanup_postgres_tx(
     Ok(changed as usize)
 }
 
+pub(crate) fn schedule_artifact_cleanup_sqlite_tx(
+    tx: &SqliteTransaction<'_>,
+    account_id: &str,
+    artifact_id: &str,
+    now_ms: i64,
+) -> Result<usize> {
+    let changed = tx.execute(
+        "UPDATE object_uploads
+            SET state = 'delete_pending', updated_at_ms = ?3
+          WHERE account_id = ?1
+            AND object_kind = 'artifact'
+            AND logical_id = ?2
+            AND state IN ('pending', 'ready')",
+        params![account_id, artifact_id, now_ms],
+    )?;
+    tx.execute(
+        "INSERT INTO object_storage_outbox (
+            id, upload_id, account_id, operation, state, next_attempt_at_ms,
+            created_at_ms, updated_at_ms
+         )
+         SELECT u.id || ':delete', u.id, u.account_id, 'delete', 'pending', ?3, ?3, ?3
+           FROM object_uploads u
+          WHERE u.account_id = ?1
+            AND u.object_kind = 'artifact'
+            AND u.logical_id = ?2
+            AND u.state = 'delete_pending'
+         ON CONFLICT(upload_id, operation) DO NOTHING",
+        params![account_id, artifact_id, now_ms],
+    )?;
+    tx.execute(
+        "UPDATE object_storage_outbox
+            SET state = 'abandoned',
+                last_error = 'artifact deleted before upload completed',
+                updated_at_ms = ?3,
+                completed_at_ms = ?3
+          WHERE operation = 'put'
+            AND state IN ('pending', 'processing', 'retry')
+            AND upload_id IN (
+                SELECT id
+                  FROM object_uploads
+                 WHERE account_id = ?1
+                   AND object_kind = 'artifact'
+                   AND logical_id = ?2
+            )",
+        params![account_id, artifact_id, now_ms],
+    )?;
+    Ok(changed)
+}
+
+pub(crate) fn schedule_artifact_cleanup_postgres_tx(
+    tx: &mut PgTransaction<'_>,
+    account_id: &str,
+    artifact_id: &str,
+    now_ms: i64,
+) -> Result<usize> {
+    let changed = tx.execute(
+        "UPDATE object_uploads
+            SET state = 'delete_pending', updated_at_ms = $3
+          WHERE account_id = $1
+            AND object_kind = 'artifact'
+            AND logical_id = $2
+            AND state IN ('pending', 'ready')",
+        &[&account_id, &artifact_id, &now_ms],
+    )?;
+    tx.execute(
+        "INSERT INTO object_storage_outbox (
+            id, upload_id, account_id, operation, state, next_attempt_at_ms,
+            created_at_ms, updated_at_ms
+         )
+         SELECT u.id || ':delete', u.id, u.account_id, 'delete', 'pending', $3, $3, $3
+           FROM object_uploads u
+          WHERE u.account_id = $1
+            AND u.object_kind = 'artifact'
+            AND u.logical_id = $2
+            AND u.state = 'delete_pending'
+         ON CONFLICT(upload_id, operation) DO NOTHING",
+        &[&account_id, &artifact_id, &now_ms],
+    )?;
+    tx.execute(
+        "UPDATE object_storage_outbox
+            SET state = 'abandoned',
+                last_error = 'artifact deleted before upload completed',
+                updated_at_ms = $3,
+                completed_at_ms = $3
+          WHERE operation = 'put'
+            AND state IN ('pending', 'processing', 'retry')
+            AND upload_id IN (
+                SELECT id
+                  FROM object_uploads
+                 WHERE account_id = $1
+                   AND object_kind = 'artifact'
+                   AND logical_id = $2
+            )",
+        &[&account_id, &artifact_id, &now_ms],
+    )?;
+    Ok(changed as usize)
+}
+
 fn validate_input(input: &NewObjectUpload) -> Result<()> {
     if input.account_id.trim().is_empty() {
         return Err(UploadControlError::InvalidMetadata("account id").into());
@@ -341,8 +465,14 @@ fn validate_input(input: &NewObjectUpload) -> Result<()> {
     if input.expires_at_ms <= input.now_ms {
         return Err(UploadControlError::InvalidMetadata("expiration").into());
     }
-    if input.object_kind == ObjectKind::SessionAudit && input.session_id.is_none() {
-        return Err(UploadControlError::InvalidMetadata("audit session").into());
+    let session_id = input
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty() && session_id.len() <= 128)
+        .ok_or(UploadControlError::InvalidMetadata("parent session"))?;
+    if session_id != input.session_id.as_deref().unwrap_or_default() {
+        return Err(UploadControlError::InvalidMetadata("parent session").into());
     }
     Ok(())
 }
@@ -354,6 +484,7 @@ fn reserve_upload_sqlite(pool: &DbPool, input: &NewObjectUpload) -> Result<Uploa
         .context("begin sqlite object upload reservation")?;
 
     validate_session_sqlite(&tx, input)?;
+    reject_tombstoned_artifact_sqlite(&tx, input)?;
     if let Some(existing) = load_logical_upload_sqlite(
         &tx,
         &input.account_id,
@@ -408,6 +539,19 @@ fn reserve_upload_postgres(pool: &DbPool, input: &NewObjectUpload) -> Result<Upl
     let mut tx = conn
         .transaction()
         .context("begin postgres object upload reservation")?;
+    if input.object_kind == ObjectKind::Artifact {
+        // Sync tombstones take this same identity lock before publishing the
+        // tombstone. Take it before the account row lock so the reservation
+        // cannot observe "not deleted" and insert after a concurrent delete.
+        lock_context_artifact_postgres_tx(&mut tx, &input.logical_id)?;
+    }
+    lock_session_postgres_tx(
+        &mut tx,
+        input
+            .session_id
+            .as_deref()
+            .ok_or(UploadControlError::InvalidMetadata("parent session"))?,
+    )?;
     let account_exists = tx
         .query_opt(
             "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
@@ -419,6 +563,7 @@ fn reserve_upload_postgres(pool: &DbPool, input: &NewObjectUpload) -> Result<Upl
     }
 
     validate_session_postgres(&mut tx, input)?;
+    reject_tombstoned_artifact_postgres(&mut tx, input)?;
     if let Some(existing) = load_logical_upload_postgres(
         &mut tx,
         &input.account_id,
@@ -473,9 +618,6 @@ fn validate_session_sqlite(tx: &SqliteTransaction<'_>, input: &NewObjectUpload) 
     let Some(session_id) = input.session_id.as_deref() else {
         return Ok(());
     };
-    if input.object_kind != ObjectKind::SessionAudit {
-        return Ok(());
-    }
     let owned = tx
         .query_row(
             "SELECT 1 FROM cloud_sessions
@@ -495,9 +637,6 @@ fn validate_session_postgres(tx: &mut PgTransaction<'_>, input: &NewObjectUpload
     let Some(session_id) = input.session_id.as_deref() else {
         return Ok(());
     };
-    if input.object_kind != ObjectKind::SessionAudit {
-        return Ok(());
-    }
     let owned = tx
         .query_opt(
             "SELECT 1 FROM cloud_sessions
@@ -511,13 +650,56 @@ fn validate_session_postgres(tx: &mut PgTransaction<'_>, input: &NewObjectUpload
     Ok(())
 }
 
+fn reject_tombstoned_artifact_sqlite(
+    tx: &SqliteTransaction<'_>,
+    input: &NewObjectUpload,
+) -> Result<()> {
+    if input.object_kind != ObjectKind::Artifact {
+        return Ok(());
+    }
+    let tombstoned = tx
+        .query_row(
+            "SELECT 1 FROM cloud_child_tombstones
+              WHERE account_id = ?1 AND child_kind = 'context' AND child_id = ?2",
+            params![input.account_id, input.logical_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if tombstoned {
+        return Err(UploadControlError::UploadGone.into());
+    }
+    Ok(())
+}
+
+fn reject_tombstoned_artifact_postgres(
+    tx: &mut PgTransaction<'_>,
+    input: &NewObjectUpload,
+) -> Result<()> {
+    if input.object_kind != ObjectKind::Artifact {
+        return Ok(());
+    }
+    let tombstoned = tx
+        .query_opt(
+            "SELECT 1 FROM cloud_child_tombstones
+              WHERE account_id = $1 AND child_kind = 'context' AND child_id = $2",
+            &[&input.account_id, &input.logical_id],
+        )?
+        .is_some();
+    if tombstoned {
+        return Err(UploadControlError::UploadGone.into());
+    }
+    Ok(())
+}
+
 fn retry_reservation(
     existing: &ObjectUpload,
     input: &NewObjectUpload,
 ) -> Result<UploadReservation> {
     let same_content = existing.sha256.eq_ignore_ascii_case(&input.sha256)
         && existing.size_bytes == input.size_bytes
-        && existing.storage_scope == input.storage_scope.as_str();
+        && existing.storage_scope == input.storage_scope.as_str()
+        && existing.session_id == input.session_id;
     if matches!(existing.state.as_str(), "delete_pending" | "deleted") {
         return Err(UploadControlError::UploadGone.into());
     }
@@ -757,6 +939,26 @@ fn mark_upload_ready_sqlite(pool: &DbPool, upload_id: &str, now_ms: i64) -> Resu
     if matches!(upload.state.as_str(), "delete_pending" | "deleted") {
         return Err(UploadControlError::UploadGone.into());
     }
+    if !upload_parent_is_live_sqlite(&tx, &upload)? {
+        schedule_session_cleanup_sqlite_tx(
+            &tx,
+            &upload.account_id,
+            upload
+                .session_id
+                .as_deref()
+                .ok_or(UploadControlError::InvalidMetadata("parent session"))?,
+            now_ms,
+        )?;
+        tx.commit()?;
+        return Err(UploadControlError::UploadGone.into());
+    }
+    if upload.object_kind == ObjectKind::Artifact.as_str()
+        && artifact_tombstoned_sqlite(&tx, &upload.account_id, &upload.logical_id)?
+    {
+        schedule_artifact_cleanup_sqlite_tx(&tx, &upload.account_id, &upload.logical_id, now_ms)?;
+        tx.commit()?;
+        return Err(UploadControlError::UploadGone.into());
+    }
     tx.execute(
         "UPDATE object_uploads
             SET state = 'ready', uploaded_at_ms = COALESCE(uploaded_at_ms, ?2),
@@ -782,9 +984,46 @@ fn mark_upload_ready_sqlite(pool: &DbPool, upload_id: &str, now_ms: i64) -> Resu
 fn mark_upload_ready_postgres(pool: &DbPool, upload_id: &str, now_ms: i64) -> Result<ObjectUpload> {
     let mut conn = pool.get_pg()?;
     let mut tx = conn.transaction()?;
+    let identity = load_upload_postgres_unlocked(&mut tx, upload_id)?
+        .ok_or(UploadControlError::UploadNotFound)?;
+    if identity.object_kind == ObjectKind::Artifact.as_str() {
+        lock_context_artifact_postgres_tx(&mut tx, &identity.logical_id)?;
+    }
+    lock_session_postgres_tx(
+        &mut tx,
+        identity
+            .session_id
+            .as_deref()
+            .ok_or(UploadControlError::InvalidMetadata("parent session"))?,
+    )?;
     let mut upload =
         load_upload_postgres(&mut tx, upload_id)?.ok_or(UploadControlError::UploadNotFound)?;
     if matches!(upload.state.as_str(), "delete_pending" | "deleted") {
+        return Err(UploadControlError::UploadGone.into());
+    }
+    if !upload_parent_is_live_postgres(&mut tx, &upload)? {
+        schedule_session_cleanup_postgres_tx(
+            &mut tx,
+            &upload.account_id,
+            upload
+                .session_id
+                .as_deref()
+                .ok_or(UploadControlError::InvalidMetadata("parent session"))?,
+            now_ms,
+        )?;
+        tx.commit()?;
+        return Err(UploadControlError::UploadGone.into());
+    }
+    if upload.object_kind == ObjectKind::Artifact.as_str()
+        && artifact_tombstoned_postgres(&mut tx, &upload.account_id, &upload.logical_id)?
+    {
+        schedule_artifact_cleanup_postgres_tx(
+            &mut tx,
+            &upload.account_id,
+            &upload.logical_id,
+            now_ms,
+        )?;
+        tx.commit()?;
         return Err(UploadControlError::UploadGone.into());
     }
     tx.execute(
@@ -807,6 +1046,69 @@ fn mark_upload_ready_postgres(pool: &DbPool, upload_id: &str, now_ms: i64) -> Re
     publish_index_postgres(&mut tx, &upload)?;
     tx.commit()?;
     Ok(upload)
+}
+
+fn upload_parent_is_live_sqlite(tx: &SqliteTransaction<'_>, upload: &ObjectUpload) -> Result<bool> {
+    let session_id = upload
+        .session_id
+        .as_deref()
+        .ok_or(UploadControlError::InvalidMetadata("parent session"))?;
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM cloud_sessions
+              WHERE account_id = ?1 AND session_id = ?2 AND deleted_at_ms IS NULL",
+            params![upload.account_id, session_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn upload_parent_is_live_postgres(
+    tx: &mut PgTransaction<'_>,
+    upload: &ObjectUpload,
+) -> Result<bool> {
+    let session_id = upload
+        .session_id
+        .as_deref()
+        .ok_or(UploadControlError::InvalidMetadata("parent session"))?;
+    Ok(tx
+        .query_opt(
+            "SELECT 1 FROM cloud_sessions
+              WHERE account_id = $1 AND session_id = $2 AND deleted_at_ms IS NULL",
+            &[&upload.account_id, &session_id],
+        )?
+        .is_some())
+}
+
+fn artifact_tombstoned_sqlite(
+    tx: &SqliteTransaction<'_>,
+    account_id: &str,
+    artifact_id: &str,
+) -> Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM cloud_child_tombstones
+              WHERE account_id = ?1 AND child_kind = 'context' AND child_id = ?2",
+            params![account_id, artifact_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn artifact_tombstoned_postgres(
+    tx: &mut PgTransaction<'_>,
+    account_id: &str,
+    artifact_id: &str,
+) -> Result<bool> {
+    Ok(tx
+        .query_opt(
+            "SELECT 1 FROM cloud_child_tombstones
+              WHERE account_id = $1 AND child_kind = 'context' AND child_id = $2",
+            &[&account_id, &artifact_id],
+        )?
+        .is_some())
 }
 
 fn publish_index_sqlite(tx: &SqliteTransaction<'_>, upload: &ObjectUpload) -> Result<()> {
@@ -1758,6 +2060,18 @@ fn load_upload_postgres(
     .transpose()
 }
 
+fn load_upload_postgres_unlocked(
+    tx: &mut PgTransaction<'_>,
+    upload_id: &str,
+) -> Result<Option<ObjectUpload>> {
+    tx.query_opt(
+        &format!("SELECT {UPLOAD_COLUMNS} FROM object_uploads WHERE id = $1"),
+        &[&upload_id],
+    )?
+    .map(row_to_upload_postgres)
+    .transpose()
+}
+
 fn load_logical_upload_sqlite(
     tx: &SqliteTransaction<'_>,
     account_id: &str,
@@ -1905,7 +2219,9 @@ fn bounded_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{open_pool, run_migrations};
+    use crate::db::{open_pool, open_postgres_pool, run_migrations};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
 
     fn test_pool() -> DbPool {
         let pool = open_pool(":memory:".as_ref()).unwrap();
@@ -1928,6 +2244,13 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO cloud_sessions (
+                account_id, session_id, title, status, created_at_ms, updated_at_ms, metadata_json
+             ) VALUES ('acct_1', 'session_2', 'Other session', 'active', 1, 1, '{}')",
+            [],
+        )
+        .unwrap();
         drop(conn);
         pool
     }
@@ -1938,7 +2261,7 @@ mod tests {
             account_id: "acct_1".into(),
             object_kind: ObjectKind::Artifact,
             logical_id: logical_id.into(),
-            session_id: None,
+            session_id: Some("session_1".into()),
             storage_scope: StorageScope::Artifact,
             object_key: format!("objects/accounts/acct_1/{logical_id}/{hash}"),
             size_bytes,
@@ -1963,6 +2286,7 @@ mod tests {
         let first = reserve_upload(&pool, &input).unwrap();
         assert!(first.needs_put);
         assert_eq!(first.upload.state, "pending");
+        assert_eq!(first.upload.session_id.as_deref(), Some("session_1"));
         let account_refs = crate::db::account_data::artifact_object_refs(&pool, "acct_1").unwrap();
         assert_eq!(account_refs.len(), 1);
         assert_eq!(account_refs[0].object_key, input.object_key);
@@ -1996,6 +2320,295 @@ mod tests {
             error.downcast_ref::<UploadControlError>(),
             Some(&UploadControlError::IdempotencyConflict)
         );
+
+        let mut parent_conflict = artifact_input("artifact_1", 40, 1_200);
+        parent_conflict.session_id = Some("session_2".into());
+        let error = reserve_upload(&pool, &parent_conflict).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<UploadControlError>(),
+            Some(&UploadControlError::IdempotencyConflict),
+            "a stable artifact id cannot be rebound to another parent session"
+        );
+    }
+
+    #[test]
+    fn context_tombstone_rejects_stale_artifact_reservation() {
+        let pool = test_pool();
+        let input = artifact_input("deleted-artifact", 40, 1_000);
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO cloud_child_tombstones (
+                    account_id, child_kind, child_id, session_id, deleted_at_ms
+                 ) VALUES ('acct_1', 'context', 'deleted-artifact', 'session_1', 900)",
+                [],
+            )
+            .unwrap();
+
+        let error = reserve_upload(&pool, &input).expect_err("stale object must be rejected");
+        assert_eq!(
+            error.downcast_ref::<UploadControlError>(),
+            Some(&UploadControlError::UploadGone)
+        );
+        assert!(artifact_upload(&pool, "acct_1", "deleted-artifact")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn tombstone_racing_reserved_artifact_prevents_ready_publication() {
+        let pool = test_pool();
+        let input = artifact_input("racing-artifact", 40, 1_000);
+        let reservation = reserve_upload(&pool, &input).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO cloud_child_tombstones (
+                    account_id, child_kind, child_id, session_id, deleted_at_ms
+                 ) VALUES ('acct_1', 'context', 'racing-artifact', 'session_1', 1_050)",
+                [],
+            )
+            .unwrap();
+
+        let error = mark_upload_ready(&pool, &reservation.upload.id, 1_100)
+            .expect_err("tombstoned object must not become ready");
+        assert_eq!(
+            error.downcast_ref::<UploadControlError>(),
+            Some(&UploadControlError::UploadGone)
+        );
+        let upload = artifact_upload(&pool, "acct_1", "racing-artifact")
+            .unwrap()
+            .expect("delete-pending upload retained for cleanup");
+        assert_eq!(upload.state, "delete_pending");
+        let outbox_state: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM object_storage_outbox
+                  WHERE upload_id = ?1 AND operation = 'delete'",
+                params![reservation.upload.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_state, "pending");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_tombstone_lock_blocks_a_racing_artifact_reservation() {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = open_postgres_pool(&database_url).expect("open Postgres test pool");
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct_lock_{suffix}");
+        let session_id = format!("session_lock_{suffix}");
+        let artifact_id = format!("artifact_lock_{suffix}");
+        let email = format!("{account_id}@example.test");
+        {
+            let mut conn = pool.get_pg().expect("get Postgres setup connection");
+            conn.execute(
+                "INSERT INTO accounts (id, email, password_hash) VALUES ($1, $2, 'hash')",
+                &[&account_id, &email],
+            )
+            .expect("insert Postgres test account");
+            conn.execute(
+                "INSERT INTO cloud_sessions (
+                    account_id, session_id, title, status, created_at_ms, updated_at_ms,
+                    last_active_at_ms, metadata_json
+                 ) VALUES ($1, $2, 'Session', 'active', 1, 1, 1, '{}')",
+                &[&account_id, &session_id],
+            )
+            .expect("insert Postgres test session");
+        }
+
+        let mut input = artifact_input(&artifact_id, 40, 1_000);
+        input.account_id = account_id.clone();
+        input.session_id = Some(session_id.clone());
+        input.object_key = format!(
+            "objects/accounts/{account_id}/{artifact_id}/{}",
+            input.sha256
+        );
+
+        let mut blocker = pool.get_pg().expect("get Postgres blocker connection");
+        let mut blocker_tx = blocker.transaction().expect("begin blocker transaction");
+        lock_context_artifact_postgres_tx(&mut blocker_tx, &artifact_id)
+            .expect("acquire artifact advisory lock");
+
+        let reservation_pool = pool.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reservation_thread = std::thread::spawn(move || {
+            let _ = result_tx.send(reserve_upload(&reservation_pool, &input));
+        });
+
+        assert!(
+            matches!(
+                result_rx.recv_timeout(Duration::from_millis(300)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "reservation completed while the tombstone identity lock was held"
+        );
+
+        blocker_tx
+            .execute(
+                "INSERT INTO cloud_child_tombstones (
+                    account_id, child_kind, child_id, session_id, deleted_at_ms
+                 ) VALUES ($1, 'context', $2, $3, 1050)",
+                &[&account_id, &artifact_id, &session_id],
+            )
+            .expect("insert racing context tombstone");
+        schedule_artifact_cleanup_postgres_tx(&mut blocker_tx, &account_id, &artifact_id, 1_050)
+            .expect("schedule racing artifact cleanup");
+        blocker_tx.commit().expect("commit racing tombstone");
+
+        let reservation = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reservation should finish after tombstone commit")
+            .expect_err("tombstoned artifact reservation must be rejected");
+        reservation_thread
+            .join()
+            .expect("reservation thread should not panic");
+        assert_eq!(
+            reservation.downcast_ref::<UploadControlError>(),
+            Some(&UploadControlError::UploadGone)
+        );
+        assert!(
+            artifact_upload(&pool, &account_id, &artifact_id)
+                .expect("query raced artifact upload")
+                .is_none(),
+            "reservation must not insert an object after the tombstone commits"
+        );
+
+        let mut conn = pool.get_pg().expect("get Postgres cleanup connection");
+        conn.execute(
+            "DELETE FROM cloud_child_tombstones
+              WHERE account_id = $1 AND child_kind = 'context' AND child_id = $2",
+            &[&account_id, &artifact_id],
+        )
+        .expect("delete Postgres test tombstone");
+        conn.execute(
+            "DELETE FROM cloud_sessions WHERE account_id = $1 AND session_id = $2",
+            &[&account_id, &session_id],
+        )
+        .expect("delete Postgres test session");
+        conn.execute("DELETE FROM accounts WHERE id = $1", &[&account_id])
+            .expect("delete Postgres test account");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_session_lock_blocks_a_racing_audit_reservation() {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = open_postgres_pool(&database_url).expect("open Postgres test pool");
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct_audit_lock_{suffix}");
+        let session_id = format!("session_audit_lock_{suffix}");
+        let email = format!("{account_id}@example.test");
+        {
+            let mut conn = pool.get_pg().expect("get Postgres setup connection");
+            conn.execute(
+                "INSERT INTO accounts (id, email, password_hash) VALUES ($1, $2, 'hash')",
+                &[&account_id, &email],
+            )
+            .expect("insert Postgres test account");
+            conn.execute(
+                "INSERT INTO cloud_sessions (
+                    account_id, session_id, title, status, created_at_ms, updated_at_ms,
+                    last_active_at_ms, metadata_json
+                 ) VALUES ($1, $2, 'Session', 'active', 1, 1, 1, '{}')",
+                &[&account_id, &session_id],
+            )
+            .expect("insert Postgres test session");
+        }
+
+        let hash = sha256_hex("audit payload");
+        let input = NewObjectUpload {
+            account_id: account_id.clone(),
+            object_kind: ObjectKind::SessionAudit,
+            logical_id: format!("{session_id}/bundle"),
+            session_id: Some(session_id.clone()),
+            storage_scope: StorageScope::Audit,
+            object_key: format!("logs/accounts/{account_id}/{session_id}/bundle/{hash}"),
+            size_bytes: 13,
+            sha256: hash,
+            content_type: "application/json".into(),
+            expires_at_ms: DAY_MS + 1_000,
+            metadata_json: serde_json::json!({"bundle_id":"bundle"}),
+            now_ms: 1_000,
+            limits: UploadLimits {
+                max_object_bytes: 100,
+                max_account_bytes: 1_000,
+                max_daily_bytes: 1_000,
+                max_account_objects: 10,
+            },
+        };
+
+        let mut blocker = pool.get_pg().expect("get Postgres blocker connection");
+        let mut blocker_tx = blocker.transaction().expect("begin blocker transaction");
+        lock_session_postgres_tx(&mut blocker_tx, &session_id)
+            .expect("acquire session advisory lock");
+
+        let reservation_pool = pool.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reservation_thread = std::thread::spawn(move || {
+            let _ = result_tx.send(reserve_upload(&reservation_pool, &input));
+        });
+
+        assert!(
+            matches!(
+                result_rx.recv_timeout(Duration::from_millis(300)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "audit reservation completed while its parent session lock was held"
+        );
+
+        blocker_tx
+            .execute(
+                "UPDATE cloud_sessions
+                    SET status = 'deleted', deleted_at_ms = 1050, updated_at_ms = 1050
+                  WHERE account_id = $1 AND session_id = $2",
+                &[&account_id, &session_id],
+            )
+            .expect("tombstone racing parent session");
+        schedule_session_cleanup_postgres_tx(&mut blocker_tx, &account_id, &session_id, 1_050)
+            .expect("schedule racing audit cleanup");
+        blocker_tx
+            .commit()
+            .expect("commit racing session tombstone");
+
+        let reservation = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reservation should finish after session tombstone commit")
+            .expect_err("deleted parent must reject the audit reservation");
+        reservation_thread
+            .join()
+            .expect("reservation thread should not panic");
+        assert_eq!(
+            reservation.downcast_ref::<UploadControlError>(),
+            Some(&UploadControlError::SessionNotOwned)
+        );
+
+        let mut conn = pool.get_pg().expect("get Postgres cleanup connection");
+        let count: i64 = conn
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM object_uploads
+                  WHERE account_id = $1 AND session_id = $2",
+                &[&account_id, &session_id],
+            )
+            .expect("count raced audit uploads")
+            .get(0);
+        assert_eq!(count, 0, "deleted parent must not gain an audit upload");
+        conn.execute(
+            "DELETE FROM cloud_sessions WHERE account_id = $1 AND session_id = $2",
+            &[&account_id, &session_id],
+        )
+        .expect("delete Postgres test session");
+        conn.execute("DELETE FROM accounts WHERE id = $1", &[&account_id])
+            .expect("delete Postgres test account");
     }
 
     #[test]
@@ -2081,6 +2694,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(indexed, ("acct_1".into(), "session_1".into()));
+
+        input.logical_id = "session_1/bundle_2".into();
+        input.object_key = input.object_key.replace("bundle_1", "bundle_2");
+        input.now_ms = 1_200;
+        input.expires_at_ms = input.now_ms + DAY_MS;
+        let pending = reserve_upload(&pool, &input).unwrap();
+        crate::db::sync::tombstone_session(&pool, "acct_1", "session_1").unwrap();
+        let error = mark_upload_ready(&pool, &pending.upload.id, 1_300)
+            .expect_err("an audit upload cannot become ready after its parent is deleted");
+        assert_eq!(
+            error.downcast_ref::<UploadControlError>(),
+            Some(&UploadControlError::UploadGone)
+        );
+        let state: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM object_uploads WHERE id = ?1",
+                params![pending.upload.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "delete_pending");
     }
 
     #[test]

@@ -55,6 +55,7 @@ export interface InflightResponse {
 
 export interface CueResponseChunk {
   response_id: string;
+  source_session_id: string;
   kind?: CueResponseKind;
   partial_text: string;
   finished: boolean;
@@ -79,6 +80,26 @@ export interface CueResponseChunk {
   artifact_type?: string | null;
   artifact_body?: string | null;
   artifact_confidence?: number | null;
+}
+
+export interface ResponseLoadToken {
+  generation: number;
+  sessionId: string;
+}
+
+export function shouldApplyResponseLoad(
+  activeGeneration: number,
+  activeSessionId: string | null,
+  token: ResponseLoadToken,
+): boolean {
+  return activeGeneration === token.generation && activeSessionId === token.sessionId;
+}
+
+export function responseBelongsToSession(
+  activeSessionId: string | null,
+  sourceSessionId: string,
+): boolean {
+  return activeSessionId !== null && activeSessionId === sourceSessionId;
 }
 
 /**

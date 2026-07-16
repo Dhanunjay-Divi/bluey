@@ -1,5 +1,6 @@
-# Build cue-whisper for Windows
-# Requires MSVC or MinGW toolchain
+# Build the development-only Windows local-transcription capability sentinel.
+# Production release workflows intentionally do not package this binary until
+# a pinned whisper.cpp implementation passes the Windows runtime gates.
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Push-Location $scriptDir

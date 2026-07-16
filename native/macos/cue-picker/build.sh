@@ -4,8 +4,31 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
+WORKSPACE_VERSION="$(
+  awk -F'"' '
+    /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+    /^\[/ { in_workspace_package = 0 }
+    in_workspace_package && /^version[[:space:]]*=/ { print $2; exit }
+  ' "$ROOT/Cargo.toml"
+)"
+if [[ -z "$WORKSPACE_VERSION" ]]; then
+  echo "[cue-picker] could not determine workspace version from Cargo.toml" >&2
+  exit 1
+fi
+
+BUNDLE_VERSION="${BLUEY_VERSION:-$WORKSPACE_VERSION}"
+BUNDLE_VERSION="${BUNDLE_VERSION#v}"
+if [[ -n "${BLUEY_VERSION:-}" && "$BUNDLE_VERSION" != "${WORKSPACE_VERSION#v}" ]]; then
+  echo "[cue-picker] BLUEY_VERSION=${BLUEY_VERSION} does not match Cargo.toml version $WORKSPACE_VERSION" >&2
+  exit 1
+fi
+if [[ ! "$BUNDLE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  echo "[cue-picker] bundle version must be a three-component numeric version: $BUNDLE_VERSION" >&2
+  exit 1
+fi
+
 cd "$SCRIPT_DIR"
-swift_args=(-c release)
+swift_args=(-c release --disable-automatic-resolution)
 if [[ -n "${BLUEY_SWIFT_ARCH:-}" ]]; then
   swift_args+=(--arch "$BLUEY_SWIFT_ARCH")
 fi
@@ -20,7 +43,7 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 cp "$BIN" "$APP_DIR/Contents/MacOS/bluey-file-picker-macos"
 chmod +x "$APP_DIR/Contents/MacOS/bluey-file-picker-macos"
-cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
+cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -37,9 +60,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>$BUNDLE_VERSION</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>$BUNDLE_VERSION</string>
   <key>LSBackgroundOnly</key>
   <false/>
   <key>LSUIElement</key>
@@ -49,6 +72,10 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+
+if command -v plutil >/dev/null 2>&1; then
+  plutil -lint "$APP_DIR/Contents/Info.plist" >/dev/null
+fi
 
 for profile in debug release; do
   target_dir="$ROOT/target/$profile"

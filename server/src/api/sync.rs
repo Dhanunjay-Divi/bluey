@@ -76,6 +76,7 @@ pub struct RagQueryResponse {
 #[derive(Debug, Serialize)]
 pub struct ArtifactObjectResponse {
     pub artifact_id: String,
+    pub session_id: String,
     pub object_key: String,
     pub size_bytes: u64,
     pub sha256: String,
@@ -226,6 +227,27 @@ pub async fn upload_artifact_object(
 ) -> Result<Json<ArtifactObjectResponse>, (StatusCode, String)> {
     ensure_upload_allowed(&account, "artifact_upload")?;
     validate_object_id(&artifact_id)?;
+    let session_id =
+        if let Some(session_id) = optional_header(&headers, "x-bluey-session-id", "session id")? {
+            session_id
+        } else {
+            // Bluey 0.1.101 uploaded object bytes before its context batch and did
+            // not send the parent header. Keep rolling upgrades safe without
+            // accepting an unbound object: an older client can sync text first,
+            // then its next periodic pass derives the already-authorized parent.
+            // A brand-new legacy object receives a retryable conflict instead of
+            // being staged outside a session/deletion boundary.
+            sync::load_context_artifact(&state.pool, &account.id, &artifact_id)
+                .map_err(internal)?
+                .map(|artifact| artifact.session_id)
+                .ok_or_else(|| {
+                    (
+                        StatusCode::CONFLICT,
+                        "sync artifact metadata before uploading object bytes".to_string(),
+                    )
+                })?
+        };
+    validate_session_id(&session_id)?;
     let storage_config = state.config.object_storage.clone().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -260,7 +282,7 @@ pub async fn upload_artifact_object(
             account_id: account.id.clone(),
             object_kind: ObjectKind::Artifact,
             logical_id: artifact_id.clone(),
-            session_id: None,
+            session_id: Some(session_id.clone()),
             storage_scope: StorageScope::Artifact,
             object_key: key,
             size_bytes: body.len() as i64,
@@ -278,6 +300,7 @@ pub async fn upload_artifact_object(
 
     Ok(Json(ArtifactObjectResponse {
         artifact_id,
+        session_id,
         object_key: upload.object_key,
         size_bytes: upload.size_bytes as u64,
         sha256: upload.sha256,
@@ -475,6 +498,12 @@ fn validate_batch(req: &SyncBatchRequest) -> Result<(), (StatusCode, String)> {
     let mut session_ids = HashSet::new();
     for session in &req.sessions {
         validate_session_id(&session.session_id)?;
+        if session.deleted_at_ms.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "session deletion must use the session DELETE endpoint".to_string(),
+            ));
+        }
         ensure_unique_sync_id(&mut session_ids, &session.session_id, "session")?;
     }
 
@@ -651,6 +680,28 @@ fn validate_audit_bundle_id(bundle_id: &str) -> Result<(), (StatusCode, String)>
             "invalid audit bundle id".to_string(),
         ))
     }
+}
+
+fn optional_header(
+    headers: &HeaderMap,
+    name: &'static str,
+    label: &'static str,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| Some(value.to_string()))
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("missing or invalid {label}"),
+            )
+        })
 }
 
 fn internal(e: anyhow::Error) -> (StatusCode, String) {
@@ -831,7 +882,7 @@ fn upload_error(error: anyhow::Error) -> (StatusCode, String) {
         ),
         UploadControlError::IdempotencyConflict => (
             StatusCode::CONFLICT,
-            "object id is already bound to different content".to_string(),
+            "object id is already bound to different content or parent session".to_string(),
         ),
         UploadControlError::UploadInProgress => (
             StatusCode::CONFLICT,
@@ -966,6 +1017,65 @@ mod tests {
     }
 
     #[test]
+    fn sync_batch_rejects_session_tombstones_in_favor_of_atomic_delete() {
+        let mut session = SyncSessionRecord {
+            session_id: "session-delete".into(),
+            title: "Deleted".into(),
+            status: "deleted".into(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            last_active_at_ms: None,
+            answer_style: None,
+            metadata: serde_json::json!({}),
+            deleted_at_ms: Some(2),
+        };
+        let request = SyncBatchRequest {
+            sessions: vec![session.clone()],
+            transcript_segments: vec![],
+            cue_responses: vec![],
+            context_artifacts: vec![],
+            rag_chunks: vec![],
+        };
+        let error = validate_batch(&request).expect_err("batch tombstone must be rejected");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("DELETE endpoint"));
+
+        session.deleted_at_ms = None;
+        let request = SyncBatchRequest {
+            sessions: vec![session],
+            transcript_segments: vec![],
+            cue_responses: vec![],
+            context_artifacts: vec![],
+            rag_chunks: vec![],
+        };
+        validate_batch(&request).expect("ordinary session sync remains accepted");
+    }
+
+    #[test]
+    fn artifact_upload_accepts_a_valid_wire_session_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            optional_header(&headers, "x-bluey-session-id", "session id").unwrap(),
+            None
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-bluey-session-id",
+            HeaderValue::from_static("session-parent"),
+        );
+        assert_eq!(
+            optional_header(&headers, "x-bluey-session-id", "session id").unwrap(),
+            Some("session-parent".to_string())
+        );
+
+        headers.insert("x-bluey-session-id", HeaderValue::from_static("   "));
+        let error = optional_header(&headers, "x-bluey-session-id", "session id")
+            .expect_err("a present but blank parent must fail closed");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn billing_restricted_account_cannot_use_sync_compute_surfaces() {
         assert!(ensure_sync_usage_allowed(&test_account(false), "rag_query").is_ok());
         let err = ensure_sync_usage_allowed(&test_account(true), "rag_query").unwrap_err();
@@ -1022,6 +1132,7 @@ mod tests {
             artifact_type: None,
             artifact_body: None,
             artifact_confidence: None,
+            deleted_at_ms: None,
             metadata: serde_json::json!({}),
         };
         let mut conflicting = response.clone();
@@ -1059,6 +1170,7 @@ mod tests {
             artifact_type: Some("code".into()),
             artifact_body: Some("fn main() {}".into()),
             artifact_confidence: Some(0.9),
+            deleted_at_ms: None,
             metadata: serde_json::json!({
                 "attachment_ids": ["stable-attachment"],
                 "canvas_artifact_id": "stable-canvas"

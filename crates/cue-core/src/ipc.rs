@@ -8,6 +8,30 @@ use crate::{
 
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:57321";
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonSessionRecord {
+    pub id: uuid::Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_account_id: Option<String>,
+    pub title: String,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonSessionLifecycle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed: Option<DaemonSessionRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<DaemonSessionRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<DaemonSessionRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_id: Option<uuid::Uuid>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
@@ -44,6 +68,24 @@ pub enum DaemonRequest {
         title: Option<String>,
     },
     MeetingEnd,
+    SessionCreate {
+        title: Option<String>,
+    },
+    SessionActivate {
+        id: uuid::Uuid,
+    },
+    SessionContinue,
+    SessionDeactivate,
+    SessionRename {
+        id: uuid::Uuid,
+        title: String,
+    },
+    SessionArchive {
+        id: uuid::Uuid,
+    },
+    SessionDelete {
+        id: uuid::Uuid,
+    },
     TranscriptAdd {
         speaker: Speaker,
         text: String,
@@ -66,6 +108,7 @@ pub enum DaemonRequest {
         interval_secs: Option<u64>,
     },
     ScreenCaptureStop,
+    MeetingDetectionSettingsReload,
     InstructionsSet {
         text: String,
     },
@@ -163,6 +206,9 @@ pub enum DaemonResponse {
     CloudStatus {
         status: CloudSyncStatus,
     },
+    SessionLifecycle {
+        lifecycle: DaemonSessionLifecycle,
+    },
     IpcAuthError {
         code: crate::ipc_auth::IpcAuthErrorCode,
     },
@@ -202,5 +248,34 @@ mod tests {
     #[test]
     fn shutdown_is_detected_inside_trace_envelope() {
         assert!(DaemonRequest::Shutdown.with_trace_id("trace").is_shutdown());
+    }
+
+    #[test]
+    fn session_lifecycle_round_trips_exact_ids_and_owner() {
+        let id = uuid::Uuid::new_v4();
+        let lifecycle = DaemonSessionLifecycle {
+            changed: Some(DaemonSessionRecord {
+                id,
+                owner_account_id: Some("account-a".to_string()),
+                title: "Canonical".to_string(),
+                started_at: "1000".to_string(),
+                ended_at: None,
+                active: true,
+            }),
+            replaced: None,
+            deleted: None,
+            active_session_id: Some(id),
+        };
+        let json = serde_json::to_string(&DaemonResponse::SessionLifecycle {
+            lifecycle: lifecycle.clone(),
+        })
+        .expect("serialize lifecycle");
+        let decoded: DaemonResponse = serde_json::from_str(&json).expect("decode lifecycle");
+        match decoded {
+            DaemonResponse::SessionLifecycle { lifecycle: decoded } => {
+                assert_eq!(decoded, lifecycle)
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 }

@@ -86,18 +86,29 @@ export function SettingsView({
   const [deletingAnswer, setDeletingAnswer] = useState<AnswerMemory | null>(null);
   const [saved, setSaved] = useState("");
   const [localError, setLocalError] = useState("");
+  const [savingSearch, setSavingSearch] = useState(false);
 
   const saveSearchSettings = async () => {
-    await Promise.all([onSavePreferences(preferences), onSaveProfile(profile)]);
-    setSaved("Search and automation defaults saved.");
-    window.setTimeout(() => setSaved(""), 2600);
+    if (savingSearch) return;
+    setSavingSearch(true);
+    setLocalError("");
+    setSaved("");
+    try {
+      await Promise.all([onSavePreferences(preferences), onSaveProfile(profile)]);
+      setSaved("Search and automation defaults saved.");
+      window.setTimeout(() => setSaved(""), 2600);
+    } catch (requestError) {
+      setLocalError(errorMessage(requestError));
+    } finally {
+      setSavingSearch(false);
+    }
   };
 
   return (
     <div className="view-shell settings-view">
       <section className="view-heading">
         <div><p className="eyebrow">JOBS PREFERENCES</p><h1>Settings</h1><span>Career Tracks, application emails, inboxes, and plan controls.</span></div>
-        <button className="button primary" onClick={() => void saveSearchSettings()}>Save changes</button>
+        <button className="button primary" disabled={savingSearch} onClick={() => void saveSearchSettings()}>{savingSearch ? "Saving..." : "Save changes"}</button>
       </section>
       {saved && <div className="global-message success"><Check size={16} />{saved}</div>}
       {localError && <div className="global-message error">{localError}</div>}
@@ -288,10 +299,10 @@ export function SettingsView({
         </div>
         <div className="dialog-actions"><button className="button secondary" onClick={() => setConnecting(null)}>Not now</button><a className="button primary" href={`mailto:hello@bluey.sh?subject=${encodeURIComponent(`Bluey Jobs ${connecting ? integrationName(connecting.provider) : "integration"} beta`)}`}>Request beta access<ArrowRight size={15} /></a></div>
       </Dialog>
-      <ConfirmDialog open={Boolean(disconnecting)} title={`Disconnect ${disconnecting ? integrationName(disconnecting.provider) : "integration"}?`} description="Bluey will stop syncing new status updates from this account. Existing application history stays in Jobs." confirmLabel="Disconnect" tone="danger" onClose={() => setDisconnecting(null)} onConfirm={() => { if (disconnecting) void onSaveIntegration({ ...disconnecting, status: "disconnected", account_label: "" }); setDisconnecting(null); }} />
+      <ConfirmDialog open={Boolean(disconnecting)} title={`Disconnect ${disconnecting ? integrationName(disconnecting.provider) : "integration"}?`} description="Bluey will stop syncing new status updates from this account. Existing application history stays in Jobs." confirmLabel="Disconnect" tone="danger" onClose={() => setDisconnecting(null)} onConfirm={() => { const integration = disconnecting; setDisconnecting(null); if (integration) void onSaveIntegration({ ...integration, status: "disconnected", account_label: "" }).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingIdentity)} title={`Remove ${deletingIdentity?.email || "application email"}?`} description="Bluey will keep existing application receipts, but this address will no longer be available for new Career Tracks." confirmLabel="Remove email" tone="danger" onClose={() => setDeletingIdentity(null)} onConfirm={() => { const identity = deletingIdentity; setDeletingIdentity(null); if (identity) void onDeleteIdentity(identity).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(disconnectingMailbox)} title={`${disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} ${disconnectingMailbox?.account_label || "inbox"}?`} description="Bluey will stop reading new application updates from this inbox. Existing application history stays in Jobs." confirmLabel={disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} tone="danger" onClose={() => setDisconnectingMailbox(null)} onConfirm={() => { const connection = disconnectingMailbox; setDisconnectingMailbox(null); if (connection) void onDeleteMailbox(connection).catch(showError(setLocalError)); }} />
-      <ConfirmDialog open={Boolean(deletingTrack)} title={`Delete ${deletingTrack?.name || "Career Track"}?`} description="This stops discovery for the track. Existing matches and applications stay in your history." confirmLabel="Delete track" tone="danger" onClose={() => setDeletingTrack(null)} onConfirm={() => { const track = deletingTrack; setDeletingTrack(null); if (track) void onDeleteTrack(track); }} />
+      <ConfirmDialog open={Boolean(deletingTrack)} title={`Delete ${deletingTrack?.name || "Career Track"}?`} description="This stops discovery for the track. Existing matches and applications stay in your history." confirmLabel="Delete track" tone="danger" onClose={() => setDeletingTrack(null)} onConfirm={() => { const track = deletingTrack; setDeletingTrack(null); if (track) void onDeleteTrack(track).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingAnswer)} title="Remove this saved answer?" description="Bluey will ask again the next time this question appears. Existing application receipts stay unchanged." confirmLabel="Remove answer" tone="danger" onClose={() => setDeletingAnswer(null)} onConfirm={() => { const answer = deletingAnswer; setDeletingAnswer(null); if (answer) void onDeleteAnswerMemory(answer).catch(showError(setLocalError)); }} />
     </div>
   );
@@ -300,15 +311,20 @@ export function SettingsView({
 function AnswerMemoryDialog({ open, answer, tracks, onClose, onSave }: { open: boolean; answer: AnswerMemory | null; tracks: CareerTrack[]; onClose(): void; onSave(answer: AnswerMemory): Promise<void> }) {
   const [value, setValue] = useState<AnswerMemory>(() => emptyAnswerMemory());
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    if (open) setValue(answer ? { ...answer } : emptyAnswerMemory());
+    if (open) {
+      setValue(answer ? { ...answer } : emptyAnswerMemory());
+      setError("");
+    }
   }, [open, answer]);
 
   const scopeId = value.scope === "track" ? value.scope_id || tracks[0]?.id || "" : value.scope_id || "";
   const save = async () => {
     if (!value.question.trim() || !value.value.trim()) return;
     setSaving(true);
+    setError("");
     try {
       await onSave({
         ...value,
@@ -316,6 +332,8 @@ function AnswerMemoryDialog({ open, answer, tracks, onClose, onSave }: { open: b
         scope_id: value.scope === "account" ? undefined : value.scope === "company" ? normalizeCompanyKey(scopeId) : scopeId,
         confirmed: true,
       });
+    } catch (requestError) {
+      setError(errorMessage(requestError));
     } finally {
       setSaving(false);
     }
@@ -328,6 +346,7 @@ function AnswerMemoryDialog({ open, answer, tracks, onClose, onSave }: { open: b
       <label><span>Reuse for</span><select value={value.scope} onChange={(event) => setValue({ ...value, scope: event.target.value as AnswerMemory["scope"], scope_id: undefined })}><option value="account">All applications</option>{tracks.length > 0 && <option value="track">One Career Track</option>}<option value="company">One company</option></select></label>
       {value.scope === "track" && <label><span>Career Track</span><select value={scopeId} onChange={(event) => setValue({ ...value, scope_id: event.target.value })}>{tracks.map((track) => <option value={track.id} key={track.id}>{track.name}</option>)}</select></label>}
       {value.scope === "company" && <label><span>Company</span><input value={scopeId.replace(/-/g, " ")} onChange={(event) => setValue({ ...value, scope_id: event.target.value })} placeholder="Company name" /></label>}
+      {error && <div className="inline-error" role="alert">{error}</div>}
     </div>
     <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !value.question.trim() || !value.value.trim() || (value.scope !== "account" && !scopeId)} onClick={() => void save()}>{saving ? "Saving..." : "Save answer"}</button></div>
   </Dialog>;
@@ -455,12 +474,30 @@ function TrackDialog({ open, track, identities, onClose, onSave, onDelete }: { o
   const defaultIdentityId = identities.find((identity) => identity.is_default && identity.verification_status === "verified")?.id;
   const [draft, setDraft] = useState<CareerTrack>(track || emptyTrack(defaultIdentityId));
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
   useEffect(() => {
-    if (open) setDraft(track || emptyTrack(defaultIdentityId));
+    if (open) {
+      setDraft(track || emptyTrack(defaultIdentityId));
+      setError("");
+    }
   }, [open, track, defaultIdentityId]);
   const current = draft;
   const update = (next: CareerTrack) => setDraft(next);
-  return <Dialog open={open} title={track ? "Edit Career Track" : "New Career Track"} description="Give this agent one role, location policy, and application email." onClose={onClose}><div className="dialog-form"><label><span>Track name</span><input value={current.name} onChange={(event) => update({ ...current, name: event.target.value })} placeholder="Product engineering" /></label><label><span>Target role</span><input value={current.role} onChange={(event) => update({ ...current, role: event.target.value })} placeholder="Senior Product Engineer" /></label><TagInput label="Locations" values={current.locations} onChange={(values) => update({ ...current, locations: values })} /><label><span>Workplace preference</span><select value={current.remote_preference} onChange={(event) => update({ ...current, remote_preference: event.target.value })}><option value="remote_or_hybrid">Remote or hybrid</option><option value="remote_only">Remote only</option><option value="hybrid_ok">Hybrid is fine</option><option value="onsite_ok">On-site is fine</option></select></label><label><span>Application email</span><select value={current.application_identity_id || defaultIdentityId || ""} onChange={(event) => update({ ...current, application_identity_id: event.target.value || undefined })}>{identities.filter((identity) => identity.verification_status === "verified").map((identity) => <option key={identity.id} value={identity.id}>{identity.email}{identity.is_default ? " (default)" : ""}</option>)}</select></label><label className="setting-line simple"><div><b>Agent active</b><span>Paused agents keep history but stop discovery.</span></div><Toggle checked={current.active} onChange={(checked) => update({ ...current, active: checked })} /></label></div><div className="dialog-actions">{track && <button className="button danger subtle" onClick={() => onDelete(track)}><Trash2 size={15} />Delete</button>}<span /><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !current.name || !current.role || !(current.application_identity_id || defaultIdentityId)} onClick={() => { setSaving(true); void onSave({ ...current, application_identity_id: current.application_identity_id || defaultIdentityId }).finally(() => setSaving(false)); }}>{saving ? "Saving..." : "Save track"}</button></div></Dialog>;
+  const save = async () => {
+    setSaving(true);
+    setError("");
+    try {
+      await onSave({
+        ...current,
+        application_identity_id: current.application_identity_id || defaultIdentityId,
+      });
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <Dialog open={open} title={track ? "Edit Career Track" : "New Career Track"} description="Give this agent one role, location policy, and application email." onClose={onClose}><div className="dialog-form"><label><span>Track name</span><input value={current.name} onChange={(event) => update({ ...current, name: event.target.value })} placeholder="Product engineering" /></label><label><span>Target role</span><input value={current.role} onChange={(event) => update({ ...current, role: event.target.value })} placeholder="Senior Product Engineer" /></label><TagInput label="Locations" values={current.locations} onChange={(values) => update({ ...current, locations: values })} /><label><span>Workplace preference</span><select value={current.remote_preference} onChange={(event) => update({ ...current, remote_preference: event.target.value })}><option value="remote_or_hybrid">Remote or hybrid</option><option value="remote_only">Remote only</option><option value="hybrid_ok">Hybrid is fine</option><option value="onsite_ok">On-site is fine</option></select></label><label><span>Application email</span><select value={current.application_identity_id || defaultIdentityId || ""} onChange={(event) => update({ ...current, application_identity_id: event.target.value || undefined })}>{identities.filter((identity) => identity.verification_status === "verified").map((identity) => <option key={identity.id} value={identity.id}>{identity.email}{identity.is_default ? " (default)" : ""}</option>)}</select></label><label className="setting-line simple"><div><b>Agent active</b><span>Paused agents keep history but stop discovery.</span></div><Toggle checked={current.active} onChange={(checked) => update({ ...current, active: checked })} /></label>{error && <div className="inline-error" role="alert">{error}</div>}</div><div className="dialog-actions">{track && <button className="button danger subtle" onClick={() => onDelete(track)}><Trash2 size={15} />Delete</button>}<span /><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !current.name || !current.role || !(current.application_identity_id || defaultIdentityId)} onClick={() => void save()}>{saving ? "Saving..." : "Save track"}</button></div></Dialog>;
 }
 
 function TagInput({ label, values, onChange }: { label: string; values: string[]; onChange(values: string[]): void }) {

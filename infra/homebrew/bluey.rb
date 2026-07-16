@@ -5,7 +5,8 @@ class Bluey < Formula
   license "UNLICENSED"
 
   # Artifact naming: bluey-{version}-{os}-{arch}.tar.gz
-  # Archive layout: bin/bluey, bin/bluey-daemon (+ optional .app bundle at top level)
+  # Archive layout: terminal CLI, daemon, and trusted native helpers under bin/.
+  # The development dashboard is intentionally not distributed.
   # Keep in sync with: .github/workflows/release.yml, Makefile,
   #                     infra/scoop/bluey.json, INSTALL.md
   on_macos do
@@ -20,17 +21,7 @@ class Bluey < Formula
   end
 
   def install
-    bin.install "bin/bluey-daemon"
-    bin.install "bin/bluey"
-    # Install dashboard app bundle if present
-    if File.directory?("Bluey.app")
-      prefix.install "Bluey.app"
-      (bin/"bluey-dashboard").write <<~SH
-        #!/bin/sh
-        open "#{prefix}/Bluey.app"
-      SH
-      (bin/"bluey-dashboard").chmod 0755
-    end
+    bin.install Dir["bin/*"].select { |path| File.file?(path) }
   end
 
   def caveats
@@ -42,11 +33,8 @@ class Bluey < Formula
 
       Grant these in System Settings → Privacy & Security.
 
-      Start the daemon:
-        bluey-daemon &
-
-      Open the dashboard:
-        bluey-dashboard
+      Start Bluey:
+        bluey on
     EOS
   end
 

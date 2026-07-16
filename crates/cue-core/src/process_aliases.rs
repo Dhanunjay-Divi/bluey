@@ -21,6 +21,9 @@ pub const WINDOWS_AUDIO_HELPER_NAMES: &[&str] = &[
     "cue-audio.exe",
 ];
 
+pub const WINDOWS_CAPTURE_HELPER_NAMES: &[&str] =
+    &["screen-driver.exe", "bluey-capture.exe", "cue-capture.exe"];
+
 pub const MACOS_HOST_OVERLAY_BINARY_NAMES: &[&str] = &["hostovb", "host-overlay"];
 
 pub const MACOS_OVERLAY_BINARY_NAMES: &[&str] = &[
@@ -84,6 +87,10 @@ mod tests {
         assert_eq!(DAEMON_EXECUTABLE_STEMS.first(), Some(&"termb"));
         assert_eq!(MACOS_AUDIO_HELPER_NAMES.first(), Some(&"adriverb"));
         assert_eq!(WINDOWS_AUDIO_HELPER_NAMES.first(), Some(&"adriverb.exe"));
+        assert_eq!(
+            WINDOWS_CAPTURE_HELPER_NAMES.first(),
+            Some(&"screen-driver.exe")
+        );
         assert_eq!(MACOS_OVERLAY_BINARY_NAMES.first(), Some(&"hostovb"));
         assert_eq!(WINDOWS_OVERLAY_BINARY_NAMES.first(), Some(&"hostovb.exe"));
     }

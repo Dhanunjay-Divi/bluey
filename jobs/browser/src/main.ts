@@ -10,6 +10,7 @@ import {
   createApplicationReceipt,
   executeApplication,
   materializeApplicationDocuments,
+  restartDisposition,
   submissionPolicy,
   type ApplicationPacket,
   type EvidenceObjectUpload,
@@ -37,6 +38,10 @@ import {
   type LocalRunCapabilities,
   type LocalRunCapabilityOperation,
 } from "./local-capabilities.js";
+import {
+  LocalCheckpointStore,
+  type LocalRunCheckpoint,
+} from "./local-checkpoint-store.js";
 import { identityContextKey, identityProfileDirectory } from "./profile.js";
 import {
   isApprovedLocalResumeAction,
@@ -69,12 +74,15 @@ interface ActiveLocalRun {
   delivery: LocalRunDelivery;
   page: Page;
   runDirectory: string;
+  checkpointScope: string;
+  checkpointCreatedAtMs: number;
   providerFinalReview?: LocalProviderFinalReview;
   approvedSubmitActionConsumed?: boolean;
   events: Array<{ event: string; details: Record<string, unknown>; at: string }>;
 }
 
 let window: BrowserWindow | null = null;
+let checkpointStore: LocalCheckpointStore | undefined;
 const contexts = new Map<string, BrowserContext>();
 const activeLocalRuns = new Map<string, ActiveLocalRun>();
 const pendingProtocolUrls: string[] = [];
@@ -98,6 +106,7 @@ if (!singleInstance) {
 }
 
 app.whenReady().then(async () => {
+  checkpointStore = await LocalCheckpointStore.open(app.getPath("userData"));
   window = new BrowserWindow({
     width: 520,
     height: 420,
@@ -123,7 +132,11 @@ app.whenReady().then(async () => {
   window.once("ready-to-show", () => window?.show());
   await window.loadURL(statusPage());
   app.on("activate", showWindow);
+  await reconcileLocalRunCheckpoints();
   for (const url of pendingProtocolUrls.splice(0)) void openProtocolUrl(url);
+}).catch(() => {
+  console.error("Bluey Browser startup failed", { code: "checkpoint_reconciliation_failed" });
+  app.quit();
 });
 
 async function executeLocalRequest(
@@ -150,13 +163,6 @@ async function executeLocalRequest(
   if (!resume && await finalSubmitMarkerExists(runDirectory)) {
     throw new LocalBrowserError("submit_outcome_unknown");
   }
-  const documents = await materializeApplicationDocuments({
-    ...request.packet,
-    applicationIdentityId: request.applicationIdentityId,
-    browserProfileId: request.browserProfileId
-      || identityContextKey(request.accountId, request.applicationIdentityId),
-  }, join(runDirectory, "documents"));
-  request.packet = documents.packet;
   const active = activeLocalRuns.get(request.runId);
   if (resume && !active) throw new LocalBrowserError("run_not_active");
   if (!active && [...activeLocalRuns.values()].some((run) => (
@@ -164,16 +170,61 @@ async function executeLocalRequest(
   ))) {
     throw new LocalBrowserError("identity_busy");
   }
+  const checkpointCreatedAtMs = active?.checkpointCreatedAtMs ?? Date.now();
+  const checkpointScope = active?.checkpointScope ?? requiredCheckpointStore().scopeFor(request);
+  if (!resume) {
+    await writeLocalCheckpoint({
+      request,
+      delivery,
+      checkpointScope,
+      checkpointCreatedAtMs,
+      phase: "prepared",
+      status: "prepared",
+      browserUrl: request.url,
+    });
+  }
+  const documents = await materializeApplicationDocuments({
+    ...request.packet,
+    applicationIdentityId: request.applicationIdentityId,
+    browserProfileId: request.browserProfileId
+      || identityContextKey(request.accountId, request.applicationIdentityId),
+  }, join(runDirectory, "documents"));
+  request.packet = documents.packet;
   const context = await contextFor(request.accountId, request.applicationIdentityId);
   const page = active?.page ?? await context.newPage();
   const events = active?.events ?? [];
   if (!active) {
-    activeLocalRuns.set(request.runId, { request, delivery, page, runDirectory, events });
+    activeLocalRuns.set(request.runId, {
+      request,
+      delivery,
+      page,
+      runDirectory,
+      checkpointScope,
+      checkpointCreatedAtMs,
+      events,
+    });
   }
   if (!resume) await page.goto(request.url, { waitUntil: "domcontentloaded", timeout: 45_000 });
   await page.bringToFront();
+  await checkpointActiveLocalRun(request.runId, "prepared", "prepared");
   const browserPage = new PlaywrightBrowserPage(page);
-  const finalSubmitHooks = durableFinalSubmitHooks(runDirectory);
+  const durableHooks = durableFinalSubmitHooks(runDirectory);
+  const finalSubmitHooks = {
+    async beforeFinalSubmit() {
+      // The exclusive marker is written first. A crash before the encrypted
+      // checkpoint update still fails closed during startup reconciliation.
+      await durableHooks.beforeFinalSubmit();
+      await checkpointActiveLocalRun(request.runId, "final_submit_started", "side_effect_unknown");
+    },
+    async afterFinalSubmit(outcome: "activated" | "activation_uncertain") {
+      await durableHooks.afterFinalSubmit(outcome);
+      await checkpointActiveLocalRun(
+        request.runId,
+        outcome === "activated" ? "final_submit_activated" : "side_effect_unknown",
+        "side_effect_unknown",
+      );
+    },
+  };
   let execution: ExecutionResult | undefined;
   let approvedProviderReview: LocalProviderFinalReview | undefined;
   if (resume && active?.providerFinalReview) {
@@ -193,9 +244,12 @@ async function executeLocalRequest(
     if (!execution && await finalSubmitMarkerExists(runDirectory)) {
       throw new LocalBrowserError("submit_outcome_unknown");
     }
-    if (!active.approvedSubmitActionConsumed) {
+    if (!execution && !active.approvedSubmitActionConsumed) {
       const approved = await consumeApprovedLocalSubmitAction(request.runId, delivery);
-      if (approved) active.approvedSubmitActionConsumed = true;
+      if (approved) {
+        active.approvedSubmitActionConsumed = true;
+        await checkpointActiveLocalRun(request.runId, "provider_review", "provider_review");
+      }
       if (!approved) {
         const pending = pendingProviderReviewReceipt();
         pending.intervention!.takeoverUrl = localResumeUrl(request.runId, delivery);
@@ -248,6 +302,12 @@ async function executeLocalRequest(
   if (providerReview) {
     const current = activeLocalRuns.get(request.runId);
     if (current) current.providerFinalReview = providerReview;
+    await checkpointActiveLocalRun(
+      request.runId,
+      "provider_review",
+      "provider_review",
+      execution.adapter,
+    );
   }
   const markerExists = await finalSubmitMarkerExists(runDirectory);
   if (execution.receipt.status === "submitted" && !markerExists) {
@@ -261,6 +321,14 @@ async function executeLocalRequest(
   }
   if (execution.receipt.status === "needs_input" && execution.receipt.intervention) {
     execution.receipt.intervention.takeoverUrl = localResumeUrl(request.runId, delivery);
+  }
+  if (execution.receipt.status === "needs_input") {
+    await checkpointActiveLocalRun(
+      request.runId,
+      providerReview ? "provider_review" : "needs_input",
+      providerReview ? "provider_review" : "needs_input",
+      execution.adapter,
+    );
   }
   const job = request.job ?? await resolveJob(execution.adapter, browserPage);
   const screenshotPath = join(runDirectory, "final.png");
@@ -342,6 +410,7 @@ async function executeLocalRequest(
   } else {
     activeLocalRuns.delete(request.runId);
     await page.close().catch(() => undefined);
+    await requiredCheckpointStore().remove(checkpointScope);
     await showControllerPage(completedPage(execution.receipt.status));
   }
   return {
@@ -508,7 +577,7 @@ async function openProtocolUrl(rawUrl: string): Promise<void> {
   try {
     const command = parseBlueyJobsProtocol(rawUrl);
     showWindow();
-    if (command.action === "open" || command.action === "takeover") return;
+    if (command.action === "open") return;
     if (command.action === "run") {
       const { runId, ticket } = command;
       await showControllerPage(loadingPage("Opening your application"));
@@ -564,6 +633,13 @@ async function reportLocalFailure(
     active?.runDirectory ?? localRunDirectoryIfValid(request),
     error,
   );
+  if (active && failure.status === "side_effect_unknown") {
+    await checkpointActiveLocalRun(
+      request.runId,
+      "side_effect_unknown",
+      "side_effect_unknown",
+    ).catch(() => undefined);
+  }
   if (!failure.preservePage) {
     activeLocalRuns.delete(request.runId);
     await active?.page.close().catch(() => undefined);
@@ -578,7 +654,7 @@ async function reportLocalFailure(
       }
     : undefined;
   try {
-    await fetch(`${delivery.apiOrigin}/api/jobs/local-runs/${encodeURIComponent(request.runId)}/result`, {
+    const response = await fetch(`${delivery.apiOrigin}/api/jobs/local-runs/${encodeURIComponent(request.runId)}/result`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -591,6 +667,11 @@ async function reportLocalFailure(
         },
       }),
     });
+    if (response.ok && failure.status === "failed") {
+      const checkpointScope = active?.checkpointScope
+        ?? requiredCheckpointStore().scopeFor(request);
+      await requiredCheckpointStore().remove(checkpointScope);
+    }
   } catch {
     // Failure reporting must never fall back to the root claim ticket.
   }
@@ -615,6 +696,187 @@ async function consumeApprovedLocalSubmitAction(
   } catch {
     return false;
   }
+}
+
+function requiredCheckpointStore(): LocalCheckpointStore {
+  if (!checkpointStore) throw new LocalBrowserError("configuration_invalid");
+  return checkpointStore;
+}
+
+async function checkpointActiveLocalRun(
+  runId: string,
+  phase: LocalRunCheckpoint["phase"],
+  status: LocalRunCheckpoint["workflow"]["status"],
+  adapter?: string,
+): Promise<void> {
+  const active = activeLocalRuns.get(runId);
+  if (!active) throw new LocalBrowserError("run_not_active");
+  await writeLocalCheckpoint({
+    request: active.request,
+    delivery: active.delivery,
+    checkpointScope: active.checkpointScope,
+    checkpointCreatedAtMs: active.checkpointCreatedAtMs,
+    phase,
+    status,
+    browserUrl: active.page.url() || active.request.url,
+    adapter,
+    providerFinalReview: active.providerFinalReview,
+  });
+}
+
+async function writeLocalCheckpoint(input: {
+  request: StartRunRequest;
+  delivery: LocalRunDelivery;
+  checkpointScope: string;
+  checkpointCreatedAtMs: number;
+  phase: LocalRunCheckpoint["phase"];
+  status: LocalRunCheckpoint["workflow"]["status"];
+  browserUrl: string;
+  adapter?: string;
+  providerFinalReview?: LocalProviderFinalReview;
+}): Promise<void> {
+  const now = Date.now();
+  const checkpoint: LocalRunCheckpoint<StartRunRequest, LocalProviderFinalReview> = {
+    version: 1,
+    phase: input.phase,
+    createdAtMs: input.checkpointCreatedAtMs,
+    updatedAtMs: now,
+    expiresAtMs: input.delivery.capabilities.expiresAtMs,
+    request: input.request,
+    delivery: input.delivery,
+    browser: { url: input.browserUrl },
+    workflow: {
+      status: input.status,
+      ...(input.adapter ? { adapter: input.adapter } : {}),
+      ...(activeLocalRuns.get(input.request.runId)?.approvedSubmitActionConsumed
+        ? { approvedSubmitActionConsumed: true }
+        : {}),
+    },
+    ...(input.providerFinalReview ? { providerFinalReview: input.providerFinalReview } : {}),
+    events: activeLocalRuns.get(input.request.runId)?.events ?? [],
+  };
+  if (requiredCheckpointStore().scopeFor(input.request) !== input.checkpointScope) {
+    throw new LocalBrowserError("run_request_invalid");
+  }
+  await requiredCheckpointStore().write(checkpoint);
+}
+
+async function reconcileLocalRunCheckpoints(): Promise<void> {
+  const store = requiredCheckpointStore();
+  const checkpoints = await store.list<StartRunRequest, LocalProviderFinalReview>();
+  for (const { scope, checkpoint } of checkpoints) {
+    const runDirectory = localRunDirectoryIfValid(checkpoint.request);
+    let markerExists = true;
+    if (runDirectory) {
+      try {
+        markerExists = await finalSubmitMarkerExists(runDirectory);
+      } catch {
+        // An unreadable marker is itself ambiguous and must fail closed.
+      }
+    }
+    const disposition = restartDisposition(
+      checkpoint.phase,
+      checkpoint.expiresAtMs,
+      Date.now(),
+      markerExists,
+    );
+    if (disposition === "expired") {
+      await store.remove(scope);
+      continue;
+    }
+    if (disposition === "side_effect_unknown") {
+      await store.write({
+        ...checkpoint,
+        phase: "side_effect_unknown",
+        updatedAtMs: Date.now(),
+        workflow: { ...checkpoint.workflow, status: "side_effect_unknown" },
+      });
+      await reportRecoveredUnknown(checkpoint).catch(() => undefined);
+      continue;
+    }
+
+    let recoveryContext: BrowserContext | undefined;
+    try {
+      validateRestartedLocalRequest(checkpoint.request);
+      if ([...activeLocalRuns.values()].some((run) => (
+        run.request.applicationIdentityId === checkpoint.request.applicationIdentityId
+      ))) continue;
+      const context = await contextFor(
+        checkpoint.request.accountId,
+        checkpoint.request.applicationIdentityId,
+      );
+      recoveryContext = context;
+      const requestedUrl = /^https?:\/\//i.test(checkpoint.browser.url)
+        ? checkpoint.browser.url
+        : checkpoint.request.url;
+      await assertPublicApplicationUrl(requestedUrl);
+      const existingPage = context.pages().find((candidate) => /^https?:\/\//i.test(candidate.url()));
+      const page = existingPage ?? context.pages()[0] ?? await context.newPage();
+      if (!/^https?:\/\//i.test(page.url())) {
+        await page.goto(requestedUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+      }
+      activeLocalRuns.set(checkpoint.request.runId, {
+        request: checkpoint.request,
+        delivery: checkpoint.delivery,
+        page,
+        runDirectory: runDirectory!,
+        checkpointScope: scope,
+        checkpointCreatedAtMs: checkpoint.createdAtMs,
+        providerFinalReview: checkpoint.providerFinalReview,
+        approvedSubmitActionConsumed: checkpoint.workflow.approvedSubmitActionConsumed,
+        events: checkpoint.events,
+      });
+      await page.bringToFront();
+      await showControllerPage(interventionPage(
+        "Application recovered",
+        "Bluey restored this safe pre-submit application after the browser restarted.",
+        localResumeUrl(checkpoint.request.runId, checkpoint.delivery),
+      ));
+    } catch {
+      if (recoveryContext && !activeLocalRuns.has(checkpoint.request.runId)) {
+        await recoveryContext.close().catch(() => undefined);
+      }
+      // Keep the encrypted checkpoint for a later safe recovery. Never fall
+      // back to the root claim ticket or execute the application implicitly.
+    }
+  }
+}
+
+function validateRestartedLocalRequest(request: StartRunRequest): void {
+  assertIdentifier(request.accountId, "accountId");
+  assertIdentifier(request.applicationIdentityId, "applicationIdentityId");
+  assertIdentifier(request.runId, "runId");
+  assertIdentifier(request.applicationId, "applicationId");
+  if (request.packet.applicationId !== request.applicationId
+    || (request.packet.applicationIdentityId
+      && request.packet.applicationIdentityId !== request.applicationIdentityId)) {
+    throw new LocalBrowserError("run_request_invalid");
+  }
+}
+
+async function reportRecoveredUnknown(
+  checkpoint: LocalRunCheckpoint<StartRunRequest, LocalProviderFinalReview>,
+): Promise<void> {
+  const response = await fetch(
+    `${checkpoint.delivery.apiOrigin}/api/jobs/local-runs/${encodeURIComponent(checkpoint.request.runId)}/result`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...localRunAuthorization(checkpoint.delivery, "result"),
+        receipt: {
+          status: "side_effect_unknown",
+          errorCode: "submit_outcome_unknown",
+          issues: [{
+            field: "submission",
+            message: "Bluey restarted across the final-submit boundary. This run is held for manual reconciliation and will not submit again automatically.",
+            severity: "blocking",
+          }],
+        },
+      }),
+    },
+  );
+  if (!response.ok) throw new LocalBrowserError("result_delivery_failed");
 }
 
 async function showLocalFailurePage(

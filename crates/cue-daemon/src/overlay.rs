@@ -9,7 +9,7 @@ use cue_core::overlay_ipc::{
     decode_ndjson, encode_ndjson, OverlayEvent, OverlayIpcCommand, OverlayMessage,
 };
 use parking_lot::Mutex;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task::JoinHandle;
@@ -17,6 +17,8 @@ use tokio::task::JoinHandle;
 pub const MAX_RESTART_ATTEMPTS: u32 = 5;
 /// Maximum daemon-to-overlay messages waiting to be written to child stdin.
 pub const OVERLAY_OUTBOUND_CHANNEL_CAPACITY: usize = 64;
+/// Maximum lossless state/final messages waiting behind helper I/O.
+pub const OVERLAY_CONTROL_CHANNEL_CAPACITY: usize = 32;
 /// Maximum privileged overlay commands waiting for the daemon to consume them.
 pub const OVERLAY_COMMAND_CHANNEL_CAPACITY: usize = 32;
 
@@ -260,7 +262,8 @@ impl Shared {
 }
 
 pub struct NativeOverlayHandle {
-    send_tx: Sender<OverlayMessage>,
+    lossy_send_tx: Sender<OverlayMessage>,
+    control_send_tx: Sender<OverlayMessage>,
     recv_rx: Receiver<OverlayIpcCommand>,
     shared: Arc<Shared>,
     _tasks: Vec<JoinHandle<()>>,
@@ -269,16 +272,27 @@ pub struct NativeOverlayHandle {
 impl NativeOverlayHandle {
     pub async fn spawn(opts: OverlaySpawnOptions) -> std::io::Result<Self> {
         let shared = Arc::new(Shared::new());
-        let (send_tx, send_rx) = channel::<OverlayMessage>(OVERLAY_OUTBOUND_CHANNEL_CAPACITY);
+        let (lossy_send_tx, lossy_send_rx) =
+            channel::<OverlayMessage>(OVERLAY_OUTBOUND_CHANNEL_CAPACITY);
+        let (control_send_tx, control_send_rx) =
+            channel::<OverlayMessage>(OVERLAY_CONTROL_CHANNEL_CAPACITY);
         let (recv_tx, recv_rx) = channel::<OverlayIpcCommand>(OVERLAY_COMMAND_CHANNEL_CAPACITY);
 
         shared.set_state(OverlayProcessState::Starting);
         let child = spawn_child(&opts).await?;
         shared.set_state(OverlayProcessState::Running);
 
-        let tasks = wire_child(child, opts, shared.clone(), send_rx, recv_tx);
+        let tasks = wire_child(
+            child,
+            opts,
+            shared.clone(),
+            lossy_send_rx,
+            control_send_rx,
+            recv_tx,
+        );
         Ok(Self {
-            send_tx,
+            lossy_send_tx,
+            control_send_tx,
             recv_rx,
             shared,
             _tasks: tasks,
@@ -286,7 +300,12 @@ impl NativeOverlayHandle {
     }
 
     pub fn send(&self, msg: OverlayMessage) -> Result<(), OverlayMessage> {
-        self.send_tx.try_send(msg).map_err(|e| e.into_inner())
+        let sender = if overlay_message_is_lossy(&msg) {
+            &self.lossy_send_tx
+        } else {
+            &self.control_send_tx
+        };
+        sender.try_send(msg).map_err(|e| e.into_inner())
     }
 
     pub async fn next_command(&mut self) -> Option<OverlayIpcCommand> {
@@ -317,15 +336,21 @@ impl NativeOverlayHandle {
             .shutdown_requested
             .store(true, std::sync::atomic::Ordering::Release);
         self.shared.set_state(OverlayProcessState::ShuttingDown);
-        // Drop send_tx so the supervisor's send_rx.recv() returns None,
+        // Drop both senders so the supervisor receivers return None,
         // which triggers stdin close → child sees EOF → exits cleanly.
-        let (dead_tx, _dead_rx) = channel(1);
-        let _ = std::mem::replace(&mut self.send_tx, dead_tx);
+        let (dead_lossy_tx, _dead_lossy_rx) = channel(1);
+        let (dead_control_tx, _dead_control_rx) = channel(1);
+        let _ = std::mem::replace(&mut self.lossy_send_tx, dead_lossy_tx);
+        let _ = std::mem::replace(&mut self.control_send_tx, dead_control_tx);
         let tasks = std::mem::take(&mut self._tasks);
         for handle in tasks {
             let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         }
     }
+}
+
+fn overlay_message_is_lossy(message: &OverlayMessage) -> bool {
+    matches!(message, OverlayMessage::TranscriptPartial { .. })
 }
 
 impl Drop for NativeOverlayHandle {
@@ -338,10 +363,11 @@ impl Drop for NativeOverlayHandle {
 
 async fn spawn_child(opts: &OverlaySpawnOptions) -> std::io::Result<Child> {
     let mut cmd = Command::new(&opts.executable);
+    apply_minimal_overlay_env(&mut cmd);
     cmd.args(&opts.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     // Item 3: pass session token via env var
     if !opts.session_token.is_empty() {
@@ -350,18 +376,48 @@ async fn spawn_child(opts: &OverlaySpawnOptions) -> std::io::Result<Child> {
     cmd.spawn()
 }
 
+fn apply_minimal_overlay_env(cmd: &mut Command) {
+    #[cfg(target_os = "windows")]
+    const ALLOWLIST: &[&str] = &[
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "ProgramData",
+        "PATH",
+    ];
+    #[cfg(not(target_os = "windows"))]
+    const ALLOWLIST: &[&str] = &[
+        "HOME", "TMPDIR", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME",
+    ];
+
+    let inherited = ALLOWLIST
+        .iter()
+        .filter_map(|key| std::env::var_os(key).map(|value| ((*key).to_string(), value)))
+        .collect::<Vec<_>>();
+    cmd.env_clear();
+    for (key, value) in inherited {
+        cmd.env(key, value);
+    }
+}
+
 fn wire_child(
     initial_child: Child,
     opts: OverlaySpawnOptions,
     shared: Arc<Shared>,
-    send_rx: Receiver<OverlayMessage>,
+    lossy_send_rx: Receiver<OverlayMessage>,
+    control_send_rx: Receiver<OverlayMessage>,
     recv_tx: Sender<OverlayIpcCommand>,
 ) -> Vec<JoinHandle<()>> {
     vec![tokio::spawn(run_supervisor(
         initial_child,
         opts,
         shared,
-        send_rx,
+        lossy_send_rx,
+        control_send_rx,
         recv_tx,
     ))]
 }
@@ -379,14 +435,21 @@ fn validate_token(event: &OverlayEvent, expected: &str) -> bool {
 async fn run_one_child(
     mut child: Child,
     shared: Arc<Shared>,
-    mut send_rx: Receiver<OverlayMessage>,
+    mut lossy_send_rx: Receiver<OverlayMessage>,
+    mut control_send_rx: Receiver<OverlayMessage>,
     recv_tx: Sender<OverlayIpcCommand>,
     carryover_in: Option<OverlayMessage>,
     session_token: &str,
-) -> (Receiver<OverlayMessage>, Option<OverlayMessage>, bool) {
+) -> (
+    Receiver<OverlayMessage>,
+    Receiver<OverlayMessage>,
+    Option<OverlayMessage>,
+    bool,
+) {
     tracing::debug!("run_one_child: starting new generation");
     let mut stdin = child.stdin.take().expect("stdin piped");
     let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take();
 
     let msgs_written = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let msgs_acked = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -404,16 +467,12 @@ async fn run_one_child(
             }
             match lines.next_line().await {
                 Ok(Some(line)) => {
-                    tracing::debug!(line = %line, "reader: got line");
+                    tracing::debug!(line_bytes = line.len(), "reader: got overlay line");
                     msgs_acked_r.fetch_add(1, std::sync::atomic::Ordering::Release);
                     // Try to parse as OverlayEvent (with token) first
                     if let Ok(event) = serde_json::from_str::<OverlayEvent>(&line) {
                         if !validate_token(&event, &token_for_reader) {
-                            tracing::warn!(
-                                expected_prefix =
-                                    &token_for_reader[..8.min(token_for_reader.len())],
-                                "overlay event rejected: token mismatch"
-                            );
+                            tracing::warn!("overlay event rejected: token mismatch");
                             continue;
                         }
                         if recv_tx_reader.send(event.command).await.is_err() {
@@ -429,7 +488,10 @@ async fn run_one_child(
                             }
                         }
                         Ok(_) => {
-                            tracing::warn!(line = %line, "overlay sent message on reverse pipe");
+                            tracing::warn!(
+                                line_bytes = line.len(),
+                                "overlay sent unsupported message on reverse pipe"
+                            );
                         }
                         Err(_) => match serde_json::from_str::<OverlayIpcCommand>(&line) {
                             Ok(cmd) => {
@@ -443,7 +505,11 @@ async fn run_one_child(
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, line = %line, "bad overlay stdout line");
+                                tracing::warn!(
+                                    error = %e,
+                                    line_bytes = line.len(),
+                                    "bad overlay stdout line"
+                                );
                             }
                         },
                     }
@@ -458,6 +524,28 @@ async fn run_one_child(
                 }
             }
         }
+    });
+    let stderr_reader = stderr.map(|mut stderr| {
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 4096];
+            let mut total_bytes = 0u64;
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(read) => total_bytes = total_bytes.saturating_add(read as u64),
+                    Err(error) => {
+                        tracing::warn!(
+                            error_kind = ?error.kind(),
+                            "overlay stderr drain failed"
+                        );
+                        break;
+                    }
+                }
+            }
+            if total_bytes > 0 {
+                tracing::debug!(total_bytes, "overlay emitted redacted stderr diagnostics");
+            }
+        })
     });
 
     // Helper to write one message to stdin.
@@ -480,7 +568,7 @@ async fn run_one_child(
             let _ = reader.await;
             let status = child.wait().await;
             let clean = matches!(&status, Ok(s) if s.success());
-            return (send_rx, carryover_in, clean);
+            return (lossy_send_rx, control_send_rx, carryover_in, clean);
         }
         msgs_written.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
@@ -489,6 +577,8 @@ async fn run_one_child(
     let mut wait_fut = Box::pin(child.wait());
     let mut last_msg: Option<OverlayMessage> = carryover_in;
     let mut write_failed = false;
+    let mut lossy_open = true;
+    let mut control_open = true;
 
     let status = loop {
         if shared.is_shutdown_requested() {
@@ -499,7 +589,7 @@ async fn run_one_child(
         tokio::select! {
             biased;
             s = &mut wait_fut => break s,
-            msg = send_rx.recv() => {
+            msg = control_send_rx.recv(), if control_open => {
                 match msg {
                     Some(m) => {
                         if !write_msg(&mut stdin, &m).await {
@@ -511,12 +601,31 @@ async fn run_one_child(
                         last_msg = Some(m);
                     }
                     None => {
-                        // Channel closed (shutdown). Close stdin so child exits.
-                        drop(stdin);
-                        break (&mut wait_fut).await;
+                        control_open = false;
                     }
                 }
             }
+            msg = lossy_send_rx.recv(), if lossy_open => {
+                match msg {
+                    Some(m) => {
+                        if !write_msg(&mut stdin, &m).await {
+                            last_msg = Some(m);
+                            write_failed = true;
+                            break (&mut wait_fut).await;
+                        }
+                        msgs_written.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        last_msg = Some(m);
+                    }
+                    None => {
+                        lossy_open = false;
+                    }
+                }
+            }
+        }
+        if !lossy_open && !control_open {
+            // Both channels closed (shutdown). Close stdin so child exits.
+            drop(stdin);
+            break (&mut wait_fut).await;
         }
     };
 
@@ -524,6 +633,9 @@ async fn run_one_child(
 
     // Ensure reader task completes.
     let _ = reader.await;
+    if let Some(stderr_reader) = stderr_reader {
+        let _ = stderr_reader.await;
+    }
 
     let written = msgs_written.load(std::sync::atomic::Ordering::Acquire);
     let acked = msgs_acked.load(std::sync::atomic::Ordering::Acquire);
@@ -540,14 +652,15 @@ async fn run_one_child(
         acked = acked,
         "run_one_child: finished"
     );
-    (send_rx, carryover_out, clean_exit)
+    (lossy_send_rx, control_send_rx, carryover_out, clean_exit)
 }
 
 async fn run_supervisor(
     initial_child: Child,
     opts: OverlaySpawnOptions,
     shared: Arc<Shared>,
-    mut send_rx: Receiver<OverlayMessage>,
+    mut lossy_send_rx: Receiver<OverlayMessage>,
+    mut control_send_rx: Receiver<OverlayMessage>,
     recv_tx: Sender<OverlayIpcCommand>,
 ) {
     let mut current_child = initial_child;
@@ -556,16 +669,18 @@ async fn run_supervisor(
     let session_token = opts.session_token.clone();
 
     loop {
-        let (rx_back, carryover_out, clean_exit) = run_one_child(
+        let (lossy_rx_back, control_rx_back, carryover_out, clean_exit) = run_one_child(
             current_child,
             shared.clone(),
-            send_rx,
+            lossy_send_rx,
+            control_send_rx,
             recv_tx.clone(),
             carryover.take(),
             &session_token,
         )
         .await;
-        send_rx = rx_back;
+        lossy_send_rx = lossy_rx_back;
+        control_send_rx = control_rx_back;
         carryover = carryover_out;
 
         if shared.is_shutdown_requested() {
@@ -587,7 +702,10 @@ async fn run_supervisor(
             shared.set_state(OverlayProcessState::Failed);
             // Drain pending messages so senders see backpressure immediately.
             let mut drained: u64 = 0;
-            while send_rx.try_recv().is_ok() {
+            while lossy_send_rx.try_recv().is_ok() {
+                drained += 1;
+            }
+            while control_send_rx.try_recv().is_ok() {
                 drained += 1;
             }
             if drained > 0 {
@@ -655,11 +773,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn outbound_channel_returns_terminal_event_on_overload() {
-        let (send_tx, send_rx) = channel(OVERLAY_OUTBOUND_CHANNEL_CAPACITY);
+    fn partial_saturation_does_not_drop_terminal_event() {
+        let (lossy_send_tx, lossy_send_rx) = channel(OVERLAY_OUTBOUND_CHANNEL_CAPACITY);
+        let (control_send_tx, mut control_send_rx) = channel(OVERLAY_CONTROL_CHANNEL_CAPACITY);
         let (_recv_tx, recv_rx) = channel(1);
         let handle = NativeOverlayHandle {
-            send_tx,
+            lossy_send_tx,
+            control_send_tx,
             recv_rx,
             shared: Arc::new(Shared::new()),
             _tasks: Vec::new(),
@@ -677,8 +797,11 @@ mod tests {
             source: "mic".into(),
             text: "complete".into(),
         };
-        assert_eq!(handle.send(terminal.clone()), Err(terminal));
-        assert_eq!(send_rx.len(), OVERLAY_OUTBOUND_CHANNEL_CAPACITY);
+        handle
+            .send(terminal.clone())
+            .expect("terminal uses a separate lossless lane");
+        assert_eq!(lossy_send_rx.len(), OVERLAY_OUTBOUND_CHANNEL_CAPACITY);
+        assert_eq!(control_send_rx.try_recv().unwrap(), terminal);
     }
 
     #[tokio::test]

@@ -77,4 +77,3 @@ jobs:
         run: |
           Push-Location native/windows/cue-overlay; ./build.ps1; Pop-Location
           Push-Location native/windows/cue-audio; ./build.ps1; Pop-Location
-          Push-Location native/windows/cue-whisper; ./build.ps1; Pop-Location

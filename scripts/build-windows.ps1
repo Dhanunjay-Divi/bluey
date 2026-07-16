@@ -51,6 +51,16 @@ Assert-BuildOutput "Windows overlay" @(
   "native\windows\cue-overlay\build\host-overlay.exe"
 )
 
+Invoke-CheckedCommand "Windows screen capture helper" {
+  powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+    -File native\windows\cue-capture\build.ps1
+}
+Assert-BuildOutput "Windows screen capture helper" @(
+  "native\windows\cue-capture\build\bluey-capture.exe",
+  "native\windows\cue-capture\build\cue-capture.exe",
+  "native\windows\cue-capture\build\screen-driver.exe"
+)
+
 Invoke-CheckedCommand "Windows audio driver" {
   powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
     -File native\windows\cue-audio\build.ps1
@@ -60,14 +70,6 @@ Assert-BuildOutput "Windows audio driver" @(
   "native\windows\cue-audio\build\cue-audio.exe",
   "native\windows\cue-audio\build\adriverb.exe",
   "native\windows\cue-audio\build\audio-driver.exe"
-)
-
-Invoke-CheckedCommand "Windows local speech helper" {
-  powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-    -File native\windows\cue-whisper\build.ps1
-}
-Assert-BuildOutput "Windows local speech helper" @(
-  "native\windows\cue-whisper\cue-whisper.exe"
 )
 
 $Dist = Join-Path $Root "dist\bluey-windows-x64"
@@ -86,12 +88,13 @@ Copy-Item native\windows\cue-overlay\build\bluey-overlay.exe (Join-Path $Dist "b
 Copy-Item native\windows\cue-overlay\build\bluey-overlay.exe (Join-Path $Dist "hostovb.exe")
 Copy-Item native\windows\cue-overlay\build\bluey-overlay.exe (Join-Path $Dist "host-overlay.exe")
 Copy-Item native\windows\cue-overlay\build\cue-overlay.exe (Join-Path $Dist "cue-overlay.exe")
+Copy-Item native\windows\cue-capture\build\bluey-capture.exe (Join-Path $Dist "bluey-capture.exe")
+Copy-Item native\windows\cue-capture\build\cue-capture.exe (Join-Path $Dist "cue-capture.exe")
+Copy-Item native\windows\cue-capture\build\screen-driver.exe (Join-Path $Dist "screen-driver.exe")
 Copy-Item native\windows\cue-audio\build\bluey-audio.exe (Join-Path $Dist "bluey-audio.exe")
 Copy-Item native\windows\cue-audio\build\bluey-audio.exe (Join-Path $Dist "adriverb.exe")
 Copy-Item native\windows\cue-audio\build\bluey-audio.exe (Join-Path $Dist "audio-driver.exe")
 Copy-Item native\windows\cue-audio\build\cue-audio.exe (Join-Path $Dist "cue-audio.exe")
-Copy-Item native\windows\cue-whisper\cue-whisper.exe (Join-Path $Dist "cue-whisper.exe")
-
 $VersionLine = Select-String -Path (Join-Path $Root "Cargo.toml") -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
 if (-not $VersionLine) {
   throw "Could not determine Bluey version from Cargo.toml"

@@ -10,11 +10,11 @@ import { Home } from "./pages/Home";
 import { Search } from "./routes/Search";
 import { LiveTranscript } from "./routes/LiveTranscript";
 import { Responses } from "./routes/Responses";
-import { UpdateToast } from "./components/UpdateToast";
 import { PermissionBanner } from "./components/PermissionBanner";
 import { Onboarding } from "./pages/Onboarding";
 import { Settings } from "./pages/Settings";
 import { InvisibilityToast } from "./components/InvisibilityToast";
+import { Context } from "./pages/Context";
 
 /** Listens for tray "navigate_to" events and routes accordingly. */
 function NavigateListener() {
@@ -115,8 +115,9 @@ function App() {
           <Route index element={<Home />} />
           <Route path="chats" element={<Chats />} />
           <Route path="session/:id" element={<SessionDetail />} />
-          <Route path="prompts" element={<Placeholder name="Prompts" />} />
-          <Route path="shortcuts" element={<Placeholder name="Shortcuts" />} />
+          <Route path="context" element={<Context />} />
+          <Route path="prompts" element={<Placeholder name="Prompt library" />} />
+          <Route path="shortcuts" element={<Settings />} />
           <Route path="settings" element={<Settings />} />
           <Route path="responses" element={<Responses />} />
           <Route path="screenshot" element={<Placeholder name="Screenshot" />} />
@@ -127,7 +128,6 @@ function App() {
         </Route>
       </Routes>
       <InvisibilityToast />
-      <UpdateToast />
     </HashRouter>
     </>
   );

@@ -1,9 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
+#include "../answer_snapshot_recovery.h"
 #include "../ask_event_protocol.h"
 #include "../json_type_extract.h"
+#include "../meeting_banner_protocol.h"
+#include "../meeting_detection_protocol.h"
 #include "../ndjson_stream.h"
 
 #define MAX_CAPTURED_RECORDS 8
@@ -357,6 +361,95 @@ static void test_answer_current_transcript_ask_field(void) {
         &value_len));
 }
 
+static void test_fresh_state_answer_snapshot_contract(void) {
+    static const char snapshot[] =
+        "{\"type\":\"update_card\",\"id\":\"answer-42\","
+        "\"body\":\"Recovered answer\",\"done\":false,"
+        "\"sequence\":7,\"snapshot\":true}";
+    char type[32];
+    char id[80];
+    char *body = NULL;
+    size_t body_len = 0;
+    const char *snapshot_value = NULL;
+    size_t snapshot_len = 0;
+    double sequence = 0.0;
+
+    CHECK(json_extract_type(snapshot, sizeof(snapshot) - 1, type, sizeof(type)));
+    CHECK(strcmp(type, "update_card") == 0);
+    CHECK(json_extract_string(
+        snapshot, sizeof(snapshot) - 1, "id", id, sizeof(id)));
+    CHECK(strcmp(id, "answer-42") == 0);
+    CHECK(json_extract_string_alloc(
+        snapshot, sizeof(snapshot) - 1, "body", &body, &body_len));
+    CHECK(body_len == strlen("Recovered answer"));
+    CHECK(memcmp(body, "Recovered answer", body_len) == 0);
+    CHECK(json_extract_number(
+        snapshot, sizeof(snapshot) - 1, "sequence", &sequence));
+    CHECK(sequence == 7.0);
+    CHECK(json_find_top_level_value(
+        snapshot,
+        sizeof(snapshot) - 1,
+        "snapshot",
+        &snapshot_value,
+        &snapshot_len));
+    CHECK(snapshot_len == 4 && memcmp(snapshot_value, "true", 4) == 0);
+    free(body);
+
+    wchar_t recovered_id[80] = L"";
+    wchar_t recovered_kind[64] = L"system";
+    wchar_t recovered_title[256] = L"Stale title";
+    wchar_t recovered_source[256] = L"stale-provider";
+    int sent_chip_count = 3;
+    int recovery_mode = 2;
+    CHECK(recover_answer_snapshot_state(
+        L"answer-42",
+        recovered_id,
+        80,
+        recovered_kind,
+        64,
+        recovered_title,
+        256,
+        recovered_source,
+        256,
+        &sent_chip_count,
+        &recovery_mode));
+    CHECK(wcscmp(recovered_id, L"answer-42") == 0);
+    CHECK(wcscmp(recovered_kind, L"answer") == 0);
+    CHECK(wcscmp(recovered_title, L"Bluey") == 0);
+    CHECK(wcscmp(recovered_source, L"Bluey answer stream") == 0);
+    CHECK(sent_chip_count == 0);
+    CHECK(recovery_mode == 0);
+}
+
+static void test_meeting_banner_timeout_is_expired_not_dismissed(void) {
+    CHECK(strcmp(bluey_meeting_banner_timeout_action(), "expired") == 0);
+    CHECK(strcmp(bluey_meeting_banner_timeout_action(), "dismiss") != 0);
+}
+
+static void test_meeting_detection_enabled_command_requires_boolean(void) {
+    static const char enabled[] =
+        "{\"type\":\"set_meeting_detection_enabled\",\"enabled\":true}";
+    static const char disabled[] =
+        "{\"type\":\"set_meeting_detection_enabled\",\"enabled\":false}";
+    static const char missing[] =
+        "{\"type\":\"set_meeting_detection_enabled\"}";
+    static const char invalid[] =
+        "{\"type\":\"set_meeting_detection_enabled\",\"enabled\":\"false\"}";
+    bool value = false;
+
+    CHECK(!bluey_meeting_detection_default_enabled());
+    CHECK(bluey_parse_meeting_detection_enabled(
+        enabled, sizeof(enabled) - 1, &value));
+    CHECK(value);
+    CHECK(bluey_parse_meeting_detection_enabled(
+        disabled, sizeof(disabled) - 1, &value));
+    CHECK(!value);
+    CHECK(!bluey_parse_meeting_detection_enabled(
+        missing, sizeof(missing) - 1, &value));
+    CHECK(!bluey_parse_meeting_detection_enabled(
+        invalid, sizeof(invalid) - 1, &value));
+}
+
 int main(void) {
     test_answer_over_2k();
     test_answer_over_8k_fragmented();
@@ -366,6 +459,9 @@ int main(void) {
     test_top_level_context_array_and_nested_decoys();
     test_nested_artifact_and_optional_session_fields();
     test_answer_current_transcript_ask_field();
+    test_fresh_state_answer_snapshot_contract();
+    test_meeting_banner_timeout_is_expired_not_dismissed();
+    test_meeting_detection_enabled_command_requires_boolean();
     puts("overlay protocol tests passed");
     return 0;
 }

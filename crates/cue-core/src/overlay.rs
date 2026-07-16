@@ -46,6 +46,73 @@ pub struct OverlaySessionItem {
     pub is_active: bool,
 }
 
+/// A single, privacy-preserving observation used to decide whether a meeting
+/// is actually in progress. Native helpers report metadata only; recording
+/// never starts until the daemon accepts an explicit/authorized action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeetingEvidence {
+    /// Native source, for example `coreaudio_process` or `wasapi_session`.
+    pub source: String,
+    /// Human-readable host application name.
+    pub app_name: String,
+    /// Stable bundle ID or executable identity.
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_url: Option<String>,
+    #[serde(default)]
+    pub audio_input_active: bool,
+    #[serde(default)]
+    pub audio_output_active: bool,
+    #[serde(default)]
+    pub app_foreground: bool,
+    #[serde(default)]
+    pub browser: bool,
+    #[serde(default)]
+    pub dedicated_meeting_app: bool,
+    pub observed_at_unix_ms: i64,
+}
+
+/// A corroborated meeting candidate produced by the daemon state machine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeetingCandidate {
+    pub candidate_id: String,
+    pub app_name: String,
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Normalized confidence from 0 through 100.
+    pub confidence: u8,
+    /// Stable, machine-readable evidence labels used for audit/debug UI.
+    #[serde(default)]
+    pub provenance: Vec<String>,
+    /// Concise user-facing explanation of why Bluey surfaced the banner.
+    pub reason: String,
+    #[serde(default)]
+    pub browser: bool,
+    pub first_seen_unix_ms: i64,
+    pub last_seen_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingBannerAction {
+    Start,
+    Dismiss,
+    /// The native banner reached its display timeout without user input.
+    /// This is intentionally distinct from a manual dismissal so the detector
+    /// applies only its short re-entry cooldown.
+    Expired,
+    Snooze,
+    Ignore,
+    Settings,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OverlayCommand {
@@ -90,6 +157,22 @@ pub enum OverlayCommand {
         idle_secs: u64,
     },
     AudioAutoStopCountdownCleared,
+    /// Enables or fully suspends native meeting-evidence sampling. Disabling
+    /// this command must also hide any pending native meeting banner.
+    SetMeetingDetectionEnabled {
+        enabled: bool,
+    },
+    ShowMeetingBanner {
+        candidate: MeetingCandidate,
+        #[serde(default = "default_meeting_banner_timeout_secs")]
+        timeout_secs: u64,
+    },
+    HideMeetingBanner {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidate_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     TranscriptPartial {
         source: String,
         text: String,
@@ -111,6 +194,14 @@ pub enum OverlayCommand {
         body: String,
         #[serde(default)]
         done: bool,
+        /// Monotonic per-card presentation sequence. Native overlays reject
+        /// stale non-snapshot updates after reconnect or scheduling jitter.
+        #[serde(default)]
+        sequence: u64,
+        /// A snapshot may replace local presentation state after an overlay
+        /// restart even when its sequence was already observed.
+        #[serde(default)]
+        snapshot: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,6 +276,17 @@ pub enum OverlayEvent {
     CaptureStopRequested,
     RecordingStartRequested,
     RecordingStopRequested,
+    MeetingEvidenceObserved {
+        evidence: MeetingEvidence,
+    },
+    MeetingBannerAction {
+        candidate_id: String,
+        action: MeetingBannerAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
     TranscriptClearRequested,
     SignInRequested,
     CloseRequested,
@@ -202,6 +304,10 @@ pub enum OverlayEvent {
         detail: Option<String>,
     },
     Exited,
+}
+
+const fn default_meeting_banner_timeout_secs() -> u64 {
+    12
 }
 
 #[cfg(test)]
@@ -319,6 +425,113 @@ mod tests {
     }
 
     #[test]
+    fn meeting_evidence_event_roundtrips_without_content_capture() {
+        let event = OverlayEvent::MeetingEvidenceObserved {
+            evidence: MeetingEvidence {
+                source: "coreaudio_process".to_string(),
+                app_name: "Google Chrome".to_string(),
+                app_id: "com.google.Chrome".to_string(),
+                process_id: Some(42),
+                provider: Some("google_meet".to_string()),
+                window_title: Some("Daily sync - Google Meet".to_string()),
+                page_url: None,
+                audio_input_active: true,
+                audio_output_active: true,
+                app_foreground: true,
+                browser: true,
+                dedicated_meeting_app: false,
+                observed_at_unix_ms: 1_700_000_000_000,
+            },
+        };
+
+        let json = serde_json::to_string(&event).expect("serialize meeting evidence");
+        assert!(!json.contains("transcript"));
+        let decoded: OverlayEvent =
+            serde_json::from_str(&json).expect("deserialize meeting evidence");
+        assert!(matches!(
+            decoded,
+            OverlayEvent::MeetingEvidenceObserved {
+                evidence: MeetingEvidence {
+                    browser: true,
+                    audio_input_active: true,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn meeting_banner_command_includes_confidence_and_provenance() {
+        let command = OverlayCommand::ShowMeetingBanner {
+            candidate: MeetingCandidate {
+                candidate_id: "com.google.Chrome:google_meet".to_string(),
+                app_name: "Google Chrome".to_string(),
+                app_id: "com.google.Chrome".to_string(),
+                provider: Some("google_meet".to_string()),
+                confidence: 92,
+                provenance: vec![
+                    "audio_input".to_string(),
+                    "provider_window_title".to_string(),
+                ],
+                reason: "Chrome is using the microphone in a Google Meet window.".to_string(),
+                browser: true,
+                first_seen_unix_ms: 1,
+                last_seen_unix_ms: 2,
+            },
+            timeout_secs: 12,
+        };
+
+        let json = serde_json::to_string(&command).expect("serialize meeting banner");
+        assert!(json.contains(r#""type":"show_meeting_banner""#));
+        assert!(json.contains(r#""confidence":92"#));
+        assert!(json.contains("provider_window_title"));
+    }
+
+    #[test]
+    fn meeting_banner_action_roundtrips() {
+        let event = OverlayEvent::MeetingBannerAction {
+            candidate_id: "us.zoom.xos".to_string(),
+            action: MeetingBannerAction::Snooze,
+            app_id: Some("us.zoom.xos".to_string()),
+            provider: Some("zoom".to_string()),
+        };
+        let json = serde_json::to_string(&event).expect("serialize banner action");
+        assert_eq!(
+            json,
+            r#"{"type":"meeting_banner_action","candidate_id":"us.zoom.xos","action":"snooze","app_id":"us.zoom.xos","provider":"zoom"}"#
+        );
+    }
+
+    #[test]
+    fn meeting_banner_expiration_is_not_serialized_as_manual_dismissal() {
+        let event = OverlayEvent::MeetingBannerAction {
+            candidate_id: "us.zoom.xos".to_string(),
+            action: MeetingBannerAction::Expired,
+            app_id: Some("us.zoom.xos".to_string()),
+            provider: Some("zoom".to_string()),
+        };
+        let json = serde_json::to_string(&event).expect("serialize expired banner action");
+        assert!(json.contains(r#""action":"expired""#));
+        assert!(!json.contains(r#""action":"dismiss""#));
+    }
+
+    #[test]
+    fn meeting_detection_switch_roundtrips() {
+        let command = OverlayCommand::SetMeetingDetectionEnabled { enabled: false };
+        let json = serde_json::to_string(&command).expect("serialize meeting switch");
+        assert_eq!(
+            json,
+            r#"{"type":"set_meeting_detection_enabled","enabled":false}"#
+        );
+        let decoded: OverlayCommand =
+            serde_json::from_str(&json).expect("deserialize meeting switch");
+        assert!(matches!(
+            decoded,
+            OverlayCommand::SetMeetingDetectionEnabled { enabled: false }
+        ));
+    }
+
+    #[test]
     fn set_passthrough_serializes_as_overlay_command() {
         let json = serde_json::to_string(&OverlayCommand::SetPassthrough {
             enabled: true,
@@ -330,6 +543,33 @@ mod tests {
             json,
             r#"{"type":"set_passthrough","enabled":true,"duration_ms":900}"#
         );
+    }
+
+    #[test]
+    fn update_card_carries_monotonic_sequence_and_snapshot_marker() {
+        let id = uuid::Uuid::nil();
+        let command = OverlayCommand::UpdateCard {
+            id,
+            body: "Recovered answer".to_string(),
+            done: false,
+            sequence: 7,
+            snapshot: true,
+            cost_label: None,
+            artifact: None,
+        };
+
+        let json = serde_json::to_string(&command).expect("serialize update card");
+        assert!(json.contains(r#""sequence":7"#));
+        assert!(json.contains(r#""snapshot":true"#));
+        let decoded: OverlayCommand = serde_json::from_str(&json).expect("deserialize update card");
+        assert!(matches!(
+            decoded,
+            OverlayCommand::UpdateCard {
+                sequence: 7,
+                snapshot: true,
+                ..
+            }
+        ));
     }
 
     #[test]

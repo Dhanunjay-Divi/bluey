@@ -44,6 +44,7 @@ export function AppShell({ children, account, workspace, onRefresh, preview }: P
   });
   const [profileOpen, setProfileOpen] = useState(false);
   const profileRef = useRef<HTMLDivElement>(null);
+  const profileButtonRef = useRef<HTMLButtonElement>(null);
   const openInterventions = workspace.interventions.filter((item) => item.status === "open").length;
   const destination = (path: string) => `${path}${preview ? "?preview=1" : ""}`;
 
@@ -56,9 +57,18 @@ export function AppShell({ children, account, workspace, onRefresh, preview }: P
     const close = (event: PointerEvent) => {
       if (!profileRef.current?.contains(event.target as Node)) setProfileOpen(false);
     };
+    const closeWithKeyboard = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || !profileOpen) return;
+      setProfileOpen(false);
+      profileButtonRef.current?.focus();
+    };
     document.addEventListener("pointerdown", close);
-    return () => document.removeEventListener("pointerdown", close);
-  }, []);
+    document.addEventListener("keydown", closeWithKeyboard);
+    return () => {
+      document.removeEventListener("pointerdown", close);
+      document.removeEventListener("keydown", closeWithKeyboard);
+    };
+  }, [profileOpen]);
 
   const signOut = async () => {
     const token = localStorage.getItem("bluey_access_token") || sessionStorage.getItem("bluey_access_token") || "";
@@ -79,6 +89,7 @@ export function AppShell({ children, account, workspace, onRefresh, preview }: P
 
   return (
     <div className="jobs-shell">
+      <a className="jobs-skip-link" href="#jobs-main">Skip to Jobs content</a>
       <header className="app-header">
         <Link className="brand-lockup small" to={destination("/matches")} aria-label="Bluey Jobs home">
           <img className="brand-icon" src={blueyIcon} alt="" />
@@ -98,8 +109,8 @@ export function AppShell({ children, account, workspace, onRefresh, preview }: P
             <WalletCards size={15} />
             <span>{money(account?.balance_cents || 0)}</span>
           </div>
-          <button className="icon-button" title="Refresh Jobs" onClick={onRefresh}><RefreshCw size={17} /></button>
-          <Link className="icon-button notification" title="Intervention inbox" to={destination("/applications")}>
+          <button className="icon-button" title="Refresh Jobs" aria-label="Refresh Jobs" onClick={onRefresh}><RefreshCw aria-hidden="true" size={17} /></button>
+          <Link className="icon-button notification" title="Intervention inbox" aria-label={`${openInterventions} open interventions`} to={destination("/applications")}>
             <Bell size={17} />
             {openInterventions > 0 && <span>{openInterventions}</span>}
           </Link>
@@ -115,9 +126,11 @@ export function AppShell({ children, account, workspace, onRefresh, preview }: P
           </button>
           <div className="profile-control" ref={profileRef}>
             <button
+              ref={profileButtonRef}
               className="profile-button"
               aria-expanded={profileOpen}
               aria-haspopup="menu"
+              aria-label="Open account menu"
               onClick={() => setProfileOpen((open) => !open)}
             >
               <span>{initials(workspace.profile.full_name)}</span>
@@ -142,7 +155,7 @@ export function AppShell({ children, account, workspace, onRefresh, preview }: P
         </div>
       </header>
 
-      <main className="app-main">{children}</main>
+      <main id="jobs-main" tabIndex={-1} className="app-main">{children}</main>
 
       <nav className="mobile-nav" aria-label="Jobs navigation">
         {navItems.map(({ to, label, icon: Icon }) => (

@@ -1,8 +1,27 @@
-import { useEffect, useState, useRef } from "react";
-import { invoke } from "../lib/tauri";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { applyChunk, clearInflight, type CueResponseChunk, type InflightResponse } from "./responseReducer";
-import { LaneBadge } from "./LaneBadge";
+import { useNavigate } from "react-router-dom";
+import {
+  ArrowRight,
+  Check,
+  Clipboard,
+  FileCode2,
+  LoaderCircle,
+  MessageCircle,
+  Radio,
+  Search,
+  Sparkles,
+} from "lucide-react";
+import { invoke } from "../lib/tauri";
+import {
+  applyChunk,
+  clearInflight,
+  responseBelongsToSession,
+  shouldApplyResponseLoad,
+  type CueResponseChunk,
+  type InflightResponse,
+  type ResponseLoadToken,
+} from "./responseReducer";
 
 interface CueResponse {
   id: string;
@@ -23,153 +42,196 @@ interface CueResponse {
   artifact_confidence?: number | null;
 }
 
+interface SessionSwitchedPayload {
+  id: string | null;
+}
+
+type ResponseFilter = "all" | "answer" | "suggestion" | "recap";
+
 export function Responses() {
+  const navigate = useNavigate();
   const [responses, setResponses] = useState<CueResponse[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [inflight, setInflight] = useState<Map<string, InflightResponse>>(new Map());
-  const inflightRef = useRef(inflight);
-  inflightRef.current = inflight;
+  const [filter, setFilter] = useState<ResponseFilter>("all");
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [copyStatus, setCopyStatus] = useState("");
+  const sessionIdRef = useRef<string | null>(null);
+  const selectionGenerationRef = useRef(0);
+  const loadGenerationRef = useRef(0);
+  const loadAbortRef = useRef<AbortController | null>(null);
 
-  useEffect(() => {
-    invoke<string | null>("get_active_session").then((id) => {
-      if (id) {
-        setSessionId(id);
-        invoke<CueResponse[]>("list_responses", { sessionId: id, limit: 50 })
-          .then(setResponses)
-          .catch((e) => console.warn("list_responses failed:", e));
+  const loadSessionResponses = useCallback(async (nextSessionId: string | null) => {
+    loadAbortRef.current?.abort();
+    const controller = new AbortController();
+    loadAbortRef.current = controller;
+    const generation = loadGenerationRef.current + 1;
+    loadGenerationRef.current = generation;
+    sessionIdRef.current = nextSessionId;
+    setSessionId(nextSessionId);
+    setResponses([]);
+    setInflight(new Map());
+    setError("");
+    if (!nextSessionId) {
+      setLoading(false);
+      return;
+    }
+    const token: ResponseLoadToken = { generation, sessionId: nextSessionId };
+    setLoading(true);
+    try {
+      const loaded = await invoke<CueResponse[]>("list_responses", {
+        sessionId: nextSessionId,
+        limit: 100,
+      });
+      if (
+        controller.signal.aborted ||
+        !shouldApplyResponseLoad(loadGenerationRef.current, sessionIdRef.current, token)
+      ) {
+        return;
       }
-    });
+      const accepted = loaded.filter((response) =>
+        responseBelongsToSession(sessionIdRef.current, response.source_session_id),
+      );
+      setResponses((current) => {
+        const merged = new Map(accepted.map((response) => [response.id, response]));
+        for (const response of current) {
+          if (responseBelongsToSession(sessionIdRef.current, response.source_session_id)) {
+            merged.set(response.id, response);
+          }
+        }
+        return Array.from(merged.values()).sort((a, b) => b.ts_ms - a.ts_ms);
+      });
+    } catch (nextError) {
+      if (
+        controller.signal.aborted ||
+        !shouldApplyResponseLoad(loadGenerationRef.current, sessionIdRef.current, token)
+      ) {
+        return;
+      }
+      setError(String(nextError));
+    } finally {
+      if (
+        !controller.signal.aborted &&
+        shouldApplyResponseLoad(loadGenerationRef.current, sessionIdRef.current, token)
+      ) {
+        setLoading(false);
+      }
+    }
   }, []);
 
   useEffect(() => {
-    const unlisten = listen<CueResponse>("cue_response", (event) => {
-      const r = event.payload;
-      // Remove from inflight when final arrives
-      setInflight((prev) => clearInflight(prev, r.id));
-      setResponses((prev) => [r, ...prev]);
+    let disposed = false;
+    let removeListener: (() => void) | null = null;
+    void (async () => {
+      removeListener = await listen<SessionSwitchedPayload>("session:switched", (event) => {
+        selectionGenerationRef.current += 1;
+        void loadSessionResponses(event.payload.id);
+      });
+      if (disposed) {
+        removeListener();
+        return;
+      }
+      const selectionGeneration = selectionGenerationRef.current;
+      try {
+        const activeSessionId = await invoke<string | null>("get_active_session");
+        if (!disposed && selectionGenerationRef.current === selectionGeneration) {
+          await loadSessionResponses(activeSessionId);
+        }
+      } catch (nextError) {
+        if (!disposed && selectionGenerationRef.current === selectionGeneration) {
+          setError(String(nextError));
+          setLoading(false);
+        }
+      }
+    })().catch((nextError) => {
+      if (!disposed) {
+        setError(String(nextError));
+        setLoading(false);
+      }
     });
-    return () => { unlisten.then((fn) => fn()); };
+    return () => {
+      disposed = true;
+      selectionGenerationRef.current += 1;
+      loadGenerationRef.current += 1;
+      loadAbortRef.current?.abort();
+      removeListener?.();
+    };
+  }, [loadSessionResponses]);
+
+  useEffect(() => {
+    const unlisten = listen<CueResponse>("cue_response", (event) => {
+      const response = event.payload;
+      if (!responseBelongsToSession(sessionIdRef.current, response.source_session_id)) return;
+      setInflight((current) => clearInflight(current, response.id));
+      setResponses((current) => [
+        response,
+        ...current.filter((item) => item.id !== response.id),
+      ]);
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
   }, []);
 
   useEffect(() => {
     const unlisten = listen<CueResponseChunk>("cue_response_chunk", (event) => {
-      const chunk = event.payload;
-      setInflight((prev) => applyChunk(prev, chunk));
+      if (
+        !responseBelongsToSession(
+          sessionIdRef.current,
+          event.payload.source_session_id,
+        )
+      ) {
+        return;
+      }
+      setInflight((current) => applyChunk(current, event.payload));
     });
-    return () => { unlisten.then((fn) => fn()); };
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
   }, []);
 
-  const grouped = {
-    answer: responses.filter((r) => r.kind === "answer"),
-    suggestion: responses.filter((r) => r.kind === "suggestion"),
-    recap: responses.filter((r) => r.kind === "recap"),
-  };
-
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text).catch(() => {});
-  };
-
-  const formatTime = (ts: number) => new Date(ts).toLocaleTimeString();
-
-  const formatCents = (cents?: number | null) => {
-    if (cents === null || cents === undefined) return null;
-    return `$${(cents / 100).toFixed(2)}`;
-  };
-
-  const renderCostPill = (r: Pick<CueResponse, "cost_cents" | "balance_cents_after" | "provider" | "model" | "cost_label">) => {
-    if (r.cost_label) {
+  const visibleResponses = useMemo(() => {
+    const normalized = query.trim().toLowerCase();
+    return responses.filter((response) => {
+      if (filter !== "all" && response.kind !== filter) return false;
+      if (!normalized) return true;
       return (
-        <span className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-[11px] font-medium text-cyan-200">
-          {r.cost_label}
-        </span>
+        response.text.toLowerCase().includes(normalized) ||
+        response.source_text?.toLowerCase().includes(normalized)
       );
+    });
+  }, [filter, query, responses]);
+
+  async function copy(text: string) {
+    setCopyStatus("");
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyStatus("Answer copied.");
+    } catch (nextError) {
+      setError(String(nextError));
     }
-    const cost = formatCents(r.cost_cents);
-    if (!cost) return null;
-    const balance = formatCents(r.balance_cents_after);
+  }
+
+  if (!loading && !sessionId) {
     return (
-      <span className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-[11px] font-medium text-cyan-200">
-        {cost}
-        {r.model ? <span className="text-cyan-300/70"> · {r.model}</span> : null}
-        {balance ? <span className="text-cyan-300/70"> · bal {balance}</span> : null}
-      </span>
-    );
-  };
-
-  const renderArtifact = (
-    artifact: Pick<CueResponse, "artifact_type" | "artifact_body" | "artifact_confidence">,
-  ) => {
-    if (!artifact.artifact_type || !artifact.artifact_body) return null;
-    const label = artifact.artifact_type.replace(/_/g, " ");
-    const confidence =
-      artifact.artifact_confidence === null || artifact.artifact_confidence === undefined
-        ? null
-        : `${Math.round(artifact.artifact_confidence * 100)}%`;
-    return (
-      <div className="mt-3 rounded border border-cyan-500/30 bg-black/30 p-3">
-        <div className="mb-2 flex items-center justify-between gap-2">
-          <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-300">
-            {label} canvas
-          </span>
-          {confidence ? <span className="text-[11px] text-zinc-500">{confidence}</span> : null}
+      <div className="mx-auto flex min-h-[60vh] max-w-xl items-center justify-center text-center">
+        <div>
+          <MessageCircle aria-hidden="true" className="mx-auto text-zinc-600" size={34} />
+          <h1 className="mt-4 text-xl font-semibold text-zinc-100">No active session</h1>
+          <p className="mt-2 text-sm leading-6 text-zinc-500">
+            Open or create a session, then use Live or the overlay to ask Bluey.
+          </p>
+          <button
+            type="button"
+            onClick={() => navigate("/")}
+            className="mt-4 inline-flex min-h-10 items-center gap-2 rounded-md bg-cyan-400 px-4 text-sm font-semibold text-zinc-950 hover:bg-cyan-300"
+          >
+            Go home
+            <ArrowRight aria-hidden="true" size={15} />
+          </button>
         </div>
-        <pre className="max-h-64 overflow-auto whitespace-pre-wrap text-xs leading-relaxed text-zinc-200">
-          {artifact.artifact_body}
-        </pre>
-      </div>
-    );
-  };
-
-  const renderCard = (r: CueResponse) => (
-    <div key={r.id} className="rounded border border-zinc-700 bg-zinc-800 p-3 space-y-1">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-zinc-500">{formatTime(r.ts_ms)}</span>
-          {renderCostPill(r)}
-        </div>
-        <button
-          onClick={() => copyToClipboard(r.text)}
-          className="text-xs text-blue-400 hover:text-blue-300"
-        >
-          Copy
-        </button>
-      </div>
-      {r.source_text && (
-        <p className="text-xs text-zinc-500 italic truncate">{r.source_text}</p>
-      )}
-      <p className="text-sm text-zinc-200 whitespace-pre-wrap">{r.text}</p>
-      {renderArtifact(r)}
-    </div>
-  );
-
-  const renderInflightCard = (id: string, data: InflightResponse) => (
-    <div key={`inflight-${id}`} className="rounded border border-blue-600 bg-zinc-800 p-3 space-y-1 animate-pulse">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-blue-400 font-medium">
-            {data.refined ? "Refined" : "Streaming…"}
-          </span>
-          <span className="text-xs text-zinc-500">{data.kind}</span>
-          {renderCostPill(data)}
-        </div>
-        {data.routerMeta ? (
-          <LaneBadge meta={data.routerMeta} refined={data.refined} />
-        ) : null}
-      </div>
-      <p className="text-sm text-zinc-200 whitespace-pre-wrap">
-        {data.text || "⏳"}
-        {!data.done ? (
-          <span className="inline-block w-1 h-4 bg-blue-400 ml-0.5 animate-pulse" />
-        ) : null}
-      </p>
-      {renderArtifact(data)}
-    </div>
-  );
-
-  if (!sessionId) {
-    return (
-      <div className="p-6 text-zinc-400">
-        No active session. Start a meeting to see AI responses.
       </div>
     );
   }
@@ -177,42 +239,218 @@ export function Responses() {
   const inflightEntries = Array.from(inflight.entries());
 
   return (
-    <div className="p-6 space-y-6 overflow-y-auto max-h-[calc(100vh-4rem)]">
-      <h1 className="text-2xl font-bold">AI Responses</h1>
+    <div className="mx-auto max-w-5xl space-y-5">
+      <header className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-300">
+            Current session
+          </p>
+          <h1 className="mt-1 text-3xl font-semibold tracking-tight text-zinc-50">Answers</h1>
+          <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-400">
+            Completed and streaming responses stay together without provider or routing internals.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => navigate("/live")}
+          className="inline-flex min-h-10 items-center gap-2 rounded-md bg-cyan-400 px-4 text-sm font-semibold text-zinc-950 hover:bg-cyan-300"
+        >
+          <Radio aria-hidden="true" size={16} />
+          Open live session
+        </button>
+      </header>
 
-      {inflightEntries.length > 0 && (
-        <section>
-          <h2 className="text-lg font-semibold text-blue-400 mb-2">In Progress</h2>
-          <div className="space-y-2">
-            {inflightEntries.map(([id, data]) => renderInflightCard(id, data))}
+      {error ? (
+        <p role="alert" className="rounded-lg border border-red-500/30 bg-red-950/30 px-4 py-3 text-sm text-red-100">
+          Answers could not be updated: {error}
+        </p>
+      ) : null}
+      {copyStatus ? (
+        <p role="status" className="flex items-center gap-2 text-xs text-emerald-300">
+          <Check aria-hidden="true" size={14} />
+          {copyStatus}
+        </p>
+      ) : null}
+
+      <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
+        <label className="relative">
+          <span className="sr-only">Search answers</span>
+          <Search
+            aria-hidden="true"
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500"
+            size={15}
+          />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            className="min-h-11 w-full rounded-md border border-zinc-800 bg-zinc-900 pl-9 pr-3 text-sm text-zinc-100 outline-none placeholder:text-zinc-600 focus:border-cyan-400"
+            placeholder="Search questions and answers..."
+          />
+        </label>
+        <div className="flex gap-1 overflow-x-auto rounded-md border border-zinc-800 bg-zinc-900 p-1">
+          {(["all", "answer", "suggestion", "recap"] as ResponseFilter[]).map((item) => (
+            <button
+              key={item}
+              type="button"
+              aria-pressed={filter === item}
+              onClick={() => setFilter(item)}
+              className={`min-h-8 whitespace-nowrap rounded px-3 text-xs font-semibold capitalize ${
+                filter === item
+                  ? "bg-cyan-400/10 text-cyan-200"
+                  : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+              }`}
+            >
+              {item}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900 px-5 py-12 text-center text-sm text-zinc-500">
+          Loading saved answers...
+        </div>
+      ) : null}
+
+      {inflightEntries.length > 0 ? (
+        <section aria-labelledby="streaming-answers-title" aria-live="polite">
+          <h2 id="streaming-answers-title" className="mb-2 flex items-center gap-2 text-sm font-semibold text-cyan-200">
+            <LoaderCircle aria-hidden="true" className="animate-spin" size={15} />
+            Answering now
+          </h2>
+          <div className="space-y-3">
+            {inflightEntries.map(([id, response]) => (
+              <InflightCard key={id} response={response} />
+            ))}
           </div>
         </section>
-      )}
+      ) : null}
 
-      {grouped.answer.length > 0 && (
-        <section>
-          <h2 className="text-lg font-semibold text-blue-400 mb-2">Answers</h2>
-          <div className="space-y-2">{grouped.answer.map(renderCard)}</div>
-        </section>
-      )}
+      {!loading && visibleResponses.length > 0 ? (
+        <ol className="space-y-3">
+          {visibleResponses.map((response) => (
+            <li key={response.id}>
+              <ResponseCard response={response} onCopy={copy} />
+            </li>
+          ))}
+        </ol>
+      ) : null}
 
-      {grouped.suggestion.length > 0 && (
-        <section>
-          <h2 className="text-lg font-semibold text-green-400 mb-2">Suggestions</h2>
-          <div className="space-y-2">{grouped.suggestion.map(renderCard)}</div>
-        </section>
-      )}
+      {!loading && responses.length === 0 && inflightEntries.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/50 px-5 py-12 text-center">
+          <Sparkles aria-hidden="true" className="mx-auto text-zinc-600" size={30} />
+          <p className="mt-3 text-sm font-medium text-zinc-200">No answers yet</p>
+          <p className="mt-1 text-xs text-zinc-500">
+            Ask from Live or the overlay. Streaming output and completed answers will appear here.
+          </p>
+        </div>
+      ) : null}
 
-      {grouped.recap.length > 0 && (
-        <section>
-          <h2 className="text-lg font-semibold text-purple-400 mb-2">Recaps</h2>
-          <div className="space-y-2">{grouped.recap.map(renderCard)}</div>
-        </section>
-      )}
-
-      {responses.length === 0 && inflightEntries.length === 0 && (
-        <p className="text-zinc-500">No AI responses yet for this session.</p>
-      )}
+      {!loading && responses.length > 0 && visibleResponses.length === 0 ? (
+        <p className="rounded-xl border border-zinc-800 bg-zinc-900 px-4 py-8 text-center text-sm text-zinc-500">
+          No answers match this search and filter.
+        </p>
+      ) : null}
     </div>
   );
+}
+
+function ResponseCard({
+  response,
+  onCopy,
+}: {
+  response: CueResponse;
+  onCopy: (text: string) => Promise<void>;
+}) {
+  return (
+    <article className="overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900">
+      <header className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 bg-zinc-950/50 px-4 py-3">
+        <span className="flex items-center gap-2">
+          <span className="rounded-full bg-cyan-400/10 px-2.5 py-1 text-[11px] font-semibold capitalize text-cyan-200">
+            {response.kind}
+          </span>
+          <span className="text-xs text-zinc-600">{formatTime(response.ts_ms)}</span>
+          {displayCost(response) ? (
+            <span className="text-[11px] text-zinc-500">{displayCost(response)}</span>
+          ) : null}
+        </span>
+        <button
+          type="button"
+          onClick={() => void onCopy(response.text)}
+          className="inline-flex min-h-8 items-center gap-1.5 rounded-md px-2 text-xs font-semibold text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+        >
+          <Clipboard aria-hidden="true" size={13} />
+          Copy
+        </button>
+      </header>
+      <div className="px-4 py-4">
+        {response.source_text ? (
+          <blockquote className="mb-3 border-l-2 border-zinc-700 pl-3 text-xs leading-5 text-zinc-500">
+            {response.source_text}
+          </blockquote>
+        ) : null}
+        <p className="whitespace-pre-wrap text-sm leading-6 text-zinc-200">{response.text}</p>
+        <Artifact response={response} />
+      </div>
+    </article>
+  );
+}
+
+function InflightCard({ response }: { response: InflightResponse }) {
+  return (
+    <article className="rounded-xl border border-cyan-500/35 bg-cyan-950/10 px-4 py-4">
+      <div className="flex items-center gap-2 text-xs">
+        <span className="font-semibold text-cyan-200">
+          {response.refined ? "Refining answer" : "Streaming answer"}
+        </span>
+        <span className="capitalize text-zinc-500">{response.kind}</span>
+        {displayCost(response) ? <span className="text-zinc-600">{displayCost(response)}</span> : null}
+      </div>
+      <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-zinc-200">
+        {response.text || "Bluey is preparing the first useful words..."}
+        {!response.done ? (
+          <span aria-hidden="true" className="ml-1 inline-block h-4 w-1 animate-pulse bg-cyan-300" />
+        ) : null}
+      </p>
+      <Artifact response={response} />
+    </article>
+  );
+}
+
+function Artifact({
+  response,
+}: {
+  response: Pick<CueResponse, "artifact_type" | "artifact_body">;
+}) {
+  if (!response.artifact_type || !response.artifact_body) return null;
+  return (
+    <div className="mt-4 rounded-lg border border-violet-400/25 bg-violet-400/5 p-3">
+      <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-violet-200">
+        <FileCode2 aria-hidden="true" size={13} />
+        {response.artifact_type.replace(/_/g, " ")} workbench
+      </div>
+      <pre className="max-h-80 overflow-auto whitespace-pre-wrap text-xs leading-5 text-zinc-300">
+        {response.artifact_body}
+      </pre>
+    </div>
+  );
+}
+
+function displayCost(
+  response: Pick<CueResponse, "cost_label" | "cost_cents">,
+): string | null {
+  if (response.cost_label) return response.cost_label;
+  if (response.cost_cents === null || response.cost_cents === undefined) return null;
+  return `$${(response.cost_cents / 100).toFixed(2)}`;
+}
+
+function formatTime(value: number): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Unknown time";
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }

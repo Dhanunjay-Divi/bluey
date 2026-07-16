@@ -1,4 +1,5 @@
 pub mod rag;
+pub(crate) mod rag_queue;
 pub mod search;
 pub mod speakers;
 
@@ -332,6 +333,68 @@ impl Database {
         Ok(())
     }
 
+    pub fn reassign_session_owner(
+        &self,
+        id: Uuid,
+        from_owner_account_id: Option<&str>,
+        to_owner_account_id: Option<&str>,
+    ) -> Result<()> {
+        if from_owner_account_id == to_owner_account_id {
+            return Ok(());
+        }
+        let id = id.to_string();
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let changed = self.conn.execute(
+                "UPDATE sessions SET owner_account_id = ?1, updated_at = ?2 \
+                 WHERE id = ?3 AND owner_account_id IS ?4",
+                params![to_owner_account_id, now_ms(), id, from_owner_account_id],
+            )?;
+            if changed == 0 {
+                let existing: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                let already_target: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM sessions \
+                     WHERE id = ?1 AND owner_account_id IS ?2",
+                    params![id, to_owner_account_id],
+                    |row| row.get(0),
+                )?;
+                if existing > 0 && already_target == 0 {
+                    return Err(anyhow::anyhow!(
+                        "session {id} not found for requested owner scope"
+                    ));
+                }
+            }
+
+            let old_active_key = active_session_state_key(from_owner_account_id);
+            let moved_active = self.conn.execute(
+                "UPDATE app_state SET value = NULL, updated_at = ?1 \
+                 WHERE key = ?2 AND value = ?3",
+                params![now_ms(), old_active_key, id],
+            )?;
+            if moved_active > 0 {
+                self.conn.execute(
+                    "INSERT INTO app_state (key, value, updated_at) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(key) DO UPDATE SET \
+                         value = excluded.value, updated_at = excluded.updated_at",
+                    params![active_session_state_key(to_owner_account_id), id, now_ms()],
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub fn archive_session(&self, id: Uuid) -> Result<()> {
         self.archive_session_for_owner(None, id)
     }
@@ -349,10 +412,27 @@ impl Database {
     }
 
     pub fn delete_session_for_owner(&self, owner_account_id: Option<&str>, id: Uuid) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM sessions WHERE id = ?1 AND owner_account_id IS ?2",
-            params![id.to_string(), owner_account_id],
-        )?;
+        let id = id.to_string();
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            self.conn.execute(
+                "DELETE FROM sessions WHERE id = ?1 AND owner_account_id IS ?2",
+                params![id, owner_account_id],
+            )?;
+            self.conn.execute(
+                "UPDATE app_state SET value = NULL, updated_at = ?1 \
+                 WHERE key = ?2 AND value = ?3",
+                params![now_ms(), active_session_state_key(owner_account_id), id],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -1063,6 +1143,137 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(db.get_session(local.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_session_cascades_history_and_clears_matching_active_pointer() {
+        let db = test_db();
+        let owner = "acct-delete";
+        let session = db
+            .create_session_for_owner(Some(owner), Some("Delete me".into()))
+            .unwrap();
+        db.save_active_session_for_owner(Some(owner), Some(session.id))
+            .unwrap();
+        db.append_turn(
+            session.id,
+            NewTurn {
+                user_message: "question".into(),
+                model_response: "answer".into(),
+                lane: Lane::Solve,
+                provider: "test".into(),
+                model: "test".into(),
+                created_at: 100,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cost_cents: None,
+            },
+        )
+        .unwrap();
+        let session_id = session.id.to_string();
+        db.insert_cue_response(NewCueResponse {
+            id: "delete-response",
+            session_id: &session_id,
+            kind: "answer",
+            text: "answer",
+            source_text: Some("question"),
+            ts_ms: 100,
+            cost_cents: None,
+            balance_cents_after: None,
+            provider: Some("test"),
+            model: Some("test"),
+            input_tokens: None,
+            output_tokens: None,
+            cost_label: None,
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
+        })
+        .unwrap();
+
+        db.delete_session_for_owner(Some(owner), session.id)
+            .unwrap();
+
+        assert!(db
+            .get_session_for_owner(Some(owner), session.id)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .list_turns_for_owner(Some(owner), session.id, None)
+            .unwrap()
+            .is_empty());
+        assert!(db.list_cue_responses(&session_id, 10).unwrap().is_empty());
+        assert_eq!(db.load_active_session_for_owner(Some(owner)).unwrap(), None);
+        assert_eq!(
+            db.get_app_state(&active_session_state_key(Some(owner)))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn reassign_session_owner_preserves_history_and_moves_active_pointer() {
+        let db = test_db();
+        let session = db.create_session(Some("Move me".into())).unwrap();
+        db.save_active_session(Some(session.id)).unwrap();
+        db.append_turn(
+            session.id,
+            NewTurn {
+                user_message: "question".into(),
+                model_response: "answer".into(),
+                lane: Lane::Solve,
+                provider: "test".into(),
+                model: "test".into(),
+                created_at: 100,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cost_cents: None,
+            },
+        )
+        .unwrap();
+        let session_id = session.id.to_string();
+        db.insert_cue_response(NewCueResponse {
+            id: "moved-response",
+            session_id: &session_id,
+            kind: "answer",
+            text: "answer",
+            source_text: Some("question"),
+            ts_ms: 100,
+            cost_cents: None,
+            balance_cents_after: None,
+            provider: Some("test"),
+            model: Some("test"),
+            input_tokens: None,
+            output_tokens: None,
+            cost_label: None,
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
+        })
+        .unwrap();
+
+        db.reassign_session_owner(session.id, None, Some("acct-moved"))
+            .unwrap();
+
+        assert!(db.get_session(session.id).unwrap().is_none());
+        assert!(db
+            .get_session_for_owner(Some("acct-moved"), session.id)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            db.list_turns_for_owner(Some("acct-moved"), session.id, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.list_cue_responses(&session_id, 10).unwrap().len(), 1);
+        assert_eq!(db.load_active_session().unwrap(), None);
+        assert_eq!(
+            db.load_active_session_for_owner(Some("acct-moved"))
+                .unwrap(),
+            Some(session.id)
+        );
     }
 
     #[test]

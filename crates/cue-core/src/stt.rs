@@ -19,11 +19,14 @@
 //! - **Error classification** — providers tag errors so the router knows
 //!   which to retry (network) vs which to surface to the user (auth).
 
+pub mod agreement;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::pcm::{AudioChunk, AudioSource, SampleRate};
+use agreement::TranscriptAgreementUpdate;
 
 /// A transcription event emitted by a running STT session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,6 +69,39 @@ pub struct WordTiming {
     pub start_s: f32,
     pub end_s: f32,
     pub confidence: Option<f32>,
+}
+
+/// Internal sidecar for stability-aware consumers. `event` remains the exact
+/// legacy wire event; agreement metadata is intentionally carried beside it
+/// so existing serialization and downstream matches remain compatible.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StableTranscriptEvent {
+    pub event: TranscriptEvent,
+    pub agreement: Option<TranscriptAgreementUpdate>,
+}
+
+impl StableTranscriptEvent {
+    pub fn legacy(event: TranscriptEvent) -> Self {
+        Self {
+            event,
+            agreement: None,
+        }
+    }
+
+    pub fn with_agreement(event: TranscriptEvent, agreement: TranscriptAgreementUpdate) -> Self {
+        Self {
+            event,
+            agreement: Some(agreement),
+        }
+    }
+
+    pub fn into_legacy(self) -> TranscriptEvent {
+        self.event
+    }
+
+    pub fn is_partial(&self) -> bool {
+        matches!(self.event, TranscriptEvent::Partial { .. })
+    }
 }
 
 /// High-level connection state of an STT session. Dashboard listens on
@@ -180,6 +216,14 @@ pub trait SttProvider: Send + Sync {
     /// the session is closed.
     async fn next_event(&mut self) -> Option<Result<TranscriptEvent, SttError>>;
 
+    /// Stability-aware counterpart to [`SttProvider::next_event`]. Providers
+    /// without local agreement metadata retain the legacy behavior by default.
+    async fn next_stable_event(&mut self) -> Option<Result<StableTranscriptEvent, SttError>> {
+        self.next_event()
+            .await
+            .map(|result| result.map(StableTranscriptEvent::legacy))
+    }
+
     /// Cleanly close the session. Connection goes to `Closed`.
     async fn close(&mut self) -> Result<(), SttError>;
 }
@@ -211,6 +255,10 @@ mod tests {
             source: AudioSource::Microphone,
         };
         let s = serde_json::to_string(&e).unwrap();
+        assert_eq!(
+            s,
+            r#"{"kind":"partial","text":"hello world","confidence":0.82,"source":"microphone"}"#
+        );
         let back: TranscriptEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(e, back);
     }

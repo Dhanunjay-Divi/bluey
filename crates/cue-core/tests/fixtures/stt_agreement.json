@@ -1,0 +1,42 @@
+[
+  {
+    "name": "punctuated_question",
+    "reference": "How would you reduce p95 latency?",
+    "updates": [
+      {"at_ms": 0, "kind": "partial", "text": "How would", "silence_ms": 0, "endpoint_expected": false},
+      {"at_ms": 300, "kind": "partial", "text": "How would you", "silence_ms": 0, "endpoint_expected": false},
+      {"at_ms": 600, "kind": "partial", "text": "How would you reduce p95", "silence_ms": 0, "endpoint_expected": false},
+      {"at_ms": 900, "kind": "partial", "text": "How would you reduce p95 latency?", "silence_ms": 0, "endpoint_expected": false},
+      {"at_ms": 1200, "kind": "partial", "text": "How would you reduce p95 latency?", "silence_ms": 150, "endpoint_expected": false},
+      {"at_ms": 1500, "kind": "partial", "text": "How would you reduce p95 latency?", "silence_ms": 350, "endpoint_expected": false},
+      {"at_ms": 1800, "kind": "partial", "text": "How would you reduce p95 latency?", "silence_ms": 350, "endpoint_expected": true},
+      {"at_ms": 1900, "kind": "final", "text": "How would you reduce p95 latency?", "silence_ms": 0}
+    ]
+  },
+  {
+    "name": "mid_sentence_pause",
+    "reference": "We should measure before changing the model",
+    "updates": [
+      {"at_ms": 0, "kind": "partial", "text": "We should", "silence_ms": 0, "endpoint_expected": false},
+      {"at_ms": 300, "kind": "partial", "text": "We should measure", "silence_ms": 0, "endpoint_expected": false},
+      {"at_ms": 600, "kind": "partial", "text": "We should measure before changing", "silence_ms": 0, "endpoint_expected": false},
+      {"at_ms": 900, "kind": "partial", "text": "We should measure before changing", "silence_ms": 700, "endpoint_expected": false},
+      {"at_ms": 1200, "kind": "partial", "text": "We should measure before changing", "silence_ms": 900, "endpoint_expected": false},
+      {"at_ms": 1500, "kind": "partial", "text": "We should measure before changing", "silence_ms": 1100, "endpoint_expected": true},
+      {"at_ms": 1600, "kind": "final", "text": "We should measure before changing the model", "silence_ms": 0}
+    ]
+  },
+  {
+    "name": "provider_final_correction",
+    "reference": "Please explain idempotency and retry leases",
+    "updates": [
+      {"at_ms": 0, "kind": "partial", "text": "Please explain item potency", "silence_ms": 0, "endpoint_expected": false},
+      {"at_ms": 300, "kind": "partial", "text": "Please explain idempotency and", "silence_ms": 0, "endpoint_expected": false},
+      {"at_ms": 600, "kind": "partial", "text": "Please explain idempotency and", "silence_ms": 0, "endpoint_expected": false},
+      {"at_ms": 900, "kind": "partial", "text": "Please explain idempotency and retry lease", "silence_ms": 0, "endpoint_expected": false},
+      {"at_ms": 1200, "kind": "partial", "text": "Please explain idempotency and retry lease", "silence_ms": 700, "endpoint_expected": false},
+      {"at_ms": 1500, "kind": "partial", "text": "Please explain idempotency and retry lease", "silence_ms": 1100, "endpoint_expected": true},
+      {"at_ms": 1600, "kind": "final", "text": "Please explain idempotency and retry lease", "silence_ms": 0}
+    ]
+  }
+]

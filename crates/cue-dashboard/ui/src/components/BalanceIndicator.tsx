@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "../lib/tauri";
+import { cloudSyncConsentCopy } from "../lib/cloudSyncConsent";
 import { CreditCard } from "lucide-react";
 
 interface BalanceSnapshot {
@@ -95,7 +96,7 @@ function toneForBalance(cents: number, lowBalanceWarning: boolean): "normal" | "
 function tooltip(snapshot: BalanceSnapshot | null, status: string): string {
   if (!snapshot) {
     return status === "signed-out"
-      ? "Bluey account is not signed in. Sign in to use credits and saved-session sync; you can turn sync off in Settings."
+      ? cloudSyncConsentCopy.signedOutBalance
       : "Credits balance unavailable.";
   }
   const threshold = formatCents(snapshot.auto_topup_threshold_cents);

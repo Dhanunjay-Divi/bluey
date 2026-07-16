@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::app_paths::AppPaths;
+use crate::app_paths::{create_private_file_new, AppPaths};
 use crate::clock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,7 +81,7 @@ pub struct CueSettings {
     pub audio_system_enabled: bool,
     pub audio_microphone_enabled: bool,
     pub cloud_sync_enabled: bool,
-    #[serde(default = "legacy_cloud_sync_consent_granted")]
+    #[serde(default)]
     pub cloud_sync_consent_granted: bool,
     pub retention_days: u32,
     pub updated_at: String,
@@ -96,6 +96,67 @@ pub struct CueSettings {
     /// Codex Stage 24: persisted disguise mode (none / activity / terminal / settings).
     #[serde(default = "default_disguise_mode")]
     pub disguise_mode: String,
+    /// Consent-first policy for periodic work-context capture. Starting and
+    /// stopping capture remains an explicit runtime action; these fields only
+    /// constrain what an approved capture session may observe and retain.
+    #[serde(default)]
+    pub context_watch: ContextWatchSettings,
+    /// Meeting applications explicitly ignored from the detection banner.
+    /// This stores process/bundle identities only, never window titles,
+    /// transcripts, URLs, or audio data.
+    #[serde(default = "default_meeting_detection_enabled")]
+    pub meeting_detection_enabled: bool,
+    /// Meeting applications explicitly ignored from the detection banner.
+    /// This stores process/bundle identities only, never window titles,
+    /// transcripts, URLs, or audio data.
+    #[serde(default)]
+    pub meeting_detection_ignored_apps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextWatchSettings {
+    #[serde(default = "default_context_watch_semantic_first")]
+    pub semantic_first: bool,
+    #[serde(default = "default_context_watch_screenshot_fallback")]
+    pub screenshot_fallback: bool,
+    #[serde(default = "default_context_watch_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_context_watch_max_items")]
+    pub max_local_items: usize,
+    #[serde(default)]
+    pub excluded_apps: Vec<String>,
+    #[serde(default)]
+    pub excluded_domains: Vec<String>,
+}
+
+impl Default for ContextWatchSettings {
+    fn default() -> Self {
+        Self {
+            semantic_first: true,
+            screenshot_fallback: default_context_watch_screenshot_fallback(),
+            interval_secs: default_context_watch_interval_secs(),
+            max_local_items: default_context_watch_max_items(),
+            excluded_apps: Vec::new(),
+            excluded_domains: Vec::new(),
+        }
+    }
+}
+
+impl ContextWatchSettings {
+    fn normalize(&mut self) {
+        self.interval_secs = self.interval_secs.clamp(3, 300);
+        self.max_local_items = self.max_local_items.clamp(10, 500);
+        normalize_exclusion_list(&mut self.excluded_apps);
+        normalize_exclusion_list(&mut self.excluded_domains);
+    }
+
+    pub fn excludes_app(&self, app_name_or_id: &str) -> bool {
+        exclusion_matches(&self.excluded_apps, app_name_or_id)
+    }
+
+    pub fn excludes_domain(&self, domain_or_url: &str) -> bool {
+        exclusion_matches(&self.excluded_domains, domain_or_url)
+    }
 }
 
 impl Default for CueSettings {
@@ -114,13 +175,24 @@ impl Default for CueSettings {
             auto_disguise_prompted: false,
             auto_disguise_enabled: false,
             disguise_mode: "none".to_string(),
+            context_watch: ContextWatchSettings::default(),
+            meeting_detection_enabled: default_meeting_detection_enabled(),
+            meeting_detection_ignored_apps: Vec::new(),
         }
     }
 }
 
 impl CueSettings {
+    /// Whether cloud processing is allowed by the persisted user settings.
+    ///
+    /// Callers must require both switches. The operational switch cannot be
+    /// used as a substitute for the user's explicit cloud-processing consent.
+    pub fn cloud_sync_allowed(&self) -> bool {
+        self.cloud_sync_enabled && self.cloud_sync_consent_granted
+    }
+
     fn enforce_consent(&mut self) {
-        if !self.cloud_sync_consent_granted {
+        if !self.cloud_sync_allowed() {
             self.cloud_sync_enabled = false;
         }
     }
@@ -129,8 +201,67 @@ impl CueSettings {
         self.enforce_consent();
         self.overlay_opacity = self.overlay_opacity.clamp(0.18, 1.0);
         self.retention_days = self.retention_days.clamp(1, 3650);
+        self.context_watch.normalize();
+        normalize_exclusion_list(&mut self.meeting_detection_ignored_apps);
         self.updated_at = clock::now_epoch_ms_string();
     }
+}
+
+const fn default_context_watch_semantic_first() -> bool {
+    true
+}
+
+const fn default_context_watch_screenshot_fallback() -> bool {
+    false
+}
+
+const fn default_context_watch_interval_secs() -> u64 {
+    12
+}
+
+const fn default_context_watch_max_items() -> usize {
+    120
+}
+
+const fn default_meeting_detection_enabled() -> bool {
+    true
+}
+
+fn normalize_exclusion_list(values: &mut Vec<String>) {
+    let mut normalized = values
+        .drain(..)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized.truncate(128);
+    *values = normalized;
+}
+
+fn exclusion_matches(exclusions: &[String], candidate: &str) -> bool {
+    let candidate = candidate.trim().to_ascii_lowercase();
+    !candidate.is_empty()
+        && exclusions.iter().any(|excluded| {
+            candidate.match_indices(excluded).any(|(start, matched)| {
+                let end = start + matched.len();
+                let before_is_boundary = start == 0
+                    || candidate[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(is_exclusion_boundary);
+                let after_is_boundary = end == candidate.len()
+                    || candidate[end..]
+                        .chars()
+                        .next()
+                        .is_some_and(is_exclusion_boundary);
+                before_is_boundary && after_is_boundary
+            })
+        })
+}
+
+fn is_exclusion_boundary(value: char) -> bool {
+    matches!(value, '.' | '/' | ':' | ' ' | '@' | '?' | '#' | '\\')
 }
 
 pub fn load_account(paths: &AppPaths) -> Result<Option<AccountConfig>> {
@@ -190,21 +321,27 @@ pub fn load_settings(paths: &AppPaths) -> Result<CueSettings> {
 
 pub fn save_settings(paths: &AppPaths, settings: &CueSettings) -> Result<()> {
     paths.ensure()?;
-    write_private_json(&paths.settings_file, settings)
+    let _lock = lock_private_file(&paths.settings_file)?;
+    write_private_json_atomic(&paths.settings_file, settings)
 }
 
-fn write_private_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
-    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-    }
-
-    Ok(())
+/// Mutate the latest settings snapshot under one cross-process lock and
+/// atomically publish the normalized result.
+///
+/// Prefer this to a separate `load_settings` / `save_settings` pair so a
+/// daemon, dashboard, or CLI process cannot overwrite unrelated fields that
+/// another process saved between the read and write.
+pub fn update_settings<F>(paths: &AppPaths, update: F) -> Result<CueSettings>
+where
+    F: FnOnce(&mut CueSettings),
+{
+    paths.ensure()?;
+    let _lock = lock_private_file(&paths.settings_file)?;
+    let mut settings = load_settings(paths)?;
+    update(&mut settings);
+    settings.touch();
+    write_private_json_atomic(&paths.settings_file, &settings)?;
+    Ok(settings)
 }
 
 fn write_next_account_generation(
@@ -220,7 +357,11 @@ fn write_next_account_generation(
 }
 
 fn lock_account_file(paths: &AppPaths) -> Result<File> {
-    let lock_path = account_lock_path(&paths.account_file);
+    lock_private_file(&paths.account_file)
+}
+
+fn lock_private_file(path: &Path) -> Result<File> {
+    let lock_path = private_lock_path(path);
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -241,8 +382,8 @@ fn lock_account_file(paths: &AppPaths) -> Result<File> {
     Ok(lock)
 }
 
-fn account_lock_path(account_file: &Path) -> PathBuf {
-    let mut path = account_file.as_os_str().to_os_string();
+fn private_lock_path(path: &Path) -> PathBuf {
+    let mut path = path.as_os_str().to_os_string();
     path.push(".lock");
     PathBuf::from(path)
 }
@@ -257,31 +398,21 @@ fn write_private_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()>
     let temp_path = PathBuf::from(temp_path);
 
     let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .with_context(|| format!("failed to create {}", temp_path.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("failed to set permissions on {}", temp_path.display()))?;
-        }
+        let mut file = create_private_file_new(&temp_path)?;
 
         file.write_all(&bytes)
             .with_context(|| format!("failed to write {}", temp_path.display()))?;
         file.sync_all()
             .with_context(|| format!("failed to sync {}", temp_path.display()))?;
         drop(file);
-        fs::rename(&temp_path, path).with_context(|| {
+        atomic_replace_file(&temp_path, path).with_context(|| {
             format!(
                 "failed to replace {} with {}",
                 path.display(),
                 temp_path.display()
             )
         })?;
+        #[cfg(unix)]
         if let Some(parent) = path.parent() {
             File::open(parent)
                 .and_then(|directory| directory.sync_all())
@@ -296,19 +427,53 @@ fn write_private_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()>
     result
 }
 
+#[cfg(unix)]
+fn atomic_replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, path)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let to = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn atomic_replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, path)
+}
+
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
 fn default_disguise_mode() -> String {
     "none".to_string()
-}
-
-// Existing signed-in installs already enabled saved-session sync under the
-// accepted account terms. Missing this newly introduced field must preserve
-// that state; brand-new settings still default to false until sign-in.
-fn legacy_cloud_sync_consent_granted() -> bool {
-    true
 }
 
 #[cfg(test)]
@@ -407,16 +572,87 @@ mod tests {
     }
 
     #[test]
+    fn account_publication_uses_owner_only_file_permissions() {
+        let paths = test_paths("private-account");
+        let mut account = AccountConfig::local();
+        account.provider = "bluey".to_string();
+        account.user_id = "private@example.com".to_string();
+        account.access_token = Some("private-access".to_string());
+        account.refresh_token = Some("private-refresh".to_string());
+
+        save_account(&paths, &account).expect("save account");
+        crate::app_paths::validate_private_file(&paths.account_file)
+            .expect("account file should be owner-only");
+
+        let _ = fs::remove_dir_all(&paths.config_dir);
+    }
+
+    #[test]
     fn default_settings_require_cloud_sync_opt_in() {
         let settings = CueSettings::default();
 
         assert!(!settings.cloud_sync_enabled);
         assert!(!settings.cloud_sync_consent_granted);
         assert_eq!(settings.disguise_mode, "none");
+        assert!(settings.context_watch.semantic_first);
+        assert!(!settings.context_watch.screenshot_fallback);
+        assert_eq!(settings.context_watch.interval_secs, 12);
+        assert!(settings.meeting_detection_enabled);
+        assert!(settings.meeting_detection_ignored_apps.is_empty());
     }
 
     #[test]
-    fn legacy_enabled_sync_without_new_consent_field_stays_on() {
+    fn legacy_settings_keep_meeting_suggestions_enabled_until_user_disables_them() {
+        let mut value = serde_json::to_value(CueSettings::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("meeting_detection_enabled");
+        let legacy: CueSettings = serde_json::from_value(value).unwrap();
+        assert!(legacy.meeting_detection_enabled);
+
+        let mut disabled = CueSettings {
+            meeting_detection_enabled: false,
+            ..CueSettings::default()
+        };
+        disabled.touch();
+        assert!(!disabled.meeting_detection_enabled);
+    }
+
+    #[test]
+    fn context_watch_policy_is_backward_compatible_bounded_and_excludable() {
+        let mut value = serde_json::to_value(CueSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("context_watch");
+        let legacy: CueSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.context_watch, ContextWatchSettings::default());
+
+        let mut settings = CueSettings::default();
+        settings.context_watch.interval_secs = 1;
+        settings.context_watch.max_local_items = usize::MAX;
+        settings.context_watch.excluded_apps = vec![
+            "  com.example.Secret  ".to_string(),
+            "com.example.secret".to_string(),
+        ];
+        settings.context_watch.excluded_domains = vec!["Accounts.Example.com".to_string()];
+        settings.touch();
+
+        assert_eq!(settings.context_watch.interval_secs, 3);
+        assert_eq!(settings.context_watch.max_local_items, 500);
+        assert_eq!(
+            settings.context_watch.excluded_apps,
+            vec!["com.example.secret"]
+        );
+        assert!(settings
+            .context_watch
+            .excludes_app("com.example.secret.helper"));
+        assert!(settings
+            .context_watch
+            .excludes_domain("https://accounts.example.com/private"));
+        assert!(!settings.context_watch.excludes_domain("example.com"));
+    }
+
+    #[test]
+    fn legacy_enabled_sync_without_explicit_consent_fails_closed() {
         let mut value = serde_json::to_value(CueSettings::default()).unwrap();
         value["cloud_sync_enabled"] = serde_json::Value::Bool(true);
         value
@@ -427,8 +663,9 @@ mod tests {
         let mut settings: CueSettings = serde_json::from_value(value).unwrap();
         settings.enforce_consent();
 
-        assert!(settings.cloud_sync_enabled);
-        assert!(settings.cloud_sync_consent_granted);
+        assert!(!settings.cloud_sync_enabled);
+        assert!(!settings.cloud_sync_consent_granted);
+        assert!(!settings.cloud_sync_allowed());
     }
 
     #[test]
@@ -443,5 +680,74 @@ mod tests {
 
         assert!(settings.cloud_sync_enabled);
         assert!(settings.cloud_sync_consent_granted);
+        assert!(settings.cloud_sync_allowed());
+    }
+
+    #[test]
+    fn concurrent_disjoint_settings_updates_preserve_every_field() {
+        use std::sync::{Arc, Barrier};
+
+        let paths = test_paths("concurrent-settings");
+        save_settings(&paths, &CueSettings::default()).unwrap();
+        let paths = Arc::new(paths);
+        let barrier = Arc::new(Barrier::new(4));
+
+        let cloud = {
+            let paths = Arc::clone(&paths);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                update_settings(&paths, |settings| {
+                    settings.cloud_sync_consent_granted = true;
+                    settings.cloud_sync_enabled = true;
+                })
+                .unwrap();
+            })
+        };
+        let context = {
+            let paths = Arc::clone(&paths);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                update_settings(&paths, |settings| {
+                    settings.context_watch.interval_secs = 24;
+                    settings
+                        .context_watch
+                        .excluded_domains
+                        .push("private.example.com".to_string());
+                })
+                .unwrap();
+            })
+        };
+        let meetings = {
+            let paths = Arc::clone(&paths);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                update_settings(&paths, |settings| {
+                    settings
+                        .meeting_detection_ignored_apps
+                        .push("zoom.exe".to_string());
+                })
+                .unwrap();
+            })
+        };
+
+        barrier.wait();
+        cloud.join().unwrap();
+        context.join().unwrap();
+        meetings.join().unwrap();
+
+        let settings = load_settings(&paths).unwrap();
+        assert!(settings.cloud_sync_enabled);
+        assert!(settings.cloud_sync_consent_granted);
+        assert_eq!(settings.context_watch.interval_secs, 24);
+        assert_eq!(
+            settings.context_watch.excluded_domains,
+            vec!["private.example.com"]
+        );
+        assert_eq!(settings.meeting_detection_ignored_apps, vec!["zoom.exe"]);
+
+        let _ = fs::remove_dir_all(&paths.config_dir);
     }
 }

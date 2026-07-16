@@ -14,11 +14,12 @@ const FILE_MODE = 0o600;
 const HKDF_SALT = Buffer.from("bluey-jobs-runner:BLUEYJP2:hkdf-sha256", "utf8");
 const VALID_SCOPE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
-export type RunnerEncryptionPurpose = "profile-snapshot" | "durable-result";
+export type RunnerEncryptionPurpose = "profile-snapshot" | "durable-result" | "run-checkpoint";
 
 export type RunnerEncryptionContext =
   | { purpose: "profile-snapshot"; scope: string }
-  | { purpose: "durable-result"; scope: string; requestScope: string };
+  | { purpose: "durable-result"; scope: string; requestScope: string }
+  | { purpose: "run-checkpoint"; scope: string; checkpointScope: string };
 
 export type RunnerEncryptionErrorCode =
   | "authentication_failed"
@@ -66,6 +67,25 @@ export async function encryptFile(
   } catch (error) {
     await rm(staging, { force: true });
     throw error;
+  } finally {
+    encryptionKey.fill(0);
+  }
+}
+
+/** Encrypt a bounded in-memory payload without ever staging plaintext on disk. */
+export function encryptBytes(
+  plaintext: Buffer,
+  masterKey: Buffer,
+  context: RunnerEncryptionContext,
+): Buffer {
+  const aad = authenticatedContext(context);
+  const encryptionKey = deriveEncryptionKey(masterKey, aad);
+  const iv = randomBytes(IV_BYTES);
+  try {
+    const cipher = createCipheriv("aes-256-gcm", encryptionKey, iv);
+    cipher.setAAD(aad);
+    const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    return Buffer.concat([MAGIC, iv, ciphertext, cipher.getAuthTag()]);
   } finally {
     encryptionKey.fill(0);
   }
@@ -140,6 +160,44 @@ export async function decryptFile(
   }
 }
 
+/** Decrypt a bounded in-memory payload without writing plaintext to disk. */
+export function decryptBytes(
+  encrypted: Buffer,
+  masterKey: Buffer,
+  context: RunnerEncryptionContext,
+): Buffer {
+  if (encrypted.length < MAGIC.length) {
+    throw new RunnerEncryptionError("invalid_envelope");
+  }
+  const magic = encrypted.subarray(0, MAGIC.length);
+  if (magic.equals(LEGACY_MAGIC)) throw new RunnerEncryptionError("legacy_envelope");
+  if (!magic.equals(MAGIC)) {
+    if (magic.subarray(0, MAGIC_PREFIX.length).equals(MAGIC_PREFIX)) {
+      throw new RunnerEncryptionError("unsupported_envelope_version");
+    }
+    throw new RunnerEncryptionError("invalid_envelope");
+  }
+  if (encrypted.length < MAGIC.length + IV_BYTES + TAG_BYTES) {
+    throw new RunnerEncryptionError("invalid_envelope");
+  }
+
+  const aad = authenticatedContext(context);
+  const encryptionKey = deriveEncryptionKey(masterKey, aad);
+  try {
+    const iv = encrypted.subarray(MAGIC.length, MAGIC.length + IV_BYTES);
+    const tag = encrypted.subarray(encrypted.length - TAG_BYTES);
+    const ciphertext = encrypted.subarray(MAGIC.length + IV_BYTES, encrypted.length - TAG_BYTES);
+    const decipher = createDecipheriv("aes-256-gcm", encryptionKey, iv);
+    decipher.setAAD(aad);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  } catch {
+    throw new RunnerEncryptionError("authentication_failed");
+  } finally {
+    encryptionKey.fill(0);
+  }
+}
+
 function authenticatedContext(context: RunnerEncryptionContext): Buffer {
   if (!context || typeof context !== "object" || !VALID_SCOPE.test(context.scope)) {
     throw new RunnerEncryptionError("configuration");
@@ -154,6 +212,13 @@ function authenticatedContext(context: RunnerEncryptionContext): Buffer {
     return Buffer.from(
       `bluey-jobs-runner\0BLUEYJP2\0aes-256-gcm\0durable-result\0profile-scope\0${context.scope}`
         + `\0request-scope\0${context.requestScope}`,
+      "utf8",
+    );
+  }
+  if (context.purpose === "run-checkpoint" && /^[a-f0-9]{64}$/.test(context.checkpointScope)) {
+    return Buffer.from(
+      `bluey-jobs-runner\0BLUEYJP2\0aes-256-gcm\0run-checkpoint\0profile-scope\0${context.scope}`
+        + `\0checkpoint-scope\0${context.checkpointScope}`,
       "utf8",
     );
   }

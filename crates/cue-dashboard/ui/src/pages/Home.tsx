@@ -14,6 +14,11 @@ import {
   Sparkles,
 } from "lucide-react";
 import { invoke } from "../lib/tauri";
+import {
+  newSessionActionErrorMessage,
+  startNewSession,
+} from "../lib/sessionActions";
+import { AssistantControlPanel } from "../components/AssistantControlPanel";
 
 interface Session {
   id: string;
@@ -93,13 +98,14 @@ export function Home() {
     : "text-zinc-200";
 
   async function createSession() {
+    if (creating) return;
     setCreating(true);
     setError(null);
     try {
-      const session = await invoke<Session>("create_session", { title: null });
-      navigate(`/session/${session.id}`);
+      await startNewSession({ navigate });
     } catch (err) {
-      setError(String(err));
+      await load(true);
+      setError(newSessionActionErrorMessage(err));
     } finally {
       setCreating(false);
     }
@@ -116,6 +122,7 @@ export function Home() {
 
   return (
     <div className="mx-auto max-w-6xl space-y-6">
+      <AssistantControlPanel />
       <section className="grid gap-4 rounded-lg border border-zinc-800 bg-zinc-900/70 p-5 shadow-2xl shadow-black/20 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
         <div className="min-w-0 space-y-3">
           <div className="inline-flex items-center gap-2 rounded-full border border-cyan-400/25 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-200">
@@ -135,8 +142,9 @@ export function Home() {
         <div className="flex flex-wrap gap-2 md:justify-end">
           <button
             type="button"
-            onClick={createSession}
+            onClick={() => void createSession()}
             disabled={creating}
+            aria-busy={creating}
             className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md bg-blue-500 px-4 text-sm font-semibold text-white hover:bg-blue-400 disabled:cursor-not-allowed disabled:opacity-60"
           >
             <MessageSquarePlus className="h-4 w-4" />
@@ -164,8 +172,9 @@ export function Home() {
           icon={<MessageSquarePlus className="h-5 w-5" />}
           title="1. Open a session"
           body={activeSession ? activeSession.title : "Create a session before a meeting, coding task, or research pass."}
-          cta={activeSession ? "Continue session" : "Create session"}
+          cta={activeSession ? "Continue session" : creating ? "Starting..." : "Create session"}
           onClick={activeSession ? () => navigate(`/session/${activeSession.id}`) : createSession}
+          disabled={!activeSession && creating}
         />
         <ActionCard
           icon={<Headphones className="h-5 w-5" />}
@@ -309,18 +318,22 @@ function ActionCard({
   body,
   cta,
   onClick,
+  disabled = false,
 }: {
   icon: ReactNode;
   title: string;
   body: string;
   cta: string;
   onClick: () => void;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="group grid min-h-44 content-between rounded-lg border border-zinc-800 bg-zinc-900 p-4 text-left hover:border-cyan-400/40 hover:bg-zinc-900/80"
+      disabled={disabled}
+      aria-busy={disabled}
+      className="group grid min-h-44 content-between rounded-lg border border-zinc-800 bg-zinc-900 p-4 text-left hover:border-cyan-400/40 hover:bg-zinc-900/80 disabled:cursor-not-allowed disabled:opacity-60"
     >
       <span>
         <span className="mb-3 inline-grid h-10 w-10 place-items-center rounded-md border border-cyan-400/25 bg-cyan-400/10 text-cyan-200">

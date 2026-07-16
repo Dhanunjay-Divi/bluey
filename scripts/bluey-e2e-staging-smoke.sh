@@ -31,13 +31,14 @@ else
 fi
 
 log "Windows overlay syntax"
-if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
-  x86_64-w64-mingw32-gcc -fsyntax-only "$ROOT/native/windows/cue-overlay/main.c" \
+if command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1; then
+  x86_64-w64-mingw32-g++ -x c++ -std=c++17 -fsyntax-only \
+    "$ROOT/native/windows/cue-overlay/main.c" \
     -I"$ROOT/native/windows/cue-overlay" \
     -DUNICODE -D_UNICODE
-  ok "Windows overlay C syntax check passed"
+  ok "Windows overlay C++ syntax check passed"
 else
-  skip "x86_64-w64-mingw32-gcc not available"
+  skip "x86_64-w64-mingw32-g++ not available"
 fi
 
 log "Public API health"

@@ -31,7 +31,7 @@ if ($LASTEXITCODE -ne 0) {
   throw "Windows overlay protocol tests failed."
 }
 
-cl.exe /nologo /O2 /D_WIN32_WINNT=0x0601 /Fe:build\bluey-overlay.exe /Tp main.c user32.lib gdi32.lib d2d1.lib dwrite.lib uuid.lib shell32.lib comctl32.lib advapi32.lib
+cl.exe /nologo /O2 /D_WIN32_WINNT=0x0601 /Fe:build\bluey-overlay.exe /Tp main.c user32.lib gdi32.lib d2d1.lib dwrite.lib uuid.lib shell32.lib comctl32.lib advapi32.lib ole32.lib
 if ($LASTEXITCODE -ne 0) {
   throw "Windows overlay failed to compile."
 }

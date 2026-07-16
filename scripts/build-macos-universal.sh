@@ -1,92 +1,166 @@
 #!/usr/bin/env bash
-# build-macos-universal.sh
-#
-# Combines arm64 + x86_64 builds via `lipo -create` into universal binaries.
-# Inputs:
-#   target/aarch64-apple-darwin/release/{bluey,bluey-daemon}
-#   target/x86_64-apple-darwin/release/{bluey,bluey-daemon}
-#   native/macos/cue-overlay/.build/{arm64,x86_64}-apple-macosx/release/cue-overlay
-#   native/macos/cue-audio/.build/{arm64,x86_64}-apple-macosx/release/cue-audio
-#   native/macos/cue-whisper/.build/{arm64,x86_64}-apple-macosx/release/CueWhisper
-#   native/macos/cue-picker/.build/{arm64,x86_64}-apple-macosx/release/cue-picker
-#
-# Output:
-#   dist/bluey-macos-universal/{bluey,bluey-daemon,termb,Terminal,hostovb,host-overlay,adriverb,audio-driver,bluey-overlay-macos,bluey-audio-macos,bluey-whisper-macos,bluey-file-picker-macos}
+# Combine complete arm64 and x86_64 terminal releases into one universal tree.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-OUT="dist/bluey-macos-universal"
+CARGO_TARGET_ROOT="${BLUEY_CARGO_TARGET_DIR:-$ROOT/target}"
+OUT="${BLUEY_UNIVERSAL_OUT:-$ROOT/dist/bluey-macos-universal}"
+
+for command_name in chmod install mkdir python3 rm sed sort swift tr xcrun; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "[macos-universal] required command not found: $command_name" >&2
+        exit 1
+    fi
+done
+if ! xcrun --find lipo >/dev/null 2>&1; then
+    echo "[macos-universal] required Apple tool not found: lipo" >&2
+    exit 1
+fi
+
+require_executable() {
+    local path="$1"
+    if [[ ! -f "$path" || ! -x "$path" || ! -s "$path" ]]; then
+        echo "[macos-universal] required executable is missing or empty: $path" >&2
+        exit 1
+    fi
+}
+
+swift_binary() {
+    local package_dir="$1"
+    local arch="$2"
+    local product="$3"
+    local bin_dir
+    bin_dir="$(
+        cd "$package_dir"
+        swift build \
+            -c release \
+            --arch "$arch" \
+            --disable-automatic-resolution \
+            --show-bin-path
+    )"
+    printf '%s/%s\n' "$bin_dir" "$product"
+}
+
+verify_arches() {
+    local path="$1"
+    shift
+    local expected actual
+    expected="$(printf '%s\n' "$@" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+    actual="$(
+        xcrun lipo -archs "$path" \
+            | tr ' ' '\n' \
+            | sed '/^$/d' \
+            | LC_ALL=C sort \
+            | tr '\n' ' ' \
+            | sed 's/ $//'
+    )"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "[macos-universal] architecture mismatch for $path: expected '$expected', got '$actual'" >&2
+        exit 1
+    fi
+}
+
+combine() {
+    local arm_path="$1"
+    local x86_path="$2"
+    local destination="$3"
+    require_executable "$arm_path"
+    require_executable "$x86_path"
+    verify_arches "$arm_path" arm64
+    verify_arches "$x86_path" x86_64
+    xcrun lipo -create "$arm_path" "$x86_path" -output "$destination"
+    chmod 0755 "$destination"
+    verify_arches "$destination" arm64 x86_64
+}
+
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-# Rust binaries.
-lipo -create \
-    "target/aarch64-apple-darwin/release/bluey" \
-    "target/x86_64-apple-darwin/release/bluey" \
-    -output "$OUT/bluey"
+combine \
+    "$CARGO_TARGET_ROOT/aarch64-apple-darwin/release/bluey" \
+    "$CARGO_TARGET_ROOT/x86_64-apple-darwin/release/bluey" \
+    "$OUT/bluey"
+combine \
+    "$CARGO_TARGET_ROOT/aarch64-apple-darwin/release/bluey-daemon" \
+    "$CARGO_TARGET_ROOT/x86_64-apple-darwin/release/bluey-daemon" \
+    "$OUT/bluey-daemon"
 
-lipo -create \
-    "target/aarch64-apple-darwin/release/bluey-daemon" \
-    "target/x86_64-apple-darwin/release/bluey-daemon" \
-    -output "$OUT/bluey-daemon"
-cp "$OUT/bluey-daemon" "$OUT/termb"
-cp "$OUT/bluey-daemon" "$OUT/Terminal"
+ARM_OVERLAY="$(swift_binary native/macos/cue-overlay arm64 cue-overlay)"
+X86_OVERLAY="$(swift_binary native/macos/cue-overlay x86_64 cue-overlay)"
+combine "$ARM_OVERLAY" "$X86_OVERLAY" "$OUT/bluey-overlay-macos"
 
-# Swift overlay.
-ARM_OVERLAY="native/macos/cue-overlay/.build/arm64-apple-macosx/release/cue-overlay"
-X86_OVERLAY="native/macos/cue-overlay/.build/x86_64-apple-macosx/release/cue-overlay"
-if [[ -f "$ARM_OVERLAY" && -f "$X86_OVERLAY" ]]; then
-    lipo -create "$ARM_OVERLAY" "$X86_OVERLAY" -output "$OUT/bluey-overlay-macos"
-    cp "$OUT/bluey-overlay-macos" "$OUT/hostovb"
-    cp "$OUT/bluey-overlay-macos" "$OUT/host-overlay"
-else
-    echo "warn: overlay arch builds not both present; skipping overlay in universal" >&2
+ARM_AUDIO="$(swift_binary native/macos/cue-audio arm64 cue-audio)"
+X86_AUDIO="$(swift_binary native/macos/cue-audio x86_64 cue-audio)"
+combine "$ARM_AUDIO" "$X86_AUDIO" "$OUT/bluey-audio-macos"
+
+ARM_WHISPER="$(swift_binary native/macos/cue-whisper arm64 CueWhisper)"
+X86_WHISPER="$(swift_binary native/macos/cue-whisper x86_64 CueWhisper)"
+combine "$ARM_WHISPER" "$X86_WHISPER" "$OUT/bluey-whisper-macos"
+
+ARM_PICKER="$(swift_binary native/macos/cue-picker arm64 cue-picker)"
+X86_PICKER="$(swift_binary native/macos/cue-picker x86_64 cue-picker)"
+combine "$ARM_PICKER" "$X86_PICKER" "$OUT/bluey-file-picker-macos"
+
+install -m 0755 "$OUT/bluey-daemon" "$OUT/termb"
+install -m 0755 "$OUT/bluey-daemon" "$OUT/Terminal"
+install -m 0755 "$OUT/bluey-overlay-macos" "$OUT/cue-overlay-macos"
+install -m 0755 "$OUT/bluey-overlay-macos" "$OUT/hostovb"
+install -m 0755 "$OUT/bluey-overlay-macos" "$OUT/host-overlay"
+install -m 0755 "$OUT/bluey-audio-macos" "$OUT/cue-audio-macos"
+install -m 0755 "$OUT/bluey-audio-macos" "$OUT/adriverb"
+install -m 0755 "$OUT/bluey-audio-macos" "$OUT/audio-driver"
+install -m 0755 "$OUT/bluey-whisper-macos" "$OUT/cue-whisper"
+install -m 0755 "$OUT/bluey-file-picker-macos" "$OUT/cue-file-picker-macos"
+
+PICKER_PLIST="native/macos/cue-picker/.build/BlueyFilePicker.app/Contents/Info.plist"
+if [[ ! -f "$PICKER_PLIST" || ! -s "$PICKER_PLIST" ]]; then
+    echo "[macos-universal] required file picker Info.plist is missing: $PICKER_PLIST" >&2
+    exit 1
 fi
+mkdir -p "$OUT/BlueyFilePicker.app/Contents/MacOS"
+install -m 0644 "$PICKER_PLIST" "$OUT/BlueyFilePicker.app/Contents/Info.plist"
+install -m 0755 \
+    "$OUT/bluey-file-picker-macos" \
+    "$OUT/BlueyFilePicker.app/Contents/MacOS/bluey-file-picker-macos"
 
-# Swift audio.
-ARM_AUDIO="native/macos/cue-audio/.build/arm64-apple-macosx/release/cue-audio"
-X86_AUDIO="native/macos/cue-audio/.build/x86_64-apple-macosx/release/cue-audio"
-if [[ -f "$ARM_AUDIO" && -f "$X86_AUDIO" ]]; then
-    lipo -create "$ARM_AUDIO" "$X86_AUDIO" -output "$OUT/bluey-audio-macos"
-    cp "$OUT/bluey-audio-macos" "$OUT/adriverb"
-    cp "$OUT/bluey-audio-macos" "$OUT/audio-driver"
-else
-    echo "warn: audio arch builds not both present; skipping audio in universal" >&2
-fi
+python3 - "$OUT" <<'PY'
+from pathlib import Path
+import sys
 
-# Swift whisper.
-ARM_WHISPER="native/macos/cue-whisper/.build/arm64-apple-macosx/release/CueWhisper"
-X86_WHISPER="native/macos/cue-whisper/.build/x86_64-apple-macosx/release/CueWhisper"
-if [[ -f "$ARM_WHISPER" && -f "$X86_WHISPER" ]]; then
-    lipo -create "$ARM_WHISPER" "$X86_WHISPER" -output "$OUT/bluey-whisper-macos"
-else
-    echo "warn: whisper arch builds not both present; skipping whisper in universal" >&2
-fi
+root = Path(sys.argv[1])
+expected = {
+    "BlueyFilePicker.app/Contents/Info.plist",
+    "BlueyFilePicker.app/Contents/MacOS/bluey-file-picker-macos",
+    "Terminal",
+    "adriverb",
+    "audio-driver",
+    "bluey-audio-macos",
+    "bluey-daemon",
+    "bluey-file-picker-macos",
+    "bluey-overlay-macos",
+    "bluey-whisper-macos",
+    "bluey",
+    "cue-audio-macos",
+    "cue-file-picker-macos",
+    "cue-overlay-macos",
+    "cue-whisper",
+    "host-overlay",
+    "hostovb",
+    "termb",
+}
+actual = {
+    path.relative_to(root).as_posix()
+    for path in root.rglob("*")
+    if path.is_file()
+}
+if actual != expected:
+    raise SystemExit(
+        "[macos-universal] output member mismatch; "
+        f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+    )
+PY
 
-# Swift context file picker.
-ARM_PICKER="native/macos/cue-picker/.build/arm64-apple-macosx/release/cue-picker"
-X86_PICKER="native/macos/cue-picker/.build/x86_64-apple-macosx/release/cue-picker"
-if [[ -f "$ARM_PICKER" && -f "$X86_PICKER" ]]; then
-    lipo -create "$ARM_PICKER" "$X86_PICKER" -output "$OUT/bluey-file-picker-macos"
-    APP_DIR="$OUT/BlueyFilePicker.app"
-    rm -rf "$APP_DIR"
-    mkdir -p "$APP_DIR/Contents/MacOS"
-    cp native/macos/cue-picker/.build/BlueyFilePicker.app/Contents/Info.plist "$APP_DIR/Contents/Info.plist"
-    cp "$OUT/bluey-file-picker-macos" "$APP_DIR/Contents/MacOS/bluey-file-picker-macos"
-else
-    echo "warn: picker arch builds not both present; skipping picker in universal" >&2
-fi
-
-# Verify.
-echo "=== universal binaries ==="
-for f in "$OUT"/*; do
-    if [[ -x "$f" && ! -d "$f" ]]; then
-        printf "%-40s " "$(basename "$f"):"
-        lipo -archs "$f" 2>/dev/null || file "$f" | head -1
-    fi
-done
-
-echo "$OUT"
+echo "[macos-universal] output=$OUT"

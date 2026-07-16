@@ -33,6 +33,9 @@ describe("execution lease client", () => {
     const client = createClient(fetch);
 
     const lease = await client.claim(CLAIM);
+    expect(lease.fence).toBe(7);
+    expect(lease.expiresAtMs).toBeGreaterThan(Date.now());
+    expect(lease.ownerId).toBe("runner-test-1");
     await lease.beforeFinalSubmit();
     await lease.afterFinalSubmit("activated");
     await lease.finish("submitted");
@@ -291,6 +294,7 @@ function grantResponse(): Response {
     run_id: "run-123",
     lease_token: "lease-secret-value",
     fence: 7,
+    lease_expires_at_ms: Date.now() + 60_000,
     phase: "prepared",
   }), {
     status: 200,

@@ -1,7 +1,17 @@
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import { invoke } from "../lib/tauri";
 import { listen } from "@tauri-apps/api/event";
-import { Loader2, Shield, ArrowRight, Check, Eye } from "lucide-react";
+import {
+  ArrowRight,
+  AudioLines,
+  Check,
+  Cloud,
+  Eye,
+  FilePlus2,
+  Loader2,
+  Shield,
+} from "lucide-react";
 
 /**
  * First-run onboarding wizard. Codex Stage 18 — deep-link Option A.
@@ -78,7 +88,7 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
       <div className="w-full max-w-md">
         {step === "welcome" && <WelcomeStep onSignIn={startSignIn} />}
         {step === "authorizing" && <AuthorizingStep onCancel={cancel} />}
-        {step === "linked" && email && (
+        {step === "linked" && (
           <LinkedStep email={email} onComplete={onComplete} />
         )}
         {step === "error" && error && (
@@ -93,6 +103,9 @@ function WelcomeStep({ onSignIn }: { onSignIn: () => void }) {
   return (
     <div className="space-y-8">
       <div className="text-center space-y-3">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-300">
+          Step 1 of 2 · Link your account
+        </p>
         <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-500/15 text-blue-400">
           <BlueyMark />
         </div>
@@ -115,6 +128,14 @@ function WelcomeStep({ onSignIn }: { onSignIn: () => void }) {
           <div className="text-xs text-zinc-300 leading-relaxed">
             <span className="font-medium text-zinc-100">Cloud sync stays off.</span>{" "}
             Browser sign-in enables managed answers and account balance. Session sync remains a separate Settings choice.
+          </div>
+        </div>
+        <div className="flex items-start gap-3">
+          <AudioLines className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
+          <div className="text-xs text-zinc-300 leading-relaxed">
+            <span className="font-medium text-zinc-100">Meeting suggestions are controllable.</span>{" "}
+            Bluey can use app identity, call-related window metadata, and audio activity to suggest
+            starting a session without recording. You can fully stop this detector in Settings.
           </div>
         </div>
       </div>
@@ -161,12 +182,26 @@ function AuthorizingStep({ onCancel }: { onCancel: () => void }) {
   );
 }
 
-function LinkedStep({ email, onComplete }: { email: string; onComplete?: () => void }) {
+function LinkedStep({ email, onComplete }: { email: string | null; onComplete?: () => void }) {
+  const [finishing, setFinishing] = useState(false);
+  const [finishError, setFinishError] = useState<string | null>(null);
+
   async function finish() {
+    if (finishing) return;
+    setFinishing(true);
+    setFinishError(null);
     try {
       await invoke("complete_onboarding");
     } catch (e) {
-      console.warn("complete_onboarding failed", e);
+      setFinishError(
+        typeof e === "string"
+          ? e
+          : e instanceof Error
+            ? e.message
+            : "Bluey could not save onboarding yet. Please try again.",
+      );
+      setFinishing(false);
+      return;
     }
     if (onComplete) {
       onComplete();
@@ -175,32 +210,96 @@ function LinkedStep({ email, onComplete }: { email: string; onComplete?: () => v
     }
   }
   return (
-    <div className="space-y-6 text-center">
-      <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-emerald-500/15 text-emerald-400">
-        <Check className="h-6 w-6" />
-      </div>
-      <div className="space-y-2">
-        <h2 className="text-xl font-semibold">You&apos;re in.</h2>
-        <p className="text-sm text-zinc-400 leading-relaxed">
-          Signed in as <span className="text-zinc-200 font-medium">{email}</span>.
+    <div className="space-y-6">
+      <div className="text-center">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-300">
+          Step 2 of 2 · Know the controls
         </p>
-      </div>
-      <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3 text-left">
-        <div className="flex items-start gap-3">
-          <Eye className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
-          <div className="text-xs text-zinc-300 leading-relaxed">
-            <span className="font-medium text-zinc-100">Press F19</span> (or
-            the menu-bar icon) anytime to show or hide the overlay. Listening has its own control.
-          </div>
+        <div className="mt-4 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-emerald-500/15 text-emerald-400">
+          <Check className="h-6 w-6" />
         </div>
       </div>
+      <div className="space-y-2 text-center">
+        <h2 className="text-xl font-semibold">You&apos;re in.</h2>
+        <p className="text-sm text-zinc-400 leading-relaxed">
+          {email ? (
+            <>
+              Signed in as <span className="text-zinc-200 font-medium">{email}</span>.
+            </>
+          ) : (
+            "Your Bluey account is linked."
+          )}
+        </p>
+      </div>
+      <div className="overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900 text-left">
+        <ReadinessRow
+          icon={<AudioLines className="h-4 w-4" />}
+          title="Listening stays visible"
+          body="Start and stop microphone plus system audio from Live, the overlay, or your shortcut. Bluey shows an active recording state."
+        />
+        <ReadinessRow
+          icon={<FilePlus2 className="h-4 w-4" />}
+          title="Context is explicit"
+          body="Screen captures and files are added through their own controls. Bluey does not silently treat every open app as context."
+        />
+        <ReadinessRow
+          icon={<Cloud className="h-4 w-4" />}
+          title="Sync stays your choice"
+          body="Account linking enables managed answers. Saved-session cloud sync remains off until you enable it in Settings."
+        />
+      </div>
+      <p className="text-center text-xs leading-5 text-zinc-500">
+        Press <kbd className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-zinc-200">F19</kbd>{" "}
+        or use the menu-bar/tray command to show or hide the overlay. Hiding it does not stop
+        listening.
+      </p>
+      {finishError ? (
+        <p
+          role="alert"
+          className="rounded-lg border border-red-500/35 bg-red-950/35 px-3 py-2 text-center text-xs leading-5 text-red-100"
+        >
+          {finishError}
+        </p>
+      ) : null}
       <button
+        type="button"
         onClick={finish}
-        className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-blue-500 hover:bg-blue-400 text-white font-medium py-2.5 transition-colors"
+        disabled={finishing}
+        aria-busy={finishing}
+        className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-blue-500 hover:bg-blue-400 disabled:cursor-wait disabled:opacity-60 text-white font-medium py-2.5 transition-colors"
       >
-        Get started
-        <ArrowRight className="h-4 w-4" />
+        {finishing ? (
+          <>
+            Saving…
+            <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+          </>
+        ) : (
+          <>
+            Get started
+            <ArrowRight aria-hidden="true" className="h-4 w-4" />
+          </>
+        )}
       </button>
+    </div>
+  );
+}
+
+function ReadinessRow({
+  icon,
+  title,
+  body,
+}: {
+  icon: ReactNode;
+  title: string;
+  body: string;
+}) {
+  return (
+    <div className="flex items-start gap-3 border-b border-zinc-800 p-4 last:border-b-0">
+      <span className="mt-0.5 shrink-0 text-cyan-300">{icon}</span>
+      <span>
+        <strong className="block text-sm font-medium text-zinc-100">{title}</strong>
+        <span className="mt-1 block text-xs leading-5 text-zinc-400">{body}</span>
+      </span>
     </div>
   );
 }

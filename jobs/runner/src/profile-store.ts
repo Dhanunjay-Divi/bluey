@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import * as tar from "tar";
@@ -19,6 +19,11 @@ export function profilePaths(root: string, accountId: string, applicationIdentit
     .update(`${accountId}\0${applicationIdentityId}`)
     .digest("hex")
     .slice(0, 40);
+  return profilePathsFromScope(root, scope);
+}
+
+export function profilePathsFromScope(root: string, scope: string): ProfilePaths {
+  if (!/^[a-f0-9]{40}$/.test(scope)) throw new Error("Invalid browser profile scope");
   return {
     scope,
     directory: join(root, "active", scope),
@@ -34,7 +39,8 @@ export function parseProfileKey(encoded: string): Buffer {
 
 export async function restoreProfile(paths: ProfilePaths, key: Buffer): Promise<void> {
   await rm(paths.directory, { recursive: true, force: true });
-  await mkdir(paths.directory, { recursive: true });
+  await mkdir(paths.directory, { recursive: true, mode: 0o700 });
+  await chmod(paths.directory, 0o700);
   try {
     await stat(paths.encryptedSnapshot);
   } catch (error) {
@@ -56,7 +62,8 @@ export async function restoreProfile(paths: ProfilePaths, key: Buffer): Promise<
 
 export async function sealProfile(paths: ProfilePaths, key: Buffer): Promise<void> {
   const archive = `${paths.directory}.seal.tar.gz`;
-  await mkdir(dirname(paths.encryptedSnapshot), { recursive: true });
+  await mkdir(dirname(paths.encryptedSnapshot), { recursive: true, mode: 0o700 });
+  await chmod(dirname(paths.encryptedSnapshot), 0o700);
   await rm(archive, { force: true });
   try {
     await pipeline(

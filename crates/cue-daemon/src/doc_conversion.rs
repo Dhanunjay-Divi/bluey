@@ -1,9 +1,10 @@
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use cue_core::ContextKind;
@@ -13,7 +14,15 @@ const MAX_DIRECT_TEXT_BYTES: u64 = 1_000_000;
 const MAX_MARKITDOWN_INPUT_BYTES: u64 = 25_000_000;
 const MAX_MARKITDOWN_OUTPUT_BYTES: u64 = 2_000_000;
 const MARKITDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+const NATIVE_CONVERTER_TIMEOUT: Duration = Duration::from_secs(15);
 const PREVIEW_CHARS: usize = 16_000;
+
+#[cfg(unix)]
+const DOCUMENT_CHILD_ENV_ALLOWLIST: &[&str] = &["HOME", "TMPDIR", "LANG", "LC_ALL"];
+#[cfg(windows)]
+const DOCUMENT_CHILD_ENV_ALLOWLIST: &[&str] = &["USERPROFILE", "HOME", "TEMP", "TMP"];
+#[cfg(not(any(unix, windows)))]
+const DOCUMENT_CHILD_ENV_ALLOWLIST: &[&str] = &[];
 
 pub(crate) fn supported_context_formats_message() -> &'static str {
     "Supported formats: PDF, Word, PowerPoint, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images. Video files are not readable context yet."
@@ -100,13 +109,13 @@ pub(crate) fn convert_context_file_to_markdown(
             }
             Ok(_) => {
                 debug!(
-                    path = %path.display(),
+                    file_kind = ?kind,
                     "MarkItDown returned empty markdown; falling back to native parser"
                 );
             }
             Err(error) => {
                 debug!(
-                    path = %path.display(),
+                    file_kind = ?kind,
                     error = %error,
                     "MarkItDown conversion failed; falling back to native parser"
                 );
@@ -132,69 +141,84 @@ fn discover_markitdown_commands() -> Vec<ConverterCommand> {
         }
     };
 
+    // Arbitrary executable overrides are available only in development and
+    // tests. Release daemons resolve converters exclusively inside the
+    // canonical package root established by their own executable path.
+    #[cfg(debug_assertions)]
     for name in ["BLUEY_DOC_CONVERTER_BIN", "BLUEY_MARKITDOWN_BIN"] {
         if let Some(value) = env::var_os(name).filter(|value| !value.is_empty()) {
-            push(PathBuf::from(value));
+            let path = PathBuf::from(value);
+            push(canonical_executable(&path).unwrap_or(path));
         }
     }
 
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for candidate in bluey_local_doc_converter_candidates(dir) {
-                if candidate.is_file() {
-                    push(candidate);
-                }
+    for root in packaged_install_roots() {
+        for candidate in bluey_doc_converter_candidates_for_roots([root.clone()]) {
+            if let Some(program) = canonical_packaged_executable(&candidate, &root) {
+                push(program);
             }
         }
     }
 
+    #[cfg(debug_assertions)]
     for candidate in bluey_home_doc_converter_candidates() {
         if candidate.is_file() {
-            push(candidate);
+            push(canonical_executable(&candidate).unwrap_or(candidate));
         }
     }
 
-    // Let Command::new resolve PATH. If neither command exists, conversion
-    // falls back without making users install anything manually.
-    push(PathBuf::from("bluey-doc-converter"));
-    push(PathBuf::from("markitdown"));
+    // Development builds retain PATH-based commands for source-tree workflows.
+    // This block is absent from production binaries.
+    #[cfg(debug_assertions)]
+    {
+        push(PathBuf::from("bluey-doc-converter"));
+        push(PathBuf::from("markitdown"));
+    }
 
     commands
 }
 
-fn bluey_local_doc_converter_candidates(exe_dir: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    candidates.extend([
-        exe_dir.join("bluey-doc-converter"),
-        exe_dir.join("markitdown"),
-        exe_dir.join("bin/bluey-doc-converter"),
-        exe_dir.join("bin/markitdown"),
-    ]);
-
-    #[cfg(target_os = "windows")]
-    candidates.extend([
-        exe_dir.join("bluey-doc-converter.cmd"),
-        exe_dir.join("markitdown.exe"),
-        exe_dir.join("bin/bluey-doc-converter.cmd"),
-        exe_dir.join("bin/markitdown.exe"),
-    ]);
-
-    if let Some(install_root) = exe_dir.parent() {
-        candidates.extend([
-            install_root.join("tools/doc-converter/bin/bluey-doc-converter"),
-            install_root.join("tools/doc-converter/.venv/bin/markitdown"),
-        ]);
-
-        #[cfg(target_os = "windows")]
-        candidates.extend([
-            install_root.join("tools/doc-converter/bin/bluey-doc-converter.cmd"),
-            install_root.join("tools/doc-converter/.venv/Scripts/markitdown.exe"),
-        ]);
-    }
-
-    candidates
+fn packaged_install_roots() -> Vec<PathBuf> {
+    let Some(executable) = env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+    else {
+        return Vec::new();
+    };
+    let Some(executable_dir) = executable.parent() else {
+        return Vec::new();
+    };
+    let root = if executable_dir.file_name().is_some_and(|name| name == "bin") {
+        executable_dir.parent().unwrap_or(executable_dir)
+    } else {
+        executable_dir
+    };
+    vec![root.to_path_buf()]
 }
 
+fn canonical_packaged_executable(candidate: &Path, root: &Path) -> Option<PathBuf> {
+    let canonical_root = root.canonicalize().ok()?;
+    let canonical = canonical_executable(candidate)?;
+    canonical.starts_with(canonical_root).then_some(canonical)
+}
+
+fn canonical_executable(candidate: &Path) -> Option<PathBuf> {
+    let canonical = candidate.canonicalize().ok()?;
+    let metadata = canonical.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    Some(canonical)
+}
+
+#[cfg(debug_assertions)]
 fn bluey_home_doc_converter_candidates() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for name in ["BLUEY_INSTALL_ROOT", "HOME", "USERPROFILE"] {
@@ -224,76 +248,180 @@ where
     let mut candidates = Vec::new();
     for root in roots {
         candidates.extend([
+            root.join("tools/doc-converter/.venv/bin/markitdown"),
             root.join("bin/bluey-doc-converter"),
             root.join("tools/doc-converter/bin/bluey-doc-converter"),
-            root.join("tools/doc-converter/.venv/bin/markitdown"),
         ]);
 
         #[cfg(target_os = "windows")]
         candidates.extend([
+            root.join("tools/doc-converter/.venv/Scripts/markitdown.exe"),
             root.join("bin/bluey-doc-converter.cmd"),
             root.join("tools/doc-converter/bin/bluey-doc-converter.cmd"),
-            root.join("tools/doc-converter/.venv/Scripts/markitdown.exe"),
         ]);
     }
     candidates
 }
 
 fn run_markitdown(converter: &ConverterCommand, path: &Path) -> Result<String> {
-    let output_path = env::temp_dir().join(format!(
-        "bluey-markitdown-{}-{}.md",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    ));
+    let (output, file) = PrivateCommandOutput::new("markitdown", "md")?;
+    drop(file);
 
-    let mut child = Command::new(&converter.program)
-        .arg(path)
-        .arg("-o")
-        .arg(&output_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    let mut command = Command::new(&converter.program);
+    command.arg(path).arg("-o").arg(output.path());
+    configure_document_command(&mut command);
+    command.stdout(Stdio::null());
+    let child = command
         .spawn()
-        .with_context(|| format!("failed to launch {}", converter.program.display()))?;
+        .map_err(|error| anyhow!("document converter could not start ({:?})", error.kind()))?;
+    wait_for_bounded_child(
+        child,
+        output.path(),
+        MARKITDOWN_TIMEOUT,
+        MAX_MARKITDOWN_OUTPUT_BYTES,
+        "document converter",
+    )?;
+    cue_core::app_paths::validate_private_file(output.path())
+        .context("document converter output lost its private permissions")?;
+    read_utf8_bounded(output.path(), MAX_MARKITDOWN_OUTPUT_BYTES)
+}
 
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .context("failed to poll document converter")?
-        {
-            if !status.success() {
-                let _ = fs::remove_file(&output_path);
-                return Err(anyhow!(
-                    "{} exited with status {}",
-                    converter.program.display(),
-                    status
-                ));
-            }
-            break;
-        }
+struct PrivateCommandOutput {
+    directory: PathBuf,
+    path: PathBuf,
+}
 
-        if started.elapsed() > MARKITDOWN_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = fs::remove_file(&output_path);
-            return Err(anyhow!(
-                "{} timed out after {}s",
-                converter.program.display(),
-                MARKITDOWN_TIMEOUT.as_secs()
-            ));
-        }
-
-        std::thread::sleep(Duration::from_millis(25));
+impl PrivateCommandOutput {
+    fn new(label: &str, extension: &str) -> Result<(Self, File)> {
+        let directory = env::temp_dir().join(format!(
+            "bluey-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        cue_core::app_paths::create_private_dir(&directory)
+            .context("failed to create private converter workspace")?;
+        let path = directory.join(format!("output.{extension}"));
+        let file = cue_core::app_paths::create_private_file_new(&path)
+            .context("failed to create private converter output")?;
+        Ok((Self { directory, path }, file))
     }
 
-    let markdown = read_utf8_prefix(&output_path, MAX_MARKITDOWN_OUTPUT_BYTES)
-        .with_context(|| format!("failed to read {}", output_path.display()))?;
-    let _ = fs::remove_file(&output_path);
-    Ok(markdown)
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateCommandOutput {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn configure_document_command(command: &mut Command) {
+    command
+        .env_clear()
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    for name in DOCUMENT_CHILD_ENV_ALLOWLIST {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    if let Some(path) = env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+
+    #[cfg(all(not(debug_assertions), unix))]
+    command.env("PATH", "/usr/bin:/bin");
+
+    #[cfg(windows)]
+    if let Some(root) = windows_system_root() {
+        let system32 = root.join("System32");
+        command
+            .env("SystemRoot", &root)
+            .env("WINDIR", &root)
+            .env("ComSpec", system32.join("cmd.exe"));
+        #[cfg(not(debug_assertions))]
+        command.env(
+            "PATH",
+            format!("{};{}", system32.to_string_lossy(), root.to_string_lossy()),
+        );
+    }
+}
+
+fn wait_for_bounded_child(
+    mut child: std::process::Child,
+    output_path: &Path,
+    timeout: Duration,
+    max_output_bytes: u64,
+    label: &str,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if fs::metadata(output_path)
+            .map(|metadata| metadata.len() > max_output_bytes)
+            .unwrap_or(false)
+        {
+            terminate_child(&mut child);
+            return Err(anyhow!("{label} exceeded its output limit"));
+        }
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                terminate_child(&mut child);
+                return Err(error).context("failed to poll converter");
+            }
+        };
+        if let Some(status) = status {
+            if !status.success() {
+                return Err(anyhow!("{label} exited unsuccessfully"));
+            }
+            let bytes = fs::metadata(output_path)
+                .context("converter output is missing")?
+                .len();
+            if bytes > max_output_bytes {
+                return Err(anyhow!("{label} exceeded its output limit"));
+            }
+            return Ok(());
+        }
+        if started.elapsed() > timeout {
+            terminate_child(&mut child);
+            return Err(anyhow!("{label} exceeded its time limit"));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_bounded_stdout_command<I, S>(program: &Path, args: I, label: &str) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let (output, file) = PrivateCommandOutput::new("native-converter", "txt")?;
+    let mut command = Command::new(program);
+    command.args(args);
+    configure_document_command(&mut command);
+    command.stdout(Stdio::from(file));
+    let child = command
+        .spawn()
+        .map_err(|error| anyhow!("{label} could not start ({:?})", error.kind()))?;
+    wait_for_bounded_child(
+        child,
+        output.path(),
+        NATIVE_CONVERTER_TIMEOUT,
+        MAX_MARKITDOWN_OUTPUT_BYTES,
+        label,
+    )?;
+    cue_core::app_paths::validate_private_file(output.path())
+        .context("native converter output lost its private permissions")?;
+    read_utf8_bounded(output.path(), MAX_MARKITDOWN_OUTPUT_BYTES)
 }
 
 fn native_markdown_fallback(path: &Path, kind: ContextKind, size_bytes: u64) -> Result<String> {
@@ -358,69 +486,56 @@ fn extract_document_text_preview(path: &Path, size_bytes: u64) -> Result<String>
 }
 
 fn extract_pdf_text(path: &Path) -> Result<String> {
-    let output = match Command::new("pdftotext")
-        .arg("-layout")
-        .arg(path)
-        .arg("-")
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow!(
-                "PDF text extraction needs `pdftotext` locally or the bundled MarkItDown converter"
-            ));
-        }
-        Err(error) => return Err(error).context("failed to run PDF text extractor"),
-    };
+    let program = resolve_pdf_text_extractor().ok_or_else(|| {
+        anyhow!(
+            "PDF text extraction needs the bundled MarkItDown converter or a packaged PDF extractor"
+        )
+    })?;
+    run_bounded_stdout_command(
+        &program,
+        [
+            OsString::from("-layout"),
+            path.as_os_str().to_os_string(),
+            OsString::from("-"),
+        ],
+        "PDF text extractor",
+    )
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        return Err(anyhow!(
-            "PDF text extraction failed: {}",
-            if detail.is_empty() {
-                "unknown pdftotext error"
-            } else {
-                detail
+fn resolve_pdf_text_extractor() -> Option<PathBuf> {
+    for root in packaged_install_roots() {
+        for candidate in [
+            root.join("tools/doc-converter/bin/pdftotext"),
+            root.join("bin/pdftotext"),
+        ] {
+            if let Some(program) = canonical_packaged_executable(&candidate, &root) {
+                return Some(program);
             }
-        ));
+        }
     }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    #[cfg(debug_assertions)]
+    {
+        return Some(PathBuf::from("pdftotext"));
+    }
+    #[cfg(not(debug_assertions))]
+    None
 }
 
 #[cfg(target_os = "macos")]
 fn extract_word_text(path: &Path) -> Result<String> {
-    let output = match Command::new("textutil")
-        .arg("-convert")
-        .arg("txt")
-        .arg("-stdout")
-        .arg(path)
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow!(
-                "DOC/DOCX text extraction needs macOS `textutil` or the bundled MarkItDown converter"
-            ));
-        }
-        Err(error) => return Err(error).context("failed to run document text extractor"),
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        return Err(anyhow!(
-            "document text extraction failed: {}",
-            if detail.is_empty() {
-                "unknown textutil error"
-            } else {
-                detail
-            }
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let program = canonical_executable(Path::new("/usr/bin/textutil")).ok_or_else(|| {
+        anyhow!("DOC/DOCX text extraction needs macOS textutil or the bundled converter")
+    })?;
+    run_bounded_stdout_command(
+        &program,
+        [
+            OsString::from("-convert"),
+            OsString::from("txt"),
+            OsString::from("-stdout"),
+            path.as_os_str().to_os_string(),
+        ],
+        "document text extractor",
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -451,29 +566,50 @@ if ($ext -eq '.docx') {{
 "#,
         path = powershell_single_quoted(path)
     );
-    let output = Command::new("powershell")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .output()
-        .context("failed to launch Windows document parser")?;
+    let program = windows_powershell_path().ok_or_else(|| {
+        anyhow!("DOCX text extraction needs Windows PowerShell or the bundled converter")
+    })?;
+    run_bounded_stdout_command(
+        &program,
+        [
+            OsString::from("-NoLogo"),
+            OsString::from("-NoProfile"),
+            OsString::from("-NonInteractive"),
+            OsString::from("-ExecutionPolicy"),
+            OsString::from("Bypass"),
+            OsString::from("-Command"),
+            OsString::from(script),
+        ],
+        "Windows document parser",
+    )
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        return Err(anyhow!(
-            "document text extraction failed: {}",
-            if detail.is_empty() {
-                "unknown PowerShell parser error"
-            } else {
-                detail
-            }
-        ));
+#[cfg(windows)]
+fn windows_system_root() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if length == 0 {
+            return None;
+        }
+        if (length as usize) < buffer.len() {
+            buffer.truncate(length as usize);
+            return Some(PathBuf::from(OsString::from_wide(&buffer)));
+        }
+        buffer.resize(length as usize + 1, 0);
     }
+}
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+#[cfg(windows)]
+fn windows_powershell_path() -> Option<PathBuf> {
+    let root = windows_system_root()?;
+    let canonical_root = root.canonicalize().ok()?;
+    let candidate = root.join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let canonical = canonical_executable(&candidate)?;
+    canonical.starts_with(canonical_root).then_some(canonical)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -488,21 +624,16 @@ fn powershell_single_quoted(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "''"))
 }
 
-fn read_utf8_prefix(path: &Path, max_bytes: u64) -> Result<String> {
+fn read_utf8_bounded(path: &Path, max_bytes: u64) -> Result<String> {
     let mut file = File::open(path)?;
     let mut bytes = Vec::new();
     std::io::Read::by_ref(&mut file)
         .take(max_bytes + 1)
         .read_to_end(&mut bytes)?;
-    let truncated = bytes.len() as u64 > max_bytes;
-    if truncated {
-        bytes.truncate(max_bytes as usize);
+    if bytes.len() as u64 > max_bytes {
+        return Err(anyhow!("converter output exceeded its size limit"));
     }
-    let mut text = String::from_utf8_lossy(&bytes).to_string();
-    if truncated {
-        text.push_str("\n\n...");
-    }
-    Ok(text)
+    String::from_utf8(bytes).context("converter output was not valid UTF-8")
 }
 
 fn markdown_language_for_path(path: &Path) -> &'static str {
@@ -578,8 +709,8 @@ pub(crate) fn write_markdown_artifact(
     let dir = data_dir.join("context-markdown");
     cue_core::app_paths::create_private_dir(&dir)?;
     let path = dir.join(format!("{artifact_id}.md"));
-    let mut file =
-        File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut file = cue_core::app_paths::create_private_file_new(&path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
     file.write_all(markdown.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
@@ -646,6 +777,125 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn packaged_converter_resolution_rejects_symlink_escape() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let base = env::temp_dir().join(format!(
+            "bluey-converter-resolution-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = base.join("install");
+        let outside = base.join("outside-converter");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(&outside, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let candidate = root.join("bin/bluey-doc-converter");
+        symlink(&outside, &candidate).unwrap();
+        assert!(canonical_packaged_executable(&candidate, &root).is_none());
+
+        fs::remove_file(&candidate).unwrap();
+        fs::write(&candidate, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            canonical_packaged_executable(&candidate, &root),
+            Some(candidate.canonicalize().unwrap())
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn document_child_environment_excludes_credentials_and_injection_hooks() {
+        assert!(!DOCUMENT_CHILD_ENV_ALLOWLIST.contains(&"OPENAI_API_KEY"));
+        assert!(!DOCUMENT_CHILD_ENV_ALLOWLIST.contains(&"BLUEY_API_TOKEN"));
+        assert!(!DOCUMENT_CHILD_ENV_ALLOWLIST.contains(&"LD_PRELOAD"));
+        assert!(!DOCUMENT_CHILD_ENV_ALLOWLIST.contains(&"DYLD_INSERT_LIBRARIES"));
+
+        let mut command = Command::new("unused-converter");
+        configure_document_command(&mut command);
+        for (name, _) in command.get_envs() {
+            let name = name.to_string_lossy();
+            assert!(
+                DOCUMENT_CHILD_ENV_ALLOWLIST
+                    .iter()
+                    .any(|allowed| *allowed == name)
+                    || name == "PATH"
+                    || (cfg!(windows)
+                        && matches!(name.as_ref(), "SystemRoot" | "WINDIR" | "ComSpec")),
+                "unexpected child environment variable: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_output_workspace_is_private_and_removed_on_drop() {
+        let (output, file) = PrivateCommandOutput::new("test", "txt").unwrap();
+        let directory = output.directory.clone();
+        drop(file);
+        cue_core::app_paths::validate_private_file(output.path()).unwrap();
+        drop(output);
+        assert!(!directory.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn converter_failure_does_not_surface_raw_stderr() {
+        let error = run_bounded_stdout_command(
+            Path::new("/bin/sh"),
+            ["-c", "echo BLUEY_TEST_SECRET >&2; exit 7"],
+            "test converter",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exited unsuccessfully"));
+        assert!(!error.contains("BLUEY_TEST_SECRET"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn converter_output_and_runtime_are_bounded() {
+        let (output, file) = PrivateCommandOutput::new("limit-test", "txt").unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("while :; do printf '0123456789abcdef'; done");
+        configure_document_command(&mut command);
+        command.stdout(Stdio::from(file));
+        let child = command.spawn().unwrap();
+        let error = wait_for_bounded_child(
+            child,
+            output.path(),
+            Duration::from_secs(2),
+            32 * 1024,
+            "test converter",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("output limit"));
+
+        let (output, file) = PrivateCommandOutput::new("timeout-test", "txt").unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 5");
+        configure_document_command(&mut command);
+        command.stdout(Stdio::from(file));
+        let child = command.spawn().unwrap();
+        let started = Instant::now();
+        let error = wait_for_bounded_child(
+            child,
+            output.path(),
+            Duration::from_millis(75),
+            32 * 1024,
+            "test converter",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("time limit"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn write_markdown_artifact_persists_under_bluey_data_dir() {
         let base = env::temp_dir().join(format!("bluey-md-artifact-{}", uuid::Uuid::new_v4()));
@@ -657,6 +907,7 @@ mod tests {
             Some(expected.as_str())
         );
         assert_eq!(fs::read_to_string(&path).expect("read markdown"), "# hello");
+        cue_core::app_paths::validate_private_file(&path).expect("private markdown artifact");
 
         let _ = fs::remove_dir_all(base);
     }

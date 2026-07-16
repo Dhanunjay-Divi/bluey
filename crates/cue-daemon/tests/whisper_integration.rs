@@ -1,6 +1,7 @@
 //! Integration tests for LocalWhisperProvider using the whisper-stub binary.
 
 use cue_core::pcm::{AudioChunk, AudioSource, SampleRate};
+use cue_core::stt::agreement::TranscriptAgreementPhase;
 use cue_core::stt::{SttConfig, SttError, SttProvider, TranscriptEvent};
 use cue_daemon::stt::mock::{MockStt, MockSttControl};
 use cue_daemon::stt::router::SttRouter;
@@ -15,7 +16,7 @@ fn stub_binary_path() -> String {
         .parent()
         .unwrap()
         .to_path_buf();
-    path.push("whisper-stub");
+    path.push(format!("whisper-stub{}", std::env::consts::EXE_SUFFIX));
     path.to_string_lossy().to_string()
 }
 
@@ -46,36 +47,66 @@ async fn whisper_provider_receives_ndjson_events() {
     provider.send_audio(&audio_chunk()).await.unwrap();
 
     // Read events with timeout
-    let evt1 = tokio::time::timeout(std::time::Duration::from_secs(2), provider.next_event())
-        .await
-        .expect("timeout waiting for event 1")
-        .expect("channel closed")
-        .expect("error event");
+    let evt1 = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        provider.next_stable_event(),
+    )
+    .await
+    .expect("timeout waiting for event 1")
+    .expect("channel closed")
+    .expect("error event");
 
-    assert!(matches!(evt1, TranscriptEvent::Partial { ref text, .. } if text == "hello"));
+    assert!(matches!(
+        evt1.event,
+        TranscriptEvent::Partial { ref text, .. } if text == "hello"
+    ));
+    let first_agreement = evt1.agreement.expect("local partial stability");
+    assert_eq!(first_agreement.phase, TranscriptAgreementPhase::Tentative);
+    assert_eq!(first_agreement.tentative_text, "hello");
 
-    let evt2 = tokio::time::timeout(std::time::Duration::from_secs(2), provider.next_event())
-        .await
-        .expect("timeout waiting for event 2")
-        .expect("channel closed")
-        .expect("error event");
+    let evt2 = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        provider.next_stable_event(),
+    )
+    .await
+    .expect("timeout waiting for event 2")
+    .expect("channel closed")
+    .expect("error event");
 
-    assert!(matches!(evt2, TranscriptEvent::Partial { ref text, .. } if text == "hello world"));
+    assert!(matches!(
+        evt2.event,
+        TranscriptEvent::Partial { ref text, .. } if text == "hello world"
+    ));
+    let second_agreement = evt2.agreement.expect("local committed prefix");
+    assert_eq!(second_agreement.phase, TranscriptAgreementPhase::Committed);
+    assert_eq!(second_agreement.committed_text, "hello");
+    assert_eq!(second_agreement.tentative_text, "world");
+    assert_eq!(
+        second_agreement.generation_id,
+        first_agreement.generation_id
+    );
+    assert_eq!(second_agreement.segment_id, first_agreement.segment_id);
 
-    let evt3 = tokio::time::timeout(std::time::Duration::from_secs(2), provider.next_event())
-        .await
-        .expect("timeout waiting for event 3")
-        .expect("channel closed")
-        .expect("error event");
+    let evt3 = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        provider.next_stable_event(),
+    )
+    .await
+    .expect("timeout waiting for event 3")
+    .expect("channel closed")
+    .expect("error event");
 
-    match evt3 {
+    let final_agreement = evt3.agreement.expect("local final stability");
+    assert_eq!(final_agreement.phase, TranscriptAgreementPhase::Final);
+    assert_eq!(final_agreement.segment_id, first_agreement.segment_id);
+    match evt3.event {
         TranscriptEvent::Final {
             text, confidence, ..
         } => {
             assert_eq!(text, "hello world");
             assert_eq!(confidence, Some(0.95f32));
         }
-        _ => panic!("expected Final event, got {:?}", evt3),
+        other => panic!("expected Final event, got {other:?}"),
     }
 
     provider.close().await.unwrap();
@@ -131,11 +162,18 @@ async fn router_three_tier_failover_deepgram_openai_whisper() {
     router.send_audio(&audio_chunk()).await.unwrap();
 
     // Should receive events from the whisper stub
-    let evt = tokio::time::timeout(std::time::Duration::from_secs(2), router.next_event())
-        .await
-        .expect("timeout")
-        .expect("channel closed")
-        .expect("error");
+    let evt = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        router.next_stable_event(),
+    )
+    .await
+    .expect("timeout")
+    .expect("channel closed")
+    .expect("error");
 
-    assert!(matches!(evt, TranscriptEvent::Partial { ref text, .. } if text == "hello"));
+    assert!(evt.agreement.is_some());
+    assert!(matches!(
+        evt.event,
+        TranscriptEvent::Partial { ref text, .. } if text == "hello"
+    ));
 }

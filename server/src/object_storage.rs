@@ -491,6 +491,16 @@ mod tests {
                 [],
             )
             .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO cloud_sessions (
+                    account_id, session_id, title, status, created_at_ms, updated_at_ms,
+                    metadata_json
+                 ) VALUES ('acct_worker', 'session_worker', 'Worker', 'active', 1, 1, '{}')",
+                [],
+            )
+            .unwrap();
         let hash = sha256_hex("worker payload");
         let key = storage.artifact_upload_key("acct_worker", "artifact_worker", &hash);
         let reservation = reserve_upload(
@@ -499,7 +509,7 @@ mod tests {
                 account_id: "acct_worker".into(),
                 object_kind: ObjectKind::Artifact,
                 logical_id: "artifact_worker".into(),
-                session_id: None,
+                session_id: Some("session_worker".into()),
                 storage_scope: StorageScope::Artifact,
                 object_key: key.clone(),
                 size_bytes: 14,

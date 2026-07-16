@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+BLUEY_UV_VERSION="0.11.29"
+BLUEY_MARKITDOWN_VERSION="0.1.6"
+BLUEY_MARKITDOWN_EXCLUDE_NEWER="2026-07-16T00:00:00Z"
+BLUEY_AZURE_CONTENT_UNDERSTANDING_VERSION="1.2.0b2"
+
 INSTALL_HELPER_NAMES=(
   termb Terminal hostovb host-overlay adriverb audio-driver screen-driver
   bluey-overlay-macos cue-overlay-macos
@@ -71,20 +76,42 @@ ensure_process_identity_aliases() {
   copy_first_binary_alias "$bin_path" host-overlay bluey-overlay-macos cue-overlay-macos
   copy_first_binary_alias "$bin_path" adriverb bluey-audio-macos cue-audio-macos
   copy_first_binary_alias "$bin_path" audio-driver bluey-audio-macos cue-audio-macos
+  copy_first_binary_alias "$bin_path" screen-driver bluey-capture cue-capture
 }
 
 bluey_uv_url() {
   if [[ -n "${BLUEY_UV_URL:-}" ]]; then
+    [[ -n "${BLUEY_UV_SHA256:-}" ]] || return 1
     printf '%s\n' "$BLUEY_UV_URL"
     return 0
   fi
 
   case "$(uname -m)" in
     arm64|aarch64)
-      printf '%s\n' "https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-apple-darwin.tar.gz"
+      printf '%s\n' "https://github.com/astral-sh/uv/releases/download/${BLUEY_UV_VERSION}/uv-aarch64-apple-darwin.tar.gz"
       ;;
     x86_64|amd64)
-      printf '%s\n' "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-apple-darwin.tar.gz"
+      printf '%s\n' "https://github.com/astral-sh/uv/releases/download/${BLUEY_UV_VERSION}/uv-x86_64-apple-darwin.tar.gz"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+bluey_uv_sha256() {
+  if [[ -n "${BLUEY_UV_URL:-}" ]]; then
+    [[ -n "${BLUEY_UV_SHA256:-}" ]] || return 1
+    printf '%s\n' "$BLUEY_UV_SHA256"
+    return 0
+  fi
+
+  case "$(uname -m)" in
+    arm64|aarch64)
+      printf '%s\n' "61c04acc52a33ef0f331e494bdfbedcdb6c26c6970c022ed3699e5860f8930e3"
+      ;;
+    x86_64|amd64)
+      printf '%s\n' "c4c4de482da9ccdd076dc4fb5cfe7b740609029385c72f58606be3153602387d"
       ;;
     *)
       return 1
@@ -97,13 +124,29 @@ ensure_bluey_uv() {
   local uv_dir="$root/tools/uv"
   local uv_bin="$uv_dir/uv"
 
-  if [[ -x "$uv_bin" ]]; then
-    printf '%s\n' "$uv_bin"
-    return 0
+  if [[ -n "${BLUEY_UV_URL:-}" && -z "${BLUEY_UV_SHA256:-}" ]]; then
+    warn "BLUEY_UV_URL overrides require BLUEY_UV_SHA256"
+    return 1
   fi
 
-  local url tmp archive extract found
+  if [[ -x "$uv_bin" ]]; then
+    local installed_version
+    installed_version="$("$uv_bin" --version 2>/dev/null | awk '{print $2}' || true)"
+    if [[ "$installed_version" == "$BLUEY_UV_VERSION" ]]; then
+      printf '%s\n' "$uv_bin"
+      return 0
+    fi
+    rm -f "$uv_bin"
+  fi
+
+  local url expected_sha tmp archive extract found
   url="$(bluey_uv_url)" || return 1
+  expected_sha="$(bluey_uv_sha256)" || return 1
+  expected_sha="$(printf '%s' "$expected_sha" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${#expected_sha}" -ne 64 || "$expected_sha" == *[!0-9a-f]* ]]; then
+    warn "Bluey local Python runtime helper SHA256 must contain exactly 64 hexadecimal characters"
+    return 1
+  fi
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/bluey-uv.XXXXXX")"
   archive="$tmp/uv.tar.gz"
   extract="$tmp/extract"
@@ -111,6 +154,11 @@ ensure_bluey_uv() {
 
   printf 'Installing Bluey local Python runtime helper...\n' >&2
   if ! curl -fsSL "$url" -o "$archive"; then
+    rm -rf "$tmp"
+    return 1
+  fi
+  if ! printf '%s  %s\n' "$expected_sha" "$archive" | shasum -a 256 -c - >/dev/null 2>&1; then
+    warn "Bluey local Python runtime helper checksum verification failed"
     rm -rf "$tmp"
     return 1
   fi
@@ -143,7 +191,9 @@ run_with_bluey_uv_env() {
 }
 
 remove_bluey_legacy_terminal_link() {
-  local legacy_link="$1/Terminal"
+  local bin_path="$1"
+  local install_path="$2"
+  local legacy_link="$bin_path/Terminal"
   local target
 
   [[ -L "$legacy_link" ]] || return 0
@@ -156,7 +206,7 @@ remove_bluey_legacy_terminal_link() {
     target="$target_dir/$target_name"
   fi
   case "$target" in
-    "$target_root"/*|"$HOME/.bluey"/*)
+    "$install_path"/*|"$HOME/.bluey"/*)
       rm -f "$legacy_link"
       ;;
   esac
@@ -169,53 +219,52 @@ install_local_doc_tools() {
   local venv_dir="$tools_dir/.venv"
   local uv_bin=""
 
+  rm -f "$wrapper"
+  rm -rf "$venv_dir"
   if [[ "${BLUEY_SKIP_LOCAL_TOOLS:-0}" == "1" ]]; then
     warn "Skipping Bluey-local document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
     return 0
   fi
 
   mkdir -p "$tools_dir" "$root/bin"
-  if command -v python3 >/dev/null 2>&1 && python3 --version 2>&1 | grep -Eq 'Python 3\.'; then
-    if ! python3 -m venv "$venv_dir" >/dev/null 2>&1; then
-      warn "could not create Bluey-local Python venv with installed python3; trying Bluey's local bootstrap"
-      rm -rf "$venv_dir"
-      uv_bin="$(ensure_bluey_uv "$root" || true)"
-    fi
-  else
-    warn "real python3 was not found; creating Bluey's local document tools runtime"
-    uv_bin="$(ensure_bluey_uv "$root" || true)"
+  uv_bin="$(ensure_bluey_uv "$root" || true)"
+  if [[ -z "$uv_bin" ]]; then
+    warn "could not prepare Bluey-local document tools; document conversion will use built-in fallbacks only"
+    return 0
   fi
 
-  if [[ -n "$uv_bin" ]]; then
-    if ! run_with_bluey_uv_env "$root" "$uv_bin" venv --python 3.12 "$venv_dir" >/dev/null 2>&1; then
-      warn "could not prepare Bluey-local document tools; document conversion will use built-in fallbacks only"
-      return 0
-    fi
-  elif [[ ! -x "$venv_dir/bin/python" ]]; then
+  if ! run_with_bluey_uv_env "$root" "$uv_bin" venv --python 3.12 "$venv_dir" >/dev/null 2>&1; then
+    rm -rf "$venv_dir"
     warn "could not prepare Bluey-local document tools; document conversion will use built-in fallbacks only"
     return 0
   fi
 
   local py="$venv_dir/bin/python"
-  if [[ -n "$uv_bin" ]]; then
-    if ! run_with_bluey_uv_env "$root" "$uv_bin" pip install --python "$py" "markitdown[all]" >/dev/null 2>&1; then
-      if ! run_with_bluey_uv_env "$root" "$uv_bin" pip install --python "$py" markitdown >/dev/null 2>&1; then
-        warn "could not install MarkItDown into Bluey's local tools venv; document conversion will use built-in fallbacks only"
-        return 0
-      fi
+  if ! run_with_bluey_uv_env "$root" "$uv_bin" pip install \
+      --prerelease explicit \
+      --python "$py" \
+      --exclude-newer "$BLUEY_MARKITDOWN_EXCLUDE_NEWER" \
+      "markitdown[all]==$BLUEY_MARKITDOWN_VERSION" \
+      "azure-ai-contentunderstanding==$BLUEY_AZURE_CONTENT_UNDERSTANDING_VERSION" >/dev/null 2>&1; then
+    rm -rf "$venv_dir"
+    if ! run_with_bluey_uv_env "$root" "$uv_bin" venv --python 3.12 "$venv_dir" >/dev/null 2>&1; then
+      rm -rf "$venv_dir"
+      warn "could not prepare Bluey-local document tools; document conversion will use built-in fallbacks only"
+      return 0
     fi
-  else
-    "$py" -m pip install --disable-pip-version-check --upgrade pip >/dev/null 2>&1 || true
-    if ! "$py" -m pip install --disable-pip-version-check "markitdown[all]" >/dev/null 2>&1; then
-      if ! "$py" -m pip install --disable-pip-version-check markitdown >/dev/null 2>&1; then
-        warn "could not install MarkItDown into Bluey's local tools venv; document conversion will use built-in fallbacks only"
-        return 0
-      fi
+    if ! run_with_bluey_uv_env "$root" "$uv_bin" pip install \
+        --python "$py" \
+        --exclude-newer "$BLUEY_MARKITDOWN_EXCLUDE_NEWER" \
+        "markitdown==$BLUEY_MARKITDOWN_VERSION" >/dev/null 2>&1; then
+      rm -rf "$venv_dir"
+      warn "could not install pinned MarkItDown into Bluey's local tools venv; document conversion will use built-in fallbacks only"
+      return 0
     fi
   fi
 
   if [[ ! -x "$venv_dir/bin/markitdown" ]] && [[ ! -x "$venv_dir/bin/markitdown.exe" ]]; then
-    warn "could not install MarkItDown into Bluey's local tools venv; document conversion will use built-in fallbacks only"
+    rm -rf "$venv_dir"
+    warn "could not install pinned MarkItDown into Bluey's local tools venv; document conversion will use built-in fallbacks only"
     return 0
   fi
 
@@ -324,7 +373,7 @@ install_local_doc_tools "$target_tmp"
 rm -rf "$target"
 mv "$target_tmp" "$target"
 
-remove_bluey_legacy_terminal_link "$bin_dir"
+remove_bluey_legacy_terminal_link "$bin_dir" "$install_root"
 ln -sfn "$target/bin/bluey" "$bin_dir/bluey"
 daemon_link_target="$target/bin/termb"
 if [[ ! -x "$daemon_link_target" ]]; then

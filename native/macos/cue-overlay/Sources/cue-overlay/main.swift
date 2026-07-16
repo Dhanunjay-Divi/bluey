@@ -23,6 +23,7 @@
 import AppKit
 import ApplicationServices
 import Carbon
+import CoreAudio
 import Darwin
 import Foundation
 import QuartzCore
@@ -1445,6 +1446,16 @@ private struct OverlaySessionItem {
     let isActive: Bool
 }
 
+private struct MeetingBannerPayload {
+    let candidateId: String
+    let appName: String
+    let appId: String
+    let provider: String?
+    let confidence: Int
+    let reason: String
+    let timeoutSecs: Int
+}
+
 private func shortSessionCode(_ id: String) -> String {
     let compact = id.filter { $0 != "-" }
     let prefix = String(compact.prefix(8)).uppercased()
@@ -1474,6 +1485,66 @@ private let remoteControlAppNeedles = [
     "vnc viewer",
 ]
 
+private struct CardUpdateSequenceTracker {
+    private var lastSequenceByCard: [String: UInt64] = [:]
+
+    mutating func reset(cardId: String) {
+        lastSequenceByCard.removeValue(forKey: cardId)
+    }
+
+    mutating func resetAll() {
+        lastSequenceByCard.removeAll(keepingCapacity: true)
+    }
+
+    mutating func shouldAccept(
+        cardId: String,
+        sequence: ParsedUpdateSequence,
+        snapshot: Bool
+    ) -> Bool {
+        guard !cardId.isEmpty else { return false }
+        switch sequence {
+        case .absent:
+            // Legacy daemons did not send a sequence. Preserve rolling-upgrade
+            // compatibility by rendering every such frame without changing
+            // the dedupe barrier for explicitly sequenced frames.
+            return true
+        case .invalid:
+            return false
+        case .value(let sequence):
+            return shouldAcceptSequenced(
+                cardId: cardId,
+                sequence: sequence,
+                snapshot: snapshot)
+        }
+    }
+
+    private mutating func shouldAcceptSequenced(
+        cardId: String,
+        sequence: UInt64,
+        snapshot: Bool
+    ) -> Bool {
+        let previous = lastSequenceByCard[cardId]
+        if snapshot {
+            // A snapshot is an explicit recovery baseline and is always
+            // renderable. Preserve the highest observed sequence as the
+            // incremental-frame barrier so delayed deltas cannot roll it back.
+            lastSequenceByCard[cardId] = max(previous ?? sequence, sequence)
+            return true
+        }
+        if let previous, sequence <= previous {
+            return false
+        }
+        lastSequenceByCard[cardId] = sequence
+        return true
+    }
+}
+
+private enum ParsedUpdateSequence: Equatable {
+    case absent
+    case value(UInt64)
+    case invalid
+}
+
 /// Inbound commands from the daemon.
 private enum OverlayCommand {
     case ping
@@ -1492,13 +1563,40 @@ private enum OverlayCommand {
     case listeningStateChanged(String)
     case audioAutoStopCountdown(remainingSecs: Int, idleSecs: Int)
     case audioAutoStopCountdownCleared
+    case setMeetingDetectionEnabled(Bool)
+    case showMeetingBanner(MeetingBannerPayload)
+    case hideMeetingBanner(candidateId: String?, reason: String?)
     case transcriptPartial(source: String, text: String)
     case transcriptFinal(source: String, text: String)
     case setPassthrough(enabled: Bool, durationMs: Int?)
     case pushCard(CueCard)
-    case updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?)
+    case updateCard(
+        id: String,
+        body: String,
+        done: Bool,
+        costLabel: String?,
+        artifact: OverlayArtifact?,
+        sequence: ParsedUpdateSequence,
+        snapshot: Bool)
     case shutdown
     case unknown(String)
+}
+
+private func parseUpdateSequence(_ raw: Any?, present: Bool) -> ParsedUpdateSequence {
+    guard present else { return .absent }
+    if let number = raw as? NSNumber {
+        guard CFGetTypeID(number) != CFBooleanGetTypeID() else {
+            return .invalid
+        }
+        return UInt64(number.stringValue).map(ParsedUpdateSequence.value) ?? .invalid
+    }
+    if let value = raw as? UInt64 {
+        return .value(value)
+    }
+    if let value = raw as? Int, value >= 0 {
+        return .value(UInt64(value))
+    }
+    return .invalid
 }
 
 private func parseCommand(_ line: String) -> OverlayCommand {
@@ -1568,6 +1666,28 @@ private func parseCommand(_ line: String) -> OverlayCommand {
             idleSecs: obj["idle_secs"] as? Int ?? 0)
     case "audio_auto_stop_countdown_cleared":
         return .audioAutoStopCountdownCleared
+    case "set_meeting_detection_enabled":
+        guard let enabled = obj["enabled"] as? Bool else {
+            return .unknown(line)
+        }
+        return .setMeetingDetectionEnabled(enabled)
+    case "show_meeting_banner":
+        guard let candidate = obj["candidate"] as? [String: Any] else {
+            return .unknown(line)
+        }
+        return .showMeetingBanner(MeetingBannerPayload(
+            candidateId: candidate["candidate_id"] as? String ?? "",
+            appName: candidate["app_name"] as? String ?? "Meeting app",
+            appId: candidate["app_id"] as? String ?? "",
+            provider: candidate["provider"] as? String,
+            confidence: candidate["confidence"] as? Int ?? 0,
+            reason: candidate["reason"] as? String ?? "Bluey detected meeting activity.",
+            timeoutSecs: max(3, min(obj["timeout_secs"] as? Int ?? 12, 60))
+        ))
+    case "hide_meeting_banner":
+        return .hideMeetingBanner(
+            candidateId: obj["candidate_id"] as? String,
+            reason: obj["reason"] as? String)
     case "transcript_partial":
         return .transcriptPartial(
             source: obj["source"] as? String ?? "audio",
@@ -1592,12 +1712,23 @@ private func parseCommand(_ line: String) -> OverlayCommand {
         let body = obj["body"] as? String ?? ""
         let done = obj["done"] as? Bool ?? false
         let costLabel = obj["cost_label"] as? String
+        let sequence = parseUpdateSequence(
+            obj["sequence"],
+            present: obj.keys.contains("sequence"))
+        let snapshot = obj["snapshot"] as? Bool ?? false
         var artifact: OverlayArtifact?
         if let artifactObj = obj["artifact"] as? [String: Any],
            let artifactData = try? JSONSerialization.data(withJSONObject: artifactObj) {
             artifact = try? JSONDecoder().decode(OverlayArtifact.self, from: artifactData)
         }
-        return .updateCard(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact)
+        return .updateCard(
+            id: id,
+            body: body,
+            done: done,
+            costLabel: costLabel,
+            artifact: artifact,
+            sequence: sequence,
+            snapshot: snapshot)
     default:
         return .unknown(line)
     }
@@ -1817,6 +1948,449 @@ private func emitCardRendered(id: String) {
 
 private func emitOpacityUpdated(_ opacity: Double) {
     emitEvent(["type": "opacity_updated", "opacity": opacity])
+}
+
+private func emitMeetingBannerAction(_ payload: MeetingBannerPayload, action: String) {
+    var event: [String: Any] = [
+        "type": "meeting_banner_action",
+        "candidate_id": payload.candidateId,
+        "action": action,
+        "app_id": payload.appId,
+    ]
+    if let provider = payload.provider, !provider.isEmpty {
+        event["provider"] = provider
+    }
+    emitEvent(event)
+}
+
+// MARK: - Privacy-preserving meeting evidence
+
+private struct MacMeetingAppIdentity {
+    let appName: String
+    let appId: String
+    let browser: Bool
+    let dedicatedMeetingApp: Bool
+}
+
+private struct MacMeetingEvidenceAggregate {
+    let identity: MacMeetingAppIdentity
+    var processId: pid_t
+    var inputActive: Bool
+    var outputActive: Bool
+}
+
+private struct MacMeetingWindowSnapshot {
+    let processId: pid_t
+    let layer: Int
+    let title: String?
+}
+
+private let meetingDetectionEnabledAtLaunch = false
+
+private func normalizedMeetingIdentity(
+    bundleId rawBundleId: String,
+    fallbackName: String
+) -> MacMeetingAppIdentity? {
+    let bundleId = rawBundleId.lowercased()
+    let browser: (String, String)? = {
+        if bundleId.contains("com.google.chrome") {
+            return ("Google Chrome", "com.google.Chrome")
+        }
+        if bundleId.contains("com.microsoft.edgemac") {
+            return ("Microsoft Edge", "com.microsoft.edgemac")
+        }
+        if bundleId.contains("com.brave.browser") {
+            return ("Brave", "com.brave.Browser")
+        }
+        if bundleId.contains("org.mozilla.firefox") {
+            return ("Firefox", "org.mozilla.firefox")
+        }
+        if bundleId.contains("company.thebrowser.browser") {
+            return ("Arc", "company.thebrowser.Browser")
+        }
+        return nil
+    }()
+    if let browser {
+        return MacMeetingAppIdentity(
+            appName: browser.0,
+            appId: browser.1,
+            browser: true,
+            dedicatedMeetingApp: false)
+    }
+
+    let dedicated: (String, String)? = {
+        if bundleId.hasPrefix("us.zoom.") {
+            return ("Zoom", "us.zoom.xos")
+        }
+        if bundleId.hasPrefix("com.microsoft.teams") {
+            return ("Microsoft Teams", "com.microsoft.teams2")
+        }
+        if bundleId.hasPrefix("com.tinyspeck.slackmacgap") {
+            return ("Slack", "com.tinyspeck.slackmacgap")
+        }
+        if bundleId.contains("webex") || bundleId.contains("cisco") && bundleId.contains("meeting") {
+            return ("Webex", "com.cisco.webexmeetingsapp")
+        }
+        if bundleId.contains("gotomeeting") || bundleId.contains("logmein.goto.meeting") {
+            return ("GoTo Meeting", "com.logmein.goto.meeting")
+        }
+        if bundleId.contains("whereby") {
+            return ("Whereby", "com.whereby.app")
+        }
+        return nil
+    }()
+    guard let dedicated else { return nil }
+    return MacMeetingAppIdentity(
+        appName: dedicated.0.isEmpty ? fallbackName : dedicated.0,
+        appId: dedicated.1,
+        browser: false,
+        dedicatedMeetingApp: true)
+}
+
+private func meetingProvider(from context: String?) -> String? {
+    guard let context else { return nil }
+    let value = context.lowercased()
+    if value.contains("meet.google.com") || value.contains("google meet") {
+        return "google_meet"
+    }
+    if value.contains("zoom.us") || value.contains("zoom meeting") {
+        return "zoom"
+    }
+    if value.contains("teams.microsoft")
+        || value.contains("microsoft teams")
+        || value.contains("teams meeting")
+    {
+        return "microsoft_teams"
+    }
+    if value.contains("webex") {
+        return "webex"
+    }
+    if value.contains("slack huddle") || value.contains("huddle | slack") {
+        return "slack_huddle"
+    }
+    if value.contains("whereby") {
+        return "whereby"
+    }
+    if value.contains("gotomeeting") || value.contains("go to meeting") {
+        return "gotomeeting"
+    }
+    return nil
+}
+
+private func foregroundBrowserMeetingContext(
+    frontmostProcessId: pid_t,
+    windows: [MacMeetingWindowSnapshot]
+) -> (provider: String, title: String)? {
+    // CGWindowListCopyWindowInfo returns windows front-to-back. Inspect only
+    // the first normal window owned by the frontmost browser process. If that
+    // window is not a meeting, never fall through to a stale meeting title in
+    // another background window from the same browser family.
+    guard let frontWindow = windows.first(where: {
+        $0.processId == frontmostProcessId && $0.layer == 0
+    }) else {
+        return nil
+    }
+    let title = (frontWindow.title ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !title.isEmpty, let provider = meetingProvider(from: title) else {
+        return nil
+    }
+    return (provider, String(title.prefix(512)))
+}
+
+private func foregroundBrowserMeetingContext(
+    frontmostApplication: NSRunningApplication,
+    identity: MacMeetingAppIdentity
+) -> (provider: String, title: String)? {
+    guard identity.browser,
+          let bundleId = frontmostApplication.bundleIdentifier,
+          normalizedMeetingIdentity(
+            bundleId: bundleId,
+            fallbackName: frontmostApplication.localizedName ?? bundleId)?.appId == identity.appId,
+          let windows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID) as? [[String: Any]]
+    else {
+        return nil
+    }
+
+    let snapshots = windows.compactMap { window -> MacMeetingWindowSnapshot? in
+        guard let processId =
+                (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+              let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue
+        else {
+            return nil
+        }
+        return MacMeetingWindowSnapshot(
+            processId: processId,
+            layer: layer,
+            title: window[kCGWindowName as String] as? String)
+    }
+    return foregroundBrowserMeetingContext(
+        frontmostProcessId: frontmostApplication.processIdentifier,
+        windows: snapshots)
+}
+
+private func dedicatedMeetingProvider(appId: String) -> String? {
+    let value = appId.lowercased()
+    if value.contains("zoom") { return "zoom" }
+    if value.contains("teams") { return "microsoft_teams" }
+    if value.contains("slack") { return "slack_huddle" }
+    if value.contains("webex") { return "webex" }
+    if value.contains("whereby") { return "whereby" }
+    if value.contains("goto") { return "gotomeeting" }
+    return nil
+}
+
+private func audioUInt32Property(
+    objectId: AudioObjectID,
+    selector: AudioObjectPropertySelector
+) -> UInt32? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var value: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(
+        objectId,
+        &address,
+        0,
+        nil,
+        &size,
+        &value) == noErr
+    else {
+        return nil
+    }
+    return value
+}
+
+private func activeAudioProcessObjectIds() -> [AudioObjectID] {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        0,
+        nil,
+        &size) == noErr,
+        size >= UInt32(MemoryLayout<AudioObjectID>.size)
+    else {
+        return []
+    }
+
+    var objects = [AudioObjectID](
+        repeating: kAudioObjectUnknown,
+        count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    let status = objects.withUnsafeMutableBytes { bytes in
+        AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            bytes.baseAddress!)
+    }
+    return status == noErr ? objects : []
+}
+
+private func defaultInputDeviceIsRunning() -> Bool {
+    var defaultAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var deviceId = AudioObjectID(kAudioObjectUnknown)
+    var deviceSize = UInt32(MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &defaultAddress,
+        0,
+        nil,
+        &deviceSize,
+        &deviceId) == noErr,
+        deviceId != kAudioObjectUnknown
+    else {
+        return false
+    }
+
+    var runningAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+        mScope: kAudioDevicePropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain)
+    var running: UInt32 = 0
+    var runningSize = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(
+        deviceId,
+        &runningAddress,
+        0,
+        nil,
+        &runningSize,
+        &running) == noErr
+    else {
+        return false
+    }
+    return running != 0
+}
+
+private final class MacMeetingEvidenceDetector {
+    private var timer: Timer?
+    private var enabled = meetingDetectionEnabledAtLaunch
+
+    func setEnabled(_ enabled: Bool) {
+        if enabled {
+            start()
+        } else {
+            stop()
+        }
+    }
+
+    private func start() {
+        enabled = true
+        guard timer == nil else { return }
+        sample()
+        let timer = Timer(timeInterval: 0.75, repeats: true) { [weak self] _ in
+            self?.sample()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func stop() {
+        enabled = false
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func sample() {
+        guard enabled else { return }
+        let workspace = NSWorkspace.shared
+        let frontmost = workspace.frontmostApplication
+        let frontmostBundleId = frontmost?.bundleIdentifier ?? ""
+        let frontmostIdentity = normalizedMeetingIdentity(
+            bundleId: frontmostBundleId,
+            fallbackName: frontmost?.localizedName ?? "")
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        var aggregates: [String: MacMeetingEvidenceAggregate] = [:]
+
+        for objectId in activeAudioProcessObjectIds() {
+            guard let rawPid = audioUInt32Property(
+                objectId: objectId,
+                selector: kAudioProcessPropertyPID),
+                rawPid > 0
+            else {
+                continue
+            }
+            let inputActive = audioUInt32Property(
+                objectId: objectId,
+                selector: kAudioProcessPropertyIsRunningInput) == 1
+            let outputActive = audioUInt32Property(
+                objectId: objectId,
+                selector: kAudioProcessPropertyIsRunningOutput) == 1
+            guard inputActive || outputActive else { continue }
+
+            let pid = pid_t(rawPid)
+            guard let app = NSRunningApplication(processIdentifier: pid),
+                  let rawBundleId = app.bundleIdentifier,
+                  let identity = normalizedMeetingIdentity(
+                    bundleId: rawBundleId,
+                    fallbackName: app.localizedName ?? rawBundleId)
+            else {
+                continue
+            }
+
+            var aggregate = aggregates[identity.appId] ?? MacMeetingEvidenceAggregate(
+                identity: identity,
+                processId: pid,
+                inputActive: false,
+                outputActive: false)
+            aggregate.processId = pid
+            aggregate.inputActive = aggregate.inputActive || inputActive
+            aggregate.outputActive = aggregate.outputActive || outputActive
+            aggregates[identity.appId] = aggregate
+        }
+
+        // Process objects are unavailable on some macOS/CoreAudio combinations.
+        // The fallback deliberately requires the meeting host to be foreground;
+        // browsers still need a provider-specific window title, so a generic
+        // Chrome microphone user cannot become a meeting candidate.
+        if aggregates.isEmpty,
+           defaultInputDeviceIsRunning(),
+           let frontmost,
+           let frontmostIdentity
+        {
+            let browserContext = frontmostIdentity.browser
+                ? foregroundBrowserMeetingContext(
+                    frontmostApplication: frontmost,
+                    identity: frontmostIdentity)
+                : nil
+            if !frontmostIdentity.browser || browserContext != nil {
+                var evidence: [String: Any] = [
+                    "source": "coreaudio_device_fallback",
+                    "app_name": frontmostIdentity.appName,
+                    "app_id": frontmostIdentity.appId,
+                    "process_id": Int(frontmost.processIdentifier),
+                    "audio_input_active": true,
+                    "audio_output_active": false,
+                    "app_foreground": true,
+                    "browser": frontmostIdentity.browser,
+                    "dedicated_meeting_app": frontmostIdentity.dedicatedMeetingApp,
+                    "observed_at_unix_ms": nowMs,
+                ]
+                if let provider = browserContext?.provider
+                    ?? dedicatedMeetingProvider(appId: frontmostIdentity.appId)
+                {
+                    evidence["provider"] = provider
+                }
+                if let title = browserContext?.title {
+                    evidence["window_title"] = title
+                }
+                emitEvent([
+                    "type": "meeting_evidence_observed",
+                    "evidence": evidence,
+                ])
+            }
+        }
+
+        for aggregate in aggregates.values {
+            let identity = aggregate.identity
+            let isForegroundFamily = frontmostIdentity?.appId == identity.appId
+            let browserContext =
+                identity.browser && isForegroundFamily
+                ? frontmost.flatMap {
+                    foregroundBrowserMeetingContext(
+                        frontmostApplication: $0,
+                        identity: identity)
+                }
+                : nil
+            let provider = browserContext?.provider
+                ?? dedicatedMeetingProvider(appId: identity.appId)
+            var evidence: [String: Any] = [
+                "source": "coreaudio_process",
+                "app_name": identity.appName,
+                "app_id": identity.appId,
+                "process_id": Int(aggregate.processId),
+                "audio_input_active": aggregate.inputActive,
+                "audio_output_active": aggregate.outputActive,
+                "app_foreground": isForegroundFamily,
+                "browser": identity.browser,
+                "dedicated_meeting_app": identity.dedicatedMeetingApp,
+                "observed_at_unix_ms": nowMs,
+            ]
+            if let provider {
+                evidence["provider"] = provider
+            }
+            if let title = browserContext?.title {
+                evidence["window_title"] = title
+            }
+            emitEvent([
+                "type": "meeting_evidence_observed",
+                "evidence": evidence,
+            ])
+        }
+    }
 }
 
 // MARK: - Overlay NSWindow
@@ -5408,6 +5982,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var lastSubmittedAskFingerprint: String?
     private var lastSubmittedAskAt: CFTimeInterval = 0
     private var answerStreamStats: [String: AnswerStreamStats] = [:]
+    private var cardUpdateSequences = CardUpdateSequenceTracker()
     private var audioPulseTimer: Timer?
     private var audioPulseFrame = 0
     private var attachPickerPending = false
@@ -9215,7 +9790,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             ("Ctrl+Option+I", "Toggle click-through"),
             ("Ctrl+Option+H", "History"),
             ("Ctrl+Option+F", "Files"),
-            ("Ctrl+Option+Enter", "Answer"),
+            ("Ctrl+Option+Enter", "Answer / accept meeting banner"),
+            ("Ctrl+Option+X", "Dismiss meeting banner"),
         ]
 
         appendLine(
@@ -10392,7 +10968,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func setActiveSession(id: String?, code: String, title: String) {
-        activeSessionId = id?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextSessionId = id?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if nextSessionId != activeSessionId {
+            cardUpdateSequences.resetAll()
+        }
+        activeSessionId = nextSessionId
         let cleanCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
         activeSessionCode = cleanCode.isEmpty ? activeSessionId.map(shortSessionCode) : cleanCode
         activeSessionTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -11230,6 +11810,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     func resetSessionSurface() {
         autoSendAfterStopWorkItem?.cancel()
         autoSendAfterStopWorkItem = nil
+        cardUpdateSequences.resetAll()
         feed.clear()
         hideSystemToast(immediately: true)
         setContextItems([])
@@ -11261,6 +11842,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func pushCard(_ card: RenderedCard) {
+        cardUpdateSequences.reset(cardId: card.id)
         if shouldRenderAsToast(card) {
             showSystemToast(for: card)
             emitCardRendered(id: card.id)
@@ -11271,8 +11853,48 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeCanvasIfNeeded(card)
     }
 
-    func updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?) {
-        guard let card = feed.update(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact) else {
+    func updateCard(
+        id: String,
+        body: String,
+        done: Bool,
+        costLabel: String?,
+        artifact: OverlayArtifact?,
+        sequence: ParsedUpdateSequence,
+        snapshot: Bool
+    ) {
+        guard cardUpdateSequences.shouldAccept(
+            cardId: id,
+            sequence: sequence,
+            snapshot: snapshot)
+        else {
+            return
+        }
+        let card: RenderedCard
+        if let updated = feed.update(
+            id: id,
+            body: body,
+            done: done,
+            costLabel: costLabel,
+            artifact: artifact)
+        {
+            card = updated
+        } else if snapshot {
+            // A reconnect snapshot can arrive after the native process has
+            // lost its in-memory feed. Recreate the answer card from that
+            // authoritative state instead of silently dropping recovery.
+            let recovered = RenderedCard(
+                id: id,
+                kind: "answer",
+                title: "Bluey",
+                body: body,
+                done: done,
+                costLabel: costLabel,
+                artifact: artifact,
+                attachments: [])
+            trackAnswerStreamPush(recovered)
+            feed.push(recovered)
+            card = recovered
+        } else {
             return
         }
         trackAnswerStreamUpdate(card)
@@ -14757,9 +15379,289 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 }
 
+// MARK: - Meeting banner
+
+private func meetingBannerTimeoutAction() -> String {
+    "expired"
+}
+
+private func meetingBannerAccessibilityAnnouncement(
+    _ payload: MeetingBannerPayload
+) -> String {
+    let provider = payload.provider?
+        .replacingOccurrences(of: "_", with: " ")
+        .capitalized ?? "Meeting"
+    return "\(provider) detected in \(payload.appName). \(payload.reason) "
+        + "Press Control Option Return to start recording, or Control Option X to dismiss."
+}
+
+private final class MeetingBannerPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+private final class MeetingBannerController: NSObject {
+    private let panel: MeetingBannerPanel
+    private let titleLabel = NSTextField(labelWithString: "Meeting detected")
+    private let appLabel = NSTextField(labelWithString: "")
+    private let reasonLabel = NSTextField(wrappingLabelWithString: "")
+    private let countdownLabel = NSTextField(labelWithString: "")
+    private let progress = NSProgressIndicator()
+    private var payload: MeetingBannerPayload?
+    private var timer: Timer?
+    private var deadline = Date.distantPast
+
+    override init() {
+        panel = MeetingBannerPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 154),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false)
+        super.init()
+        configurePanel()
+    }
+
+    deinit {
+        timer?.invalidate()
+    }
+
+    func show(_ payload: MeetingBannerPayload) {
+        guard !payload.candidateId.isEmpty else { return }
+        self.payload = payload
+        titleLabel.stringValue = payload.provider.map {
+            "\($0.replacingOccurrences(of: "_", with: " ").capitalized) detected"
+        } ?? "Meeting detected"
+        appLabel.stringValue = payload.appName
+        reasonLabel.stringValue = payload.reason
+        progress.doubleValue = 100
+        deadline = Date().addingTimeInterval(TimeInterval(payload.timeoutSecs))
+        updateCountdown()
+        placeNearActiveScreen()
+        panel.orderFrontRegardless()
+        announce(payload)
+
+        timer?.invalidate()
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.updateCountdown()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    func hide(candidateId: String? = nil) {
+        if let candidateId,
+           let payload,
+           payload.candidateId != candidateId
+        {
+            return
+        }
+        timer?.invalidate()
+        timer = nil
+        payload = nil
+        panel.orderOut(nil)
+    }
+
+    private func configurePanel() {
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .statusBar
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.collectionBehavior = [
+            .canJoinAllSpaces,
+            .stationary,
+            .ignoresCycle,
+            .fullScreenAuxiliary,
+        ]
+        panel.sharingType = captureVisibleForDebug ? .readOnly : .none
+
+        let root = NSVisualEffectView()
+        root.material = .popover
+        root.blendingMode = .behindWindow
+        root.state = .active
+        root.wantsLayer = true
+        root.layer?.cornerRadius = 18
+        root.layer?.masksToBounds = true
+        root.layer?.borderWidth = 1
+        root.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.35).cgColor
+        panel.contentView = root
+
+        let accent = NSView()
+        accent.wantsLayer = true
+        accent.layer?.backgroundColor = BlueyTheme.green.cgColor
+        accent.layer?.cornerRadius = 3
+        accent.translatesAutoresizingMaskIntoConstraints = false
+
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.textColor = BlueyTheme.text
+        appLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        appLabel.textColor = BlueyTheme.textDim
+        reasonLabel.font = .systemFont(ofSize: 11)
+        reasonLabel.textColor = BlueyTheme.textDim
+        reasonLabel.maximumNumberOfLines = 2
+        countdownLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+        countdownLabel.textColor = BlueyTheme.textDim
+
+        let start = makeButton("Start recording", action: #selector(startRecording))
+        start.contentTintColor = BlueyTheme.panelDeep
+        start.wantsLayer = true
+        start.layer?.backgroundColor = BlueyTheme.green.cgColor
+        start.layer?.cornerRadius = 8
+        let snooze = makeButton("Snooze", action: #selector(snooze))
+        let dismiss = makeButton("Dismiss", action: #selector(dismiss))
+        let more = makeButton("•••", action: #selector(showMore))
+        more.toolTip = "Ignore this app or open meeting settings"
+
+        let header = NSStackView(views: [titleLabel, NSView(), appLabel])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 8
+        let actions = NSStackView(views: [start, snooze, dismiss, more])
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.spacing = 8
+        let footer = NSStackView(views: [countdownLabel, NSView(), actions])
+        footer.orientation = .horizontal
+        footer.alignment = .centerY
+        footer.spacing = 8
+        let body = NSStackView(views: [header, reasonLabel, footer, progress])
+        body.orientation = .vertical
+        body.alignment = .leading
+        body.spacing = 9
+        body.translatesAutoresizingMaskIntoConstraints = false
+        progress.isIndeterminate = false
+        progress.minValue = 0
+        progress.maxValue = 100
+        progress.controlSize = .small
+        progress.style = .bar
+
+        root.addSubview(accent)
+        root.addSubview(body)
+        NSLayoutConstraint.activate([
+            accent.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            accent.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
+            accent.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16),
+            accent.widthAnchor.constraint(equalToConstant: 5),
+            body.leadingAnchor.constraint(equalTo: accent.trailingAnchor, constant: 14),
+            body.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+            body.topAnchor.constraint(equalTo: root.topAnchor, constant: 13),
+            body.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -11),
+            header.widthAnchor.constraint(equalTo: body.widthAnchor),
+            reasonLabel.widthAnchor.constraint(equalTo: body.widthAnchor),
+            footer.widthAnchor.constraint(equalTo: body.widthAnchor),
+            progress.widthAnchor.constraint(equalTo: body.widthAnchor),
+            start.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
+        ])
+    }
+
+    private func makeButton(_ title: String, action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.bezelStyle = .rounded
+        button.font = .systemFont(ofSize: 11, weight: .medium)
+        button.setButtonType(.momentaryPushIn)
+        button.refusesFirstResponder = true
+        return button
+    }
+
+    private func placeNearActiveScreen() {
+        let point = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(point, $0.frame, false) })
+            ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { return }
+        let margin: CGFloat = 18
+        panel.setFrameOrigin(NSPoint(
+            x: visible.maxX - panel.frame.width - margin,
+            y: visible.maxY - panel.frame.height - margin))
+    }
+
+    private func announce(_ payload: MeetingBannerPayload) {
+        panel.setAccessibilityLabel("Bluey meeting detected")
+        NSAccessibility.post(
+            element: panel,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: meetingBannerAccessibilityAnnouncement(payload),
+                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+            ])
+    }
+
+    private func updateCountdown() {
+        guard let payload else {
+            hide()
+            return
+        }
+        let remaining = max(0, deadline.timeIntervalSinceNow)
+        let total = max(1, Double(payload.timeoutSecs))
+        progress.doubleValue = min(100, max(0, remaining / total * 100))
+        countdownLabel.stringValue =
+            "\(payload.confidence)% confidence • closes in \(Int(ceil(remaining)))s"
+        if remaining <= 0 {
+            emitMeetingBannerAction(payload, action: meetingBannerTimeoutAction())
+            hide()
+        }
+    }
+
+    @discardableResult
+    func startFromGlobalShortcut() -> Bool {
+        guard let payload else { return false }
+        emitMeetingBannerAction(payload, action: "start")
+        emitSimple("recording_start_requested")
+        hide()
+        return true
+    }
+
+    @objc private func startRecording() {
+        _ = startFromGlobalShortcut()
+    }
+
+    @discardableResult
+    func dismissFromGlobalShortcut() -> Bool {
+        guard let payload else { return false }
+        emitMeetingBannerAction(payload, action: "dismiss")
+        hide()
+        return true
+    }
+
+    @objc private func dismiss() {
+        _ = dismissFromGlobalShortcut()
+    }
+
+    @objc private func snooze() {
+        guard let payload else { return }
+        emitMeetingBannerAction(payload, action: "snooze")
+        hide()
+    }
+
+    @objc private func showMore(_ sender: NSButton) {
+        guard payload != nil else { return }
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Ignore this app", action: #selector(ignoreApp), keyEquivalent: "")
+        menu.addItem(withTitle: "Meeting settings…", action: #selector(openSettings), keyEquivalent: "")
+        for item in menu.items {
+            item.target = self
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+
+    @objc private func ignoreApp() {
+        guard let payload else { return }
+        emitMeetingBannerAction(payload, action: "ignore")
+        hide()
+    }
+
+    @objc private func openSettings() {
+        guard let payload else { return }
+        emitMeetingBannerAction(payload, action: "settings")
+        hide()
+    }
+}
+
 // MARK: - Coordinator
 
 private final class OverlayApp {
+    var onMeetingDetectionEnabledChanged: ((Bool) -> Void)?
+
     private var pillWindow: OverlayWindow!
     private var expandedWindow: OverlayWindow?
     private var pillView: PillView!
@@ -14789,6 +15691,8 @@ private final class OverlayApp {
     private var stickyExpandedFrame: NSRect?
     private var lastTargetBundleIdentifier: String?
     private var accountUIState: OverlayAccountUIState = .unknown
+    private var meetingDetectionEnabled = meetingDetectionEnabledAtLaunch
+    private let meetingBanner = MeetingBannerController()
 
     /// Pending boot card, if a Boot command arrived before windows materialised.
     private var pendingBoot: (title: String, lines: [String])?
@@ -15030,6 +15934,7 @@ private final class OverlayApp {
         case answer = 6
         case history = 7
         case files = 8
+        case meetingDismiss = 9
     }
 
     private func registerSystemHotKeys() {
@@ -15078,6 +15983,7 @@ private final class OverlayApp {
             (.answer, UInt32(kVK_Return)),
             (.history, UInt32(kVK_ANSI_H)),
             (.files, UInt32(kVK_ANSI_F)),
+            (.meetingDismiss, UInt32(kVK_ANSI_X)),
         ]
         var failures: [String] = []
         for (hotKey, keyCode) in keys {
@@ -15103,6 +16009,12 @@ private final class OverlayApp {
 
     private func handleRegisteredGlobalHotKey(id: UInt32) {
         guard let hotKey = BlueyRegisteredHotKey(rawValue: id) else { return }
+        if hotKey == .answer, meetingBanner.startFromGlobalShortcut() {
+            emitLifecycle(
+                "shortcut_invoked",
+                detail: "source=registered_global action=meeting_start")
+            return
+        }
         switch hotKey {
         case .hideRestore:
             toggleBlueyHiddenFromShortcut()
@@ -15153,6 +16065,12 @@ private final class OverlayApp {
             }
             expandedView?.invokeFilesShortcut()
             emitLifecycle("shortcut_invoked", detail: "source=registered_global action=files")
+        case .meetingDismiss:
+            if meetingBanner.dismissFromGlobalShortcut() {
+                emitLifecycle(
+                    "shortcut_invoked",
+                    detail: "source=registered_global action=meeting_dismiss")
+            }
         }
     }
 
@@ -15222,9 +16140,17 @@ private final class OverlayApp {
             updateExpandedMousePolicy()
             emitLifecycle("shortcut_invoked", detail: "source=global action=files")
             return true
+        case "x":
+            guard meetingBanner.dismissFromGlobalShortcut() else { return false }
+            emitLifecycle("shortcut_invoked", detail: "source=global action=meeting_dismiss")
+            return true
         default:
             let isReturn = event.keyCode == 36 || event.keyCode == 76 || key == "\r" || key == "\n"
             guard isReturn else { return false }
+            if meetingBanner.startFromGlobalShortcut() {
+                emitLifecycle("shortcut_invoked", detail: "source=global action=meeting_start")
+                return true
+            }
             guard expandedModeActive, expandedWindow?.isVisible == true else {
                 expandAndFocusQuestion()
                 return true
@@ -15674,6 +16600,9 @@ private final class OverlayApp {
         let wasCapturing = currentRunState == .listening || currentRunState == .connecting
         let isCapturing = state == .listening || state == .connecting
         currentRunState = state
+        if isCapturing {
+            meetingBanner.hide()
+        }
         if isCapturing && !wasCapturing {
             expandedView?.prepareAutoSendListenCapture()
         }
@@ -15799,6 +16728,24 @@ private final class OverlayApp {
                 idleSecs: idleSecs)
         case .audioAutoStopCountdownCleared:
             expandedView?.clearAudioAutoStopCountdown()
+        case .setMeetingDetectionEnabled(let enabled):
+            meetingDetectionEnabled = enabled
+            if !enabled {
+                meetingBanner.hide()
+            }
+            onMeetingDetectionEnabledChanged?(enabled)
+            emitLifecycle(
+                "meeting_detection",
+                status: enabled ? "enabled" : "disabled")
+        case .showMeetingBanner(let payload):
+            if meetingDetectionEnabled
+                && currentRunState != .listening
+                && currentRunState != .connecting
+            {
+                meetingBanner.show(payload)
+            }
+        case .hideMeetingBanner(let candidateId, _):
+            meetingBanner.hide(candidateId: candidateId)
         case .transcriptPartial(let source, let text):
             let runState = PillRunState(listeningState: "listening")
             setRunState(runState)
@@ -15819,10 +16766,25 @@ private final class OverlayApp {
                 id: card.id, kind: card.kind, title: card.title,
                 body: card.body, done: true, costLabel: card.costLabel,
                 artifact: card.artifact, attachments: card.attachments ?? []))
-        case .updateCard(let id, let body, let done, let costLabel, let artifact):
+        case .updateCard(
+            let id,
+            let body,
+            let done,
+            let costLabel,
+            let artifact,
+            let sequence,
+            let snapshot):
             ensureExpandedWindow()
-            expandedView?.updateCard(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact)
+            expandedView?.updateCard(
+                id: id,
+                body: body,
+                done: done,
+                costLabel: costLabel,
+                artifact: artifact,
+                sequence: sequence,
+                snapshot: snapshot)
         case .shutdown:
+            meetingBanner.hide()
             emitLifecycle("shutdown")
             NSApp.terminate(nil)
         case .unknown:
@@ -16073,12 +17035,229 @@ private func runAuthUIPolicyTests() {
 }
 
 runAuthUIPolicyTests()
+#elseif BLUEY_MEETING_EVIDENCE_TESTS
+private func runMeetingEvidenceTests() {
+    let staleFamilyMeeting = [
+        MacMeetingWindowSnapshot(
+            processId: 200,
+            layer: 0,
+            title: "Weekly planning - Google Meet"),
+        MacMeetingWindowSnapshot(
+            processId: 100,
+            layer: 0,
+            title: "Project notes"),
+        MacMeetingWindowSnapshot(
+            processId: 100,
+            layer: 0,
+            title: "Old stand-up - Google Meet"),
+    ]
+    precondition(foregroundBrowserMeetingContext(
+        frontmostProcessId: 100,
+        windows: staleFamilyMeeting) == nil)
+
+    let foregroundMeeting = [
+        MacMeetingWindowSnapshot(
+            processId: 100,
+            layer: 0,
+            title: "Daily sync - Google Meet"),
+        MacMeetingWindowSnapshot(
+            processId: 100,
+            layer: 0,
+            title: "Background docs"),
+    ]
+    let context = foregroundBrowserMeetingContext(
+        frontmostProcessId: 100,
+        windows: foregroundMeeting)
+    precondition(context?.provider == "google_meet")
+    precondition(context?.title == "Daily sync - Google Meet")
+
+    let overlayAboveGenericWindow = [
+        MacMeetingWindowSnapshot(
+            processId: 100,
+            layer: 4,
+            title: "Google Meet controls"),
+        MacMeetingWindowSnapshot(
+            processId: 100,
+            layer: 0,
+            title: "Inbox"),
+        MacMeetingWindowSnapshot(
+            processId: 100,
+            layer: 0,
+            title: "Stale Google Meet"),
+    ]
+    precondition(foregroundBrowserMeetingContext(
+        frontmostProcessId: 100,
+        windows: overlayAboveGenericWindow) == nil)
+
+    precondition(meetingBannerTimeoutAction() == "expired")
+    precondition(meetingBannerTimeoutAction() != "dismiss")
+
+    let announcement = meetingBannerAccessibilityAnnouncement(MeetingBannerPayload(
+        candidateId: "com.google.Chrome",
+        appName: "Google Chrome",
+        appId: "com.google.Chrome",
+        provider: "google_meet",
+        confidence: 90,
+        reason: "A foreground meeting tab has call audio.",
+        timeoutSecs: 12))
+    precondition(announcement.contains("Google Meet detected in Google Chrome"))
+    precondition(announcement.contains("Control Option Return"))
+    precondition(announcement.contains("Control Option X"))
+    precondition(!meetingDetectionEnabledAtLaunch)
+
+    guard case .setMeetingDetectionEnabled(false) = parseCommand(
+        #"{"type":"set_meeting_detection_enabled","enabled":false}"#)
+    else {
+        preconditionFailure("disabled meeting detection command must parse")
+    }
+    guard case .setMeetingDetectionEnabled(true) = parseCommand(
+        #"{"type":"set_meeting_detection_enabled","enabled":true}"#)
+    else {
+        preconditionFailure("enabled meeting detection command must parse")
+    }
+    guard case .unknown = parseCommand(
+        #"{"type":"set_meeting_detection_enabled"}"#)
+    else {
+        preconditionFailure("meeting detection command requires a boolean enabled field")
+    }
+
+    print("Meeting evidence tests passed")
+}
+
+runMeetingEvidenceTests()
+#elseif BLUEY_OVERLAY_SEQUENCE_PROTOCOL_TESTS
+private func runOverlaySequenceProtocolTests() {
+    let parsed = parseCommand(
+        #"{"type":"update_card","id":"answer-1","body":"hello","done":false,"sequence":7,"snapshot":true}"#)
+    guard case .updateCard(
+        let parsedId,
+        let parsedBody,
+        let parsedDone,
+        _,
+        _,
+        let parsedSequence,
+        let parsedSnapshot) = parsed
+    else {
+        preconditionFailure("update_card must parse")
+    }
+    precondition(parsedId == "answer-1")
+    precondition(parsedBody == "hello")
+    precondition(!parsedDone)
+    precondition(parsedSequence == .value(7))
+    precondition(parsedSnapshot)
+
+    let defaulted = parseCommand(
+        #"{"type":"update_card","id":"answer-2","body":"legacy","done":true}"#)
+    guard case .updateCard(_, _, let defaultDone, _, _, let defaultSequence, let defaultSnapshot)
+        = defaulted
+    else {
+        preconditionFailure("legacy update_card must parse")
+    }
+    precondition(defaultDone)
+    precondition(defaultSequence == .absent)
+    precondition(!defaultSnapshot)
+    precondition(parseUpdateSequence(nil, present: false) == .absent)
+    precondition(parseUpdateSequence(nil, present: true) == .invalid)
+    precondition(parseUpdateSequence(true, present: true) == .invalid)
+    precondition(parseUpdateSequence(-1, present: true) == .invalid)
+    precondition(parseUpdateSequence(1.5, present: true) == .invalid)
+
+    var tracker = CardUpdateSequenceTracker()
+    precondition(tracker.shouldAccept(
+        cardId: "answer-1",
+        sequence: .value(1),
+        snapshot: false))
+    precondition(!tracker.shouldAccept(
+        cardId: "answer-1",
+        sequence: .value(1),
+        snapshot: false))
+    precondition(!tracker.shouldAccept(
+        cardId: "answer-1",
+        sequence: .value(0),
+        snapshot: false))
+    precondition(tracker.shouldAccept(
+        cardId: "answer-1",
+        sequence: .value(3),
+        snapshot: false))
+    precondition(tracker.shouldAccept(
+        cardId: "answer-1",
+        sequence: .value(2),
+        snapshot: true))
+    precondition(!tracker.shouldAccept(
+        cardId: "answer-1",
+        sequence: .value(3),
+        snapshot: false))
+    precondition(tracker.shouldAccept(
+        cardId: "answer-1",
+        sequence: .value(4),
+        snapshot: false))
+    precondition(tracker.shouldAccept(
+        cardId: "answer-2",
+        sequence: .value(0),
+        snapshot: false))
+    precondition(!tracker.shouldAccept(
+        cardId: "",
+        sequence: .value(1),
+        snapshot: true))
+    precondition(!tracker.shouldAccept(
+        cardId: "answer-invalid",
+        sequence: .invalid,
+        snapshot: false))
+
+    precondition(tracker.shouldAccept(
+        cardId: "legacy-answer",
+        sequence: .absent,
+        snapshot: false))
+    precondition(tracker.shouldAccept(
+        cardId: "legacy-answer",
+        sequence: .absent,
+        snapshot: false))
+    precondition(tracker.shouldAccept(
+        cardId: "mixed-answer",
+        sequence: .value(5),
+        snapshot: false))
+    precondition(tracker.shouldAccept(
+        cardId: "mixed-answer",
+        sequence: .absent,
+        snapshot: false))
+    precondition(!tracker.shouldAccept(
+        cardId: "mixed-answer",
+        sequence: .value(4),
+        snapshot: false))
+
+    tracker.reset(cardId: "answer-1")
+    precondition(tracker.shouldAccept(
+        cardId: "answer-1",
+        sequence: .value(1),
+        snapshot: false))
+    tracker.resetAll()
+    precondition(tracker.shouldAccept(
+        cardId: "answer-1",
+        sequence: .value(0),
+        snapshot: false))
+    precondition(tracker.shouldAccept(
+        cardId: "answer-2",
+        sequence: .value(0),
+        snapshot: false))
+
+    print("Overlay sequence protocol tests passed")
+}
+
+runOverlaySequenceProtocolTests()
 #else
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let coord = OverlayApp()
+    private let meetingEvidenceDetector = MacMeetingEvidenceDetector()
     func applicationDidFinishLaunching(_ notification: Notification) {
         connectIpcIfNeeded()
+        coord.onMeetingDetectionEnabledChanged = { [weak self] enabled in
+            self?.meetingEvidenceDetector.setEnabled(enabled)
+        }
         coord.start()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        meetingEvidenceDetector.setEnabled(false)
     }
 }
 

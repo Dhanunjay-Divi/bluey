@@ -246,6 +246,8 @@ pub struct SyncTranscriptSegment {
     pub ts_ms: i64,
     pub is_final: bool,
     #[serde(default)]
+    pub deleted_at_ms: Option<i64>,
+    #[serde(default)]
     pub metadata: serde_json::Value,
 }
 
@@ -279,6 +281,8 @@ pub struct SyncCueResponseRecord {
     #[serde(default)]
     pub artifact_confidence: Option<f32>,
     #[serde(default)]
+    pub deleted_at_ms: Option<i64>,
+    #[serde(default)]
     pub metadata: serde_json::Value,
 }
 
@@ -299,6 +303,8 @@ pub struct SyncContextArtifactRecord {
     pub created_at_ms: i64,
     #[serde(default)]
     pub updated_at_ms: i64,
+    #[serde(default)]
+    pub deleted_at_ms: Option<i64>,
     #[serde(default)]
     pub metadata: serde_json::Value,
 }
@@ -321,6 +327,8 @@ pub struct SyncRagChunkRecord {
     #[serde(default)]
     pub content_hash: Option<String>,
     pub updated_at_ms: i64,
+    #[serde(default)]
+    pub deleted_at_ms: Option<i64>,
     #[serde(default)]
     pub metadata: serde_json::Value,
 }
@@ -357,6 +365,8 @@ pub struct SyncBatchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactObjectResponse {
     pub artifact_id: String,
+    #[serde(default)]
+    pub session_id: String,
     pub object_key: String,
     pub size_bytes: u64,
     pub sha256: String,

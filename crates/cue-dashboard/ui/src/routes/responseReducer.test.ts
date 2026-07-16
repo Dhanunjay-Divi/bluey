@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   applyChunk,
   clearInflight,
+  responseBelongsToSession,
+  shouldApplyResponseLoad,
   type CueResponseChunk,
   type InflightResponse,
   type RouterMeta,
@@ -17,6 +19,7 @@ const chunk = (
   extras: Partial<CueResponseChunk> = {},
 ): CueResponseChunk => ({
   response_id,
+  source_session_id: "session-a",
   partial_text,
   finished,
   kind,
@@ -170,5 +173,25 @@ describe("responseReducer.clearInflight", () => {
     let m = applyChunk(empty(), chunk("text", false));
     m = clearInflight(m, "does-not-exist");
     expect(m.get("r1")?.text).toBe("text");
+  });
+});
+
+describe("response session isolation", () => {
+  it("rejects a delayed A history load after the active session switches to B", () => {
+    const delayedA = { generation: 1, sessionId: "session-a" };
+    const currentB = { generation: 2, sessionId: "session-b" };
+
+    expect(
+      shouldApplyResponseLoad(currentB.generation, currentB.sessionId, delayedA),
+    ).toBe(false);
+    expect(
+      shouldApplyResponseLoad(currentB.generation, currentB.sessionId, currentB),
+    ).toBe(true);
+  });
+
+  it("drops A chunks and finals that arrive after an in-flight switch to B", () => {
+    expect(responseBelongsToSession("session-b", "session-a")).toBe(false);
+    expect(responseBelongsToSession("session-b", "session-b")).toBe(true);
+    expect(responseBelongsToSession(null, "session-a")).toBe(false);
   });
 });

@@ -4,6 +4,12 @@ use uuid::Uuid;
 use crate::cards::CueCardArtifact;
 use crate::clock;
 
+const MAX_ACTIVE_CONVERSATION_TURNS: usize = 80;
+const COMPACTED_ACTIVE_CONVERSATION_TURNS: usize = 64;
+const MAX_CONVERSATION_MEMORY_EPOCHS: usize = 8;
+const MAX_CONVERSATION_MEMORY_EPOCH_CHARS: usize = 12_000;
+const MAX_CONVERSATION_MEMORY_TURN_CHARS: usize = 1_200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Speaker {
@@ -293,6 +299,179 @@ impl ConversationTurn {
     }
 }
 
+/// Bounded, revisioned memory for conversation turns that no longer need to
+/// remain in the hot session tail. This prevents long-running sessions from
+/// silently losing their oldest context while keeping serialized state and
+/// prompt construction bounded.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationMemory {
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub compacted_turn_count: u64,
+    #[serde(default)]
+    pub epochs: Vec<ConversationMemoryEpoch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationMemoryEpoch {
+    pub revision: u64,
+    pub turn_count: u64,
+    pub first_turn_id: Uuid,
+    pub last_turn_id: Uuid,
+    pub first_created_at: String,
+    pub last_created_at: String,
+    pub summary: String,
+}
+
+impl ConversationMemory {
+    pub fn is_empty(&self) -> bool {
+        self.compacted_turn_count == 0 || self.epochs.is_empty()
+    }
+
+    pub fn render_bounded(&self, max_epochs: usize, max_chars: usize) -> String {
+        if self.is_empty() || max_epochs == 0 || max_chars == 0 {
+            return String::new();
+        }
+
+        let start = self.epochs.len().saturating_sub(max_epochs);
+        let mut rendered = format!(
+            "Conversation memory revision {} ({} earlier turns compacted).",
+            self.revision, self.compacted_turn_count
+        );
+        for epoch in &self.epochs[start..] {
+            let section = format!(
+                "\n\nEpoch r{} ({} turns, {} through {}):\n{}",
+                epoch.revision,
+                epoch.turn_count,
+                epoch.first_created_at,
+                epoch.last_created_at,
+                epoch.summary.trim()
+            );
+            append_bounded(&mut rendered, &section, max_chars);
+            if rendered.chars().count() >= max_chars {
+                break;
+            }
+        }
+        rendered
+    }
+
+    /// Merge compacted history recovered from another trusted copy of the
+    /// same session. Exact epoch ranges are deduplicated; divergent ranges
+    /// are retained in chronological order and then compacted to the normal
+    /// bounded representation.
+    pub fn merge_from(&mut self, other: ConversationMemory) {
+        if other.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            *self = other;
+            self.merge_oldest_epochs_until_bounded();
+            return;
+        }
+
+        let local_revision = self.revision;
+        let local_count = self.compacted_turn_count;
+        let other_revision = other.revision;
+        let other_count = other.compacted_turn_count;
+        let mut merged = std::mem::take(&mut self.epochs);
+        for incoming in other.epochs {
+            if let Some(existing) = merged.iter_mut().find(|epoch| {
+                epoch.first_turn_id == incoming.first_turn_id
+                    && epoch.last_turn_id == incoming.last_turn_id
+            }) {
+                if incoming.revision > existing.revision
+                    || (incoming.revision == existing.revision
+                        && incoming.summary.chars().count() > existing.summary.chars().count())
+                {
+                    *existing = incoming;
+                }
+            } else {
+                merged.push(incoming);
+            }
+        }
+        merged.sort_by_key(|epoch| {
+            (
+                epoch.first_created_at.parse::<u128>().unwrap_or(0),
+                epoch.last_created_at.parse::<u128>().unwrap_or(0),
+                epoch.first_turn_id.as_u128(),
+            )
+        });
+        self.revision = local_revision.max(other_revision);
+        self.compacted_turn_count = local_count.max(other_count);
+        self.epochs = merged;
+        self.merge_oldest_epochs_until_bounded();
+    }
+
+    fn compact_turns(&mut self, turns: Vec<ConversationTurn>) {
+        if turns.is_empty() {
+            return;
+        }
+
+        self.revision = self.revision.saturating_add(1);
+        self.compacted_turn_count = self.compacted_turn_count.saturating_add(turns.len() as u64);
+
+        let first = turns.first().expect("non-empty compacted turns");
+        let last = turns.last().expect("non-empty compacted turns");
+        let mut summary = String::new();
+        for (index, turn) in turns.iter().enumerate() {
+            let compacted = compact_conversation_turn(turn);
+            if compacted.is_empty() {
+                continue;
+            }
+            let section = format!("\n{}. {}", index + 1, compacted);
+            append_bounded(&mut summary, &section, MAX_CONVERSATION_MEMORY_EPOCH_CHARS);
+            if summary.chars().count() >= MAX_CONVERSATION_MEMORY_EPOCH_CHARS {
+                break;
+            }
+        }
+
+        self.epochs.push(ConversationMemoryEpoch {
+            revision: self.revision,
+            turn_count: turns.len() as u64,
+            first_turn_id: first.id,
+            last_turn_id: last.id,
+            first_created_at: first.created_at.clone(),
+            last_created_at: last.created_at.clone(),
+            summary: summary.trim().to_string(),
+        });
+        self.merge_oldest_epochs_until_bounded();
+    }
+
+    fn merge_oldest_epochs_until_bounded(&mut self) {
+        while self.epochs.len() > MAX_CONVERSATION_MEMORY_EPOCHS {
+            let first = self.epochs.remove(0);
+            let second = self.epochs.remove(0);
+            let mut summary = format!(
+                "Earlier memory merged from revisions {}-{}.",
+                first.revision, second.revision
+            );
+            append_bounded(
+                &mut summary,
+                &format!("\n\n{}", first.summary.trim()),
+                MAX_CONVERSATION_MEMORY_EPOCH_CHARS / 2,
+            );
+            append_bounded(
+                &mut summary,
+                &format!("\n\n{}", second.summary.trim()),
+                MAX_CONVERSATION_MEMORY_EPOCH_CHARS,
+            );
+            self.epochs.insert(
+                0,
+                ConversationMemoryEpoch {
+                    revision: second.revision,
+                    turn_count: first.turn_count.saturating_add(second.turn_count),
+                    first_turn_id: first.first_turn_id,
+                    last_turn_id: second.last_turn_id,
+                    first_created_at: first.first_created_at,
+                    last_created_at: second.last_created_at,
+                    summary,
+                },
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingRecord {
     pub id: Uuid,
@@ -313,6 +492,8 @@ pub struct MeetingRecord {
     pub context: Vec<ContextArtifact>,
     #[serde(default)]
     pub conversation: Vec<ConversationTurn>,
+    #[serde(default)]
+    pub conversation_memory: ConversationMemory,
     #[serde(default)]
     pub answer_instructions: Option<String>,
     #[serde(default)]
@@ -397,6 +578,7 @@ impl MeetingRecord {
             decisions: Vec::new(),
             context: Vec::new(),
             conversation: Vec::new(),
+            conversation_memory: ConversationMemory::default(),
             answer_instructions: None,
             diagnostics: MeetingDiagnostics::default(),
             summary: None,
@@ -498,9 +680,32 @@ impl MeetingRecord {
 
     pub fn push_conversation_turn(&mut self, turn: ConversationTurn) {
         self.conversation.push(turn);
-        let excess = self.conversation.len().saturating_sub(80);
-        if excess > 0 {
-            self.conversation.drain(0..excess);
+        if self.conversation.len() > MAX_ACTIVE_CONVERSATION_TURNS {
+            let compact_count = self
+                .conversation
+                .len()
+                .saturating_sub(COMPACTED_ACTIVE_CONVERSATION_TURNS);
+            let compacted = self.conversation.drain(0..compact_count).collect();
+            self.conversation_memory.compact_turns(compacted);
+        }
+    }
+
+    /// Restore deterministic chronological order after multi-device union and
+    /// enforce the same hot-tail bound used by ordinary local appends.
+    pub fn normalize_conversation_bounds(&mut self) {
+        self.conversation.sort_by_key(|turn| {
+            (
+                turn.created_at.parse::<u128>().unwrap_or(0),
+                turn.id.as_u128(),
+            )
+        });
+        if self.conversation.len() > MAX_ACTIVE_CONVERSATION_TURNS {
+            let compact_count = self
+                .conversation
+                .len()
+                .saturating_sub(COMPACTED_ACTIVE_CONVERSATION_TURNS);
+            let compacted = self.conversation.drain(0..compact_count).collect();
+            self.conversation_memory.compact_turns(compacted);
         }
     }
 
@@ -557,6 +762,70 @@ fn tail_chars(text: &str, max_chars: usize) -> String {
     chars.into_iter().collect()
 }
 
+fn compact_conversation_turn(turn: &ConversationTurn) -> String {
+    let mut compacted = String::new();
+    let question = compact_memory_text(&turn.question, 360);
+    let answer = compact_memory_text(&turn.answer, 620);
+    if !question.is_empty() {
+        compacted.push_str("User: ");
+        compacted.push_str(&question);
+    }
+    if !answer.is_empty() {
+        if !compacted.is_empty() {
+            compacted.push_str("\nBluey: ");
+        } else {
+            compacted.push_str("Bluey: ");
+        }
+        compacted.push_str(&answer);
+    }
+    if let Some(artifact) = turn
+        .artifact
+        .as_ref()
+        .filter(|artifact| !artifact.body.trim().is_empty())
+    {
+        let artifact_body = compact_memory_text(&artifact.body, 220);
+        if !artifact_body.is_empty() {
+            let artifact_summary = format!(
+                "\nArtifact {:?} \"{}\": {}",
+                artifact.artifact_type,
+                compact_memory_text(&artifact.title, 80),
+                artifact_body
+            );
+            append_bounded(
+                &mut compacted,
+                &artifact_summary,
+                MAX_CONVERSATION_MEMORY_TURN_CHARS,
+            );
+        }
+    }
+    compacted
+}
+
+fn compact_memory_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut compacted: String = normalized
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect();
+    compacted.push('…');
+    compacted
+}
+
+fn append_bounded(target: &mut String, addition: &str, max_chars: usize) {
+    let used = target.chars().count();
+    if used >= max_chars {
+        return;
+    }
+    let remaining = max_chars - used;
+    target.extend(addition.chars().take(remaining));
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingRecap {
     pub meeting_id: Uuid,
@@ -602,6 +871,74 @@ mod tests {
         assert!(text.contains("you: What is the plan?"));
         assert!(text.contains("bluey: Step two is to wire the provider route."));
         assert!(text.contains("provider: Bluey managed"));
+    }
+
+    #[test]
+    fn long_conversation_compacts_old_turns_in_revisioned_epochs() {
+        let mut meeting = MeetingRecord::new(Some("Long session".to_string()));
+        for index in 0..98 {
+            meeting.push_conversation_turn(ConversationTurn::new(
+                format!("Question {index} about the production rollout"),
+                format!("Answer {index} preserves the relevant decision and evidence."),
+                Some("overlay ask".to_string()),
+                Some("Bluey managed".to_string()),
+            ));
+        }
+
+        assert_eq!(
+            meeting.conversation.len(),
+            COMPACTED_ACTIVE_CONVERSATION_TURNS
+        );
+        assert_eq!(meeting.conversation_memory.revision, 2);
+        assert_eq!(meeting.conversation_memory.compacted_turn_count, 34);
+        assert_eq!(meeting.conversation_memory.epochs.len(), 2);
+        assert!(meeting.conversation[0].question.contains("Question 34"));
+
+        let memory = meeting.conversation_memory.render_bounded(8, 24_000);
+        assert!(memory.contains("Conversation memory revision 2"));
+        assert!(memory.contains("Question 0"));
+        assert!(memory.contains("Question 33"));
+    }
+
+    #[test]
+    fn compacted_conversation_memory_is_bounded_and_backward_compatible() {
+        let legacy: MeetingRecord = serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "title": "Legacy",
+            "started_at": "1",
+            "ended_at": null,
+            "transcript": [],
+            "action_items": [],
+            "decisions": [],
+            "summary": null
+        }))
+        .expect("deserialize legacy meeting");
+        assert!(legacy.conversation_memory.is_empty());
+
+        let mut meeting = MeetingRecord::new(Some("Bounded".to_string()));
+        for index in 0..900 {
+            meeting.push_conversation_turn(ConversationTurn::new(
+                format!("Question {index} {}", "context ".repeat(80)),
+                format!("Answer {index} {}", "detail ".repeat(160)),
+                None,
+                None,
+            ));
+        }
+
+        assert!(meeting.conversation_memory.epochs.len() <= MAX_CONVERSATION_MEMORY_EPOCHS);
+        assert!(meeting.conversation_memory.epochs.iter().all(|epoch| epoch
+            .summary
+            .chars()
+            .count()
+            <= MAX_CONVERSATION_MEMORY_EPOCH_CHARS));
+        assert!(
+            meeting
+                .conversation_memory
+                .render_bounded(8, 10_000)
+                .chars()
+                .count()
+                <= 10_000
+        );
     }
 
     #[test]

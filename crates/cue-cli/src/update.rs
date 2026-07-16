@@ -617,12 +617,7 @@ fn relaunch_bluey_bin_from(current_exe: Option<PathBuf>) -> PathBuf {
 }
 
 fn select_artifact(manifest: &ReleaseManifest) -> Option<(String, PlatformArtifact)> {
-    let platform = current_platform();
-    let mut candidates = vec![platform.clone()];
-    if platform == "darwin-arm64" {
-        candidates.push("darwin-universal".to_string());
-    }
-    for candidate in candidates {
+    for candidate in platform_artifact_candidates(env::consts::OS, env::consts::ARCH) {
         if let Some(artifact) = manifest.platforms.get(&candidate) {
             return Some((candidate, artifact.clone()));
         }
@@ -658,12 +653,19 @@ fn installer_extension() -> &'static str {
 }
 
 fn current_platform() -> String {
-    match (env::consts::OS, env::consts::ARCH) {
-        ("macos", "aarch64") => "darwin-arm64".to_string(),
-        ("macos", "x86_64") => "darwin-universal".to_string(),
-        ("windows", "x86_64") => "windows-x86_64".to_string(),
-        ("linux", "x86_64") => "linux-x86_64".to_string(),
-        (os, arch) => format!("{os}-{arch}"),
+    platform_artifact_candidates(env::consts::OS, env::consts::ARCH)
+        .into_iter()
+        .next()
+        .expect("every OS and architecture has a platform identifier")
+}
+
+fn platform_artifact_candidates(os: &str, arch: &str) -> Vec<String> {
+    match (os, arch) {
+        ("macos", "aarch64") => vec!["darwin-arm64".to_string(), "darwin-universal".to_string()],
+        ("macos", "x86_64") => vec!["darwin-x86_64".to_string(), "darwin-universal".to_string()],
+        ("windows", "x86_64") => vec!["windows-x86_64".to_string()],
+        ("linux", "x86_64") => vec!["linux-x86_64".to_string()],
+        (os, arch) => vec![format!("{os}-{arch}")],
     }
 }
 
@@ -867,6 +869,18 @@ mod tests {
             let (platform, _) = select_artifact(&manifest).unwrap();
             assert_eq!(platform, "darwin-universal");
         }
+    }
+
+    #[test]
+    fn selects_arch_specific_macos_artifacts_before_universal_fallback() {
+        assert_eq!(
+            platform_artifact_candidates("macos", "aarch64"),
+            vec!["darwin-arm64", "darwin-universal"]
+        );
+        assert_eq!(
+            platform_artifact_candidates("macos", "x86_64"),
+            vec!["darwin-x86_64", "darwin-universal"]
+        );
     }
 
     #[test]

@@ -44,6 +44,8 @@ pub struct SyncTranscriptSegment {
     pub ts_ms: i64,
     #[serde(default = "default_true")]
     pub is_final: bool,
+    #[serde(default)]
+    pub deleted_at_ms: Option<i64>,
     #[serde(default = "empty_json")]
     pub metadata: serde_json::Value,
 }
@@ -77,6 +79,8 @@ pub struct SyncCueResponseRecord {
     pub artifact_body: Option<String>,
     #[serde(default)]
     pub artifact_confidence: Option<f32>,
+    #[serde(default)]
+    pub deleted_at_ms: Option<i64>,
     #[serde(default = "empty_json")]
     pub metadata: serde_json::Value,
 }
@@ -98,6 +102,8 @@ pub struct SyncContextArtifactRecord {
     pub created_at_ms: i64,
     #[serde(default)]
     pub updated_at_ms: i64,
+    #[serde(default)]
+    pub deleted_at_ms: Option<i64>,
     #[serde(default = "empty_json")]
     pub metadata: serde_json::Value,
 }
@@ -120,6 +126,8 @@ pub struct SyncRagChunkRecord {
     #[serde(default)]
     pub content_hash: Option<String>,
     pub updated_at_ms: i64,
+    #[serde(default)]
+    pub deleted_at_ms: Option<i64>,
     #[serde(default = "empty_json")]
     pub metadata: serde_json::Value,
 }
@@ -194,6 +202,8 @@ pub enum SyncWriteError {
     InvalidAttachmentMetadata { response_id: String },
     #[error("duplicate {entity} id {id} appears in one sync batch")]
     DuplicateIdentity { entity: &'static str, id: String },
+    #[error("session deletion must use the atomic session DELETE endpoint")]
+    UnsupportedSessionTombstone,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -286,6 +296,9 @@ fn validate_incoming_identities(
 ) -> Result<()> {
     let mut session_ids = HashSet::new();
     for record in sessions {
+        if record.deleted_at_ms.is_some() {
+            return Err(SyncWriteError::UnsupportedSessionTombstone.into());
+        }
         if !session_ids.insert(record.session_id.as_str()) {
             return Err(SyncWriteError::DuplicateIdentity {
                 entity: "session",
@@ -343,7 +356,9 @@ fn sync_lock_keys(
 ) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     for session in sessions {
-        keys.insert(format!("session:{}", session.session_id));
+        keys.insert(crate::db::object_uploads::session_advisory_lock_key(
+            &session.session_id,
+        ));
     }
     for identity in child_identities(
         transcript_segments,
@@ -351,14 +366,20 @@ fn sync_lock_keys(
         context_artifacts,
         rag_chunks,
     ) {
-        keys.insert(format!("{}:{}", identity.entity, identity.id));
+        if identity.entity == "context artifact" {
+            keys.insert(crate::db::object_uploads::context_artifact_advisory_lock_key(identity.id));
+        } else {
+            keys.insert(format!("{}:{}", identity.entity, identity.id));
+        }
         if let Some(session_id) = identity.session_id {
-            keys.insert(format!("session:{session_id}"));
+            keys.insert(crate::db::object_uploads::session_advisory_lock_key(
+                session_id,
+            ));
         }
     }
     for response in cue_responses {
         for artifact_id in response_attachment_ids(response)? {
-            keys.insert(format!("context artifact:{artifact_id}"));
+            keys.insert(crate::db::object_uploads::context_artifact_advisory_lock_key(artifact_id));
         }
     }
     Ok(keys)
@@ -808,6 +829,28 @@ fn upsert_batch_sqlite(
         if session_is_tombstoned_sqlite_tx(&tx, account_id, &record.session_id)? {
             continue;
         }
+        if let Some(deleted_at_ms) = record.deleted_at_ms {
+            if apply_child_tombstone_sqlite_tx(
+                &tx,
+                account_id,
+                "transcript",
+                &record.segment_id,
+                &record.session_id,
+                deleted_at_ms,
+            )? {
+                applied_transcript_segments += 1;
+            }
+            continue;
+        }
+        if !child_write_allowed_sqlite_tx(
+            &tx,
+            account_id,
+            "transcript",
+            &record.segment_id,
+            record.ts_ms,
+        )? {
+            continue;
+        }
         let metadata = serde_json::to_string(&record.metadata)?;
         applied_transcript_segments += tx.execute(
             "INSERT INTO cloud_transcript_segments (
@@ -843,6 +886,28 @@ fn upsert_batch_sqlite(
 
     for record in cue_responses {
         if session_is_tombstoned_sqlite_tx(&tx, account_id, &record.session_id)? {
+            continue;
+        }
+        if let Some(deleted_at_ms) = record.deleted_at_ms {
+            if apply_child_tombstone_sqlite_tx(
+                &tx,
+                account_id,
+                "response",
+                &record.response_id,
+                &record.session_id,
+                deleted_at_ms,
+            )? {
+                applied_cue_responses += 1;
+            }
+            continue;
+        }
+        if !child_write_allowed_sqlite_tx(
+            &tx,
+            account_id,
+            "response",
+            &record.response_id,
+            record.ts_ms,
+        )? {
             continue;
         }
         let metadata = serde_json::to_string(&record.metadata)?;
@@ -897,8 +962,30 @@ fn upsert_batch_sqlite(
         if session_is_tombstoned_sqlite_tx(&tx, account_id, &record.session_id)? {
             continue;
         }
-        let metadata = serde_json::to_string(&record.metadata)?;
         let updated_at_ms = record.updated_at_ms.max(record.created_at_ms);
+        if let Some(deleted_at_ms) = record.deleted_at_ms {
+            if apply_child_tombstone_sqlite_tx(
+                &tx,
+                account_id,
+                "context",
+                &record.artifact_id,
+                &record.session_id,
+                deleted_at_ms,
+            )? {
+                applied_context_artifacts += 1;
+            }
+            continue;
+        }
+        if !child_write_allowed_sqlite_tx(
+            &tx,
+            account_id,
+            "context",
+            &record.artifact_id,
+            updated_at_ms,
+        )? {
+            continue;
+        }
+        let metadata = serde_json::to_string(&record.metadata)?;
         let affected = tx.execute(
             "INSERT INTO cloud_context_artifacts (
                 account_id, artifact_id, session_id, kind, title, note, source_uri,
@@ -948,6 +1035,36 @@ fn upsert_batch_sqlite(
             if session_is_tombstoned_sqlite_tx(&tx, account_id, session_id)? {
                 continue;
             }
+        }
+        if let Some(deleted_at_ms) = record.deleted_at_ms {
+            let Some(session_id) = record.session_id.as_deref() else {
+                continue;
+            };
+            if apply_child_tombstone_sqlite_tx(
+                &tx,
+                account_id,
+                "rag",
+                &record.chunk_id,
+                session_id,
+                deleted_at_ms,
+            )? {
+                applied_rag_chunks += 1;
+            }
+            continue;
+        }
+        if record.source_kind == "context"
+            && context_artifact_is_final_deleted_sqlite_tx(&tx, account_id, &record.source_id)?
+        {
+            continue;
+        }
+        if !child_write_allowed_sqlite_tx(
+            &tx,
+            account_id,
+            "rag",
+            &record.chunk_id,
+            record.updated_at_ms,
+        )? {
+            continue;
         }
         let metadata = serde_json::to_string(&record.metadata)?;
         let embedding = record
@@ -1102,6 +1219,28 @@ fn upsert_batch_postgres(
         if session_is_tombstoned_postgres_tx(&mut tx, account_id, &record.session_id)? {
             continue;
         }
+        if let Some(deleted_at_ms) = record.deleted_at_ms {
+            if apply_child_tombstone_postgres_tx(
+                &mut tx,
+                account_id,
+                "transcript",
+                &record.segment_id,
+                &record.session_id,
+                deleted_at_ms,
+            )? {
+                applied_transcript_segments += 1;
+            }
+            continue;
+        }
+        if !child_write_allowed_postgres_tx(
+            &mut tx,
+            account_id,
+            "transcript",
+            &record.segment_id,
+            record.ts_ms,
+        )? {
+            continue;
+        }
         let metadata = serde_json::to_string(&record.metadata)?;
         let is_final = if record.is_final { 1_i32 } else { 0_i32 };
         let speaker = db_text(&record.speaker);
@@ -1148,6 +1287,28 @@ fn upsert_batch_postgres(
 
     for record in cue_responses {
         if session_is_tombstoned_postgres_tx(&mut tx, account_id, &record.session_id)? {
+            continue;
+        }
+        if let Some(deleted_at_ms) = record.deleted_at_ms {
+            if apply_child_tombstone_postgres_tx(
+                &mut tx,
+                account_id,
+                "response",
+                &record.response_id,
+                &record.session_id,
+                deleted_at_ms,
+            )? {
+                applied_cue_responses += 1;
+            }
+            continue;
+        }
+        if !child_write_allowed_postgres_tx(
+            &mut tx,
+            account_id,
+            "response",
+            &record.response_id,
+            record.ts_ms,
+        )? {
             continue;
         }
         let metadata = serde_json::to_string(&record.metadata)?;
@@ -1219,6 +1380,29 @@ fn upsert_batch_postgres(
         if session_is_tombstoned_postgres_tx(&mut tx, account_id, &record.session_id)? {
             continue;
         }
+        let updated_at_ms = record.updated_at_ms.max(record.created_at_ms);
+        if let Some(deleted_at_ms) = record.deleted_at_ms {
+            if apply_child_tombstone_postgres_tx(
+                &mut tx,
+                account_id,
+                "context",
+                &record.artifact_id,
+                &record.session_id,
+                deleted_at_ms,
+            )? {
+                applied_context_artifacts += 1;
+            }
+            continue;
+        }
+        if !child_write_allowed_postgres_tx(
+            &mut tx,
+            account_id,
+            "context",
+            &record.artifact_id,
+            updated_at_ms,
+        )? {
+            continue;
+        }
         let metadata = serde_json::to_string(&record.metadata)?;
         let kind = db_text(&record.kind);
         let title = db_text(&record.title);
@@ -1226,7 +1410,6 @@ fn upsert_batch_postgres(
         let source_uri = db_opt_text(&record.source_uri);
         let content_hash = db_opt_text(&record.content_hash);
         let text_preview = db_opt_text(&record.text_preview);
-        let updated_at_ms = record.updated_at_ms.max(record.created_at_ms);
         let affected = tx
             .execute(
                 "INSERT INTO cloud_context_artifacts (
@@ -1283,6 +1466,40 @@ fn upsert_batch_postgres(
             if session_is_tombstoned_postgres_tx(&mut tx, account_id, session_id)? {
                 continue;
             }
+        }
+        if let Some(deleted_at_ms) = record.deleted_at_ms {
+            let Some(session_id) = record.session_id.as_deref() else {
+                continue;
+            };
+            if apply_child_tombstone_postgres_tx(
+                &mut tx,
+                account_id,
+                "rag",
+                &record.chunk_id,
+                session_id,
+                deleted_at_ms,
+            )? {
+                applied_rag_chunks += 1;
+            }
+            continue;
+        }
+        if record.source_kind == "context"
+            && context_artifact_is_final_deleted_postgres_tx(
+                &mut tx,
+                account_id,
+                &record.source_id,
+            )?
+        {
+            continue;
+        }
+        if !child_write_allowed_postgres_tx(
+            &mut tx,
+            account_id,
+            "rag",
+            &record.chunk_id,
+            record.updated_at_ms,
+        )? {
+            continue;
         }
         let metadata = serde_json::to_string(&record.metadata)?;
         let embedding_json = record
@@ -1391,6 +1608,301 @@ pub fn list_deleted_sessions(
     })
 }
 
+fn apply_child_tombstone_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    child_kind: &str,
+    child_id: &str,
+    session_id: &str,
+    deleted_at_ms: i64,
+) -> Result<bool> {
+    let changed = tx.execute(
+        "INSERT INTO cloud_child_tombstones (
+            account_id, child_kind, child_id, session_id, deleted_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(account_id, child_kind, child_id) DO UPDATE SET
+            session_id=excluded.session_id,
+            deleted_at_ms=excluded.deleted_at_ms
+         WHERE excluded.deleted_at_ms > cloud_child_tombstones.deleted_at_ms",
+        params![account_id, child_kind, child_id, session_id, deleted_at_ms],
+    )?;
+    let deleted = match child_kind {
+        "transcript" => tx.execute(
+            "DELETE FROM cloud_transcript_segments
+             WHERE account_id = ?1
+               AND segment_id = ?2
+               AND session_id = ?3
+               AND ts_ms <= ?4",
+            params![account_id, child_id, session_id, deleted_at_ms],
+        )?,
+        "response" => tx.execute(
+            "DELETE FROM cloud_cue_responses
+             WHERE account_id = ?1
+               AND response_id = ?2
+               AND session_id = ?3
+               AND ts_ms <= ?4",
+            params![account_id, child_id, session_id, deleted_at_ms],
+        )?,
+        "context" => {
+            let deleted = tx.execute(
+                "DELETE FROM cloud_context_artifacts
+                 WHERE account_id = ?1
+                   AND artifact_id = ?2
+                   AND session_id = ?3
+                   AND updated_at_ms <= ?4",
+                params![account_id, child_id, session_id, deleted_at_ms],
+            )?;
+            let surviving = tx
+                .query_row(
+                    "SELECT 1
+                       FROM cloud_context_artifacts
+                      WHERE account_id = ?1 AND artifact_id = ?2 AND session_id = ?3",
+                    params![account_id, child_id, session_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !surviving && (changed > 0 || deleted > 0) {
+                crate::db::object_uploads::schedule_artifact_cleanup_sqlite_tx(
+                    tx,
+                    account_id,
+                    child_id,
+                    deleted_at_ms,
+                )?;
+            }
+            deleted
+        }
+        "rag" => tx.execute(
+            "DELETE FROM cloud_rag_chunks
+             WHERE account_id = ?1
+               AND chunk_id = ?2
+               AND session_id = ?3
+               AND updated_at_ms <= ?4",
+            params![account_id, child_id, session_id, deleted_at_ms],
+        )?,
+        _ => anyhow::bail!("unsupported cloud child tombstone kind"),
+    };
+    Ok(changed > 0 || deleted > 0)
+}
+
+fn child_write_allowed_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    child_kind: &str,
+    child_id: &str,
+    updated_at_ms: i64,
+) -> Result<bool> {
+    if child_kind == "context"
+        && context_artifact_is_final_deleted_sqlite_tx(tx, account_id, child_id)?
+    {
+        return Ok(false);
+    }
+    let deleted_at_ms = tx
+        .query_row(
+            "SELECT deleted_at_ms
+             FROM cloud_child_tombstones
+             WHERE account_id = ?1 AND child_kind = ?2 AND child_id = ?3",
+            params![account_id, child_kind, child_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(deleted_at_ms) = deleted_at_ms else {
+        return Ok(true);
+    };
+    if child_kind == "context" {
+        return Ok(false);
+    }
+    if deleted_at_ms >= updated_at_ms {
+        return Ok(false);
+    }
+    tx.execute(
+        "DELETE FROM cloud_child_tombstones
+         WHERE account_id = ?1 AND child_kind = ?2 AND child_id = ?3",
+        params![account_id, child_kind, child_id],
+    )?;
+    Ok(true)
+}
+
+fn context_artifact_is_final_deleted_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    artifact_id: &str,
+) -> Result<bool> {
+    let tombstoned = tx
+        .query_row(
+            "SELECT 1
+               FROM cloud_child_tombstones
+              WHERE account_id = ?1 AND child_kind = 'context' AND child_id = ?2",
+            params![account_id, artifact_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if tombstoned {
+        return Ok(true);
+    }
+    Ok(tx
+        .query_row(
+            "SELECT 1
+               FROM object_uploads
+              WHERE account_id = ?1
+                AND object_kind = 'artifact'
+                AND logical_id = ?2
+                AND state IN ('delete_pending', 'deleted')",
+            params![account_id, artifact_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn apply_child_tombstone_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    child_kind: &str,
+    child_id: &str,
+    session_id: &str,
+    deleted_at_ms: i64,
+) -> Result<bool> {
+    let changed = tx.execute(
+        "INSERT INTO cloud_child_tombstones (
+            account_id, child_kind, child_id, session_id, deleted_at_ms
+         ) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT(account_id, child_kind, child_id) DO UPDATE SET
+            session_id=excluded.session_id,
+            deleted_at_ms=excluded.deleted_at_ms
+         WHERE excluded.deleted_at_ms > cloud_child_tombstones.deleted_at_ms",
+        &[
+            &account_id,
+            &child_kind,
+            &child_id,
+            &session_id,
+            &deleted_at_ms,
+        ],
+    )?;
+    let deleted = match child_kind {
+        "transcript" => tx.execute(
+            "DELETE FROM cloud_transcript_segments
+             WHERE account_id = $1
+               AND segment_id = $2
+               AND session_id = $3
+               AND ts_ms <= $4",
+            &[&account_id, &child_id, &session_id, &deleted_at_ms],
+        )?,
+        "response" => tx.execute(
+            "DELETE FROM cloud_cue_responses
+             WHERE account_id = $1
+               AND response_id = $2
+               AND session_id = $3
+               AND ts_ms <= $4",
+            &[&account_id, &child_id, &session_id, &deleted_at_ms],
+        )?,
+        "context" => {
+            let deleted = tx.execute(
+                "DELETE FROM cloud_context_artifacts
+                 WHERE account_id = $1
+                   AND artifact_id = $2
+                   AND session_id = $3
+                   AND updated_at_ms <= $4",
+                &[&account_id, &child_id, &session_id, &deleted_at_ms],
+            )?;
+            let surviving = tx
+                .query_opt(
+                    "SELECT 1
+                       FROM cloud_context_artifacts
+                      WHERE account_id = $1 AND artifact_id = $2 AND session_id = $3",
+                    &[&account_id, &child_id, &session_id],
+                )?
+                .is_some();
+            if !surviving && (changed > 0 || deleted > 0) {
+                crate::db::object_uploads::schedule_artifact_cleanup_postgres_tx(
+                    tx,
+                    account_id,
+                    child_id,
+                    deleted_at_ms,
+                )?;
+            }
+            deleted
+        }
+        "rag" => tx.execute(
+            "DELETE FROM cloud_rag_chunks
+             WHERE account_id = $1
+               AND chunk_id = $2
+               AND session_id = $3
+               AND updated_at_ms <= $4",
+            &[&account_id, &child_id, &session_id, &deleted_at_ms],
+        )?,
+        _ => anyhow::bail!("unsupported cloud child tombstone kind"),
+    };
+    Ok(changed > 0 || deleted > 0)
+}
+
+fn child_write_allowed_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    child_kind: &str,
+    child_id: &str,
+    updated_at_ms: i64,
+) -> Result<bool> {
+    if child_kind == "context"
+        && context_artifact_is_final_deleted_postgres_tx(tx, account_id, child_id)?
+    {
+        return Ok(false);
+    }
+    let deleted_at_ms = tx
+        .query_opt(
+            "SELECT deleted_at_ms
+             FROM cloud_child_tombstones
+             WHERE account_id = $1 AND child_kind = $2 AND child_id = $3",
+            &[&account_id, &child_kind, &child_id],
+        )?
+        .map(|row| row.get::<_, i64>(0));
+    let Some(deleted_at_ms) = deleted_at_ms else {
+        return Ok(true);
+    };
+    if child_kind == "context" {
+        return Ok(false);
+    }
+    if deleted_at_ms >= updated_at_ms {
+        return Ok(false);
+    }
+    tx.execute(
+        "DELETE FROM cloud_child_tombstones
+         WHERE account_id = $1 AND child_kind = $2 AND child_id = $3",
+        &[&account_id, &child_kind, &child_id],
+    )?;
+    Ok(true)
+}
+
+fn context_artifact_is_final_deleted_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    artifact_id: &str,
+) -> Result<bool> {
+    let tombstoned = tx
+        .query_opt(
+            "SELECT 1
+               FROM cloud_child_tombstones
+              WHERE account_id = $1 AND child_kind = 'context' AND child_id = $2",
+            &[&account_id, &artifact_id],
+        )?
+        .is_some();
+    if tombstoned {
+        return Ok(true);
+    }
+    Ok(tx
+        .query_opt(
+            "SELECT 1
+               FROM object_uploads
+              WHERE account_id = $1
+                AND object_kind = 'artifact'
+                AND logical_id = $2
+                AND state IN ('delete_pending', 'deleted')",
+            &[&account_id, &artifact_id],
+        )?
+        .is_some())
+}
+
 pub fn tombstone_session(pool: &DbPool, account_id: &str, session_id: &str) -> Result<()> {
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => tombstone_session_sqlite(pool, account_id, session_id),
@@ -1488,7 +2000,7 @@ fn tombstone_session_postgres(pool: &DbPool, account_id: &str, session_id: &str)
     let mut tx = conn
         .transaction()
         .context("begin postgres session tombstone tx")?;
-    let lock_key = format!("session:{session_id}");
+    let lock_key = crate::db::object_uploads::session_advisory_lock_key(session_id);
     tx.query(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))",
         &[&lock_key],
@@ -1824,6 +2336,7 @@ fn load_context_artifact_sqlite(
                 text_preview: row.get(7)?,
                 created_at_ms: row.get(8)?,
                 updated_at_ms: row.get(9)?,
+                deleted_at_ms: None,
                 metadata: parse_json(&metadata),
             })
         },
@@ -1858,6 +2371,7 @@ fn load_context_artifact_postgres(
             text_preview: row.try_get(7)?,
             created_at_ms: row.try_get(8)?,
             updated_at_ms: row.try_get(9)?,
+            deleted_at_ms: None,
             metadata: parse_json(&metadata),
         })
     })
@@ -2046,6 +2560,7 @@ fn load_transcripts(
             end_ms: row.get(6)?,
             ts_ms: row.get(7)?,
             is_final: row.get::<_, i64>(8)? != 0,
+            deleted_at_ms: None,
             metadata: parse_json(&metadata),
         })
     })?;
@@ -2085,6 +2600,7 @@ fn load_responses(
             artifact_type: row.get(13)?,
             artifact_body: row.get(14)?,
             artifact_confidence: row.get(15)?,
+            deleted_at_ms: None,
             metadata: parse_json(&metadata),
         })
     })?;
@@ -2117,6 +2633,7 @@ fn load_context(
             text_preview: row.get(7)?,
             created_at_ms: row.get(8)?,
             updated_at_ms: row.get(9)?,
+            deleted_at_ms: None,
             metadata: parse_json(&metadata),
         })
     })?;
@@ -2180,6 +2697,7 @@ fn load_transcripts_pg(
                 end_ms: row.try_get(6)?,
                 ts_ms: row.try_get(7)?,
                 is_final: is_final != 0,
+                deleted_at_ms: None,
                 metadata: parse_json(&metadata),
             })
         })
@@ -2221,6 +2739,7 @@ fn load_responses_pg(
                 artifact_type: row.try_get(13)?,
                 artifact_body: row.try_get(14)?,
                 artifact_confidence: artifact_confidence.map(|v| v as f32),
+                deleted_at_ms: None,
                 metadata: parse_json(&metadata),
             })
         })
@@ -2254,6 +2773,7 @@ fn load_context_pg(
                 text_preview: row.try_get(7)?,
                 created_at_ms: row.try_get(8)?,
                 updated_at_ms: row.try_get(9)?,
+                deleted_at_ms: None,
                 metadata: parse_json(&metadata),
             })
         })
@@ -2417,6 +2937,7 @@ mod tests {
                 end_ms: None,
                 ts_ms: 2,
                 is_final: true,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
             &[SyncCueResponseRecord {
@@ -2436,6 +2957,7 @@ mod tests {
                 artifact_type: Some("system_design".into()),
                 artifact_body: Some("CACHE\n-----".into()),
                 artifact_confidence: Some(0.9),
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
             &[],
@@ -2451,6 +2973,7 @@ mod tests {
                 token_count: Some(6),
                 content_hash: None,
                 updated_at_ms: 4,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
         )
@@ -2473,6 +2996,429 @@ mod tests {
         let matches = query_rag(&pool, account_id, "cache", Some(&[1.0, 0.0]), 5).unwrap();
         assert_eq!(matches[0].chunk_id, "c1");
         assert!(matches[0].score > 0.8);
+    }
+
+    #[test]
+    fn child_tombstones_remove_all_child_records_and_enforce_newer_writes() {
+        use crate::db::object_uploads::{
+            mark_upload_ready, reserve_upload, NewObjectUpload, ObjectKind, StorageScope,
+        };
+        use crate::object_storage::{sha256_hex, UploadLimits};
+
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_child_delete";
+        insert_test_account(&pool, account_id, "child-delete@example.com");
+        let session = test_session("session-child-delete", 10);
+        let transcript = SyncTranscriptSegment {
+            segment_id: "segment-private".into(),
+            session_id: session.session_id.clone(),
+            speaker: "user".into(),
+            source: "microphone".into(),
+            text: "private transcript text".into(),
+            start_ms: Some(0),
+            end_ms: Some(1000),
+            ts_ms: 10,
+            is_final: true,
+            deleted_at_ms: None,
+            metadata: serde_json::json!({}),
+        };
+        let response = SyncCueResponseRecord {
+            response_id: "response-private".into(),
+            session_id: session.session_id.clone(),
+            kind: "answer".into(),
+            text: "private response text".into(),
+            source_text: Some("private question".into()),
+            ts_ms: 10,
+            provider: Some("test".into()),
+            model: Some("test".into()),
+            lane: None,
+            task_type: None,
+            cost_cents: None,
+            balance_cents_after: None,
+            cost_label: None,
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
+            deleted_at_ms: None,
+            metadata: serde_json::json!({}),
+        };
+        let context = SyncContextArtifactRecord {
+            artifact_id: "artifact-private".into(),
+            session_id: session.session_id.clone(),
+            kind: "document".into(),
+            title: "Private context".into(),
+            note: None,
+            source_uri: Some("bluey://artifact/artifact-private".into()),
+            content_hash: None,
+            text_preview: Some("private context text".into()),
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            deleted_at_ms: None,
+            metadata: serde_json::json!({}),
+        };
+        upsert_batch(
+            &pool,
+            account_id,
+            std::slice::from_ref(&session),
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let object_hash = sha256_hex("private context bytes");
+        let object_reservation = reserve_upload(
+            &pool,
+            &NewObjectUpload {
+                account_id: account_id.into(),
+                object_kind: ObjectKind::Artifact,
+                logical_id: context.artifact_id.clone(),
+                session_id: Some(session.session_id.clone()),
+                storage_scope: StorageScope::Artifact,
+                object_key: format!(
+                    "objects/accounts/{account_id}/{}/{object_hash}",
+                    context.artifact_id
+                ),
+                size_bytes: 21,
+                sha256: object_hash,
+                content_type: "text/plain".into(),
+                expires_at_ms: 86_400_010,
+                metadata_json: serde_json::json!({}),
+                now_ms: 10,
+                limits: UploadLimits {
+                    max_object_bytes: 100,
+                    max_account_bytes: 1_000,
+                    max_daily_bytes: 1_000,
+                    max_account_objects: 10,
+                },
+            },
+        )
+        .unwrap();
+        mark_upload_ready(&pool, &object_reservation.upload.id, 11).unwrap();
+        let orphan_artifact_id = "artifact-uploaded-before-metadata";
+        let orphan_hash = sha256_hex("uploaded before metadata");
+        let orphan_reservation = reserve_upload(
+            &pool,
+            &NewObjectUpload {
+                account_id: account_id.into(),
+                object_kind: ObjectKind::Artifact,
+                logical_id: orphan_artifact_id.into(),
+                session_id: Some(session.session_id.clone()),
+                storage_scope: StorageScope::Artifact,
+                object_key: format!(
+                    "objects/accounts/{account_id}/{orphan_artifact_id}/{orphan_hash}"
+                ),
+                size_bytes: 24,
+                sha256: orphan_hash,
+                content_type: "text/plain".into(),
+                expires_at_ms: 86_400_010,
+                metadata_json: serde_json::json!({}),
+                now_ms: 10,
+                limits: UploadLimits {
+                    max_object_bytes: 100,
+                    max_account_bytes: 1_000,
+                    max_daily_bytes: 1_000,
+                    max_account_objects: 10,
+                },
+            },
+        )
+        .unwrap();
+        mark_upload_ready(&pool, &orphan_reservation.upload.id, 11).unwrap();
+        let rag = SyncRagChunkRecord {
+            chunk_id: "session-child-delete:context:artifact-private:0".into(),
+            session_id: Some(session.session_id.clone()),
+            source_kind: "context".into(),
+            source_id: context.artifact_id.clone(),
+            chunk_index: 0,
+            text: "private context text".into(),
+            embedding: Some(vec![1.0, 0.0]),
+            embedding_model: Some("test".into()),
+            token_count: None,
+            content_hash: None,
+            updated_at_ms: 10,
+            deleted_at_ms: None,
+            metadata: serde_json::json!({}),
+        };
+        upsert_batch(
+            &pool,
+            account_id,
+            std::slice::from_ref(&session),
+            std::slice::from_ref(&transcript),
+            std::slice::from_ref(&response),
+            std::slice::from_ref(&context),
+            std::slice::from_ref(&rag),
+        )
+        .unwrap();
+        let initial_bundle = load_session(&pool, account_id, &session.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial_bundle.transcript_segments.len(), 1);
+        assert_eq!(initial_bundle.cue_responses.len(), 1);
+        assert_eq!(initial_bundle.context_artifacts.len(), 1);
+        assert_eq!(
+            query_rag(&pool, account_id, "private", Some(&[1.0, 0.0]), 5)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut transcript_tombstone = transcript.clone();
+        transcript_tombstone.text.clear();
+        transcript_tombstone.ts_ms = 20;
+        transcript_tombstone.deleted_at_ms = Some(20);
+        let mut response_tombstone = response.clone();
+        response_tombstone.text.clear();
+        response_tombstone.source_text = None;
+        response_tombstone.ts_ms = 20;
+        response_tombstone.deleted_at_ms = Some(20);
+        let mut context_tombstone = context.clone();
+        context_tombstone.text_preview = None;
+        context_tombstone.updated_at_ms = 20;
+        context_tombstone.deleted_at_ms = Some(20);
+        let orphan_context_tombstone = SyncContextArtifactRecord {
+            artifact_id: orphan_artifact_id.into(),
+            session_id: session.session_id.clone(),
+            kind: "document".into(),
+            title: "Upload without metadata".into(),
+            note: None,
+            source_uri: None,
+            content_hash: None,
+            text_preview: None,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            deleted_at_ms: Some(20),
+            metadata: serde_json::json!({}),
+        };
+        let mut rag_tombstone = rag.clone();
+        rag_tombstone.text.clear();
+        rag_tombstone.embedding = None;
+        rag_tombstone.updated_at_ms = 20;
+        rag_tombstone.deleted_at_ms = Some(20);
+        upsert_batch(
+            &pool,
+            account_id,
+            &[],
+            &[transcript_tombstone],
+            &[response_tombstone],
+            &[context_tombstone, orphan_context_tombstone],
+            &[rag_tombstone],
+        )
+        .unwrap();
+
+        let bundle = load_session(&pool, account_id, &session.session_id)
+            .unwrap()
+            .unwrap();
+        assert!(bundle.transcript_segments.is_empty());
+        assert!(bundle.cue_responses.is_empty());
+        assert!(bundle.context_artifacts.is_empty());
+        assert!(
+            query_rag(&pool, account_id, "private", Some(&[1.0, 0.0]), 5)
+                .unwrap()
+                .is_empty()
+        );
+        let object_lifecycle: (String, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT u.state, o.state
+                   FROM object_uploads u
+                   JOIN object_storage_outbox o
+                     ON o.upload_id = u.id AND o.operation = 'delete'
+                  WHERE u.id = ?1",
+                params![object_reservation.upload.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            object_lifecycle,
+            ("delete_pending".into(), "pending".into())
+        );
+        let orphan_object_lifecycle: (String, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT u.state, o.state
+                   FROM object_uploads u
+                   JOIN object_storage_outbox o
+                     ON o.upload_id = u.id AND o.operation = 'delete'
+                  WHERE u.id = ?1",
+                params![orphan_reservation.upload.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_object_lifecycle,
+            ("delete_pending".into(), "pending".into())
+        );
+
+        // A delayed upload from another device cannot resurrect content that
+        // predates the tombstone.
+        upsert_batch(
+            &pool,
+            account_id,
+            &[],
+            std::slice::from_ref(&transcript),
+            std::slice::from_ref(&response),
+            std::slice::from_ref(&context),
+            std::slice::from_ref(&rag),
+        )
+        .unwrap();
+        let stale_bundle = load_session(&pool, account_id, &session.session_id)
+            .unwrap()
+            .unwrap();
+        assert!(stale_bundle.transcript_segments.is_empty());
+        assert!(stale_bundle.cue_responses.is_empty());
+        assert!(stale_bundle.context_artifacts.is_empty());
+        assert!(
+            query_rag(&pool, account_id, "private", Some(&[1.0, 0.0]), 5)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Ordinary text records retain last-write-wins, but a deleted context
+        // artifact id is final. Reusing it could publish metadata or RAG text
+        // after its durable object has already entered deletion.
+        let mut newer_transcript = transcript;
+        newer_transcript.text = "newer transcript text".into();
+        newer_transcript.ts_ms = 30;
+        let mut newer_response = response;
+        newer_response.text = "newer response text".into();
+        newer_response.ts_ms = 30;
+        let mut newer_context = context;
+        newer_context.text_preview = Some("newer context text".into());
+        newer_context.updated_at_ms = 30;
+        let mut newer_rag = rag;
+        newer_rag.text = "newer context text".into();
+        newer_rag.updated_at_ms = 30;
+        upsert_batch(
+            &pool,
+            account_id,
+            &[],
+            &[newer_transcript],
+            &[newer_response],
+            &[newer_context],
+            &[newer_rag],
+        )
+        .unwrap();
+        let newer_bundle = load_session(&pool, account_id, &session.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            newer_bundle.transcript_segments[0].text,
+            "newer transcript text"
+        );
+        assert_eq!(newer_bundle.cue_responses[0].text, "newer response text");
+        assert!(newer_bundle.context_artifacts.is_empty());
+        assert!(
+            query_rag(&pool, account_id, "newer", Some(&[1.0, 0.0]), 5)
+                .unwrap()
+                .is_empty(),
+            "RAG derived from a finally deleted context id must not resurrect"
+        );
+    }
+
+    #[test]
+    fn delete_pending_object_prevents_metadata_only_context_resurrection() {
+        use crate::db::object_uploads::{
+            mark_upload_ready, reserve_upload, schedule_artifact_cleanup_sqlite_tx,
+            NewObjectUpload, ObjectKind, StorageScope,
+        };
+        use crate::object_storage::{sha256_hex, UploadLimits};
+
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_final_context_delete";
+        let session = test_session("session-final-context-delete", 10);
+        let artifact_id = "artifact-final-context-delete";
+        insert_test_account(&pool, account_id, "final-context@example.test");
+        upsert_batch(
+            &pool,
+            account_id,
+            std::slice::from_ref(&session),
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let hash = sha256_hex("private bytes");
+        let reservation = reserve_upload(
+            &pool,
+            &NewObjectUpload {
+                account_id: account_id.into(),
+                object_kind: ObjectKind::Artifact,
+                logical_id: artifact_id.into(),
+                session_id: Some(session.session_id.clone()),
+                storage_scope: StorageScope::Artifact,
+                object_key: format!("objects/accounts/{account_id}/{artifact_id}/{hash}"),
+                size_bytes: 13,
+                sha256: hash.clone(),
+                content_type: "text/plain".into(),
+                expires_at_ms: 86_400_010,
+                metadata_json: serde_json::json!({}),
+                now_ms: 10,
+                limits: UploadLimits {
+                    max_object_bytes: 100,
+                    max_account_bytes: 1_000,
+                    max_daily_bytes: 1_000,
+                    max_account_objects: 10,
+                },
+            },
+        )
+        .unwrap();
+        mark_upload_ready(&pool, &reservation.upload.id, 11).unwrap();
+        {
+            let mut conn = pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            schedule_artifact_cleanup_sqlite_tx(&tx, account_id, artifact_id, 20).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let context = SyncContextArtifactRecord {
+            artifact_id: artifact_id.into(),
+            session_id: session.session_id.clone(),
+            kind: "document".into(),
+            title: "Metadata without durable bytes".into(),
+            note: None,
+            source_uri: None,
+            content_hash: Some(hash),
+            text_preview: Some("must not return".into()),
+            created_at_ms: 10,
+            updated_at_ms: 30,
+            deleted_at_ms: None,
+            metadata: serde_json::json!({
+                "object_key": reservation.upload.object_key,
+                "object_size_bytes": reservation.upload.size_bytes,
+            }),
+        };
+        let rag = SyncRagChunkRecord {
+            chunk_id: "rag-final-context-delete".into(),
+            session_id: Some(session.session_id.clone()),
+            source_kind: "context".into(),
+            source_id: artifact_id.into(),
+            chunk_index: 0,
+            text: "must not return".into(),
+            embedding: None,
+            embedding_model: None,
+            token_count: None,
+            content_hash: None,
+            updated_at_ms: 30,
+            deleted_at_ms: None,
+            metadata: serde_json::json!({}),
+        };
+        let counts = upsert_batch(&pool, account_id, &[], &[], &[], &[context], &[rag]).unwrap();
+        assert_eq!(counts.context_artifacts, 0);
+        assert_eq!(counts.rag_chunks, 0);
+        assert!(load_session(&pool, account_id, &session.session_id)
+            .unwrap()
+            .unwrap()
+            .context_artifacts
+            .is_empty());
+        assert!(query_rag(&pool, account_id, "must not return", None, 5)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2538,6 +3484,7 @@ mod tests {
                 artifact_type: None,
                 artifact_body: None,
                 artifact_confidence: None,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
             &[],
@@ -2586,6 +3533,7 @@ mod tests {
             end_ms: None,
             ts_ms,
             is_final: true,
+            deleted_at_ms: None,
             metadata: serde_json::json!({"version": text}),
         };
         let response = |text: &str, ts_ms: i64| SyncCueResponseRecord {
@@ -2605,6 +3553,7 @@ mod tests {
             artifact_type: None,
             artifact_body: None,
             artifact_confidence: None,
+            deleted_at_ms: None,
             metadata: serde_json::json!({"version": text}),
         };
         let context = |title: &str, updated_at_ms: i64| SyncContextArtifactRecord {
@@ -2618,6 +3567,7 @@ mod tests {
             text_preview: Some(title.into()),
             created_at_ms: 1,
             updated_at_ms,
+            deleted_at_ms: None,
             metadata: serde_json::json!({"version": title}),
         };
         let rag = |text: &str, updated_at_ms: i64| SyncRagChunkRecord {
@@ -2632,6 +3582,7 @@ mod tests {
             token_count: None,
             content_hash: None,
             updated_at_ms,
+            deleted_at_ms: None,
             metadata: serde_json::json!({"version": text}),
         };
 
@@ -2745,6 +3696,7 @@ mod tests {
             artifact_type: None,
             artifact_body: None,
             artifact_confidence: None,
+            deleted_at_ms: None,
             metadata: serde_json::json!({}),
         };
         upsert_batch(
@@ -2761,6 +3713,7 @@ mod tests {
                 end_ms: None,
                 ts_ms: 10,
                 is_final: true,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
             std::slice::from_ref(&response),
@@ -2775,6 +3728,7 @@ mod tests {
                 text_preview: Some("private text".into()),
                 created_at_ms: 10,
                 updated_at_ms: 10,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
             &[SyncRagChunkRecord {
@@ -2789,6 +3743,7 @@ mod tests {
                 token_count: None,
                 content_hash: None,
                 updated_at_ms: 10,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
         )
@@ -2851,6 +3806,28 @@ mod tests {
     }
 
     #[test]
+    fn batch_session_tombstone_is_rejected_before_partial_deletion() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_batch_delete_rejected";
+        insert_test_account(&pool, account_id, "batch-delete@example.test");
+        let mut session = test_session("session-batch-delete", 20);
+        session.status = "deleted".into();
+        session.deleted_at_ms = Some(20);
+
+        let error = upsert_batch(&pool, account_id, &[session], &[], &[], &[], &[])
+            .expect_err("batch deletion must use the atomic DELETE path");
+        assert!(matches!(
+            error.downcast_ref::<SyncWriteError>(),
+            Some(SyncWriteError::UnsupportedSessionTombstone)
+        ));
+        assert!(list_sessions(&pool, account_id, 10).unwrap().is_empty());
+        assert!(list_deleted_sessions(&pool, account_id, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn artifact_upload_is_linked_and_delete_is_enqueued_with_session_tombstone() {
         use crate::db::object_uploads::{
             mark_upload_ready, reserve_upload, NewObjectUpload, ObjectKind, StorageScope,
@@ -2871,6 +3848,26 @@ mod tests {
             .unwrap();
 
         let created_at_ms = now_ms();
+        upsert_batch(
+            &pool,
+            account_id,
+            &[SyncSessionRecord {
+                session_id: session_id.clone(),
+                title: "Object session".into(),
+                status: "active".into(),
+                created_at_ms,
+                updated_at_ms: created_at_ms,
+                last_active_at_ms: None,
+                answer_style: None,
+                metadata: serde_json::json!({}),
+                deleted_at_ms: None,
+            }],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
         let hash = sha256_hex("artifact bytes");
         let reservation = reserve_upload(
             &pool,
@@ -2878,7 +3875,7 @@ mod tests {
                 account_id: account_id.into(),
                 object_kind: ObjectKind::Artifact,
                 logical_id: artifact_id.clone(),
-                session_id: None,
+                session_id: Some(session_id.clone()),
                 storage_scope: StorageScope::Artifact,
                 object_key: format!("objects/accounts/{account_id}/{artifact_id}/{hash}"),
                 size_bytes: 14,
@@ -2897,6 +3894,42 @@ mod tests {
         )
         .unwrap();
         mark_upload_ready(&pool, &reservation.upload.id, created_at_ms + 1).unwrap();
+
+        // This second upload intentionally never receives context metadata,
+        // modeling a crash between durable object reservation and batch sync.
+        let orphan_artifact_id = uuid::Uuid::new_v4().to_string();
+        let orphan_hash = sha256_hex("orphaned artifact bytes");
+        let orphan = reserve_upload(
+            &pool,
+            &NewObjectUpload {
+                account_id: account_id.into(),
+                object_kind: ObjectKind::Artifact,
+                logical_id: orphan_artifact_id.clone(),
+                session_id: Some(session_id.clone()),
+                storage_scope: StorageScope::Artifact,
+                object_key: format!(
+                    "objects/accounts/{account_id}/{orphan_artifact_id}/{orphan_hash}"
+                ),
+                size_bytes: 23,
+                sha256: orphan_hash,
+                content_type: "text/plain".into(),
+                expires_at_ms: created_at_ms + 86_400_000,
+                metadata_json: serde_json::json!({}),
+                now_ms: created_at_ms,
+                limits: UploadLimits {
+                    max_object_bytes: 100,
+                    max_account_bytes: 1_000,
+                    max_daily_bytes: 1_000,
+                    max_account_objects: 10,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            orphan.upload.session_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        mark_upload_ready(&pool, &orphan.upload.id, created_at_ms + 1).unwrap();
 
         upsert_batch(
             &pool,
@@ -2925,6 +3958,7 @@ mod tests {
                 text_preview: None,
                 created_at_ms,
                 updated_at_ms: created_at_ms,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
             &[],
@@ -2956,6 +3990,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lifecycle, ("delete_pending".into(), "pending".into()));
+        let orphan_lifecycle: (String, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT u.state, o.state
+                   FROM object_uploads u
+                   JOIN object_storage_outbox o
+                     ON o.upload_id = u.id AND o.operation = 'delete'
+                  WHERE u.id = ?1",
+                rusqlite::params![orphan.upload.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_lifecycle,
+            ("delete_pending".into(), "pending".into()),
+            "the parent-bound reservation remains deletable without metadata"
+        );
     }
 
     #[test]
@@ -3017,6 +4069,7 @@ mod tests {
             end_ms: Some(2),
             ts_ms: 12,
             is_final: true,
+            deleted_at_ms: None,
             metadata: serde_json::json!({}),
         };
         upsert_batch(
@@ -3081,6 +4134,7 @@ mod tests {
                 text_preview: Some("owned".into()),
                 created_at_ms: 10,
                 updated_at_ms: 10,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
             &[],
@@ -3108,6 +4162,7 @@ mod tests {
                 artifact_type: None,
                 artifact_body: None,
                 artifact_confidence: None,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({"attachment_ids": ["owned-attachment"]}),
             }],
             &[],
@@ -3140,6 +4195,7 @@ mod tests {
             end_ms: Some(202),
             ts_ms: 20,
             is_final: true,
+            deleted_at_ms: None,
             metadata: serde_json::json!({"stt_provider": "deepgram", "channel": 2}),
         };
         let context = SyncContextArtifactRecord {
@@ -3153,6 +4209,7 @@ mod tests {
             text_preview: Some("retry context".into()),
             created_at_ms: 30,
             updated_at_ms: 30,
+            deleted_at_ms: None,
             metadata: serde_json::json!({"processing_status": "ready"}),
         };
         let response = SyncCueResponseRecord {
@@ -3172,6 +4229,7 @@ mod tests {
             artifact_type: Some("code".into()),
             artifact_body: Some("fn retry() {}".into()),
             artifact_confidence: Some(0.9),
+            deleted_at_ms: None,
             metadata: serde_json::json!({
                 "attachment_ids": ["retry-artifact"],
                 "canvas_artifact_id": "retry-canvas"
@@ -3189,6 +4247,7 @@ mod tests {
             token_count: None,
             content_hash: None,
             updated_at_ms: 40,
+            deleted_at_ms: None,
             metadata: serde_json::json!({}),
         };
 
@@ -3257,6 +4316,7 @@ mod tests {
                 end_ms: None,
                 ts_ms: 20,
                 is_final: true,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
             &[SyncCueResponseRecord {
@@ -3276,6 +4336,7 @@ mod tests {
                 artifact_type: None,
                 artifact_body: None,
                 artifact_confidence: None,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
             &[SyncContextArtifactRecord {
@@ -3289,6 +4350,7 @@ mod tests {
                 text_preview: Some("context".into()),
                 created_at_ms: 1,
                 updated_at_ms: 40,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
             &[SyncRagChunkRecord {
@@ -3303,6 +4365,7 @@ mod tests {
                 token_count: None,
                 content_hash: None,
                 updated_at_ms: 35,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
         )
@@ -3329,6 +4392,7 @@ mod tests {
                 text_preview: Some("newer context".into()),
                 created_at_ms: 1,
                 updated_at_ms: 50,
+                deleted_at_ms: None,
                 metadata: serde_json::json!({}),
             }],
             &[],

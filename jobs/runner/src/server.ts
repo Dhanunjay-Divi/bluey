@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium, type BrowserContext } from "playwright";
 import {
@@ -9,6 +9,7 @@ import {
   createApplicationReceipt,
   executeApplication,
   materializeApplicationDocuments,
+  restartDisposition,
   submissionPolicy,
   type ApplicationPacket,
   type EvidenceObjectUpload,
@@ -30,7 +31,20 @@ import {
   terminalLeaseOutcome,
 } from "./leased-run.js";
 import { RunnerEncryptionError } from "./crypto-envelope.js";
-import { parseProfileKey, profilePaths, restoreProfile, sealProfile } from "./profile-store.js";
+import {
+  parseProfileKey,
+  profilePaths,
+  profilePathsFromScope,
+  restoreProfile,
+  sealProfile,
+} from "./profile-store.js";
+import {
+  listRunCheckpoints,
+  reconcileOrphanActiveProfiles,
+  removeRunCheckpoint,
+  writeRunCheckpoint,
+  type CloudRunCheckpoint,
+} from "./run-checkpoint-store.js";
 import { providerRegistryForResumeAction } from "./resume-policy.js";
 import { readResult, ResultStoreError, stageResult, writeResult } from "./result-store.js";
 
@@ -84,13 +98,14 @@ const activeRuns = new Map<string, {
   input: CloudRunRequest;
   events: RunEvent[];
   lease: ActiveExecutionLease;
+  checkpointCreatedAtMs: number;
 }>();
 const activeScopes = new Set<string>();
 
 if (!serviceToken) throw new Error("BLUEY_JOBS_RUNNER_TOKEN is required");
 if (!profileKey) throw new Error("BLUEY_JOBS_PROFILE_ENCRYPTION_KEY is required");
 
-createServer(async (request, response) => {
+const runnerServer = createServer(async (request, response) => {
   try {
     if (request.url === "/healthz" && request.method === "GET") return json(response, 200, { ok: true });
     if (!authorized(request)) return json(response, 401, { error: "Unauthorized" });
@@ -100,6 +115,7 @@ createServer(async (request, response) => {
       const requestId = `${input.runId}:initial`;
       const paths = profilePaths(root, input.accountId, input.applicationIdentityId);
       const resultContext = { requestId, profileScope: paths.scope };
+      const checkpointCreatedAtMs = Date.now();
       const completed = await readResult<CloudRunResult>(root, resultContext, profileKey);
       if (completed) return json(response, 200, completed);
       const result = await serialized(paths.scope, async () => {
@@ -113,14 +129,39 @@ createServer(async (request, response) => {
             runId: input.runId,
             browserProfileId: input.browserProfileId,
           },
-          (activeLease) => run(input, paths, activeLease),
-          (activeLease) => abortLeasedRun(activeLease, async () => {}),
+          (activeLease) => run(
+            input,
+            paths,
+            activeLease,
+            requestId,
+            checkpointCreatedAtMs,
+          ),
+          async (activeLease) => {
+            if (activeLease.finalSubmitAttempted) {
+              await markCloudCheckpointUnknown(
+                input,
+                paths,
+                [],
+                activeLease,
+                requestId,
+                checkpointCreatedAtMs,
+                input.url,
+              ).catch(() => undefined);
+            } else {
+              await removeRunCheckpoint(root, paths.scope, input.browserSessionId)
+                .catch(() => undefined);
+            }
+            return abortLeasedRun(activeLease, async () => {});
+          },
         );
         if (execution.keepActive) {
           try {
             await writeResult(root, resultContext, execution.result, profileKey);
           } catch {
-            return abortLeasedRun(lease, () => closeBrowserExecution(execution.context, paths));
+            return abortLeasedRun(lease, async () => {
+              await closeBrowserExecution(execution.context, paths);
+              await removeRunCheckpoint(root, paths.scope, input.browserSessionId);
+            });
           }
           if (!execution.context) return abortLeasedRun(lease, async () => {});
           activeScopes.add(paths.scope);
@@ -130,12 +171,22 @@ createServer(async (request, response) => {
             input,
             events: execution.events,
             lease,
+            checkpointCreatedAtMs,
           });
           return execution.result;
         }
 
         const outcome = terminalLeaseOutcome(execution.result.receipt.status, lease);
         if (outcome === "side_effect_unknown") {
+          await markCloudCheckpointUnknown(
+            input,
+            paths,
+            execution.events,
+            lease,
+            requestId,
+            checkpointCreatedAtMs,
+            input.url,
+          ).catch(() => undefined);
           return abortLeasedRun(lease, () => closeBrowserExecution(execution.context, paths));
         }
         return finalizeLeasedRun({
@@ -147,6 +198,7 @@ createServer(async (request, response) => {
           },
           async commit() {
             await writeResult(root, resultContext, execution.result, profileKey);
+            await removeRunCheckpoint(root, paths.scope, input.browserSessionId);
             return execution.result;
           },
         });
@@ -168,7 +220,7 @@ createServer(async (request, response) => {
       };
       const completed = await readResult<CloudRunResult>(root, resultContext, profileKey);
       if (completed) return json(response, 200, completed);
-      const active = activeRuns.get(resume[1]);
+      const active = activeRuns.get(resume[1]) ?? await restoreCloudRunCheckpoint(resume[1]);
       if (!active || active.paths.scope !== resolution.profileScope) {
         return json(response, 404, { error: "Browser run not found" });
       }
@@ -188,6 +240,8 @@ createServer(async (request, response) => {
             active.lease,
             false,
             resolution.action,
+            resolution.requestId,
+            active.checkpointCreatedAtMs,
           );
           if (executed.receipt.status === "needs_input" && !active.lease.finalSubmitAttempted) {
             await writeResult(root, resultContext, executed, profileKey);
@@ -196,6 +250,15 @@ createServer(async (request, response) => {
 
           const outcome = terminalLeaseOutcome(executed.receipt.status, active.lease);
           if (outcome === "side_effect_unknown") {
+            await markCloudCheckpointUnknown(
+              active.input,
+              active.paths,
+              active.events,
+              active.lease,
+              resolution.requestId,
+              active.checkpointCreatedAtMs,
+              active.context.pages()[0]?.url() || active.input.url,
+            ).catch(() => undefined);
             return abortLeasedRun(active.lease, () => closeActiveRun(resume[1], active));
           }
           return finalizeLeasedRun({
@@ -207,11 +270,26 @@ createServer(async (request, response) => {
             },
             async commit() {
               await writeResult(root, resultContext, executed, profileKey);
+              await removeRunCheckpoint(root, active.paths.scope, active.input.browserSessionId);
               return executed;
             },
           });
         } catch (error) {
           if (error instanceof LeasedRunError) throw error;
+          if (active.lease.finalSubmitAttempted) {
+            await markCloudCheckpointUnknown(
+              active.input,
+              active.paths,
+              active.events,
+              active.lease,
+              resolution.requestId,
+              active.checkpointCreatedAtMs,
+              active.context.pages()[0]?.url() || active.input.url,
+            ).catch(() => undefined);
+          } else {
+            await removeRunCheckpoint(root, active.paths.scope, active.input.browserSessionId)
+              .catch(() => undefined);
+          }
           return abortLeasedRun(active.lease, () => closeActiveRun(resume[1], active));
         }
       });
@@ -228,7 +306,9 @@ createServer(async (request, response) => {
           intendedOutcome: "released",
           cleanup: () => closeActiveRun(release[1], active),
           async stage() {},
-          async commit() {},
+          async commit() {
+            await removeRunCheckpoint(root, active.paths.scope, active.input.browserSessionId);
+          },
         });
       });
       return json(response, 204, {});
@@ -239,14 +319,198 @@ createServer(async (request, response) => {
     console.error("Bluey Jobs runner request failed", { code: failure.code });
     return json(response, failure.status, { error: failure.message });
   }
-}).listen(port, "0.0.0.0", () => {
-  console.log(`Bluey Jobs runner listening on ${port}`);
 });
+
+void startRunner().catch(() => {
+  console.error("Bluey Jobs runner startup failed", { code: "startup_reconciliation_failed" });
+  process.exitCode = 1;
+});
+
+async function startRunner(): Promise<void> {
+  await reconcileOrphanActiveProfiles(root, profileKey!);
+  await restoreCloudRunCheckpoints();
+  runnerServer.listen(port, "0.0.0.0", () => {
+    console.log(`Bluey Jobs runner listening on ${port}`);
+  });
+}
+
+async function restoreCloudRunCheckpoints(): Promise<void> {
+  const checkpoints = await listRunCheckpoints<CloudRunRequest, RunEvent>(root, profileKey!);
+  for (const { checkpoint } of checkpoints) {
+    const disposition = restartDisposition(checkpoint.phase, checkpoint.expiresAtMs);
+    if (disposition === "expired") {
+      await removeRunCheckpoint(root, checkpoint.profileScope, checkpoint.browserSessionId);
+    } else if (disposition === "restore") {
+      await restoreCheckpoint(checkpoint).catch(() => undefined);
+    } else if (checkpoint.phase !== "side_effect_unknown"
+      || checkpoint.workflow.status !== "side_effect_unknown") {
+      await writeRunCheckpoint(root, {
+        ...checkpoint,
+        phase: "side_effect_unknown",
+        updatedAtMs: Date.now(),
+        workflow: { ...checkpoint.workflow, status: "side_effect_unknown" },
+      }, profileKey!);
+    }
+  }
+}
+
+async function restoreCloudRunCheckpoint(
+  browserSessionId: string,
+): Promise<NonNullable<ReturnType<typeof activeRuns.get>> | undefined> {
+  const existing = activeRuns.get(browserSessionId);
+  if (existing) return existing;
+  const checkpoints = await listRunCheckpoints<CloudRunRequest, RunEvent>(root, profileKey!);
+  const found = checkpoints.find(({ checkpoint }) => checkpoint.browserSessionId === browserSessionId)?.checkpoint;
+  if (!found || restartDisposition(found.phase, found.expiresAtMs) !== "restore") return undefined;
+  await restoreCheckpoint(found).catch(() => undefined);
+  return activeRuns.get(browserSessionId);
+}
+
+async function restoreCheckpoint(
+  checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
+): Promise<void> {
+  await validate(checkpoint.request);
+  const paths = profilePathsFromScope(root, checkpoint.profileScope);
+  if (profilePaths(
+    root,
+    checkpoint.request.accountId,
+    checkpoint.request.applicationIdentityId,
+  ).scope !== paths.scope) {
+    throw new Error("Cloud run checkpoint profile mismatch");
+  }
+  if (activeRuns.has(checkpoint.browserSessionId) || activeScopes.has(paths.scope)) return;
+
+  let lease: ActiveExecutionLease | undefined;
+  let context: BrowserContext | undefined;
+  try {
+    lease = await leaseClient.claim({
+      accountId: checkpoint.request.accountId,
+      applicationId: checkpoint.request.applicationId,
+      runId: checkpoint.request.runId,
+      browserProfileId: checkpoint.request.browserProfileId,
+    });
+    await restoreProfile(paths, profileKey!);
+    context = await chromium.launchPersistentContext(paths.directory, {
+      headless: true,
+      acceptDownloads: true,
+      serviceWorkers: "block",
+      viewport: { width: 1440, height: 1000 },
+    });
+    await installBrowserNetworkGuard(context);
+    const recoveryUrl = /^https?:\/\//i.test(checkpoint.browser.url)
+      ? checkpoint.browser.url
+      : checkpoint.request.url;
+    await assertPublicApplicationUrl(recoveryUrl);
+    const existingPage = context.pages().find((page) => /^https?:\/\//i.test(page.url()));
+    const page = existingPage ?? context.pages()[0] ?? await context.newPage();
+    if (!/^https?:\/\//i.test(page.url())) {
+      await page.goto(recoveryUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    }
+    const active = {
+      context,
+      paths,
+      input: checkpoint.request,
+      events: checkpoint.events,
+      lease,
+      checkpointCreatedAtMs: checkpoint.createdAtMs,
+    };
+    activeScopes.add(paths.scope);
+    activeRuns.set(checkpoint.browserSessionId, active);
+    await writeCloudCheckpoint({
+      input: checkpoint.request,
+      paths,
+      events: checkpoint.events,
+      lease,
+      requestId: checkpoint.workflow.requestId,
+      checkpointCreatedAtMs: checkpoint.createdAtMs,
+      phase: checkpoint.phase,
+      status: checkpoint.workflow.status,
+      browserUrl: page.url() || recoveryUrl,
+      providerReview: checkpoint.workflow.providerReview,
+    });
+  } catch (error) {
+    if (context) await closeBrowserExecution(context, paths).catch(() => undefined);
+    await rm(paths.directory, { recursive: true, force: true }).catch(() => undefined);
+    if (activeRuns.get(checkpoint.browserSessionId)?.lease === lease) {
+      activeRuns.delete(checkpoint.browserSessionId);
+      activeScopes.delete(paths.scope);
+    }
+    if (lease) {
+      // Keep the safe encrypted checkpoint and leave the server-side lease in
+      // prepared state. The same stable runner owner can rotate it immediately;
+      // another owner can retry after expiry. A terminal finish would make the
+      // otherwise-safe checkpoint permanently unrecoverable.
+      await lease.stopHeartbeat().catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+async function writeCloudCheckpoint(input: {
+  input: CloudRunRequest;
+  paths: ReturnType<typeof profilePaths>;
+  events: RunEvent[];
+  lease: ActiveExecutionLease;
+  requestId: string;
+  checkpointCreatedAtMs: number;
+  phase: CloudRunCheckpoint["phase"];
+  status: CloudRunCheckpoint["workflow"]["status"];
+  browserUrl: string;
+  providerReview?: { adapter: string; adapterVersion?: string };
+}): Promise<void> {
+  const now = Date.now();
+  await writeRunCheckpoint<CloudRunRequest, RunEvent>(root, {
+    version: 1,
+    phase: input.phase,
+    createdAtMs: input.checkpointCreatedAtMs,
+    updatedAtMs: now,
+    expiresAtMs: now + 24 * 60 * 60 * 1_000,
+    profileScope: input.paths.scope,
+    browserSessionId: input.input.browserSessionId,
+    request: input.input,
+    browser: { url: input.browserUrl },
+    workflow: {
+      status: input.status,
+      requestId: input.requestId,
+      ...(input.providerReview ? { providerReview: input.providerReview } : {}),
+    },
+    events: input.events,
+    lease: {
+      fence: input.lease.fence,
+      expiresAtMs: input.lease.expiresAtMs,
+      ownerId: input.lease.ownerId,
+    },
+  }, profileKey!);
+}
+
+async function markCloudCheckpointUnknown(
+  input: CloudRunRequest,
+  paths: ReturnType<typeof profilePaths>,
+  events: RunEvent[],
+  lease: ActiveExecutionLease,
+  requestId: string,
+  checkpointCreatedAtMs: number,
+  browserUrl: string,
+): Promise<void> {
+  await writeCloudCheckpoint({
+    input,
+    paths,
+    events,
+    lease,
+    requestId,
+    checkpointCreatedAtMs,
+    phase: "side_effect_unknown",
+    status: "side_effect_unknown",
+    browserUrl,
+  });
+}
 
 async function run(
   input: CloudRunRequest,
   paths: ReturnType<typeof profilePaths>,
   lease: ActiveExecutionLease,
+  requestId: string,
+  checkpointCreatedAtMs: number,
 ): Promise<BrowserRunExecution> {
   const events: RunEvent[] = [];
   const decision = submissionPolicy(input.url);
@@ -269,6 +533,17 @@ async function run(
   let context: BrowserContext | undefined;
   let profileRestored = false;
   try {
+    await writeCloudCheckpoint({
+      input,
+      paths,
+      events,
+      lease,
+      requestId,
+      checkpointCreatedAtMs,
+      phase: "prepared",
+      status: "prepared",
+      browserUrl: input.url,
+    });
     await restoreProfile(paths, profileKey!);
     profileRestored = true;
     context = await chromium.launchPersistentContext(paths.directory, {
@@ -278,7 +553,17 @@ async function run(
       viewport: { width: 1440, height: 1000 },
     });
     await installBrowserNetworkGuard(context);
-    const result = await executeRun(input, paths, context, events, lease, true);
+    const result = await executeRun(
+      input,
+      paths,
+      context,
+      events,
+      lease,
+      true,
+      undefined,
+      requestId,
+      checkpointCreatedAtMs,
+    );
     return {
       result,
       events,
@@ -291,6 +576,7 @@ async function run(
     } else if (profileRestored) {
       await sealProfile(paths, profileKey!).catch(() => undefined);
     }
+    await rm(paths.directory, { recursive: true, force: true }).catch(() => undefined);
     throw new Error("Browser execution failed");
   }
 }
@@ -303,6 +589,8 @@ async function executeRun(
   lease: ActiveExecutionLease,
   navigate: boolean,
   resumeAction?: string,
+  requestId = `${input.runId}:initial`,
+  checkpointCreatedAtMs = Date.now(),
 ) {
   const runDirectory = join(root, "receipts", paths.scope, input.runId);
   await mkdir(runDirectory, { recursive: true });
@@ -324,13 +612,57 @@ async function executeRun(
     async log(type: string, detail: Record<string, unknown> = {}) {
       events.push({ id: `${input.runId}:${events.length + 1}`, occurredAt: new Date().toISOString(), type, detail });
     },
-    beforeFinalSubmit: () => lease.beforeFinalSubmit(),
-    afterFinalSubmit: (outcome: "activated" | "activation_uncertain") => lease.afterFinalSubmit(outcome),
+    beforeFinalSubmit: async () => {
+      await writeCloudCheckpoint({
+        input,
+        paths,
+        events,
+        lease,
+        requestId,
+        checkpointCreatedAtMs,
+        phase: "final_submit_started",
+        status: "side_effect_unknown",
+        browserUrl: browserPage.url(),
+      });
+      await lease.beforeFinalSubmit();
+    },
+    afterFinalSubmit: async (outcome: "activated" | "activation_uncertain") => {
+      await lease.afterFinalSubmit(outcome);
+      await writeCloudCheckpoint({
+        input,
+        paths,
+        events,
+        lease,
+        requestId,
+        checkpointCreatedAtMs,
+        phase: outcome === "activated" ? "final_submit_activated" : "side_effect_unknown",
+        status: "side_effect_unknown",
+        browserUrl: browserPage.url(),
+      });
+    },
   } as const;
   const providerRegistry = providerRegistryForResumeAction(resumeAction);
   const execution = providerRegistry
     ? await executeApplication(adapterContext, providerRegistry)
     : await executeApplication(adapterContext);
+  if (execution.receipt.status === "needs_input" && !lease.finalSubmitAttempted) {
+    const providerReview = ["greenhouse", "lever"].includes(execution.adapter)
+      && execution.receipt.issues.length === 0
+      ? { adapter: execution.adapter, adapterVersion: execution.adapterVersion }
+      : undefined;
+    await writeCloudCheckpoint({
+      input,
+      paths,
+      events,
+      lease,
+      requestId,
+      checkpointCreatedAtMs,
+      phase: providerReview ? "provider_review" : "needs_input",
+      status: providerReview ? "provider_review" : "needs_input",
+      browserUrl: browserPage.url(),
+      providerReview,
+    });
+  }
   const screenshotPath = join(runDirectory, "final.png");
   const screenshotBytes = Buffer.from(await browserPage.screenshot({ fullPage: true }));
   await writeFile(screenshotPath, screenshotBytes, { mode: 0o600 });
@@ -439,6 +771,7 @@ async function closeBrowserExecution(
     await sealProfile(paths, profileKey!);
   } catch {
     failed = true;
+    await rm(paths.directory, { recursive: true, force: true }).catch(() => undefined);
   }
   if (failed) throw new Error("Browser cleanup failed");
 }

@@ -6,7 +6,7 @@ ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 cd "$SCRIPT_DIR"
 CONFIGURATION="${BLUEY_OVERLAY_SWIFT_CONFIGURATION:-release}"
-swift_args=(-c "$CONFIGURATION")
+swift_args=(-c "$CONFIGURATION" --disable-automatic-resolution)
 if [[ -n "${BLUEY_SWIFT_ARCH:-}" ]]; then
   swift_args+=(--arch "$BLUEY_SWIFT_ARCH")
 fi

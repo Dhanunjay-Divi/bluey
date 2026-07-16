@@ -1,9 +1,10 @@
 //! Microphone capture via CPAL.
 //!
 //! Spawns the capture on a dedicated OS thread (CPAL requirement: the stream
-//! must live on whatever thread started it). Audio samples arrive in the
-//! CPAL callback, get converted to mono i16, framed into 20 ms chunks, and
-//! published to a tokio channel the caller polls.
+//! must live on whatever thread started it). The realtime CPAL callback only
+//! copies samples into preallocated blocks and transfers them through a
+//! lock-free SPSC bridge. A dedicated worker performs conversion, downmixing,
+//! framing, logging, and publication to the Tokio-facing queue.
 //!
 //! Integration tests for this module require a real input device and are
 //! gated behind `#[ignore]`; CI does not exercise them. The framer + DSP
@@ -12,18 +13,30 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread::{self, JoinHandle, Thread};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
-use cpal::{SampleFormat, StreamConfig};
+use cpal::{SampleFormat, SizedSample, StreamConfig};
 use cue_core::pcm::{AudioChunk, AudioSource, SampleRate};
+use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
 use tokio::sync::Notify;
 
 use crate::audio::framer::{downmix_to_mono, f32_to_i16, Framer};
 
 /// One second of 20 ms chunks at the recommended capture cadence.
 const CAPTURE_QUEUE_CAPACITY: usize = 50;
+/// Raw capture blocks are intentionally shorter than the downstream queue.
+/// A callback larger than this is split across multiple preallocated blocks.
+const RAW_BRIDGE_BLOCK_MS: usize = 20;
+/// Maximum raw audio buffered between the realtime callback and worker.
+const RAW_BRIDGE_CAPACITY_MS: usize = 500;
+const RAW_BRIDGE_MIN_BLOCKS: usize = 4;
+const MAX_CAPTURE_CHANNELS: usize = 32;
+const CAPTURE_CONTROL_POLL: Duration = Duration::from_millis(10);
+const CAPTURE_WORKER_IDLE_WAIT: Duration = Duration::from_millis(2);
 
 struct LatestQueueState<T> {
     items: VecDeque<T>,
@@ -179,6 +192,467 @@ impl<T> Drop for LatestReceiver<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RawBridgeLayout {
+    block_samples: usize,
+    block_count: usize,
+}
+
+impl RawBridgeLayout {
+    fn for_stream(sample_rate: SampleRate, channels: usize) -> Result<Self> {
+        if channels == 0 {
+            bail!("capture stream reported zero channels");
+        }
+        if channels > MAX_CAPTURE_CHANNELS {
+            bail!(
+                "capture stream reported {channels} channels; maximum supported is {MAX_CAPTURE_CHANNELS}"
+            );
+        }
+        let rate = sample_rate.hz() as usize;
+        let block_frames = rate
+            .checked_mul(RAW_BRIDGE_BLOCK_MS)
+            .context("raw capture block frame count overflow")?
+            .saturating_add(999)
+            / 1000;
+        let block_samples = block_frames
+            .max(1)
+            .checked_mul(channels)
+            .context("raw capture block sample count overflow")?;
+        let block_count =
+            RAW_BRIDGE_CAPACITY_MS.saturating_add(RAW_BRIDGE_BLOCK_MS - 1) / RAW_BRIDGE_BLOCK_MS;
+        Ok(Self {
+            block_samples,
+            block_count: block_count.max(RAW_BRIDGE_MIN_BLOCKS),
+        })
+    }
+}
+
+struct RawAudioBlock<T> {
+    samples: Box<[T]>,
+    valid_samples: usize,
+    captured_at_ms: u64,
+    sequence: u64,
+}
+
+impl<T: Copy + Default> RawAudioBlock<T> {
+    fn new(sample_capacity: usize) -> Self {
+        Self {
+            samples: vec![T::default(); sample_capacity].into_boxed_slice(),
+            valid_samples: 0,
+            captured_at_ms: 0,
+            sequence: 0,
+        }
+    }
+}
+
+trait CaptureSample: SizedSample + Copy + Default + Send + 'static {
+    fn append_mono(
+        interleaved: &[Self],
+        channels: usize,
+        conversion_scratch: &mut Vec<i16>,
+        mono: &mut Vec<i16>,
+    );
+}
+
+impl CaptureSample for i16 {
+    fn append_mono(
+        interleaved: &[Self],
+        channels: usize,
+        _conversion_scratch: &mut Vec<i16>,
+        mono: &mut Vec<i16>,
+    ) {
+        downmix_to_mono(interleaved, channels, mono);
+    }
+}
+
+impl CaptureSample for f32 {
+    fn append_mono(
+        interleaved: &[Self],
+        channels: usize,
+        conversion_scratch: &mut Vec<i16>,
+        mono: &mut Vec<i16>,
+    ) {
+        f32_to_i16(interleaved, conversion_scratch);
+        downmix_to_mono(conversion_scratch, channels, mono);
+    }
+}
+
+struct RawCallbackBridge<T> {
+    filled: HeapProd<RawAudioBlock<T>>,
+    recycled: HeapCons<RawAudioBlock<T>>,
+    retained: Option<RawAudioBlock<T>>,
+    sample_capacity: usize,
+    channels: usize,
+    sample_rate_hz: u32,
+    next_sequence: u64,
+    overflow_blocks: Arc<AtomicU64>,
+    overflow_samples: Arc<AtomicU64>,
+    worker_waker: Option<Thread>,
+}
+
+struct RawWorkerBridge<T> {
+    filled: HeapCons<RawAudioBlock<T>>,
+    recycled: HeapProd<RawAudioBlock<T>>,
+}
+
+fn build_raw_bridge<T: Copy + Default>(
+    layout: RawBridgeLayout,
+    channels: usize,
+    sample_rate: SampleRate,
+    overflow_blocks: Arc<AtomicU64>,
+    overflow_samples: Arc<AtomicU64>,
+) -> (RawCallbackBridge<T>, RawWorkerBridge<T>) {
+    let (filled, filled_consumer) = HeapRb::<RawAudioBlock<T>>::new(layout.block_count).split();
+    let (mut recycle_producer, recycled) =
+        HeapRb::<RawAudioBlock<T>>::new(layout.block_count).split();
+    for _ in 0..layout.block_count {
+        let block = RawAudioBlock::new(layout.block_samples);
+        assert!(
+            recycle_producer.try_push(block).is_ok(),
+            "preallocated raw capture pool must fit its recycle ring"
+        );
+    }
+    (
+        RawCallbackBridge {
+            filled,
+            recycled,
+            retained: None,
+            sample_capacity: layout.block_samples,
+            channels,
+            sample_rate_hz: sample_rate.hz(),
+            next_sequence: 1,
+            overflow_blocks,
+            overflow_samples,
+            worker_waker: None,
+        },
+        RawWorkerBridge {
+            filled: filled_consumer,
+            recycled: recycle_producer,
+        },
+    )
+}
+
+/// Realtime callback boundary. Keep this function allocation-free and limited
+/// to preallocated block transfer, timestamp/sequence stamping, atomics, and
+/// worker notification. Conversion, framing, logging, and async queue work
+/// belong in `run_capture_worker`.
+fn enqueue_raw_callback<T: Copy>(bridge: &mut RawCallbackBridge<T>, data: &[T], at_ms: u64) {
+    let usable_samples = data.len() - (data.len() % bridge.channels);
+    let trailing_samples = data.len() - usable_samples;
+    if trailing_samples > 0 {
+        bridge.overflow_blocks.fetch_add(1, Ordering::Relaxed);
+        bridge
+            .overflow_samples
+            .fetch_add(trailing_samples as u64, Ordering::Relaxed);
+    }
+
+    let mut offset = 0usize;
+    while offset < usable_samples {
+        let take = (usable_samples - offset).min(bridge.sample_capacity);
+        let sequence = bridge.next_sequence;
+        bridge.next_sequence = bridge.next_sequence.wrapping_add(1);
+        let frame_offset = offset / bridge.channels;
+        let block_offset_ms = (frame_offset as u128 * 1000 / bridge.sample_rate_hz as u128) as u64;
+
+        let Some(mut block) = bridge.retained.take().or_else(|| bridge.recycled.try_pop()) else {
+            bridge.overflow_blocks.fetch_add(1, Ordering::Relaxed);
+            bridge
+                .overflow_samples
+                .fetch_add(take as u64, Ordering::Relaxed);
+            offset += take;
+            continue;
+        };
+        block.samples[..take].copy_from_slice(&data[offset..offset + take]);
+        block.valid_samples = take;
+        block.captured_at_ms = at_ms.saturating_add(block_offset_ms);
+        block.sequence = sequence;
+
+        match bridge.filled.try_push(block) {
+            Ok(()) => {
+                if let Some(worker) = bridge.worker_waker.as_ref() {
+                    worker.unpark();
+                }
+            }
+            Err(block) => {
+                // The fixed pool invariant should make this unreachable: once
+                // a block has been removed from the recycle ring, the filled
+                // ring has room for it. Retain it anyway so an unexpected
+                // producer-full observation never frees memory in the callback.
+                bridge.retained = Some(block);
+                bridge.overflow_blocks.fetch_add(1, Ordering::Relaxed);
+                bridge
+                    .overflow_samples
+                    .fetch_add(take as u64, Ordering::Relaxed);
+            }
+        }
+        offset += take;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CallbackClock {
+    epoch_origin_ms: u64,
+    monotonic_origin: Instant,
+}
+
+impl CallbackClock {
+    fn new() -> Self {
+        Self {
+            epoch_origin_ms: epoch_ms(),
+            monotonic_origin: Instant::now(),
+        }
+    }
+
+    fn now_ms(self) -> u64 {
+        self.epoch_origin_ms
+            .saturating_add(self.monotonic_origin.elapsed().as_millis() as u64)
+    }
+}
+
+fn recycle_raw_block<T>(bridge: &mut RawWorkerBridge<T>, mut block: RawAudioBlock<T>) {
+    block.valid_samples = 0;
+    if bridge.recycled.try_push(block).is_err() {
+        tracing::error!("raw capture recycle ring rejected a pool block");
+    }
+}
+
+fn emit_worker_chunk(
+    sender: &LatestSender<AudioChunk>,
+    chunk: AudioChunk,
+    dropped_chunks: &AtomicU64,
+    downstream_closed: &AtomicBool,
+) -> bool {
+    if try_emit_chunk(sender, chunk, dropped_chunks) {
+        true
+    } else {
+        downstream_closed.store(true, Ordering::Release);
+        false
+    }
+}
+
+struct CaptureWorkerArgs<T> {
+    bridge: RawWorkerBridge<T>,
+    sender: LatestSender<AudioChunk>,
+    source: AudioSource,
+    sample_rate: SampleRate,
+    chunk_ms: u32,
+    callback_closed: Arc<AtomicBool>,
+    downstream_closed: Arc<AtomicBool>,
+    dropped_chunks: Arc<AtomicU64>,
+    worker_sample_capacity: usize,
+    channels: usize,
+}
+
+fn run_capture_worker<T: CaptureSample>(args: CaptureWorkerArgs<T>) {
+    let CaptureWorkerArgs {
+        mut bridge,
+        sender,
+        source,
+        sample_rate,
+        chunk_ms,
+        callback_closed,
+        downstream_closed,
+        dropped_chunks,
+        worker_sample_capacity,
+        channels,
+    } = args;
+    let mut framer = Framer::new(source, sample_rate, chunk_ms);
+    let mut conversion_scratch = Vec::with_capacity(worker_sample_capacity);
+    let mut mono = Vec::with_capacity(worker_sample_capacity / channels.max(1));
+    let mut last_sequence: Option<u64> = None;
+
+    loop {
+        let Some(block) = bridge.filled.try_pop() else {
+            if callback_closed.load(Ordering::Acquire) {
+                break;
+            }
+            thread::park_timeout(CAPTURE_WORKER_IDLE_WAIT);
+            continue;
+        };
+
+        let sequence_gap = last_sequence
+            .map(|last| block.sequence != last.wrapping_add(1))
+            .unwrap_or(false);
+        if sequence_gap {
+            if let Some(chunk) = framer.flush_padded() {
+                if !emit_worker_chunk(&sender, chunk, &dropped_chunks, &downstream_closed) {
+                    recycle_raw_block(&mut bridge, block);
+                    return;
+                }
+            }
+        }
+        last_sequence = Some(block.sequence);
+
+        conversion_scratch.clear();
+        mono.clear();
+        T::append_mono(
+            &block.samples[..block.valid_samples],
+            channels,
+            &mut conversion_scratch,
+            &mut mono,
+        );
+        let chunks = framer.push(&mono, block.captured_at_ms);
+        let mut keep_running = true;
+        for chunk in chunks {
+            if !emit_worker_chunk(&sender, chunk, &dropped_chunks, &downstream_closed) {
+                keep_running = false;
+                break;
+            }
+        }
+        recycle_raw_block(&mut bridge, block);
+        if !keep_running {
+            return;
+        }
+    }
+
+    if let Some(chunk) = framer.flush_padded() {
+        let _ = emit_worker_chunk(&sender, chunk, &dropped_chunks, &downstream_closed);
+    }
+}
+
+struct CaptureStreamArgs {
+    device: cpal::Device,
+    stream_config: StreamConfig,
+    source: AudioSource,
+    chunk_ms: u32,
+    sample_rate: SampleRate,
+    channels: usize,
+    stop: Arc<AtomicBool>,
+    sender: LatestSender<AudioChunk>,
+    dropped_chunks: Arc<AtomicU64>,
+    raw_overflow_blocks: Arc<AtomicU64>,
+    raw_overflow_samples: Arc<AtomicU64>,
+}
+
+fn run_capture_stream<T: CaptureSample>(args: CaptureStreamArgs) {
+    let CaptureStreamArgs {
+        device,
+        stream_config,
+        source,
+        chunk_ms,
+        sample_rate,
+        channels,
+        stop,
+        sender,
+        dropped_chunks,
+        raw_overflow_blocks,
+        raw_overflow_samples,
+    } = args;
+    let layout = match RawBridgeLayout::for_stream(sample_rate, channels) {
+        Ok(layout) => layout,
+        Err(error) => {
+            tracing::error!(error = %error, "invalid microphone capture bridge layout");
+            return;
+        }
+    };
+    let (mut callback_bridge, worker_bridge) = build_raw_bridge::<T>(
+        layout,
+        channels,
+        sample_rate,
+        Arc::clone(&raw_overflow_blocks),
+        Arc::clone(&raw_overflow_samples),
+    );
+    let callback_closed = Arc::new(AtomicBool::new(false));
+    let downstream_closed = Arc::new(AtomicBool::new(false));
+    let worker_callback_closed = Arc::clone(&callback_closed);
+    let worker_downstream_closed = Arc::clone(&downstream_closed);
+    let worker_dropped_chunks = Arc::clone(&dropped_chunks);
+    let worker = match thread::Builder::new()
+        .name("bluey-mic-worker".to_string())
+        .spawn(move || {
+            run_capture_worker(CaptureWorkerArgs {
+                bridge: worker_bridge,
+                sender,
+                source,
+                sample_rate,
+                chunk_ms,
+                callback_closed: worker_callback_closed,
+                downstream_closed: worker_downstream_closed,
+                dropped_chunks: worker_dropped_chunks,
+                worker_sample_capacity: layout.block_samples,
+                channels,
+            });
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to start microphone capture worker");
+            return;
+        }
+    };
+    callback_bridge.worker_waker = Some(worker.thread().clone());
+
+    let callback_clock = CallbackClock::new();
+    let stream_error_count = Arc::new(AtomicU64::new(0));
+    let callback_error_count = Arc::clone(&stream_error_count);
+    let stream_result = device.build_input_stream::<T, _, _>(
+        &stream_config,
+        move |data, _| {
+            enqueue_raw_callback(&mut callback_bridge, data, callback_clock.now_ms());
+        },
+        move |_error| {
+            callback_error_count.fetch_add(1, Ordering::Relaxed);
+        },
+        None,
+    );
+
+    let stream = match stream_result {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to build input stream");
+            callback_closed.store(true, Ordering::Release);
+            worker.thread().unpark();
+            let _ = worker.join();
+            return;
+        }
+    };
+
+    use cpal::traits::StreamTrait;
+    if let Err(error) = stream.play() {
+        tracing::error!(error = %error, "failed to play input stream");
+        drop(stream);
+        callback_closed.store(true, Ordering::Release);
+        worker.thread().unpark();
+        let _ = worker.join();
+        return;
+    }
+
+    let mut next_raw_overflow_report = 1u64;
+    while !stop.load(Ordering::Acquire)
+        && !downstream_closed.load(Ordering::Acquire)
+        && !worker.is_finished()
+    {
+        let stream_errors = stream_error_count.swap(0, Ordering::AcqRel);
+        if stream_errors > 0 {
+            tracing::error!(
+                count = stream_errors,
+                "CPAL reported microphone input stream errors"
+            );
+        }
+        let raw_overflow = raw_overflow_blocks.load(Ordering::Relaxed);
+        if raw_overflow >= next_raw_overflow_report {
+            tracing::warn!(
+                dropped_blocks = raw_overflow,
+                dropped_samples = raw_overflow_samples.load(Ordering::Relaxed),
+                "microphone raw capture bridge overloaded"
+            );
+            next_raw_overflow_report = raw_overflow.checked_next_power_of_two().unwrap_or(u64::MAX);
+            if next_raw_overflow_report <= raw_overflow {
+                next_raw_overflow_report = next_raw_overflow_report.saturating_mul(2);
+            }
+        }
+        thread::sleep(CAPTURE_CONTROL_POLL);
+    }
+
+    // Dropping the stream first guarantees no callback can enqueue after the
+    // worker observes callback_closed and drains the final filled blocks.
+    drop(stream);
+    callback_closed.store(true, Ordering::Release);
+    worker.thread().unpark();
+    if worker.join().is_err() {
+        tracing::error!("microphone capture worker panicked");
+    }
+}
+
 /// Parameters for microphone capture.
 pub struct CaptureOptions {
     /// Source label stamped onto each emitted chunk (normally `Microphone`).
@@ -233,6 +707,8 @@ pub struct MicrophoneCapture {
     thread: Option<JoinHandle<()>>,
     sample_rate: SampleRate,
     dropped_chunks: Arc<AtomicU64>,
+    raw_overflow_blocks: Arc<AtomicU64>,
+    raw_overflow_samples: Arc<AtomicU64>,
 }
 
 impl MicrophoneCapture {
@@ -241,6 +717,9 @@ impl MicrophoneCapture {
     /// Returns a `(handle, rx)` pair: the handle owns the capture thread;
     /// `rx` yields framed `AudioChunk`s.
     pub fn start(opts: CaptureOptions) -> Result<(Self, LatestReceiver<AudioChunk>)> {
+        if opts.chunk_ms == 0 {
+            bail!("capture chunk duration must be non-zero");
+        }
         let host = cpal::default_host();
         let device = resolve_input_device(&host, opts.device_name.as_deref())?;
 
@@ -253,13 +732,18 @@ impl MicrophoneCapture {
         if channels == 0 {
             bail!("device reported zero channels");
         }
+        RawBridgeLayout::for_stream(sample_rate, channels)?;
         let format = config.sample_format();
 
         let (tx, rx) = latest_channel::<AudioChunk>(CAPTURE_QUEUE_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));
         let dropped_chunks = Arc::new(AtomicU64::new(0));
+        let raw_overflow_blocks = Arc::new(AtomicU64::new(0));
+        let raw_overflow_samples = Arc::new(AtomicU64::new(0));
         let thread_stop = stop.clone();
         let thread_dropped_chunks = dropped_chunks.clone();
+        let thread_raw_overflow_blocks = raw_overflow_blocks.clone();
+        let thread_raw_overflow_samples = raw_overflow_samples.clone();
         let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
         tracing::info!(
             device = %device_name,
@@ -270,80 +754,27 @@ impl MicrophoneCapture {
         );
 
         let thread = thread::spawn(move || {
-            let mut framer = Framer::new(opts.source, sample_rate, opts.chunk_ms);
             let stream_cfg: StreamConfig = config.into();
-
-            let emit = {
-                let tx = tx.clone();
-                move |samples: Vec<i16>| {
-                    let captured_at_ms = epoch_ms();
-                    for chunk in framer.push(&samples, captured_at_ms) {
-                        if !try_emit_chunk(&tx, chunk, &thread_dropped_chunks) {
-                            // Receiver dropped — the capture thread can exit on the
-                            // next stop check.
-                            break;
-                        }
-                    }
-                }
+            let args = CaptureStreamArgs {
+                device,
+                stream_config: stream_cfg,
+                source: opts.source,
+                chunk_ms: opts.chunk_ms,
+                sample_rate,
+                channels,
+                stop: thread_stop,
+                sender: tx,
+                dropped_chunks: thread_dropped_chunks,
+                raw_overflow_blocks: thread_raw_overflow_blocks,
+                raw_overflow_samples: thread_raw_overflow_samples,
             };
-
-            // We keep `emit` as a closure that owns a mutable framer — but we
-            // need it to be `Fn` (CPAL callback constraint), so wrap in a
-            // Mutex and allow callbacks to borrow mutably.
-            let emit_mu = std::sync::Mutex::new(emit);
-
-            let err_fn = |e| tracing::error!(error = %e, "cpal input stream error");
-
-            let stream_result: Result<cpal::Stream, cpal::BuildStreamError> = match format {
-                SampleFormat::I16 => device.build_input_stream(
-                    &stream_cfg,
-                    move |data: &[i16], _| {
-                        let mut emit = emit_mu.lock().unwrap();
-                        let mut mono = Vec::with_capacity(data.len() / channels.max(1));
-                        downmix_to_mono(data, channels, &mut mono);
-                        emit(mono);
-                    },
-                    err_fn,
-                    None,
-                ),
-                SampleFormat::F32 => device.build_input_stream(
-                    &stream_cfg,
-                    move |data: &[f32], _| {
-                        let mut emit = emit_mu.lock().unwrap();
-                        let mut i16_buf = Vec::with_capacity(data.len());
-                        f32_to_i16(data, &mut i16_buf);
-                        let mut mono = Vec::with_capacity(i16_buf.len() / channels.max(1));
-                        downmix_to_mono(&i16_buf, channels, &mut mono);
-                        emit(mono);
-                    },
-                    err_fn,
-                    None,
-                ),
+            match format {
+                SampleFormat::I16 => run_capture_stream::<i16>(args),
+                SampleFormat::F32 => run_capture_stream::<f32>(args),
                 other => {
                     tracing::error!(?other, "unsupported CPAL sample format");
-                    return;
                 }
-            };
-
-            let stream = match stream_result {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to build input stream");
-                    return;
-                }
-            };
-
-            use cpal::traits::StreamTrait;
-            if let Err(e) = stream.play() {
-                tracing::error!(error = %e, "failed to play input stream");
-                return;
             }
-
-            // Park until stop is signaled.
-            while !thread_stop.load(Ordering::Relaxed) {
-                thread::sleep(std::time::Duration::from_millis(50));
-            }
-            drop(stream); // drop on the same thread that built it
         });
 
         Ok((
@@ -352,6 +783,8 @@ impl MicrophoneCapture {
                 thread: Some(thread),
                 sample_rate,
                 dropped_chunks,
+                raw_overflow_blocks,
+                raw_overflow_samples,
             },
             rx,
         ))
@@ -366,6 +799,17 @@ impl MicrophoneCapture {
         self.dropped_chunks.load(Ordering::Relaxed)
     }
 
+    /// Number of pre-framing raw blocks dropped because the realtime bridge
+    /// was saturated or received a trailing partial channel frame.
+    pub fn raw_overflow_blocks(&self) -> u64 {
+        self.raw_overflow_blocks.load(Ordering::Relaxed)
+    }
+
+    /// Number of interleaved device samples dropped at the raw bridge.
+    pub fn raw_overflow_samples(&self) -> u64 {
+        self.raw_overflow_samples.load(Ordering::Relaxed)
+    }
+
     /// Signal the capture thread to exit and wait for it. Called
     /// automatically on drop if not invoked explicitly.
     pub fn stop(mut self) {
@@ -373,7 +817,7 @@ impl MicrophoneCapture {
     }
 
     fn stop_internal(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -520,6 +964,198 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().captured_at_ms, 1);
         drop(rx);
         assert!(!try_emit_chunk(&tx, chunk, &dropped));
+    }
+
+    #[test]
+    fn raw_bridge_saturation_is_bounded_and_preserves_accepted_order() {
+        let overflow_blocks = Arc::new(AtomicU64::new(0));
+        let overflow_samples = Arc::new(AtomicU64::new(0));
+        let layout = RawBridgeLayout {
+            block_samples: 2,
+            block_count: 2,
+        };
+        let (mut callback, mut worker) = build_raw_bridge::<i16>(
+            layout,
+            1,
+            SampleRate::new(1_000).unwrap(),
+            Arc::clone(&overflow_blocks),
+            Arc::clone(&overflow_samples),
+        );
+
+        enqueue_raw_callback(&mut callback, &[1, 2, 3, 4, 5, 6], 100);
+
+        assert_eq!(overflow_blocks.load(Ordering::Relaxed), 1);
+        assert_eq!(overflow_samples.load(Ordering::Relaxed), 2);
+        let first = worker.filled.try_pop().expect("first accepted block");
+        let second = worker.filled.try_pop().expect("second accepted block");
+        assert_eq!(&first.samples[..first.valid_samples], &[1, 2]);
+        assert_eq!(&second.samples[..second.valid_samples], &[3, 4]);
+        assert_eq!((first.sequence, second.sequence), (1, 2));
+        assert_eq!((first.captured_at_ms, second.captured_at_ms), (100, 102));
+        assert!(worker.filled.try_pop().is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_worker_preserves_order_and_flushes_padded_tail() {
+        let overflow_blocks = Arc::new(AtomicU64::new(0));
+        let overflow_samples = Arc::new(AtomicU64::new(0));
+        let layout = RawBridgeLayout {
+            block_samples: 3,
+            block_count: 2,
+        };
+        let (mut callback, worker) = build_raw_bridge::<i16>(
+            layout,
+            1,
+            SampleRate::new(1_000).unwrap(),
+            overflow_blocks,
+            overflow_samples,
+        );
+        enqueue_raw_callback(&mut callback, &[1, 2, 3, 4, 5, 6], 200);
+
+        let callback_closed = Arc::new(AtomicBool::new(true));
+        let downstream_closed = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (sender, mut receiver) = latest_channel(8);
+        run_capture_worker(CaptureWorkerArgs {
+            bridge: worker,
+            sender,
+            source: AudioSource::Microphone,
+            sample_rate: SampleRate::new(1_000).unwrap(),
+            chunk_ms: 4,
+            callback_closed,
+            downstream_closed: Arc::clone(&downstream_closed),
+            dropped_chunks: Arc::clone(&dropped),
+            worker_sample_capacity: layout.block_samples,
+            channels: 1,
+        });
+
+        let first = receiver.recv().await.expect("complete frame");
+        let final_padded = receiver.recv().await.expect("padded final frame");
+        assert_eq!(first.samples, vec![1, 2, 3, 4]);
+        assert_eq!(first.captured_at_ms, 200);
+        assert_eq!(final_padded.samples, vec![5, 6, 0, 0]);
+        assert_eq!(final_padded.captured_at_ms, 204);
+        assert!(receiver.recv().await.is_none());
+        assert!(!downstream_closed.load(Ordering::Acquire));
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn raw_worker_flushes_before_a_sequence_gap() {
+        let overflow_blocks = Arc::new(AtomicU64::new(0));
+        let overflow_samples = Arc::new(AtomicU64::new(0));
+        let layout = RawBridgeLayout {
+            block_samples: 2,
+            block_count: 2,
+        };
+        let (mut callback, worker) = build_raw_bridge::<i16>(
+            layout,
+            1,
+            SampleRate::new(1_000).unwrap(),
+            overflow_blocks,
+            overflow_samples,
+        );
+        enqueue_raw_callback(&mut callback, &[1, 2], 300);
+        callback.next_sequence = 3;
+        enqueue_raw_callback(&mut callback, &[3, 4], 304);
+
+        let callback_closed = Arc::new(AtomicBool::new(true));
+        let downstream_closed = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (sender, mut receiver) = latest_channel(8);
+        run_capture_worker(CaptureWorkerArgs {
+            bridge: worker,
+            sender,
+            source: AudioSource::Microphone,
+            sample_rate: SampleRate::new(1_000).unwrap(),
+            chunk_ms: 4,
+            callback_closed,
+            downstream_closed,
+            dropped_chunks: dropped,
+            worker_sample_capacity: layout.block_samples,
+            channels: 1,
+        });
+
+        let before_gap = receiver.recv().await.expect("pre-gap padded frame");
+        let after_gap = receiver.recv().await.expect("post-gap padded frame");
+        assert_eq!(before_gap.samples, vec![1, 2, 0, 0]);
+        assert_eq!(before_gap.captured_at_ms, 300);
+        assert_eq!(after_gap.samples, vec![3, 4, 0, 0]);
+        assert_eq!(after_gap.captured_at_ms, 304);
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[test]
+    fn raw_worker_stops_cleanly_after_callback_close() {
+        let layout = RawBridgeLayout {
+            block_samples: 4,
+            block_count: 2,
+        };
+        let (_callback, worker_bridge) = build_raw_bridge::<i16>(
+            layout,
+            1,
+            SampleRate::new(1_000).unwrap(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let callback_closed = Arc::new(AtomicBool::new(false));
+        let worker_closed = Arc::clone(&callback_closed);
+        let (sender, _receiver) = latest_channel(2);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            run_capture_worker(CaptureWorkerArgs {
+                bridge: worker_bridge,
+                sender,
+                source: AudioSource::Microphone,
+                sample_rate: SampleRate::new(1_000).unwrap(),
+                chunk_ms: 4,
+                callback_closed: worker_closed,
+                downstream_closed: Arc::new(AtomicBool::new(false)),
+                dropped_chunks: Arc::new(AtomicU64::new(0)),
+                worker_sample_capacity: layout.block_samples,
+                channels: 1,
+            });
+            let _ = done_tx.send(());
+        });
+
+        callback_closed.store(true, Ordering::Release);
+        worker.thread().unpark();
+        done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("worker did not stop after callback close");
+        worker.join().expect("worker join");
+    }
+
+    #[test]
+    fn realtime_callback_boundary_contains_no_forbidden_work() {
+        let source = include_str!("capture.rs");
+        let callback = source
+            .split("fn enqueue_raw_callback")
+            .nth(1)
+            .expect("callback function exists")
+            .split("#[derive(Clone, Copy)]")
+            .next()
+            .expect("callback section ends before clock");
+        for forbidden in [
+            "Mutex",
+            "Vec::",
+            "Box",
+            "vec!",
+            "String",
+            "format!",
+            "downmix",
+            "f32_to_i16",
+            "tracing::",
+            "tokio",
+            "Framer",
+            "AudioChunk",
+            "try_emit_chunk",
+        ] {
+            assert!(
+                !callback.contains(forbidden),
+                "realtime callback contains forbidden work: {forbidden}"
+            );
+        }
     }
 
     #[tokio::test]

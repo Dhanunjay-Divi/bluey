@@ -2,16 +2,13 @@ import { parseLocalRunCapability } from "./local-capabilities.js";
 
 export type BlueyJobsProtocolCommand =
   | { action: "open" }
-  | { action: "takeover" }
   | { action: "run"; runId: string; ticket: string }
   | { action: "resume"; runId: string; capability: string };
 
 export function parseBlueyJobsProtocol(rawUrl: string, nowMs = Date.now()): BlueyJobsProtocolCommand {
   const url = new URL(rawUrl);
   if (url.protocol !== "bluey-jobs:") throw new Error("Invalid Bluey Browser link");
-  if (url.hostname === "open" || url.hostname === "takeover") {
-    return { action: url.hostname };
-  }
+  if (url.hostname === "open") return { action: "open" };
   if (url.hostname !== "run" && url.hostname !== "resume") {
     throw new Error("Invalid Bluey Browser action");
   }

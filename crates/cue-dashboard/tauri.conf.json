@@ -39,12 +39,6 @@
     }
   },
   "plugins": {
-    "updater": {
-      "endpoints": [
-        "https://github.com/<org>/bluey/releases/latest/download/latest.json"
-      ],
-      "pubkey": "REPLACE_BEFORE_RELEASE"
-    },
     "deep-link": {
       "desktop": {
         "schemes": [

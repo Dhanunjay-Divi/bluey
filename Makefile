@@ -8,8 +8,10 @@
 # We package the "bluey" / "bluey-daemon" variants.
 
 .PHONY: require-update-pubkey build-daemon-release build-dashboard-release build-helpers-release \
-        build-darwin-arm64 build-darwin-x86_64 build-windows-x86_64 build-all \
-        package-darwin-arm64 package-darwin-x86_64 package-windows-x86_64
+        build-darwin-arm64 build-darwin-x86_64 build-darwin-universal \
+        build-windows-x86_64 build-all package-darwin-arm64 \
+        package-darwin-x86_64 package-darwin-universal \
+        package-windows-x86_64 package-windows-x86_64-gnu
 
 VERSION ?= $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
@@ -24,7 +26,12 @@ build-dashboard-release:
 	cd crates/cue-dashboard && cargo tauri build
 
 build-helpers-release:
-	@for s in native/macos/*/build.sh; do [ -f "$$s" ] && bash "$$s" || true; done
+	@set -eu; \
+	for helper in cue-overlay cue-audio cue-whisper cue-picker; do \
+		s="native/macos/$$helper/build.sh"; \
+		[ -x "$$s" ] || { echo "Missing macOS helper builder: $$s" >&2; exit 1; }; \
+		bash "$$s"; \
+	done
 
 build-darwin-arm64:
 	cargo build --release --target aarch64-apple-darwin -p cue-daemon -p cue-cli
@@ -37,67 +44,19 @@ build-windows-x86_64:
 
 build-all: build-darwin-arm64 build-darwin-x86_64
 
-package-darwin-arm64: require-update-pubkey build-darwin-arm64 build-helpers-release
-	mkdir -p dist staging-arm64/bin
-	cp target/aarch64-apple-darwin/release/bluey-daemon staging-arm64/bin/ 2>/dev/null || \
-		cp target/aarch64-apple-darwin/release/cue-daemon staging-arm64/bin/bluey-daemon
-	cp staging-arm64/bin/bluey-daemon staging-arm64/bin/termb
-	cp staging-arm64/bin/bluey-daemon staging-arm64/bin/Terminal
-	cp target/aarch64-apple-darwin/release/bluey staging-arm64/bin/ 2>/dev/null || \
-		cp target/aarch64-apple-darwin/release/cue staging-arm64/bin/bluey
-	cp native/macos/cue-overlay/.build/host-overlay staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-overlay/.build/hostovb staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-overlay/.build/bluey-overlay-macos staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-overlay/.build/cue-overlay-macos staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-audio/.build/audio-driver staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-audio/.build/adriverb staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-audio/.build/bluey-audio-macos staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-audio/.build/cue-audio-macos staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-whisper/.build/cue-whisper staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-whisper/.build/bluey-whisper-macos staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-picker/.build/bluey-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-picker/.build/cue-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
-	cp -R native/macos/cue-picker/.build/BlueyFilePicker.app staging-arm64/bin/ 2>/dev/null || true
-	COPYFILE_DISABLE=1 tar -czf dist/bluey-$(VERSION)-darwin-arm64.tar.gz -C staging-arm64 .
-	shasum -a 256 dist/bluey-$(VERSION)-darwin-arm64.tar.gz \
-	  > dist/bluey-$(VERSION)-darwin-arm64.tar.gz.sha256
-	rm -rf staging-arm64
+package-darwin-arm64: require-update-pubkey
+	BLUEY_UPDATE_PUBKEY="$(BLUEY_UPDATE_PUBKEY)" bash scripts/package-macos.sh arm64
 
-package-darwin-x86_64: require-update-pubkey build-darwin-x86_64
-	mkdir -p dist staging-x86/bin
-	cp target/x86_64-apple-darwin/release/bluey-daemon staging-x86/bin/ 2>/dev/null || \
-		cp target/x86_64-apple-darwin/release/cue-daemon staging-x86/bin/bluey-daemon
-	cp staging-x86/bin/bluey-daemon staging-x86/bin/termb
-	cp staging-x86/bin/bluey-daemon staging-x86/bin/Terminal
-	cp target/x86_64-apple-darwin/release/bluey staging-x86/bin/ 2>/dev/null || \
-		cp target/x86_64-apple-darwin/release/cue staging-x86/bin/bluey
-	COPYFILE_DISABLE=1 tar -czf dist/bluey-$(VERSION)-darwin-x86_64.tar.gz -C staging-x86 .
-	rm -rf staging-x86
+package-darwin-x86_64: require-update-pubkey
+	BLUEY_UPDATE_PUBKEY="$(BLUEY_UPDATE_PUBKEY)" bash scripts/package-macos.sh x86_64
 
 build-darwin-universal: build-darwin-arm64 build-darwin-x86_64
-	@bash scripts/build-macos-universal.sh
+	BLUEY_SWIFT_ARCH=arm64 $(MAKE) build-helpers-release
+	BLUEY_SWIFT_ARCH=x86_64 $(MAKE) build-helpers-release
+	BLUEY_CARGO_TARGET_DIR="$(CURDIR)/target" bash scripts/build-macos-universal.sh
 
-package-darwin-universal: require-update-pubkey build-darwin-universal
-	mkdir -p dist staging-universal/bin
-	cp dist/bluey-macos-universal/bluey staging-universal/bin/bluey
-	cp dist/bluey-macos-universal/bluey-daemon staging-universal/bin/bluey-daemon
-	cp dist/bluey-macos-universal/termb staging-universal/bin/termb 2>/dev/null || \
-		cp dist/bluey-macos-universal/bluey-daemon staging-universal/bin/termb
-	cp dist/bluey-macos-universal/Terminal staging-universal/bin/Terminal 2>/dev/null || \
-		cp dist/bluey-macos-universal/bluey-daemon staging-universal/bin/Terminal
-	cp dist/bluey-macos-universal/hostovb staging-universal/bin/hostovb 2>/dev/null || true
-	cp dist/bluey-macos-universal/host-overlay staging-universal/bin/host-overlay 2>/dev/null || true
-	cp dist/bluey-macos-universal/bluey-overlay-macos staging-universal/bin/bluey-overlay-macos 2>/dev/null || true
-	cp dist/bluey-macos-universal/adriverb staging-universal/bin/adriverb 2>/dev/null || true
-	cp dist/bluey-macos-universal/audio-driver staging-universal/bin/audio-driver 2>/dev/null || true
-	cp dist/bluey-macos-universal/bluey-audio-macos staging-universal/bin/bluey-audio-macos 2>/dev/null || true
-	cp dist/bluey-macos-universal/bluey-whisper-macos staging-universal/bin/bluey-whisper-macos 2>/dev/null || true
-	cp dist/bluey-macos-universal/bluey-file-picker-macos staging-universal/bin/bluey-file-picker-macos 2>/dev/null || true
-	cp -R dist/bluey-macos-universal/BlueyFilePicker.app staging-universal/bin/ 2>/dev/null || true
-	COPYFILE_DISABLE=1 tar -czf dist/bluey-$(VERSION)-darwin-universal.tar.gz -C staging-universal .
-	shasum -a 256 dist/bluey-$(VERSION)-darwin-universal.tar.gz \
-	  > dist/bluey-$(VERSION)-darwin-universal.tar.gz.sha256
-	rm -rf staging-universal
+package-darwin-universal: require-update-pubkey
+	BLUEY_UPDATE_PUBKEY="$(BLUEY_UPDATE_PUBKEY)" bash scripts/package-macos.sh universal
 
 
 package-windows-x86_64: require-update-pubkey build-windows-x86_64
@@ -114,3 +73,9 @@ package-windows-x86_64: require-update-pubkey build-windows-x86_64
 	cp staging-win/bin/audio-driver.exe staging-win/bin/adriverb.exe 2>/dev/null || true
 	cd staging-win && zip ../dist/bluey-$(VERSION)-windows-x86_64.zip -r *
 	rm -rf staging-win
+
+# Explicit POSIX-hosted MinGW path. This leaves the Windows/MSVC build above
+# unchanged while producing the same canonical release artifact on macOS or
+# Linux when the Rust windows-gnu target and MinGW-w64 toolchain are installed.
+package-windows-x86_64-gnu: require-update-pubkey
+	BLUEY_UPDATE_PUBKEY="$(BLUEY_UPDATE_PUBKEY)" bash scripts/package-windows-gnu.sh

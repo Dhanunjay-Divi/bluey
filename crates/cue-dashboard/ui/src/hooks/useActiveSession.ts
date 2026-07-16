@@ -41,11 +41,7 @@ export function useActiveSession() {
   }, []);
 
   const setActive = useCallback(async (id: string | null) => {
-    try {
-      await invoke("set_active_session", { id });
-    } catch (e) {
-      console.error("set_active_session failed", e);
-    }
+    await invoke("set_active_session", { id });
   }, []);
 
   return { activeId, setActive };

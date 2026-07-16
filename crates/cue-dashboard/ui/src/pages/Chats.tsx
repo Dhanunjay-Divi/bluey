@@ -3,6 +3,19 @@ import { invoke } from "../lib/tauri";
 import { useNavigate } from "react-router-dom";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { useActiveSession } from "../hooks/useActiveSession";
+import {
+  newSessionActionErrorMessage,
+  startNewSession,
+} from "../lib/sessionActions";
+import {
+  Archive,
+  ArrowRight,
+  Clock3,
+  MessageSquarePlus,
+  RefreshCw,
+  Search,
+  Trash2,
+} from "lucide-react";
 
 interface Session {
   id: string;
@@ -21,6 +34,7 @@ export function Chats() {
 
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
@@ -31,19 +45,23 @@ export function Chats() {
       const result = await invoke<Session[]>("list_sessions");
       setSessions(result);
     } catch (e) {
-      setError(String(e));
+      setError(`Saved sessions could not be loaded: ${String(e)}`);
     } finally {
       setLoading(false);
     }
   }, []);
 
   async function handleCreate() {
+    if (creating) return;
+    setCreating(true);
+    setError(null);
     try {
-      const s = await invoke<Session>("create_session", { title: null });
-      await fetchSessions();
-      navigate(`/session/${s.id}`);
+      await startNewSession({ navigate });
     } catch (e) {
-      setError(String(e));
+      await fetchSessions();
+      setError(newSessionActionErrorMessage(e));
+    } finally {
+      setCreating(false);
     }
   }
 
@@ -53,7 +71,7 @@ export function Chats() {
       await invoke("archive_session", { id });
       await fetchSessions();
     } catch (e) {
-      setError(String(e));
+      setError(`Bluey could not archive this session: ${String(e)}`);
     }
   }
 
@@ -64,7 +82,7 @@ export function Chats() {
       await invoke("delete_session", { id });
       await fetchSessions();
     } catch (e) {
-      setError(String(e));
+      setError(`Bluey could not delete this session: ${String(e)}`);
     }
   }
 
@@ -80,47 +98,80 @@ export function Chats() {
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return sessions.filter((s) => {
-      if (filter !== "all" && s.status !== filter) return false;
-      if (q && !s.title.toLowerCase().includes(q)) return false;
-      return true;
-    });
+    return [...sessions]
+      .filter((s) => {
+        if (filter !== "all" && s.status !== filter) return false;
+        if (q && !s.title.toLowerCase().includes(q)) return false;
+        return true;
+      })
+      .sort((a, b) => (b.updated_at || b.created_at) - (a.updated_at || a.created_at));
   }, [sessions, filter, query]);
 
-  if (loading) return <p className="text-zinc-500">Loading sessions...</p>;
-  if (error) return <p className="text-red-400">Error: {error}</p>;
-
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between gap-4">
+    <div className="mx-auto max-w-6xl space-y-5">
+      <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h2 className="text-xl font-semibold">Saved sessions</h2>
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-300">
+            Durable work history
+          </p>
+          <h1 className="mt-1 text-3xl font-semibold tracking-tight">Saved sessions</h1>
           <p className="mt-1 text-sm text-zinc-500">
-            Local sessions on this desktop. Sign in to sync them to your account.
+            Continue, rename, export, archive, or remove work owned by the current desktop account.
           </p>
         </div>
         <button
-          onClick={handleCreate}
-          className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium hover:bg-blue-500"
+          type="button"
+          onClick={() => void handleCreate()}
+          disabled={creating}
+          aria-busy={creating}
+          className="inline-flex min-h-10 items-center gap-2 rounded-md bg-cyan-400 px-4 text-sm font-semibold text-zinc-950 hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          New session
+          <MessageSquarePlus aria-hidden="true" size={16} />
+          {creating ? "Starting..." : "New session"}
         </button>
       </div>
 
-      <div className="flex items-center gap-3">
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search by title..."
-          className="flex-1 rounded-md border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-sm placeholder-zinc-600 focus:border-zinc-600 focus:outline-none"
-        />
-        <div className="flex items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
+      {error ? (
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-red-500/35 bg-red-950/35 px-4 py-3 text-sm text-red-100">
+          <span>{error}</span>
+          <button
+            type="button"
+            onClick={() => void fetchSessions()}
+            className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-red-400/30 px-3 text-xs font-semibold hover:bg-red-400/10"
+          >
+            <RefreshCw aria-hidden="true" size={13} />
+            Refresh
+          </button>
+        </div>
+      ) : null}
+
+      <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
+        <label className="relative">
+          <span className="sr-only">Search saved sessions by title</span>
+          <Search
+            aria-hidden="true"
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500"
+            size={16}
+          />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search by session title..."
+            className="min-h-11 w-full rounded-md border border-zinc-800 bg-zinc-900 pl-10 pr-3 text-sm placeholder-zinc-600 focus:border-cyan-400 focus:outline-none"
+          />
+        </label>
+        <div
+          className="flex items-center gap-1 overflow-x-auto rounded-md border border-zinc-800 bg-zinc-900 p-1 text-xs"
+          aria-label="Filter sessions"
+        >
           {(["all", "active", "paused", "archived"] as Filter[]).map((f) => (
             <button
+              type="button"
               key={f}
               onClick={() => setFilter(f)}
-              className={`rounded px-2 py-1 capitalize ${
-                filter === f ? "bg-zinc-800 text-zinc-200" : "text-zinc-500 hover:text-zinc-300"
+              aria-pressed={filter === f}
+              className={`min-h-8 whitespace-nowrap rounded px-3 capitalize ${
+                filter === f ? "bg-cyan-400/10 text-cyan-200" : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
               }`}
             >
               {f}
@@ -129,64 +180,96 @@ export function Chats() {
         </div>
       </div>
 
-      {filtered.length === 0 ? (
-        <p className="text-zinc-500">
-          {sessions.length === 0
-            ? "No sessions yet. Start one before a meeting, coding task, or research pass."
-            : "No sessions match the current filter."}
-        </p>
+      {loading ? (
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900 px-4 py-10 text-center text-sm text-zinc-500">
+          Loading saved sessions...
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/60 px-6 py-12 text-center">
+          <MessageSquarePlus aria-hidden="true" className="mx-auto text-zinc-600" size={30} />
+          <p className="mt-3 text-sm font-medium text-zinc-200">
+            {sessions.length === 0 ? "No sessions yet" : "No sessions match this view"}
+          </p>
+          <p className="mt-1 text-xs leading-5 text-zinc-500">
+            {sessions.length === 0
+              ? "Start one before a meeting, coding task, or research pass."
+              : "Change the title search or status filter."}
+          </p>
+        </div>
       ) : (
-        <ul className="space-y-2">
+        <ul className="space-y-3">
           {filtered.map((s) => {
             const isActive = s.id === activeId;
             return (
               <li
                 key={s.id}
-                onClick={() => navigate(`/session/${s.id}`)}
-                className={`flex items-center justify-between rounded-md border px-4 py-3 transition-colors cursor-pointer ${
+                className={`grid gap-3 rounded-xl border px-4 py-4 transition-colors sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center ${
                   isActive
-                    ? "border-blue-700 bg-blue-950/30"
-                    : "border-zinc-800 bg-zinc-900 hover:bg-zinc-850 hover:border-zinc-700"
+                    ? "border-cyan-500/40 bg-cyan-950/20"
+                    : "border-zinc-800 bg-zinc-900 hover:border-zinc-700"
                 }`}
               >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <p className="truncate font-medium">{s.title}</p>
+                <button
+                  type="button"
+                  onClick={() => navigate(`/session/${s.id}`)}
+                  className="min-w-0 text-left"
+                  aria-label={`Open ${s.title}`}
+                >
+                  <span className="flex items-center gap-2">
+                    <span className="truncate font-medium text-zinc-100">{s.title}</span>
                     {isActive && (
-                      <span className="shrink-0 rounded-full bg-blue-900/40 px-2 py-0.5 text-xs text-blue-300">
-                        active
+                      <span className="shrink-0 rounded-full bg-emerald-400/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-200">
+                        live
                       </span>
                     )}
-                  </div>
-                  <p className="text-xs text-zinc-500">
-                    {new Date(s.created_at).toLocaleString()} · {s.token_count} tokens
-                  </p>
-                </div>
-                <div className="flex shrink-0 items-center gap-2">
+                  </span>
+                  <span className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
+                    <span className="inline-flex items-center gap-1.5">
+                      <Clock3 aria-hidden="true" size={13} />
+                      Updated {formatTime(s.updated_at || s.created_at)}
+                    </span>
+                    <span>{s.status === "archived" ? "Archived history" : "Saved history"}</span>
+                  </span>
+                </button>
+                <div className="flex flex-wrap items-center gap-2 sm:justify-end">
                   <span
                     className={`rounded-full px-2 py-0.5 text-xs ${
                       s.status === "active"
-                        ? "bg-green-900/50 text-green-400"
+                        ? "bg-emerald-400/10 text-emerald-300"
                         : s.status === "archived"
                           ? "bg-zinc-700 text-zinc-400"
-                          : "bg-yellow-900/50 text-yellow-400"
+                          : "bg-amber-400/10 text-amber-300"
                     }`}
                   >
                     {s.status}
                   </span>
                   {s.status !== "archived" && (
                     <button
+                      type="button"
                       onClick={(e) => handleArchive(s.id, e)}
-                      className="rounded px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+                      aria-label={`Archive ${s.title}`}
+                      className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-zinc-700 px-2.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
                     >
+                      <Archive aria-hidden="true" size={13} />
                       Archive
                     </button>
                   )}
                   <button
+                    type="button"
                     onClick={(e) => handleDelete(s.id, s.title, e)}
-                    className="rounded px-2 py-1 text-xs text-red-400 hover:bg-red-950 hover:text-red-300"
+                    aria-label={`Delete ${s.title}`}
+                    className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-red-500/20 px-2.5 text-xs text-red-300 hover:bg-red-500/10"
                   >
+                    <Trash2 aria-hidden="true" size={13} />
                     Delete
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => navigate(`/session/${s.id}`)}
+                    aria-label={`Continue ${s.title}`}
+                    className="grid h-8 w-8 place-items-center rounded-md text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+                  >
+                    <ArrowRight aria-hidden="true" size={15} />
                   </button>
                 </div>
               </li>
@@ -196,4 +279,15 @@ export function Chats() {
       )}
     </div>
   );
+}
+
+function formatTime(ms: number): string {
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return "at an unknown time";
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }

@@ -9,7 +9,9 @@
 
 use async_trait::async_trait;
 use cue_core::pcm::AudioChunk;
-use cue_core::stt::{ConnectionState, SttError, SttProvider, TranscriptEvent};
+use cue_core::stt::{
+    ConnectionState, StableTranscriptEvent, SttError, SttProvider, TranscriptEvent,
+};
 use tracing::{info, warn};
 
 pub struct SttRouter {
@@ -81,6 +83,16 @@ impl SttProvider for SttRouter {
         let event = self.providers[self.active].next_event().await;
         if let Some(Err(e)) = &event {
             if e.should_failover() {
+                self.failover();
+            }
+        }
+        event
+    }
+
+    async fn next_stable_event(&mut self) -> Option<Result<StableTranscriptEvent, SttError>> {
+        let event = self.providers[self.active].next_stable_event().await;
+        if let Some(Err(error)) = &event {
+            if error.should_failover() {
                 self.failover();
             }
         }

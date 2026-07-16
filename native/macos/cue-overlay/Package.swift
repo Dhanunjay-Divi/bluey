@@ -10,6 +10,7 @@ let package = Package(
             path: "Sources/cue-overlay",
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("CoreAudio"),
                 .linkedFramework("QuartzCore"),
             ]
         )

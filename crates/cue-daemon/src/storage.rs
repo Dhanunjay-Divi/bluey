@@ -419,12 +419,16 @@ fn read_archived_meetings(archive_dir: &Path) -> Result<Vec<MeetingRecord>> {
 
 fn write_private_json(path: &Path, meeting: &MeetingRecord) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(meeting)?;
-    write_private_bytes(path, &bytes, false)
+    write_private_atomic_bytes(path, &bytes)
 }
 
 fn write_recoverable_private_json(path: &Path, meeting: &MeetingRecord) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(meeting)?;
     write_private_bytes(path, &bytes, true)
+}
+
+pub(crate) fn write_private_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_private_bytes(path, bytes, false)
 }
 
 fn write_private_bytes(path: &Path, bytes: &[u8], preserve_backup: bool) -> Result<()> {
@@ -816,6 +820,34 @@ mod security_tests {
         let cloned = store.clone();
 
         assert!(Arc::ptr_eq(&store.operation_lock, &cloned.operation_lock));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn private_state_publication_atomically_replaces_complete_payloads() {
+        let (base, paths, _store) = test_store("atomic-state");
+        let first = br#"{"generation":1,"status":"starting"}"#;
+        let second = br#"{"generation":2,"status":"ready"}"#;
+
+        write_private_atomic_bytes(&paths.state_file, first).expect("publish first state");
+        assert_eq!(
+            fs::read(&paths.state_file).expect("read first state"),
+            first
+        );
+
+        write_private_atomic_bytes(&paths.state_file, second).expect("publish second state");
+        assert_eq!(
+            fs::read(&paths.state_file).expect("read second state"),
+            second
+        );
+        assert!(fs::read_dir(&paths.runtime_dir)
+            .expect("read runtime dir")
+            .all(|entry| !entry
+                .expect("runtime entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TEMP_FILE_PREFIX)));
 
         let _ = fs::remove_dir_all(base);
     }

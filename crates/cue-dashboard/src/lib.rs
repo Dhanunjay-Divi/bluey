@@ -90,9 +90,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        // Auto-update plugin. Endpoint + pubkey configured in tauri.conf.json.
-        // PLACEHOLDER: replace pubkey and endpoint URL before production release.
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::get_app_version,
             commands::get_balance_snapshot,
@@ -106,6 +103,12 @@ pub fn run() {
             commands::complete_onboarding,
             commands::get_data_controls,
             commands::set_cloud_sync_enabled,
+            commands::get_context_watch_settings,
+            commands::update_context_watch_settings,
+            commands::get_meeting_detection_settings,
+            commands::set_meeting_detection_enabled,
+            commands::get_meeting_detection_ignored_apps,
+            commands::clear_meeting_detection_ignored_apps,
             commands::list_sessions,
             commands::create_session,
             commands::get_session,
@@ -133,8 +136,11 @@ pub fn run() {
             commands::daemon_end_session,
             commands::daemon_set_push_to_talk,
             commands::daemon_toggle_overlay,
-            // R5: Update check
-            commands::check_for_updates,
+            commands::daemon_context_status,
+            commands::daemon_context_start,
+            commands::daemon_context_stop,
+            commands::daemon_capture_active_page,
+            commands::daemon_context_items,
             // R7: Live Transcript
             commands::get_live_transcripts,
             // R6: Permission UX
@@ -255,31 +261,6 @@ pub fn run() {
             // Setup system tray
             setup_tray(app)?;
 
-            // Auto-update: silent background check after 30s delay
-            let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(30));
-                tauri::async_runtime::block_on(async {
-                    match tauri_plugin_updater::UpdaterExt::updater(&handle) {
-                        Ok(updater) => match updater.check().await {
-                            Ok(Some(update)) => {
-                                tracing::info!(version = %update.version, "update available");
-                                let _ = handle.emit("update_available", update.version.clone());
-                            }
-                            Ok(None) => {
-                                tracing::debug!("no update available");
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "update check failed (network?)");
-                            }
-                        },
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to create updater");
-                        }
-                    }
-                });
-            });
-
             #[cfg(target_os = "macos")]
             macos::setup_nspanel(app)?;
             #[cfg(target_os = "macos")]
@@ -379,10 +360,8 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let toggle_overlay = MenuItemBuilder::with_id("toggle_overlay", "Toggle Overlay").build(app)?;
     let overlay_visibility =
         MenuItemBuilder::with_id("overlay_visibility", "Show / Hide Overlay (F19)").build(app)?;
-    let signin = MenuItemBuilder::with_id("signin", "Sign in / Out").build(app)?;
+    let signin = MenuItemBuilder::with_id("signin", "Account & Sign In…").build(app)?;
     let settings = MenuItemBuilder::with_id("settings", "Settings…").build(app)?;
-    let check_updates =
-        MenuItemBuilder::with_id("check_updates", "Check for Updates…").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
     let menu = MenuBuilder::new(app)
@@ -393,7 +372,6 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&signin)
         .item(&settings)
-        .item(&check_updates)
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&quit)
         .build()?;
@@ -420,33 +398,11 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
             "signin" => {
                 show_main_window(app);
-                let _ = app.emit("navigate_to", "/onboarding");
+                let _ = app.emit("navigate_to", "/settings");
             }
             "settings" => {
                 show_main_window(app);
                 let _ = app.emit("navigate_to", "/settings");
-            }
-            "check_updates" => {
-                let handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    match tauri_plugin_updater::UpdaterExt::updater(&handle) {
-                        Ok(updater) => match updater.check().await {
-                            Ok(Some(update)) => {
-                                let _ = handle.emit("update_available", update.version.clone());
-                            }
-                            Ok(None) => {
-                                let _ = handle.emit("update_not_available", ());
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "manual update check failed");
-                                let _ = handle.emit("update_check_failed", e.to_string());
-                            }
-                        },
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to create updater");
-                        }
-                    }
-                });
             }
             "quit" => {
                 app.exit(0);
@@ -494,9 +450,57 @@ struct DeepLinkLoginResult {
     error: Option<String>,
 }
 
-/// Handle an incoming bluey://link?code=... URL: exchange the one-time
-/// code for tokens, persist them in the local account store via CloudClient, and
-/// emit a "deep_link_login" event the dashboard subscribes to.
+fn local_dashboard_route(parsed: &url::Url) -> Option<&'static str> {
+    let is_settings_host = parsed.scheme() == "bluey"
+        && parsed.host_str() == Some("settings")
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.port().is_none()
+        && matches!(parsed.path(), "" | "/")
+        && parsed.fragment().is_none();
+
+    if !is_settings_host {
+        return None;
+    }
+
+    match parsed.query() {
+        None => Some("/settings"),
+        Some("section=audio-meetings") => Some("/settings?section=audio-meetings"),
+        Some(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod deep_link_route_tests {
+    use super::local_dashboard_route;
+
+    #[test]
+    fn accepts_only_the_fixed_local_settings_route() {
+        let settings = url::Url::parse("bluey://settings").expect("valid settings URL");
+        assert_eq!(local_dashboard_route(&settings), Some("/settings"));
+        let audio_meetings =
+            url::Url::parse("bluey://settings?section=audio-meetings").expect("valid section URL");
+        assert_eq!(
+            local_dashboard_route(&audio_meetings),
+            Some("/settings?section=audio-meetings")
+        );
+
+        for rejected in [
+            "bluey://settings/account",
+            "bluey://settings?next=/onboarding",
+            "bluey://settings?section=audio-meetings&next=/onboarding",
+            "bluey://link?code=one-time-code",
+            "https://settings",
+        ] {
+            let parsed = url::Url::parse(rejected).expect("valid test URL");
+            assert_eq!(local_dashboard_route(&parsed), None, "{rejected}");
+        }
+    }
+}
+
+/// Handle a fixed local dashboard route or an incoming bluey://link?code=...
+/// login URL. Login links exchange the one-time code, persist tokens through
+/// CloudClient, and emit the result the dashboard subscribes to.
 async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
     use tauri::Emitter;
 
@@ -514,6 +518,12 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
 
     if parsed.scheme() != "bluey" {
         tracing::warn!(scheme = %parsed.scheme(), "unexpected deep link scheme");
+        return;
+    }
+
+    if let Some(route) = local_dashboard_route(&parsed) {
+        show_main_window(&app);
+        let _ = app.emit("navigate_to", route);
         return;
     }
 

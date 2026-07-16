@@ -266,7 +266,8 @@ async fn rag_indexes_context_artifact_with_source_labels() {
 
     pipeline
         .index_context_artifact("session-docs", &artifact)
-        .await;
+        .await
+        .unwrap();
 
     let hits = pipeline
         .query("cache invalidation revenue", 5, Some("session-docs"))
@@ -277,7 +278,8 @@ async fn rag_indexes_context_artifact_with_source_labels() {
     assert!(hits[0].chunk_text.contains("Attached context: Launch plan"));
     assert!(hits[0]
         .chunk_text
-        .contains("Source: /Users/example/launch-plan.md"));
+        .contains(&format!("Artifact ID: {}", artifact.id)));
+    assert!(!hits[0].chunk_text.contains("/Users/example"));
     assert!(hits[0].chunk_text.contains("cache invalidation"));
 }
 
@@ -306,7 +308,8 @@ async fn rag_indexes_saved_markdown_artifact_when_available() {
 
     pipeline
         .index_context_artifact("session-markdown", &artifact)
-        .await;
+        .await
+        .unwrap();
 
     let hits = pipeline
         .query("quasar ledger reconciliation", 5, Some("session-markdown"))

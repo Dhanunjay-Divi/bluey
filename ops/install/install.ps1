@@ -30,6 +30,10 @@ $InstallRoot = if (![string]::IsNullOrWhiteSpace($env:BLUEY_INSTALL_ROOT)) {
 }
 $BinDir = Join-Path $InstallRoot "bin"
 $Platform = "windows-x86_64"
+$BlueyUvVersion = "0.11.29"
+$BlueyMarkItDownVersion = "0.1.6"
+$BlueyMarkItDownExcludeNewer = "2026-07-16T00:00:00Z"
+$BlueyAzureContentUnderstandingVersion = "1.2.0b2"
 
 function Write-Step {
     param([string]$Message)
@@ -81,6 +85,9 @@ function Assert-FileSha256 {
         Fail "Missing SHA256 for downloaded Bluey artifact"
     }
     $expectedTrimmed = ($Expected -split '\s+')[0].Trim().ToLowerInvariant()
+    if ($expectedTrimmed -notmatch '^[0-9a-f]{64}$') {
+        Fail "Invalid SHA256 for downloaded Bluey artifact"
+    }
     $actual = Get-FileSha256 -Path $Path
     if ($actual -ne $expectedTrimmed) {
         Fail "Checksum mismatch for $(Split-Path -Leaf $Path). Expected $expectedTrimmed, got $actual"
@@ -114,7 +121,7 @@ function Ensure-UserPathEntry {
 }
 
 function Stop-BlueyForInstall {
-    Get-Process -Name "bluey", "bluey-daemon", "cue", "cue-daemon", "bluey-overlay", "cue-overlay", "bluey-audio", "cue-audio" -ErrorAction SilentlyContinue |
+    Get-Process -Name "bluey", "bluey-daemon", "cue", "cue-daemon", "bluey-overlay", "cue-overlay", "bluey-audio", "cue-audio", "bluey-capture", "cue-capture" -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
 
     $installRootFull = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
@@ -179,6 +186,7 @@ function Ensure-ProcessIdentityAliases {
     Copy-FirstBinaryAlias -Dir $Dir -AliasName "host-overlay.exe" -Candidates @("bluey-overlay.exe", "cue-overlay.exe")
     Copy-FirstBinaryAlias -Dir $Dir -AliasName "adriverb.exe" -Candidates @("bluey-audio.exe", "cue-audio.exe")
     Copy-FirstBinaryAlias -Dir $Dir -AliasName "audio-driver.exe" -Candidates @("bluey-audio.exe", "cue-audio.exe")
+    Copy-FirstBinaryAlias -Dir $Dir -AliasName "screen-driver.exe" -Candidates @("bluey-capture.exe", "cue-capture.exe")
 }
 
 function Test-BlueyPythonCommand {
@@ -221,6 +229,9 @@ function Get-BlueyPythonCommand {
 
 function Get-BlueyUvUrl {
     if (![string]::IsNullOrWhiteSpace($env:BLUEY_UV_URL)) {
+        if ([string]::IsNullOrWhiteSpace($env:BLUEY_UV_SHA256)) {
+            return $null
+        }
         return $env:BLUEY_UV_URL
     }
 
@@ -231,10 +242,33 @@ function Get-BlueyUvUrl {
     }
     switch -Regex ($arch) {
         '^(ARM64|AARCH64)$' {
-            return "https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-pc-windows-msvc.zip"
+            return "https://github.com/astral-sh/uv/releases/download/$BlueyUvVersion/uv-aarch64-pc-windows-msvc.zip"
         }
         default {
-            return "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
+            return "https://github.com/astral-sh/uv/releases/download/$BlueyUvVersion/uv-x86_64-pc-windows-msvc.zip"
+        }
+    }
+}
+
+function Get-BlueyUvSha256 {
+    if (![string]::IsNullOrWhiteSpace($env:BLUEY_UV_URL)) {
+        if ([string]::IsNullOrWhiteSpace($env:BLUEY_UV_SHA256)) {
+            return $null
+        }
+        return $env:BLUEY_UV_SHA256
+    }
+
+    $arch = if (![string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITEW6432)) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+    switch -Regex ($arch) {
+        '^(ARM64|AARCH64)$' {
+            return "55b597ae81bc29531a7c352a1431a8a73cc2755d7a5b9ec454580cbe02e5154f"
+        }
+        default {
+            return "a047d55651bc3e0ca24595b25ec4cfcb10f9dca9fb56514e661269b37d4fae68"
         }
     }
 }
@@ -242,13 +276,35 @@ function Get-BlueyUvUrl {
 function Install-BlueyLocalUv {
     param([string]$Root)
 
+    if (
+        ![string]::IsNullOrWhiteSpace($env:BLUEY_UV_URL) -and
+        [string]::IsNullOrWhiteSpace($env:BLUEY_UV_SHA256)
+    ) {
+        Write-Warn "BLUEY_UV_URL overrides require BLUEY_UV_SHA256"
+        return $null
+    }
+
     $uvDir = Join-Path $Root "tools\uv"
     $uvExe = Join-Path $uvDir "uv.exe"
     if (Test-Path $uvExe) {
-        return $uvExe
+        try {
+            $installedVersion = (& $uvExe --version 2>$null) -replace '^uv\s+', ''
+            $installedVersion = ($installedVersion -split '\s+')[0]
+            if ($installedVersion -eq $BlueyUvVersion) {
+                return $uvExe
+            }
+        } catch {
+            # Replace an unreadable or stale helper below.
+        }
+        Remove-Item -LiteralPath $uvExe -Force -ErrorAction SilentlyContinue
     }
 
     $uvUrl = Get-BlueyUvUrl
+    $uvSha256 = Get-BlueyUvSha256
+    if ([string]::IsNullOrWhiteSpace($uvUrl) -or [string]::IsNullOrWhiteSpace($uvSha256)) {
+        Write-Warn "BLUEY_UV_URL overrides require BLUEY_UV_SHA256"
+        return $null
+    }
     $tempRoot = Join-Path $env:TEMP ("bluey-uv-" + [guid]::NewGuid().ToString("N"))
     $zipPath = Join-Path $tempRoot "uv.zip"
     $extractPath = Join-Path $tempRoot "extract"
@@ -257,6 +313,14 @@ function Install-BlueyLocalUv {
         New-Item -ItemType Directory -Force -Path $uvDir, $tempRoot, $extractPath | Out-Null
         Write-Step "Installing Bluey local Python runtime helper..."
         Invoke-WebRequest -Uri $uvUrl -OutFile $zipPath -UseBasicParsing
+        $expectedUvSha256 = ($uvSha256 -split '\s+')[0].Trim().ToLowerInvariant()
+        if ($expectedUvSha256 -notmatch '^[0-9a-f]{64}$') {
+            throw "Bluey local Python runtime helper SHA256 must contain exactly 64 hexadecimal characters"
+        }
+        $actualUvSha256 = Get-FileSha256 -Path $zipPath
+        if ($actualUvSha256 -ne $expectedUvSha256) {
+            throw "Checksum mismatch for the Bluey local Python runtime helper. Expected $expectedUvSha256, got $actualUvSha256"
+        }
         Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
         $downloadedUv = Get-ChildItem -Path $extractPath -Filter "uv.exe" -Recurse -ErrorAction SilentlyContinue |
             Select-Object -First 1
@@ -285,6 +349,7 @@ function Invoke-WithBlueyUvEnv {
     $oldPythonInstall = $env:UV_PYTHON_INSTALL_DIR
     $oldDownloads = $env:UV_PYTHON_DOWNLOADS
     $oldLinkMode = $env:UV_LINK_MODE
+    $exitCode = 0
     try {
         $env:UV_CACHE_DIR = Join-Path $Root "tools\uv-cache"
         $env:UV_PYTHON_INSTALL_DIR = Join-Path $Root "tools\python"
@@ -292,16 +357,25 @@ function Invoke-WithBlueyUvEnv {
         $env:UV_LINK_MODE = "copy"
         New-Item -ItemType Directory -Force -Path $env:UV_CACHE_DIR, $env:UV_PYTHON_INSTALL_DIR | Out-Null
         & $Body
+        $exitCode = $LASTEXITCODE
     } finally {
         if ($null -eq $oldCache) { Remove-Item Env:\UV_CACHE_DIR -ErrorAction SilentlyContinue } else { $env:UV_CACHE_DIR = $oldCache }
         if ($null -eq $oldPythonInstall) { Remove-Item Env:\UV_PYTHON_INSTALL_DIR -ErrorAction SilentlyContinue } else { $env:UV_PYTHON_INSTALL_DIR = $oldPythonInstall }
         if ($null -eq $oldDownloads) { Remove-Item Env:\UV_PYTHON_DOWNLOADS -ErrorAction SilentlyContinue } else { $env:UV_PYTHON_DOWNLOADS = $oldDownloads }
         if ($null -eq $oldLinkMode) { Remove-Item Env:\UV_LINK_MODE -ErrorAction SilentlyContinue } else { $env:UV_LINK_MODE = $oldLinkMode }
     }
+    return $exitCode
 }
 
 function Install-BlueyLocalDocTools {
     param([string]$Root)
+
+    $toolsDir = Join-Path $Root "tools\doc-converter"
+    $venvDir = Join-Path $toolsDir ".venv"
+    $wrapper = Join-Path (Join-Path $Root "bin") "bluey-doc-converter.cmd"
+    New-Item -ItemType Directory -Force -Path $toolsDir, (Split-Path -Parent $wrapper) | Out-Null
+    Remove-Item -LiteralPath $wrapper -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $venvDir -Recurse -Force -ErrorAction SilentlyContinue
 
     if ($env:BLUEY_SKIP_LOCAL_TOOLS -eq "1") {
         Write-Warn "Skipping Bluey document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
@@ -309,57 +383,43 @@ function Install-BlueyLocalDocTools {
     }
 
     Write-Step "Installing Bluey document tools..."
-    $toolsDir = Join-Path $Root "tools\doc-converter"
-    $venvDir = Join-Path $toolsDir ".venv"
-    $wrapper = Join-Path (Join-Path $Root "bin") "bluey-doc-converter.cmd"
-    New-Item -ItemType Directory -Force -Path $toolsDir, (Split-Path -Parent $wrapper) | Out-Null
 
     try {
-        $pythonSpec = Get-BlueyPythonCommand
-        $uvExe = $null
-        if ($pythonSpec) {
-            & $pythonSpec.Source @($pythonSpec.Args) -m venv $venvDir | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warn "Could not create Bluey's local Python environment with installed Python; trying Bluey's local bootstrap"
-                $uvExe = Install-BlueyLocalUv -Root $Root
-            }
-        } else {
-            Write-Warn "A real Python 3 install was not found; creating Bluey's local document tools runtime"
-            $uvExe = Install-BlueyLocalUv -Root $Root
+        $uvExe = Install-BlueyLocalUv -Root $Root
+        if (-not $uvExe) {
+            Write-Warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
+            return
         }
-
-        if ($uvExe) {
-            Invoke-WithBlueyUvEnv -Root $Root -Body {
-                & $uvExe venv --python 3.12 $venvDir | Out-Null
-            }
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
-                return
-            }
-        } elseif (-not (Test-Path (Join-Path $venvDir "Scripts\python.exe"))) {
+        $uvExitCode = Invoke-WithBlueyUvEnv -Root $Root -Body {
+            & $uvExe venv --python 3.12 $venvDir | Out-Null
+        }
+        if ($uvExitCode -ne 0) {
+            Remove-Item -LiteralPath $venvDir -Recurse -Force -ErrorAction SilentlyContinue
             Write-Warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
             return
         }
 
         $venvPython = Join-Path $venvDir "Scripts\python.exe"
-        if ($uvExe) {
-            Invoke-WithBlueyUvEnv -Root $Root -Body {
-                & $uvExe pip install --python $venvPython "markitdown[all]" | Out-Null
+        $uvExitCode = Invoke-WithBlueyUvEnv -Root $Root -Body {
+            & $uvExe pip install --prerelease explicit --python $venvPython --exclude-newer $BlueyMarkItDownExcludeNewer "markitdown[all]==$BlueyMarkItDownVersion" "azure-ai-contentunderstanding==$BlueyAzureContentUnderstandingVersion" | Out-Null
+        }
+        if ($uvExitCode -ne 0) {
+            Remove-Item -LiteralPath $venvDir -Recurse -Force -ErrorAction SilentlyContinue
+            $uvExitCode = Invoke-WithBlueyUvEnv -Root $Root -Body {
+                & $uvExe venv --python 3.12 $venvDir | Out-Null
             }
-            if ($LASTEXITCODE -ne 0) {
-                Invoke-WithBlueyUvEnv -Root $Root -Body {
-                    & $uvExe pip install --python $venvPython markitdown | Out-Null
-                }
+            if ($uvExitCode -ne 0) {
+                Remove-Item -LiteralPath $venvDir -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
+                return
             }
-        } else {
-            & $venvPython -m pip install --disable-pip-version-check --upgrade pip | Out-Null
-            & $venvPython -m pip install --disable-pip-version-check "markitdown[all]" | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                & $venvPython -m pip install --disable-pip-version-check markitdown | Out-Null
+            $uvExitCode = Invoke-WithBlueyUvEnv -Root $Root -Body {
+                & $uvExe pip install --python $venvPython --exclude-newer $BlueyMarkItDownExcludeNewer "markitdown==$BlueyMarkItDownVersion" | Out-Null
             }
         }
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
+        if ($uvExitCode -ne 0) {
+            Remove-Item -LiteralPath $venvDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Warn "Could not install pinned MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
             return
         }
 
@@ -371,6 +431,8 @@ function Install-BlueyLocalDocTools {
         Set-Content -Path $wrapper -Encoding ASCII -Value $wrapperLines
         Write-Ok "Bluey document tools installed"
     } catch {
+        Remove-Item -LiteralPath $wrapper -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $venvDir -Recurse -Force -ErrorAction SilentlyContinue
         Write-Warn "Could not install Bluey document tools: $($_.Exception.Message)"
     }
 }

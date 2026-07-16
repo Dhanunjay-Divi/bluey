@@ -35,7 +35,7 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
   const emailCodeReady = intervention?.resolution_kind === "email_otp_approval"
     && (!intervention.expires_at_ms || intervention.expires_at_ms > Date.now());
   const finalSubmissionReview = isFinalSubmissionReview(intervention);
-  const takeoverUrl = active?.takeover_url || (active ? `bluey-jobs://takeover?session_id=${encodeURIComponent(active.id)}` : "#");
+  const takeoverUrl = active?.takeover_url;
   const queuedApplications = runnerEligibleApplications(workspace.applications);
   const localCopy = localRunnerAccessCopy(workspace.entitlement.local_browser);
   const cloudCopy = cloudRunnerAccessCopy(workspace.entitlement.cloud_browser);
@@ -61,11 +61,11 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
             {intervention && <div className="run-alert"><AlertTriangle size={17} /><div><b>{intervention.title}</b><p>{intervention.detail}</p></div></div>}
             <div className="run-actions">
               {finalSubmissionReview && intervention ? <>
-                <a className="button secondary compact" href={takeoverUrl}><MonitorUp size={15} />Review form</a>
+                <TakeoverAction url={takeoverUrl} label="Review form" compact />
                 <button className="button primary" disabled={resolving} onClick={() => { setReviewConfirmed(false); setApprovalOpen(true); }}><ShieldCheck size={16} />Approve submission</button>
               </> : emailCodeReady && intervention
-                ? <><button className="button primary" disabled={resolving} onClick={() => { setResolving(true); void onResolveIntervention(intervention, "approve_email_otp").finally(() => setResolving(false)); }}><MailCheck size={16} />{resolving ? "Approving..." : "Use email code"}</button><a className="button secondary compact" href={takeoverUrl}><MonitorUp size={15} />Take over</a></>
-                : <a className="button primary" href={takeoverUrl}><MonitorUp size={16} />Take over</a>}
+                ? <><button className="button primary" disabled={resolving} onClick={() => { setResolving(true); void onResolveIntervention(intervention, "approve_email_otp").finally(() => setResolving(false)); }}><MailCheck size={16} />{resolving ? "Approving..." : "Use email code"}</button><TakeoverAction url={takeoverUrl} label="Take over" compact /></>
+                : <TakeoverAction url={takeoverUrl} label="Take over" primary />}
               <button className="icon-button" title={active.status === "paused" ? "Resume run" : "Pause run"} onClick={() => void onUpdateSession(active, active.status === "paused" ? "queued" : "paused")}>{active.status === "paused" ? <Play size={18} /> : <PauseCircle size={18} />}</button>
             </div>
           </div>
@@ -116,4 +116,16 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
       </Dialog>
     </div>
   );
+}
+
+function TakeoverAction({ url, label, primary = false, compact = false }: {
+  url?: string;
+  label: string;
+  primary?: boolean;
+  compact?: boolean;
+}) {
+  const className = `button ${primary ? "primary" : "secondary"}${compact ? " compact" : ""}`;
+  return url
+    ? <a className={className} href={url}><MonitorUp size={compact ? 15 : 16} />{label}</a>
+    : <button className={className} disabled title="A scoped takeover capability is not available for this run"><MonitorUp size={compact ? 15 : 16} />Takeover unavailable</button>;
 }

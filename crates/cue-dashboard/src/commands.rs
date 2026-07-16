@@ -1,11 +1,11 @@
-use cue_core::ipc::{DaemonRequest, DaemonResponse};
-use cue_core::session::Session;
-use cue_core::{AudioCaptureState, AudioPipelineStatus, AudioSourceState};
+use cue_core::ipc::{DaemonRequest, DaemonResponse, DaemonSessionLifecycle, DaemonSessionRecord};
+use cue_core::session::{Session, SessionStatus};
+use cue_core::{AudioCaptureState, AudioPipelineStatus, AudioSourceKind, AudioSourceState};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
@@ -717,17 +717,6 @@ fn dashboard_get_session(
         .map_err(|e| e.to_string())
 }
 
-fn require_dashboard_session(
-    db: &cue_daemon::db::Database,
-    owner: &DashboardOwner,
-    id: Uuid,
-) -> Result<(), String> {
-    if dashboard_get_session(db, owner, id)?.is_none() {
-        return Err(format!("session {id} not found"));
-    }
-    Ok(())
-}
-
 fn active_session_for_owner(
     db: &cue_daemon::db::Database,
     active: &ActiveSessionState,
@@ -767,6 +756,121 @@ fn cache_active_session(
     Ok(())
 }
 
+fn daemon_session_owner_matches(owner: &DashboardOwner, session: &DaemonSessionRecord) -> bool {
+    let record_owner = session
+        .owner_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    owner.db_owner_id() == record_owner
+}
+
+fn lifecycle_timestamp(value: &str) -> i64 {
+    value.trim().parse::<i64>().unwrap_or_default()
+}
+
+fn dashboard_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn project_daemon_session(
+    db: &cue_daemon::db::Database,
+    owner: &DashboardOwner,
+    session: &DaemonSessionRecord,
+) -> Result<Session, String> {
+    if !daemon_session_owner_matches(owner, session) {
+        return Err(format!(
+            "daemon session {} does not belong to the current account",
+            session.id
+        ));
+    }
+    let created_at = lifecycle_timestamp(&session.started_at);
+    let updated_at = session
+        .ended_at
+        .as_deref()
+        .map(lifecycle_timestamp)
+        .unwrap_or_else(dashboard_now_ms)
+        .max(created_at);
+    db.ensure_session_record_for_owner(
+        owner.db_owner_id(),
+        session.id,
+        &session.title,
+        created_at,
+        updated_at,
+    )
+    .map_err(|error| error.to_string())?;
+    let status = if session.active {
+        SessionStatus::Active
+    } else if session.ended_at.is_some() {
+        SessionStatus::Archived
+    } else {
+        SessionStatus::Paused
+    };
+    db.update_session_status_for_owner(owner.db_owner_id(), session.id, status)
+        .map_err(|error| error.to_string())?;
+    dashboard_get_session(db, owner, session.id)?
+        .ok_or_else(|| format!("session {} projection is missing", session.id))
+}
+
+fn project_session_lifecycle(
+    db: &cue_daemon::db::Database,
+    owner: &DashboardOwner,
+    lifecycle: &DaemonSessionLifecycle,
+) -> Result<Option<Session>, String> {
+    for session in [
+        lifecycle.changed.as_ref(),
+        lifecycle.replaced.as_ref(),
+        lifecycle.deleted.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !daemon_session_owner_matches(owner, session) {
+            return Err(format!(
+                "daemon session {} does not belong to the current account",
+                session.id
+            ));
+        }
+    }
+
+    if let Some(replaced) = lifecycle.replaced.as_ref() {
+        project_daemon_session(db, owner, replaced)?;
+    }
+    let changed = lifecycle
+        .changed
+        .as_ref()
+        .map(|session| project_daemon_session(db, owner, session))
+        .transpose()?;
+    if let Some(deleted) = lifecycle.deleted.as_ref() {
+        db.delete_session_for_owner(owner.db_owner_id(), deleted.id)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(active_id) = lifecycle.active_session_id {
+        if dashboard_get_session(db, owner, active_id)?.is_none() {
+            return Err(format!(
+                "daemon active session {active_id} is missing from the dashboard projection"
+            ));
+        }
+    }
+    db.save_active_session_for_owner(owner.db_owner_id(), lifecycle.active_session_id)
+        .map_err(|error| error.to_string())?;
+    Ok(changed)
+}
+
+fn session_lifecycle_from_response(
+    response: DaemonResponse,
+) -> Result<DaemonSessionLifecycle, String> {
+    match response {
+        DaemonResponse::SessionLifecycle { lifecycle } => Ok(lifecycle),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Err("Bluey's local service returned an unexpected session response.".to_string()),
+    }
+}
+
 #[tauri::command]
 pub fn list_sessions(db: State<DbState>, app: AppHandle) -> Result<Vec<Session>, String> {
     let owner = current_owner_for_app(&app)?;
@@ -775,21 +879,33 @@ pub fn list_sessions(db: State<DbState>, app: AppHandle) -> Result<Vec<Session>,
 }
 
 #[tauri::command]
-pub fn create_session(
+pub async fn create_session(
     title: Option<String>,
-    db: State<DbState>,
+    db: State<'_, DbState>,
+    active: State<'_, ActiveSessionState>,
     app: AppHandle,
 ) -> Result<Session, String> {
     let owner = current_owner_for_app(&app)?;
+    let lifecycle =
+        session_lifecycle_from_response(daemon_ipc(DaemonRequest::SessionCreate { title }).await?)?;
     let session = {
         let db = db.0.lock().map_err(|e| e.to_string())?;
-        db.create_session_for_owner(owner.db_owner_id(), title)
-            .map_err(|e| e.to_string())?
+        project_session_lifecycle(&db, &owner, &lifecycle)?
+            .ok_or_else(|| "daemon did not return the created session".to_string())?
     };
+    cache_active_session(&active, &owner, lifecycle.active_session_id)?;
     // Broadcast so any other window / page listening via
     // `useSessionEvents` picks up the new session without a refetch.
     if let Err(e) = app.emit("session:created", &session) {
         tracing::warn!(error = %e, "failed to emit session:created event");
+    }
+    if let Err(e) = app.emit(
+        "session:switched",
+        SessionSwitchedPayload {
+            id: lifecycle.active_session_id.map(|id| id.to_string()),
+        },
+    ) {
+        tracing::warn!(error = %e, "failed to emit session:switched event");
     }
     Ok(session)
 }
@@ -807,40 +923,65 @@ pub fn get_session(
 }
 
 #[tauri::command]
-pub fn archive_session(id: String, db: State<DbState>, app: AppHandle) -> Result<(), String> {
-    let owner = current_owner_for_app(&app)?;
-    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    require_dashboard_session(&db, &owner, uuid)?;
-    db.archive_session_for_owner(owner.db_owner_id(), uuid)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn delete_session(
+pub async fn archive_session(
     id: String,
-    db: State<DbState>,
-    active: State<ActiveSessionState>,
+    db: State<'_, DbState>,
+    active: State<'_, ActiveSessionState>,
     app: AppHandle,
 ) -> Result<(), String> {
     let owner = current_owner_for_app(&app)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-    let was_active = {
+    let previous = {
         let db = db.0.lock().map_err(|e| e.to_string())?;
-        require_dashboard_session(&db, &owner, uuid)?;
-        let was_active = active_session_for_owner(&db, &active, &owner)? == Some(uuid);
-        db.delete_session_for_owner(owner.db_owner_id(), uuid)
-            .map_err(|e| e.to_string())?;
-        if was_active {
-            db.save_active_session_for_owner(owner.db_owner_id(), None)
-                .map_err(|e| e.to_string())?;
-        }
-        was_active
+        active_session_for_owner(&db, &active, &owner)?
     };
+    let lifecycle = session_lifecycle_from_response(
+        daemon_ipc(DaemonRequest::SessionArchive { id: uuid }).await?,
+    )?;
+    {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        project_session_lifecycle(&db, &owner, &lifecycle)?;
+    }
+    cache_active_session(&active, &owner, lifecycle.active_session_id)?;
+    if previous != lifecycle.active_session_id {
+        let _ = app.emit(
+            "session:switched",
+            SessionSwitchedPayload {
+                id: lifecycle.active_session_id.map(|id| id.to_string()),
+            },
+        );
+    }
+    Ok(())
+}
 
-    if was_active {
-        cache_active_session(&active, &owner, None)?;
-        if let Err(e) = app.emit("session:switched", SessionSwitchedPayload { id: None }) {
+#[tauri::command]
+pub async fn delete_session(
+    id: String,
+    db: State<'_, DbState>,
+    active: State<'_, ActiveSessionState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let owner = current_owner_for_app(&app)?;
+    let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let previous = {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        active_session_for_owner(&db, &active, &owner)?
+    };
+    let lifecycle = session_lifecycle_from_response(
+        daemon_ipc(DaemonRequest::SessionDelete { id: uuid }).await?,
+    )?;
+    {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        project_session_lifecycle(&db, &owner, &lifecycle)?;
+    }
+    cache_active_session(&active, &owner, lifecycle.active_session_id)?;
+    if previous != lifecycle.active_session_id {
+        if let Err(e) = app.emit(
+            "session:switched",
+            SessionSwitchedPayload {
+                id: lifecycle.active_session_id.map(|id| id.to_string()),
+            },
+        ) {
             tracing::warn!(error = %e, "failed to emit session:switched event");
         }
     }
@@ -848,17 +989,20 @@ pub fn delete_session(
 }
 
 #[tauri::command]
-pub fn update_session_title(
+pub async fn update_session_title(
     id: String,
     title: String,
-    db: State<DbState>,
+    db: State<'_, DbState>,
     app: AppHandle,
 ) -> Result<(), String> {
     let owner = current_owner_for_app(&app)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let lifecycle = session_lifecycle_from_response(
+        daemon_ipc(DaemonRequest::SessionRename { id: uuid, title }).await?,
+    )?;
     let db = db.0.lock().map_err(|e| e.to_string())?;
-    db.update_session_title_for_owner(owner.db_owner_id(), uuid, &title)
-        .map_err(|e| e.to_string())
+    project_session_lifecycle(&db, &owner, &lifecycle)?;
+    Ok(())
 }
 
 /// Return the currently-active session id, or `None` if no session is selected.
@@ -879,32 +1023,29 @@ pub fn get_active_session(
 /// at an id that was just deleted in another window). Emits `session:switched`
 /// whenever the selection changes.
 #[tauri::command]
-pub fn set_active_session(
+pub async fn set_active_session(
     id: Option<String>,
-    db: State<DbState>,
-    active: State<ActiveSessionState>,
+    db: State<'_, DbState>,
+    active: State<'_, ActiveSessionState>,
     app: AppHandle,
 ) -> Result<(), String> {
     let owner = current_owner_for_app(&app)?;
-    let new_id = match id {
-        Some(raw) => {
-            let uuid = Uuid::parse_str(&raw).map_err(|e| e.to_string())?;
-            let db = db.0.lock().map_err(|e| e.to_string())?;
-            require_dashboard_session(&db, &owner, uuid)?;
-            Some(uuid)
-        }
-        None => None,
-    };
-
     let previous = {
         let db = db.0.lock().map_err(|e| e.to_string())?;
-        let previous = active_session_for_owner(&db, &active, &owner)?;
-        if previous != new_id {
-            db.save_active_session_for_owner(owner.db_owner_id(), new_id)
-                .map_err(|e| e.to_string())?;
-        }
-        previous
+        active_session_for_owner(&db, &active, &owner)?
     };
+    let request = match id {
+        Some(raw) => DaemonRequest::SessionActivate {
+            id: Uuid::parse_str(&raw).map_err(|e| e.to_string())?,
+        },
+        None => DaemonRequest::SessionDeactivate,
+    };
+    let lifecycle = session_lifecycle_from_response(daemon_ipc(request).await?)?;
+    {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        project_session_lifecycle(&db, &owner, &lifecycle)?;
+    }
+    let new_id = lifecycle.active_session_id;
     let changed = previous != new_id;
     cache_active_session(&active, &owner, new_id)?;
 
@@ -960,12 +1101,148 @@ pub fn get_data_controls() -> Result<DataControlsPayload, String> {
 #[tauri::command]
 pub fn set_cloud_sync_enabled(enabled: bool) -> Result<DataControlsPayload, String> {
     let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
-    let mut settings = cue_core::load_settings(&paths).map_err(|e| e.to_string())?;
-    settings.cloud_sync_consent_granted = enabled;
-    settings.cloud_sync_enabled = enabled;
-    settings.touch();
-    cue_core::save_settings(&paths, &settings).map_err(|e| e.to_string())?;
+    let settings = cue_core::update_settings(&paths, |settings| {
+        settings.cloud_sync_consent_granted = enabled;
+        settings.cloud_sync_enabled = enabled;
+    })
+    .map_err(|e| e.to_string())?;
     Ok(data_controls_payload(&settings))
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ContextWatchSettingsPayload {
+    pub semantic_first: bool,
+    pub screenshot_fallback: bool,
+    pub interval_secs: u64,
+    pub max_local_items: usize,
+    pub excluded_apps: Vec<String>,
+    pub excluded_domains: Vec<String>,
+}
+
+fn context_watch_settings_payload(
+    settings: &cue_core::ContextWatchSettings,
+) -> ContextWatchSettingsPayload {
+    ContextWatchSettingsPayload {
+        semantic_first: settings.semantic_first,
+        screenshot_fallback: settings.screenshot_fallback,
+        interval_secs: settings.interval_secs,
+        max_local_items: settings.max_local_items,
+        excluded_apps: settings.excluded_apps.clone(),
+        excluded_domains: settings.excluded_domains.clone(),
+    }
+}
+
+fn apply_context_watch_settings(
+    current: &mut cue_core::CueSettings,
+    requested: ContextWatchSettingsPayload,
+) {
+    // Semantic browser text remains the mandatory first boundary. The
+    // dashboard may authorize screenshots only as an explicit fallback.
+    current.context_watch.semantic_first = true;
+    current.context_watch.screenshot_fallback = requested.screenshot_fallback;
+    current.context_watch.interval_secs = requested.interval_secs;
+    current.context_watch.max_local_items = requested.max_local_items;
+    current.context_watch.excluded_apps = requested.excluded_apps;
+    current.context_watch.excluded_domains = requested.excluded_domains;
+}
+
+#[tauri::command]
+pub fn get_context_watch_settings() -> Result<ContextWatchSettingsPayload, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let settings = cue_core::load_settings(&paths).map_err(|e| e.to_string())?;
+    Ok(context_watch_settings_payload(&settings.context_watch))
+}
+
+#[tauri::command]
+pub fn update_context_watch_settings(
+    settings: ContextWatchSettingsPayload,
+) -> Result<ContextWatchSettingsPayload, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let saved = cue_core::update_settings(&paths, move |current| {
+        apply_context_watch_settings(current, settings);
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(context_watch_settings_payload(&saved.context_watch))
+}
+
+#[tauri::command]
+pub fn get_meeting_detection_ignored_apps() -> Result<Vec<String>, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let settings = cue_core::load_settings(&paths).map_err(|e| e.to_string())?;
+    Ok(settings.meeting_detection_ignored_apps)
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MeetingDetectionSettingsPayload {
+    pub enabled: bool,
+    pub detection_refreshed: bool,
+}
+
+async fn reload_meeting_detection_settings() -> bool {
+    match daemon_ipc(DaemonRequest::MeetingDetectionSettingsReload).await {
+        Ok(DaemonResponse::Ok | DaemonResponse::Text { .. }) => true,
+        Ok(DaemonResponse::Error { message }) => {
+            tracing::warn!(%message, "meeting detection settings reload was rejected");
+            false
+        }
+        Ok(_) => {
+            tracing::warn!("meeting detection settings reload returned an unexpected response");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(%error, "meeting detection settings reload failed");
+            false
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_meeting_detection_settings() -> Result<MeetingDetectionSettingsPayload, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let settings = cue_core::load_settings(&paths).map_err(|e| e.to_string())?;
+    Ok(MeetingDetectionSettingsPayload {
+        enabled: settings.meeting_detection_enabled,
+        detection_refreshed: true,
+    })
+}
+
+#[tauri::command]
+pub async fn set_meeting_detection_enabled(
+    enabled: bool,
+) -> Result<MeetingDetectionSettingsPayload, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let settings = cue_core::update_settings(&paths, |settings| {
+        settings.meeting_detection_enabled = enabled;
+    })
+    .map_err(|e| e.to_string())?;
+    let detection_refreshed = reload_meeting_detection_settings().await;
+    Ok(MeetingDetectionSettingsPayload {
+        enabled: settings.meeting_detection_enabled,
+        detection_refreshed,
+    })
+}
+
+#[derive(Clone, Serialize)]
+pub struct ClearMeetingDetectionIgnoredAppsPayload {
+    pub apps: Vec<String>,
+    pub detection_refreshed: bool,
+}
+
+#[tauri::command]
+pub async fn clear_meeting_detection_ignored_apps(
+) -> Result<ClearMeetingDetectionIgnoredAppsPayload, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let settings = cue_core::update_settings(&paths, |settings| {
+        settings.meeting_detection_ignored_apps.clear();
+    })
+    .map_err(|e| e.to_string())?;
+
+    let detection_refreshed = reload_meeting_detection_settings().await;
+
+    Ok(ClearMeetingDetectionIgnoredAppsPayload {
+        apps: settings.meeting_detection_ignored_apps,
+        detection_refreshed,
+    })
 }
 
 #[tauri::command]
@@ -1500,24 +1777,101 @@ pub async fn daemon_toggle_overlay() -> Result<String, String> {
     }
 }
 
-/// Trigger an update check from the UI. Emits `update_available` or `update_not_available`.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ContextModeStatusPayload {
+    pub active: bool,
+    pub interval_secs: Option<u64>,
+    pub context_items: usize,
+}
+
+fn context_mode_status_from_response(
+    response: DaemonResponse,
+) -> Result<ContextModeStatusPayload, String> {
+    match response {
+        DaemonResponse::Status { state } => Ok(ContextModeStatusPayload {
+            active: state.screen_capture_active,
+            interval_secs: state.screen_capture_interval_secs,
+            context_items: state.context_items,
+        }),
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+async fn current_context_mode_status() -> Result<ContextModeStatusPayload, String> {
+    context_mode_status_from_response(daemon_ipc(DaemonRequest::Status).await?)
+}
+
 #[tauri::command]
-pub async fn check_for_updates(app: AppHandle) -> Result<String, String> {
-    let updater = tauri_plugin_updater::UpdaterExt::updater(&app).map_err(|e| e.to_string())?;
-    match updater.check().await {
-        Ok(Some(update)) => {
-            let version = update.version.clone();
-            let _ = app.emit("update_available", &version);
-            Ok(version)
-        }
-        Ok(None) => {
-            let _ = app.emit("update_not_available", ());
-            Ok("up-to-date".to_string())
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "update check failed");
-            Err(format!("update check failed: {e}"))
-        }
+pub async fn daemon_context_status() -> Result<ContextModeStatusPayload, String> {
+    current_context_mode_status().await
+}
+
+#[tauri::command]
+pub async fn daemon_context_start(interval_secs: u64) -> Result<ContextModeStatusPayload, String> {
+    let interval_secs = interval_secs.clamp(3, 300);
+    match daemon_ipc(DaemonRequest::ScreenCaptureStart {
+        interval_secs: Some(interval_secs),
+    })
+    .await?
+    {
+        DaemonResponse::Text { .. } | DaemonResponse::Ok => current_context_mode_status().await,
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+#[tauri::command]
+pub async fn daemon_context_stop() -> Result<ContextModeStatusPayload, String> {
+    match daemon_ipc(DaemonRequest::ScreenCaptureStop).await? {
+        DaemonResponse::Text { .. } | DaemonResponse::Ok => current_context_mode_status().await,
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+#[tauri::command]
+pub async fn daemon_capture_active_page() -> Result<ContextModeStatusPayload, String> {
+    match daemon_ipc(DaemonRequest::ActivePageCapture).await? {
+        DaemonResponse::ContextItems { .. } => current_context_mode_status().await,
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ContextItemSummaryPayload {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub processing_status: String,
+    pub created_at: String,
+    pub context_mode_observation: bool,
+}
+
+fn context_item_summary_payload(item: cue_core::ContextArtifact) -> ContextItemSummaryPayload {
+    ContextItemSummaryPayload {
+        id: item.id.to_string(),
+        title: item.title,
+        kind: item.kind.to_string(),
+        processing_status: item.processing_status.to_string(),
+        created_at: item.created_at,
+        context_mode_observation: item
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("Context mode observation.")),
+    }
+}
+
+#[tauri::command]
+pub async fn daemon_context_items() -> Result<Vec<ContextItemSummaryPayload>, String> {
+    match daemon_ipc(DaemonRequest::ContextList).await? {
+        DaemonResponse::ContextItems { items } => Ok(items
+            .into_iter()
+            .map(context_item_summary_payload)
+            .collect()),
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
     }
 }
 
@@ -1596,6 +1950,62 @@ pub struct PermissionDeniedPayload {
     pub source: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioPermissionVerification {
+    Allowed,
+    Denied,
+    NeedsListening,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AudioPermissionSourcePayload {
+    pub source: String,
+    pub verification: AudioPermissionVerification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AudioPermissionPollPayload {
+    pub sources: Vec<AudioPermissionSourcePayload>,
+}
+
+fn audio_permission_verification(
+    status: &AudioPipelineStatus,
+    source: AudioSourceKind,
+) -> AudioPermissionVerification {
+    let source_status = match source {
+        AudioSourceKind::System => &status.capture.system,
+        AudioSourceKind::Microphone => &status.capture.microphone,
+    };
+    let source_reports_permission_denial = source_status
+        .last_error
+        .as_deref()
+        .is_some_and(|message| classify_audio_error(message) == PublicAudioErrorKind::Permission);
+
+    if status.capture.permission_denied_source == Some(source) || source_reports_permission_denial {
+        AudioPermissionVerification::Denied
+    } else if source_status.chunks_captured > 0 && source_status.last_sequence.is_some() {
+        // A successfully received source chunk is the positive verification
+        // boundary. Merely opening Settings or observing an idle/planned
+        // pipeline does not prove that the OS granted capture access.
+        AudioPermissionVerification::Allowed
+    } else {
+        AudioPermissionVerification::NeedsListening
+    }
+}
+
+fn audio_permission_poll_payload(status: &AudioPipelineStatus) -> AudioPermissionPollPayload {
+    AudioPermissionPollPayload {
+        sources: [AudioSourceKind::Microphone, AudioSourceKind::System]
+            .into_iter()
+            .map(|source| AudioPermissionSourcePayload {
+                source: source.default_label().to_string(),
+                verification: audio_permission_verification(status, source),
+            })
+            .collect(),
+    }
+}
+
 /// Emit a permission-denied event to the dashboard for testing/integration.
 /// In production, the daemon capture code calls this when it detects denial.
 #[tauri::command]
@@ -1607,23 +2017,36 @@ pub fn emit_permission_denied(source: String, app: AppHandle) -> Result<(), Stri
     .map_err(|e| e.to_string())
 }
 
-/// Poll daemon audio status; if permission_denied_source is set, emit the
-/// Tauri event so the dashboard banner appears from real capture failures.
+/// Poll daemon audio status and return source-specific verification.
+///
+/// A warning is cleared only after the daemon has successfully received a
+/// chunk from that source. An idle/planned pipeline remains `needs_listening`
+/// because it cannot prove that the OS permission is now allowed.
 #[tauri::command]
-pub async fn poll_audio_permission(app: AppHandle) -> Result<(), String> {
-    let resp = daemon_ipc(DaemonRequest::AudioStatus).await?;
-    if let DaemonResponse::AudioStatus { status } = resp {
-        if let Some(source) = status.capture.permission_denied_source {
-            app.emit(
-                "audio_permission_denied",
-                PermissionDeniedPayload {
-                    source: source.default_label().to_string(),
-                },
-            )
-            .map_err(|e| e.to_string())?;
+pub async fn poll_audio_permission(app: AppHandle) -> Result<AudioPermissionPollPayload, String> {
+    let status = match daemon_ipc(DaemonRequest::AudioStatus).await? {
+        DaemonResponse::AudioStatus { status } => status,
+        DaemonResponse::Error { message } => {
+            return Err(public_audio_failure("verify audio permission", &message));
         }
+        _ => return Err("Bluey could not read the current audio permission status.".to_string()),
+    };
+    let payload = audio_permission_poll_payload(&status);
+    for source in &payload.sources {
+        let event = match source.verification {
+            AudioPermissionVerification::Allowed => "audio_permission_allowed",
+            AudioPermissionVerification::Denied => "audio_permission_denied",
+            AudioPermissionVerification::NeedsListening => continue,
+        };
+        app.emit(
+            event,
+            PermissionDeniedPayload {
+                source: source.source.clone(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(payload)
 }
 
 // ===== Phase 3 Round 9: LLM / Cue commands =====
@@ -1764,7 +2187,6 @@ mod tests {
         assert!(dashboard_get_session(&db, &owner_b, session_a.id)
             .unwrap()
             .is_none());
-        assert!(require_dashboard_session(&db, &owner_b, session_a.id).is_err());
 
         db.update_session_title_for_owner(owner_a.db_owner_id(), session_a.id, "Renamed A")
             .unwrap();
@@ -1782,6 +2204,114 @@ mod tests {
                 .title,
             "Owner B"
         );
+    }
+
+    #[test]
+    fn daemon_lifecycle_projection_preserves_exact_ids_and_owner_scope() {
+        let db = cue_daemon::db::Database::open(":memory:").unwrap();
+        let owner = DashboardOwner::SignedIn("account-a".to_string());
+        let id = Uuid::new_v4();
+        let lifecycle = DaemonSessionLifecycle {
+            changed: Some(DaemonSessionRecord {
+                id,
+                owner_account_id: Some("account-a".to_string()),
+                title: "Canonical session".to_string(),
+                started_at: "1000".to_string(),
+                ended_at: None,
+                active: true,
+            }),
+            replaced: None,
+            deleted: None,
+            active_session_id: Some(id),
+        };
+
+        let projected = project_session_lifecycle(&db, &owner, &lifecycle)
+            .unwrap()
+            .expect("changed session");
+        assert_eq!(projected.id, id);
+        assert_eq!(projected.title, "Canonical session");
+        assert_eq!(projected.status, SessionStatus::Active);
+        assert_eq!(
+            db.load_active_session_for_owner(owner.db_owner_id())
+                .unwrap(),
+            Some(id)
+        );
+        assert!(db.get_session(id).unwrap().is_none());
+        assert!(db
+            .get_session_for_owner(Some("account-b"), id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn daemon_lifecycle_projection_archives_replaced_session_on_switch() {
+        let db = cue_daemon::db::Database::open(":memory:").unwrap();
+        let owner = DashboardOwner::Local;
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+        db.ensure_session_record(old_id, "Old", 1000, 1000).unwrap();
+        db.save_active_session(Some(old_id)).unwrap();
+        let lifecycle = DaemonSessionLifecycle {
+            changed: Some(DaemonSessionRecord {
+                id: new_id,
+                owner_account_id: None,
+                title: "New".to_string(),
+                started_at: "2000".to_string(),
+                ended_at: None,
+                active: true,
+            }),
+            replaced: Some(DaemonSessionRecord {
+                id: old_id,
+                owner_account_id: None,
+                title: "Old".to_string(),
+                started_at: "1000".to_string(),
+                ended_at: Some("3000".to_string()),
+                active: false,
+            }),
+            deleted: None,
+            active_session_id: Some(new_id),
+        };
+
+        project_session_lifecycle(&db, &owner, &lifecycle).unwrap();
+        assert_eq!(
+            db.get_session(old_id).unwrap().unwrap().status,
+            SessionStatus::Archived
+        );
+        assert_eq!(
+            db.get_session(new_id).unwrap().unwrap().status,
+            SessionStatus::Active
+        );
+        assert_eq!(db.load_active_session().unwrap(), Some(new_id));
+    }
+
+    #[test]
+    fn daemon_lifecycle_projection_rejects_cross_owner_records() {
+        let db = cue_daemon::db::Database::open(":memory:").unwrap();
+        let owner = DashboardOwner::SignedIn("account-a".to_string());
+        let id = Uuid::new_v4();
+        let lifecycle = DaemonSessionLifecycle {
+            changed: Some(DaemonSessionRecord {
+                id,
+                owner_account_id: Some("account-b".to_string()),
+                title: "Foreign".to_string(),
+                started_at: "1000".to_string(),
+                ended_at: None,
+                active: true,
+            }),
+            replaced: None,
+            deleted: None,
+            active_session_id: Some(id),
+        };
+
+        assert!(project_session_lifecycle(&db, &owner, &lifecycle).is_err());
+        assert!(db
+            .get_session_for_owner(Some("account-a"), id)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_session_for_owner(Some("account-b"), id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2068,6 +2598,102 @@ mod tests {
     }
 
     #[test]
+    fn context_mode_status_uses_authoritative_daemon_state() {
+        let mut state = cue_core::DaemonState::new(42);
+        state.screen_capture_active = true;
+        state.screen_capture_interval_secs = Some(30);
+        state.context_items = 7;
+
+        let payload = context_mode_status_from_response(DaemonResponse::Status { state })
+            .expect("status payload");
+        assert_eq!(
+            payload,
+            ContextModeStatusPayload {
+                active: true,
+                interval_secs: Some(30),
+                context_items: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn context_mode_status_surfaces_daemon_errors() {
+        let error = context_mode_status_from_response(DaemonResponse::Error {
+            message: "capture denied".to_string(),
+        })
+        .expect_err("daemon error");
+        assert_eq!(error, "capture denied");
+    }
+
+    #[test]
+    fn context_item_summary_exposes_status_without_local_paths_or_content() {
+        let artifact = cue_core::ContextArtifact::new(
+            cue_core::ContextKind::Text,
+            "/private/bluey/page-context/secret.txt",
+            "ChatGPT · Release planning",
+            Some("Context mode observation. Changed readable page text.".to_string()),
+            Some(512),
+        )
+        .with_text_preview("private page content");
+        let payload = context_item_summary_payload(artifact);
+        assert_eq!(payload.title, "ChatGPT · Release planning");
+        assert_eq!(payload.kind, "text");
+        assert_eq!(payload.processing_status, "ready");
+        assert!(payload.context_mode_observation);
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("/private/bluey"));
+        assert!(!json.contains("private page content"));
+    }
+
+    #[test]
+    fn context_watch_update_is_semantic_first_bounded_and_normalized() {
+        let mut settings = cue_core::CueSettings::default();
+        apply_context_watch_settings(
+            &mut settings,
+            ContextWatchSettingsPayload {
+                semantic_first: false,
+                screenshot_fallback: true,
+                interval_secs: 1,
+                max_local_items: usize::MAX,
+                excluded_apps: vec![
+                    "  Google Chrome  ".to_string(),
+                    "google chrome".to_string(),
+                    String::new(),
+                ],
+                excluded_domains: vec![
+                    " Accounts.Example.COM ".to_string(),
+                    "accounts.example.com".to_string(),
+                ],
+            },
+        );
+        settings.touch();
+
+        assert!(settings.context_watch.semantic_first);
+        assert!(settings.context_watch.screenshot_fallback);
+        assert_eq!(settings.context_watch.interval_secs, 3);
+        assert_eq!(settings.context_watch.max_local_items, 500);
+        assert_eq!(
+            settings.context_watch.excluded_apps,
+            vec!["google chrome".to_string()]
+        );
+        assert_eq!(
+            settings.context_watch.excluded_domains,
+            vec!["accounts.example.com".to_string()]
+        );
+        assert_eq!(
+            context_watch_settings_payload(&settings.context_watch),
+            ContextWatchSettingsPayload {
+                semantic_first: true,
+                screenshot_fallback: true,
+                interval_secs: 3,
+                max_local_items: 500,
+                excluded_apps: vec!["google chrome".to_string()],
+                excluded_domains: vec!["accounts.example.com".to_string()],
+            }
+        );
+    }
+
+    #[test]
     fn test_privacy_settings_command_microphone() {
         let result = privacy_settings_command("microphone");
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -2124,6 +2750,78 @@ mod tests {
         };
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("microphone"));
+    }
+
+    #[test]
+    fn permission_poll_requires_successful_source_capture_before_allowed() {
+        let mut status = active_audio_status();
+        let initial = audio_permission_poll_payload(&status);
+        assert_eq!(
+            initial.sources,
+            vec![
+                AudioPermissionSourcePayload {
+                    source: "microphone".to_string(),
+                    verification: AudioPermissionVerification::NeedsListening,
+                },
+                AudioPermissionSourcePayload {
+                    source: "system".to_string(),
+                    verification: AudioPermissionVerification::NeedsListening,
+                },
+            ]
+        );
+
+        status.capture.microphone.chunks_captured = 1;
+        status.capture.microphone.last_sequence = Some(1);
+        assert_eq!(
+            audio_permission_verification(&status, AudioSourceKind::Microphone),
+            AudioPermissionVerification::Allowed
+        );
+        assert_eq!(
+            audio_permission_verification(&status, AudioSourceKind::System),
+            AudioPermissionVerification::NeedsListening
+        );
+    }
+
+    #[test]
+    fn permission_denial_wins_over_earlier_success() {
+        let mut status = active_audio_status();
+        status.capture.system.chunks_captured = 2;
+        status.capture.system.last_sequence = Some(2);
+        status.capture.permission_denied_source = Some(AudioSourceKind::System);
+        assert_eq!(
+            audio_permission_verification(&status, AudioSourceKind::System),
+            AudioPermissionVerification::Denied
+        );
+
+        status.capture.permission_denied_source = None;
+        status.capture.system.last_error = Some("Screen Recording permission denied".to_string());
+        assert_eq!(
+            audio_permission_verification(&status, AudioSourceKind::System),
+            AudioPermissionVerification::Denied
+        );
+    }
+
+    #[test]
+    fn streamed_response_payload_always_names_its_source_session() {
+        let payload = CueResponseChunkPayload {
+            response_id: "response-1".to_string(),
+            source_session_id: "session-b".to_string(),
+            kind: "answer".to_string(),
+            partial_text: "Hello".to_string(),
+            finished: false,
+            cost_cents: None,
+            balance_cents_after: None,
+            provider: None,
+            model: None,
+            cost_label: None,
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
+            router_meta: None,
+            replace_body: None,
+        };
+        let json = serde_json::to_value(payload).expect("serialize chunk");
+        assert_eq!(json["source_session_id"], "session-b");
     }
 }
 
@@ -2394,6 +3092,7 @@ mod listening_shortcut_tests {
 #[derive(Clone, Serialize)]
 pub struct CueResponseChunkPayload {
     pub response_id: String,
+    pub source_session_id: String,
     pub kind: String,
     pub partial_text: String,
     pub finished: bool,
@@ -2623,6 +3322,7 @@ async fn try_speculative_dispatch(
                     "cue_response_chunk",
                     CueResponseChunkPayload {
                         response_id: response_id.to_string(),
+                        source_session_id: session_id.to_string(),
                         kind: kind.to_string(),
                         partial_text: text,
                         finished,
@@ -2660,6 +3360,7 @@ async fn try_speculative_dispatch(
                     "cue_response_chunk",
                     CueResponseChunkPayload {
                         response_id: response_id.to_string(),
+                        source_session_id: session_id.to_string(),
                         kind: kind.to_string(),
                         partial_text: text.clone(),
                         finished: true,
@@ -2867,6 +3568,8 @@ pub async fn request_cue(
     let emitted_meta_b = emitted_meta.clone();
     let router_meta_a = router_meta.clone();
     let router_meta_b = router_meta.clone();
+    let source_session_id_a = session_id.clone();
+    let source_session_id_b = session_id.clone();
     let cue_resp = if kind == "answer" && ends_with_question(&recent) {
         let question = recent
             .rsplit('.')
@@ -2887,6 +3590,7 @@ pub async fn request_cue(
                     "cue_response_chunk",
                     CueResponseChunkPayload {
                         response_id: rid.clone(),
+                        source_session_id: source_session_id_a.clone(),
                         kind: "answer".to_string(),
                         partial_text: partial.to_string(),
                         finished,
@@ -2920,6 +3624,7 @@ pub async fn request_cue(
                     "cue_response_chunk",
                     CueResponseChunkPayload {
                         response_id: rid.clone(),
+                        source_session_id: source_session_id_b.clone(),
                         kind: "suggestion".to_string(),
                         partial_text: partial.to_string(),
                         finished,
@@ -2990,6 +3695,7 @@ pub async fn auto_recap(
 
     let response_id = Uuid::new_v4().to_string();
     let rid = response_id.clone();
+    let stream_session_id = session_id.clone();
     let app2 = app.clone();
 
     let cue_resp = RecapLlm
@@ -3002,6 +3708,7 @@ pub async fn auto_recap(
                     "cue_response_chunk",
                     CueResponseChunkPayload {
                         response_id: rid.clone(),
+                        source_session_id: stream_session_id.clone(),
                         kind: "recap".to_string(),
                         partial_text: partial.to_string(),
                         finished,

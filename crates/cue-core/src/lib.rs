@@ -23,6 +23,7 @@ pub mod overlay_ipc;
 pub mod pcm;
 pub mod stt;
 pub mod vad;
+pub mod windows_capture;
 
 pub use ai::{
     AiCapabilities, AiCapability, AiModelId, AiProviderId, AiProviderKind, AiRuntimeStatus,
@@ -45,10 +46,11 @@ pub use cloud::{
     WorkspaceId,
 };
 pub use config::{
-    load_account, load_settings, save_account, save_settings, AccountConfig, CueSettings,
+    load_account, load_settings, save_account, save_settings, update_settings, AccountConfig,
+    ContextWatchSettings, CueSettings,
 };
 pub use intelligence::{analyze_segment, generate_recap, local_answer, SegmentAnalysis};
-pub use ipc::{DaemonRequest, DaemonResponse};
+pub use ipc::{DaemonRequest, DaemonResponse, DaemonSessionLifecycle, DaemonSessionRecord};
 pub use ipc_auth::{
     load_ipc_capability, publish_ipc_capability, remove_ipc_capability_if_current,
     AuthenticatedDaemonRequest, DaemonWireRequest, IpcAuthErrorCode, IpcAuthenticator,
@@ -63,8 +65,8 @@ pub use logging::{
 };
 pub use meeting::{
     short_session_code, ActionItem, ContextArtifact, ContextKind, ContextProcessingStatus,
-    ConversationTurn, Decision, MeetingDiagnostics, MeetingRecap, MeetingRecord, MemoryHit,
-    Speaker, TranscriptSegment,
+    ConversationMemory, ConversationMemoryEpoch, ConversationTurn, Decision, MeetingDiagnostics,
+    MeetingRecap, MeetingRecord, MemoryHit, Speaker, TranscriptSegment,
 };
 pub use observability::{
     account_id_hash_prefix, new_request_id, new_trace_id, platform, sanitize_observability_id,
@@ -72,9 +74,14 @@ pub use observability::{
     BLUEY_TRACE_ID_ENV, BLUEY_TRACE_ID_HEADER,
 };
 pub use overlay::{
-    OverlayCommand, OverlayContextItem, OverlayEvent, OverlayPosition, OverlaySessionItem,
+    MeetingBannerAction, MeetingCandidate, MeetingEvidence, OverlayCommand, OverlayContextItem,
+    OverlayEvent, OverlayPosition, OverlaySessionItem,
 };
 pub use state::{DaemonState, MeetingState};
+pub use windows_capture::{
+    capture_windows_screen, discover_windows_capture_binary, WindowsCaptureDiagnostic,
+    WindowsCaptureRegion,
+};
 
 #[macro_export]
 macro_rules! observe {

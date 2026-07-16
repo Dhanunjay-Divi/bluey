@@ -24,8 +24,16 @@ install -m 0750 "$ROOT/ops/archive-bluey-logs.sh" /usr/local/sbin/archive-bluey-
 install -m 0750 "$ROOT/ops/bluey-disk-guard.sh" /usr/local/sbin/bluey-disk-guard.sh
 
 mkdir -p "$LOG_DIR" "$API_ROOT/logs" "$ARCHIVE_ROOT"
+cron_logs=(
+    "$LOG_DIR/log-archive-cron.log"
+    "$LOG_DIR/disk-guard-cron.log"
+)
+for cron_log in "${cron_logs[@]}"; do
+    touch "$cron_log"
+    chmod 0640 "$cron_log"
+done
 if id "$USER_NAME" >/dev/null 2>&1; then
-    chown -R "$USER_NAME:$GROUP_NAME" "$LOG_DIR" "$API_ROOT/logs" || true
+    chown -R "$USER_NAME:$GROUP_NAME" "$LOG_DIR" "$API_ROOT/logs"
 fi
 chmod 0750 "$LOG_DIR" "$API_ROOT/logs" "$ARCHIVE_ROOT"
 

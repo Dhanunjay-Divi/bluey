@@ -284,12 +284,19 @@ impl CloudClient {
     pub async fn upload_artifact_object(
         &self,
         artifact_id: &str,
+        session_id: &str,
         bytes: Vec<u8>,
         content_type: &str,
     ) -> Result<ArtifactObjectResponse> {
         let path = format!("/sync/artifacts/{artifact_id}/object");
         let resp = self
-            .send_bytes_with_auth(Method::POST, &path, bytes, content_type)
+            .send_bytes_with_auth(
+                Method::POST,
+                &path,
+                bytes,
+                content_type,
+                &[("x-bluey-session-id", session_id)],
+            )
             .await?;
         Self::parse_or_err(resp).await
     }
@@ -303,7 +310,7 @@ impl CloudClient {
     ) -> Result<SessionAuditBundleResponse> {
         let path = format!("/sync/session-audit/{session_id}/{bundle_id}");
         let resp = self
-            .send_bytes_with_auth(Method::POST, &path, bytes, content_type)
+            .send_bytes_with_auth(Method::POST, &path, bytes, content_type, &[])
             .await?;
         Self::parse_or_err(resp).await
     }
@@ -414,15 +421,18 @@ impl CloudClient {
         path: &str,
         bytes: Vec<u8>,
         content_type: &str,
+        headers: &[(&str, &str)],
     ) -> Result<Response> {
         let access = self.current_tokens().ok_or(Error::Unauthorized)?.access;
-        let resp = self
+        let mut request = self
             .request_builder(method.clone(), path)
             .header(header::AUTHORIZATION, format!("Bearer {access}"))
             .header(header::CONTENT_TYPE, content_type)
-            .body(bytes.clone())
-            .send()
-            .await?;
+            .body(bytes.clone());
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let resp = request.send().await?;
         if resp.status() != StatusCode::UNAUTHORIZED {
             return Ok(resp);
         }
@@ -430,13 +440,15 @@ impl CloudClient {
             return Err(Error::Unauthorized);
         }
         let access = self.current_tokens().ok_or(Error::Unauthorized)?.access;
-        Ok(self
+        let mut request = self
             .request_builder(method, path)
             .header(header::AUTHORIZATION, format!("Bearer {access}"))
             .header(header::CONTENT_TYPE, content_type)
-            .body(bytes)
-            .send()
-            .await?)
+            .body(bytes);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        Ok(request.send().await?)
     }
 
     fn request_builder(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
@@ -845,6 +857,44 @@ mod tests {
         })
         .await
         .expect("request was not received before timeout");
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_sends_the_wire_parent_session() {
+        let server = MockServer::start().await;
+        let artifact_id = "61b8c310-27de-4cc1-b598-c62bdcc07ba8";
+        let session_id = "session-parent-1";
+        Mock::given(method("POST"))
+            .and(path(format!("/sync/artifacts/{artifact_id}/object")))
+            .and(header("authorization", "Bearer access"))
+            .and(header("x-bluey-session-id", session_id))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "artifact_id": artifact_id,
+                "session_id": session_id,
+                "object_key": "objects/artifact",
+                "size_bytes": 7,
+                "sha256": "a".repeat(64),
+                "content_type": "text/plain",
+                "expires_at_ms": 1234
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "access".into(),
+                refresh: "refresh".into(),
+                email: "owner@example.test".into(),
+            })
+            .unwrap();
+
+        let response = client
+            .upload_artifact_object(artifact_id, session_id, b"payload".to_vec(), "text/plain")
+            .await
+            .unwrap();
+        assert_eq!(response.session_id, session_id);
     }
 
     #[test]

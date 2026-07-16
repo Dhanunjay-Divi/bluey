@@ -1,12 +1,25 @@
 //! Mock system audio binary for testing `SystemAudioCapture`.
 //!
-//! Outputs a 440 Hz sine wave as 16 kHz mono i16 LE PCM on stdout for 2
-//! seconds, then exits cleanly. This mimics the native helper's continuous
-//! output format.
+//! Emits the production v1 helper handshake on stderr, then outputs a 440 Hz
+//! sine wave as 16 kHz mono i16 LE PCM on stdout for 2 seconds. This keeps the
+//! test double honest as the native helper protocol evolves.
 
 use std::io::Write;
 
 fn main() {
+    let backend = if cfg!(target_os = "macos") {
+        "screen_capture_kit"
+    } else if cfg!(target_os = "windows") {
+        "wasapi"
+    } else {
+        "system_audio_stub"
+    };
+    eprintln!(
+        "{{\"event\":\"ready\",\"protocol_version\":1,\"source\":\"system\",\
+         \"backend\":\"{backend}\",\"format\":{{\"sample_rate_hz\":16000,\
+         \"channel_count\":1,\"sample_format\":\"i16_le\"}}}}"
+    );
+
     let sample_rate = 16_000u32;
     let frequency = 440.0f64;
     let duration_samples = sample_rate * 2; // 2 seconds
@@ -25,4 +38,8 @@ fn main() {
         }
     }
     let _ = out.flush();
+    eprintln!(
+        "{{\"event\":\"stopped\",\"protocol_version\":1,\"source\":\"system\",\
+         \"reason\":\"duration_complete\",\"exit_code\":0}}"
+    );
 }

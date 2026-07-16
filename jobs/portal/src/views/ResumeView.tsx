@@ -30,6 +30,7 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
   const [selectedResume, setSelectedResume] = useState<ResumeVersion | undefined>();
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
   const applicationsWithResume = workspace.applications.filter((item) => item.resume_version_id);
   const selectedApplication = selectedResume
@@ -57,22 +58,27 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
   const upload = async (file?: File) => {
     if (!file) return;
     setMessage("");
+    setError("");
     try {
       const imported = await importResume(file);
       const next = inferProfileFromResume(profile, imported);
       setProfile(next);
       await onSave(next);
       setMessage("Resume imported. Review the profile facts Bluey extracted before your next application.");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Resume import failed.");
+    } catch (requestError) {
+      setError(resumeErrorMessage(requestError, "Resume import failed."));
     }
   };
 
   const save = async () => {
     setSaving(true);
+    setError("");
     try {
       await onSave(profile);
       setEditOpen(false);
+      setMessage("Career Profile saved.");
+    } catch (requestError) {
+      setError(resumeErrorMessage(requestError, "Career Profile could not be saved."));
     } finally {
       setSaving(false);
     }
@@ -80,15 +86,48 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
 
   const openVersion = async (resumeId?: string) => {
     if (!resumeId) return;
-    const version = resumeVersions[resumeId] || (await onLoadResume(resumeId));
-    setSelectedResume(version);
+    setError("");
+    try {
+      const version = resumeVersions[resumeId] || (await onLoadResume(resumeId));
+      if (!version) throw new Error("That resume version is no longer available.");
+      setSelectedResume(version);
+    } catch (requestError) {
+      setError(resumeErrorMessage(requestError, "Resume version could not be loaded."));
+    }
   };
 
   const exportSelected = async (format: "pdf" | "docx") => {
     if (!selectedResume || !selectedApplication) return;
-    await onCommit(selectedApplication);
-    if (format === "pdf") await exportResumePdf(selectedResume.content, "bluey-tailored-resume");
-    else await exportResumeDocx(selectedResume.content, "bluey-tailored-resume");
+    setError("");
+    try {
+      await onCommit(selectedApplication);
+      if (format === "pdf") await exportResumePdf(selectedResume.content, "bluey-tailored-resume");
+      else await exportResumeDocx(selectedResume.content, "bluey-tailored-resume");
+    } catch (requestError) {
+      setError(resumeErrorMessage(requestError, "Resume export could not be completed."));
+    }
+  };
+
+  const updateResumeMode = async (mode: CareerProfile["resume_mode"]) => {
+    const previous = profile;
+    const next = { ...profile, resume_mode: mode };
+    setProfile(next);
+    setError("");
+    try {
+      await onSave(next);
+    } catch (requestError) {
+      setProfile(previous);
+      setError(resumeErrorMessage(requestError, "Default resume mode could not be saved."));
+    }
+  };
+
+  const exportBaseResume = async () => {
+    setError("");
+    try {
+      await exportResumePdf(baseContent, "bluey-career-profile");
+    } catch (requestError) {
+      setError(resumeErrorMessage(requestError, "Career Profile export could not be completed."));
+    }
   };
 
   return (
@@ -99,16 +138,17 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
       </section>
 
       {message && <div className="global-message success"><Check size={16} />{message}</div>}
+      {error && <div className="global-message error" role="alert">{error}</div>}
 
       <section className="profile-band">
         <div className="profile-identity"><div>{profile.full_name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</div><span><h2>{profile.full_name}</h2><p>{profile.headline}</p><small>{profile.current_location} · {profile.email}</small></span></div>
         <div className="profile-health"><span><b>{profile.employment.length}</b><small>roles</small></span><span><b>{profile.skills.length}</b><small>skills</small></span><span><b>{workspace.facts.filter((fact) => fact.verification_status === "confirmed").length}</b><small>confirmed facts</small></span></div>
-        <div className="mode-control"><label>DEFAULT MODE</label><div className="segmented"><button className={profile.resume_mode === "factual" ? "active" : ""} onClick={() => { const next = { ...profile, resume_mode: "factual" as const }; setProfile(next); void onSave(next); }}>Factual</button><button className={profile.resume_mode === "enhance" ? "active" : ""} onClick={() => { const next = { ...profile, resume_mode: "enhance" as const }; setProfile(next); void onSave(next); }}>Enhance</button></div></div>
+        <div className="mode-control"><label>DEFAULT MODE</label><div className="segmented"><button className={profile.resume_mode === "factual" ? "active" : ""} onClick={() => void updateResumeMode("factual")}>Factual</button><button className={profile.resume_mode === "enhance" ? "active" : ""} onClick={() => void updateResumeMode("enhance")}>Enhance</button></div></div>
       </section>
 
       <div className="resume-layout">
         <section className="resume-sheet">
-          <div className="section-heading compact"><div><p>BASE PROFILE</p><h2>{profile.source_resume_name || "Bluey Career Profile"}</h2></div><div><button className="icon-button" title="Download PDF" onClick={() => void exportResumePdf(baseContent, "bluey-career-profile")}><Download size={16} /></button></div></div>
+          <div className="section-heading compact"><div><p>BASE PROFILE</p><h2>{profile.source_resume_name || "Bluey Career Profile"}</h2></div><div><button className="icon-button" title="Download PDF" onClick={() => void exportBaseResume()}><Download size={16} /></button></div></div>
           <BaseResume content={baseContent} />
         </section>
 
@@ -143,6 +183,10 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
       </Dialog>
     </div>
   );
+}
+
+function resumeErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message.trim() ? error.message : fallback;
 }
 
 function BaseResume({ content }: { content: ResumeContent }) {

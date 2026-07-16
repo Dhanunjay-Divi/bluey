@@ -49,8 +49,10 @@ FORBIDDEN_SUFFIXES = {
 }
 FORBIDDEN_BASENAMES = {
     ".env",
+    "bluey-dashboard",
     "cargo.lock",
     "cargo.toml",
+    "cue-dashboard",
     "package-lock.json",
     "package.json",
     "pnpm-lock.yaml",
@@ -62,6 +64,7 @@ FORBIDDEN_COMPONENTS = {
     ".git",
     "__pycache__",
     "app.asar.unpacked",
+    "bluey.app",
     "node_modules",
     "src",
     "tests",
@@ -75,6 +78,7 @@ STATIC_PATTERNS = {
     "dev flag bluey-local-visible-overlay": b"bluey-local-visible-overlay",
     "dev flag bluey-overlay-capture-visible": b"bluey-overlay-capture-visible",
     "dev flag bluey-dev-overlay": b"bluey-dev-overlay",
+    "placeholder local transcription": b"[stub transcription]",
 }
 SECRET_ENV_NAMES = {
     "OPENAI_API_KEYS",
@@ -253,12 +257,19 @@ def self_test() -> None:
             archive.addfile(member, io.BytesIO(payload))
         assert scan_artifact(clean_tar, patterns={"secret": b"secret-value-1234"}) == 1
 
-        def rejected(name: str, data: bytes = b"x") -> None:
+        def rejected(
+            name: str,
+            data: bytes = b"x",
+            patterns: dict[str, bytes] | None = None,
+        ) -> None:
             candidate = root / (re.sub(r"[^a-z]", "-", name.casefold()) + ".zip")
             with zipfile.ZipFile(candidate, "w") as archive:
                 archive.writestr(name, data)
             try:
-                scan_artifact(candidate, patterns={"secret": b"secret-value-1234"})
+                scan_artifact(
+                    candidate,
+                    patterns=patterns or {"secret": b"secret-value-1234"},
+                )
             except ArtifactViolation:
                 return
             raise AssertionError(f"scanner accepted forbidden entry {name}")
@@ -267,6 +278,13 @@ def self_test() -> None:
         rejected("../escape.exe")
         rejected("bluey/src/main.rs")
         rejected("bluey/bluey.exe", b"prefix-secret-value-1234-suffix")
+        rejected(
+            "bluey/cue-whisper.exe",
+            b"[stub transcription]",
+            patterns={"placeholder": b"[stub transcription]"},
+        )
+        rejected("Bluey.app/Contents/MacOS/bluey")
+        rejected("bin/bluey-dashboard")
 
         symlink_zip = root / "symlink.zip"
         with zipfile.ZipFile(symlink_zip, "w") as archive:
@@ -280,7 +298,7 @@ def self_test() -> None:
             pass
         else:
             raise AssertionError("scanner accepted a symbolic link")
-    print("Release artifact scanner self-test passed (2 clean + 5 rejection cases).")
+    print("Release artifact scanner self-test passed (2 clean + 8 rejection cases).")
 
 
 def main() -> int:

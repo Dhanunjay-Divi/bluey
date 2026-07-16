@@ -187,6 +187,13 @@ impl DaemonRequest {
             | Self::PushCard { .. }
             | Self::MeetingStart { .. }
             | Self::MeetingEnd
+            | Self::SessionCreate { .. }
+            | Self::SessionActivate { .. }
+            | Self::SessionContinue
+            | Self::SessionDeactivate
+            | Self::SessionRename { .. }
+            | Self::SessionArchive { .. }
+            | Self::SessionDelete { .. }
             | Self::TranscriptAdd { .. }
             | Self::Ask { .. }
             | Self::Answer { .. }
@@ -194,6 +201,7 @@ impl DaemonRequest {
             | Self::ActivePageCapture
             | Self::ScreenCaptureStart { .. }
             | Self::ScreenCaptureStop
+            | Self::MeetingDetectionSettingsReload
             | Self::InstructionsSet { .. }
             | Self::InstructionsClear
             | Self::AudioStart { .. }
@@ -750,6 +758,12 @@ impl WindowsOwnerOnlySecurity {
         &mut self.attributes
     }
 
+    pub(crate) fn as_security_descriptor(
+        &self,
+    ) -> windows_sys::Win32::Security::PSECURITY_DESCRIPTOR {
+        self.descriptor
+    }
+
     pub(crate) fn as_raw_security_attributes(&mut self) -> *mut c_void {
         self.as_security_attributes().cast()
     }
@@ -834,7 +848,7 @@ pub(crate) fn windows_sid_to_string(sid: windows_sys::Win32::Security::PSID) -> 
 }
 
 #[cfg(windows)]
-fn validate_windows_owner_only_file(file: &fs::File) -> Result<()> {
+pub(crate) fn validate_windows_owner_only_file(file: &fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
@@ -961,6 +975,17 @@ mod tests {
         );
         assert_eq!(
             DaemonRequest::OverlayShow.ipc_authorization(),
+            IpcAuthorization::Mutation
+        );
+        assert_eq!(
+            DaemonRequest::SessionDelete {
+                id: uuid::Uuid::new_v4(),
+            }
+            .ipc_authorization(),
+            IpcAuthorization::Mutation
+        );
+        assert_eq!(
+            DaemonRequest::SessionContinue.ipc_authorization(),
             IpcAuthorization::Mutation
         );
         assert_eq!(

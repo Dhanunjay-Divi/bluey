@@ -8,13 +8,17 @@
 #
 # Canonical pattern: bluey-{version}-{os}-{arch}.{ext}
 #   os:   darwin | windows | linux
-#   arch: arm64 | x86_64
+#   arch: arm64 | x86_64 | universal
 #   ext:  tar.gz (unix) | zip (windows)
 #
 # Binary names (from Cargo.toml [[bin]] entries):
 #   - cue-daemon crate produces: "cue-daemon" and "bluey-daemon"
 #   - cue-cli crate produces: "cue" and "bluey"
 # We package the "bluey" / "bluey-daemon" variants.
+#
+# Production archives are terminal-only: CLI, daemon, and trusted native
+# helpers. The Tauri dashboard remains a development/test surface and is not
+# built or copied into release artifacts.
 
 name: Release
 
@@ -25,9 +29,99 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CI: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bluey-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  quality:
+    name: Mandatory release quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential libssl-dev pkg-config \
+            libwebkit2gtk-4.1-dev librsvg2-dev patchelf \
+            libasound2-dev libayatana-appindicator3-dev libxdo-dev
+
+      - name: Install Rust quality toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Node.js quality toolchain
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            crates/cue-dashboard/ui/package-lock.json
+            jobs/package-lock.json
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            server/target/
+          key: ${{ runner.os }}-release-quality-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-release-quality-
+
+      - name: Self-test release and source guards
+        run: |
+          python3 scripts/check-release-artifact-contents.py --self-test
+          node jobs/scripts/ci-guards-self-test.mjs
+          node jobs/scripts/privacy-gate.mjs
+          node jobs/scripts/check-jobs-schema-parity.mjs
+          node jobs/scripts/check-provenance-licenses.mjs
+
+      - name: Check Rust formatting
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path server/Cargo.toml -- --check
+
+      - name: Lint Rust workspaces
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
+
+      - name: Test Rust workspaces
+        run: |
+          cargo test --all-targets
+          cargo test --manifest-path server/Cargo.toml --all-targets
+
+      - name: Test and build dashboard UI
+        run: |
+          npm ci --prefix crates/cue-dashboard/ui --no-audit --no-fund
+          npm test --prefix crates/cue-dashboard/ui
+          npm run build --prefix crates/cue-dashboard/ui
+
+      - name: Test, typecheck, and build Jobs
+        run: |
+          npm ci --prefix jobs --no-audit --no-fund
+          npm test --prefix jobs
+          npm run typecheck --prefix jobs
+          npm run build --prefix jobs
+
   build:
+    needs: quality
     strategy:
       fail-fast: false
       matrix:
@@ -36,22 +130,44 @@ jobs:
             target: aarch64-apple-darwin
             platform: darwin-arm64
             swift_arch: arm64
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             platform: darwin-x86_64
             swift_arch: x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin,x86_64-apple-darwin
+            platform: darwin-universal
+            swift_arch: universal
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             platform: windows-x86_64
             swift_arch: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Determine version
         id: version
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          VERSION="$(
+            awk -F'"' '
+              /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+              /^\[/ { in_workspace_package = 0 }
+              in_workspace_package && /^version[[:space:]]*=/ { print $2; exit }
+            ' Cargo.toml
+          )"
+          if [ -z "$VERSION" ]; then
+            echo "could not determine workspace version" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
+            echo "tag version ${GITHUB_REF_NAME#v} does not match Cargo.toml $VERSION" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -62,24 +178,16 @@ jobs:
             patchelf build-essential libssl-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Setup Node.js
-        if: startsWith(matrix.os, 'macos-')
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: crates/cue-dashboard/ui/package-lock.json
-
       - name: Configure MSVC
         if: matrix.os == 'windows-latest'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/
@@ -89,18 +197,6 @@ jobs:
             target/
           key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-release-
-
-      - name: Build daemon and CLI
-        if: matrix.os != 'windows-latest'
-        env:
-          BLUEY_UPDATE_PUBKEY: ${{ vars.BLUEY_UPDATE_PUBKEY }}
-        shell: bash
-        run: |
-          if [ -z "${BLUEY_UPDATE_PUBKEY:-}" ]; then
-            echo "BLUEY_UPDATE_PUBKEY repository variable is required for release builds" >&2
-            exit 1
-          fi
-          cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
 
       - name: Build daemon and CLI (Windows)
         if: matrix.os == 'windows-latest'
@@ -114,99 +210,25 @@ jobs:
           }
           cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
 
-      - name: Build macOS dashboard app
-        if: startsWith(matrix.os, 'macos-')
-        shell: bash
-        run: |
-          npm ci --prefix crates/cue-dashboard/ui
-          cargo install tauri-cli --version "^2.0.0" --locked --force
-          cd crates/cue-dashboard
-          cargo tauri build --target ${{ matrix.target }} --bundles app
-
-      - name: Build macOS native helpers
-        if: startsWith(matrix.os, 'macos-')
-        env:
-          BLUEY_SWIFT_ARCH: ${{ matrix.swift_arch }}
-        run: |
-          shopt -s nullglob
-          for helper in native/macos/*/build.sh; do
-            bash "$helper"
-          done
-
       - name: Build Windows native helpers
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           Push-Location native/windows/cue-overlay; ./build.ps1; Pop-Location
+          Push-Location native/windows/cue-capture; ./build.ps1; Pop-Location
           Push-Location native/windows/cue-audio; ./build.ps1; Pop-Location
-          Push-Location native/windows/cue-whisper; ./build.ps1; Pop-Location
 
-      - name: Package (Unix)
-        if: matrix.os != 'windows-latest'
+      - name: Package macOS (hardened)
+        if: startsWith(matrix.os, 'macos-')
+        env:
+          BLUEY_UPDATE_PUBKEY: ${{ vars.BLUEY_UPDATE_PUBKEY }}
         shell: bash
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p staging/bin
-          # Canonical binary: bluey-daemon (fallback: cue-daemon from same crate)
-          cp "target/${{ matrix.target }}/release/bluey-daemon" staging/bin/ 2>/dev/null || \
-            cp "target/${{ matrix.target }}/release/cue-daemon" staging/bin/bluey-daemon
-          cp staging/bin/bluey-daemon staging/bin/termb
-          cp staging/bin/bluey-daemon staging/bin/Terminal
-          # Canonical binary: bluey (fallback: cue from same crate)
-          cp "target/${{ matrix.target }}/release/bluey" staging/bin/ 2>/dev/null || \
-            cp "target/${{ matrix.target }}/release/cue" staging/bin/bluey
-          # Native helpers. Keep both canonical bluey-* names and legacy cue-*
-          # aliases because older dev scripts still probe the cue-* fallback.
-          find native \( \
-            -name "bluey-*" -o -name "cue-*" -o -name "*.dylib" -o \
-            -name "hostovb" -o -name "host-overlay" -o \
-            -name "adriverb" -o -name "audio-driver" \
-          \) -type f | while read f; do
-            if [ -x "$f" ] || [[ "$f" == *.dylib ]]; then
-              cp "$f" staging/bin/ 2>/dev/null || true
-            fi
-          done
-          if [ -d "target/release/BlueyFilePicker.app" ]; then
-            cp -R "target/release/BlueyFilePicker.app" staging/bin/BlueyFilePicker.app
-          fi
-          if [[ "${{ matrix.os }}" == macos-* ]]; then
-            APP_SRC=""
-            for app_dir in "target/${{ matrix.target }}/release/bundle/macos" "target/release/bundle/macos"; do
-              if [ -d "$app_dir" ]; then
-                for candidate in "$app_dir"/*.app; do
-                  if [ -d "$candidate" ]; then
-                    APP_SRC="$candidate"
-                    break 2
-                  fi
-                done
-              fi
-            done
-            if [ -z "$APP_SRC" ]; then
-              echo "missing Tauri .app bundle for macOS distribution" >&2
-              exit 1
-            fi
-            cp -R "$APP_SRC" staging/Bluey.app
-            mkdir -p staging/Bluey.app/Contents/Resources
-            cp staging/bin/bluey staging/Bluey.app/Contents/Resources/bluey-cli
-            cp staging/bin/bluey-daemon staging/Bluey.app/Contents/Resources/bluey-daemon
-            for helper in \
-              bluey-overlay-macos cue-overlay-macos \
-              bluey-audio-macos cue-audio-macos \
-              bluey-whisper-macos cue-whisper; do
-              if [ -f "staging/bin/$helper" ]; then
-                cp "staging/bin/$helper" "staging/Bluey.app/Contents/Resources/$helper"
-              fi
-            done
-            if [ -d "target/release/BlueyOverlay.app" ]; then
-              cp -R "target/release/BlueyOverlay.app" \
-                staging/Bluey.app/Contents/Resources/BlueyOverlay.app
-            fi
-            if [ -d "target/release/BlueyFilePicker.app" ]; then
-              cp -R "target/release/BlueyFilePicker.app" \
-                staging/Bluey.app/Contents/Resources/BlueyFilePicker.app
-            fi
-          fi
-          tar -czf "bluey-${VERSION}-${{ matrix.platform }}.tar.gz" -C staging .
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+          BLUEY_VERSION="$VERSION" \
+            bash scripts/package-macos.sh "${{ matrix.swift_arch }}"
+          cp "dist/bluey-${VERSION}-${{ matrix.platform }}.tar.gz" .
 
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
@@ -233,12 +255,88 @@ jobs:
           Copy-Item native/windows/cue-overlay/build/cue-overlay.exe staging/bin/
           Copy-Item native/windows/cue-overlay/build/hostovb.exe staging/bin/
           Copy-Item native/windows/cue-overlay/build/host-overlay.exe staging/bin/
+          Copy-Item native/windows/cue-capture/build/bluey-capture.exe staging/bin/
+          Copy-Item native/windows/cue-capture/build/cue-capture.exe staging/bin/
+          Copy-Item native/windows/cue-capture/build/screen-driver.exe staging/bin/
           Copy-Item native/windows/cue-audio/build/bluey-audio.exe staging/bin/
           Copy-Item native/windows/cue-audio/build/cue-audio.exe staging/bin/
           Copy-Item native/windows/cue-audio/build/adriverb.exe staging/bin/
           Copy-Item native/windows/cue-audio/build/audio-driver.exe staging/bin/
-          Copy-Item native/windows/cue-whisper/cue-whisper.exe staging/bin/
-          Compress-Archive -Path staging/* -DestinationPath "bluey-${VERSION}-${{ matrix.platform }}.zip"
+
+      - name: Create deterministic Windows archive
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCHIVE="bluey-${VERSION}-${{ matrix.platform }}.zip"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python - staging "$ARCHIVE" "$SOURCE_DATE_EPOCH" <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+          import stat
+          import sys
+          import time
+          import zipfile
+
+          stage = Path(sys.argv[1])
+          archive_path = Path(sys.argv[2])
+          epoch = max(315532800, min(int(sys.argv[3]), 4354819198))
+          raw_timestamp = time.gmtime(epoch)[:6]
+          timestamp = (*raw_timestamp[:5], raw_timestamp[5] // 2 * 2)
+          files = sorted(path for path in stage.rglob("*") if path.is_file())
+
+          with zipfile.ZipFile(
+              archive_path,
+              "w",
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=9,
+          ) as archive:
+              for path in files:
+                  name = path.relative_to(stage).as_posix()
+                  info = zipfile.ZipInfo(name, timestamp)
+                  info.create_system = 3
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.external_attr = (stat.S_IFREG | 0o755) << 16
+                  archive.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
+          PY
+
+      - name: Verify Windows release members and hygiene
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCHIVE="bluey-${VERSION}-${{ matrix.platform }}.zip"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python - "$ARCHIVE" "$SOURCE_DATE_EPOCH" <<'PY'
+          import sys
+          import time
+          import zipfile
+
+          expected = {
+              "bin/Terminal.exe", "bin/adriverb.exe", "bin/audio-driver.exe",
+              "bin/bluey-audio.exe", "bin/bluey-capture.exe",
+              "bin/bluey-daemon.exe", "bin/bluey-overlay.exe", "bin/bluey.exe",
+              "bin/cue-audio.exe", "bin/cue-capture.exe", "bin/cue-overlay.exe",
+              "bin/host-overlay.exe", "bin/hostovb.exe", "bin/screen-driver.exe",
+              "bin/termb.exe",
+          }
+          epoch = max(315532800, min(int(sys.argv[2]), 4354819198))
+          raw_timestamp = time.gmtime(epoch)[:6]
+          expected_timestamp = (*raw_timestamp[:5], raw_timestamp[5] // 2 * 2)
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              members = [info for info in archive.infolist() if not info.is_dir()]
+              names = [info.filename.replace("\\", "/") for info in members]
+          actual = set(names)
+          if len(names) != len(actual) or actual != expected:
+              raise SystemExit(
+                  "Windows release member mismatch: "
+                  f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+              )
+          if any(info.date_time != expected_timestamp for info in members):
+              raise SystemExit("Windows release members do not use the fixed source timestamp")
+          PY
+          python scripts/check-release-artifact-contents.py "$ARCHIVE"
 
       - name: Compute SHA256
         id: sha
@@ -255,7 +353,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bluey-${{ steps.version.outputs.version }}-${{ matrix.platform }}
           path: ${{ steps.sha.outputs.file }}
@@ -269,9 +367,11 @@ jobs:
     steps:
       # Need the repo checked out so infra/scripts/build-sha256-manifest.py
       # is available in the runner workspace.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           merge-multiple: true
@@ -287,7 +387,7 @@ jobs:
           python3 infra/scripts/build-sha256-manifest.py
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           files: |

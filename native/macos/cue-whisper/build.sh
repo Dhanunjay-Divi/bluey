@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
-swift_args=(-c release)
+swift_args=(-c release --disable-automatic-resolution)
 if [[ -n "${BLUEY_SWIFT_ARCH:-}" ]]; then
   swift_args+=(--arch "$BLUEY_SWIFT_ARCH")
 fi

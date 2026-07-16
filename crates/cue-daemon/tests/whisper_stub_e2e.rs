@@ -20,7 +20,7 @@ fn whisper_stub_path() -> String {
             .parent()
             .unwrap()
             .to_path_buf();
-        path.push("whisper-stub");
+        path.push(format!("whisper-stub{}", std::env::consts::EXE_SUFFIX));
         path.to_string_lossy().to_string()
     })
 }

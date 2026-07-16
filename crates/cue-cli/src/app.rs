@@ -19,8 +19,10 @@ use cue_core::process_aliases::is_daemon_executable_path;
 #[cfg(target_os = "macos")]
 use cue_core::process_aliases::MACOS_AUDIO_HELPER_NAMES;
 use cue_core::process_aliases::{is_daemon_identity_path, DAEMON_EXECUTABLE_STEMS};
+#[cfg(target_os = "windows")]
+use cue_core::{capture_windows_screen, WindowsCaptureRegion};
 use cue_core::{
-    load_account, load_settings, new_trace_id, save_settings, trace_id_from_env, AccountConfig,
+    load_account, load_settings, new_trace_id, trace_id_from_env, update_settings, AccountConfig,
     ActionItem, AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerRequest, AnswerResponse,
     AudioPipelineStatus, CardKind, CloudSyncStatus, ContextArtifact, CueCard, CueSettings,
     MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, PrivacyFlags, ProviderRoute,
@@ -38,6 +40,8 @@ const CLI_UNINSTALL_LINK_STEMS: &[&str] = &[
     "adriverb",
     "audio-driver",
     "screen-driver",
+    "bluey-capture",
+    "cue-capture",
     "bluey-overlay-macos",
     "cue-overlay-macos",
     "bluey-audio-macos",
@@ -58,6 +62,8 @@ const WINDOWS_INSTALL_BIN_NAMES: &[&str] = &[
     "adriverb.exe",
     "audio-driver.exe",
     "screen-driver.exe",
+    "bluey-capture.exe",
+    "cue-capture.exe",
     "bluey-overlay.exe",
     "cue-overlay.exe",
     "bluey-audio.exe",
@@ -359,6 +365,30 @@ struct SettingsArgs {
     /// Local/cloud retention target in days.
     #[arg(long)]
     retention_days: Option<u32>,
+    /// Allow screenshot capture only when semantic browser text is unavailable.
+    #[arg(long)]
+    context_screenshot_fallback: Option<bool>,
+    /// Work-context observation cadence in seconds (clamped to 3-300).
+    #[arg(long)]
+    context_interval: Option<u64>,
+    /// Maximum locally retained work-context items (clamped to 10-500).
+    #[arg(long)]
+    context_max_items: Option<usize>,
+    /// Comma- or newline-separated applications context observation must ignore.
+    /// Pass an empty value to clear the list.
+    #[arg(long, value_name = "APP[,APP...]")]
+    context_excluded_apps: Option<String>,
+    /// Comma- or newline-separated domains context observation must ignore.
+    /// Pass an empty value to clear the list.
+    #[arg(long, value_name = "DOMAIN[,DOMAIN...]")]
+    context_excluded_domains: Option<String>,
+    /// Enable or disable local meeting-detection suggestions.
+    #[arg(long)]
+    meeting_detection: Option<bool>,
+    /// Comma- or newline-separated meeting applications to ignore.
+    /// Pass an empty value to clear the list.
+    #[arg(long, value_name = "APP[,APP...]")]
+    meeting_ignored_apps: Option<String>,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -422,6 +452,15 @@ struct ContextCaptureArgs {
     /// Capture the whole screen instead of using the OS region/window picker.
     #[arg(long)]
     full_screen: bool,
+    /// Capture a bounded Windows virtual-desktop region: x y width height.
+    #[arg(
+        long,
+        num_args = 4,
+        value_names = ["X", "Y", "WIDTH", "HEIGHT"],
+        allow_hyphen_values = true,
+        conflicts_with = "full_screen"
+    )]
+    region: Option<Vec<i64>>,
     /// Attach without asking for confirmation after capture.
     #[arg(long)]
     yes: bool,
@@ -1545,12 +1584,10 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
 
     let has_cloud_tokens = account.token_configured();
     cue_cloud_client::save_account_profile_and_tokens(&paths, &account)?;
+    let cloud_sync_enabled = load_settings(&paths)
+        .map(|settings| settings.cloud_sync_enabled && settings.cloud_sync_consent_granted)
+        .unwrap_or(false);
     if has_cloud_tokens {
-        let mut settings = load_settings(&paths)?;
-        settings.cloud_sync_consent_granted = true;
-        settings.cloud_sync_enabled = true;
-        settings.touch();
-        save_settings(&paths, &settings)?;
         let _ = request(DaemonRequest::CloudStatus).await;
     }
 
@@ -1560,9 +1597,13 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
     );
     if has_cloud_tokens {
         println!("Cloud token saved in Bluey's private local account profile.");
-        println!(
-            "Saved-session cloud sync is on for this device. You can turn it off in Settings."
-        );
+        if cloud_sync_enabled {
+            println!("Saved-session cloud sync remains on for this device.");
+        } else {
+            println!(
+                "Saved-session cloud sync remains off. Enable it explicitly in Settings or with `bluey settings --cloud-sync true`."
+            );
+        }
     } else {
         println!("Local account linked. Run `bluey on` later to sign in when the Bluey cloud endpoint is ready.");
     }
@@ -1668,12 +1709,15 @@ fn print_sessions(args: SessionsArgs) -> Result<()> {
 
 fn cue_settings(args: SettingsArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let mut settings = if args.reset {
-        CueSettings::default()
-    } else {
-        load_settings(&paths)?
-    };
+    let settings = update_settings(&paths, |settings| apply_cli_settings(settings, args))?;
+    print_settings(&settings);
+    Ok(())
+}
 
+fn apply_cli_settings(settings: &mut CueSettings, args: SettingsArgs) {
+    if args.reset {
+        *settings = CueSettings::default();
+    }
     if let Some(answer_style) = args.answer_style {
         settings.answer_style = if answer_style.trim().is_empty() {
             None
@@ -1697,11 +1741,35 @@ fn cue_settings(args: SettingsArgs) -> Result<()> {
     if let Some(days) = args.retention_days {
         settings.retention_days = days;
     }
-    settings.touch();
+    if let Some(enabled) = args.context_screenshot_fallback {
+        settings.context_watch.screenshot_fallback = enabled;
+    }
+    if let Some(interval) = args.context_interval {
+        settings.context_watch.interval_secs = interval;
+    }
+    if let Some(max_items) = args.context_max_items {
+        settings.context_watch.max_local_items = max_items;
+    }
+    if let Some(apps) = args.context_excluded_apps {
+        settings.context_watch.excluded_apps = parse_cli_list(&apps);
+    }
+    if let Some(domains) = args.context_excluded_domains {
+        settings.context_watch.excluded_domains = parse_cli_list(&domains);
+    }
+    if let Some(enabled) = args.meeting_detection {
+        settings.meeting_detection_enabled = enabled;
+    }
+    if let Some(apps) = args.meeting_ignored_apps {
+        settings.meeting_detection_ignored_apps = parse_cli_list(&apps);
+    }
+}
 
-    save_settings(&paths, &settings)?;
-    print_settings(&settings);
-    Ok(())
+fn parse_cli_list(raw: &str) -> Vec<String> {
+    raw.split([',', '\n'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 async fn browser_login(
@@ -2081,13 +2149,52 @@ fn print_settings(settings: &CueSettings) {
     println!("Microphone: {}", on_off(settings.audio_microphone_enabled));
     println!(
         "Cloud sync: {}",
-        if settings.cloud_sync_enabled {
+        if settings.cloud_sync_allowed() {
             "automatic"
         } else {
             "off"
         }
     );
     println!("Retention: {} day(s)", settings.retention_days);
+    println!(
+        "Work context: semantic text first; start explicitly with `bluey context watch start`"
+    );
+    println!(
+        "Context screenshot fallback: {}",
+        on_off(settings.context_watch.screenshot_fallback)
+    );
+    println!(
+        "Context cadence: {} second(s)",
+        settings.context_watch.interval_secs
+    );
+    println!(
+        "Context local limit: {} item(s)",
+        settings.context_watch.max_local_items
+    );
+    println!(
+        "Context excluded apps: {}",
+        printable_list(&settings.context_watch.excluded_apps)
+    );
+    println!(
+        "Context excluded domains: {}",
+        printable_list(&settings.context_watch.excluded_domains)
+    );
+    println!(
+        "Meeting suggestions: {}",
+        on_off(settings.meeting_detection_enabled)
+    );
+    println!(
+        "Meeting ignored apps: {}",
+        printable_list(&settings.meeting_detection_ignored_apps)
+    );
+}
+
+fn printable_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(", ")
+    }
 }
 
 fn on_off(value: bool) -> &'static str {
@@ -2118,11 +2225,6 @@ fn open_browser(url: &str) -> Result<()> {
         bail!("browser opener exited with status {status}");
     }
     Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn powershell_single_quoted(path: &PathBuf) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "''"))
 }
 
 async fn ensure_daemon(no_overlay: bool) -> Result<()> {
@@ -2304,6 +2406,7 @@ async fn handle_live_command(command: LiveCommand<'_>) -> Result<bool> {
         LiveCommand::Capture => {
             capture_context(ContextCaptureArgs {
                 full_screen: false,
+                region: None,
                 yes: false,
                 no_preview: false,
                 title: None,
@@ -2477,6 +2580,9 @@ fn capture_screen(args: &ContextCaptureArgs) -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn capture_screen_platform(args: &ContextCaptureArgs, capture_path: &PathBuf) -> Result<()> {
+    if args.region.is_some() {
+        bail!("--region is currently supported by the native Windows capture helper");
+    }
     let mut command = Command::new("screencapture");
     if args.full_screen {
         command.arg("-x");
@@ -2500,32 +2606,15 @@ fn capture_screen_platform(_args: &ContextCaptureArgs, _capture_path: &PathBuf) 
 }
 
 #[cfg(target_os = "windows")]
-fn capture_screen_platform(_args: &ContextCaptureArgs, capture_path: &PathBuf) -> Result<()> {
-    let escaped_path = powershell_single_quoted(capture_path);
-    let script = format!(
-        r#"
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-$bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-$graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-$bitmap.Save({escaped_path}, [System.Drawing.Imaging.ImageFormat]::Png)
-$graphics.Dispose()
-$bitmap.Dispose()
-"#
-    );
-    let status = Command::new("powershell")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .status()
-        .context("failed to launch Windows screen capture")?;
-    if !status.success() {
-        bail!("Windows screen capture failed or was denied");
-    }
+fn capture_screen_platform(args: &ContextCaptureArgs, capture_path: &PathBuf) -> Result<()> {
+    let region = match args.region.as_deref() {
+        Some([x, y, width, height]) => Some(WindowsCaptureRegion::from_values([
+            *x, *y, *width, *height,
+        ])?),
+        Some(_) => bail!("--region requires exactly x y width height"),
+        None => None,
+    };
+    let _diagnostic = capture_windows_screen(capture_path, region)?;
     Ok(())
 }
 
@@ -3174,6 +3263,12 @@ fn print_response(response: DaemonResponse) -> Result<()> {
         DaemonResponse::AiStatus { status } => print_ai_status(status),
         DaemonResponse::Answer { response, events } => {
             print_answer_response(response, false, events.len())
+        }
+        DaemonResponse::SessionLifecycle { lifecycle } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&lifecycle).expect("session lifecycle serializes")
+            );
         }
         DaemonResponse::CloudStatus { status } => print_cloud_status(status),
         DaemonResponse::IpcAuthError { code } => {
@@ -3862,12 +3957,12 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        answer_request_from_args, bluey_on_boot_lines, bluey_on_boot_title,
+        answer_request_from_args, apply_cli_settings, bluey_on_boot_lines, bluey_on_boot_title,
         default_bluey_signin_url, device_login_url, install_root_from_exe, login_account_provider,
         resolve_daemon_bin_from_roots, resolve_login_api_url_from, AskArgs, BlueyOnAuthState, Cli,
         Commands,
     };
-    use cue_core::AiProviderKind;
+    use cue_core::{AiProviderKind, CueSettings};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -3885,6 +3980,53 @@ mod tests {
         let json = <Cli as clap::Parser>::try_parse_from(["bluey", "legal", "--json"])
             .expect("parse JSON legal command");
         assert!(matches!(json.command, Commands::Legal { json: true }));
+    }
+
+    #[test]
+    fn terminal_settings_cover_context_and_meeting_privacy_controls() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "bluey",
+            "settings",
+            "--context-screenshot-fallback",
+            "true",
+            "--context-interval",
+            "1",
+            "--context-max-items",
+            "999",
+            "--context-excluded-apps",
+            "Google Chrome, Slack\nGoogle Chrome",
+            "--context-excluded-domains",
+            "Accounts.Example.com, mail.example.com",
+            "--meeting-detection",
+            "false",
+            "--meeting-ignored-apps",
+            "Zoom, Teams",
+        ])
+        .expect("parse terminal privacy settings");
+        let Commands::Settings(args) = cli.command else {
+            panic!("expected settings command");
+        };
+
+        let mut settings = CueSettings::default();
+        apply_cli_settings(&mut settings, args);
+        settings.touch();
+
+        assert!(settings.context_watch.screenshot_fallback);
+        assert_eq!(settings.context_watch.interval_secs, 3);
+        assert_eq!(settings.context_watch.max_local_items, 500);
+        assert_eq!(
+            settings.context_watch.excluded_apps,
+            vec!["google chrome", "slack"]
+        );
+        assert_eq!(
+            settings.context_watch.excluded_domains,
+            vec!["accounts.example.com", "mail.example.com"]
+        );
+        assert!(!settings.meeting_detection_enabled);
+        assert_eq!(
+            settings.meeting_detection_ignored_apps,
+            vec!["teams", "zoom"]
+        );
     }
 
     #[test]

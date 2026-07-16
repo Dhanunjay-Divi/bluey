@@ -24,6 +24,7 @@ describe("Bluey Browser protocol", () => {
   });
 
   it("rejects missing or malformed capabilities", () => {
+    expect(() => parseBlueyJobsProtocol("bluey-jobs://takeover?session_id=run-123")).toThrow();
     expect(() => parseBlueyJobsProtocol("bluey-jobs://run/run-123?ticket=short")).toThrow();
     expect(() => parseBlueyJobsProtocol(`https://bluey.sh/run/run-123?ticket=${"a".repeat(64)}`)).toThrow();
     expect(() => parseBlueyJobsProtocol(

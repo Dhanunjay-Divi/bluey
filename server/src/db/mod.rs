@@ -552,6 +552,17 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_cloud_rag_session
         ON cloud_rag_chunks(account_id, session_id);
 
+    CREATE TABLE IF NOT EXISTS cloud_child_tombstones (
+        account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        child_kind         TEXT NOT NULL,
+        child_id           TEXT NOT NULL,
+        session_id         TEXT NOT NULL,
+        deleted_at_ms      INTEGER NOT NULL,
+        PRIMARY KEY (account_id, child_kind, child_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cloud_child_tombstones_session
+        ON cloud_child_tombstones(account_id, session_id, deleted_at_ms);
+
     CREATE TABLE IF NOT EXISTS stt_sessions (
         session_token       TEXT PRIMARY KEY,
         account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
