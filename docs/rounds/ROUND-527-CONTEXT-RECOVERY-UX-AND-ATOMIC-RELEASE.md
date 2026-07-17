@@ -2,9 +2,13 @@
 
 Date: 2026-07-16
 
-Branch: `codex/bluey-interrupted-asks-round519-20260712`
+Implementation branch: `codex/bluey-interrupted-asks-round519-20260712`
 
-Status: implementation complete; final release and production evidence pending
+Deployed source implementation commit:
+`7b816343d2bffdca80f7ab21ebf6f00de952b521`
+
+Status: complete; exact source promoted, signed release published, and
+production acceptance passed
 
 ## Executive Summary
 
@@ -131,6 +135,116 @@ this round:
   verified all top-level Mach-O signatures plus the nested file-picker bundle.
 - Rust formatting and `git diff --check` passed.
 
+## Production Release Evidence
+
+### Exact source and native packages
+
+- Production was built from
+  `7b816343d2bffdca80f7ab21ebf6f00de952b521`.
+- The local source archive used for upload is
+  `/tmp/bluey-0.1.102-7b816343d2bf-source.tar.gz`, with SHA-256
+  `e6e970059bd4be593c5c1534f0db6da2ed53636adf89c70f05dc060b263aa353`.
+  Its production extraction is
+  `/opt/bluey-releases/round527-7b816343d2bf`.
+- Native packages were built twice from detached exact source with
+  `SOURCE_DATE_EPOCH=1784245775`; the second build was byte-identical.
+
+| Platform | Bytes | SHA-256 |
+|---|---:|---|
+| macOS arm64 | 21,902,791 | `230e2479985f2bf69b70ffaf6d8e65299a5899922122505189f17485b95983c9` |
+| macOS Intel | 23,274,384 | `48ef56c58c44499cd16b18c28bc07fd84783ba7fa2536e825fad96f605b34055` |
+| macOS universal | 45,184,619 | `3cecaee5f2ecac635e57dedde86e405b3752c86912507a416e252d18b69b4093` |
+| Windows x86-64 | 21,245,777 | `2646cf31870a5e28a92b474c7089f931ac6f7b01c690c42193be6691a7c7a108` |
+
+The signed-manifest sizes matched the exact local publication files. The live
+verifier then passed independently for all four immutable platform URLs and
+SHA-256 values. The arm64 archive was also unpacked on compatible hardware;
+the CLI, daemon, and alternate daemon identities reported `0.1.102`, and the
+four overlay/audio helper aliases checked by the verifier were present. The
+other three packages remain subject to the physical-platform canaries listed
+below.
+
+The immutable installers are:
+
+| Installer | Bytes | SHA-256 |
+|---|---:|---|
+| `install.sh` | 23,326 | `63e7ed0d4e8af63016a46f6be622d1f93905fa744bddf7a4f69cc46a8517ca36` |
+| `install.ps1` | 20,778 | `74de690c5eebf6a03cac6aafb2e00ab96b410fab9db919ecfc55ef1e111481b3` |
+
+Both immutable installer paths and root aliases returned the expected MIME
+types. A separate byte comparison confirmed that each root alias exactly
+matched its immutable installer; the immutable byte counts and hashes agreed
+with the signed manifest and `SHA256SUMS.txt`.
+`latest.json` has SHA-256
+`b3082b8abcfd9158cd8f7a8df362f32dae3753038938bffa2b2019ce8cc9d8c3`;
+its base64 signature file has SHA-256
+`8a09cce7674d9990200053b69755c876947a082b19594309be1e490a3208fb73`.
+Ed25519 verification passed with the public key. Versioned artifacts,
+checksums, installers, and the signature were published before the signed
+manifest and root aliases. The owner-authorized release used a direct signing
+key file, not Keychain, and did not depend on a GitHub Actions deployment.
+
+### Recovery and atomic deployment
+
+- Fresh database backup:
+  `/var/backups/bluey-api/hourly/bluey-postgres-20260716T233544Z.pgdump`
+  (`24,037,357` bytes, SHA-256
+  `20f704e7e7ca4c91d92ea33165a4d4fa7346a4cb84cbf1fd65a230824e86d50d`).
+  Its checksum passed, `pg_restore --list` returned `357` lines containing
+  `342` non-comment entries, and the offsite R2 upload completed.
+- Rollback snapshot:
+  `/var/backups/bluey-api/releases/20260716T233632Z-before-round527-d215db35a0f8`
+  (`83` files, `50,950,693` bytes), containing both prior APIs, the Jobs
+  environment, non-release web tree, installers, and signed manifest.
+- The health-gated atomic swap ran from `2026-07-17T00:01:08Z` through
+  `2026-07-17T00:01:11Z`.
+- The running main API SHA-256 is
+  `4d44ae41f08093223732620f2d768a62574395c45c9d5b306f36d59f4135cea1`;
+  the running Jobs API SHA-256 is
+  `27f6d7fb581e57163db18a4693867f6d99db541a7519d79484a41f1a545f435a`.
+  Both loopback health endpoints report the exact deployed source commit.
+- `BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0` occurs exactly once in
+  the production Jobs environment and is also `0` in the live process. This
+  release therefore does not advertise an unavailable browser package.
+
+### Live acceptance
+
+- The exact deployed cloud preflight passed with zero warnings: Postgres and
+  pgvector, Redis/Valkey strict mode, object and log storage, offsite backup,
+  provider pools, production billing configuration and Bluey branding,
+  Turnstile, public health, and signed update files all passed.
+- Browser, `bluey-cloud-client/0.1.102`, and `bluey-cli/0.1.102` health
+  requests returned `200`, `status=ok`, and the exact deployed commit.
+  Turnstile configuration returned `200` with a public site key.
+  `/account/me` and `/api/jobs/workspace` returned `401`; the private
+  discovery lease route returned `404`; and `/llms.txt` returned `410`.
+- All `27` current-build Jobs assets (`3,820,525` bytes) were byte-identical
+  to their production counterparts. Older hashed assets remain available for
+  already-open tabs. The entry JavaScript SHA-256 is
+  `05130d4cdbffc3a615cc2a916e95b82b7821cc3efc91ca1e1e7605dd36b564bc`;
+  the entry CSS SHA-256 is
+  `c3f87f965f45534181f53158b67cd4703dd89c20d2261ad9a11942c06f863cec`.
+  Hashed assets are immutable cached, source maps return `404`, and the
+  bundles contain no `sourceMappingURL`. After removing only Cloudflare's
+  managed challenge injection, the live Jobs HTML is byte-identical to
+  `web/jobs/index.html`.
+- All `10` shared public site assets (`826,665` bytes) matched the repository.
+  The home, product-explanation, context, overlay, and Jobs application routes
+  returned `200`.
+- The edge verifier passed: crawler policy, Jobs `noindex`/`no-cache`,
+  immutable asset caching, redirect behavior, and protected-route status all
+  matched policy. Googlebot received `200`, GPTBot received `403`, direct
+  HTTPS origin bypass was blocked, and direct HTTP was redirect-only.
+- `bluey-api`, `bluey-jobs-api`, and Caddy were active and enabled with
+  `NRestarts=0`. APIs listened only on `127.0.0.1:8080` and
+  `127.0.0.1:8081`; no API listener was exposed on a non-loopback address.
+  Twenty-three consecutive samples from `2026-07-17T00:06:16Z` through
+  `00:17:20Z` kept both APIs on the exact deployed commit with all services
+  active and zero restarts. The final `00:17:49Z` scan, more than sixteen
+  minutes after deployment began, still found zero warning-or-higher records
+  and zero textual warning, error, panic, fatal, failed, or critical matches.
+  The host had `27,070,754,816` bytes free (`56%` used).
+
 ## Deliberately Gated Follow-On Work
 
 - Context Watch provides explicit foreground supported-browser context, a
@@ -187,22 +301,19 @@ ownership is established.
 These are explicit hardware/provider gates; static analysis cannot honestly
 convert them into completed runtime evidence.
 
-## Implementation Handoff
+## Release Closure And Residual Handoff
 
-The next release operator should:
+The implementation, deterministic rebuild, backup, atomic deployment, signed
+publication, and public acceptance steps for `0.1.102` are complete. Future
+work should start from the current fetched `origin/main`, treat the deployed
+source commit cited above as the immutable runtime baseline, and preserve the
+consent, irreversible-side-effect, and release-ordering boundaries established
+in this round.
 
-1. Run the full Rust, server, Dashboard, Jobs, native-helper, release-policy,
-   deterministic-package, and secret/provenance gates.
-2. Build all four native archives from the exact committed source with a fixed
-   `SOURCE_DATE_EPOCH` and embedded Ed25519 public key.
-3. Rebuild once and compare hashes.
-4. Back up PostgreSQL and the current binaries/static/release tree.
-5. Deploy the exact source commit, static assets before HTML, and immutable
-   release assets before the signed manifest.
-6. Verify both APIs report the exact source commit and all public artifact
-   hashes/signatures match.
-7. Append exact commits, artifact hashes, backup/rollback locations, service
-   status, and live-canary results to this document.
-
-No implementation agent should treat the hardware/provider unknowns above as
-already validated.
+The next measured work is limited to the explicit hardware/provider gates:
+physical Windows and Intel Mac canaries, live ATS/CAPTCHA/2FA certification,
+mail/calendar OAuth and ingestion, a separately signed Bluey Browser
+distribution, acoustic echo cancellation/device-change coverage, and full
+Projects/Routines/generated-summary/local-embedding product work. No
+implementation agent should relabel those items complete without the
+corresponding runtime evidence.
