@@ -5918,7 +5918,7 @@ fn prompt_with_answer_plan(
         );
         if payment_timeout_question {
             instructions.push_str(
-                "\nPayment timeout follow-up output: answer in one compact, ready-to-say paragraph. Start exactly with `I would transition the payment intent from PROCESSING to UNKNOWN and stop automatic charge retries.` Then explain that provider status checks by payment ID or client reference and deduplicated webhook events determine the confirmed terminal state. The original operation's idempotency key is reused only if the same provider command must be replayed; it is not the webhook deduplication key."
+                "\nPayment timeout follow-up output: answer in one compact, ready-to-say paragraph. Start exactly with `I would transition the payment intent from PROCESSING to UNKNOWN and stop automatic charge retries.` Then say that provider status checks by payment ID or client reference and webhook events deduplicated by provider event ID determine the confirmed terminal state. The original operation's idempotency key is reused only if the same provider command must be replayed; it is not the webhook deduplication key."
             );
         }
     }
@@ -14809,6 +14809,9 @@ mod tests {
         assert!(system.contains("transactional outbox command"));
         assert!(system.contains("provider payment ID or client reference"));
         assert!(system.contains("Deduplicate webhooks by provider event ID"));
+        assert!(system.contains(
+            "webhook events deduplicated by provider event ID determine the confirmed terminal state"
+        ));
         assert!(system.contains("original operation's idempotency key"));
         assert!(system.contains("not the webhook deduplication key"));
     }

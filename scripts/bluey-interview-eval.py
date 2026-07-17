@@ -1386,6 +1386,16 @@ def payment_operation_semantic_issues(
                     clause,
                 )
             )
+            or (
+                len(operations) == 3
+                and re.search(
+                    r"\beach\b.{0,30}\bauthoriz\w*\b.{0,50}\bcaptur\w*\b"
+                    r".{0,50}\brefund\w*\b.{0,35}\b(?:gets?|has|uses?)\b"
+                    r".{0,20}\b(?:its\s+own|a\s+(?:unique|distinct|separate))\b"
+                    r".{0,25}\b(?:stable\s+)?(?:idempotency\s+)?key\b",
+                    clause,
+                )
+            )
         )
         safely_rejected = bool(
             re.search(
@@ -1436,6 +1446,13 @@ def payment_operation_semantic_issues(
                 r".{0,45}\beach\b.{0,35}\b(?:gets?|has|uses?)\b.{0,20}"
                 r"\b(?:a\s+)?(?:unique|distinct|separate)\b.{0,20}"
                 r"\b(?:idempotency\s+)?key\b",
+                lower,
+            )
+            or re.search(
+                r"\beach\b.{0,30}\bauthoriz\w*\b.{0,50}\bcaptur\w*\b"
+                r".{0,50}\brefund\w*\b.{0,35}\b(?:gets?|has|uses?)\b"
+                r".{0,20}\b(?:its\s+own|a\s+(?:unique|distinct|separate))\b"
+                r".{0,25}\b(?:stable\s+)?(?:idempotency\s+)?key\b",
                 lower,
             )
         )
@@ -1502,6 +1519,24 @@ def payment_operation_semantic_issues(
             r".{0,70}\b(?:retr(?:y|ied)|replay)\w*\b",
             lower,
         )
+        or re.search(
+            r"\b(?:use|uses|reuse|reuses|reused|reusing)\b.{0,30}"
+            r"\b(?:the\s+)?same\b.{0,20}\b(?:idempotency\s+)?key\b"
+            r".{0,25}\bfor\b.{0,25}\b(?:the\s+)?same\b.{0,25}"
+            r"\b(?:logical\s+|provider\s+)?(?:operation|command)\b"
+            r".{0,25}\b(?:retry|replay)\w*\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:the\s+)?(?:same|original)\b.{0,25}"
+            r"\b(?:logical\s+|provider\s+)?(?:operation|command)(?:'s)?\b"
+            r".{0,20}\b(?:idempotency\s+)?key\b.{0,20}"
+            r"\b(?:is|was)\s+(?:reused|kept|preserved)\b.{0,55}"
+            r"\b(?:the\s+)?same\b.{0,25}"
+            r"\b(?:logical\s+|provider\s+)?(?:operation|command)\b"
+            r".{0,30}\b(?:retry|replay)\w*\b",
+            lower,
+        )
     )
     negated_same_operation_retry_reuse = bool(
         re.search(
@@ -1532,6 +1567,15 @@ def payment_operation_semantic_issues(
             r".{0,55}\b(?:retr(?:y|ied)|replay)\w*\b",
             lower,
         )
+        or re.search(
+            r"\b(?:do not|don't|never|must not|should not|avoid)\b\s+"
+            r"(?:use|using)\b.{0,30}\b(?:the\s+)?same\b.{0,20}"
+            r"\b(?:idempotency\s+)?key\b.{0,25}\bfor\b.{0,25}"
+            r"\b(?:the\s+)?same\b.{0,25}"
+            r"\b(?:logical\s+|provider\s+)?(?:operation|command)\b"
+            r".{0,25}\b(?:retry|replay)\w*\b",
+            lower,
+        )
     )
     if negated_same_operation_retry_reuse:
         same_operation_retry_reuse = False
@@ -1553,6 +1597,13 @@ def payment_operation_semantic_issues(
         or re.search(
             r"\bidempotency\s+key\b.{0,25}\bper\b.{0,25}"
             r"\b(?:logical\s+|provider\s+|payment\s+)?(?:operation|command)\b",
+            lower,
+        )
+        or re.search(
+            r"\beach\b.{0,30}\bauthoriz\w*\b.{0,50}\bcaptur\w*\b"
+            r".{0,50}\brefund\w*\b.{0,35}\b(?:gets?|has|uses?)\b"
+            r".{0,20}\b(?:its\s+own|a\s+(?:unique|distinct|separate))\b"
+            r".{0,25}\b(?:stable\s+)?(?:idempotency\s+)?key\b",
             lower,
         )
         or (distinct_operation_keys and same_operation_retry_reuse)
@@ -1972,12 +2023,23 @@ def self_check_payment_operation_semantics() -> None:
         live_q39_wording,
         require_webhook_event_dedup=True,
     )
+    deployed_q39_wording = (
+        "Each authorize, capture, or refund gets its own stable idempotency key. "
+        "The worker uses the same idempotency key for the same logical operation "
+        "replay. Deduplicate webhook events by provider event ID."
+    )
+    assert not payment_operation_semantic_issues(
+        deployed_q39_wording,
+        require_webhook_event_dedup=True,
+    )
     negated_retry_rules = (
         "Do not reuse the same idempotency key for retries of the same operation.",
         "Avoid reusing the same idempotency key for retries of the same operation.",
         "Do not retry the same operation with the same idempotency key.",
         "Never replay the original charge operation using the original idempotency key.",
         "The same operation must not keep its idempotency key when replayed.",
+        "Do not use the same idempotency key for the same logical operation replay.",
+        "Never use the same idempotency key for the same logical operation replay.",
     )
     for negated_rule in negated_retry_rules:
         negated_retry_reuse = (
@@ -1998,6 +2060,27 @@ def self_check_payment_operation_semantics() -> None:
     )
     assert not payment_operation_semantic_issues(
         live_q40_wording,
+        require_webhook_event_dedup=False,
+        require_complete_idempotency_semantics=False,
+        require_same_operation_retry_reuse=True,
+    )
+    deployed_q40_wording = (
+        "The provider status checks by payment ID or client reference and "
+        "deduplicated webhook events determine the confirmed terminal state. The "
+        "original operation's idempotency key is reused only if the same provider "
+        "command must be replayed; it is not the webhook deduplication key."
+    )
+    assert payment_operation_semantic_issues(
+        deployed_q40_wording,
+        require_webhook_event_dedup=False,
+        require_complete_idempotency_semantics=False,
+        require_same_operation_retry_reuse=True,
+    ) == ["missing_provider_event_id_webhook_dedup"]
+    assert not payment_operation_semantic_issues(
+        deployed_q40_wording.replace(
+            "deduplicated webhook events",
+            "webhook events deduplicated by provider event ID",
+        ),
         require_webhook_event_dedup=False,
         require_complete_idempotency_semantics=False,
         require_same_operation_retry_reuse=True,
