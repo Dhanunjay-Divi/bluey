@@ -284,7 +284,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q44", "behavioral", "amazon_de", "Tell me about a time you challenged a decision with data and then committed to the final direction.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("data", "evidence"), g("disagree", "challenge"), g("commit", "align"))),
     EvalCase("Q45", "behavioral", "amazon_de", "Tell me about a failure. What did you change so the same class of failure would not repeat?", "behavioral_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("fail", "mistake"), g("root cause", "learn"), g("guardrail", "test", "monitor", "process"))),
     EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
-    EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("align", "stakeholder", "tradeoff to both directors", "visible to both directors"), g("communicat", "tradeoff"))),
+    EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("align", "stakeholder", "tradeoff to both directors", "visible to both directors", "both directors together"), g("communicat", "tradeoff", "lay out"))),
     EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("follow", "ownership"))),
     EvalCase("Q49", "scenario", "ds", "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?", "otter_visible_scenario", speakable=True, required_groups=(g("track", "identity"), g("calibrat", "time", "spatial"), g("dedup", "fusion", "association"))),
     EvalCase("Q50", "behavioral", "ds", "Why this role, and what would you focus on in your first ninety days?", "resume_and_jd_pdf", speakable=True, required_groups=(g("hpe", "datacenter", "telemetry"), g("first", "90", "ninety"), g("stakeholder", "baseline", "production"))),
@@ -2561,7 +2561,7 @@ def self_check_attempt_integrity_guards() -> None:
         "I would show leadership by selecting the request with the greatest customer "
         "impact, then communicate my tradeoff and final decision.",
     ) == [
-        "missing_signal:align|stakeholder|tradeoff to both directors|visible to both directors"
+        "missing_signal:align|stakeholder|tradeoff to both directors|visible to both directors|both directors together"
     ]
     assert not q47_director_alignment_issues(
         "I compare customer impact, explain the tradeoff to both directors, and "
@@ -2632,6 +2632,15 @@ def self_check_attempt_integrity_guards() -> None:
     )
     assert not missing_required_group_issues(q47, live_q47)
     assert not q47_director_alignment_issues(live_q47)
+    side_by_side_q47 = (
+        "I go to both directors together and lay out a single, objective comparison "
+        "of the two requests side by side using customer impact, deadline urgency, "
+        "effort, dependencies, and reversibility. I ask them to agree on the order. "
+        "If they cannot agree, I escalate the decision to their common accountable "
+        "owner and notify both directors."
+    )
+    assert not missing_required_group_issues(q47, side_by_side_q47)
+    assert not q47_director_alignment_issues(side_by_side_q47)
     unsafe_visible_comparison = (
         "I make one comparison visible to both directors, but do not ask them to agree; "
         "I choose the priority myself and communicate my tradeoff."

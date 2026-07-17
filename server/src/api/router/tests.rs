@@ -3136,6 +3136,9 @@ fn answer_plan_url_shortener_uses_one_safe_mapping_write_path() {
     assert!(system.contains("Do not acknowledge a delete, abuse-block, or legal-block transition"));
     assert!(system.contains("synchronously publish a versioned safety tombstone or deny overlay"));
     assert!(system.contains("fail closed with an authoritative state check"));
+    assert!(system.contains(
+        "Every redirect worker checks the versioned deny overlay before serving any cached active mapping"
+    ));
     assert!(system.contains("never redirect those states to the stored destination"));
     assert!(system.contains("Never say a cache may remain stale after delete or block"));
     assert!(system.contains("durably sink before committing the consumer offset"));

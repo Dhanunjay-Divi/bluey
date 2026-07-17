@@ -983,10 +983,12 @@ def url_shortener_safety_issues(
     text: str, *, require_revocation_completeness: bool = False
 ) -> List[str]:
     """Reject redirects that can expose stale or abuse-blocked destinations."""
+    cleaned = re.sub(r"[*`~]+", "", text.casefold().replace("’", "'"))
+    cleaned = re.sub(r"(?:\r?\n)+", ". ", cleaned)
     lower = re.sub(
         r"\s+",
         " ",
-        re.sub(r"[*`~]+", "", text.casefold().replace("’", "'")),
+        cleaned,
     )
     issues: List[str] = []
     clauses = [
@@ -1303,7 +1305,9 @@ def url_shortener_safety_issues(
                     r"\b(?:but|and)\s+(?:do\s+not|don't|never|must\s+not|cannot|can't)"
                     rf"\b.{{0,55}}\b(?:after|for|on)\b.{{0,45}}\b{inactive_state}\b|"
                     r"\b(?:do\s+not|don't|never|must\s+not|cannot|can't)\b"
-                    rf".{{0,35}}\b(?:after|for|on)\b.{{0,45}}\b{inactive_state}\b",
+                    rf".{{0,35}}\b(?:after|for|on)\b.{{0,45}}\b{inactive_state}\b|"
+                    rf"\bnot\s+(?:after|for|on|following)\b.{{0,45}}"
+                    rf"\b{inactive_state}\b",
                     window,
                 )
                 or re.search(
@@ -1457,7 +1461,7 @@ def url_shortener_safety_issues(
             )
             has_redirect_suppression = bool(
                 re.search(
-                    r"\b(?:purge|invalidate|evict|deny|non[- ]redirect|"
+                    r"\b(?:purge|invalidate|evict|non[- ]redirect|"
                     r"authoritative\s+state\s+check)\w*\b",
                     clause,
                 )
@@ -1579,6 +1583,22 @@ def q47_director_alignment_issues(text: str) -> List[str]:
             lower,
         )
     )
+    shared_side_by_side_engagement = bool(
+        re.search(
+            rf"\b{directors}\b.{{0,220}}\b(?:single|same|shared|objective)\b"
+            r".{0,45}\b(?:comparison|tradeoff|picture|view)\b.{0,220}"
+            r"\bask\w*\s+them\b.{0,45}\b(?:agree|align)\w*\b.{0,60}"
+            r"\b(?:priority|order|sequence|decision|tradeoff|shared\s+rule|"
+            r"which\s+(?:request|one))\b",
+            lower,
+        )
+        and not re.search(
+            r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|"
+            r"without)\b.{0,25}\bask\w*\s+them\b.{0,35}"
+            r"\b(?:agree|align)\w*\b",
+            lower,
+        )
+    )
     engagement = bool(
         re.search(rf"\b{action}\b.{{0,80}}\b{directors}\b", lower)
         or re.search(
@@ -1587,6 +1607,7 @@ def q47_director_alignment_issues(text: str) -> List[str]:
             lower,
         )
         or visible_shared_engagement
+        or shared_side_by_side_engagement
     )
     shared_resolution = bool(
         re.search(
@@ -1617,6 +1638,7 @@ def q47_director_alignment_issues(text: str) -> List[str]:
             lower,
         )
         or visible_shared_engagement
+        or shared_side_by_side_engagement
     )
     negated_shared_alignment = bool(
         re.search(
