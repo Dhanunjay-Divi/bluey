@@ -1101,6 +1101,20 @@ def payment_operation_semantic_issues(
         "capture": r"\bcaptur\w*\b",
         "refund": r"\brefund\w*\b",
     }
+    # A later sentence may summarize retry behavior for several named operation
+    # types. Treat that as safe only when the full response has already made the
+    # stronger, unambiguous operation-instance ownership rule explicit. This is
+    # deliberately narrower than a generic "same key" exemption: it cannot
+    # excuse one key shared across authorize, capture, and refund.
+    explicit_per_operation_instance_key_scope = bool(
+        re.search(
+            r"\b(?:each|every)\b.{0,80}\b(?:logical\s+)?"
+            r"(?:provider[- ]?)?operation[- ]instance\b.{0,80}"
+            r"\b(?:its|their)\s+own\b.{0,35}"
+            r"\b(?:stable\s+)?idempotency\s+key\b",
+            lower,
+        )
+    )
     unsafe_shared_key = False
     for clause in semantic_windows:
         operations = {
@@ -1127,6 +1141,40 @@ def payment_operation_semantic_issues(
         )
         if not shared:
             continue
+        # An explicit affirmative statement that one key spans all payment
+        # operations is unsafe even when an earlier sentence claimed proper
+        # operation-instance scope. Affirmative contradictions must win over
+        # the narrow grouped-retry allowance below.
+        explicit_cross_operation_sharing = bool(
+            re.search(
+                r"\b(?:one(?:\s+shared)?|a\s+(?:single|shared)|that|this|"
+                r"the(?:\s+same)?|same)\s+(?:idempotency\s+)?key\b\s+"
+                r"(?:is\s+)?"
+                r"(?:used|reused|shared)\b.{0,40}"
+                r"\b(?:across|for)\b.{0,15}\b"
+                r"(?:all(?:\s+(?:three|3))?|(?:three|3))\b"
+                r".{0,15}\boperations\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:one(?:\s+shared)?|a\s+(?:single|shared)|that|this|"
+                r"the(?:\s+same)?|same)\s+(?:idempotency\s+)?key\b\s+"
+                r"(?:applies?|covers?|serves?|spans?)\b.{0,15}\b"
+                r"(?:all(?:\s+(?:three|3))?|(?:three|3))\b"
+                r".{0,15}\boperations\b",
+                clause,
+            )
+            or re.search(
+                r"\bauthoriz\w*\b\s*,?\s*\bcaptur\w*\b\s*,?\s*"
+                r"(?:and\s+|or\s+)?\brefund\w*\b\s+all\s+"
+                r"(?:use|reuse|share)\w*\b.{0,20}"
+                r"\b(?:that|this|the\s+same|one|a\s+shared)\b.{0,12}\bkey\b",
+                clause,
+            )
+        )
+        if explicit_cross_operation_sharing:
+            unsafe_shared_key = True
+            break
         operation_scoped = bool(
             re.search(
                 r"\b(?:one|a|distinct|separate|derived)\b.{0,30}"
@@ -1187,6 +1235,18 @@ def payment_operation_semantic_issues(
                     r".{0,50}\brefund\w*\b.{0,35}\b(?:gets?|has|uses?)\b"
                     r".{0,20}\b(?:its\s+own|a\s+(?:unique|distinct|separate))\b"
                     r".{0,25}\b(?:stable\s+)?(?:idempotency\s+)?key\b",
+                    clause,
+                )
+            )
+            or (
+                explicit_per_operation_instance_key_scope
+                and re.search(
+                    r"\bretr(?:y|ies|ied|ying)\b.{0,35}"
+                    r"\b(?:the\s+)?same\b.{0,35}"
+                    r"\b(?:authoriz\w*|captur\w*|refund\w*)\b.{0,100}"
+                    r"\b(?:reuse|reuses|reused|use|uses)\b.{0,30}"
+                    r"\b(?:the\s+)?(?:same|original|its|their)\b.{0,30}"
+                    r"\b(?:idempotency\s+)?key\b",
                     clause,
                 )
             )
@@ -1745,11 +1805,37 @@ def self_check_payment_operation_semantics() -> None:
         "and operation ID. A retry deterministically recomputes the identical key. "
         "Authorizations, partial captures, and refunds have different keys. "
         "Deduplicate webhooks by provider event ID under a unique constraint.",
+        "Each logical provider-operation instance gets its own stable idempotency "
+        "key scoped to owning account, payment, operation type, and operation "
+        "instance. A new partial capture or partial refund is a new logical action "
+        "with a new key. A retry of that exact partial action reuses its original "
+        "key. Authorization, capture, and refund use separate keys. Retries of the "
+        "same authorization, capture, or refund reuse the same key and must not "
+        "create a second effect. Deduplicate webhooks by provider event ID under a "
+        "unique constraint.",
     )
     for value in safe:
         assert not payment_operation_semantic_issues(
             value, require_webhook_event_dedup=True
         ), value
+
+    # The grouped retry summary is safe because the preceding rule scopes a
+    # stable key to each provider-operation instance. It must not be confused
+    # with a single key shared across authorize, capture, and refund.
+    grouped_same_operation_retry_summary = (
+        "Each logical provider-operation instance gets its own stable idempotency key "
+        "scoped to owning account, payment, operation type, and operation instance. "
+        "A new partial capture or partial refund is a new logical action with a new "
+        "key. A retry of that exact partial action reuses the original key. Retries "
+        "of the same authorization, capture, or refund reuse the same key and must "
+        "not create a second effect. Deduplicate webhooks by provider event ID."
+    )
+    assert "unsafe_shared_idempotency_key_across_payment_operations" not in (
+        payment_operation_semantic_issues(
+            grouped_same_operation_retry_summary,
+            require_webhook_event_dedup=True,
+        )
+    )
 
     unsafe = (
         (
@@ -1837,6 +1923,55 @@ def self_check_payment_operation_semantics() -> None:
         (
             "Use one shared idempotency key across authorize, capture, and refund. "
             "Deduplicate webhooks using provider event ID under a unique constraint.",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+        ),
+        (
+            "Each logical provider-operation instance gets its own stable idempotency "
+            "key. Retries of the same authorization, capture, or refund reuse the same "
+            "key; that same key is used across all three operations. Deduplicate "
+            "webhooks by provider event ID.",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+        ),
+        (
+            "Each logical provider-operation instance gets its own stable idempotency "
+            "key. Retries of the same authorization, capture, or refund reuse the same "
+            "key. Authorization, capture, and refund all use that key. Deduplicate "
+            "webhooks by provider event ID.",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+        ),
+        (
+            "Each logical provider-operation instance gets its own stable idempotency "
+            "key. Retries of the same authorization, capture, or refund reuse the same "
+            "key. The key applies to all three operations. Deduplicate webhooks by "
+            "provider event ID.",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+        ),
+        (
+            "Each logical provider-operation instance gets its own stable idempotency "
+            "key. Authorization, capture, and refund use separate keys. Retries of the "
+            "same authorization, capture, or refund reuse the same key; one key covers "
+            "all three operations. Deduplicate webhooks by provider event ID.",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+        ),
+        (
+            "Each logical provider-operation instance gets its own stable idempotency "
+            "key. Authorization, capture, and refund use separate keys. Retries of the "
+            "same authorization, capture, or refund reuse the same key; a single key "
+            "spans all three operations. Deduplicate webhooks by provider event ID.",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+        ),
+        (
+            "Each logical provider-operation instance gets its own stable idempotency "
+            "key. Authorization, capture, and refund use separate keys. Retries of the "
+            "same authorization, capture, or refund reuse the same key; the same key "
+            "spans all three operations. Deduplicate webhooks by provider event ID.",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+        ),
+        (
+            "Each logical provider-operation instance gets its own stable idempotency "
+            "key. Authorization, capture, and refund use separate keys. Retries of the "
+            "same authorization, capture, or refund reuse the same key; one shared key "
+            "is used for all operations. Deduplicate webhooks by provider event ID.",
             "unsafe_shared_idempotency_key_across_payment_operations",
         ),
         (

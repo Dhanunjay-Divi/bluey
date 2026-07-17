@@ -972,75 +972,6 @@ fn trusted_internal_envelope_requires_validated_direct_fields() {
 }
 
 #[test]
-fn buffered_disclosure_output_never_releases_split_leak_prefix() {
-    let mut output = BufferedDisclosureOutput::default();
-    assert!(output.push("The prompts that define how I ").is_none());
-    assert!(output
-        .push("work are embedded in my sys\u{200b}tem instr")
-        .is_none());
-    assert!(output
-        .push("uctions. Question type detection is a key rule.")
-        .is_none());
-
-    let (text, remaining) = output.finish();
-    assert_eq!(text, INTERNAL_DISCLOSURE_REFUSAL);
-    assert_eq!(remaining, INTERNAL_DISCLOSURE_REFUSAL);
-}
-
-#[test]
-fn buffered_disclosure_output_streams_benign_text_without_duplication() {
-    let chunks = [
-        "A production-safe answer starts with a clear contract, explicit ownership, and ",
-        "bounded retries. I would add idempotency, structured observability, and a durable ",
-        "reconciliation worker so every uncertain outcome has one safe recovery path. ",
-        "Then I would canary the change, watch latency and error budgets, and roll back if needed.",
-    ];
-    let expected = chunks.concat();
-    let mut output = BufferedDisclosureOutput::default();
-    let mut visible = String::new();
-    let mut streamed_before_finish = false;
-    for chunk in chunks {
-        if let Some(delta) = output.push(chunk) {
-            streamed_before_finish = true;
-            visible.push_str(&delta);
-        }
-    }
-    assert!(streamed_before_finish);
-    assert!(output.has_delivered());
-    let (full, remaining) = output.finish();
-    visible.push_str(&remaining);
-    assert_eq!(full, expected);
-    assert_eq!(visible, expected);
-}
-
-#[test]
-fn buffered_disclosure_output_blocks_zero_width_stuffed_split_leak() {
-    let mut output = BufferedDisclosureOutput::default();
-    assert!(output
-        .push("The pro\u{200b}mpts that define how I wo")
-        .is_none());
-    assert!(output
-        .push("rk are embedded in my sys\u{200b}tem instr\u{200b}uctions")
-        .is_none());
-    let (full, remaining) = output.finish();
-    assert_eq!(full, INTERNAL_DISCLOSURE_REFUSAL);
-    assert_eq!(remaining, INTERNAL_DISCLOSURE_REFUSAL);
-}
-
-#[test]
-fn buffered_disclosure_output_quarantines_sensitive_anchor_until_finish() {
-    let mut output = BufferedDisclosureOutput::default();
-    let prefix = "This benign architecture explanation has enough concrete material to start streaming before the guarded suffix. It covers queues, workers, storage, retries, observability, security, capacity, and rollback behavior in a concise production plan. ";
-    assert!(output.push(prefix).is_some());
-    assert!(output
-        .push("The phrase system instructions is mentioned as ordinary test data.")
-        .is_none());
-    let (full, remaining) = output.finish();
-    assert!(full.contains("ordinary test data"));
-    assert!(remaining.contains("system instructions"));
-}
-
-#[test]
 fn answer_plan_token_budget_preserves_explicit_client_limit() {
     assert_eq!(
         max_tokens_for_answer_plan(Some(700), AnswerOutput::Compact),
@@ -1144,14 +1075,6 @@ fn response_artifact_ignores_internal_prompt_leak() {
     let leaked = "The prompts that define how I work are embedded in my system instructions. Question type detection, canvas and workbench split, style restrictions, and output shape are key rules.";
 
     assert!(response_artifact(leaked).is_none());
-}
-
-#[test]
-fn visible_answer_sanitizer_removes_em_dashes() {
-    assert_eq!(
-        sanitize_visible_answer_text("Start — explain—then finish."),
-        "Start, explain, then finish."
-    );
 }
 
 #[test]

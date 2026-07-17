@@ -29,6 +29,9 @@ use crate::routing;
 use cue_core::prompt_contracts::ROLE_ADAPTIVE_PRACTITIONER_VOICE;
 use cue_core::short_observability_ref;
 
+mod visible_output;
+use visible_output::{explicitly_requests_reasoning_section, BufferedDisclosureOutput};
+
 type RouterSseStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static>>;
 
@@ -52,7 +55,6 @@ const DEFAULT_SLOW_FIRST_TOKEN_AUDIT_MS: i64 = 2_500;
 const DEFAULT_DEEP_SLOW_FIRST_TOKEN_AUDIT_MS: i64 = 8_000;
 const CODE_ARTIFACT_DEFAULT_OUTPUT_TOKENS: u32 = 4_096;
 const CANVAS_DETAIL_DEFAULT_OUTPUT_TOKENS: u32 = 3_072;
-const DISCLOSURE_STREAM_HOLDBACK_ALNUM_CHARS: usize = 96;
 const DEFAULT_CAPACITY_SHORT_WAIT_MAX_SECS: u64 = 2;
 const DEFAULT_LLM_USAGE_RESERVATION_TTL_SECS: u64 = 30 * 60;
 const LLM_SETTLEMENT_RETRY_ATTEMPTS: usize = 3;
@@ -114,10 +116,6 @@ impl InternalDisclosureBlocked {
     fn into_api_error(self) -> (StatusCode, Json<ApiError>) {
         internal_disclosure_api_error()
     }
-}
-
-fn sanitize_visible_answer_text(text: &str) -> String {
-    text.replace(" \u{2014} ", ", ").replace('\u{2014}', ", ")
 }
 
 fn internal_disclosure_api_error() -> (StatusCode, Json<ApiError>) {
@@ -369,83 +367,6 @@ fn fold_guardrail_confusable(ch: char) -> char {
 }
 
 #[derive(Default)]
-struct BufferedDisclosureOutput {
-    text: String,
-    pending: String,
-    delivered_chars: usize,
-    blocked: bool,
-}
-
-impl BufferedDisclosureOutput {
-    /// Appends an upstream delta and returns the prefix that is safe to expose
-    /// now. A rolling suffix stays private so a disclosure phrase split across
-    /// provider events is inspected before any part of that phrase is sent.
-    fn push(&mut self, delta: &str) -> Option<String> {
-        let sanitized = sanitize_visible_answer_text(delta);
-        self.text.push_str(&sanitized);
-        self.pending.push_str(&sanitized);
-
-        if self.blocked || looks_like_internal_disclosure_leak(&self.text) {
-            self.blocked = true;
-            return None;
-        }
-
-        // These are the non-contiguous anchors used by the disclosure guard.
-        // Once one appears, retain the remaining response until completion so
-        // a later anchor cannot turn already-delivered text into a leak.
-        let normalized = normalize_guardrail_text(&self.text);
-        if normalized.contains("system instructions")
-            || normalized.contains("i follow")
-            || normalized.contains("how i work")
-        {
-            return None;
-        }
-
-        let release_bytes =
-            disclosure_safe_release_bytes(&self.pending, DISCLOSURE_STREAM_HOLDBACK_ALNUM_CHARS);
-        if release_bytes == 0 {
-            return None;
-        }
-        let released: String = self.pending.drain(..release_bytes).collect();
-        self.delivered_chars = self
-            .delivered_chars
-            .saturating_add(released.chars().count());
-        (!released.is_empty()).then_some(released)
-    }
-
-    fn char_count(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    fn has_delivered(&self) -> bool {
-        self.delivered_chars > 0
-    }
-
-    /// Returns only the not-yet-delivered suffix for interrupted streams.
-    fn take_safe(&mut self) -> String {
-        if self.blocked || looks_like_internal_disclosure_leak(&self.text) {
-            self.blocked = true;
-            self.pending.clear();
-            INTERNAL_DISCLOSURE_REFUSAL.to_string()
-        } else {
-            std::mem::take(&mut self.pending)
-        }
-    }
-
-    /// Returns the complete safe answer for persistence plus the suffix that
-    /// still needs to be emitted to the streaming client.
-    fn finish(mut self) -> (String, String) {
-        if self.blocked || looks_like_internal_disclosure_leak(&self.text) {
-            return (
-                INTERNAL_DISCLOSURE_REFUSAL.to_string(),
-                INTERNAL_DISCLOSURE_REFUSAL.to_string(),
-            );
-        }
-        (self.text, std::mem::take(&mut self.pending))
-    }
-}
-
-#[derive(Default)]
 struct CanvasSpokenStream {
     pending_line: String,
     seen_spoken_heading: bool,
@@ -539,28 +460,6 @@ impl CanvasSpokenStream {
         }
         String::new()
     }
-}
-
-fn disclosure_safe_release_bytes(text: &str, holdback_alnum_chars: usize) -> usize {
-    if holdback_alnum_chars == 0 {
-        return text.len();
-    }
-
-    let mut alnum_chars = 0usize;
-    for (byte_index, original) in text.char_indices().rev() {
-        let folded = fold_guardrail_compatibility_char(original);
-        let is_alnum = folded
-            .to_lowercase()
-            .map(fold_guardrail_confusable)
-            .any(|ch| ch.is_ascii_alphanumeric());
-        if is_alnum {
-            alnum_chars += 1;
-            if alnum_chars >= holdback_alnum_chars {
-                return byte_index;
-            }
-        }
-    }
-    0
 }
 
 fn completion_delta_event(text: &str) -> Event {
@@ -8717,10 +8616,12 @@ async fn complete_stream_inner(
     // streaming artifact so users see useful output without full-answer lag.
     let split_canvas_stream = answer_plan.output == AnswerOutput::CanvasDetail
         && answer_plan.intent == AnswerIntent::SystemDesign;
+    let strip_interview_coaching_appendix = answer_plan.output == AnswerOutput::InterviewAnswer
+        && !explicitly_requests_reasoning_section(&req.user);
     let event_stream = async_stream::stream! {
         let mut events = streaming.events;
         let mut pending_first = selected_first_event;
-        let mut output = BufferedDisclosureOutput::default();
+        let mut output = BufferedDisclosureOutput::new(strip_interview_coaching_appendix);
         let mut canvas_visible = CanvasSpokenStream::default();
         let mut final_tokens: Option<(i64, i64)> = None;
 
@@ -10201,7 +10102,10 @@ async fn complete_inner(
         return Err(err);
     }
 
-    let mut output = BufferedDisclosureOutput::default();
+    let mut output = BufferedDisclosureOutput::new(
+        answer_plan.output == AnswerOutput::InterviewAnswer
+            && !explicitly_requests_reasoning_section(&req.user),
+    );
     let _ = output.push(&comp.text);
     let (response_text, _) = output.finish();
     if let Some(reason) = generated_answer_quality_failure(

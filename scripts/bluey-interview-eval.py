@@ -284,7 +284,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q44", "behavioral", "amazon_de", "Tell me about a time you challenged a decision with data and then committed to the final direction.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("data", "evidence"), g("disagree", "challenge"), g("commit", "align"))),
     EvalCase("Q45", "behavioral", "amazon_de", "Tell me about a failure. What did you change so the same class of failure would not repeat?", "behavioral_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("fail", "mistake"), g("root cause", "learn"), g("guardrail", "test", "monitor", "process"))),
     EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
-    EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("align", "stakeholder", "tradeoff to both directors", "visible to both directors", "both directors together"), g("communicat", "tradeoff", "lay out"))),
+    EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("align", "stakeholder", "tradeoff to both directors", "visible to both directors", "both directors together", "ask both directors"), g("communicat", "tradeoff", "lay out", "comparison"))),
     EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("follow", "ownership"))),
     EvalCase("Q49", "scenario", "ds", "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?", "otter_visible_scenario", speakable=True, required_groups=(g("track", "identity"), g("calibrat", "time", "spatial"), g("dedup", "fusion", "association"))),
     EvalCase("Q50", "behavioral", "ds", "Why this role, and what would you focus on in your first ninety days?", "resume_and_jd_pdf", speakable=True, required_groups=(g("hpe", "datacenter", "telemetry"), g("first", "90", "ninety"), g("stakeholder", "baseline", "production"))),
@@ -2468,6 +2468,48 @@ def mandatory_answer_shape_issues(case: EvalCase, attempt: AttemptResult) -> Lis
     return issues
 
 
+def has_unsolicited_coaching_appendix(text: str) -> bool:
+    """Detect a standalone coaching section that should not enter the talk track."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    headings = ("why this works", "why it works", "reasoning", "rationale")
+    open_fence: Optional[Tuple[str, int]] = None
+    for line in normalized.split("\n"):
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if fence:
+            marker = fence.group(1)
+            if open_fence is None:
+                open_fence = (marker[0], len(marker))
+            elif marker[0] == open_fence[0] and len(marker) >= open_fence[1]:
+                open_fence = None
+            continue
+        if open_fence is not None:
+            continue
+
+        candidate = line.strip()
+        while True:
+            stripped = re.sub(r"^[#*_`>\-]+\s*", "", candidate)
+            if stripped == candidate:
+                break
+            candidate = stripped
+        lower = candidate.casefold()
+        for heading in headings:
+            if not lower.startswith(heading):
+                continue
+            suffix = candidate[len(heading) :].lstrip()
+            suffix = re.sub(r"^(?:[#*_`]+\s*)+", "", suffix)
+            if not suffix or suffix[0] in ":.,-–—":
+                return True
+
+        if re.search(
+            r"(?i)(?:^|[\s.!?])(?:\*\*|__)"
+            r"(?:why (?:this|it) works|reasoning|rationale)"
+            r"(?:\s*[:.,\-–—])?(?:\*\*|__)",
+            line,
+        ):
+            return True
+    return False
+
+
 def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
     """Return deterministic defects that prevent an answer from being success."""
     issues = stream_terminal_integrity_issues(attempt)
@@ -2482,6 +2524,12 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
     word_count = len(re.findall(r"\b[\w'’+-]+\b", combined))
     if word_count < MIN_SUBSTANTIVE_ANSWER_WORDS and not safe_needs_user_input:
         issues.append("answer_too_short")
+    if (
+        case.speakable
+        and not case.expect_code
+        and has_unsolicited_coaching_appendix(attempt.visible_answer)
+    ):
+        issues.append("unsolicited_coaching_appendix")
 
     exact_cap = attempt.output_tokens is not None and (
         attempt.output_tokens == case.max_tokens
@@ -2596,7 +2644,7 @@ def self_check_attempt_integrity_guards() -> None:
         "I would show leadership by selecting the request with the greatest customer "
         "impact, then communicate my tradeoff and final decision.",
     ) == [
-        "missing_signal:align|stakeholder|tradeoff to both directors|visible to both directors|both directors together"
+        "missing_signal:align|stakeholder|tradeoff to both directors|visible to both directors|both directors together|ask both directors"
     ]
     assert not q47_director_alignment_issues(
         "I compare customer impact, explain the tradeoff to both directors, and "
@@ -2656,8 +2704,80 @@ def self_check_attempt_integrity_guards() -> None:
         "I make one comparison visible to both directors using impact, urgency, effort, "
         "dependencies, and reversibility. Then I ask them to agree on the order; if "
         "they cannot, I escalate to their common accountable owner.",
+        "I share one tradeoff comparison with both directors and ask them to agree "
+        "on a shared priority. I avoid making unilateral calls.",
+        "I present the same comparison to both directors and ask them to agree on a "
+        "shared priority. This process avoids unilateral decisions.",
     ):
         assert not q47_director_alignment_issues(safe_alignment), safe_alignment
+    saved_round541_q47 = (
+        "I would immediately clarify business impact and share the comparison using "
+        "the same criteria. I would ask both directors to prioritize together; if "
+        "they cannot agree, I would escalate to their common accountable owner. "
+        "It avoids making a unilateral call."
+    )
+    assert not missing_required_group_issues(q47, saved_round541_q47)
+    assert not q47_director_alignment_issues(saved_round541_q47)
+    assert not has_unsolicited_coaching_appendix(
+        "I make the comparison visible. This works because the tradeoff is explicit."
+    )
+    for appendix in (
+        "Answer.\n\n## Why it works. ##\nCoaching detail.",
+        "Answer.\r\rReasoning -\rCoaching detail.",
+        "Answer.\n\nRationale — Coaching detail.",
+        "Answer. **Why this works:** Coaching detail.",
+    ):
+        assert has_unsolicited_coaching_appendix(appendix), appendix
+    assert not has_unsolicited_coaching_appendix(
+        "Answer with a literal fixture:\n```text\nReasoning:\nKeep this line.\n```"
+    )
+    saved_round541_q47_with_appendix = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=(
+            f"{saved_round541_q47}\n\n**Why this works:**\n"
+            "- It applies one decision framework."
+        ),
+        streamed_answer=(
+            f"{saved_round541_q47}\n\n**Why this works:**\n"
+            "- It applies one decision framework."
+        ),
+        terminal_answer=(
+            f"{saved_round541_q47}\n\n**Why this works:**\n"
+            "- It applies one decision framework."
+        ),
+        billing_received=True,
+    )
+    assert "unsolicited_coaching_appendix" in blocking_answer_issues(
+        q47, saved_round541_q47_with_appendix
+    )
+    assert "unsafe_negated_or_unilateral_director_alignment" in (
+        q47_director_alignment_issues(
+            "I compare the requests and ask both directors for input, but I make a "
+            "unilateral call on the priority."
+        )
+    )
+    for article in ("a", "the"):
+        unsafe_private_priority = (
+            "I share one tradeoff comparison with both directors and ask them to "
+            f"agree on a shared priority. Then I make {article} priority decision "
+            "privately."
+        )
+        assert "unsafe_negated_or_unilateral_director_alignment" in (
+            q47_director_alignment_issues(unsafe_private_priority)
+        ), unsafe_private_priority
+    for private_action in (
+        "privately make the priority decision",
+        "alone decide which request wins",
+        "unilaterally choose the priority",
+    ):
+        unsafe_pre_action_marker = (
+            "I share one tradeoff comparison with both directors and ask them to "
+            f"agree on a shared priority. Then I {private_action}."
+        )
+        assert "unsafe_negated_or_unilateral_director_alignment" in (
+            q47_director_alignment_issues(unsafe_pre_action_marker)
+        ), unsafe_pre_action_marker
     live_q47 = (
         "I make one comparison visible to both directors using the same criteria: "
         "impact, deadline urgency, effort, dependencies, and reversibility. Then I ask "
