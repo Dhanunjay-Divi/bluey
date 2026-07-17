@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { inferProfileFromResume, pdfTextItemsToText, summarizeResumeImport } from "./documents";
+import { inferProfileFromResume, pdfTextItemsToText, resumeHtmlToText, summarizeResumeImport } from "./documents";
 import type { CareerProfile } from "../types";
 
 function emptyProfile(): CareerProfile {
@@ -134,5 +134,82 @@ Technologies: Rust, React`,
       { str: "EXPERIENCE", transform: [1, 0, 0, 1, 40, 660], width: 70 },
     ]);
     expect(text).toBe("Taylor Morgan\nAustin, TX taylor@example.com\nEXPERIENCE");
+  });
+
+  it("preserves DOCX table cells, bullets, and manual line breaks", () => {
+    expect(resumeHtmlToText(`
+      <p><strong>CORE COMPETENCIES</strong></p>
+      <table><tr><td><p>Clinical Research</p></td><td><p>REDCap</p></td></tr></table>
+      <p><strong>Master of Science – Health Informatics<br />Example University, December 2023</strong></p>
+      <ul><li>Verified source documentation.</li></ul>
+    `)).toBe([
+      "CORE COMPETENCIES",
+      "Clinical Research",
+      "REDCap",
+      "Master of Science – Health Informatics",
+      "Example University, December 2023",
+      "• Verified source documentation.",
+    ].join("\n"));
+  });
+
+  it("separates company, title, and US or international location rows", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "clinical-resume.docx",
+      text: `Morgan Reed
+morgan@example.com | (703) 555-0148
+PROFESSIONAL EXPERIENCE
+Example Health System
+PAA2, Falls Church, VA February 2024 – Present
+• Supported clinical research operations and verified study records.
+Example University School of Medicine
+Clinical Research Coordinator, Indianapolis, IN January 2022 – December 2023
+• Coordinated clinical research activities across multidisciplinary teams.
+Meridian Hospitals
+Director of Clinical Operations, Hyderabad, India January 2020 – October 2020
+• Improved clinical documentation quality and operational reporting.
+Harbor Dental Hospital
+Director of Clinical Operations, Visakhapatnam, India, January 2019 – December 2019
+• Coordinated patient care activities and documentation processes.
+EDUCATION
+Master of Science – Health Informatics
+Example University, December 2023
+CERTIFICATIONS
+Epic Ambulatory Certified
+TECHNICAL SKILLS
+Clinical Systems: Epic EMR • REDCap
+PROFESSIONAL AFFILIATIONS
+Example Clinical Association - Peer Reviewer`,
+    });
+
+    expect(result.employment).toHaveLength(4);
+    expect(result.employment[0]).toMatchObject({
+      company: "Example Health System",
+      title: "PAA2",
+      location: "Falls Church, VA",
+      start_date: "2024-02",
+      current: true,
+    });
+    expect(result.employment[1]).toMatchObject({
+      company: "Example University School of Medicine",
+      title: "Clinical Research Coordinator",
+      location: "Indianapolis, IN",
+    });
+    expect(result.employment[2]).toMatchObject({
+      company: "Meridian Hospitals",
+      title: "Director of Clinical Operations",
+      location: "Hyderabad, India",
+    });
+    expect(result.employment[3]).toMatchObject({
+      company: "Harbor Dental Hospital",
+      title: "Director of Clinical Operations",
+      location: "Visakhapatnam, India",
+    });
+    expect(result.education[0]).toMatchObject({
+      school: "Example University",
+      degree: "Master of Science – Health Informatics",
+      field: "Health Informatics",
+      end_date: "2023",
+    });
+    expect(result.skills).toEqual(["Epic EMR", "REDCap"]);
   });
 });

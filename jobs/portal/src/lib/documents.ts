@@ -35,7 +35,8 @@ type ResumeSection =
   | "education"
   | "skills"
   | "certifications"
-  | "projects";
+  | "projects"
+  | "other";
 
 interface ResumeSections extends Record<ResumeSection, string[]> {}
 
@@ -59,13 +60,26 @@ export async function importResume(file: File): Promise<ImportedResume> {
   }
   if (extension === "docx") {
     const { default: mammoth } = await import("mammoth");
-    const result = await mammoth.extractRawText({ arrayBuffer: buffer });
-    return { name: file.name, text: result.value.trim() };
+    const result = await mammoth.convertToHtml({ arrayBuffer: buffer });
+    return { name: file.name, text: resumeHtmlToText(result.value) };
   }
   if (extension === "txt") {
     return { name: file.name, text: new TextDecoder().decode(buffer).trim() };
   }
   throw new Error("Use a PDF, DOCX, or TXT resume.");
+}
+
+export function resumeHtmlToText(html: string): string {
+  const withStructure = html
+    .replace(/<br\s*\/?\s*>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "\n• ")
+    .replace(/<\/(?:p|li|td|th|tr|table|ul|ol|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, "");
+  return decodeHtmlEntities(withStructure)
+    .split(/\r?\n/)
+    .map((line) => line.replace(/[ \t]+/g, " ").trim())
+    .filter(Boolean)
+    .join("\n");
 }
 
 export function inferProfileFromResume(profile: CareerProfile, imported: ImportedResume): CareerProfile {
@@ -163,6 +177,7 @@ function splitResumeSections(text: string): ResumeSections {
     skills: [],
     certifications: [],
     projects: [],
+    other: [],
   };
   let current: ResumeSection = "preamble";
   for (const line of normalizeResumeLines(text)) {
@@ -200,6 +215,7 @@ function detectSection(
     ["skills", /^(?:technical\s+)?(?:skills|core competencies|technologies|expertise)(?:\s*[:|-]\s*(.*))?$/i],
     ["certifications", /^(?:certifications?|licenses?|credentials)(?:\s*[:|-]\s*(.*))?$/i],
     ["projects", /^(?:selected\s+)?projects?(?:\s*[:|-]\s*(.*))?$/i],
+    ["other", /^(?:professional\s+)?(?:affiliations?|memberships?|awards?|honors?|publications?|languages?|volunteer(?:ing)?|interests?|references?)(?:\s*[:|-]\s*(.*))?$/i],
   ];
   for (const [section, pattern] of aliases) {
     const match = line.match(pattern);
@@ -242,14 +258,25 @@ function inferHeadline(lines: string[], name: string): string {
 
 function parseEmployment(lines: string[]): EmploymentEntry[] {
   return datedBlocks(lines, false).map((block, index) => {
-    const candidates = splitHeaderCandidates([...block.header, block.dateRemainder]);
-    const location = candidates.find(looksLikeLocation) || "";
-    const roleCandidates = candidates.filter((candidate) => candidate !== location);
-    const title = pickByScore(roleCandidates, titleScore);
-    const company =
-      pickByScore(roleCandidates.filter((candidate) => candidate !== title), companyScore) ||
-      roleCandidates.find((candidate) => candidate !== title) ||
-      "";
+    const parsedCandidates = splitHeaderCandidates([...block.header, block.dateRemainder])
+      .map(splitEmploymentCandidate);
+    const location = parsedCandidates.map((candidate) => candidate.location).find(Boolean) || "";
+    const roleCandidates = uniqueStrings(parsedCandidates.map((candidate) => candidate.value).filter(Boolean));
+    let title = pickByPositiveScore(roleCandidates, titleScore);
+    let company = pickByPositiveScore(
+      roleCandidates.filter((candidate) => candidate !== title),
+      companyScore,
+    );
+    if (!title) {
+      title = roleCandidates.find((candidate) => candidate !== company && companyScore(candidate) === 0) || "";
+    }
+    if (!company) {
+      company = roleCandidates.find((candidate) => candidate !== title) || "";
+    }
+    if (!title && roleCandidates.length === 1 && companyScore(roleCandidates[0]) === 0) {
+      title = roleCandidates[0];
+      company = "";
+    }
     return {
       id: stableResumeId("employment", `${company}|${title}|${block.start}|${index}`),
       company,
@@ -272,8 +299,8 @@ function parseEducation(lines: string[]): EducationEntry[] {
       const school = pickByScore(candidates, schoolScore);
       const degreeLine = pickByScore(candidates.filter((candidate) => candidate !== school), degreeScore);
       const field =
+        degreeLine.match(/[—–-]\s*(.+)$/)?.[1]?.trim() ||
         degreeLine.match(/\bin\s+(.+)$/i)?.[1]?.trim() ||
-        degreeLine.match(/\bof\s+(.+)$/i)?.[1]?.trim() ||
         "";
       const location = candidates.find((candidate) => candidate !== school && looksLikeLocation(candidate)) || "";
       return {
@@ -420,10 +447,12 @@ function normalizeDate(value: string): string {
 function splitHeaderCandidates(lines: string[]): string[] {
   return uniqueStrings(
     lines.flatMap((line) => {
-      const clean = stripBullet(line);
-      const separator = schoolScore(clean) > 0
-        ? /\s*[|•]\s*|\s+[—–]\s+/i
-        : /\s+(?:at|@)\s+|\s*[|•]\s*|\s+[—–]\s+/i;
+      const clean = stripDanglingDateMonth(stripBullet(line));
+      const separator = degreeScore(clean) > 0
+        ? /\s*[|•]\s*/i
+        : schoolScore(clean) > 0
+          ? /\s*[|•]\s*|\s+[—–]\s+/i
+          : /\s+(?:at|@)\s+|\s*[|•]\s*|\s+[—–]\s+/i;
       return clean
         .split(separator)
         .map((part) => part.trim())
@@ -432,17 +461,53 @@ function splitHeaderCandidates(lines: string[]): string[] {
   );
 }
 
+function splitEmploymentCandidate(candidate: string): { value: string; location: string } {
+  const clean = candidate.replace(/,+$/, "").trim();
+  if (!clean) return { value: "", location: "" };
+  if (/^(?:remote|hybrid|on-?site)(?:\s*[-–—]\s*.+)?$/i.test(clean)) {
+    return { value: "", location: clean };
+  }
+  const parts = clean.split(/\s*,\s*/).map((part) => part.trim()).filter(Boolean);
+  if (parts.length < 2) return { value: clean, location: "" };
+
+  const last = parts.at(-1) || "";
+  if (isUsStateCode(last)) {
+    return {
+      value: parts.slice(0, -2).join(", "),
+      location: parts.slice(-2).join(", "),
+    };
+  }
+  if (isCountryName(last)) {
+    const titlePrefix = parts.length >= 3 && titleScore(parts[0]) > 0;
+    return {
+      value: titlePrefix ? parts[0] : parts.slice(0, -2).join(", "),
+      location: titlePrefix ? parts.slice(1).join(", ") : parts.slice(-2).join(", "),
+    };
+  }
+  return { value: clean, location: "" };
+}
+
 function pickByScore(values: string[], score: (value: string) => number): string {
   return values
     .map((value, index) => ({ value, index, score: score(value) }))
     .sort((left, right) => right.score - left.score || left.index - right.index)[0]?.value || "";
 }
 
+function pickByPositiveScore(values: string[], score: (value: string) => number): string {
+  const selected = values
+    .map((value, index) => ({ value, index, score: score(value) }))
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score || left.index - right.index)[0];
+  return selected?.value || "";
+}
+
 function titleScore(value: string): number {
   return keywordScore(value, [
     "engineer", "developer", "manager", "director", "analyst", "scientist", "designer",
     "consultant", "specialist", "architect", "lead", "intern", "associate", "coordinator",
-    "product", "research", "operations", "founder", "president", "officer",
+    "product", "research", "operations", "founder", "president", "officer", "nurse",
+    "physician", "clinician", "technician", "administrator", "assistant", "researcher",
+    "pharmacist", "dentist", "therapist", "recruiter", "counsel", "accountant", "paa",
   ]);
 }
 
@@ -450,6 +515,7 @@ function companyScore(value: string): number {
   return keywordScore(value, [
     "inc", "llc", "ltd", "corp", "company", "group", "labs", "technologies", "systems",
     "solutions", "consulting", "bank", "university", "health", "media",
+    "hospital", "hospitals", "medical", "clinic", "care", "system", "center", "centre",
   ]);
 }
 
@@ -497,10 +563,8 @@ function stripContactParts(line: string): string {
 
 function looksLikeLocation(line: string): boolean {
   const value = stripContactParts(line);
-  return (
-    /\bremote\b/i.test(value) ||
-    /\b[A-Za-z .'-]+,\s*(?:A[LKSZR]|C[AOT]|D[EC]|F[LM]|G[A]|H[I]|I[ADLN]|K[SY]|L[A]|M[ADEHINOST]|N[CDEHJMVY]|O[HKR]|P[A]|R[I]|S[CD]|T[NX]|U[T]|V[AIT]|W[AIVY])\b/.test(value)
-  );
+  const parsed = splitEmploymentCandidate(value);
+  return Boolean(parsed.location) && !parsed.value;
 }
 
 function extractLocation(line: string): string {
@@ -525,6 +589,37 @@ function uniqueStrings(values: string[]): string[] {
     if (!normalized || seen.has(normalized)) return false;
     seen.add(normalized);
     return true;
+  });
+}
+
+function stripDanglingDateMonth(value: string): string {
+  return value
+    .replace(/,?\s*(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*$/i, "")
+    .replace(/,+$/, "")
+    .trim();
+}
+
+function isUsStateCode(value: string): boolean {
+  return /^(?:A[LKSZR]|C[AOT]|D[EC]|F[LM]|G[A]|H[I]|I[ADLN]|K[SY]|L[A]|M[ADEHINOST]|N[CDEHJMVY]|O[HKR]|P[A]|R[I]|S[CD]|T[NX]|U[T]|V[AIT]|W[AIVY])(?:\s+\d{5}(?:-\d{4})?)?$/i.test(value);
+}
+
+function isCountryName(value: string): boolean {
+  return /^(?:Argentina|Australia|Austria|Belgium|Brazil|Canada|Chile|China|Colombia|Denmark|Egypt|Finland|France|Germany|Greece|India|Indonesia|Ireland|Israel|Italy|Japan|Kenya|Malaysia|Mexico|Netherlands|New Zealand|Nigeria|Norway|Pakistan|Philippines|Poland|Portugal|Singapore|South Africa|South Korea|Spain|Sweden|Switzerland|Taiwan|Thailand|Turkey|United Arab Emirates|United Kingdom|United States|Vietnam)$/i.test(value);
+}
+
+function decodeHtmlEntities(value: string): string {
+  const named: Record<string, string> = {
+    amp: "&",
+    apos: "'",
+    gt: ">",
+    lt: "<",
+    nbsp: " ",
+    quot: '"',
+  };
+  return value.replace(/&(?:#(\d+)|#x([0-9a-f]+)|([a-z]+));/gi, (entity, decimal, hex, name) => {
+    if (decimal) return String.fromCodePoint(Number(decimal));
+    if (hex) return String.fromCodePoint(Number.parseInt(hex, 16));
+    return named[String(name).toLowerCase()] ?? entity;
   });
 }
 

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useId, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -29,6 +29,14 @@ import {
   summarizeResumeImport,
   type ResumeImportSummary,
 } from "../lib/documents";
+import {
+  CERTIFICATION_SUGGESTIONS,
+  filterCareerSuggestions,
+  LOCATION_SUGGESTIONS,
+  mergeCareerSuggestions,
+  ROLE_SUGGESTIONS,
+  SKILL_SUGGESTIONS,
+} from "../data/career-suggestions";
 import blueyIcon from "../../../../web/assets/bluey-logo.svg";
 import blueyWordmark from "../../../../web/assets/bluey-wordmark.svg";
 
@@ -77,6 +85,28 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
       updated_at_ms: 0,
     }),
     [preferences, profile.headline, workspace.tracks],
+  );
+  const roleSuggestions = useMemo(
+    () => mergeCareerSuggestions(
+      [profile.headline],
+      profile.employment.map((entry) => entry.title),
+      preferences.desired_roles,
+      ROLE_SUGGESTIONS,
+    ),
+    [preferences.desired_roles, profile.employment, profile.headline],
+  );
+  const locationSuggestions = useMemo(
+    () => mergeCareerSuggestions(
+      [profile.current_location],
+      profile.employment.map((entry) => entry.location),
+      preferences.desired_locations,
+      LOCATION_SUGGESTIONS,
+    ),
+    [preferences.desired_locations, profile.current_location, profile.employment],
+  );
+  const companySuggestions = useMemo(
+    () => mergeCareerSuggestions(profile.employment.map((entry) => entry.company)),
+    [profile.employment],
   );
 
   const update = <K extends keyof CareerProfile>(key: K, value: CareerProfile[K]) =>
@@ -222,8 +252,8 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
               <div className="form-grid two">
                 <Field label="Full name" value={profile.full_name} onChange={(value) => update("full_name", value)} autoFocus />
                 <Field label="Phone" value={profile.phone} onChange={(value) => update("phone", value)} />
-                <Field label="Current location" value={profile.current_location} onChange={(value) => update("current_location", value)} placeholder="City, state" />
-                <Field label="Professional headline" value={profile.headline} onChange={(value) => update("headline", value)} placeholder="Senior Product Engineer" />
+                <Field label="Current location" value={profile.current_location} onChange={(value) => update("current_location", value)} placeholder="City, state" suggestions={locationSuggestions} />
+                <Field label="Professional headline" value={profile.headline} onChange={(value) => update("headline", value)} placeholder="Senior Product Engineer" suggestions={roleSuggestions} />
                 <Field label="LinkedIn" value={profile.linkedin_url} onChange={(value) => update("linkedin_url", value)} placeholder="https://linkedin.com/in/..." />
                 <Field label="Portfolio" value={profile.portfolio_url} onChange={(value) => update("portfolio_url", value)} placeholder="https://..." />
               </div>
@@ -238,6 +268,9 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
                   <EmploymentEditor
                     key={entry.id || index}
                     entry={entry}
+                    companySuggestions={companySuggestions}
+                    roleSuggestions={roleSuggestions}
+                    locationSuggestions={locationSuggestions}
                     onChange={(next) => update("employment", profile.employment.map((item, itemIndex) => itemIndex === index ? next : item))}
                     onRemove={() => update("employment", profile.employment.filter((_, itemIndex) => itemIndex !== index))}
                   />
@@ -261,8 +294,8 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
               ))}
               <button className="button secondary compact" onClick={() => update("education", [...profile.education, emptyEducation()])}><Plus size={16} />Add education</button>
               <div className="form-grid two roomy-top">
-                <TagField label="Skills" values={profile.skills} onChange={(values) => update("skills", values)} placeholder="Type a skill and press Enter" />
-                <TagField label="Certifications" values={profile.certifications} onChange={(values) => update("certifications", values)} placeholder="Type a certification and press Enter" />
+                <TagField label="Skills" values={profile.skills} onChange={(values) => update("skills", values)} placeholder="Type a skill and press Enter" suggestions={mergeCareerSuggestions(profile.skills, SKILL_SUGGESTIONS)} />
+                <TagField label="Certifications" values={profile.certifications} onChange={(values) => update("certifications", values)} placeholder="Type a certification and press Enter" suggestions={mergeCareerSuggestions(profile.certifications, CERTIFICATION_SUGGESTIONS)} />
               </div>
             </>
           )}
@@ -271,8 +304,8 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
             <>
               <div className="setup-heading"><p>STEP 4 OF 6</p><h2>Where should Bluey look?</h2><span>Location is a hard filter. Tell Bluey what to say instead of letting an application guess.</span></div>
               <div className="form-grid two">
-                <TagField label="Target roles" values={preferences.desired_roles} onChange={(values) => updatePreferences("desired_roles", values)} placeholder="Senior Product Engineer" />
-                <TagField label="Target locations" values={preferences.desired_locations} onChange={(values) => updatePreferences("desired_locations", values)} placeholder="New York, NY" />
+                <TagField label="Target roles" values={preferences.desired_roles} onChange={(values) => updatePreferences("desired_roles", values)} placeholder="Senior Product Engineer" suggestions={roleSuggestions} />
+                <TagField label="Target locations" values={preferences.desired_locations} onChange={(values) => updatePreferences("desired_locations", values)} placeholder="New York, NY" suggestions={locationSuggestions} />
                 <SelectField label="Location answer" value={preferences.location_policy} onChange={(value) => updatePreferences("location_policy", value as JobPreferences["location_policy"])} options={[
                   ["ask", "Ask before using another location"],
                   ["local", "Use my current location only"],
@@ -368,40 +401,178 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
   );
 }
 
-function Field({ label, value, onChange, placeholder, autoFocus, inputMode, suffix }: {
-  label: string; value: string; onChange(value: string): void; placeholder?: string; autoFocus?: boolean; inputMode?: "numeric"; suffix?: string;
+function Field({ label, value, onChange, placeholder, autoFocus, inputMode, suffix, suggestions = [] }: {
+  label: string;
+  value: string;
+  onChange(value: string): void;
+  placeholder?: string;
+  autoFocus?: boolean;
+  inputMode?: "numeric";
+  suffix?: string;
+  suggestions?: string[];
 }) {
-  return <label className="field"><span>{label}</span><div>{suffix && <i>{suffix}</i>}<input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} autoFocus={autoFocus} inputMode={inputMode} /></div></label>;
+  const listId = useId();
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(-1);
+  const options = useMemo(
+    () => filterCareerSuggestions(value, suggestions, value.trim() ? [value] : []),
+    [suggestions, value],
+  );
+  const choose = (option: string) => {
+    onChange(option);
+    setOpen(false);
+    setActive(-1);
+  };
+  return <label className="field"><span>{label}</span><div className="typeahead-control">
+    {suffix && <i>{suffix}</i>}
+    <input
+      value={value}
+      onChange={(event) => { onChange(event.target.value); setOpen(true); setActive(-1); }}
+      onFocus={() => setOpen(true)}
+      onBlur={() => setOpen(false)}
+      onKeyDown={(event) => {
+        if (!options.length) return;
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          setOpen(true);
+          setActive((current) => current >= options.length - 1 ? 0 : current + 1);
+        } else if (event.key === "ArrowUp") {
+          event.preventDefault();
+          setOpen(true);
+          setActive((current) => current <= 0 ? options.length - 1 : current - 1);
+        } else if (event.key === "Enter" && open && active >= 0 && options[active]) {
+          event.preventDefault();
+          choose(options[active]);
+        } else if (event.key === "Escape") {
+          setOpen(false);
+          setActive(-1);
+        }
+      }}
+      placeholder={placeholder}
+      autoFocus={autoFocus}
+      inputMode={inputMode}
+      autoComplete={suggestions.length ? "off" : undefined}
+      role={suggestions.length ? "combobox" : undefined}
+      aria-autocomplete={suggestions.length ? "list" : undefined}
+      aria-expanded={suggestions.length ? open && options.length > 0 : undefined}
+      aria-controls={suggestions.length ? listId : undefined}
+      aria-activedescendant={open && active >= 0 ? `${listId}-${active}` : undefined}
+    />
+    <SuggestionList id={listId} open={open} options={options} active={active} onChoose={choose} onActive={setActive} />
+  </div></label>;
 }
 
 function SelectField({ label, value, onChange, options }: { label: string; value: string; onChange(value: string): void; options: Array<[string, string]> }) {
   return <label className="field"><span>{label}</span><div><select value={value} onChange={(event) => onChange(event.target.value)}>{options.map(([optionValue, labelText]) => <option key={optionValue} value={optionValue}>{labelText}</option>)}</select></div></label>;
 }
 
-function TagField({ label, values, onChange, placeholder }: { label: string; values: string[]; onChange(values: string[]): void; placeholder: string }) {
+function TagField({ label, values, onChange, placeholder, suggestions = [] }: {
+  label: string;
+  values: string[];
+  onChange(values: string[]): void;
+  placeholder: string;
+  suggestions?: string[];
+}) {
   const [draft, setDraft] = useState("");
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(-1);
+  const listId = useId();
+  const options = useMemo(
+    () => filterCareerSuggestions(draft, suggestions, values),
+    [draft, suggestions, values],
+  );
   const add = () => {
     const next = draft.trim();
     if (!next || values.some((value) => value.toLowerCase() === next.toLowerCase())) return;
     onChange([...values, next]);
     setDraft("");
   };
+  const choose = (option: string) => {
+    if (!values.some((value) => value.toLowerCase() === option.toLowerCase())) onChange([...values, option]);
+    setDraft("");
+    setOpen(false);
+    setActive(-1);
+  };
   return (
-    <label className="field tag-field"><span>{label}</span><div className="tag-input">
-      {values.map((value) => <button key={value} onClick={() => onChange(values.filter((item) => item !== value))}>{value}<span>×</span></button>)}
-      <input value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === ",") { event.preventDefault(); add(); } }} onBlur={add} placeholder={values.length ? "Add another" : placeholder} />
+    <label className="field tag-field"><span>{label}</span><div className="tag-input typeahead-control">
+      {values.map((value) => <button type="button" key={value} aria-label={`Remove ${value}`} onClick={() => onChange(values.filter((item) => item !== value))}>{value}<span>×</span></button>)}
+      <input
+        value={draft}
+        onChange={(event) => { setDraft(event.target.value); setOpen(true); setActive(-1); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => { add(); setOpen(false); }}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown" && options.length) {
+            event.preventDefault();
+            setOpen(true);
+            setActive((current) => current >= options.length - 1 ? 0 : current + 1);
+          } else if (event.key === "ArrowUp" && options.length) {
+            event.preventDefault();
+            setOpen(true);
+            setActive((current) => current <= 0 ? options.length - 1 : current - 1);
+          } else if (event.key === "Enter" && open && active >= 0 && options[active]) {
+            event.preventDefault();
+            choose(options[active]);
+          } else if (event.key === "Enter" || event.key === ",") {
+            event.preventDefault();
+            add();
+          } else if (event.key === "Escape") {
+            setOpen(false);
+            setActive(-1);
+          }
+        }}
+        placeholder={values.length ? "Add another" : placeholder}
+        autoComplete="off"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-expanded={open && options.length > 0}
+        aria-controls={listId}
+        aria-activedescendant={open && active >= 0 ? `${listId}-${active}` : undefined}
+      />
+      <SuggestionList id={listId} open={open} options={options} active={active} onChoose={choose} onActive={setActive} />
     </div></label>
   );
 }
 
-function EmploymentEditor({ entry, onChange, onRemove }: { entry: EmploymentEntry; onChange(entry: EmploymentEntry): void; onRemove(): void }) {
+function SuggestionList({ id, open, options, active, onChoose, onActive }: {
+  id: string;
+  open: boolean;
+  options: string[];
+  active: number;
+  onChoose(option: string): void;
+  onActive(index: number): void;
+}) {
+  if (!open || options.length === 0) return null;
+  return <div id={id} className="suggestion-list" role="listbox">
+    {options.map((option, index) => (
+      <div
+        id={`${id}-${index}`}
+        key={option}
+        role="option"
+        aria-selected={active === index}
+        className={active === index ? "active" : ""}
+        onMouseEnter={() => onActive(index)}
+        onMouseDown={(event) => { event.preventDefault(); onChoose(option); }}
+      >{option}</div>
+    ))}
+  </div>;
+}
+
+function EmploymentEditor({ entry, onChange, onRemove, companySuggestions, roleSuggestions, locationSuggestions }: {
+  entry: EmploymentEntry;
+  onChange(entry: EmploymentEntry): void;
+  onRemove(): void;
+  companySuggestions: string[];
+  roleSuggestions: string[];
+  locationSuggestions: string[];
+}) {
   return (
     <div className="entry-editor">
       <div className="entry-editor-title"><BriefcaseBusiness size={17} /><strong>{entry.title || "New role"}</strong><button title="Remove role" onClick={onRemove}><Trash2 size={15} /></button></div>
       <div className="form-grid two">
-        <Field label="Company" value={entry.company} onChange={(value) => onChange({ ...entry, company: value })} />
-        <Field label="Title" value={entry.title} onChange={(value) => onChange({ ...entry, title: value })} />
-        <Field label="Location" value={entry.location} onChange={(value) => onChange({ ...entry, location: value })} />
+        <Field label="Company" value={entry.company} onChange={(value) => onChange({ ...entry, company: value })} suggestions={companySuggestions} />
+        <Field label="Title" value={entry.title} onChange={(value) => onChange({ ...entry, title: value })} suggestions={roleSuggestions} />
+        <Field label="Location" value={entry.location} onChange={(value) => onChange({ ...entry, location: value })} suggestions={locationSuggestions} />
         <div className="form-grid two dates"><Field label="Start" value={entry.start_date} onChange={(value) => onChange({ ...entry, start_date: value })} placeholder="2022-03" /><Field label="End" value={entry.end_date} onChange={(value) => onChange({ ...entry, end_date: value })} placeholder={entry.current ? "Present" : "2024-06"} /></div>
       </div>
       <label className="field"><span>Highlights (one per line)</span><textarea rows={3} value={entry.highlights.join("\n")} onChange={(event) => onChange({ ...entry, highlights: event.target.value.split("\n").filter(Boolean) })} /></label>

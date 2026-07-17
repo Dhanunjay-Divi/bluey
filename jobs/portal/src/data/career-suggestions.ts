@@ -1,0 +1,189 @@
+export const ROLE_SUGGESTIONS = [
+  "Clinical Research Coordinator",
+  "Clinical Research Associate",
+  "Clinical Research Analyst",
+  "Lead Clinical Research Analyst",
+  "Clinical Operations Manager",
+  "Director of Clinical Operations",
+  "Healthcare Data Analyst",
+  "Health Informatics Analyst",
+  "Epic Analyst",
+  "Medical Records Analyst",
+  "Regulatory Affairs Specialist",
+  "Research Program Manager",
+  "Software Engineer",
+  "Senior Software Engineer",
+  "Full Stack Engineer",
+  "Frontend Engineer",
+  "Backend Engineer",
+  "Mobile Engineer",
+  "DevOps Engineer",
+  "Site Reliability Engineer",
+  "Cloud Engineer",
+  "Security Engineer",
+  "Data Engineer",
+  "Senior Data Engineer",
+  "Data Analyst",
+  "Data Scientist",
+  "Machine Learning Engineer",
+  "AI Engineer",
+  "Business Intelligence Analyst",
+  "Product Manager",
+  "Technical Product Manager",
+  "Program Manager",
+  "Project Manager",
+  "UX Designer",
+  "Product Designer",
+  "UX Researcher",
+  "Business Analyst",
+  "Operations Manager",
+  "Strategy Consultant",
+  "Financial Analyst",
+  "Accountant",
+  "Marketing Manager",
+  "Growth Marketing Manager",
+  "Sales Development Representative",
+  "Account Executive",
+  "Customer Success Manager",
+  "Human Resources Business Partner",
+  "Recruiter",
+  "Quality Assurance Engineer",
+  "Solutions Architect",
+  "Solutions Engineer",
+];
+
+export const LOCATION_SUGGESTIONS = [
+  "Remote - United States",
+  "United States",
+  "New York, NY",
+  "San Francisco, CA",
+  "San Jose, CA",
+  "Los Angeles, CA",
+  "San Diego, CA",
+  "Seattle, WA",
+  "Austin, TX",
+  "Dallas, TX",
+  "Houston, TX",
+  "Chicago, IL",
+  "Boston, MA",
+  "Washington, DC",
+  "Arlington, VA",
+  "Falls Church, VA",
+  "Atlanta, GA",
+  "Denver, CO",
+  "Raleigh, NC",
+  "Charlotte, NC",
+  "Philadelphia, PA",
+  "Pittsburgh, PA",
+  "Phoenix, AZ",
+  "Portland, OR",
+  "Minneapolis, MN",
+  "Detroit, MI",
+  "Columbus, OH",
+  "Indianapolis, IN",
+  "Nashville, TN",
+  "Miami, FL",
+  "Tampa, FL",
+  "Salt Lake City, UT",
+  "Kansas City, MO",
+  "St. Louis, MO",
+  "Hyderabad, India",
+  "Bengaluru, India",
+  "Mumbai, India",
+  "Pune, India",
+  "Chennai, India",
+  "Visakhapatnam, India",
+  "Toronto, Canada",
+  "Vancouver, Canada",
+  "London, United Kingdom",
+];
+
+export const SKILL_SUGGESTIONS = [
+  "Clinical Research",
+  "Clinical Operations",
+  "Clinical Documentation",
+  "Health Informatics",
+  "Epic EMR",
+  "REDCap",
+  "HIPAA",
+  "Good Clinical Practice",
+  "Protocol Development",
+  "Regulatory Compliance",
+  "Patient Recruitment",
+  "Data Management",
+  "SQL",
+  "Python",
+  "R",
+  "JavaScript",
+  "TypeScript",
+  "React",
+  "Node.js",
+  "Java",
+  "C#",
+  "Rust",
+  "AWS",
+  "Azure",
+  "Google Cloud",
+  "Docker",
+  "Kubernetes",
+  "PostgreSQL",
+  "Machine Learning",
+  "Data Analysis",
+  "Project Management",
+  "Product Management",
+  "Agile",
+  "Figma",
+  "Tableau",
+  "Power BI",
+  "Salesforce",
+];
+
+export const CERTIFICATION_SUGGESTIONS = [
+  "Certified Clinical Research Professional (CCRP)",
+  "Certified Clinical Research Coordinator (CCRC)",
+  "Good Clinical Practice (GCP)",
+  "Epic Ambulatory",
+  "Project Management Professional (PMP)",
+  "Certified ScrumMaster (CSM)",
+  "AWS Certified Solutions Architect",
+  "Microsoft Certified: Azure Fundamentals",
+  "Google Professional Cloud Architect",
+  "Certified Information Systems Security Professional (CISSP)",
+  "Certified Public Accountant (CPA)",
+];
+
+export function mergeCareerSuggestions(...groups: Array<Array<string | undefined>>): string[] {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const value of groups.flat()) {
+    const clean = value?.trim();
+    if (!clean) continue;
+    const key = clean.toLocaleLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(clean);
+  }
+  return merged;
+}
+
+export function filterCareerSuggestions(
+  query: string,
+  suggestions: string[],
+  selected: string[] = [],
+  limit = 6,
+): string[] {
+  const needle = query.trim().toLocaleLowerCase();
+  const selectedSet = new Set(selected.map((value) => value.trim().toLocaleLowerCase()));
+  return mergeCareerSuggestions(suggestions)
+    .filter((value) => !selectedSet.has(value.toLocaleLowerCase()))
+    .map((value, index) => {
+      const normalized = value.toLocaleLowerCase();
+      const wordStarts = normalized.split(/[^a-z0-9]+/).some((word) => word.startsWith(needle));
+      const rank = !needle ? 3 : normalized.startsWith(needle) ? 0 : wordStarts ? 1 : normalized.includes(needle) ? 2 : 4;
+      return { value, rank, index };
+    })
+    .filter((item) => item.rank < 4)
+    .sort((left, right) => left.rank - right.rank || left.index - right.index)
+    .slice(0, limit)
+    .map((item) => item.value);
+}
