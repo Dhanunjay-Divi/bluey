@@ -1342,6 +1342,31 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_local_resume_actions_application
         ON jobs_local_run_resume_actions(account_id, application_id, created_at_ms DESC);
     "#,
+    // 0030 - append-only candidate feedback, support issues, and outcomes.
+    //
+    // The encrypted payload keeps optional notes private while relational
+    // ownership columns make tenant and target validation explicit.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_candidate_events (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        event_type            TEXT NOT NULL CHECK(event_type IN (
+            'match_feedback', 'application_issue', 'application_outcome'
+        )),
+        job_id                TEXT REFERENCES jobs_postings(id) ON DELETE CASCADE,
+        application_id        TEXT REFERENCES jobs_applications(id) ON DELETE CASCADE,
+        status                TEXT NOT NULL,
+        event_json            TEXT NOT NULL,
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_candidate_events_account
+        ON jobs_candidate_events(account_id, event_type, created_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS idx_jobs_candidate_events_job
+        ON jobs_candidate_events(account_id, job_id, created_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS idx_jobs_candidate_events_application
+        ON jobs_candidate_events(account_id, application_id, created_at_ms DESC);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {

@@ -12,7 +12,12 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { restartDisposition } from "@bluey/jobs-automation";
+import {
+  approvedExecutionChecksum,
+  restartDisposition,
+  type ApplicationPacket,
+  type NormalizedJob,
+} from "@bluey/jobs-automation";
 import { profilePaths, restoreProfile } from "../src/profile-store.js";
 import {
   cloudCheckpointScope,
@@ -113,6 +118,17 @@ describe("encrypted cloud run checkpoints", () => {
       Date.parse("2026-07-16T12:04:00.000Z"),
     )).toBe("side_effect_unknown");
   });
+
+  it("rejects a checkpoint whose approved answers changed", async () => {
+    const root = await temporaryDirectory();
+    const key = randomBytes(32);
+    const checkpoint = fixture();
+    const packet = checkpoint.request.packet as ApplicationPacket;
+    packet.answers.private_question = "changed after approval";
+
+    await expect(writeRunCheckpoint(root, checkpoint, key))
+      .rejects.toThrow("changed after review");
+  });
 });
 
 describe("cloud runner crash-start profile reconciliation", () => {
@@ -134,9 +150,41 @@ describe("cloud runner crash-start profile reconciliation", () => {
   });
 });
 
-function fixture(overrides: Record<string, unknown> = {}): CloudRunCheckpoint {
+interface FixtureRequest {
+  accountId: string;
+  applicationIdentityId: string;
+  browserProfileId: string;
+  browserSessionId: string;
+  runId: string;
+  applicationId: string;
+  url: string;
+  packet: ApplicationPacket;
+  job: NormalizedJob;
+}
+
+function fixture(overrides: Record<string, unknown> = {}): CloudRunCheckpoint<FixtureRequest> {
   const profileScope = "a".repeat(40);
   const browserSessionId = String(overrides.browserSessionId || "cloud-application-123");
+  const job: NormalizedJob = {
+    externalId: "job-123",
+    canonicalUrl: "https://jobs.example.test/apply",
+    company: "Example",
+    title: "Engineer",
+    location: "Remote",
+    workplace: "remote",
+    description: "Build useful things.",
+    source: "greenhouse",
+  };
+  const packet: ApplicationPacket = {
+    applicationId: "application-123",
+    jobId: "job-123",
+    resumeVersionId: "resume-123",
+    approvedPacketChecksum: "",
+    applicationEmail: "person@example.test",
+    answers: { private_question: "private answer" },
+    verifiedClaimIds: [],
+  };
+  packet.approvedPacketChecksum = approvedExecutionChecksum(packet, job);
   return {
     version: 1,
     phase: "needs_input",
@@ -153,14 +201,8 @@ function fixture(overrides: Record<string, unknown> = {}): CloudRunCheckpoint {
       runId: "run-123",
       applicationId: "application-123",
       url: "https://jobs.example.test/apply",
-      packet: {
-        applicationId: "application-123",
-        jobId: "job-123",
-        resumeVersionId: "resume-123",
-        applicationEmail: "person@example.test",
-        answers: { private_question: "private answer" },
-        verifiedClaimIds: [],
-      },
+      packet,
+      job,
     },
     browser: { url: "https://jobs.example.test/apply/review" },
     workflow: {

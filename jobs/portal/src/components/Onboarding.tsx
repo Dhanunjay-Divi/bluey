@@ -1,4 +1,4 @@
-import { useId, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -12,26 +12,40 @@ import {
   Plus,
   Settings2,
   Sparkles,
-  Trash2,
   UserRound,
 } from "lucide-react";
 import type {
   CareerProfile,
   CareerTrack,
-  EducationEntry,
-  EmploymentEntry,
   JobPreferences,
   JobsWorkspace,
 } from "../types";
 import {
+  applyResumeImport,
   importResume,
-  inferProfileFromResume,
+  prepareResumeImport,
   summarizeResumeImport,
+  type ResumeImportMode,
+  type ResumeImportPreview,
   type ResumeImportSummary,
 } from "../lib/documents";
+import { ResumeImportReview } from "./ResumeImportReview";
+import {
+  validateCareerProfile,
+  validateEducationEntries,
+  validateEmploymentEntries,
+  validateProfileIdentity,
+} from "../lib/profile-validation";
+import {
+  CareerEducationEditor,
+  CareerEmploymentEditor,
+  CareerField,
+  CareerTagField,
+  emptyCareerEducation,
+  emptyCareerEmployment,
+} from "./CareerFields";
 import {
   CERTIFICATION_SUGGESTIONS,
-  filterCareerSuggestions,
   LOCATION_SUGGESTIONS,
   mergeCareerSuggestions,
   ROLE_SUGGESTIONS,
@@ -67,6 +81,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
   const [importSummary, setImportSummary] = useState<ResumeImportSummary | null>(
     workspace.profile.source_resume_name ? summarizeResumeImport(workspace.profile) : null,
   );
+  const [importPreview, setImportPreview] = useState<ResumeImportPreview>();
   const [resumeStart, setResumeStart] = useState<"import" | "build">("import");
   const fileRef = useRef<HTMLInputElement>(null);
   const trackId = useRef(workspace.tracks[0]?.id || "onboarding-primary-track");
@@ -120,16 +135,21 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
     setValidation("");
     try {
       const imported = await importResume(file);
-      setProfile((current) => {
-        const inferred = inferProfileFromResume(current, imported);
-        setImportSummary(summarizeResumeImport(inferred));
-        return inferred;
-      });
+      setImportPreview(prepareResumeImport(profile, imported));
     } catch (fileError) {
       setValidation(fileError instanceof Error ? fileError.message : "That resume could not be read.");
     } finally {
       setImporting(false);
     }
+  };
+
+  const applyImport = (mode: ResumeImportMode) => {
+    if (!importPreview) return;
+    const next = applyResumeImport(importPreview, mode);
+    setProfile(next);
+    setImportSummary(summarizeResumeImport(next));
+    setImportPreview(undefined);
+    setValidation("");
   };
 
   const moveToStep = async (nextStep: number) => {
@@ -167,7 +187,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
       setValidation("Bluey could not confirm a role or education entry. Review either section before launching your first Career Track.");
       return;
     }
-    const message = validateStep(3, profile, preferences);
+    const message = validateCareerProfile(profile) || validateStep(3, profile, preferences);
     if (message) {
       setValidation(message);
       return;
@@ -223,7 +243,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
                 hidden
                 type="file"
                 accept=".pdf,.docx,.txt"
-                onChange={(event) => void handleFile(event.target.files?.[0])}
+                onChange={(event) => { void handleFile(event.target.files?.[0]); event.target.value = ""; }}
               />
               <div className="onboarding-start-choice" role="group" aria-label="Career Profile starting point">
                 <button className={resumeStart === "import" ? "active" : ""} onClick={() => setResumeStart("import")}><FileUp size={18} /><span><b>Import my resume</b><small>Start from PDF, DOCX, or TXT.</small></span></button>
@@ -232,7 +252,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
               {resumeStart === "import" ? <button className="resume-dropzone" onClick={() => fileRef.current?.click()}>
                 {importing ? <LoaderCircle className="spin" /> : <FileUp />}
                 <strong>{profile.source_resume_name || "Choose PDF, DOCX, or TXT"}</strong>
-                <span>{profile.source_resume_name ? "Resume imported. Existing edits stay in place if you choose another file." : "Bluey extracts a baseline you can edit before anything is prepared."}</span>
+                <span>{profile.source_resume_name ? "Choose another file, review the extracted facts, then decide whether to replace or fill blanks." : "Bluey extracts a baseline you can review before anything is prepared."}</span>
               </button> : <div className="no-resume-note"><Sparkles size={18} /><span><b>Start with the facts you know</b><small>Add roles, education, and skills in the next steps. Bluey builds the first resume from that profile.</small></span></div>}
               {importSummary && (
                 <div className="resume-import-summary" aria-live="polite">
@@ -250,12 +270,16 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
                 </div>
               )}
               <div className="form-grid two">
-                <Field label="Full name" value={profile.full_name} onChange={(value) => update("full_name", value)} autoFocus />
-                <Field label="Phone" value={profile.phone} onChange={(value) => update("phone", value)} />
-                <Field label="Current location" value={profile.current_location} onChange={(value) => update("current_location", value)} placeholder="City, state" suggestions={locationSuggestions} />
-                <Field label="Professional headline" value={profile.headline} onChange={(value) => update("headline", value)} placeholder="Senior Product Engineer" suggestions={roleSuggestions} />
-                <Field label="LinkedIn" value={profile.linkedin_url} onChange={(value) => update("linkedin_url", value)} placeholder="https://linkedin.com/in/..." />
-                <Field label="Portfolio" value={profile.portfolio_url} onChange={(value) => update("portfolio_url", value)} placeholder="https://..." />
+                <CareerField label="Full name" value={profile.full_name} onChange={(value) => update("full_name", value)} autoFocus />
+                <div className="profile-email-field">
+                  <CareerField label="Resume contact email" value={profile.email} onChange={(value) => update("email", value)} inputMode="email" placeholder="you@example.com" />
+                  <p className="field-note profile-email-note">This address appears on your resume. Bluey submits with a verified application email managed in Settings.</p>
+                </div>
+                <CareerField label="Phone" value={profile.phone} onChange={(value) => update("phone", value)} inputMode="tel" />
+                <CareerField label="Current location" value={profile.current_location} onChange={(value) => update("current_location", value)} placeholder="City, state" suggestions={locationSuggestions} />
+                <CareerField label="Professional headline" value={profile.headline} onChange={(value) => update("headline", value)} placeholder="Senior Product Engineer" suggestions={roleSuggestions} />
+                <CareerField label="LinkedIn" value={profile.linkedin_url} onChange={(value) => update("linkedin_url", value)} inputMode="url" placeholder="https://linkedin.com/in/..." />
+                <CareerField label="Portfolio" value={profile.portfolio_url} onChange={(value) => update("portfolio_url", value)} inputMode="url" placeholder="https://..." />
               </div>
             </>
           )}
@@ -265,7 +289,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
               <div className="setup-heading"><p>STEP 2 OF 6</p><h2>Work history</h2><span>Company, title, dates, and truthful outcomes give Bluey the raw material to tailor.</span></div>
               <div className="entry-list">
                 {profile.employment.map((entry, index) => (
-                  <EmploymentEditor
+                  <CareerEmploymentEditor
                     key={entry.id || index}
                     entry={entry}
                     companySuggestions={companySuggestions}
@@ -276,7 +300,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
                   />
                 ))}
               </div>
-              <button className="button secondary compact" onClick={() => update("employment", [...profile.employment, emptyEmployment()])}><Plus size={16} />Add role</button>
+              <button className="button secondary compact" onClick={() => update("employment", [...profile.employment, emptyCareerEmployment()])}><Plus size={16} />Add role</button>
               <QuickCapture notes={notes} setNotes={setNotes} onUse={() => { update("summary", [profile.summary, notes].filter(Boolean).join(" ")); setNotes(""); }} />
             </>
           )}
@@ -285,17 +309,18 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
             <>
               <div className="setup-heading"><p>STEP 3 OF 6</p><h2>Education and skills</h2><span>Add what recruiters need to verify. Bluey can reorder it later without changing the facts.</span></div>
               {profile.education.map((entry, index) => (
-                <EducationEditor
+                <CareerEducationEditor
                   key={entry.id || index}
                   entry={entry}
                   onChange={(next) => update("education", profile.education.map((item, itemIndex) => itemIndex === index ? next : item))}
                   onRemove={() => update("education", profile.education.filter((_, itemIndex) => itemIndex !== index))}
+                  locationSuggestions={locationSuggestions}
                 />
               ))}
-              <button className="button secondary compact" onClick={() => update("education", [...profile.education, emptyEducation()])}><Plus size={16} />Add education</button>
+              <button className="button secondary compact" onClick={() => update("education", [...profile.education, emptyCareerEducation()])}><Plus size={16} />Add education</button>
               <div className="form-grid two roomy-top">
-                <TagField label="Skills" values={profile.skills} onChange={(values) => update("skills", values)} placeholder="Type a skill and press Enter" suggestions={mergeCareerSuggestions(profile.skills, SKILL_SUGGESTIONS)} />
-                <TagField label="Certifications" values={profile.certifications} onChange={(values) => update("certifications", values)} placeholder="Type a certification and press Enter" suggestions={mergeCareerSuggestions(profile.certifications, CERTIFICATION_SUGGESTIONS)} />
+                <CareerTagField label="Skills" values={profile.skills} onChange={(values) => update("skills", values)} placeholder="Type a skill and press Enter" suggestions={mergeCareerSuggestions(profile.skills, SKILL_SUGGESTIONS)} />
+                <CareerTagField label="Certifications" values={profile.certifications} onChange={(values) => update("certifications", values)} placeholder="Type a certification and press Enter" suggestions={mergeCareerSuggestions(profile.certifications, CERTIFICATION_SUGGESTIONS)} />
               </div>
             </>
           )}
@@ -304,8 +329,8 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
             <>
               <div className="setup-heading"><p>STEP 4 OF 6</p><h2>Where should Bluey look?</h2><span>Location is a hard filter. Tell Bluey what to say instead of letting an application guess.</span></div>
               <div className="form-grid two">
-                <TagField label="Target roles" values={preferences.desired_roles} onChange={(values) => updatePreferences("desired_roles", values)} placeholder="Senior Product Engineer" suggestions={roleSuggestions} />
-                <TagField label="Target locations" values={preferences.desired_locations} onChange={(values) => updatePreferences("desired_locations", values)} placeholder="New York, NY" suggestions={locationSuggestions} />
+                <CareerTagField label="Target roles" values={preferences.desired_roles} onChange={(values) => updatePreferences("desired_roles", values)} placeholder="Senior Product Engineer" suggestions={roleSuggestions} />
+                <CareerTagField label="Target locations" values={preferences.desired_locations} onChange={(values) => updatePreferences("desired_locations", values)} placeholder="New York, NY" suggestions={locationSuggestions} />
                 <SelectField label="Location answer" value={preferences.location_policy} onChange={(value) => updatePreferences("location_policy", value as JobPreferences["location_policy"])} options={[
                   ["ask", "Ask before using another location"],
                   ["local", "Use my current location only"],
@@ -318,7 +343,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
                   ["hybrid_ok", "Hybrid is fine"],
                   ["onsite_ok", "On-site is fine"],
                 ]} />
-                <Field label="Minimum salary" value={preferences.minimum_compensation ? String(preferences.minimum_compensation) : ""} onChange={(value) => updatePreferences("minimum_compensation", Number(value) || undefined)} placeholder="165000" inputMode="numeric" />
+                <CareerField label="Minimum salary" value={preferences.minimum_compensation ? String(preferences.minimum_compensation) : ""} onChange={(value) => updatePreferences("minimum_compensation", Number(value) || undefined)} placeholder="165000" inputMode="numeric" />
                 <SelectField label="Sponsorship" value={preferences.sponsorship} onChange={(value) => updatePreferences("sponsorship", value)} options={[
                   ["ask", "Ask me before answering"],
                   ["not_required", "I do not require sponsorship"],
@@ -354,8 +379,8 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
                 <Toggle checked={profile.review_new_claims} onChange={(checked) => update("review_new_claims", checked)} />
               </div>
               <div className="form-grid two roomy-top">
-                <Field label="Applications per day" value={String(profile.daily_limit)} onChange={(value) => update("daily_limit", Math.max(1, Math.min(50, Number(value) || 10)))} inputMode="numeric" />
-                <Field label="Auto-submit threshold" value={String(profile.auto_submit_threshold)} onChange={(value) => update("auto_submit_threshold", Math.max(60, Math.min(100, Number(value) || 80)))} inputMode="numeric" suffix="%" />
+                <CareerField label="Applications per day" value={String(profile.daily_limit)} onChange={(value) => update("daily_limit", Math.max(1, Math.min(50, Number(value) || 10)))} inputMode="numeric" />
+                <CareerField label="Auto-submit threshold" value={String(profile.auto_submit_threshold)} onChange={(value) => update("auto_submit_threshold", Math.max(60, Math.min(100, Number(value) || 80)))} inputMode="numeric" suffix="%" />
               </div>
             </>
           )}
@@ -397,201 +422,17 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
           </div>
         </section>
       </div>
+      <ResumeImportReview
+        preview={importPreview}
+        onApply={applyImport}
+        onClose={() => setImportPreview(undefined)}
+      />
     </main>
   );
 }
 
-function Field({ label, value, onChange, placeholder, autoFocus, inputMode, suffix, suggestions = [] }: {
-  label: string;
-  value: string;
-  onChange(value: string): void;
-  placeholder?: string;
-  autoFocus?: boolean;
-  inputMode?: "numeric";
-  suffix?: string;
-  suggestions?: string[];
-}) {
-  const listId = useId();
-  const [open, setOpen] = useState(false);
-  const [active, setActive] = useState(-1);
-  const options = useMemo(
-    () => filterCareerSuggestions(value, suggestions, value.trim() ? [value] : []),
-    [suggestions, value],
-  );
-  const choose = (option: string) => {
-    onChange(option);
-    setOpen(false);
-    setActive(-1);
-  };
-  return <label className="field"><span>{label}</span><div className="typeahead-control">
-    {suffix && <i>{suffix}</i>}
-    <input
-      value={value}
-      onChange={(event) => { onChange(event.target.value); setOpen(true); setActive(-1); }}
-      onFocus={() => setOpen(true)}
-      onBlur={() => setOpen(false)}
-      onKeyDown={(event) => {
-        if (!options.length) return;
-        if (event.key === "ArrowDown") {
-          event.preventDefault();
-          setOpen(true);
-          setActive((current) => current >= options.length - 1 ? 0 : current + 1);
-        } else if (event.key === "ArrowUp") {
-          event.preventDefault();
-          setOpen(true);
-          setActive((current) => current <= 0 ? options.length - 1 : current - 1);
-        } else if (event.key === "Enter" && open && active >= 0 && options[active]) {
-          event.preventDefault();
-          choose(options[active]);
-        } else if (event.key === "Escape") {
-          setOpen(false);
-          setActive(-1);
-        }
-      }}
-      placeholder={placeholder}
-      autoFocus={autoFocus}
-      inputMode={inputMode}
-      autoComplete={suggestions.length ? "off" : undefined}
-      role={suggestions.length ? "combobox" : undefined}
-      aria-autocomplete={suggestions.length ? "list" : undefined}
-      aria-expanded={suggestions.length ? open && options.length > 0 : undefined}
-      aria-controls={suggestions.length ? listId : undefined}
-      aria-activedescendant={open && active >= 0 ? `${listId}-${active}` : undefined}
-    />
-    <SuggestionList id={listId} open={open} options={options} active={active} onChoose={choose} onActive={setActive} />
-  </div></label>;
-}
-
 function SelectField({ label, value, onChange, options }: { label: string; value: string; onChange(value: string): void; options: Array<[string, string]> }) {
   return <label className="field"><span>{label}</span><div><select value={value} onChange={(event) => onChange(event.target.value)}>{options.map(([optionValue, labelText]) => <option key={optionValue} value={optionValue}>{labelText}</option>)}</select></div></label>;
-}
-
-function TagField({ label, values, onChange, placeholder, suggestions = [] }: {
-  label: string;
-  values: string[];
-  onChange(values: string[]): void;
-  placeholder: string;
-  suggestions?: string[];
-}) {
-  const [draft, setDraft] = useState("");
-  const [open, setOpen] = useState(false);
-  const [active, setActive] = useState(-1);
-  const listId = useId();
-  const options = useMemo(
-    () => filterCareerSuggestions(draft, suggestions, values),
-    [draft, suggestions, values],
-  );
-  const add = () => {
-    const next = draft.trim();
-    if (!next || values.some((value) => value.toLowerCase() === next.toLowerCase())) return;
-    onChange([...values, next]);
-    setDraft("");
-  };
-  const choose = (option: string) => {
-    if (!values.some((value) => value.toLowerCase() === option.toLowerCase())) onChange([...values, option]);
-    setDraft("");
-    setOpen(false);
-    setActive(-1);
-  };
-  return (
-    <label className="field tag-field"><span>{label}</span><div className="tag-input typeahead-control">
-      {values.map((value) => <button type="button" key={value} aria-label={`Remove ${value}`} onClick={() => onChange(values.filter((item) => item !== value))}>{value}<span>×</span></button>)}
-      <input
-        value={draft}
-        onChange={(event) => { setDraft(event.target.value); setOpen(true); setActive(-1); }}
-        onFocus={() => setOpen(true)}
-        onBlur={() => { add(); setOpen(false); }}
-        onKeyDown={(event) => {
-          if (event.key === "ArrowDown" && options.length) {
-            event.preventDefault();
-            setOpen(true);
-            setActive((current) => current >= options.length - 1 ? 0 : current + 1);
-          } else if (event.key === "ArrowUp" && options.length) {
-            event.preventDefault();
-            setOpen(true);
-            setActive((current) => current <= 0 ? options.length - 1 : current - 1);
-          } else if (event.key === "Enter" && open && active >= 0 && options[active]) {
-            event.preventDefault();
-            choose(options[active]);
-          } else if (event.key === "Enter" || event.key === ",") {
-            event.preventDefault();
-            add();
-          } else if (event.key === "Escape") {
-            setOpen(false);
-            setActive(-1);
-          }
-        }}
-        placeholder={values.length ? "Add another" : placeholder}
-        autoComplete="off"
-        role="combobox"
-        aria-autocomplete="list"
-        aria-expanded={open && options.length > 0}
-        aria-controls={listId}
-        aria-activedescendant={open && active >= 0 ? `${listId}-${active}` : undefined}
-      />
-      <SuggestionList id={listId} open={open} options={options} active={active} onChoose={choose} onActive={setActive} />
-    </div></label>
-  );
-}
-
-function SuggestionList({ id, open, options, active, onChoose, onActive }: {
-  id: string;
-  open: boolean;
-  options: string[];
-  active: number;
-  onChoose(option: string): void;
-  onActive(index: number): void;
-}) {
-  if (!open || options.length === 0) return null;
-  return <div id={id} className="suggestion-list" role="listbox">
-    {options.map((option, index) => (
-      <div
-        id={`${id}-${index}`}
-        key={option}
-        role="option"
-        aria-selected={active === index}
-        className={active === index ? "active" : ""}
-        onMouseEnter={() => onActive(index)}
-        onMouseDown={(event) => { event.preventDefault(); onChoose(option); }}
-      >{option}</div>
-    ))}
-  </div>;
-}
-
-function EmploymentEditor({ entry, onChange, onRemove, companySuggestions, roleSuggestions, locationSuggestions }: {
-  entry: EmploymentEntry;
-  onChange(entry: EmploymentEntry): void;
-  onRemove(): void;
-  companySuggestions: string[];
-  roleSuggestions: string[];
-  locationSuggestions: string[];
-}) {
-  return (
-    <div className="entry-editor">
-      <div className="entry-editor-title"><BriefcaseBusiness size={17} /><strong>{entry.title || "New role"}</strong><button title="Remove role" onClick={onRemove}><Trash2 size={15} /></button></div>
-      <div className="form-grid two">
-        <Field label="Company" value={entry.company} onChange={(value) => onChange({ ...entry, company: value })} suggestions={companySuggestions} />
-        <Field label="Title" value={entry.title} onChange={(value) => onChange({ ...entry, title: value })} suggestions={roleSuggestions} />
-        <Field label="Location" value={entry.location} onChange={(value) => onChange({ ...entry, location: value })} suggestions={locationSuggestions} />
-        <div className="form-grid two dates"><Field label="Start" value={entry.start_date} onChange={(value) => onChange({ ...entry, start_date: value })} placeholder="2022-03" /><Field label="End" value={entry.end_date} onChange={(value) => onChange({ ...entry, end_date: value })} placeholder={entry.current ? "Present" : "2024-06"} /></div>
-      </div>
-      <label className="field"><span>Highlights (one per line)</span><textarea rows={3} value={entry.highlights.join("\n")} onChange={(event) => onChange({ ...entry, highlights: event.target.value.split("\n").filter(Boolean) })} /></label>
-    </div>
-  );
-}
-
-function EducationEditor({ entry, onChange, onRemove }: { entry: EducationEntry; onChange(entry: EducationEntry): void; onRemove(): void }) {
-  return (
-    <div className="entry-editor">
-      <div className="entry-editor-title"><GraduationCap size={17} /><strong>{entry.school || "Education"}</strong><button title="Remove education" onClick={onRemove}><Trash2 size={15} /></button></div>
-      <div className="form-grid two">
-        <Field label="School" value={entry.school} onChange={(value) => onChange({ ...entry, school: value })} />
-        <Field label="Degree" value={entry.degree} onChange={(value) => onChange({ ...entry, degree: value })} />
-        <Field label="Field of study" value={entry.field} onChange={(value) => onChange({ ...entry, field: value })} />
-        <Field label="Graduation" value={entry.end_date} onChange={(value) => onChange({ ...entry, end_date: value })} placeholder="2019" />
-      </div>
-    </div>
-  );
 }
 
 function QuickCapture({ notes, setNotes, onUse }: { notes: string; setNotes(value: string): void; onUse(): void }) {
@@ -628,17 +469,10 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange(checked: boo
   return <button type="button" className={`toggle ${checked ? "on" : ""}`} role="switch" aria-checked={checked} onClick={() => onChange(!checked)}><span /></button>;
 }
 
-function emptyEmployment(): EmploymentEntry {
-  return { id: crypto.randomUUID(), company: "", title: "", location: "", start_date: "", end_date: "", current: false, highlights: [] };
-}
-
-function emptyEducation(): EducationEntry {
-  return { id: crypto.randomUUID(), school: "", degree: "", field: "", start_date: "", end_date: "", location: "" };
-}
-
 function validateStep(step: number, profile: CareerProfile, preferences: JobPreferences): string {
-  if (step === 0 && !profile.full_name.trim()) return "Add your full name to continue.";
-  if (step === 0 && !profile.current_location.trim()) return "Add your current city and state so Bluey can answer location questions correctly.";
+  if (step === 0) return validateProfileIdentity(profile);
+  if (step === 1) return validateEmploymentEntries(profile.employment);
+  if (step === 2) return validateEducationEntries(profile.education);
   if (step === 3 && preferences.desired_roles.length === 0) return "Add at least one target role.";
   if (step === 3 && preferences.desired_locations.length === 0) return "Add at least one target location.";
   return "";

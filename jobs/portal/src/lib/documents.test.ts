@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { inferProfileFromResume, pdfTextItemsToText, resumeHtmlToText, summarizeResumeImport } from "./documents";
+import {
+  applyResumeImport,
+  inferProfileFromResume,
+  pdfTextItemsToText,
+  prepareResumeImport,
+  resumeHtmlToText,
+  summarizeResumeImport,
+  validateExtractedResumeText,
+  validateResumeFileBytes,
+} from "./documents";
 import type { CareerProfile } from "../types";
 
 function emptyProfile(): CareerProfile {
@@ -152,6 +161,81 @@ Technologies: Rust, React`,
     ].join("\n"));
   });
 
+  it("drops DOCX table category headers without dropping skill values", () => {
+    expect(resumeHtmlToText(`
+      <p><strong>CORE COMPETENCIES</strong></p>
+      <table>
+        <thead><tr><th>Clinical Research</th><th>Regulatory &amp; Compliance</th></tr></thead>
+        <tbody><tr><td>Clinical Trial Operations</td><td>Good Clinical Practice</td></tr></tbody>
+      </table>
+    `)).toBe([
+      "CORE COMPETENCIES",
+      "Clinical Trial Operations",
+      "Good Clinical Practice",
+    ].join("\n"));
+  });
+
+  it("keeps contact details when a DOCX template places them in a table header", () => {
+    expect(resumeHtmlToText(`
+      <table>
+        <thead><tr><th>Morgan Reed</th><th>morgan@example.com</th><th>https://linkedin.com/in/morgan</th></tr></thead>
+        <tbody><tr><td>Clinical Research Analyst</td><td>Indianapolis, IN</td></tr></tbody>
+      </table>
+    `)).toBe([
+      "Morgan Reed",
+      "morgan@example.com",
+      "https://linkedin.com/in/morgan",
+      "Clinical Research Analyst",
+      "Indianapolis, IN",
+    ].join("\n"));
+  });
+
+  it("keeps internal experience headings with the bullets they introduce", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "clinical.docx",
+      text: `Morgan Reed
+PROFESSIONAL EXPERIENCE
+Example Health System
+Clinical Research Analyst, Falls Church, VA February 2024 – Present
+• Coordinated research operations.
+Neuro-Oncology Research Project – Technical Lead
+• Built a longitudinal research dataset.
+• Improved source verification.
+Health Information Management
+• Organized audit-ready documentation.
+EDUCATION
+Example University
+Master of Science in Health Informatics
+2023`,
+    });
+
+    expect(result.employment[0].highlights).toEqual([
+      "Coordinated research operations.",
+      "Neuro-Oncology Research Project – Technical Lead: Built a longitudinal research dataset.",
+      "Improved source verification.",
+      "Health Information Management: Organized audit-ready documentation.",
+    ]);
+  });
+
+  it("keeps parenthetical experience subheadings separate and uses the current role location", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "clinical.docx",
+      text: `Morgan Reed
+PROFESSIONAL EXPERIENCE
+Example Health System
+Clinical Research Analyst, Falls Church, VA February 2024 – Present
+• Coordinated research operations.
+Health Information Management (HIM)
+• Organized audit-ready documentation.`,
+    });
+
+    expect(result.current_location).toBe("Falls Church, VA");
+    expect(result.employment[0].highlights).toEqual([
+      "Coordinated research operations.",
+      "Health Information Management (HIM): Organized audit-ready documentation.",
+    ]);
+  });
+
   it("separates company, title, and US or international location rows", () => {
     const result = inferProfileFromResume(emptyProfile(), {
       name: "clinical-resume.docx",
@@ -300,4 +384,146 @@ Cloud/DevOps: AWS, Docker, Kubernetes`,
       "Kubernetes",
     ]);
   });
+
+  it("stages replacement separately from an explicit fill-blanks merge", () => {
+    const first = prepareResumeImport(emptyProfile(), {
+      name: "alex.pdf",
+      text: `Alex Morgan
+alex@example.com
+EXPERIENCE
+Software Engineer
+Northstar Labs
+January 2022 - Present
+• Built reliable services.
+SKILLS
+Rust, TypeScript`,
+    }).replacement;
+    const second = prepareResumeImport(first, {
+      name: "taylor.pdf",
+      text: `Taylor Reed
+taylor@example.com
+EXPERIENCE
+Clinical Research Analyst
+Example Health System
+January 2023 - Present
+• Coordinated clinical studies.
+SKILLS
+REDCap, Epic EMR`,
+    });
+
+    expect(second.likely_different_person).toBe(true);
+    expect(applyResumeImport(second, "replace")).toMatchObject({
+      full_name: "Taylor Reed",
+      email: "taylor@example.com",
+      skills: ["REDCap", "Epic EMR"],
+    });
+    expect(applyResumeImport(second, "replace").employment[0].company).toBe("Example Health System");
+    expect(() => applyResumeImport(second, "merge")).toThrow("current Career Profile");
+  });
+
+  it("clears candidate-specific application facts when replacing a different person", () => {
+    const current = {
+      ...emptyProfile(),
+      full_name: "Alex Morgan",
+      email: "alex@example.com",
+      street_address: "100 Old Street",
+      work_authorization: "US citizen",
+      sponsorship_required: false,
+      salary_expectation: "$170,000",
+      notice_period: "Two weeks",
+      reusable_answers: { authorization: "I am authorized." },
+      resume_mode: "enhance" as const,
+      default_submission_mode: "auto_submit" as const,
+    };
+    const preview = prepareResumeImport(current, {
+      name: "taylor.pdf",
+      text: `Taylor Reed
+(212) 555-0199
+EXPERIENCE
+Clinical Research Analyst
+Example Health System
+January 2023 - Present
+Improved participant screening by 20%`,
+    });
+
+    expect(preview.likely_different_person).toBe(true);
+    expect(preview.replacement).toMatchObject({
+      full_name: "Taylor Reed",
+      email: "",
+      street_address: "",
+      work_authorization: "",
+      sponsorship_required: null,
+      salary_expectation: "",
+      notice_period: "",
+      reusable_answers: {},
+      resume_mode: "enhance",
+      default_submission_mode: "auto_submit",
+    });
+    expect(preview.replacement.employment[0].highlights).toContain("Improved participant screening by 20%");
+  });
+
+  it("fills blanks while adding new same-person history without duplicating confirmed facts", () => {
+    const current = prepareResumeImport(emptyProfile(), {
+      name: "alex-v1.pdf",
+      text: `Alex Morgan
+alex@example.com
+EXPERIENCE
+Software Engineer
+Northstar Labs
+January 2022 - Present
+• Built reliable services.
+SKILLS
+Rust, TypeScript
+CERTIFICATIONS
+AWS Developer`,
+    }).replacement;
+    const preview = prepareResumeImport(current, {
+      name: "alex-v2.pdf",
+      text: `Alex Morgan
+alex@example.com
+EXPERIENCE
+Software Engineer
+Northstar Labs
+January 2022 - Present
+• Built reliable services.
+• Reduced deployment failures by 30%.
+Engineering Lead
+Atlas Systems
+February 2025 - Present
+• Led platform delivery.
+SKILLS
+Rust, TypeScript, PostgreSQL
+CERTIFICATIONS
+AWS Developer, CKA
+PROJECTS
+Release Guard
+• Deployment safety toolkit.
+Technologies: Rust, PostgreSQL`,
+    });
+    const merged = applyResumeImport(preview, "merge");
+
+    expect(preview.likely_different_person).toBe(false);
+    expect(merged.employment).toHaveLength(2);
+    expect(merged.employment[0].highlights).toEqual([
+      "Built reliable services.",
+      "Reduced deployment failures by 30%.",
+    ]);
+    expect(merged.skills).toEqual(["Rust", "TypeScript", "PostgreSQL"]);
+    expect(merged.certifications).toEqual(["AWS Developer", "CKA"]);
+    expect(merged.projects[0]).toMatchObject({ name: "Release Guard" });
+    expect(merged.source_resume_name).toBe("alex-v2.pdf");
+  });
+
+  it("rejects renamed files and resumes without readable text", () => {
+    const invalidPdf = new TextEncoder().encode("not a pdf");
+    expect(() => validateResumeFileBytes("resume.pdf", exactBuffer(invalidPdf))).toThrow("not a valid PDF");
+
+    const validPdf = new TextEncoder().encode("%PDF-1.7");
+    expect(() => validateResumeFileBytes("resume.pdf", exactBuffer(validPdf))).not.toThrow();
+    expect(() => validateExtractedResumeText("  ", "PDF")).toThrow("image-only or scanned PDF");
+  });
 });
+
+function exactBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}

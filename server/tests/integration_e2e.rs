@@ -310,6 +310,136 @@ async fn jobs_cross_account_match_ids_are_indistinguishable_from_missing_ids() {
 
 #[tokio::test]
 #[serial]
+async fn jobs_candidate_feedback_is_server_owned_and_tenant_scoped() {
+    let harness = boot_harness().await;
+    let owner =
+        signup_and_login(&harness, "feedback-owner@example.com", "valid-password-123").await;
+    let other =
+        signup_and_login(&harness, "feedback-other@example.com", "valid-password-123").await;
+    let saved = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/matches")
+                .header("authorization", format!("Bearer {owner}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "canonical_url": "https://boards.greenhouse.io/acme/jobs/feedback-test",
+                        "pasted_description": "Build reliable customer workflows.",
+                        "company": "Acme",
+                        "title": "Software Engineer",
+                        "location": "New York, NY",
+                        "workplace": "hybrid"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(saved.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let posting: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let posting_id = posting["id"].as_str().unwrap();
+
+    let feedback = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/candidate-events")
+                .header("authorization", format!("Bearer {owner}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "event_type": "match_feedback",
+                        "job_id": posting_id,
+                        "action": "pass",
+                        "reasons": ["location"],
+                        "note": "The commute is too long."
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(feedback.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(feedback.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let event: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(event["status"], "recorded");
+    assert!(event["id"].as_str().is_some_and(|value| !value.is_empty()));
+    assert!(event["created_at_ms"]
+        .as_i64()
+        .is_some_and(|value| value > 0));
+
+    let workspace = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/workspace")
+                .header("authorization", format!("Bearer {owner}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(workspace.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(workspace.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    let workspace: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(workspace["candidate_events"].as_array().unwrap().len(), 1);
+
+    let cross_tenant = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/candidate-events")
+                .header("authorization", format!("Bearer {other}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "event_type": "match_feedback",
+                        "job_id": posting_id,
+                        "action": "pass"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
+
+    let invalid = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/candidate-events")
+                .header("authorization", format!("Bearer {owner}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "event_type": "match_feedback",
+                        "job_id": posting_id,
+                        "action": "silently_delete"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[serial]
 async fn standalone_jobs_router_exposes_health_and_protects_customer_data() {
     let harness = boot_harness().await;
     let health = harness
@@ -564,14 +694,12 @@ async fn jobs_fact_route_owns_provenance_confirmation_and_timestamps() {
     assert_eq!(imported_after.confirmed_by, None);
 }
 
-fn setup_execution_lease_run(harness: &Harness) -> (String, String, String, String) {
-    let password_hash = auth::password::hash_password("valid-password-123").unwrap();
-    let account = Account::create(
-        &harness.pool,
-        "jobs-execution-lease@example.com",
-        &password_hash,
-    )
-    .unwrap();
+async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String, String) {
+    let email = "jobs-execution-lease@example.com";
+    let access_token = signup_and_login(harness, email, "valid-password-123").await;
+    let account = Account::fetch_by_email(&harness.pool, email)
+        .unwrap()
+        .unwrap();
     let profile = jobs::default_profile(&account.email);
     jobs::save_profile(&harness.pool, &account.id, &profile).unwrap();
     let now = chrono::Utc::now().timestamp_millis();
@@ -614,15 +742,21 @@ fn setup_execution_lease_run(harness: &Harness) -> (String, String, String, Stri
         "review_first",
     )
     .unwrap();
-    let application = jobs::update_application(
-        &harness.pool,
-        &account.id,
-        &application.id,
-        "queued",
-        Some("auto_submit"),
-    )
-    .unwrap()
-    .unwrap();
+    let approved = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/applications/{}/approve", application.id))
+                .header("authorization", format!("Bearer {access_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), StatusCode::OK);
+    let application = jobs::get_application(&harness.pool, &account.id, &application.id)
+        .unwrap()
+        .unwrap();
     let run_id = "cloud-run-integration-lease".to_string();
     jobs::upsert_browser_session(
         &harness.pool,
@@ -691,6 +825,16 @@ fn cloud_receipt_request(
         .pointer("/application_identity/email")
         .and_then(serde_json::Value::as_str)
         .unwrap();
+    let approved_packet = application
+        .receipt
+        .pointer("/approved_execution/packet")
+        .and_then(serde_json::Value::as_object)
+        .unwrap();
+    let approved_packet_checksum = application
+        .receipt
+        .pointer("/approved_execution/checksum")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
     let pdf = valid_receipt_pdf();
     let png = valid_receipt_png();
     let pdf_sha = hex::encode(Sha256::digest(&pdf));
@@ -715,8 +859,12 @@ fn cloud_receipt_request(
                 "jobId": application.job_id,
                 "resumeVersionId": resume_id,
                 "applicationEmail": application_email,
-                "answers": {},
-                "verifiedClaimIds": []
+                "answers": approved_packet.get("answers").cloned().unwrap_or_else(|| json!({})),
+                "verifiedClaimIds": approved_packet
+                    .get("verifiedClaimIds")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "approvedPacketChecksum": approved_packet_checksum
             },
             "job": { "canonicalUrl": posting.canonical_url },
             "documents": [{
@@ -821,7 +969,7 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
     std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
     let harness = boot_harness().await;
     let (account_id, application_id, run_id, browser_profile_id) =
-        setup_execution_lease_run(&harness);
+        setup_execution_lease_run(&harness).await;
     let claim_body = json!({
         "account_id": account_id,
         "application_id": application_id,
@@ -1142,7 +1290,7 @@ async fn jobs_cloud_receipt_requires_an_exact_terminal_submitted_lease_binding()
     std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
     let harness = boot_harness().await;
     let (account_id, application_id, run_id, browser_profile_id) =
-        setup_execution_lease_run(&harness);
+        setup_execution_lease_run(&harness).await;
     jobs::reserve_application_attempt(&harness.pool, &account_id, &application_id, "cloud")
         .unwrap();
     jobs::update_application(&harness.pool, &account_id, &application_id, "running", None)
@@ -1199,7 +1347,7 @@ async fn jobs_cloud_receipt_is_atomic_and_exactly_idempotent() {
     })
     .await;
     let (account_id, application_id, run_id, browser_profile_id) =
-        setup_execution_lease_run(&harness);
+        setup_execution_lease_run(&harness).await;
     prepare_cloud_submission(
         &harness,
         &account_id,
@@ -1342,7 +1490,7 @@ async fn jobs_receipt_deletes_request_owned_uploads_after_partial_failure() {
     })
     .await;
     let (account_id, application_id, run_id, browser_profile_id) =
-        setup_execution_lease_run(&harness);
+        setup_execution_lease_run(&harness).await;
     prepare_cloud_submission(
         &harness,
         &account_id,
@@ -1430,7 +1578,7 @@ async fn jobs_submission_approval_accepts_only_the_stored_provider_final_review(
     const JWT_SECRET: &str = "test-secret-at-least-32-chars-long-xxx";
     const WORKFLOW_TOKEN: &str = "jobs-workflow-test-token";
     let harness = boot_harness().await;
-    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness);
+    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness).await;
     jobs::update_application(&harness.pool, &account_id, &application_id, "running", None).unwrap();
     jobs::update_application(
         &harness.pool,
@@ -1587,7 +1735,7 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
 
     const JWT_SECRET: &str = "test-secret-at-least-32-chars-long-xxx";
     let harness = boot_harness().await;
-    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness);
+    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness).await;
     harness
         .pool
         .get()
@@ -1919,7 +2067,7 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
     use sha2::{Digest, Sha256};
 
     let harness = boot_harness().await;
-    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness);
+    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness).await;
     harness
         .pool
         .get()

@@ -27,6 +27,7 @@ export interface ApplicationWorkflowResult {
   state: ApplicationState;
   receipt?: SubmissionReceipt;
   interventionId?: string;
+  requiresReapproval?: boolean;
 }
 
 export interface RunnerExecutionResult {

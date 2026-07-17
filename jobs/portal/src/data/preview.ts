@@ -499,6 +499,20 @@ export const previewWorkspace: JobsWorkspace = {
       use_count: 1,
     },
   ],
+  candidate_events: [
+    {
+      id: "outcome-1",
+      event_type: "application_outcome",
+      job_id: "job-1",
+      application_id: "app-1",
+      action: "interview",
+      reasons: [],
+      note: "Recruiter screen scheduled for Friday.",
+      status: "confirmed",
+      created_at_ms: now - 1_200_000,
+      updated_at_ms: now - 1_200_000,
+    },
+  ],
   integrations: [
     {
       id: "google-calendar",

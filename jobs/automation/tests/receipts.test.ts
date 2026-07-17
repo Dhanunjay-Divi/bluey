@@ -1,8 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { applicationEvidenceFromReceipt, createApplicationReceipt, fingerprintReceipt, linkedProviderEvidence } from "../src/index.js";
+import {
+  applicationEvidenceFromReceipt,
+  approvedExecutionChecksum,
+  createApplicationReceipt,
+  fingerprintReceipt,
+  linkedProviderEvidence,
+  type ApplicationPacket,
+  type NormalizedJob,
+} from "../src/index.js";
 
 describe("application receipt bundles", () => {
   it("keeps exact packet answers, documents, events, and submission evidence", async () => {
+    const job: NormalizedJob = {
+      externalId: "job-1",
+      canonicalUrl: "https://jobs.acme.com/job-1",
+      company: "Acme",
+      title: "Engineer",
+      location: "New York, NY",
+      workplace: "hybrid",
+      description: "Build useful things.",
+      source: "greenhouse",
+    };
+    const packet: ApplicationPacket = {
+      applicationId: "application-1",
+      jobId: "job-1",
+      resumeVersionId: "resume-job-1",
+      approvedPacketChecksum: "",
+      resumePath: "/packets/job-1/resume.pdf",
+      answers: { sponsorship: "No", location: "New York, NY" },
+      verifiedClaimIds: ["claim-2", "claim-1"],
+      applicationIdentityId: "identity-1",
+      applicationEmail: "ada@example.com",
+      browserProfileId: "profile-1",
+    };
+    packet.approvedPacketChecksum = approvedExecutionChecksum(packet, job);
     const receipt = createApplicationReceipt({
       receiptId: "receipt-1",
       accountId: "account-1",
@@ -13,28 +44,8 @@ describe("application receipt bundles", () => {
       adapter: "greenhouse",
       adapterVersion: "1.0.0",
       generatedAt: "2026-07-10T12:00:00.000Z",
-      job: {
-        externalId: "job-1",
-        canonicalUrl: "https://jobs.acme.com/job-1",
-        company: "Acme",
-        title: "Engineer",
-        location: "New York, NY",
-        workplace: "hybrid",
-        description: "Build useful things.",
-        source: "greenhouse",
-      },
-      packet: {
-        applicationId: "application-1",
-        jobId: "job-1",
-        resumeVersionId: "resume-job-1",
-        approvedPacketChecksum: "c".repeat(64),
-        resumePath: "/packets/job-1/resume.pdf",
-        answers: { sponsorship: "No", location: "New York, NY" },
-        verifiedClaimIds: ["claim-2", "claim-1"],
-        applicationIdentityId: "identity-1",
-        applicationEmail: "ada@example.com",
-        browserProfileId: "profile-1",
-      },
+      job,
+      packet,
       documents: [{ kind: "resume", versionId: "resume-job-1", storageKey: "receipts/resume.pdf", sha256: "a".repeat(64) }],
       events: [
         { id: "event-2", occurredAt: "2026-07-10T11:59:02.000Z", type: "submitted" },
@@ -58,6 +69,8 @@ describe("application receipt bundles", () => {
     expect(receipt.applicationIdentityId).toBe("identity-1");
     expect(receipt.browserProfileId).toBe("profile-1");
     expect(receipt.packet.applicationEmail).toBe("ada@example.com");
+    expect(receipt.packet.answers).toEqual(packet.answers);
+    expect(receipt.packet.approvedPacketChecksum).toBe(packet.approvedPacketChecksum);
     const evidence = applicationEvidenceFromReceipt(receipt);
     expect(evidence).toHaveLength(2);
     expect(evidence[0]).toMatchObject({
@@ -69,6 +82,12 @@ describe("application receipt bundles", () => {
     expect(evidence[1]).toMatchObject({ kind: "submission_confirmation", label: "Application received" });
     expect(await fingerprintReceipt(receipt)).toMatch(/^[a-f0-9]{64}$/);
     expect(await fingerprintReceipt(receipt)).toBe(await fingerprintReceipt(structuredClone(receipt)));
+
+    const changedPacket = structuredClone(packet);
+    changedPacket.answers.sponsorship = "Yes";
+    expect(() => createApplicationReceipt({
+      ...receiptInputForIntegrity(job, changedPacket),
+    })).toThrow("changed after review");
   });
 
   it("links mailbox and calendar events to one application with provider IDs", () => {
@@ -94,6 +113,30 @@ describe("application receipt bundles", () => {
     expect(() => linkedProviderEvidence({ ...emailToInput(email), externalId: "" })).toThrow("provider event ID");
   });
 });
+
+function receiptInputForIntegrity(job: NormalizedJob, packet: ApplicationPacket) {
+  return {
+    receiptId: "receipt-integrity",
+    accountId: "account-1",
+    runId: "run-integrity",
+    runner: "cloud" as const,
+    applicationIdentityId: "identity-1",
+    browserProfileId: "profile-1",
+    adapter: "greenhouse",
+    adapterVersion: "1.0.0",
+    job,
+    packet,
+    documents: [{
+      kind: "resume" as const,
+      versionId: "resume-job-1",
+      storageKey: "receipts/resume.pdf",
+      sha256: "a".repeat(64),
+    }],
+    events: [],
+    result: { status: "failed" as const, issues: [] },
+    screenshotKeys: [],
+  };
+}
 
 function emailToInput(evidence: ReturnType<typeof linkedProviderEvidence>) {
   return {

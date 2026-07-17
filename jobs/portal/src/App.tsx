@@ -19,6 +19,8 @@ import type {
   AnswerMemory,
   ApplicationIdentity,
   BrowserSession,
+  CandidateEvent,
+  CandidateEventInput,
   CareerProfile,
   CareerTrack,
   Intervention,
@@ -217,7 +219,7 @@ export default function App() {
     async (job: JobPosting, mode: string, submissionMode: string) => {
       if (!workspace) return;
       if (isPreview) {
-        const resume = previewResume(workspace, job, `resume-${job.id}-${Date.now()}`, mode);
+        const resume = previewResume(workspace, job, `resume-${job.id}-${Date.now()}`, mode, account?.email || "");
         const autoSubmitEligible = submissionMode === "auto_submit" && job.eligibility?.can_auto_submit === true;
         const application: JobApplication = {
           id: `application-${job.id}`,
@@ -277,7 +279,7 @@ export default function App() {
       setToast("Tailored application is ready.");
       navigate(`/applications${previewSearch}`);
     },
-    [navigate, workspace],
+    [account?.email, navigate, workspace],
   );
 
   const commitApplication = useCallback(async (application: JobApplication) => {
@@ -333,7 +335,7 @@ export default function App() {
         const application = workspace?.applications.find((item) => item.resume_version_id === id);
         const job = application ? workspace?.matches.find((item) => item.id === application.job_id) : undefined;
         if (!workspace || !job) return undefined;
-        const resume = previewResume(workspace, job, id, "factual");
+        const resume = previewResume(workspace, job, id, "factual", account?.email || "");
         setResumeVersions((current) => ({ ...current, [id]: resume }));
         return resume;
       }
@@ -341,7 +343,7 @@ export default function App() {
       setResumeVersions((current) => ({ ...current, [id]: resume }));
       return resume;
     },
-    [resumeVersions, workspace],
+    [account?.email, resumeVersions, workspace],
   );
 
   const saveIntegration = useCallback(async (integration: JobsIntegration) => {
@@ -456,6 +458,37 @@ export default function App() {
       answer_memory: current.answer_memory.filter((item) => item.id !== answer.id),
     } : current);
     setToast("Saved answer removed.");
+  }, []);
+
+  const saveCandidateEvent = useCallback(async (input: CandidateEventInput) => {
+    const now = Date.now();
+    const saved: CandidateEvent = isPreview
+      ? {
+          ...input,
+          id: `candidate-event-${now}`,
+          reasons: input.reasons || [],
+          note: input.note || "",
+          status: input.event_type === "application_issue"
+            ? "open"
+            : input.event_type === "application_outcome"
+              ? "confirmed"
+              : "recorded",
+          created_at_ms: now,
+          updated_at_ms: now,
+        }
+      : await jobsApi.saveCandidateEvent(input);
+    setWorkspace((current) => current ? {
+      ...current,
+      candidate_events: [saved, ...current.candidate_events.filter((item) => item.id !== saved.id)],
+    } : current);
+    setToast(
+      saved.event_type === "match_feedback"
+        ? saved.action === "restore" ? "Match restored." : "Match passed. Your search rules did not change."
+        : saved.event_type === "application_outcome"
+          ? "Application outcome saved."
+          : "Problem report saved.",
+    );
+    return saved;
   }, []);
 
   const queueRun = useCallback(async (application: JobApplication, runner: "local" | "cloud") => {
@@ -605,6 +638,7 @@ export default function App() {
               workspace={workspace}
               onAddJob={addJob}
               onPrepare={prepareApplication}
+              onSaveCandidateEvent={saveCandidateEvent}
             />
           }
         />
@@ -618,6 +652,7 @@ export default function App() {
               onCommit={commitApplication}
               onLoadResume={loadResumeVersion}
               onResolveIntervention={resolveIntervention}
+              onSaveCandidateEvent={saveCandidateEvent}
             />
           }
         />
@@ -804,7 +839,7 @@ function previewPosting(input: UserJobInput): JobPosting {
   };
 }
 
-function previewResume(workspace: JobsWorkspace, job: JobPosting, id: string, mode: string): ResumeVersion {
+function previewResume(workspace: JobsWorkspace, job: JobPosting, id: string, mode: string, accountEmail: string): ResumeVersion {
   const track = workspace.tracks.find((item) => item.id === job.track_id);
   const applicationIdentity = workspace.application_identities.find((item) => item.id === track?.application_identity_id)
     || workspace.application_identities.find((item) => item.is_default && item.verification_status === "verified");
@@ -817,7 +852,7 @@ function previewResume(workspace: JobsWorkspace, job: JobPosting, id: string, mo
       target: { company: job.company, title: job.title, location: job.location },
       contact: {
         name: workspace.profile.full_name,
-        email: applicationIdentity?.email || workspace.profile.email,
+        email: applicationIdentity?.email || accountEmail,
         phone: workspace.profile.phone,
         location: workspace.profile.current_location,
       },

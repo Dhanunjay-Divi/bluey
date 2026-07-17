@@ -8,13 +8,41 @@ import {
   FileUp,
   History,
   Pencil,
+  Plus,
   ShieldCheck,
   Sparkles,
 } from "lucide-react";
 import type { CareerProfile, JobsWorkspace, ResumeContent, ResumeVersion } from "../types";
-import { importResume, inferProfileFromResume, exportResumeDocx, exportResumePdf } from "../lib/documents";
+import {
+  applyResumeImport,
+  exportResumeDocx,
+  exportResumePdf,
+  importResume,
+  prepareResumeImport,
+  type ResumeImportMode,
+  type ResumeImportPreview,
+} from "../lib/documents";
 import { Dialog } from "../components/Dialog";
+import {
+  CareerEducationEditor,
+  CareerEmploymentEditor,
+  CareerField,
+  CareerProjectEditor,
+  CareerTagField,
+  emptyCareerEducation,
+  emptyCareerEmployment,
+  emptyCareerProject,
+} from "../components/CareerFields";
+import { ResumeImportReview } from "../components/ResumeImportReview";
+import {
+  CERTIFICATION_SUGGESTIONS,
+  LOCATION_SUGGESTIONS,
+  mergeCareerSuggestions,
+  ROLE_SUGGESTIONS,
+  SKILL_SUGGESTIONS,
+} from "../data/career-suggestions";
 import { relativeTime } from "../lib/format";
+import { validateCareerProfile } from "../lib/profile-validation";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -29,6 +57,7 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
   const [editOpen, setEditOpen] = useState(false);
   const [selectedResume, setSelectedResume] = useState<ResumeVersion | undefined>();
   const [saving, setSaving] = useState(false);
+  const [importPreview, setImportPreview] = useState<ResumeImportPreview>();
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
@@ -36,6 +65,27 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
   const selectedApplication = selectedResume
     ? workspace.applications.find((item) => item.resume_version_id === selectedResume.id)
     : undefined;
+  const roleSuggestions = useMemo(
+    () => mergeCareerSuggestions([profile.headline], profile.employment.map((entry) => entry.title), ROLE_SUGGESTIONS),
+    [profile.employment, profile.headline],
+  );
+  const locationSuggestions = useMemo(
+    () => mergeCareerSuggestions(
+      [profile.current_location],
+      profile.employment.map((entry) => entry.location),
+      profile.education.map((entry) => entry.location),
+      LOCATION_SUGGESTIONS,
+    ),
+    [profile.current_location, profile.education, profile.employment],
+  );
+  const companySuggestions = useMemo(
+    () => mergeCareerSuggestions(profile.employment.map((entry) => entry.company)),
+    [profile.employment],
+  );
+  const skillSuggestions = useMemo(
+    () => mergeCareerSuggestions(profile.skills, profile.projects.flatMap((entry) => entry.technologies), SKILL_SUGGESTIONS),
+    [profile.projects, profile.skills],
+  );
 
   const baseContent = useMemo<ResumeContent>(() => ({
     contact: {
@@ -53,7 +103,9 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
     certifications: profile.certifications,
   }), [profile]);
 
-  useEffect(() => setProfile(workspace.profile), [workspace.profile]);
+  useEffect(() => {
+    if (!editOpen) setProfile(workspace.profile);
+  }, [editOpen, workspace.profile]);
 
   const upload = async (file?: File) => {
     if (!file) return;
@@ -61,16 +113,32 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
     setError("");
     try {
       const imported = await importResume(file);
-      const next = inferProfileFromResume(profile, imported);
-      setProfile(next);
-      await onSave(next);
-      setMessage("Resume imported. Review the profile facts Bluey extracted before your next application.");
+      setImportPreview(prepareResumeImport(profile, imported));
     } catch (requestError) {
       setError(resumeErrorMessage(requestError, "Resume import failed."));
     }
   };
 
+  const applyImport = (mode: ResumeImportMode) => {
+    if (!importPreview) return;
+    setProfile(applyResumeImport(importPreview, mode));
+    setImportPreview(undefined);
+    setEditOpen(true);
+    setMessage("Import staged. Review the extracted Career Profile, then save or cancel.");
+  };
+
+  const cancelEdit = () => {
+    setProfile(workspace.profile);
+    setEditOpen(false);
+    setMessage("");
+  };
+
   const save = async () => {
+    const validationError = validateCareerProfile(profile);
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
     setSaving(true);
     setError("");
     try {
@@ -134,7 +202,7 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
     <div className="view-shell resume-view">
       <section className="view-heading">
         <div><p className="eyebrow">SOURCE OF TRUTH</p><h1>Resume</h1><span>One verified Career Profile, then a different resume version for every job.</span></div>
-        <div className="heading-actions"><input ref={fileRef} hidden type="file" accept=".pdf,.docx,.txt" onChange={(event) => void upload(event.target.files?.[0])} /><button className="button secondary" onClick={() => fileRef.current?.click()}><FileUp size={16} />Import resume</button><button className="button primary" onClick={() => setEditOpen(true)}><Pencil size={16} />Edit profile</button></div>
+        <div className="heading-actions"><input ref={fileRef} hidden type="file" accept=".pdf,.docx,.txt" onChange={(event) => { void upload(event.target.files?.[0]); event.target.value = ""; }} /><button className="button secondary" onClick={() => fileRef.current?.click()}><FileUp size={16} />Import resume</button><button className="button primary" onClick={() => { setProfile(workspace.profile); setEditOpen(true); }}><Pencil size={16} />Edit profile</button></div>
       </section>
 
       {message && <div className="global-message success"><Check size={16} />{message}</div>}
@@ -173,9 +241,85 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
         </aside>
       </div>
 
-      <Dialog open={editOpen} title="Edit Career Profile" description="These facts become reusable source material for job-specific resumes." onClose={() => setEditOpen(false)} size="large">
-        <div className="dialog-form profile-edit-form"><div className="form-grid two"><label><span>Full name</span><input value={profile.full_name} onChange={(event) => setProfile({ ...profile, full_name: event.target.value })} /></label><label><span>Headline</span><input value={profile.headline} onChange={(event) => setProfile({ ...profile, headline: event.target.value })} /></label><label><span>Current location</span><input value={profile.current_location} onChange={(event) => setProfile({ ...profile, current_location: event.target.value })} /></label><label><span>Phone</span><input value={profile.phone} onChange={(event) => setProfile({ ...profile, phone: event.target.value })} /></label></div><label><span>Professional summary</span><textarea rows={5} value={profile.summary} onChange={(event) => setProfile({ ...profile, summary: event.target.value })} /></label><label><span>Skills (comma separated)</span><input value={profile.skills.join(", ")} onChange={(event) => setProfile({ ...profile, skills: event.target.value.split(",").map((item) => item.trim()).filter(Boolean) })} /></label><div className="form-grid two"><label><span>Work authorization</span><input value={profile.work_authorization} onChange={(event) => setProfile({ ...profile, work_authorization: event.target.value })} /></label><label><span>Salary expectation</span><input value={profile.salary_expectation} onChange={(event) => setProfile({ ...profile, salary_expectation: event.target.value })} /></label></div></div>
-        <div className="dialog-actions"><button className="button secondary" onClick={() => setEditOpen(false)}>Cancel</button><button className="button primary" disabled={saving} onClick={() => void save()}>{saving ? "Saving..." : "Save profile"}</button></div>
+      <ResumeImportReview preview={importPreview} onApply={applyImport} onClose={() => setImportPreview(undefined)} />
+
+      <Dialog open={editOpen} title="Edit Career Profile" description="These facts become reusable source material for job-specific resumes." onClose={cancelEdit} size="large">
+        <div className="dialog-form profile-edit-form full-profile-editor">
+          <section className="profile-editor-section">
+            <div className="profile-editor-heading"><span>IDENTITY</span><h3>Contact and professional summary</h3></div>
+            <div className="form-grid two">
+              <CareerField label="Full name" value={profile.full_name} onChange={(value) => setProfile({ ...profile, full_name: value })} autoFocus />
+              <div className="profile-email-field">
+                <CareerField label="Resume contact email" value={profile.email} onChange={(value) => setProfile({ ...profile, email: value })} inputMode="email" />
+                <p className="field-note profile-email-note">This address appears on generated resumes. Bluey submits with a separately verified application email from Settings.</p>
+              </div>
+              <CareerField label="Phone" value={profile.phone} onChange={(value) => setProfile({ ...profile, phone: value })} inputMode="tel" />
+              <CareerField label="Current location" value={profile.current_location} onChange={(value) => setProfile({ ...profile, current_location: value })} suggestions={locationSuggestions} />
+              <CareerField label="Professional headline" value={profile.headline} onChange={(value) => setProfile({ ...profile, headline: value })} suggestions={roleSuggestions} />
+              <CareerField label="Street address" value={profile.street_address} onChange={(value) => setProfile({ ...profile, street_address: value })} />
+              <CareerField label="LinkedIn" value={profile.linkedin_url} onChange={(value) => setProfile({ ...profile, linkedin_url: value })} inputMode="url" placeholder="https://linkedin.com/in/..." />
+              <CareerField label="Portfolio" value={profile.portfolio_url} onChange={(value) => setProfile({ ...profile, portfolio_url: value })} inputMode="url" placeholder="https://..." />
+            </div>
+            <label className="field"><span>Professional summary</span><textarea rows={5} value={profile.summary} onChange={(event) => setProfile({ ...profile, summary: event.target.value })} /></label>
+          </section>
+
+          <section className="profile-editor-section">
+            <div className="profile-editor-heading"><span>EXPERIENCE</span><h3>Employment history</h3><button type="button" className="button secondary compact" onClick={() => setProfile({ ...profile, employment: [...profile.employment, emptyCareerEmployment()] })}><Plus size={15} />Add role</button></div>
+            <div className="entry-list">
+              {profile.employment.map((entry, index) => <CareerEmploymentEditor
+                key={entry.id}
+                entry={entry}
+                companySuggestions={companySuggestions}
+                roleSuggestions={roleSuggestions}
+                locationSuggestions={locationSuggestions}
+                onChange={(next) => setProfile({ ...profile, employment: profile.employment.map((item, itemIndex) => itemIndex === index ? next : item) })}
+                onRemove={() => setProfile({ ...profile, employment: profile.employment.filter((_, itemIndex) => itemIndex !== index) })}
+              />)}
+              {profile.employment.length === 0 && <p className="editor-empty">No roles yet. Add the jobs you want Bluey to use as factual source material.</p>}
+            </div>
+          </section>
+
+          <section className="profile-editor-section">
+            <div className="profile-editor-heading"><span>EDUCATION</span><h3>Schools and degrees</h3><button type="button" className="button secondary compact" onClick={() => setProfile({ ...profile, education: [...profile.education, emptyCareerEducation()] })}><Plus size={15} />Add education</button></div>
+            <div className="entry-list">
+              {profile.education.map((entry, index) => <CareerEducationEditor
+                key={entry.id}
+                entry={entry}
+                locationSuggestions={locationSuggestions}
+                onChange={(next) => setProfile({ ...profile, education: profile.education.map((item, itemIndex) => itemIndex === index ? next : item) })}
+                onRemove={() => setProfile({ ...profile, education: profile.education.filter((_, itemIndex) => itemIndex !== index) })}
+              />)}
+              {profile.education.length === 0 && <p className="editor-empty">No education entries yet.</p>}
+            </div>
+          </section>
+
+          <section className="profile-editor-section">
+            <div className="profile-editor-heading"><span>PROJECTS</span><h3>Projects and portfolio work</h3><button type="button" className="button secondary compact" onClick={() => setProfile({ ...profile, projects: [...profile.projects, emptyCareerProject()] })}><Plus size={15} />Add project</button></div>
+            <div className="entry-list">
+              {profile.projects.map((entry, index) => <CareerProjectEditor
+                key={entry.id}
+                entry={entry}
+                skillSuggestions={skillSuggestions}
+                onChange={(next) => setProfile({ ...profile, projects: profile.projects.map((item, itemIndex) => itemIndex === index ? next : item) })}
+                onRemove={() => setProfile({ ...profile, projects: profile.projects.filter((_, itemIndex) => itemIndex !== index) })}
+              />)}
+              {profile.projects.length === 0 && <p className="editor-empty">No projects yet.</p>}
+            </div>
+          </section>
+
+          <section className="profile-editor-section">
+            <div className="profile-editor-heading"><span>QUALIFICATIONS</span><h3>Skills, certifications, and application facts</h3></div>
+            <div className="form-grid two">
+              <CareerTagField label="Skills" values={profile.skills} onChange={(values) => setProfile({ ...profile, skills: values })} placeholder="Add a skill" suggestions={skillSuggestions} />
+              <CareerTagField label="Certifications" values={profile.certifications} onChange={(values) => setProfile({ ...profile, certifications: values })} placeholder="Add a certification" suggestions={mergeCareerSuggestions(profile.certifications, CERTIFICATION_SUGGESTIONS)} />
+              <CareerField label="Work authorization" value={profile.work_authorization} onChange={(value) => setProfile({ ...profile, work_authorization: value })} />
+              <CareerField label="Salary expectation" value={profile.salary_expectation} onChange={(value) => setProfile({ ...profile, salary_expectation: value })} />
+              <CareerField label="Notice period" value={profile.notice_period} onChange={(value) => setProfile({ ...profile, notice_period: value })} />
+              <label className="field"><span>Sponsorship</span><select value={profile.sponsorship_required === null ? "unknown" : profile.sponsorship_required ? "required" : "not_required"} onChange={(event) => setProfile({ ...profile, sponsorship_required: event.target.value === "unknown" ? null : event.target.value === "required" })}><option value="unknown">Ask before answering</option><option value="not_required">Not required</option><option value="required">Required</option></select></label>
+            </div>
+          </section>
+        </div>
+        <div className="dialog-actions"><button className="button secondary" onClick={cancelEdit}>Cancel</button><button className="button primary" disabled={saving} onClick={() => void save()}>{saving ? "Saving..." : "Save profile"}</button></div>
       </Dialog>
 
       <Dialog open={Boolean(selectedResume)} title={selectedResume?.content.target ? `${selectedResume.content.target.title} at ${selectedResume.content.target.company}` : "Tailored resume"} description={`Version ${selectedResume?.version_no || 1} · ${selectedResume?.mode || "factual"}`} onClose={() => setSelectedResume(undefined)} size="large">

@@ -19,20 +19,23 @@ import {
   SlidersHorizontal,
   Sparkles,
   Target,
+  Undo2,
   TriangleAlert,
 } from "lucide-react";
-import type { DiscoverySource, DiscoverySourceHealth, JobPosting, JobsWorkspace, UserJobInput } from "../types";
+import type { CandidateEventInput, DiscoverySource, DiscoverySourceHealth, JobPosting, JobsWorkspace, UserJobInput } from "../types";
 import { relativeTime, titleCase } from "../lib/format";
 import { Dialog } from "../components/Dialog";
 import { effectiveSubmissionMode } from "../lib/application-flow";
+import { isJobPassed, matchPassReasons } from "../lib/candidate-events";
 
 interface Props {
   workspace: JobsWorkspace;
   onAddJob(job: UserJobInput): Promise<JobPosting>;
   onPrepare(job: JobPosting, mode: string, submissionMode: string): Promise<void>;
+  onSaveCandidateEvent(event: CandidateEventInput): Promise<unknown>;
 }
 
-export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
+export function MatchesView({ workspace, onAddJob, onPrepare, onSaveCandidateEvent }: Props) {
   const [query, setQuery] = useState("");
   const [activeTrack, setActiveTrack] = useState("all");
   const [selected, setSelected] = useState<JobPosting | null>(null);
@@ -45,10 +48,19 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
   const [workplace, setWorkplace] = useState("all");
   const [onlyUnprepared, setOnlyUnprepared] = useState(false);
   const [density, setDensity] = useState<"comfortable" | "compact">("comfortable");
+  const [showPassed, setShowPassed] = useState(false);
+  const [passTarget, setPassTarget] = useState<JobPosting | null>(null);
+  const [passReasons, setPassReasons] = useState<string[]>([]);
+  const [passNote, setPassNote] = useState("");
+  const [feedbackBusy, setFeedbackBusy] = useState(false);
 
   const preparedJobIds = useMemo(
     () => new Set(workspace.applications.map((application) => application.job_id)),
     [workspace.applications],
+  );
+  const passedJobIds = useMemo(
+    () => new Set(workspace.matches.filter((job) => isJobPassed(workspace.candidate_events, job.id)).map((job) => job.id)),
+    [workspace.matches, workspace.candidate_events],
   );
 
   const filtered = useMemo(() => {
@@ -60,10 +72,11 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
       const matchesWorkplace = workplace === "all" || job.workplace.toLowerCase().includes(workplace);
       const matchesPacket = !onlyUnprepared || !preparedJobIds.has(job.id);
       const isRecent = isRecentPosting(job, workspace.preferences.max_posting_age_days);
+      const matchesPassed = showPassed ? passedJobIds.has(job.id) : !passedJobIds.has(job.id);
       return matchesTrack && matchesQuery && matchesScore && matchesWorkplace && matchesPacket
-        && job.status !== "skipped" && job.availability_status !== "expired" && isRecent;
+        && matchesPassed && job.status !== "skipped" && job.availability_status !== "expired" && isRecent;
     });
-  }, [workspace.matches, workspace.preferences.max_posting_age_days, activeTrack, query, minimumScore, workplace, onlyUnprepared, preparedJobIds]);
+  }, [workspace.matches, workspace.preferences.max_posting_age_days, activeTrack, query, minimumScore, workplace, onlyUnprepared, preparedJobIds, showPassed, passedJobIds]);
 
   const averageScore = filtered.length ? Math.round(filtered.reduce((sum, item) => sum + item.match_score, 0) / filtered.length) : 0;
   const activeFilterCount = Number(minimumScore > 0) + Number(workplace !== "all") + Number(onlyUnprepared);
@@ -88,6 +101,35 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
       setSelected(null);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const savePass = async () => {
+    if (!passTarget) return;
+    setFeedbackBusy(true);
+    try {
+      await onSaveCandidateEvent({
+        event_type: "match_feedback",
+        job_id: passTarget.id,
+        action: "pass",
+        reasons: passReasons,
+        note: passNote,
+      });
+      setPassTarget(null);
+      setPassReasons([]);
+      setPassNote("");
+    } finally {
+      setFeedbackBusy(false);
+    }
+  };
+
+  const restoreMatch = async (job: JobPosting) => {
+    setFeedbackBusy(true);
+    try {
+      await onSaveCandidateEvent({ event_type: "match_feedback", job_id: job.id, action: "restore" });
+      setSelected(null);
+    } finally {
+      setFeedbackBusy(false);
     }
   };
 
@@ -126,6 +168,7 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
 
       <section className="toolbar">
         <label className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search company, role, or location" /></label>
+        {passedJobIds.size > 0 && <button className={`button secondary compact ${showPassed ? "active-filter" : ""}`} onClick={() => setShowPassed((current) => !current)}>{showPassed ? <Undo2 size={15} /> : null}{showPassed ? "Back to matches" : `Passed ${passedJobIds.size}`}</button>}
         <button className={`button secondary compact ${activeFilterCount ? "active-filter" : ""}`} onClick={() => setFilterOpen(true)}><Filter size={15} />Filters{activeFilterCount ? <span className="filter-count">{activeFilterCount}</span> : null}</button>
         <button className="icon-button" title={`Use ${density === "comfortable" ? "compact" : "comfortable"} rows`} onClick={() => setDensity((current) => current === "comfortable" ? "compact" : "comfortable")}><SlidersHorizontal size={17} /></button>
       </section>
@@ -133,7 +176,7 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
       <section className={`job-list ${density}`} aria-label="Job matches">
         <div className="job-list-head"><span>ROLE</span><span>FIT</span><span>LOCATION</span><span>STATUS</span><span /></div>
         {filtered.map((job) => (
-          <button className="job-row" key={job.id} onClick={() => setSelected(job)}>
+          <button className={`job-row ${passedJobIds.has(job.id) ? "passed" : ""}`} key={job.id} onClick={() => setSelected(job)}>
             <div className="company-mark">{job.company.slice(0, 2).toUpperCase()}</div>
             <div className="job-main"><strong>{job.title}</strong><span>{job.company} · {postingAgeLabel(job)}</span></div>
             <div className={`score score-${Math.floor(job.match_score / 10)}`}><b>{job.match_score}</b><span>%</span></div>
@@ -161,9 +204,20 @@ export function MatchesView({ workspace, onAddJob, onPrepare }: Props) {
               <section><h3>Why it matched</h3><ul className="check-list">{selected.matched_reasons.map((reason) => <li key={reason}><Check size={15} />{reason}</li>)}</ul>{selected.missing_requirements.length > 0 && <><h3>Check before applying</h3><ul className="watch-list">{selected.missing_requirements.map((reason) => <li key={reason}>{reason}</li>)}</ul></>}</section>
               <section><h3>Tailored application</h3><p>Bluey creates a new resume version for this job. It will never reuse this version for another role.</p><label>Resume mode</label><div className="segmented"><button className={mode === "factual" ? "active" : ""} onClick={() => setMode("factual")}>Factual</button><button className={mode === "enhance" ? "active" : ""} onClick={() => setMode("enhance")}>Enhance</button></div><label>After preparation</label><div className="segmented"><button className={submissionMode === "review_first" || !jobEligibility(selected).can_auto_submit ? "active" : ""} onClick={() => setSubmissionMode("review_first")}>Review first</button><button disabled={!jobEligibility(selected).can_auto_submit} title={!jobEligibility(selected).can_auto_submit ? "Auto-submit becomes available only after every server rule and site capability passes." : undefined} className={submissionMode === "auto_submit" && jobEligibility(selected).can_auto_submit ? "active" : ""} onClick={() => setSubmissionMode("auto_submit")}>Auto-submit</button></div></section>
             </div>
-            <div className="dialog-actions spread"><p>{jobEligibility(selected).capability === "handoff" || jobEligibility(selected).capability === "unknown_review" ? "Bluey prepares the application kit for your review; this site stays user-controlled." : "This application uses one monthly allowance when approved, downloaded, or queued."}</p><button className="button primary" disabled={busy || !jobEligibility(selected).can_prepare} onClick={() => void prepare()}>{busy ? "Preparing..." : jobEligibility(selected).can_prepare ? "Prepare application" : "Blocked by your rules"}<ArrowRight size={17} /></button></div>
+            <div className="dialog-actions spread"><p>{jobEligibility(selected).capability === "handoff" || jobEligibility(selected).capability === "unknown_review" ? "Bluey prepares the application kit for your review; this site stays user-controlled." : "This application uses one monthly allowance when approved, downloaded, or queued."}</p><div>{passedJobIds.has(selected.id) ? <button className="button secondary" disabled={feedbackBusy} onClick={() => void restoreMatch(selected)}><Undo2 size={16} />Restore</button> : <button className="button secondary" onClick={() => { setPassTarget(selected); setSelected(null); }}>Pass</button>}<button className="button primary" disabled={busy || !jobEligibility(selected).can_prepare || passedJobIds.has(selected.id)} onClick={() => void prepare()}>{busy ? "Preparing..." : jobEligibility(selected).can_prepare ? "Prepare application" : "Blocked by your rules"}<ArrowRight size={17} /></button></div></div>
           </div>
         )}
+      </Dialog>
+
+      <Dialog open={Boolean(passTarget)} title="Pass on this match?" description={passTarget ? `${passTarget.title} at ${passTarget.company}` : ""} onClose={() => setPassTarget(null)}>
+        <div className="feedback-dialog">
+          <p>Tell Bluey why so future matches get better. This does not change your Career Track automatically.</p>
+          <div className="choice-chips" role="group" aria-label="Reasons for passing">
+            {matchPassReasons.map(([value, label]) => <button key={value} type="button" className={passReasons.includes(value) ? "active" : ""} onClick={() => setPassReasons((current) => current.includes(value) ? current.filter((item) => item !== value) : [...current, value])}>{label}</button>)}
+          </div>
+          <label><span>Note <small>optional</small></span><textarea value={passNote} maxLength={1000} rows={3} onChange={(event) => setPassNote(event.target.value)} placeholder="Anything Bluey should remember about this match" /></label>
+        </div>
+        <div className="dialog-actions"><button className="button secondary" onClick={() => setPassTarget(null)}>Keep match</button><button className="button primary" disabled={feedbackBusy} onClick={() => void savePass()}>{feedbackBusy ? "Saving..." : "Pass on match"}</button></div>
       </Dialog>
 
       <AddJobDialog open={addOpen} onClose={() => setAddOpen(false)} trackId={selectedTrack?.id || ""} onSave={async (job) => { const saved = await onAddJob(job); setAddOpen(false); setSelected(saved); }} />

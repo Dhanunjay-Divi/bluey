@@ -7,6 +7,8 @@ import type {
   CareerFact,
   CareerProfile,
   CareerTrack,
+  CandidateEvent,
+  CandidateEventInput,
   AnswerMemory,
   Intervention,
   InterventionResolutionResult,
@@ -238,6 +240,11 @@ export const jobsApi = {
     }),
   deleteAnswerMemory: (id: string) =>
     request<void>(`/api/jobs/answers/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  saveCandidateEvent: (event: CandidateEventInput) =>
+    request<CandidateEvent>("/api/jobs/candidate-events", {
+      method: "POST",
+      body: JSON.stringify(event),
+    }),
   saveIntegration: (integration: JobsIntegration) =>
     request<JobsIntegration>("/api/jobs/integrations", {
       method: "PUT",
