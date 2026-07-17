@@ -36,6 +36,8 @@ pub fn enabled() -> bool {
 }
 
 /// How many turns between passes (env `BLUEY_LEDGER_INTERVAL_TURNS`, min 5).
+/// Retained for the transcript-window sizing (`last_transcript_text_bounded`),
+/// which is turn-based; the FIRING cadence is word-based (see `should_fire`).
 pub fn interval_turns() -> usize {
     env::var("BLUEY_LEDGER_INTERVAL_TURNS")
         .ok()
@@ -44,11 +46,30 @@ pub fn interval_turns() -> usize {
         .unwrap_or(DEFAULT_INTERVAL_TURNS)
 }
 
-/// Should a ledger pass fire at this transcript length? Fires once per interval
-/// boundary (e.g. at 15, 30, 45 turns).
-pub fn should_fire(transcript_len: usize) -> bool {
-    let n = interval_turns();
-    transcript_len >= n && transcript_len.is_multiple_of(n)
+/// Words of new transcript between extraction passes. WORD-based (not
+/// segment-based) so the cadence is insensitive to how the STT chunks speech:
+/// the direct-emit path produces ~2-word fragments, so a segment-count trigger
+/// fired every ~13s (≈130 calls in a 30-min meeting — wasteful). ~350 words is
+/// roughly 2-3 minutes of speech at conversational pace, a predictable cadence
+/// regardless of fragmentation. Override with `BLUEY_LEDGER_INTERVAL_WORDS`.
+pub const DEFAULT_INTERVAL_WORDS: usize = 350;
+
+/// Words between ledger passes (env `BLUEY_LEDGER_INTERVAL_WORDS`, min 60).
+pub fn interval_words() -> usize {
+    env::var("BLUEY_LEDGER_INTERVAL_WORDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(60))
+        .unwrap_or(DEFAULT_INTERVAL_WORDS)
+}
+
+/// Should a ledger pass fire, given the total transcript word count and the word
+/// count at the LAST fire? Fires once per `interval_words()` boundary crossed, so
+/// cost scales with how much was actually SAID, not with fragment count. The
+/// caller tracks `last_fired_words` and updates it when a pass fires.
+pub fn should_fire_words(total_words: usize, last_fired_words: usize) -> bool {
+    let n = interval_words();
+    total_words >= last_fired_words + n
 }
 
 /// The cheap-lane provider selectors to try, cheapest-first. The daemon picks the
@@ -100,13 +121,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_fire_respects_interval() {
-        // default 15
-        assert!(!should_fire(0));
-        assert!(!should_fire(14));
-        assert!(should_fire(15));
-        assert!(!should_fire(16));
-        assert!(should_fire(30));
+    fn should_fire_words_respects_interval() {
+        // default 350 words between passes.
+        assert!(!should_fire_words(0, 0));
+        assert!(!should_fire_words(349, 0));
+        assert!(should_fire_words(350, 0)); // first boundary crossed
+        assert!(should_fire_words(700, 0)); // well past → still fires
+                                            // After a fire at 350, the next fire is at 350 + 350 = 700.
+        assert!(!should_fire_words(699, 350));
+        assert!(should_fire_words(700, 350));
     }
 
     #[test]

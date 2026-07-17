@@ -25,7 +25,6 @@ pub fn analyze_segment(segment: &TranscriptSegment, meeting: &MeetingRecord) -> 
         return SegmentAnalysis::empty();
     }
 
-    let lower = text.to_ascii_lowercase();
     let mut analysis = SegmentAnalysis::empty();
 
     if is_question(text) {
@@ -36,23 +35,13 @@ pub fn analyze_segment(segment: &TranscriptSegment, meeting: &MeetingRecord) -> 
         );
     }
 
-    if let Some(action_text) = extract_action_item(text, &lower) {
-        let action = ActionItem::new(action_text, extract_owner(text), Some(segment.id));
-        analysis.cards.push(
-            CueCard::new(CardKind::ActionItem, "Action item", action.text.clone())
-                .with_source("live transcript"),
-        );
-        analysis.action_items.push(action);
-    }
-
-    if let Some(decision_text) = extract_decision(text, &lower) {
-        let decision = Decision::new(decision_text, Some(segment.id));
-        analysis.cards.push(
-            CueCard::new(CardKind::Decision, "Decision", decision.text.clone())
-                .with_source("live transcript"),
-        );
-        analysis.decisions.push(decision);
-    }
+    // NOTE: action items + decisions are NOT extracted here anymore. The old
+    // per-segment keyword heuristic ("please", "follow up", "we decided")
+    // produced fragment garbage ("do", "follow up on") because it matched
+    // trigger words on chopped transcript pieces. They now come from the
+    // verified AI ledger (crate::ledger — Owner→action item, Decision→decision),
+    // which reads a whole transcript window and copies verbatim quotes. This
+    // function only surfaces live answer + context cards.
 
     if analysis.cards.is_empty() && meeting.transcript.len() % 5 == 4 {
         analysis.cards.push(
@@ -411,84 +400,6 @@ fn question_title(text: &str) -> String {
     format!("Q: {}...", &clean[..96])
 }
 
-fn extract_action_item(text: &str, lower: &str) -> Option<String> {
-    let trimmed = text.trim().trim_matches('-').trim();
-    for marker in ["action item", "todo", "to do"] {
-        if let Some(index) = lower.find(marker) {
-            let start = index + marker.len();
-            let action = text
-                .get(start..)
-                .unwrap_or(trimmed)
-                .trim()
-                .trim_start_matches([':', '-', ' '])
-                .trim();
-            if !action.is_empty() {
-                return Some(action.to_string());
-            }
-        }
-    }
-
-    for prefix in ["please ", "can you ", "could you "] {
-        if lower.starts_with(prefix) {
-            let action = text
-                .get(prefix.len()..)
-                .unwrap_or(trimmed)
-                .trim()
-                .trim_start_matches([':', '-', ' '])
-                .trim();
-            if !action.is_empty() {
-                return Some(action.to_string());
-            }
-        }
-    }
-
-    let inline_markers = [
-        "action item",
-        "todo",
-        "to do",
-        "please ",
-        "can you ",
-        "could you ",
-        "i will ",
-        "i'll ",
-        "we need to ",
-        "let's follow up",
-        "follow up",
-    ];
-
-    if inline_markers.iter().any(|marker| lower.contains(marker)) {
-        return Some(trimmed.to_string());
-    }
-
-    None
-}
-
-fn extract_decision(text: &str, lower: &str) -> Option<String> {
-    let markers = [
-        "we decided",
-        "decision:",
-        "decided to",
-        "let's go with",
-        "we will use",
-        "we are going with",
-        "approved",
-    ];
-
-    if markers.iter().any(|marker| lower.contains(marker)) {
-        return Some(text.trim().to_string());
-    }
-
-    None
-}
-
-fn extract_owner(text: &str) -> Option<String> {
-    let lower = text.to_lowercase();
-    if lower.contains("i will") || lower.contains("i'll") {
-        return Some("you".to_string());
-    }
-    None
-}
-
 fn compact_context(meeting: &MeetingRecord, count: usize) -> String {
     let context = meeting.last_transcript_text(count);
     if context.is_empty() {
@@ -551,7 +462,11 @@ mod tests {
     }
 
     #[test]
-    fn detects_question_action_and_decision_cards() {
+    fn detects_question_but_not_action_or_decision() {
+        // analyze_segment surfaces a live ANSWER card for a question, but no
+        // longer extracts action items / decisions per-segment — those now come
+        // from the verified AI ledger (the old keyword heuristic produced
+        // fragment garbage). So the structured fields stay empty here.
         let mut meeting = MeetingRecord::new(Some("Test".to_string()));
         let segment = TranscriptSegment::new(
             Speaker::System,
@@ -562,13 +477,18 @@ mod tests {
 
         let analysis = analyze_segment(&segment, &meeting);
 
-        assert!(analysis.cards.len() >= 2);
-        assert_eq!(analysis.action_items.len(), 1);
-        assert_eq!(analysis.action_items[0].text, "I will update the runbook.");
+        // A question still produces an answer card.
+        assert!(analysis
+            .cards
+            .iter()
+            .any(|c| matches!(c.kind, crate::CardKind::Answer)));
+        // Action items / decisions are NOT extracted here anymore.
+        assert!(analysis.action_items.is_empty());
+        assert!(analysis.decisions.is_empty());
     }
 
     #[test]
-    fn detects_decision() {
+    fn analyze_segment_does_not_heuristically_extract_decisions() {
         let meeting = MeetingRecord::new(Some("Test".to_string()));
         let segment = TranscriptSegment::new(
             Speaker::System,
@@ -577,7 +497,8 @@ mod tests {
         );
 
         let analysis = analyze_segment(&segment, &meeting);
-        assert_eq!(analysis.decisions.len(), 1);
+        // No per-segment decision extraction — the AI ledger owns this now.
+        assert!(analysis.decisions.is_empty());
     }
 
     #[test]

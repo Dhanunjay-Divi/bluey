@@ -138,23 +138,27 @@ impl TranscriptSegment {
             // The mic channel is always the user — keep the reliable "You".
             (true, _) => self.speaker.display_label().to_string(),
             // A resolved individual on the far side (1-based; + co-speakers).
-            (false, Some(id)) => {
-                let mut label = format!("Speaker {}", id + 1);
-                if !self.secondary_speaker_ids.is_empty() {
-                    let others: Vec<String> = self
-                        .secondary_speaker_ids
-                        .iter()
-                        .map(|s| (s + 1).to_string())
-                        .collect();
-                    label.push_str(" + ");
-                    label.push_str(&others.join(" + "));
-                }
-                label
-            }
+            (false, Some(id)) => speaker_display_label(id, &self.secondary_speaker_ids),
             // No diarization yet — coarse channel label ("They"/"Other"/…).
             (false, None) => self.speaker.display_label().to_string(),
         }
     }
+}
+
+/// The single source of truth for a diarized speaker's display label. Ids are
+/// **1-based** ("Speaker 2", not 1) so the overlay, the rehydrate wire, the dev
+/// socket, AND the AI-context transcript all name the same person identically.
+/// A talk-over fragment appends its co-speakers ("Speaker 2 + 3"). Used by
+/// `TranscriptSegment::context_label` (AI), the daemon's live overlay upgrade,
+/// and `to_wire_line` (snapshot) — one place to change the format.
+pub fn speaker_display_label(primary: i64, secondary: &[i64]) -> String {
+    let mut label = format!("Speaker {}", primary + 1);
+    if !secondary.is_empty() {
+        let others: Vec<String> = secondary.iter().map(|s| (s + 1).to_string()).collect();
+        label.push_str(" + ");
+        label.push_str(&others.join(" + "));
+    }
+    label
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

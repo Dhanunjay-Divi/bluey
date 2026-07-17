@@ -29,6 +29,17 @@ pub const LOOKAHEAD_SECS: u64 = 600;
 /// Poll cadence.
 pub const POLL_SECS: u64 = 30;
 
+/// One meeting participant (invitee or organizer) from the calendar event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Participant {
+    /// Display name when the calendar provides one (else empty).
+    pub name: String,
+    /// Email address, parsed from the participant's `mailto:` URL (else empty).
+    pub email: String,
+    /// True for the meeting organizer.
+    pub is_organizer: bool,
+}
+
 /// One upcoming meeting occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpcomingEvent {
@@ -38,6 +49,10 @@ pub struct UpcomingEvent {
     /// Occurrence start (epoch seconds) — part of the dedupe key so a MOVED
     /// event re-arms.
     pub start_epoch_secs: u64,
+    /// The meeting's invitees + organizer, when the calendar exposes them
+    /// (EventKit does; the env fake leaves it empty). Names + emails let Bluey
+    /// map diarized speakers to real people and hand the agent the roster.
+    pub participants: Vec<Participant>,
 }
 
 /// Where upcoming events come from (EventKit or the env fake).
@@ -45,6 +60,164 @@ pub trait CalendarSource: Send + 'static {
     /// Events starting within `[now, now + LOOKAHEAD_SECS]`. Fail-soft:
     /// permission denied / source errors return an empty list.
     fn upcoming(&self, now_epoch_secs: u64) -> Vec<UpcomingEvent>;
+}
+
+/// Real system-calendar source via EventKit (macOS, feature `calendar`). Reads
+/// the user's connected accounts (Outlook / Google / iCloud) through the OS
+/// Calendar — an Outlook meeting added on the Mac shows up here automatically.
+/// Requires the user's TCC consent; denied / not-yet-granted / any error returns
+/// an empty list (the trait's fail-soft contract — never crash, never loop).
+///
+/// Stateless by design: EventKit's `EKEventStore` is NOT `Send`/`Sync`, but the
+/// `CalendarSource` trait is `Send + 'static` (it runs on a tokio task). So the
+/// store is created fresh inside each `upcoming()` call (on that call's thread)
+/// and never held across an await/thread boundary. Creating a store is cheap
+/// relative to the poll cadence (30s).
+#[cfg(all(feature = "calendar", target_os = "macos"))]
+pub struct EventKitSource {
+    /// Fire the one-time access request the first time we read (so the macOS
+    /// permission prompt appears), tracked with an atomic so we don't re-request.
+    requested: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(all(feature = "calendar", target_os = "macos"))]
+impl EventKitSource {
+    pub fn new() -> Self {
+        Self {
+            requested: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[cfg(all(feature = "calendar", target_os = "macos"))]
+impl Default for EventKitSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(all(feature = "calendar", target_os = "macos"))]
+impl CalendarSource for EventKitSource {
+    fn upcoming(&self, now: u64) -> Vec<UpcomingEvent> {
+        use objc2::rc::autoreleasepool;
+        use objc2_event_kit::{EKAuthorizationStatus, EKEntityType, EKEventStore};
+        use objc2_foundation::NSDate;
+        use std::sync::atomic::Ordering;
+
+        autoreleasepool(|_| unsafe {
+            // Store lives only within this call (not Send — see the type doc).
+            let store = EKEventStore::new();
+
+            // First read: fire the access request so the OS prompt appears. The
+            // completion block is required by the API; we don't act on it — the
+            // next poll re-checks the authorization status.
+            if !self.requested.swap(true, Ordering::Relaxed) {
+                let completion = block2::RcBlock::new(
+                    |_granted: objc2::runtime::Bool, _err: *mut objc2_foundation::NSError| {},
+                );
+                // The API wants a raw `*mut Block`; RcBlock derefs to Block.
+                store.requestFullAccessToEventsWithCompletion(&*completion as *const _ as *mut _);
+            }
+
+            // Fail-soft until the user grants full access.
+            if EKEventStore::authorizationStatusForEntityType(EKEntityType::Event)
+                != EKAuthorizationStatus::FullAccess
+            {
+                return Vec::new();
+            }
+
+            let start = NSDate::dateWithTimeIntervalSince1970(now as f64);
+            let end = NSDate::dateWithTimeIntervalSince1970((now + LOOKAHEAD_SECS) as f64);
+            // `None` calendars = all of them (every connected account).
+            let predicate =
+                store.predicateForEventsWithStartDate_endDate_calendars(&start, &end, None);
+            let events = store.eventsMatchingPredicate(&predicate);
+            // Index-based iteration avoids extra objc2-foundation features.
+            let mut out = Vec::new();
+            for i in 0..events.count() {
+                let ev = events.objectAtIndex(i);
+                let start_secs = ev.startDate().timeIntervalSince1970();
+                if !start_secs.is_finite() || start_secs < 0.0 {
+                    continue;
+                }
+                // Stable id: the event identifier when present, else the title
+                // (dedupe is keyed by (id, occurrence_start), so a moved event
+                // still re-arms via the changed start).
+                let title = ev.title().to_string();
+                let id = ev
+                    .eventIdentifier()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("ek-{title}"));
+
+                // Participants: attendees + the organizer (names + emails), so
+                // Bluey can map speakers to real people and give the agent the
+                // roster. Any provider (Outlook/Google/iCloud) fills these.
+                let mut participants = Vec::new();
+                let organizer_email = ev.organizer().and_then(|o| participant_email(&o));
+                if let Some(attendees) = ev.attendees() {
+                    for j in 0..attendees.count() {
+                        let p = attendees.objectAtIndex(j);
+                        let name = p.name().map(|s| s.to_string()).unwrap_or_default();
+                        let email = participant_email(&p).unwrap_or_default();
+                        let is_organizer =
+                            !email.is_empty() && organizer_email.as_deref() == Some(email.as_str());
+                        participants.push(Participant {
+                            name,
+                            email,
+                            is_organizer,
+                        });
+                    }
+                }
+
+                out.push(UpcomingEvent {
+                    id,
+                    title,
+                    start_epoch_secs: start_secs as u64,
+                    participants,
+                });
+            }
+            out
+        })
+    }
+}
+
+/// Parse a participant's email from its EventKit `URL` (a `mailto:` NSURL).
+/// Returns None when the URL isn't a mailto or is absent.
+#[cfg(all(feature = "calendar", target_os = "macos"))]
+fn participant_email(p: &objc2_event_kit::EKParticipant) -> Option<String> {
+    // SAFETY: reading the participant's own URL + its string form.
+    unsafe {
+        let url = p.URL();
+        let s = url.absoluteString()?.to_string();
+        s.strip_prefix("mailto:").map(|e| e.to_string())
+    }
+}
+
+/// A source that never yields events — the fallback when neither the env fake
+/// nor a real calendar backend is available.
+pub struct NoopSource;
+
+impl CalendarSource for NoopSource {
+    fn upcoming(&self, _now: u64) -> Vec<UpcomingEvent> {
+        Vec::new()
+    }
+}
+
+/// Pick the calendar source the daemon should poll: the env fake when
+/// `BLUEY_CALENDAR_FAKE_EVENTS` is set (the deterministic test hook wins so a
+/// test never races the real calendar), else the real EventKit source when the
+/// `calendar` feature is compiled on macOS, else a no-op (the trigger stays
+/// dormant rather than erroring).
+pub fn default_source() -> Box<dyn CalendarSource> {
+    if std::env::var("BLUEY_CALENDAR_FAKE_EVENTS").is_ok() {
+        return Box::new(EnvFakeSource);
+    }
+    #[cfg(all(feature = "calendar", target_os = "macos"))]
+    {
+        return Box::new(EventKitSource::new());
+    }
+    #[allow(unreachable_code)]
+    Box::new(NoopSource)
 }
 
 /// The env-driven fake (`BLUEY_CALENDAR_FAKE_EVENTS="Standup@1783560000;…"`).
@@ -63,6 +236,7 @@ impl CalendarSource for EnvFakeSource {
                     id: format!("fake-{}", title.trim()),
                     title: title.trim().to_string(),
                     start_epoch_secs: start,
+                    participants: Vec::new(), // the fake carries no roster
                 })
             })
             .filter(|e| e.start_epoch_secs >= now && e.start_epoch_secs <= now + LOOKAHEAD_SECS)
@@ -120,6 +294,7 @@ mod tests {
             id: id.to_string(),
             title: id.to_string(),
             start_epoch_secs: start,
+            participants: Vec::new(),
         }
     }
 

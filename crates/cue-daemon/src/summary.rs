@@ -32,7 +32,7 @@ pub const WINDOW_MAX_CHARS: usize = 3_500;
 pub const SUMMARY_MAX_CHARS: usize = 1_800;
 
 /// How many segments between passes (env `BLUEY_SUMMARY_INTERVAL_SEGMENTS`,
-/// min 8).
+/// min 8). Retained for window sizing; the FIRE cadence is word-based below.
 pub fn interval_segments() -> usize {
     env::var("BLUEY_SUMMARY_INTERVAL_SEGMENTS")
         .ok()
@@ -41,13 +41,31 @@ pub fn interval_segments() -> usize {
         .unwrap_or(DEFAULT_INTERVAL_SEGMENTS)
 }
 
-/// Should a summary pass fire at this transcript length? Fires once per
-/// interval boundary, offset from the ledger's boundaries by construction
-/// (different default intervals) so the two passes don't always stack on the
-/// same tick.
-pub fn should_fire(transcript_len: usize) -> bool {
-    let n = interval_segments();
-    transcript_len >= n && transcript_len.is_multiple_of(n)
+/// Words of new transcript between summary passes. WORD-based (not segment-
+/// based) so cadence is insensitive to STT fragmentation — the direct-emit path
+/// yields ~2-word fragments, so a segment trigger re-summarized every ~10s (an
+/// LLM call each, the costliest of the background passes). ~450 words ≈ 3 min of
+/// speech. The summary is a RUNNING summary (each pass folds in everything since
+/// the last), so it can lag more than the ledger without losing information — it
+/// catches up on the next pass. ~700 words ≈ 5 min: coarser than the ledger's
+/// 350 so the two passes don't stack, and it's cumulative so staleness is cheap.
+/// Override with `BLUEY_SUMMARY_INTERVAL_WORDS`.
+pub const DEFAULT_INTERVAL_WORDS: usize = 700;
+
+/// Words between summary passes (env `BLUEY_SUMMARY_INTERVAL_WORDS`, min 80).
+pub fn interval_words() -> usize {
+    env::var("BLUEY_SUMMARY_INTERVAL_WORDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(80))
+        .unwrap_or(DEFAULT_INTERVAL_WORDS)
+}
+
+/// Should a summary pass fire, given total transcript words and the words at the
+/// last fire? Fires once per `interval_words()` boundary crossed.
+pub fn should_fire_words(total_words: usize, last_fired_words: usize) -> bool {
+    let n = interval_words();
+    total_words >= last_fired_words + n
 }
 
 /// Build the one-shot summarization prompt: update the running summary with
@@ -103,13 +121,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_fire_respects_interval() {
-        // default 24
-        assert!(!should_fire(0));
-        assert!(!should_fire(23));
-        assert!(should_fire(24));
-        assert!(!should_fire(25));
-        assert!(should_fire(48));
+    fn should_fire_words_respects_interval() {
+        // default 700 words between summary passes.
+        assert!(!should_fire_words(0, 0));
+        assert!(!should_fire_words(699, 0));
+        assert!(should_fire_words(700, 0));
+        // Next boundary after a fire at 700 is 1400.
+        assert!(!should_fire_words(1399, 700));
+        assert!(should_fire_words(1400, 700));
     }
 
     #[test]

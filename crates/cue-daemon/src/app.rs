@@ -705,24 +705,42 @@ fn transcript_age_ms(created_at: &str, now_ms: u64) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-/// Partial→Final dedup: when a final transcript arrives, remove the most recent
-/// partial from the same speaker if the final text starts with (or equals) the
-/// partial text (case-insensitive, whitespace-normalized).
+/// Remove the most recent still-open partial from the same speaker so an
+/// incoming partial REPLACES it rather than piling up. The sentence assembler
+/// emits a cumulative growing partial each tick; without this every growth step
+/// ("Chair okay" → "Chair okay are" → …) would persist as its own segment. Only
+/// touches non-final (partial) segments — committed finals are never removed.
 /// Returns true if a partial was removed.
+pub fn replace_open_partial(meeting: &mut MeetingRecord, speaker: Speaker) -> bool {
+    if let Some(idx) = meeting
+        .transcript
+        .iter()
+        .rposition(|seg| !seg.is_final && seg.speaker == speaker)
+    {
+        meeting.transcript.remove(idx);
+        return true;
+    }
+    false
+}
+
+/// Partial→Final dedup: when a final transcript arrives, remove the most recent
+/// still-open PARTIAL from the same speaker if the final text starts with (or
+/// equals) the partial text. The STT path emits only Finals today (clean engine
+/// deltas that append cleanly), so this is a no-op in practice — but external
+/// providers (Deepgram) still send partials, so the guard stays. Returns true if
+/// a partial was removed.
 pub fn dedup_partial_on_final(
     meeting: &mut MeetingRecord,
     speaker: Speaker,
     final_text: &str,
 ) -> bool {
     let norm_final = normalize_transcript_text(final_text);
-    // Search backwards for the most recent non-final segment from same speaker
     if let Some(idx) = meeting
         .transcript
         .iter()
         .rposition(|seg| !seg.is_final && seg.speaker == speaker)
     {
         let norm_partial = normalize_transcript_text(&meeting.transcript[idx].text);
-        // Final supersedes partial if final starts with partial text
         if norm_final.starts_with(&norm_partial) || norm_partial.starts_with(&norm_final) {
             meeting.transcript.remove(idx);
             return true;
@@ -1044,9 +1062,15 @@ pub(crate) struct Daemon {
     /// re-fragment into a fresh 1-line meeting. `None` when no session is running.
     system_audio_task: Mutex<Option<JoinHandle<()>>>,
     /// Running decisions ledger for the active meeting (see [`crate::ledger`]).
-    /// Populated by stateless cheap-lane extraction every N turns; rendered as a
-    /// pinned context block on the answer path. Reset when a new meeting starts.
+    /// Populated by stateless cheap-lane extraction on a WORD-count cadence;
+    /// rendered as a pinned context block on the answer path. Reset per meeting.
     ledger: Mutex<cue_core::LedgerState>,
+    /// Transcript word count at the LAST ledger extraction — the word-based fire
+    /// gate compares against this so a pass runs once per ~N new words (not per N
+    /// tiny fragments). Reset to 0 whenever the ledger resets (new meeting).
+    last_ledger_words: std::sync::atomic::AtomicUsize,
+    /// Same word-count gate for the running SUMMARY pass (see `crate::summary`).
+    last_summary_words: std::sync::atomic::AtomicUsize,
     live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
     rag: Option<Arc<crate::db::rag::RagPipeline>>,
     rag_index_lock: Arc<Mutex<()>>,
@@ -1338,6 +1362,8 @@ pub async fn run() -> Result<()> {
         system_audio: Mutex::new(None),
         system_audio_task: Mutex::new(None),
         ledger: Mutex::new(cue_core::LedgerState::default()),
+        last_ledger_words: std::sync::atomic::AtomicUsize::new(0),
+        last_summary_words: std::sync::atomic::AtomicUsize::new(0),
         live_transcript_tx: broadcast::channel(64).0,
         rag: rag_pipeline,
         rag_index_lock: Arc::new(Mutex::new(())),
@@ -1473,21 +1499,19 @@ pub async fn run() -> Result<()> {
     }
 
     // Calendar trigger: poll upcoming meetings and fire the warm backend at
-    // T-minus WARM_LEAD_SECS, exactly once per (event, occurrence). Source is
-    // the env fake for now (`BLUEY_CALENDAR_FAKE_EVENTS` — the same test-hook
-    // pattern as BLUEY_AUDIO_WAV_FILE, driving the FULL trigger path);
-    // EventKit lands behind a `calendar` feature once the packaged app carries
-    // the TCC usage string. Deterministic Rust owns the clock — the trigger
-    // never routes through the agent.
+    // T-minus WARM_LEAD_SECS, exactly once per (event, occurrence). The source is
+    // chosen by `default_source()`: the `BLUEY_CALENDAR_FAKE_EVENTS` test hook
+    // wins, else the real EventKit calendar (feature `calendar`, macOS — reads
+    // the user's connected Outlook/Google/iCloud accounts), else a no-op.
+    // Deterministic Rust owns the clock — the trigger never routes through the agent.
     {
         let daemon_cal = daemon.clone();
         tokio::spawn(async move {
-            let source = crate::calendar::EnvFakeSource;
+            let source = crate::calendar::default_source();
             let mut fired = std::collections::HashSet::new();
             let mut tick = tokio::time::interval(crate::calendar::poll_interval());
             loop {
                 tick.tick().await;
-                use crate::calendar::CalendarSource;
                 let now = crate::calendar::now_epoch_secs();
                 let events = source.upcoming(now);
                 for event in crate::calendar::due_for_warmup(&events, &fired, now) {
@@ -1636,6 +1660,12 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                 if let Some(meeting) = created {
                     // Fresh listening session → fresh ledger (no cross-meeting bleed).
                     *daemon.ledger.lock().await = cue_core::LedgerState::default();
+                    daemon
+                        .last_ledger_words
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    daemon
+                        .last_summary_words
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                     update_state_from_meeting(daemon, Some(&meeting)).await?;
                 }
             }
@@ -2057,6 +2087,12 @@ async fn handle_request_inner(
 
             // Fresh meeting → fresh ledger (no cross-meeting bleed).
             *daemon.ledger.lock().await = cue_core::LedgerState::default();
+            daemon
+                .last_ledger_words
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            daemon
+                .last_summary_words
+                .store(0, std::sync::atomic::Ordering::Relaxed);
 
             update_state_from_meeting(daemon, Some(&meeting)).await?;
             let card = CueCard::new(
@@ -2133,6 +2169,15 @@ async fn handle_request_inner(
                 if is_near_duplicate_transcript(meeting, speaker, &text, is_final) {
                     None
                 } else {
+                    // Same replace-open-partial rule as the live-audio path: a
+                    // growing partial replaces the prior open partial in place; a
+                    // final supersedes it. Without this, streamed partials pile up
+                    // as cumulative-duplicated segments.
+                    if !is_final {
+                        replace_open_partial(meeting, speaker);
+                    } else {
+                        dedup_partial_on_final(meeting, speaker, text.trim());
+                    }
                     let segment = TranscriptSegment::new(speaker, text, is_final)
                         .with_audio_start_secs(audio_start_secs);
                     meeting.transcript.push(segment.clone());
@@ -4171,6 +4216,12 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                         "continue: failed to archive outgoing active meeting");
                 }
                 *daemon.ledger.lock().await = cue_core::LedgerState::default();
+                daemon
+                    .last_ledger_words
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                daemon
+                    .last_summary_words
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
             }
 
             // (b) Load the target. A missing/failed target leaves state clean (the
@@ -4275,22 +4326,11 @@ fn to_wire_line(segment: &TranscriptSegment) -> MeetingTranscriptLine {
         source: speaker_channel(segment.speaker).to_string(),
         // Diarized display label when the live/post pass has resolved one (the
         // rehydrate/past-meeting paths carry labels this way; live lines get
-        // theirs via OverlayCommand::TranscriptSpeaker upgrades instead). A
-        // talk-over fragment surfaces its co-speakers ("Speaker 2 + 3") rather
-        // than hiding that more than one voice was in the line.
-        speaker: segment.speaker_id.map(|id| {
-            let mut label = format!("Speaker {}", id + 1);
-            if !segment.secondary_speaker_ids.is_empty() {
-                let others: Vec<String> = segment
-                    .secondary_speaker_ids
-                    .iter()
-                    .map(|s| (s + 1).to_string())
-                    .collect();
-                label.push_str(" + ");
-                label.push_str(&others.join(" + "));
-            }
-            label
-        }),
+        // theirs via OverlayCommand::TranscriptSpeaker upgrades instead). Uses
+        // the shared cue-core helper so overlay/wire/AI-context labels never drift.
+        speaker: segment
+            .speaker_id
+            .map(|id| cue_core::meeting::speaker_display_label(id, &segment.secondary_speaker_ids)),
         text: segment.text.clone(),
         is_final: true,
     }
@@ -7137,6 +7177,12 @@ async fn auto_end_active_meeting(daemon: &Arc<Daemon>) -> Result<Option<MeetingR
     let path = daemon.store.archive(&meeting)?;
     // Meeting over → clear the ledger so a later ad-hoc meeting starts clean.
     *daemon.ledger.lock().await = cue_core::LedgerState::default();
+    daemon
+        .last_ledger_words
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    daemon
+        .last_summary_words
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     update_state_from_meeting(daemon, None).await?;
     debug!(meeting_id = %meeting.id, path = %path.display(), "meeting auto-ended and archived");
     // R10: Auto-recap via LLM (best-effort, fire-and-forget).
@@ -7441,6 +7487,12 @@ async fn warmup_open(daemon: &Arc<Daemon>, title: Option<String>) -> Result<Warm
                 *meeting_guard = Some(meeting.clone());
                 drop(meeting_guard);
                 *daemon.ledger.lock().await = cue_core::LedgerState::default();
+                daemon
+                    .last_ledger_words
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                daemon
+                    .last_summary_words
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
                 update_state_from_meeting(daemon, Some(&meeting)).await?;
                 t
             }
@@ -7482,20 +7534,83 @@ async fn warmup_stop(daemon: &Arc<Daemon>) -> Result<DaemonResponse> {
     Ok(DaemonResponse::Ok)
 }
 
+/// Mirror the verified AI ledger into the meeting's structured `action_items`
+/// and `decisions` (Owner → action item, Decision → decision). The ledger is the
+/// authoritative accumulated set for the meeting, so this REPLACES the fields
+/// (idempotent across re-runs — no duplication) rather than appending. Owner
+/// items carry `owner` + `task`; a Decision/Constraint carries a normalized
+/// statement. Cheap: pure in-memory mapping, no LLM call.
+fn apply_ledger_to_meeting(meeting: &mut MeetingRecord, verified: &[cue_core::LedgerItem]) {
+    use cue_core::LedgerKind;
+    let mut action_items = Vec::new();
+    let mut decisions = Vec::new();
+    for item in verified {
+        match item.kind {
+            LedgerKind::Owner => {
+                action_items.push(cue_core::ActionItem::new(
+                    item.text.clone(),
+                    item.speaker.clone(),
+                    None,
+                ));
+            }
+            LedgerKind::Decision => {
+                decisions.push(cue_core::Decision::new(item.text.clone(), None));
+            }
+            // Constraints are surfaced via the rendered ledger block, not as
+            // action items or decisions.
+            LedgerKind::Constraint => {}
+        }
+    }
+    // Only overwrite when the AI produced something for that kind, so a pass that
+    // happens to surface only decisions doesn't wipe previously-found action items.
+    if !action_items.is_empty() {
+        meeting.action_items = action_items;
+    }
+    if !decisions.is_empty() {
+        meeting.decisions = decisions;
+    }
+}
+
 fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
-    let len = meeting.transcript.len();
-    if !crate::ledger::should_fire(len) {
+    // WORD-count cadence (not segment count): the direct-emit STT produces
+    // ~2-word fragments, so a segment trigger fired every ~13s (~130 calls in a
+    // 30-min meeting). Count words of transcript and fire once per ~N new words —
+    // predictable cost regardless of fragmentation, and the user's agent isn't
+    // spammed with near-empty extractions.
+    let total_words: usize = meeting
+        .transcript
+        .iter()
+        .map(|s| s.text.split_whitespace().count())
+        .sum();
+    let last_words = daemon
+        .last_ledger_words
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if !crate::ledger::should_fire_words(total_words, last_words) {
         return;
     }
     // Settings read only on interval boundaries — never per-segment.
     if !live_memory_enabled(daemon) {
         return;
     }
+    // Mark this word boundary as fired now (before the async spawn) so rapid
+    // successive segments in the same window don't each launch an extraction.
+    daemon
+        .last_ledger_words
+        .store(total_words, std::sync::atomic::Ordering::Relaxed);
     let window = crate::ledger::build_window(&meeting.last_transcript_text_bounded(
         crate::ledger::interval_turns(),
         crate::ledger::WINDOW_MAX_CHARS,
     ));
     if window.trim().is_empty() {
+        return;
+    }
+    // Content gate: skip the LLM call when this window is only backchannel /
+    // filler ("yeah", "mm-hmm", silence) — nothing to extract. The word boundary
+    // is already consumed above, so the next attempt waits another interval.
+    // Cost then tracks MEANINGFUL conversation, not clock time. (min 5 distinct
+    // content words ≈ a real statement worth extracting.)
+    if !cue_core::ledger::has_extractable_substance(&window, 5) {
+        debug!("ledger: window has no extractable substance; skipping pass");
         return;
     }
     let meeting_id = meeting.id;
@@ -7533,17 +7648,26 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                 // so a late extraction from an ended meeting must not bleed
                 // into the next meeting's ledger. (Cross-meeting indexing
                 // below is unaffected — facts carry their own meeting id.)
-                let still_active = {
-                    let guard = daemon.meeting.lock().await;
-                    guard.as_ref().map(|m| m.id) == Some(meeting_id)
-                };
-                let (added, block) = if still_active {
-                    let mut ledger = daemon.ledger.lock().await;
-                    let added = ledger.merge(verified);
-                    (added, ledger.render())
-                } else {
-                    debug!("ledger: meeting ended mid-extraction; merge discarded");
-                    (0, None)
+                // Mirror the verified AI ledger into the meeting's structured
+                // action_items + decisions (the fields the UI / recap / summary
+                // read). These REPLACE the old per-segment keyword heuristic that
+                // produced fragment garbage — same extraction, no extra LLM call.
+                // Owner items → action items; Decision items → decisions.
+                let (added, block) = {
+                    let mut guard = daemon.meeting.lock().await;
+                    match guard.as_mut() {
+                        Some(m) if m.id == meeting_id => {
+                            apply_ledger_to_meeting(m, &verified);
+                            let _ = daemon.store.save_active(m);
+                            let mut ledger = daemon.ledger.lock().await;
+                            let added = ledger.merge(verified);
+                            (added, ledger.render())
+                        }
+                        _ => {
+                            debug!("ledger: meeting ended mid-extraction; merge discarded");
+                            (0, None)
+                        }
+                    }
                 };
                 // Long-term consolidation — the Mem0 update phase (Appendix
                 // E.1 phase 2): the agent decides ADD/UPDATE/DELETE/NONE for
@@ -7642,9 +7766,17 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
 /// meeting end. Fire-and-forget; the inflight guard stops passes stacking when
 /// the agent is slow.
 fn maybe_fire_summary(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
-    use std::sync::atomic::Ordering::SeqCst;
-    let len = meeting.transcript.len();
-    if !crate::summary::should_fire(len) {
+    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+    // Word-count cadence (see maybe_fire_ledger for the rationale — the same
+    // fragmentation over-firing applied here, and re-summarizing is the costliest
+    // background call). Fire once per ~N new words.
+    let total_words: usize = meeting
+        .transcript
+        .iter()
+        .map(|s| s.text.split_whitespace().count())
+        .sum();
+    let last_words = daemon.last_summary_words.load(Relaxed);
+    if !crate::summary::should_fire_words(total_words, last_words) {
         return;
     }
     if !live_memory_enabled(daemon) {
@@ -7653,11 +7785,16 @@ fn maybe_fire_summary(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     if daemon.summary_inflight.swap(true, SeqCst) {
         return; // a pass is already running; this boundary is skipped
     }
+    // Mark this boundary fired now so rapid successive segments don't re-launch.
+    daemon.last_summary_words.store(total_words, Relaxed);
     let window = meeting.last_transcript_text_bounded(
         crate::summary::interval_segments(),
         crate::summary::WINDOW_MAX_CHARS,
     );
-    if window.trim().is_empty() {
+    // Skip an empty OR substance-free window (only backchannel/filler) — nothing
+    // to summarize. MUST clear the inflight flag on this early return, or the
+    // summary stays disabled for the session.
+    if window.trim().is_empty() || !cue_core::ledger::has_extractable_substance(&window, 5) {
         daemon.summary_inflight.store(false, SeqCst);
         return;
     }
@@ -7799,8 +7936,16 @@ async fn add_audio_transcript_segment_inner(
         if is_near_duplicate_transcript(meeting, speaker, text, segment.is_final) {
             return Ok(());
         }
-        // Dedup: if this is a final, remove superseded partial from same speaker
-        if segment.is_final {
+        // The sentence assembler streams a GROWING partial each tick ("Chair
+        // okay" → "Chair okay are" → …). A partial must REPLACE the previous
+        // open partial from the same speaker IN PLACE, not append — otherwise
+        // every growth step piles up as its own segment (the cumulative-
+        // duplication bug). Finals still supersede the last partial via
+        // dedup_partial_on_final below.
+        if !segment.is_final {
+            replace_open_partial(meeting, speaker);
+        } else {
+            // Dedup: a final removes the superseded partial from the same speaker.
             dedup_partial_on_final(meeting, speaker, text);
         }
         let transcript_segment = TranscriptSegment::new(speaker, text_raw, segment.is_final)
@@ -13984,6 +14129,55 @@ fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_partials_replace_not_pile_up() {
+        // The assembler streams a GROWING partial each tick. Each new partial
+        // must REPLACE the prior open one, not accumulate prefix-duplicated lines.
+        let mut m = MeetingRecord::new(Some("t".into()));
+        let push_partial = |m: &mut MeetingRecord, s: &str| {
+            replace_open_partial(m, Speaker::System);
+            m.transcript
+                .push(TranscriptSegment::new(Speaker::System, s, false));
+        };
+        push_partial(&mut m, "Chair okay");
+        push_partial(&mut m, "Chair okay are");
+        push_partial(&mut m, "Chair okay are there");
+        assert_eq!(m.transcript.len(), 1);
+        assert_eq!(m.transcript[0].text, "Chair okay are there");
+
+        // A final supersedes the partial (not append-on-top).
+        dedup_partial_on_final(&mut m, Speaker::System, "Chair okay are there any");
+        m.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            "Chair okay are there any",
+            true,
+        ));
+        assert_eq!(m.transcript.len(), 1);
+        assert!(m.transcript[0].is_final);
+        assert_eq!(m.transcript[0].text, "Chair okay are there any");
+    }
+
+    #[test]
+    fn direct_emit_finals_append_without_duplication() {
+        // The STT path now emits each clean engine DELTA as its own Final ("Hey",
+        // " Daniel", " welcome") — they simply append, no cumulative growth, so
+        // NOTHING dedupes them and the transcript reads as flowing text. This is
+        // the proven July-9 behavior restored (the sentence-assembler that
+        // re-emitted a growing sentence and caused the cascade is gone).
+        let mut m = MeetingRecord::new(Some("t".into()));
+        for delta in ["Hey", " Daniel", " welcome back Eric"] {
+            // A final with no matching OPEN partial removes nothing (no partials).
+            dedup_partial_on_final(&mut m, Speaker::System, delta);
+            m.transcript
+                .push(TranscriptSegment::new(Speaker::System, delta, true));
+        }
+        // Three distinct deltas → three appended segments, none merged/duplicated.
+        assert_eq!(m.transcript.len(), 3);
+        assert_eq!(m.transcript[0].text, "Hey");
+        assert_eq!(m.transcript[1].text, " Daniel");
+        assert_eq!(m.transcript[2].text, " welcome back Eric");
+    }
 
     #[test]
     fn meeting_open_is_read_only_whenever_a_live_or_active_meeting_exists() {

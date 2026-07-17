@@ -353,8 +353,118 @@ fn strip_speaker_labels(window: &str) -> String {
         .join(" ")
 }
 
+/// Backchannel / filler tokens that carry no extractable substance. A window
+/// made only of these (plus punctuation) has nothing to summarize or extract, so
+/// firing an LLM pass on it is pure waste.
+const FILLER: &[&str] = &[
+    "yeah",
+    "yep",
+    "yes",
+    "no",
+    "nope",
+    "ok",
+    "okay",
+    "mm",
+    "mmm",
+    "hmm",
+    "hm",
+    "uh",
+    "um",
+    "uhh",
+    "umm",
+    "ah",
+    "oh",
+    "right",
+    "sure",
+    "gotcha",
+    "cool",
+    "nice",
+    "wow",
+    "huh",
+    "so",
+    "well",
+    "like",
+    "you",
+    "know",
+    "i",
+    "mean",
+    "just",
+    "really",
+    "actually",
+    "basically",
+    "thanks",
+    "thank",
+    "please",
+    "the",
+    "a",
+    "an",
+    "and",
+    "but",
+    "to",
+    "of",
+    "it",
+    "that",
+    "this",
+    "is",
+    "was",
+    "in",
+    "on",
+    "for",
+];
+
+/// Whether a transcript window has enough NEW substance to justify an LLM pass.
+/// Counts DISTINCT non-filler content words — silence, backchannel ("yeah",
+/// "mm-hmm"), and repetition all collapse to near-zero, so a quiet stretch costs
+/// nothing while a dense one still fires. `min_content_words` is the bar (a
+/// handful of distinct real words). This is the credit-optimal gate: cost tracks
+/// MEANINGFUL conversation, not clock time or fragment count.
+pub fn has_extractable_substance(window: &str, min_content_words: usize) -> bool {
+    use std::collections::HashSet;
+    let mut distinct: HashSet<String> = HashSet::new();
+    for raw in window.split_whitespace() {
+        let key: String = raw
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        if key.len() < 2 {
+            continue; // punctuation / single letters
+        }
+        if FILLER.contains(&key.as_str()) {
+            continue;
+        }
+        distinct.insert(key);
+        if distinct.len() >= min_content_words {
+            return true; // early out — enough substance
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
+    use super::has_extractable_substance;
+
+    #[test]
+    fn substance_gate_skips_filler_fires_on_content() {
+        // Pure backchannel → no substance (nothing to extract, skip the call).
+        assert!(!has_extractable_substance(
+            "yeah. mm-hmm. okay. right. uh, yeah.",
+            4
+        ));
+        // Silence / empty → no substance.
+        assert!(!has_extractable_substance("   ", 4));
+        // Repetition of the same word does NOT accumulate (distinct count).
+        assert!(!has_extractable_substance("budget budget budget budget", 4));
+        // Real content clears the bar.
+        assert!(has_extractable_substance(
+            "We will ship the phased rollout for the payments migration next quarter.",
+            4
+        ));
+        // Just below the bar with filler mixed in stays skipped.
+        assert!(!has_extractable_substance("okay so the budget thing", 4));
+    }
+
     use super::*;
 
     #[test]

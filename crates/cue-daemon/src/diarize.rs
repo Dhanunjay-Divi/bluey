@@ -179,27 +179,82 @@ async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize
             return;
         };
         session_id = meeting.id.to_string();
+
+        // BOUND THE SCAN (B1): the diarizer's turns only cover the recent rolling
+        // window, so a transcript segment older than the earliest turn (minus the
+        // nearest-fallback reach) can never match this tick. Skipping those makes
+        // per-tick cost proportional to segments-IN-WINDOW (constant ~dozens)
+        // instead of the whole transcript (unbounded on a long meeting) — the
+        // loop runs under the meeting lock the audio task contends with, so an
+        // O(total_segments × turns) scan is exactly the "eats words ~15 min in"
+        // class. Segments below the cutoff keep whatever label they already have.
+        let window_floor = segments
+            .iter()
+            .filter(|t| t.speaker >= 0)
+            .map(|t| t.start)
+            .fold(f64::INFINITY, f64::min);
+        let cutoff = if window_floor.is_finite() {
+            window_floor - NEAREST_FALLBACK_CAP_SECS
+        } else {
+            f64::NEG_INFINITY // no labelled turns → don't skip (nothing to do anyway)
+        };
+
         for seg in meeting.transcript.iter_mut() {
             // Only the far (system) side gets an individual id (mic = the user).
             if seg.speaker.is_me() {
                 continue;
             }
-            if let Some(SpeakerAssignment { primary, secondary }) = assign_speaker(seg, segments) {
-                // Re-broadcast when the primary OR the co-speaker set changed, so
-                // a fragment that turns out to be talk-over upgrades its label
-                // even if the dominant speaker stayed the same.
-                if seg.speaker_id != Some(primary) || seg.secondary_speaker_ids != secondary {
-                    seg.speaker_id = Some(primary);
-                    seg.secondary_speaker_ids = secondary.clone();
-                    let ts_ms = seg.created_at.parse::<u64>().unwrap_or(0);
-                    updates.push((
-                        seg.id.to_string(),
-                        seg.text.clone(),
-                        seg.speaker.to_string(),
-                        primary,
-                        secondary,
-                        ts_ms,
-                    ));
+            // Skip segments that ended before the window the turns cover.
+            if let Some(start) = seg.audio_start_secs {
+                let end = start + seg.audio_dur_secs.unwrap_or(DEFAULT_SEGMENT_DUR_SECS);
+                if end < cutoff {
+                    continue;
+                }
+            }
+            match assign_speaker(seg, segments) {
+                Some(SpeakerAssignment { primary, secondary }) => {
+                    // Re-broadcast when the primary OR the co-speaker SET changed.
+                    // Compare secondaries order-insensitively (B3): assign_speaker
+                    // ranks them by float share, which can reorder tick-to-tick for
+                    // near-equal co-speakers — an order-only diff would fire spurious
+                    // re-broadcasts and overlay label churn with no real change.
+                    let set_changed = seg.speaker_id != Some(primary)
+                        || !same_speaker_set(&seg.secondary_speaker_ids, &secondary);
+                    if set_changed {
+                        seg.speaker_id = Some(primary);
+                        seg.secondary_speaker_ids = secondary.clone();
+                        let ts_ms = seg.created_at.parse::<u64>().unwrap_or(0);
+                        updates.push((
+                            seg.id.to_string(),
+                            seg.text.clone(),
+                            seg.speaker.to_string(),
+                            primary,
+                            secondary,
+                            ts_ms,
+                        ));
+                    }
+                }
+                None => {
+                    // CLEAR STALE TALK-OVER (B2): a segment IN the window that now
+                    // resolves to no speaker had its label produced by an earlier
+                    // tick; if it previously carried co-speakers, drop them so a
+                    // stale "Speaker 2 + 3" can't persist into the record/AI context.
+                    // (Only clear secondaries — the primary label stays as a best
+                    // guess; None here means "no overlap this tick", not "wrong".)
+                    if !seg.secondary_speaker_ids.is_empty() {
+                        seg.secondary_speaker_ids.clear();
+                        let ts_ms = seg.created_at.parse::<u64>().unwrap_or(0);
+                        if let Some(primary) = seg.speaker_id {
+                            updates.push((
+                                seg.id.to_string(),
+                                seg.text.clone(),
+                                seg.speaker.to_string(),
+                                primary,
+                                Vec::new(),
+                                ts_ms,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -219,7 +274,7 @@ async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize
         // Upgrade the OVERLAY's already-rendered line in place. A clean line is
         // "Speaker N"; a talk-over line surfaces the co-speakers honestly rather
         // than silently attributing everyone's words to the dominant voice.
-        let label = speaker_display_label(speaker_id, &secondary);
+        let label = cue_core::meeting::speaker_display_label(speaker_id, &secondary);
         crate::app::push_transcript_speaker(daemon, seg_id, label).await;
         // Dev-view WebSocket (bluey listen) gets the same upgrade.
         crate::app::broadcast_speaker_update(
@@ -231,19 +286,6 @@ async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize
             ts_ms,
         );
     }
-}
-
-/// The display label for a fragment's speakers: `"Speaker N"` when a single
-/// voice, or `"Speaker N + M"` (co-speakers appended) when the fragment was
-/// talk-over. Ids are shown 1-based to match the rest of the UI.
-fn speaker_display_label(primary: i64, secondary: &[i64]) -> String {
-    let mut label = format!("Speaker {}", primary + 1);
-    if !secondary.is_empty() {
-        let others: Vec<String> = secondary.iter().map(|s| (s + 1).to_string()).collect();
-        label.push_str(" + ");
-        label.push_str(&others.join(" + "));
-    }
-    label
 }
 
 /// Distance (seconds) from a point to a [start, end] range: 0 if inside, else
@@ -285,6 +327,18 @@ struct SpeakerAssignment {
 /// overlap to be surfaced — filters out a diarizer's incidental sub-frame grazes
 /// at a boundary (which are not real co-speech) while catching genuine talk-over.
 const SECONDARY_MIN_SHARE_RATIO: f64 = 0.25;
+
+/// True when two speaker-id lists contain the SAME set (order-independent). The
+/// secondary list is share-ranked, so order can shuffle tick-to-tick for
+/// near-equal co-speakers; comparing sets avoids treating a reorder as a change.
+fn same_speaker_set(a: &[i64], b: &[i64]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let sa: std::collections::BTreeSet<i64> = a.iter().copied().collect();
+    let sb: std::collections::BTreeSet<i64> = b.iter().copied().collect();
+    sa == sb
+}
 
 /// Attribute a transcript segment to diarized speakers using WhisperX-style
 /// **max-total-overlap**: the segment forms an interval `[start, start+dur]` on
@@ -417,10 +471,16 @@ pub(crate) async fn post_process_meeting(
         if seg.speaker.is_me() {
             continue;
         }
-        if let Some(SpeakerAssignment { primary, secondary }) = assign_speaker(seg, &out.segments) {
-            seg.speaker_id = Some(primary);
-            seg.secondary_speaker_ids = secondary;
-            labeled += 1;
+        match assign_speaker(seg, &out.segments) {
+            Some(SpeakerAssignment { primary, secondary }) => {
+                seg.speaker_id = Some(primary);
+                seg.secondary_speaker_ids = secondary;
+                labeled += 1;
+            }
+            // Authoritative pass says no speaker overlaps here: clear any stale
+            // live talk-over flag so it can't survive into the saved record / AI
+            // context (B2). The primary label is left as the last best guess.
+            None => seg.secondary_speaker_ids.clear(),
         }
     }
     if let Err(e) = daemon.store.archive(&meeting) {
@@ -607,5 +667,18 @@ mod tests {
         let s = TranscriptSegment::new(Speaker::System, "x", true); // audio_start_secs = None
         let turns = [turn(0.0, 10.0, 0)];
         assert_eq!(primary(&s, &turns), None);
+    }
+
+    #[test]
+    fn same_speaker_set_is_order_insensitive() {
+        // The re-broadcast guard (B3): a share-reordering of the SAME co-speakers
+        // must NOT read as a change, or every tick re-broadcasts spuriously.
+        assert!(same_speaker_set(&[2, 3], &[3, 2]));
+        assert!(same_speaker_set(&[], &[]));
+        assert!(same_speaker_set(&[5], &[5]));
+        // A genuine set change IS detected.
+        assert!(!same_speaker_set(&[2, 3], &[2, 4]));
+        assert!(!same_speaker_set(&[2], &[2, 3]));
+        assert!(!same_speaker_set(&[2, 3], &[2]));
     }
 }
