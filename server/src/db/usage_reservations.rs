@@ -110,6 +110,15 @@ struct AccountSnapshot {
     billing_restricted: bool,
 }
 
+/// The Postgres compatibility schema deliberately mirrors SQLite flags with
+/// `INTEGER` columns. Decode them as `i32` instead of asking `postgres` to
+/// deserialize an `INT4` value as a SQL `BOOLEAN`.
+fn postgres_integer_flag(row: &postgres::Row, index: usize) -> Result<bool, UsageReservationError> {
+    row.try_get::<_, i32>(index)
+        .map(|value| value != 0)
+        .map_err(|error| UsageReservationError::Db(error.into()))
+}
+
 pub(crate) fn reserve(
     pool: &DbPool,
     input: ReserveUsageInput<'_>,
@@ -327,9 +336,7 @@ fn reserve_postgres(
         trial_seconds_remaining: row
             .try_get(1)
             .map_err(|error| UsageReservationError::Db(error.into()))?,
-        billing_restricted: row
-            .try_get(2)
-            .map_err(|error| UsageReservationError::Db(error.into()))?,
+        billing_restricted: postgres_integer_flag(&row, 2)?,
     };
     if account.billing_restricted {
         return Err(UsageReservationError::AccountUnavailable);
@@ -389,7 +396,7 @@ fn reserve_postgres(
                     reserved_cents = reserved_cents + $1,
                     trial_seconds_remaining = trial_seconds_remaining - $2
               WHERE id = $3
-                AND billing_restricted = FALSE
+                AND billing_restricted = 0
                 AND balance_cents >= $1
                 AND trial_seconds_remaining >= $2",
             &[&reserved_cents, &reserved_trial_seconds, &input.account_id],
@@ -1195,9 +1202,7 @@ fn account_snapshot_postgres(
         trial_seconds_remaining: row
             .try_get(1)
             .map_err(|error| UsageReservationError::Db(error.into()))?,
-        billing_restricted: row
-            .try_get(2)
-            .map_err(|error| UsageReservationError::Db(error.into()))?,
+        billing_restricted: postgres_integer_flag(&row, 2)?,
     })
 }
 
