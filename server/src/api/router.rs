@@ -5418,6 +5418,12 @@ fn looks_like_system_design_question(normalized: &str) -> bool {
             "design url shortener",
             "design a url shortener",
             "design an url shortener",
+            "design link shortener",
+            "design a link shortener",
+            "design link shortening",
+            "design a link shortening",
+            "design short link service",
+            "design a short link service",
             "design tinyurl",
             "design bitly",
             "design a rate limiter",
@@ -5467,6 +5473,8 @@ fn looks_like_system_design_question(normalized: &str) -> bool {
             "processor",
             "pipeline",
             "url shortener",
+            "link shortener",
+            "link shortening",
             "rate limiter",
             "messaging",
             "monitoring",
@@ -5707,6 +5715,103 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+fn looks_like_payment_domain(normalized: &str) -> bool {
+    let checkout_payment_related = normalized.contains("checkout")
+        && contains_any(
+            normalized,
+            &[
+                "ecommerce",
+                "e commerce",
+                "shopping cart",
+                "customer order",
+                "online order",
+                "purchase",
+                "merchant",
+                "card authorization",
+                "card payment",
+                "billing",
+                "commerce",
+            ],
+        );
+    let has_card_domain = normalized.split_whitespace().any(|token| token == "card");
+    let has_merchant_domain = normalized
+        .split_whitespace()
+        .any(|token| token == "merchant");
+    let has_authorization_or_refund_operation = normalized.split_whitespace().any(|token| {
+        token.starts_with("authoriz")
+            || token.starts_with("authoris")
+            || token.starts_with("refund")
+    });
+    let has_capture_operation = normalized
+        .split_whitespace()
+        .any(|token| token.starts_with("captur"));
+    let card_or_merchant_payment_related = (has_card_domain
+        && (has_authorization_or_refund_operation
+            || (has_capture_operation
+                && contains_any(normalized, &["payment", "transaction", "settlement"]))))
+        || (has_merchant_domain
+            && (has_authorization_or_refund_operation || has_capture_operation));
+
+    checkout_payment_related
+        || card_or_merchant_payment_related
+        || contains_any(
+            normalized,
+            &[
+                "payment",
+                "payments",
+                "charged the card",
+                "charging the card",
+                "card charge",
+                "money movement",
+            ],
+        )
+}
+
+fn looks_like_feature_store_domain(normalized: &str) -> bool {
+    let feature_platform_with_ml_context = normalized.contains("feature platform")
+        && contains_any(
+            normalized,
+            &[
+                "machine learning",
+                "model training",
+                "training data",
+                "training and serving",
+                "training serving",
+                "online serving",
+                "real time serving",
+                "inference",
+                "feature skew",
+                "point in time",
+            ],
+        );
+
+    feature_platform_with_ml_context
+        || contains_any(
+            normalized,
+            &[
+                "feature store",
+                "feature serving platform",
+                "online feature service",
+            ],
+        )
+}
+
+fn looks_like_url_shortener_domain(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "url shortener",
+            "short url",
+            "shortened url",
+            "link shortener",
+            "link shortening",
+            "short link service",
+            "tinyurl",
+            "bitly",
+        ],
+    )
+}
+
 fn prompt_with_answer_plan(
     system: &str,
     user: &str,
@@ -5718,6 +5823,17 @@ fn prompt_with_answer_plan(
 
     let evidence = plan.evidence_labels().join(", ");
     let normalized_question = normalize_guardrail_text(&extract_search_question(user));
+    let inherits_previous_design_domain = !looks_like_system_design_question(&normalized_question)
+        && (plan.intent == AnswerIntent::FollowUp
+            || (plan.intent == AnswerIntent::SystemDesign
+                && plan.output == AnswerOutput::CanvasDetail));
+    let normalized_previous_design = if inherits_previous_design_domain {
+        extract_previous_system_design_answer(user)
+            .map(normalize_guardrail_text)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let direct_technical_plan = looks_like_direct_technical_plan_question(&normalized_question);
     let rag_evaluation_plan = direct_technical_plan
         && contains_any(&normalized_question, &["rag", "retrieval augmented"])
@@ -5730,18 +5846,9 @@ fn prompt_with_answer_plan(
                 "launch plan",
             ],
         );
-    let payment_related = contains_any(
-        &normalized_question,
-        &[
-            "payment",
-            "payments",
-            "charged the card",
-            "charging the card",
-            "card charge",
-            "checkout",
-            "money movement",
-        ],
-    );
+    let payment_related = looks_like_payment_domain(&normalized_question)
+        || (!normalized_previous_design.is_empty()
+            && looks_like_payment_domain(&normalized_previous_design));
     let payment_design_or_followup = payment_related
         && (matches!(
             plan.intent,
@@ -5778,13 +5885,14 @@ fn prompt_with_answer_plan(
             &normalized_question,
             &["before dispatch", "before submission", "before sending"],
         );
-    let feature_store_design =
-        plan.intent == AnswerIntent::SystemDesign && normalized_question.contains("feature store");
-    let url_shortener_design = plan.intent == AnswerIntent::SystemDesign
-        && contains_any(
-            &normalized_question,
-            &["url shortener", "short url", "shortened url"],
-        );
+    let feature_store_design = (plan.intent == AnswerIntent::SystemDesign
+        && looks_like_feature_store_domain(&normalized_question))
+        || (!normalized_previous_design.is_empty()
+            && looks_like_feature_store_domain(&normalized_previous_design));
+    let url_shortener_design = (plan.intent == AnswerIntent::SystemDesign
+        && looks_like_url_shortener_domain(&normalized_question))
+        || (!normalized_previous_design.is_empty()
+            && looks_like_url_shortener_domain(&normalized_previous_design));
     let messaging_design = plan.intent == AnswerIntent::SystemDesign
         && contains_any(
             &normalized_question,
@@ -5908,11 +6016,17 @@ fn prompt_with_answer_plan(
         instructions.push('\n');
         instructions.push_str(ROLE_ADAPTIVE_PRACTITIONER_VOICE);
         instructions.push_str(
-            "\nInterview answer mode: treat this as real-time interview coaching for the role/domain implied by the resume, JD, transcript, screen, and files. If the input is a messy live transcript, infer the latest interviewer question and answer that question; do not summarize the transcript or repeat the generic live-caption wrapper. If the transcript contains the user's rough draft, repair it into a clean answer the user can say while preserving supplied facts. For lived experience directly supported by one authoritative source, sound like a human candidate who did that work, not a textbook. For technical scenarios or missing lived details, say `My approach would be...` or provide a clearly labeled answer template instead of claiming the user did it. Use simple English, confident transitions, and production-specific reasoning. Start with the answer the user can say aloud, then add only the context needed to defend it. For self-introductions and resume introductions, start as the candidate with \"I'm...\" or \"My name is...\" when context provides a name; do not start with \"I would say\" or \"Based on the resume\". For technical interview questions, explain the problem, the design/implementation choice, why that choice was made, tradeoffs, debugging, reliability, observability, security/auth, evaluation, scaling, and failure handling only when relevant. For AI/ML, autonomy, perception, robotics, RAG, MCP, or agent questions, cover data curation, retrieval, orchestration, grounding, evaluation, safety, and cost only when they apply and are supported. For SDE/system questions, cover ownership, APIs, data flow, concurrency, failure modes, tests, and rollout when relevant. For BIE/data analyst/data engineer questions, cover source systems, validation, metrics, dashboards, query performance, lineage, and stakeholder impact only when supported. Avoid over-polished corporate language, too many bullets, and filler like maybe/probably/I guess. If the user's draft is weak or challenged, repair the framing without inventing facts.\nEvidence precedence and source isolation: treat every labeled source block as independent unless the context explicitly links them. The resume is authoritative for the user's history. A job description describes the target role, never the user's experience. Interview-preparation documents and example stories are style or technique references unless explicitly identified as the user's own history. Prior Bluey or assistant answers are unverified drafts, not factual evidence. Truncated, excerpted, or compacted text is incomplete and never authorizes filling in a missing Action, Result, metric, employer, tool, or outcome. Never transfer or merge identities, employers, projects, tools, metrics, actions, or results across sources. Use a lived first-person claim only when one authoritative source directly supports it; otherwise provide a proposed approach or clearly labeled template.\nTechnical safety contract: name the database engine and relevant version before recommending engine-specific DDL; PostgreSQL `NOT VALID` and `VALIDATE CONSTRAINT` are not portable MySQL syntax. After a timeout on an irreversible external effect such as a payment, the outcome is `UNKNOWN` or `PENDING_RECONCILIATION`: preserve the original logical operation and its idempotency key, block a second effect, and reconcile by provider payment ID, client reference, or webhook. Never mark that outcome terminally failed or submit a new effect merely because retries ended. Do not promise exactly-once processing across external systems; describe idempotent exactly-once effects. Treat model or data drift as a signal for investigation, evaluation, and canary rollout, not automatic production retraining.",
+            "\nInterview answer mode: treat this as real-time interview coaching for the role/domain implied by the resume, JD, transcript, screen, and files. If the input is a messy live transcript, infer the latest interviewer question and answer that question; do not summarize the transcript or repeat the generic live-caption wrapper. If the transcript contains the user's rough draft, repair it into a clean answer the user can say while preserving supplied facts. For lived experience directly supported by one authoritative source, sound like a human candidate who did that work, not a textbook. For technical scenarios or missing lived details, say `My approach would be...` or provide a clearly labeled answer template instead of claiming the user did it. Use simple English, confident transitions, and production-specific reasoning. Start with the answer the user can say aloud, then add only the context needed to defend it. For self-introductions and resume introductions, start as the candidate with \"I'm...\" or \"My name is...\" when context provides a name; do not start with \"I would say\" or \"Based on the resume\". For technical interview questions, explain the problem, the design/implementation choice, why that choice was made, tradeoffs, debugging, reliability, observability, security/auth, evaluation, scaling, and failure handling only when relevant. For AI/ML, autonomy, perception, robotics, RAG, MCP, or agent questions, cover data curation, retrieval, orchestration, grounding, evaluation, safety, and cost only when they apply and are supported. For SDE/system questions, cover ownership, APIs, data flow, concurrency, failure modes, tests, and rollout when relevant. For BIE/data analyst/data engineer questions, cover source systems, validation, metrics, dashboards, query performance, lineage, and stakeholder impact only when supported. Avoid over-polished corporate language, too many bullets, and filler like maybe/probably/I guess. If the user's draft is weak or challenged, repair the framing without inventing facts.\nEvidence precedence and source isolation: treat every labeled source block as independent unless the context explicitly links them. The resume is authoritative for the user's history. A job description describes the target role, never the user's experience. Interview-preparation documents and example stories are style or technique references unless explicitly identified as the user's own history. Prior Bluey or assistant answers are unverified drafts, not factual evidence. Truncated, excerpted, or compacted text is incomplete and never authorizes filling in a missing Action, Result, metric, employer, tool, or outcome. Never transfer or merge identities, employers, projects, tools, metrics, actions, or results across sources. Use a lived first-person claim only when one authoritative source directly supports it; otherwise provide a proposed approach or clearly labeled template.\nTechnical safety contract: name the database engine and relevant version before recommending engine-specific DDL; PostgreSQL `NOT VALID` and `VALIDATE CONSTRAINT` are not portable MySQL syntax. Do not promise exactly-once processing across external systems; describe idempotent exactly-once effects. Treat model or data drift as a signal for investigation, evaluation, and canary rollout, not automatic production retraining.",
         );
     } else {
         instructions.push_str(
-            "\nGrounding and technical safety: treat labeled source blocks as independent and never merge identities, employers, projects, tools, metrics, actions, or outcomes without an explicit link. The resume is authoritative for user history; a job description describes the target role, not the user's experience; interview-preparation documents and example stories are style references unless explicitly identified as the user's own history. Prior Bluey or assistant answers are unverified drafts, and truncated context does not authorize invented facts. Name the database engine and version before using engine-specific DDL; PostgreSQL `NOT VALID` is not portable MySQL syntax. An ambiguous timeout after an irreversible external effect remains `UNKNOWN` or `PENDING_RECONCILIATION`: preserve the original logical operation and its idempotency key, block a second effect, and reconcile by provider identifier or webhook instead of marking terminal failure. Do not promise exactly-once processing across external systems. Drift requires investigation, evaluation, and canary rollout, never automatic retraining by itself.",
+            "\nGrounding and technical safety: treat labeled source blocks as independent and never merge identities, employers, projects, tools, metrics, actions, or outcomes without an explicit link. The resume is authoritative for user history; a job description describes the target role, not the user's experience; interview-preparation documents and example stories are style references unless explicitly identified as the user's own history. Prior Bluey or assistant answers are unverified drafts, and truncated context does not authorize invented facts. Name the database engine and version before using engine-specific DDL; PostgreSQL `NOT VALID` is not portable MySQL syntax. Do not promise exactly-once processing across external systems. Drift requires investigation, evaluation, and canary rollout, never automatic retraining by itself.",
+        );
+    }
+
+    if payment_related {
+        instructions.push_str(
+            "\nIrreversible-payment safety contract: after an ambiguous provider timeout, keep the outcome `UNKNOWN` or `PENDING_RECONCILIATION`, preserve the original logical operation and its idempotency key, block a second effect, and reconcile by provider payment ID, client reference, or webhook. Never mark that outcome terminally failed or submit a new effect merely because retries ended.",
         );
     }
 
@@ -5957,7 +6071,7 @@ fn prompt_with_answer_plan(
 
     if feature_store_design {
         instructions.push_str(
-            "\nOnline feature-store correctness contract: materialize real-time features from the event stream through a stream processor into the online store, while the offline store supports historical point-in-time training data, backfills, and batch materialization. Define each feature once as versioned executable transformation code that is compiled or adapted into both streaming and batch jobs, with equivalence tests; a registry or matching schema alone does not establish training-serving parity. Persist event-time and availability-time, and build training rows with an as-of join that admits only values whose event and availability timestamps are at or before the prediction cutoff. State a watermark and late-event correction policy. Make replay and backfill idempotent by event ID plus feature or materialization version. Continuously compare sampled online values with offline recomputation and alert on feature skew or parity failures. Never synchronously fall back to the offline store on the live inference path. On an online miss or stale feature, follow an explicit per-feature policy such as a safe default, bounded stale value, or fail closed, and surface freshness and missingness telemetry."
+            "\nOnline feature-store correctness contract: materialize real-time features from the event stream through a stream processor into the online store, while the offline store supports historical point-in-time training data, backfills, and batch materialization. Define each feature once as versioned executable transformation code that is compiled or adapted into both streaming and batch jobs, with equivalence tests; use those exact mechanics in the response, because a registry or matching schema alone does not establish training-serving parity. Persist event-time and availability-time, and build every training row with an as-of join against that example's decision, prediction, or observation timestamp. Admit a feature value only when both its event-time and availability-time are at or before that decision timestamp. A label event timestamp may serve as the decision timestamp only when the dataset explicitly defines them as identical; never use a later outcome timestamp, label-availability timestamp, or post-decision label cutoff because that leaks future information. State a watermark and late-event correction policy. Make replay and backfill idempotent by event ID plus feature or materialization version. Continuously compare sampled online values with offline recomputation and alert on feature skew or parity failures. Never synchronously fall back to the offline store on the live inference path. On an online miss or stale feature, follow an explicit per-feature policy such as a safe default, bounded stale value, or fail closed, and surface freshness and missingness telemetry."
         );
     }
 
@@ -5969,13 +6083,13 @@ fn prompt_with_answer_plan(
 
     if url_shortener_design {
         instructions.push_str(
-            "\nURL-shortener correctness contract: label every unsupplied numeric traffic, latency, retention, or availability value as an assumption. Protect ambiguous create retries with a client idempotency key that returns the already committed mapping. Create each short-code mapping through one strongly consistent canonical write path with a uniqueness constraint or conditional insert; generate a new candidate on collision rather than using check-then-act. Populate caches only from committed mappings, and keep cache propagation and click analytics asynchronous and eventually consistent. State the main tradeoff explicitly: mapping creation chooses strong consistency for uniqueness, while cache propagation and click analytics choose eventual consistency for scale. For mutable, deleted, expired, or abuse-blocked links, use 302 or 307 plus versioned invalidation or tombstones with short bounded staleness so clients and CDNs do not retain obsolete or unsafe targets; reserve 301 for explicitly immutable links. Deliver click analytics at least once, deduplicate by event ID when exact counts matter, durably sink before committing the consumer offset, and replay after a pre-commit failure. Do not describe competing dual write paths for the source of truth."
+            "\nURL-shortener correctness contract: label every unsupplied numeric traffic, latency, retention, or availability value as an assumption. Protect ambiguous create retries with a client idempotency key that returns the already committed mapping. Create each short-code mapping through one strongly consistent canonical write path with a uniqueness constraint or conditional insert; generate a new candidate on collision rather than using check-then-act. Populate caches only from committed mappings, and keep cache propagation and click analytics asynchronous and eventually consistent. State the main tradeoff explicitly: mapping creation chooses strong consistency for uniqueness, while cache propagation and click analytics choose eventual consistency for scale. Use 302 or 307 only for active mutable mappings, with bounded cache freshness and versioned invalidation when the target changes; reserve 301 or 308 for explicitly immutable mappings. Deleted or expired mappings return 404 or 410. Abuse-blocked mappings return 403 or a safe warning interstitial; reserve 451 exclusively for a mapping made unavailable because of a legal demand or legal restriction. Purge caches and retain a tombstone for every inactive state, but never redirect those states to the stored destination. Deliver click analytics at least once, deduplicate by event ID when exact counts matter, durably sink before committing the consumer offset, and replay after a pre-commit failure. Do not describe competing dual write paths for the source of truth."
         );
     }
 
     if payment_design_or_followup {
         instructions.push_str(
-            "\nPayment correctness contract: before a provider call, atomically persist the payment intent plus a transactional outbox command. Give each logical provider operation, such as authorize, capture, or refund, its own stable idempotency key, and reuse that same key only when replaying that same operation. Append confirmed authorization, capture, and refund movements idempotently to an immutable double-entry ledger only after authoritative provider evidence from the synchronous response, status lookup, or webhook. A timeout after dispatch moves `PROCESSING` to `UNKNOWN` or `PENDING_RECONCILIATION`; block a new charge command and reconcile by provider payment ID or client reference. Deduplicate webhooks by provider event ID, and transition from UNKNOWN to `SUCCEEDED`, `FAILED`, or `CANCELED` only from authoritative provider evidence. Never use check-then-act deduplication, a Redis lock, or any distributed lock as the correctness boundary; a lock may only reduce duplicate work around the durable database, outbox, and ledger guarantees. Never write `exactly-once processing` anywhere in the response or artifact. Describe at-least-once delivery with idempotent exactly-once effects instead."
+            "\nPayment correctness contract: before a provider call, atomically persist the payment intent plus a transactional outbox command. Every logical provider-operation instance gets its own stable idempotency key scoped to the owning account and payment, operation type, and operation instance. Every authorization, every capture including each partial capture, and every refund including each partial refund therefore use different keys; every retry of exactly the same logical operation instance reuses its original key. For a system-design response, state this explicitly in both the spoken answer and canvas. Never shorten this to an ambiguous claim that the request merely has an idempotency key, that one key is allocated per operation type, or that several operations share one key. Append confirmed authorization, capture, and refund movements idempotently to an immutable double-entry ledger only after authoritative provider evidence from the synchronous response, status lookup, or webhook. A timeout after dispatch moves `PROCESSING` to `UNKNOWN` or `PENDING_RECONCILIATION`; block a new charge command and reconcile by provider payment ID or client reference. Deduplicate webhooks by provider event ID, and transition from UNKNOWN to `SUCCEEDED`, `FAILED`, or `CANCELED` only from authoritative provider evidence. Never use check-then-act deduplication, a Redis lock, or any distributed lock as the correctness boundary; a lock may only reduce duplicate work around the durable database, outbox, and ledger guarantees. Never write `exactly-once processing` anywhere in the response or artifact. Describe at-least-once delivery with idempotent exactly-once effects instead."
         );
         if payment_timeout_question {
             instructions.push_str(
@@ -6719,6 +6833,29 @@ fn extract_planning_context(user_text: &str) -> String {
         .1
         .trim()
         .to_string()
+}
+
+fn extract_previous_system_design_answer(user_text: &str) -> Option<&str> {
+    let text = user_text.trim();
+    if !text.starts_with("Question:") {
+        return None;
+    }
+    let (_, context) = split_question_and_planning_context(text);
+    const PREFIX: &str = "\n\nSession context:\nPrevious system design answer:\n";
+    let answer_with_following_context = context.strip_prefix(PREFIX)?;
+    let answer_end = [
+        "\n\n[",
+        "\n\nSession context:",
+        "\n\nScreen context:",
+        "\n\nDocument context:",
+        "\n\nAttached",
+    ]
+    .iter()
+    .filter_map(|marker| answer_with_following_context.find(marker))
+    .min()
+    .unwrap_or(answer_with_following_context.len());
+    let answer = answer_with_following_context[..answer_end].trim();
+    (!answer.is_empty()).then_some(answer)
 }
 
 fn split_question_and_planning_context(text: &str) -> (&str, &str) {
@@ -14823,8 +14960,16 @@ mod tests {
         assert!(system.contains("user did not supply as an assumption"));
         assert!(system.contains("payment intent plus a transactional outbox command"));
         assert!(system.contains("immutable double-entry ledger"));
-        assert!(system.contains("each logical provider operation"));
-        assert!(system.contains("same key only when replaying that same operation"));
+        assert!(system.contains("Every logical provider-operation instance gets its own"));
+        assert!(system.contains("scoped to the owning account and payment, operation type"));
+        assert!(system.contains("Every authorization"));
+        assert!(system.contains("every capture including each partial capture"));
+        assert!(system.contains("every refund including each partial refund"));
+        assert!(system.contains("therefore use different keys"));
+        assert!(system.contains("every retry of exactly the same logical operation instance"));
+        assert!(system.contains("both the spoken answer and canvas"));
+        assert!(system.contains("Never shorten this to an ambiguous claim"));
+        assert!(system.contains("one key is allocated per operation type"));
         assert!(system.contains("only after authoritative provider evidence"));
         assert!(system.contains("`UNKNOWN` or `PENDING_RECONCILIATION`"));
         assert!(system.contains("provider payment ID or client reference"));
@@ -14834,6 +14979,71 @@ mod tests {
         assert!(system.contains("lock may only reduce duplicate work"));
         assert!(system.contains("Never write `exactly-once processing` anywhere"));
         assert!(system.contains("at-least-once delivery with idempotent exactly-once effects"));
+    }
+
+    #[test]
+    fn answer_plan_checkout_requires_commerce_context_for_payment_contract() {
+        let git_req = complete_request("Question:\nDesign a Git checkout service for monorepos.");
+        let git_plan = answer_plan_for_request(&git_req, "balanced", &[]);
+        let (git_system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &git_req.user,
+            &git_plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(!git_system.contains("Payment correctness contract"));
+        assert!(!git_system.contains("Irreversible-payment safety contract"));
+
+        let commerce_req = complete_request(
+            "Question:\nDesign a checkout service for an ecommerce marketplace that turns a shopping cart into a paid order and handles duplicate submissions.",
+        );
+        let commerce_plan = answer_plan_for_request(&commerce_req, "balanced", &[]);
+        assert_eq!(commerce_plan.intent, AnswerIntent::SystemDesign);
+        let (commerce_system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &commerce_req.user,
+            &commerce_plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(commerce_system.contains("Payment correctness contract"));
+        assert!(commerce_system.contains("Irreversible-payment safety contract"));
+    }
+
+    #[test]
+    fn answer_plan_card_and_merchant_operations_activate_payment_contract() {
+        for question in [
+            "Design a card authorization and capture service with partial refunds.",
+            "Design a merchant capture service with authorization and partial refunds.",
+        ] {
+            let req = complete_request(&format!("Question:\n{question}"));
+            let plan = answer_plan_for_request(&req, "balanced", &[]);
+            assert_eq!(plan.intent, AnswerIntent::SystemDesign, "{question}");
+            let (system, _) = prompt_with_answer_plan(
+                "You are Bluey.",
+                &req.user,
+                &plan,
+                &WebSearchOutcome::default(),
+            );
+            assert!(
+                system.contains("Payment correctness contract"),
+                "{question}"
+            );
+            assert!(
+                system.contains("Irreversible-payment safety contract"),
+                "{question}"
+            );
+        }
+
+        let scan_req =
+            complete_request("Question:\nDesign a business-card capture service for contacts.");
+        let scan_plan = answer_plan_for_request(&scan_req, "balanced", &[]);
+        let (scan_system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &scan_req.user,
+            &scan_plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(!scan_system.contains("Payment correctness contract"));
     }
 
     #[test]
@@ -14882,12 +15092,71 @@ mod tests {
         assert!(system.contains("registry or matching schema alone"));
         assert!(system.contains("event-time and availability-time"));
         assert!(system.contains("as-of join"));
+        assert!(system.contains("example's decision, prediction, or observation timestamp"));
+        assert!(system.contains("both its event-time and availability-time"));
+        assert!(system.contains("only when the dataset explicitly defines them as identical"));
+        assert!(system.contains("never use a later outcome timestamp"));
+        assert!(system.contains("label-availability timestamp"));
+        assert!(system.contains("leaks future information"));
         assert!(system.contains("watermark and late-event correction policy"));
         assert!(system.contains("idempotent by event ID"));
         assert!(system.contains("feature skew or parity failures"));
         assert!(system.contains("Never synchronously fall back to the offline store"));
         assert!(system.contains("explicit per-feature policy"));
         assert!(system.contains("freshness and missingness telemetry"));
+    }
+
+    #[test]
+    fn answer_plan_feature_store_paraphrases_activate_the_correctness_contract() {
+        for question in [
+            "Design an ML feature-serving platform for low-latency inference and leakage-free historical training.",
+            "How would you design an online feature service that keeps training and serving values consistent?",
+            "Architect a feature platform with real-time serving, backfills, and point-in-time training data.",
+        ] {
+            let req = complete_request(&format!("Question:\n{question}"));
+            let plan = answer_plan_for_request(&req, "balanced", &[]);
+            assert_eq!(plan.intent, AnswerIntent::SystemDesign, "{question}");
+
+            let (system, _) = prompt_with_answer_plan(
+                "You are Bluey.",
+                &req.user,
+                &plan,
+                &WebSearchOutcome::default(),
+            );
+            assert!(
+                system.contains("Online feature-store correctness contract"),
+                "{question}"
+            );
+        }
+    }
+
+    #[test]
+    fn answer_plan_feature_platform_alias_requires_ml_context() {
+        let flags_req = complete_request(
+            "Question:\nDesign a product feature platform for feature flags and gradual rollouts.",
+        );
+        let flags_plan = answer_plan_for_request(&flags_req, "balanced", &[]);
+        assert_eq!(flags_plan.intent, AnswerIntent::SystemDesign);
+        let (flags_system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &flags_req.user,
+            &flags_plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(!flags_system.contains("Online feature-store correctness contract"));
+
+        let ml_req = complete_request(
+            "Question:\nDesign a feature platform for model inference with offline training data.",
+        );
+        let ml_plan = answer_plan_for_request(&ml_req, "balanced", &[]);
+        assert_eq!(ml_plan.intent, AnswerIntent::SystemDesign);
+        let (ml_system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &ml_req.user,
+            &ml_plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(ml_system.contains("Online feature-store correctness contract"));
     }
 
     #[test]
@@ -14916,12 +15185,137 @@ mod tests {
         assert!(system.contains("asynchronous and eventually consistent"));
         assert!(system.contains("mapping creation chooses strong consistency"));
         assert!(system.contains("click analytics choose eventual consistency"));
-        assert!(system.contains("For mutable, deleted, expired, or abuse-blocked links"));
-        assert!(system.contains("302 or 307"));
+        assert!(system.contains("302 or 307 only for active mutable mappings"));
+        assert!(system.contains("Deleted or expired mappings return 404 or 410"));
+        assert!(system.contains("Abuse-blocked mappings return 403 or a safe warning interstitial"));
+        assert!(system.contains("reserve 451 exclusively"));
+        assert!(system.contains("legal demand or legal restriction"));
+        assert!(system.contains("never redirect those states to the stored destination"));
         assert!(system.contains("durably sink before committing the consumer offset"));
         assert!(system.contains("replay after a pre-commit failure"));
-        assert!(system.contains("reserve 301 for explicitly immutable links"));
+        assert!(system.contains("reserve 301 or 308 for explicitly immutable mappings"));
         assert!(system.contains("Do not describe competing dual write paths"));
+        assert!(!system.to_ascii_lowercase().contains("payment"));
+        assert!(!system.to_ascii_lowercase().contains("reconcil"));
+    }
+
+    #[test]
+    fn answer_plan_url_shortener_paraphrases_activate_the_correctness_contract() {
+        for question in [
+            "Design a link-shortening service with safe caching and click analytics.",
+            "How would you design a link shortener that supports mutable destinations?",
+            "Architect a short-link service that remains correct during retries and deletion.",
+            "Design TinyURL with mutable targets and safe deletion.",
+            "Design Bitly with retries, caching, and analytics.",
+        ] {
+            let req = complete_request(&format!("Question:\n{question}"));
+            let plan = answer_plan_for_request(&req, "balanced", &[]);
+            assert_eq!(plan.intent, AnswerIntent::SystemDesign, "{question}");
+
+            let (system, _) = prompt_with_answer_plan(
+                "You are Bluey.",
+                &req.user,
+                &plan,
+                &WebSearchOutcome::default(),
+            );
+            assert!(
+                system.contains("URL-shortener correctness contract"),
+                "{question}"
+            );
+        }
+    }
+
+    #[test]
+    fn answer_plan_design_followups_inherit_only_explicit_previous_design_domain() {
+        let url_req = complete_request(
+            "Question:\nWhat about failure handling when a mapping expires or is blocked for abuse?\n\nSession context:\nPrevious system design answer:\nSystem Design\nA URL shortener uses a canonical mapping store, redirect cache, and click analytics pipeline.",
+        );
+        let url_plan = answer_plan_for_request(&url_req, "balanced", &[]);
+        assert_eq!(url_plan.intent, AnswerIntent::SystemDesign);
+        assert_eq!(url_plan.output, AnswerOutput::CanvasDetail);
+        let (url_system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &url_req.user,
+            &url_plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(url_system.contains("URL-shortener correctness contract"));
+        assert!(!url_system.contains("Payment correctness contract"));
+
+        let feature_req = complete_request(
+            "Question:\nWhat about late events and backfills?\n\nSession context:\nPrevious system design answer:\nSystem Design\nAn online feature store keeps low-latency serving consistent with point-in-time training data.",
+        );
+        let feature_plan = answer_plan_for_request(&feature_req, "balanced", &[]);
+        assert_eq!(feature_plan.intent, AnswerIntent::SystemDesign);
+        assert_eq!(feature_plan.output, AnswerOutput::CanvasDetail);
+        let (feature_system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &feature_req.user,
+            &feature_plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(feature_system.contains("Online feature-store correctness contract"));
+
+        let payment_req = complete_request(
+            "Question:\nWhat if the provider times out after dispatch?\n\nSession context:\nPrevious system design answer:\nSystem Design\nA payment processing platform uses intents, a provider adapter, an outbox, and an immutable ledger.",
+        );
+        let payment_plan = answer_plan_for_request(&payment_req, "balanced", &[]);
+        assert_eq!(payment_plan.intent, AnswerIntent::FollowUp);
+        assert_eq!(payment_plan.output, AnswerOutput::Compact);
+        let (payment_system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &payment_req.user,
+            &payment_plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(payment_system.contains("Payment correctness contract"));
+        assert!(payment_system.contains("Payment timeout follow-up output"));
+
+        let stale_notes_req = complete_request(
+            "Question:\nWhat about failure modes?\n\nSession context:\nPrevious system design answer:\nSystem Design\nA rate limiter uses token buckets, Redis counters, and regional failover.\n\n[Unrelated stale notes]\nA payment processing platform uses reconciliation after provider timeouts.",
+        );
+        let stale_notes_plan = answer_plan_for_request(&stale_notes_req, "balanced", &[]);
+        assert_eq!(stale_notes_plan.intent, AnswerIntent::SystemDesign);
+        let (stale_notes_system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &stale_notes_req.user,
+            &stale_notes_plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(!stale_notes_system.contains("Payment correctness contract"));
+        assert!(!stale_notes_system.contains("Irreversible-payment safety contract"));
+
+        let new_design_req = complete_request(
+            "Question:\nDesign a URL shortener.\n\nSession context:\nPrevious system design answer:\nSystem Design\nA payment processing platform uses a provider adapter and reconciliation ledger.",
+        );
+        let new_design_plan = answer_plan_for_request(&new_design_req, "balanced", &[]);
+        assert_eq!(new_design_plan.intent, AnswerIntent::SystemDesign);
+        let (new_design_system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &new_design_req.user,
+            &new_design_plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(new_design_system.contains("URL-shortener correctness contract"));
+        assert!(!new_design_system.contains("Payment correctness contract"));
+        assert!(!new_design_system.contains("Irreversible-payment safety contract"));
+    }
+
+    #[test]
+    fn answer_plan_short_linkedin_post_is_not_a_url_shortener_design() {
+        let req = complete_request("Question:\nHow would you design a short LinkedIn post?");
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_ne!(plan.intent, AnswerIntent::SystemDesign);
+        assert_ne!(plan.output, AnswerOutput::CanvasDetail);
+
+        let (system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(!system.contains("URL-shortener correctness contract"));
     }
 
     #[test]
@@ -14973,8 +15367,11 @@ mod tests {
             &unrelated_plan,
             &WebSearchOutcome::default(),
         );
+        assert!(unrelated_system.contains("URL-shortener correctness contract"));
         assert!(!unrelated_system.contains("Payment correctness contract"));
         assert!(!unrelated_system.contains("Payment timeout follow-up output"));
+        assert!(!unrelated_system.contains("Irreversible-payment safety contract"));
+        assert!(!unrelated_system.to_ascii_lowercase().contains("reconcil"));
 
         let predispatch = complete_request(
             "Question:\nA payment request times out before dispatch. What state and retry behavior do you use?",

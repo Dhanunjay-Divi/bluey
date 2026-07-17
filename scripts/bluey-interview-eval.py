@@ -83,6 +83,8 @@ META_OPENERS = (
 # success. Requested per-case caps are checked separately.
 KNOWN_OUTPUT_TOKEN_CAPS = frozenset((256, 512, 1024, 2048, 4096))
 MIN_SUBSTANTIVE_ANSWER_WORDS = 30
+DEFAULT_MAX_ANSWER_FIRST_TOKEN_P95_MS = 5000.0
+DEFAULT_MAX_INTERVENTION_FIRST_TOKEN_P95_MS = 500.0
 
 
 @dataclass(frozen=True)
@@ -157,6 +159,7 @@ class CaseResult:
     conversation: Optional[str]
     context_sha256: str
     attempts: List[AttemptResult]
+    cumulative_elapsed_ms: float
     final_ok: bool
     first_attempt_ok: bool
     accepted_outcome: bool
@@ -242,7 +245,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q35", "design_followup", "general", "How would you preserve per-conversation ordering when users reconnect and servers fail?", "curated", "messaging_design", max_tokens=800, speakable=True, expect_followup_context=True, required_groups=(g("sequence", "offset", "order"), g("idempot", "dedup"), g("reconnect", "replay"))),
     EvalCase("Q36", "system_design", "general", "Design a real-time monitoring platform ingesting 100,000 events per second with alerting and historical queries.", "resume_inspired", "monitoring_design", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("kafka", "queue", "stream"), g("time series", "storage"), g("alert",), g("partition", "scale"))),
     EvalCase("Q37", "design_followup", "general", "One tenant becomes a hot partition. Change the design without breaking ordering for that tenant.", "curated", "monitoring_design", max_tokens=850, speakable=True, expect_followup_context=True, required_groups=(g("partition", "shard"), g("order", "sequence"), g("tenant",))),
-    EvalCase("Q38", "system_design", "ds", "Design an online feature store that serves low-latency features and keeps training data consistent with serving.", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("offline",), g("online",), g("event time",), g("availability time", "ingestion time"), g("as-of", "as of", "temporal join"), g("executable transformation", "executable transformations", "compiled feature definition", "shared feature code", "versioned dsl"), g("late event", "out-of-order", "watermark"), g("idempot", "dedup"), g("skew", "parity"), g("fresh", "stream"))),
+    EvalCase("Q38", "system_design", "ds", "Design an online feature store that serves low-latency features and keeps training data consistent with serving.", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("offline", "batch training"), g("online", "live serving"), g("event time", "event timestamp", "source timestamp"), g("availability time", "availability timestamp", "ingestion time", "knowledge time", "known by"), g("as-of", "as of", "temporal join", "point-in-time join", "snapshot join"), g("executable transformation", "executable transformations", "compiled feature definition", "shared feature code", "shared transformation definition", "versioned transformation code", "versioned dsl"), g("late event", "out-of-order", "watermark"), g("idempot", "dedup"), g("skew", "parity", "equivalence"), g("fresh", "stream"))),
     EvalCase("Q39", "system_design", "general", "Design a payment processing platform that safely handles retries and duplicate requests.", "curated", "payment_design", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("idempot",), g("ledger",), g("webhook", "processor"), g("reconcil",))),
     EvalCase("Q40", "design_followup", "general", "The provider times out after charging the card. What exact state transition and retry behavior do you use?", "curated", "payment_design", max_tokens=850, speakable=True, expect_followup_context=True, required_groups=(g("unknown", "pending", "reconcil"), g("idempot",), g("webhook", "query"))),
     EvalCase("Q41", "system_design", "general", "Design a URL shortener and make the main scale and consistency tradeoff explicit.", max_tokens=950, speakable=True, expect_design=True, required_groups=(g("key", "id"), g("cache",), g("redirect",), g("consistency", "collision"))),
@@ -1608,6 +1611,148 @@ def payment_operation_semantic_issues(
     if unsafe_new_key:
         issues.append("unsafe_new_idempotency_key_on_retry")
 
+    explicitly_rotates_key = False
+    for clause in clauses:
+        rotates_or_replaces = bool(
+            re.search(
+                r"\b(?:rotate|change|replace|regenerate|remint|refresh)\w*\b.{0,45}"
+                r"\b(?:provider\s+)?(?:idempotency\s+)?(?:key|token)\b.{0,55}"
+                rf"\b(?:between|on|for|per|after|before)\b.{{0,25}}"
+                rf"\b(?:{retry_signal})\w*\b|"
+                rf"\b(?:{retry_signal})\w*\b.{{0,45}}"
+                r"\b(?:rotate|change|replace|regenerate|remint|refresh)\w*\b.{0,35}"
+                r"\b(?:provider\s+)?(?:idempotency\s+)?(?:key|token)\b|"
+                rf"\b(?:each|every)\s+(?:provider\s+)?(?:call|{retry_signal})\b"
+                r".{0,35}\b(?:gets?|uses?|receives?|mints?|generates?)\b.{0,25}"
+                r"\b(?:a\s+)?(?:new|fresh|different|random|rotated)\b.{0,20}"
+                r"\b(?:uuid|(?:idempotency\s+)?(?:key|token))\b|"
+                r"\b(?:new|fresh|different|random|rotated)\b.{0,20}"
+                r"\b(?:uuid|(?:idempotency\s+)?(?:key|token))\b.{0,30}"
+                rf"\bper\s+(?:provider\s+)?(?:call|{retry_signal})\b|"
+                r"\bprovider\s+(?:idempotency\s+)?(?:key|token)\b.{0,30}"
+                r"\b(?:is|remains?)\s+not\s+stable\b.{0,35}\b(?:retry|retries)\b|"
+                r"\bafter\s+(?:a\s+)?(?:provider\s+|psp\s+)?timeout\b.{0,50}"
+                r"\b(?:regenerate|rotate|replace|remint|refresh)\w*\b.{0,25}"
+                r"\b(?:the\s+)?(?:provider\s+)?(?:idempotency\s+)?(?:key|token)\b|"
+                r"\b(?:derive|compute)\w*\b.{0,30}"
+                r"\bretry\s+(?:idempotency\s+)?key\b.{0,45}"
+                r"\bappend\w*\b.{0,20}\battempt\s+(?:number|index)\b|"
+                r"\brefresh\w*\b.{0,25}\bprovider\s+(?:key|token)\b.{0,35}"
+                r"\bafter\s+(?:a\s+)?timeout\b|"
+                r"\bdiscard\w*\b.{0,25}\b(?:old|original)\s+(?:key|token)\b"
+                r".{0,35}\bmint\w*\b.{0,20}\b(?:a\s+)?successor\b|"
+                r"\battempt[- ]specific\s+(?:nonce|key|token)\b",
+                clause,
+            )
+        )
+        if not rotates_or_replaces:
+            continue
+        safely_rejected = bool(
+            re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't|avoid)\b"
+                r".{0,35}\b(?:rotate|change|replace|regenerate|remint|refresh|generate|"
+                r"mint|derive|compute|append|discard|use)\w*\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:rotating|changing|replacing|regenerating|using)\b.{0,45}"
+                r"\b(?:new|fresh|different|random|rotated)\b.{0,25}"
+                r"\b(?:key|token|uuid)\b.{0,30}\b(?:forbidden|disallowed|rejected)\b",
+                clause,
+            )
+        )
+        if not safely_rejected:
+            explicitly_rotates_key = True
+            break
+    if explicitly_rotates_key and "unsafe_new_idempotency_key_on_retry" not in issues:
+        issues.append("unsafe_new_idempotency_key_on_retry")
+
+    missing_key_on_retry = False
+    for clause in clauses:
+        omits_key = bool(
+            re.search(
+                rf"\b(?:{retry_signal})\w*\b.{{0,55}}"
+                r"\b(?:without|omit|omits|omitting|drop|drops|dropping|clear|clears|"
+                r"clearing|remove|removes|removing|no)\b.{0,25}"
+                r"\b(?:provider\s+)?idempotency\s+(?:key|token)\b|"
+                r"\bidempotency\s+(?:key|token)\b.{0,45}"
+                r"\b(?:is|becomes?|may\s+be|can\s+be)?\s*"
+                r"(?:optional|omitted|missing|absent|cleared|dropped|removed|not\s+required)\b"
+                rf".{{0,55}}\b(?:on|for|during)\b.{{0,20}}\b(?:{retry_signal})\w*\b|"
+                r"\bomit\w*\b.{0,25}\bidempotency(?:\s+(?:key|token))?\b"
+                r".{0,35}\bafter\s+(?:the\s+)?first\s+attempt\b",
+                clause,
+            )
+        )
+        if not omits_key:
+            continue
+        safely_rejected = bool(
+            re.search(
+                rf"\b(?:do not|don't|never|must not|should not|cannot|can't)\s+"
+                rf"(?:allow\s+|perform\s+)?(?:{retry_signal})\w*\b.{{0,45}}\bwithout\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:without|missing|absent)\b.{0,30}\bidempotency\s+(?:key|token)\b"
+                r".{0,35}\b(?:is|are)\s+(?:forbidden|disallowed|rejected|blocked)\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't|avoid)\b"
+                r".{0,35}\b(?:omit|drop|clear|remove)\w*\b.{0,35}"
+                r"\bidempotency\s+(?:key|token)\b",
+                clause,
+            )
+        )
+        if not safely_rejected:
+            missing_key_on_retry = True
+            break
+    if missing_key_on_retry:
+        issues.append("unsafe_missing_idempotency_key_on_retry")
+
+    constant_key = False
+    for clause in clauses:
+        constant_claim = bool(
+            re.search(
+                r"\b(?:global|constant|static|hard[- ]?coded|fixed)\b.{0,35}"
+                r"\bidempotency\s+(?:key|token)\b.{0,70}"
+                r"\b(?:all|every|each|across|system[- ]wide|service[- ]wide)\b|"
+                r"\b(?:all|every|each)\b.{0,55}"
+                r"\b(?:payment|account|tenant|operation|request|customer)s?\b.{0,45}"
+                r"\b(?:share|use|reuse|get)\w*\b.{0,25}"
+                r"\b(?:one|the\s+same|a\s+single|global|constant|static|fixed)\b"
+                r".{0,20}\b(?:idempotency\s+)?(?:key|token)\b|"
+                r"\b(?:one|the\s+same|a\s+single)\b.{0,25}"
+                r"\b(?:idempotency\s+)?(?:key|token)\b.{0,55}"
+                r"\b(?:for|across)\s+(?:all|every)\b.{0,35}"
+                r"\b(?:payment|account|tenant|operation|request|customer)s?\b|"
+                r"\bevery\s+provider\s+call\b.{0,45}\buses?\b.{0,35}"
+                r"\b(?:the\s+payment(?:'s)?\s+)?constant\s+(?:key|token)\b"
+                r".{0,45}\bacross\s+all\s+operations\b",
+                clause,
+            )
+        )
+        if not constant_claim:
+            continue
+        safely_rejected = bool(
+            re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't|avoid)\b"
+                r".{0,45}\b(?:use|share|reuse|hard[- ]?code)\w*\b.{0,45}"
+                r"\b(?:global|constant|static|fixed|same|single|one)\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:global|constant|static|fixed|shared)\b.{0,35}"
+                r"\b(?:key|token)\b.{0,30}\b(?:is|are)\s+(?:forbidden|disallowed)\b",
+                clause,
+            )
+        )
+        if not safely_rejected:
+            constant_key = True
+            break
+    if constant_key:
+        issues.append("unsafe_constant_idempotency_key")
+
     operation_pattern = {
         "authorize": r"\bauthoriz\w*\b",
         "capture": r"\bcaptur\w*\b",
@@ -1626,10 +1771,13 @@ def payment_operation_semantic_issues(
             continue
         shared = bool(
             re.search(
-                r"\b(?:same|single|one|shared)\b.{0,35}\b(?:idempotency\s+)?key\b|"
-                r"\b(?:reuse|reused|reusing)\b.{0,35}\b(?:idempotency\s+)?key\b|"
-                r"\b(?:idempotency\s+)?key\b.{0,35}\b(?:same|single|one|shared)\b|"
-                r"\b(?:share|reuse|reuses|reused|reusing)\b.{0,25}"
+                r"\b(?:same|single|one|shared)\b[^.!?;]{0,35}"
+                r"\b(?:idempotency\s+)?key\b|"
+                r"\b(?:reuse|reused|reusing)\b[^.!?;]{0,35}"
+                r"\b(?:idempotency\s+)?key\b|"
+                r"\b(?:idempotency\s+)?key\b[^.!?;]{0,35}"
+                r"\b(?:same|single|one|shared)\b|"
+                r"\b(?:share|reuse|reuses|reused|reusing)\b[^.!?;]{0,25}"
                 r"\b(?:it|that\s+key|this\s+key)\b",
                 clause,
             )
@@ -1655,6 +1803,21 @@ def payment_operation_semantic_issues(
                 r"\b(?:its|their)\s+own\b.{0,25}\bidempotency\s+key\b|"
                 r"\b(?:same|stable)\b.{0,25}\bkey\b.{0,60}\bonly\b.{0,60}"
                 r"\b(?:same|that)\s+operation\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:same|that)\s+(?:logical\s+|provider\s+)?operation\b"
+                r".{0,45}\b(?:uses?|gets?|keeps?|reuses?)\b.{0,35}"
+                r"\b(?:the\s+)?same\b.{0,20}\bstable\b.{0,25}"
+                r"\b(?:provider\s+)?(?:idempotency\s+)?key\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:retr(?:y|ies|ied|ying)|replay\w*)\b.{0,30}"
+                r"\b(?:use|uses|using|for)\b.{0,30}"
+                r"\b(?:the\s+)?same\s+(?:logical\s+|provider\s+)?operation\b"
+                r".{0,40}\b(?:the\s+)?same\b.{0,20}\bstable\b.{0,25}"
+                r"\b(?:provider\s+)?(?:idempotency\s+)?key\b",
                 clause,
             )
             or (
@@ -1735,6 +1898,13 @@ def payment_operation_semantic_issues(
                 r".{0,25}\b(?:stable\s+)?(?:idempotency\s+)?key\b",
                 lower,
             )
+            or re.search(
+                r"\b(?:authoriz\w*|captur\w*|refund\w*)\b.{0,180}"
+                r"\b(?:payment|intent|account)[- ]?id\b.{0,80}"
+                r"\boperation[- ]?(?:type|kind)\b.{0,80}"
+                r"\b(?:operation[- ]?(?:id|instance)|sequence|index|ordinal)\b",
+                lower,
+            )
         )
     )
     if re.search(
@@ -1747,7 +1917,7 @@ def payment_operation_semantic_issues(
         distinct_operation_keys = False
     same_operation_retry_reuse = bool(
         re.search(
-            r"\b(?:retry|replay|resubmit)\w*\b.{0,80}"
+            r"\b(?:retr(?:y|ies|ied|ying)|replay\w*|resubmit\w*)\b.{0,80}"
             r"\b(?:same|original)\b.{0,30}"
             r"\b(?:operation|command|authorization|capture|refund|charge|payment\s+request)\b"
             r".{0,80}\b(?:same|stable|original|existing)\b.{0,30}"
@@ -1818,6 +1988,21 @@ def payment_operation_semantic_issues(
             lower,
         )
         or has_safe_payment_same_operation_replay_condition(lower)
+        or re.search(
+            r"\b(?:same|exact|original)\b.{0,25}\b(?:command|request|action)\b"
+            r".{0,45}\b(?:keeps?|retains?|reuses?|preserves?)\b.{0,30}"
+            r"\b(?:its\s+)?(?:same\s+|original\s+|stable\s+)?"
+            r"(?:idempotency\s+)?(?:key|token)\b"
+            r".{0,45}\b(?:across|on|for)\b.{0,20}\b(?:attempt|retry|replay)s?\b",
+            lower,
+        )
+        or re.search(
+            r"\bretr(?:y|ies)\b.{0,35}\bdeterministically\b.{0,35}"
+            r"\b(?:recomputes?|derives?|recreates?)\b.{0,25}"
+            r"\b(?:the\s+)?identical\b.{0,20}"
+            r"\b(?:idempotency\s+)?(?:key|token)\b",
+            lower,
+        )
     )
     negated_same_operation_retry_reuse = bool(
         re.search(
@@ -1881,6 +2066,21 @@ def payment_operation_semantic_issues(
             lower,
         )
         or re.search(
+            r"\b(?:same|that)\s+(?:logical\s+|provider\s+)?operation\b"
+            r".{0,45}\b(?:uses?|gets?|keeps?|reuses?)\b.{0,35}"
+            r"\b(?:the\s+)?same\b.{0,20}\bstable\b.{0,25}"
+            r"\b(?:provider\s+)?idempotency\s+key\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:retr(?:y|ies|ied|ying)|replay\w*)\b.{0,30}"
+            r"\b(?:use|uses|using|for)\b.{0,30}"
+            r"\b(?:the\s+)?same\s+(?:logical\s+|provider\s+)?operation\b"
+            r".{0,40}\b(?:the\s+)?same\b.{0,20}\bstable\b.{0,25}"
+            r"\b(?:provider\s+)?idempotency\s+key\b",
+            lower,
+        )
+        or re.search(
             r"\beach\b.{0,30}\bauthoriz\w*\b.{0,50}\bcaptur\w*\b"
             r".{0,50}\brefund\w*\b.{0,35}\b(?:gets?|has|uses?)\b"
             r".{0,20}\b(?:its\s+own|a\s+(?:unique|distinct|separate))\b"
@@ -1888,6 +2088,21 @@ def payment_operation_semantic_issues(
             lower,
         )
         or (distinct_operation_keys and same_operation_retry_reuse)
+        or re.search(
+            r"\b(?:each|every)\b.{0,70}\b(?:logical\s+)?"
+            r"(?:operation|command|request|action)\s+instance\b.{0,70}"
+            r"\b(?:its\s+own|a\s+(?:stable|durable|unique|distinct))\b.{0,30}"
+            r"\bidempotency\s+(?:key|token)\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:derive|namespace|compute)\w*\b.{0,45}"
+            r"\bidempotency\s+(?:key|token)\b.{0,110}"
+            r"\b(?:payment|intent|account)[- ]?id\b.{0,80}"
+            r"\boperation[- ]?(?:type|kind)\b.{0,80}"
+            r"\b(?:operation[- ]?(?:id|instance)|sequence|index|ordinal)\b",
+            lower,
+        )
     )
     if require_complete_idempotency_semantics:
         if not operation_scoped_stable_key:
@@ -2166,6 +2381,15 @@ def self_check_payment_operation_semantics() -> None:
         "every retry reuses that operation's same stable key. Deduplicate webhooks by "
         "provider_event_id under a unique constraint. A timeout remains UNKNOWN and "
         "blocks any new charge.",
+        "Every logical operation instance, including each partial capture and refund, "
+        "gets its own durable idempotency key. Authorize, capture, and refund have "
+        "separate keys, and the exact command preserves its key across retry attempts. "
+        "Never rotate the provider key and never retry without it. Do not use a global "
+        "constant key. Deduplicate webhooks by provider event ID.",
+        "Namespace the idempotency key by merchant ID, payment ID, operation kind, "
+        "and operation ID. A retry deterministically recomputes the identical key. "
+        "Authorizations, partial captures, and refunds have different keys. "
+        "Deduplicate webhooks by provider event ID under a unique constraint.",
     )
     for value in safe:
         assert not payment_operation_semantic_issues(
@@ -2187,6 +2411,73 @@ def self_check_payment_operation_semantics() -> None:
             "On every replay, select new idempotency keys. Deduplicate webhooks using "
             "provider event ID under a unique constraint.",
             "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "Rotate the provider idempotency key between retry attempts. Deduplicate "
+            "webhooks using provider event ID.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "Each provider attempt gets a fresh random UUID as its idempotency key. "
+            "Deduplicate webhooks using provider event ID.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "The provider key is not stable across retries and we rotate it.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "After timeout regenerate the key.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "Derive the retry key by appending the attempt number.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "Derive the retry idempotency key by appending the attempt number to the "
+            "original key.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "Refresh the provider key after timeout.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "Discard the old key and mint a successor.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "Use an attempt-specific nonce.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "Retry the provider request without an idempotency key. Deduplicate "
+            "webhooks using provider event ID.",
+            "unsafe_missing_idempotency_key_on_retry",
+        ),
+        (
+            "The idempotency key may be omitted on retries. Deduplicate webhooks "
+            "using provider event ID.",
+            "unsafe_missing_idempotency_key_on_retry",
+        ),
+        (
+            "Omit idempotency after the first attempt.",
+            "unsafe_missing_idempotency_key_on_retry",
+        ),
+        (
+            "Use one global constant idempotency key across all customer payments. "
+            "Deduplicate webhooks using provider event ID.",
+            "unsafe_constant_idempotency_key",
+        ),
+        (
+            "Every tenant shares the same fixed key for all payment requests. "
+            "Deduplicate webhooks using provider event ID.",
+            "unsafe_constant_idempotency_key",
+        ),
+        (
+            "Every provider call uses the payment's constant key across all operations.",
+            "unsafe_constant_idempotency_key",
         ),
         (
             "Use one shared idempotency key across authorize, capture, and refund. "
@@ -2317,6 +2608,20 @@ def self_check_payment_operation_semantics() -> None:
         deployed_q39_wording,
         require_webhook_event_dedup=True,
     )
+    round538_q39_wording = (
+        "Support payment operations like authorize, capture, and refund. The API "
+        "normalizes the logical operation, then generates or accepts a client "
+        "idempotency key. In a single DB transaction it records operation state and "
+        "an outbox command. Provider retries use the same logical operation and the "
+        "same stable provider idempotency key. Deduplicate webhooks by provider event "
+        "ID under a unique constraint."
+    )
+    assert set(
+        payment_operation_semantic_issues(
+            round538_q39_wording,
+            require_webhook_event_dedup=True,
+        )
+    ) == {"missing_distinct_authorize_capture_refund_keys"}
     negated_retry_rules = (
         "Do not reuse the same idempotency key for retries of the same operation.",
         "Avoid reusing the same idempotency key for retries of the same operation.",
@@ -3193,12 +3498,26 @@ def feature_store_consistency_issues(text: str) -> List[str]:
         re.sub(r"[*`~]+", "", text.casefold().replace("’", "'")),
     )
     issues: List[str] = []
+    decision_time = (
+        r"(?:prediction|decision|observation|request|scoring)[- ](?:time|timestamp)|"
+        r"(?:prediction|decision|observation|request|scoring)\s+cutoff|"
+        r"time\s+(?:of|at)\s+(?:prediction|decision|observation|request|scoring)"
+    )
+    event_time = r"(?:(?:source|feature)[- ])?event[- ](?:time|timestamp)"
+    availability_time = (
+        r"(?:availability|ingestion|processing|knowledge)[- ](?:times?|timestamps?)"
+    )
+    label_time = (
+        r"(?:label(?:[- ](?:availability|outcome))?|outcome)[- ](?:time|timestamp)|"
+        r"(?:label|outcome)\s+cutoff|time\s+of\s+(?:the\s+)?(?:label|outcome)"
+    )
 
     shared_executable = bool(
         (
             re.search(
                 r"\b(?:one|single|same|shared|versioned)\b.{0,55}"
-                r"\b(?:executable|compiled|feature\s+code|transformation\s+code|dsl)\b",
+                r"\b(?:executable|compiled|feature\s+code|transformation\s+"
+                r"(?:code|definition)|dsl)\b",
                 lower,
             )
             or re.search(
@@ -3216,50 +3535,95 @@ def feature_store_consistency_issues(text: str) -> List[str]:
         and re.search(r"\b(?:stream|streaming|online|serving)\b", lower)
         and re.search(r"\b(?:batch|offline|training)\b", lower)
     )
+    independent_transformations = bool(
+        re.search(
+            r"\b(?:streaming|online)\b.{0,45}\b(?:and|versus|vs\.?|/)\b.{0,20}"
+            r"\b(?:batch|offline)\b.{0,60}\b(?:transformations?|code|logic)\b"
+            r".{0,45}\b(?:implemented\s+independently|independent|separate|different)\b|"
+            r"\b(?:batch|offline)\b.{0,45}\b(?:and|versus|vs\.?|/)\b.{0,20}"
+            r"\b(?:streaming|online)\b.{0,60}\b(?:transformations?|code|logic)\b"
+            r".{0,45}\b(?:implemented\s+independently|independent|separate|different)\b|"
+            r"\bduplicate\w*\b.{0,35}\btransformation\s+logic\b.{0,25}"
+            r"\bseparately\b|"
+            r"\bregistry\b.{0,45}\bshares?\s+schemas?\s+only\b.{0,80}"
+            r"\beach\s+path\b.{0,35}\b(?:its\s+own|separate)\b.{0,25}"
+            r"\bimplementation\b|"
+            r"\b(?:batch|streaming)\b.{0,35}\b(?:and|versus|vs\.?|/)\b.{0,20}"
+            r"\b(?:batch|streaming)\b.{0,45}\buse\w*\b.{0,25}\bdifferent\s+code\b|"
+            r"\b(?:do not|don't|never)\b.{0,35}\b(?:compile|share)\w*\b.{0,55}"
+            r"\bexecutable\s+transformations?\b.{0,40}\bbetween\s+paths\b",
+            lower,
+        )
+    )
+    if independent_transformations:
+        shared_executable = False
+        issues.append("unsafe_independent_feature_transformations")
     if not shared_executable:
         issues.append("missing_shared_executable_feature_transformations")
 
-    if not re.search(r"\bevent[- ]time\b", lower):
+    if not re.search(rf"\b(?:{event_time})\b", lower):
         issues.append("missing_feature_event_time")
-    if not re.search(r"\b(?:availability|ingestion|processing)[- ]time\b", lower):
+    known_by_decision = bool(
+        re.search(
+            rf"\b(?:known|available|visible)\b.{{0,45}}"
+            rf"\b(?:by|at|no\s+later\s+than)\b.{{0,25}}\b(?:{decision_time})\b",
+            lower,
+        )
+    )
+    if not (re.search(rf"\b(?:{availability_time})\b", lower) or known_by_decision):
         issues.append("missing_feature_availability_time")
-    as_of_join = bool(re.search(r"\b(?:as[- ]of|temporal)\s+join\b", lower))
+    as_of_join = bool(
+        re.search(
+            r"\b(?:as[- ]of|temporal|point[- ]in[- ]time|snapshot)\s+join\b|"
+            r"\bjoin\b.{0,30}\b(?:as[- ]of|point[- ]in[- ]time)\b",
+            lower,
+        )
+    )
     both_times_bounded = bool(
         re.search(
-            r"\bboth\b.{0,40}\bevent[- ]time\b.{0,60}"
-            r"\bavailability[- ]time\b.{0,100}"
-            r"\b(?:at\s+or\s+before|before|not\s+after|<=)\b.{0,50}"
-            r"\b(?:prediction|cutoff|observation)[- ]time\b|"
-            r"\bevent[- ]time\b.{0,80}\b(?:and|plus)\b.{0,40}"
-            r"\bavailability[- ]time\b.{0,100}"
-            r"\b(?:at\s+or\s+before|before|not\s+after|<=)\b.{0,50}"
-            r"\b(?:prediction|cutoff|observation)[- ]time\b|"
-            r"\bevent\s+and\s+availability\s+times?\b.{0,100}"
-            r"\b(?:at\s+or\s+before|before|not\s+after|<=)\b.{0,50}"
-            r"\b(?:prediction[- ]time|prediction\s+cutoff|observation[- ]time)\b",
+            rf"\bboth\b.{{0,40}}\b(?:{event_time})\b.{{0,60}}"
+            rf"\b(?:{availability_time})\b.{{0,100}}"
+            rf"(?:\bat\s+or\s+before\b|\bno\s+later\s+than\b|\bbefore\b|"
+            rf"\bprecedes?\b|\bis\s+earlier\s+than\b|\bnot\s+after\b|<=)"
+            rf".{{0,50}}\b(?:{decision_time})\b|"
+            rf"\b(?:{event_time})\b.{{0,80}}\b(?:and|plus)\b.{{0,40}}"
+            rf"\b(?:{availability_time})\b.{{0,100}}"
+            rf"(?:\bat\s+or\s+before\b|\bno\s+later\s+than\b|\bbefore\b|"
+            rf"\bprecedes?\b|\bis\s+earlier\s+than\b|\bnot\s+after\b|<=)"
+            rf".{{0,50}}\b(?:{decision_time})\b|"
+            r"\bevent\s+and\s+(?:availability|ingestion|knowledge)\s+"
+            rf"(?:times?|timestamps?)\b.{{0,100}}"
+            rf"(?:\bat\s+or\s+before\b|\bno\s+later\s+than\b|\bbefore\b|"
+            rf"\bprecedes?\b|\bis\s+earlier\s+than\b|\bnot\s+after\b|<=)"
+            rf".{{0,50}}\b(?:{decision_time})\b",
             lower,
         )
     )
     event_time_bounded = bool(
         both_times_bounded
         or re.search(
-            r"\bevent[- ]time\b.{0,100}(?:<=|at\s+or\s+before|before|not\s+after)"
-            r".{0,80}\b(?:prediction|cutoff|observation)[- ]time\b",
+            rf"\b(?:{event_time})\b.{{0,100}}"
+            rf"(?:<=|\bat\s+or\s+before\b|\bno\s+later\s+than\b|\bbefore\b|"
+            rf"\bprecedes?\b|\bis\s+earlier\s+than\b|\bnot\s+after\b)"
+            rf".{{0,80}}\b(?:{decision_time})\b",
             lower,
         )
     )
     availability_time_bounded = bool(
         both_times_bounded
         or re.search(
-            r"\b(?:availability|ingestion)[- ]time\b.{0,100}"
-            r"(?:<=|at\s+or\s+before|before|not\s+after).{0,80}"
-            r"\b(?:prediction|cutoff|observation)[- ]time\b",
+            rf"\b(?:{availability_time})\b.{{0,100}}"
+            rf"(?:<=|\bat\s+or\s+before\b|\bno\s+later\s+than\b|\bbefore\b|"
+            rf"\bprecedes?\b|\bis\s+earlier\s+than\b|\bnot\s+after\b)"
+            rf".{{0,80}}\b(?:{decision_time})\b",
             lower,
         )
+        or known_by_decision
     )
     coordinated_times_unbounded = bool(
         re.search(
-            r"\bevent\s+and\s+availability\s+times?\b.{0,60}"
+            r"\bevent\s+and\s+(?:availability|ingestion|knowledge)\s+"
+            r"(?:times?|timestamps?)\b.{0,60}"
             r"(?:\b(?:are\s+)?not\s+(?:required\s+to\s+be\s+|"
             r"necessarily\s+(?:required\s+to\s+be\s+)?)?"
             r"(?:filtered|bounded|checked|enforced|at\s+or\s+before|before|<=)|"
@@ -3270,20 +3634,180 @@ def feature_store_consistency_issues(text: str) -> List[str]:
         )
     )
     if re.search(
-        r"\bevent[- ]time\b.{0,35}\b(?:is|are)\s+not\s+"
+        rf"\b(?:{event_time})\b.{{0,35}}\b(?:is|are)\s+not\s+"
         r"(?:filtered|bounded|checked|enforced)\b",
         lower,
     ):
         event_time_bounded = False
     if re.search(
-        r"\b(?:availability|ingestion)[- ]time\b.{0,35}"
+        rf"\b(?:{availability_time})\b.{{0,35}}"
         r"\b(?:is|are)\s+not\s+(?:filtered|bounded|checked|enforced)\b",
         lower,
     ):
         availability_time_bounded = False
+
+    future_availability = bool(
+        re.search(
+            rf"\b(?:{availability_time})\b.{{0,25}}"
+            r"\b(?:is|remains?|can\s+be)\s+(?:unconstrained|unbounded)\b|"
+            rf"\bfuture\s+(?:{availability_time})\b.{{0,20}}"
+            r"\b(?:is|are)\s+(?:explicitly\s+)?(?:allowed|admitted|included|used)\b"
+            r".{0,45}\btraining\s+rows?\b|"
+            rf"\b(?:{availability_time})\b.{{0,35}}"
+            r"\b(?:need\s+not|(?:is|are)\s+not\s+required\s+to|"
+            r"does\s+not\s+need\s+to)\b.{0,25}"
+            r"\b(?:be\s+)?(?:before|precede|no\s+later\s+than)\b.{0,25}"
+            rf"\b(?:{decision_time})\b|"
+            r"\bfeature\s+values?\b.{0,30}\bmay\s+arrive\s+after\b.{0,20}"
+            r"\b(?:prediction|decision|observation|request|scoring)\b.{0,55}"
+            r"\b(?:are\s+)?(?:still\s+)?(?:included|eligible|used|admitted)\b|"
+            r"\bvalues?\b.{0,25}\bremain\s+eligible\b.{0,25}"
+            r"\beven\s+when\s+unavailable\b.{0,20}"
+            rf"\b(?:{decision_time})\b|"
+            rf"\b(?:{availability_time})\b.{{0,30}}\bmay\s+lag\b.{{0,25}}"
+            rf"\b(?:{decision_time})\b.{{0,55}}"
+            r"\b(?:still\s+)?(?:include|includes|included|admit|use)\w*\b|"
+            r"\bfuture\s+feature\s+values?\b.{0,25}"
+            r"\b(?:is|are)\s+(?:explicitly\s+)?(?:allowed|admitted|included|used)\b"
+            r".{0,45}\btraining\s+rows?\b|"
+            r"\b(?:do\s+not|don't|never)\s+exclude\w*\b.{0,35}"
+            r"\bvalues?\b.{0,25}\bunavailable\b.{0,20}"
+            rf"\b(?:at|by)\b.{{0,10}}\b(?:{decision_time})\b",
+            lower,
+        )
+    )
+    label_cutoff_boundary = False
+    for clause in re.split(r"(?<=[.!?;])\s+", lower):
+        future_relation = bool(
+            re.search(
+                rf"\b(?:{availability_time})\b.{{0,65}}"
+                rf"(?:\bafter\b|(?<!no\s)\blater\s+than\b|>)\s*.{{0,20}}"
+                rf"\b(?:{decision_time})\b|"
+                rf"\b(?:{decision_time})\b.{{0,65}}"
+                rf"(?:\bbefore\b|<)\s*.{{0,20}}\b(?:{availability_time})\b|"
+                r"\bfeatures?\b.{0,40}\b(?:not\s+)?(?:available|known|ingested)\b"
+                rf".{{0,35}}\b(?:until|after)\b.{{0,20}}\b(?:{decision_time})\b",
+                clause,
+            )
+        )
+        if future_relation:
+            negated_rejection = bool(
+                re.search(
+                    r"\b(?:do not|don't|never|cannot|can't)\s+"
+                    r"(?:reject|exclude|drop|ignore|filter\s+out)\w*\b",
+                    clause,
+                )
+            )
+            safely_rejects_future = bool(
+                not negated_rejection
+                and (
+                    re.search(
+                        r"\b(?:reject|exclude|drop|ignore|filter\s+out)\w*\b"
+                        rf".{{0,95}}\b(?:{availability_time})\b.{{0,50}}"
+                        rf"\b(?:after|later\s+than)\b.{{0,20}}"
+                        rf"\b(?:{decision_time})\b",
+                        clause,
+                    )
+                    or re.search(
+                        rf"\b(?:{availability_time})\b.{{0,50}}"
+                        rf"\b(?:after|later\s+than)\b.{{0,20}}"
+                        rf"\b(?:{decision_time})\b.{{0,55}}"
+                        r"\b(?:is|are|must\s+be|will\s+be)\s+"
+                        r"(?:rejected|excluded|dropped|ignored|filtered\s+out)\b",
+                        clause,
+                    )
+                    or re.search(
+                        r"\b(?:do not|don't|never|must not|cannot|can't)\s+"
+                        r"(?:admit|use|include|join|select)\w*\b.{0,110}"
+                        rf"\b(?:{availability_time})\b.{{0,50}}"
+                        rf"\b(?:after|later\s+than)\b.{{0,20}}"
+                        rf"\b(?:{decision_time})\b",
+                        clause,
+                    )
+                )
+            )
+            if not safely_rejects_future:
+                future_availability = True
+
+        positive_label_boundary = bool(
+            re.search(
+                rf"\b(?:{event_time}|{availability_time})\b.{{0,100}}"
+                rf"(?:<=|\bat\s+or\s+before\b|\bbefore\b|\bnot\s+after\b)"
+                rf".{{0,55}}\b(?:{label_time})\b|"
+                r"\bevent\s+and\s+(?:availability|ingestion|knowledge)\s+"
+                rf"(?:times?|timestamps?)\b.{{0,100}}\b(?:{label_time})\b|"
+                rf"\b(?:as[- ]of|temporal|point[- ]in[- ]time)\s+join\b.{{0,100}}"
+                rf"\b(?:{label_time})\b",
+                clause,
+            )
+        )
+        label_is_explicitly_different = bool(
+            re.search(
+                rf"\b(?:{label_time})\b.{{0,45}}"
+                r"\b(?:(?:is|are)\s+)?(?:not|never)\s+"
+                r"(?:exactly\s+|explicitly\s+)?"
+                r"(?:the\s+)?(?:same\s+as|identical\s+to|equal\s+to)\b"
+                rf".{{0,25}}\b(?:{decision_time})\b|"
+                rf"\b(?:{label_time})\b.{{0,45}}"
+                r"\b(?:is|are)\s+not\s+(?:the\s+)?"
+                rf"(?:{decision_time})\b|"
+                rf"\b(?:{label_time})\b.{{0,45}}"
+                r"\b(?:differs?\s+from|is\s+(?:unrelated\s+to|approximately))\b"
+                rf".{{0,25}}\b(?:{decision_time})\b|"
+                rf"\b(?:{decision_time})\b.{{0,45}}"
+                r"\bdiffers?\s+from\b.{0,25}"
+                rf"\b(?:{label_time})\b",
+                clause,
+            )
+        )
+        label_is_decision = bool(
+            re.search(
+                rf"\b(?:{label_time})\b.{{0,45}}"
+                r"\b(?:(?:is|are)\s+)?(?:explicitly\s+)?(?:the\s+)?"
+                r"(?:same\s+as|identical\s+to|equal\s+to)\b.{0,25}"
+                rf"\b(?:{decision_time})\b|"
+                rf"\b(?:{label_time})\b.{{0,45}}\bequals?\b.{{0,25}}"
+                rf"\b(?:{decision_time})\b|"
+                rf"\b(?:{label_time})\b.{{0,45}}"
+                r"\b(?:explicitly\s+defined\s+as|defined\s+to\s+be\s+exactly|"
+                r"serves?\s+as|coincides?\s+exactly\s+with)\b.{0,25}"
+                rf"\b(?:{decision_time})\b|"
+                rf"\b(?:{decision_time})\b.{{0,45}}"
+                r"\b(?:same\s+as|identical\s+to|equal\s+to|equals?)\b.{0,25}"
+                rf"\b(?:{label_time})\b",
+                clause,
+            )
+            and not label_is_explicitly_different
+        )
+        rejects_label_boundary = bool(
+            re.search(
+                r"\b(?:do not|don't|never|must not|cannot|can't|avoid)\b.{0,40}"
+                r"\b(?:use|substitute|join|bound|filter)\w*\b.{0,70}"
+                rf"\b(?:{label_time})\b",
+                clause,
+            )
+        )
+        if positive_label_boundary and label_is_decision:
+            if re.search(rf"\b(?:{event_time})\b", clause):
+                event_time_bounded = True
+            if re.search(rf"\b(?:{availability_time})\b", clause):
+                availability_time_bounded = True
+            if re.search(
+                r"\bevent\s+and\s+(?:availability|ingestion|knowledge)\s+"
+                r"(?:times?|timestamps?)\b",
+                clause,
+            ):
+                event_time_bounded = True
+                availability_time_bounded = True
+        elif positive_label_boundary and not rejects_label_boundary:
+            label_cutoff_boundary = True
+
     if coordinated_times_unbounded:
         event_time_bounded = False
         availability_time_bounded = False
+    if future_availability or label_cutoff_boundary:
+        availability_time_bounded = False
+        issues.append("unsafe_future_feature_availability_or_label_cutoff")
     if not (as_of_join and event_time_bounded and availability_time_bounded):
         issues.append("missing_point_in_time_join_mechanics")
 
@@ -3442,6 +3966,206 @@ def payment_timeout_followup_completeness_issues(text: str) -> List[str]:
     return issues
 
 
+def url_shortener_safety_issues(text: str) -> List[str]:
+    """Reject redirects that can expose stale or abuse-blocked destinations."""
+    lower = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[*`~]+", "", text.casefold().replace("’", "'")),
+    )
+    issues: List[str] = []
+    clauses = [
+        clause.strip()
+        for clause in re.split(
+            r"(?<=[.!?;])\s+|,\s+(?=(?:but|while|whereas|although)\b)",
+            lower,
+        )
+        if clause.strip()
+    ]
+    unsafe_state_redirect = False
+    state = (
+        r"(?:deleted|expired|blocked|abuse[- ]blocked|disabled|tombstoned|"
+        r"revoked|suspended|quarantined|malicious)"
+    )
+    redirect = r"(?:30[1278]|redirect\w*)"
+    for clause in clauses:
+        associates_state_with_redirect = bool(
+            re.search(
+                rf"\b{state}\b.{{0,95}}"
+                r"\b(?:gets?|returns?|responds?|serves?|sends?|uses?|issues?|allows?|"
+                r"performs?|resolves?|maps?\s+to|mapped\s+to)\b"
+                rf".{{0,60}}\b{redirect}\b|"
+                rf"\b{state}\b.{{0,95}}\b(?:continue\s+)?redirect\w*\b"
+                r".{0,45}\b(?:stored|original|target|destination|30[1278])\b|"
+                rf"\b{state}\b.{{0,95}}\b(?:continue\s+)?"
+                r"(?:serv(?:e|es|ed|ing)|sends?|routes?|falls?\s+back\s+to)\b.{0,60}"
+                r"\b(?:stored|original|target|destination|url)\b|"
+                rf"\bredirect\w*\b.{{0,35}}\b{state}\b.{{0,45}}"
+                r"\b(?:stored|original|target|destination|30[1278])\b|"
+                rf"\bredirect\w*\b.{{0,65}}\b(?:for|on|when|if|to)\b"
+                rf".{{0,35}}\b{state}\b|"
+                rf"\b(?:30[1278])\b.{{0,65}}\b(?:for|on|when|if)\b"
+                rf".{{0,35}}\b{state}\b",
+                clause,
+            )
+        )
+        if not associates_state_with_redirect:
+            continue
+        double_negation = bool(
+            re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't)\s+"
+                r"(?:prevent|block|forbid|disable)\w*\b.{0,35}\bredirect\w*\b",
+                clause,
+            )
+        )
+        safely_rejected = bool(
+            not double_negation
+            and (
+                re.search(
+                    rf"\b{state}\b.{{0,70}}"
+                    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't)\s+"
+                    rf"(?:(?:return|serve|send|use|issue|perform)\w*\s+)?\b{redirect}\b",
+                    clause,
+                )
+                or re.search(
+                    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't)\s+"
+                    rf"(?:(?:return|serve|send|use|issue|perform)\w*\s+)?\b{redirect}\b"
+                    rf".{{0,70}}\b{state}\b",
+                    clause,
+                )
+                or re.search(
+                    rf"\b{redirect}\b.{{0,30}}\b(?:is|are|will\s+be|must\s+be)\s+"
+                    rf"not\s+(?:used|returned|served|sent|issued)\b.{{0,45}}\b{state}\b",
+                    clause,
+                )
+                or re.search(
+                    rf"\b{state}\b.{{0,75}}\b(?:404|410|403|safe\s+interstitial)\b"
+                    rf".{{0,45}}\b(?:instead\s+of|rather\s+than|not)\b.{{0,20}}"
+                    rf"\b{redirect}\b",
+                    clause,
+                )
+                or re.search(
+                    rf"\b(?:purge|invalidate|evict|remove)\w*\b.{{0,40}}"
+                    rf"\b(?:cached\s+)?{redirect}\b.{{0,70}}\b(?:404|410|403)\b",
+                    clause,
+                )
+                or re.search(
+                    rf"\b{state}\b.{{0,70}}\bredirect\w*\b.{{0,30}}"
+                    r"\b(?:safe\s+)?(?:warning|abuse)\s+interstitial\b",
+                    clause,
+                )
+                or re.search(
+                    rf"\b{state}\b.{{0,80}}\b(?:302|307)\b.{{0,45}}"
+                    r"\b(?:safe\s+)?warning\s+interstitial\b.{0,55}"
+                    r"\bnever\b.{0,25}\b(?:stored|original|target|destination)\b",
+                    clause,
+                )
+            )
+        )
+        if not safely_rejected:
+            unsafe_state_redirect = True
+            break
+    if unsafe_state_redirect:
+        issues.append("unsafe_redirect_for_inactive_or_blocked_link")
+
+    mutable_permanent_redirect = False
+    mutable = r"(?:mutable|editable|changeable)"
+    permanent = r"(?:301|308|permanent\s+redirect)"
+    for clause in clauses:
+        association = bool(
+            re.search(
+                rf"\b{mutable}\b.{{0,80}}\b(?:gets?|returns?|responds?|serves?|"
+                rf"sends?|uses?|issues?|allows?|performs?|maps?\s+to|mapped\s+to)\b"
+                rf".{{0,30}}\b{permanent}\b|"
+                rf"\b{permanent}\b.{{0,70}}\b(?:for|on|when|while)\b.{{0,25}}"
+                rf"\b{mutable}\b",
+                clause,
+            )
+        )
+        if not association:
+            continue
+        safely_rejected = bool(
+            re.search(
+                rf"\b{mutable}\b.{{0,65}}"
+                r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't)\s+"
+                rf"(?:(?:return|serve|send|use|issue)\w*\s+)?\b{permanent}\b|"
+                r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|reserve)\b"
+                rf".{{0,50}}\b{permanent}\b.{{0,60}}\b{mutable}\b|"
+                rf"\b{permanent}\b.{{0,30}}\b(?:is|are)\s+not\s+used\b"
+                rf".{{0,45}}\b{mutable}\b|"
+                rf"\b{mutable}\b.{{0,45}}\b(?:302|307)\b.{{0,25}}\bnot\b.{{0,15}}"
+                rf"\b{permanent}\b",
+                clause,
+            )
+        )
+        double_negation = bool(
+            re.search(
+                r"\b(?:do not|don't|never|must not)\s+(?:prevent|block|forbid)\w*\b"
+                rf".{{0,35}}\b{permanent}\b",
+                clause,
+            )
+        )
+        if not safely_rejected or double_negation:
+            mutable_permanent_redirect = True
+            break
+    if re.search(
+        r"\b(?:users?\s+can|allow\w*\s+users?\s+to)\s+"
+        r"(?:update|change)\w*\b.{0,30}\bdestination\b.{0,100}"
+        r"\bredirects?\b.{0,25}\buses?\b.{0,15}\b(?:http\s+)?(?:301|308)\b",
+        lower,
+    ):
+        mutable_permanent_redirect = True
+    if mutable_permanent_redirect:
+        issues.append("unsafe_permanent_redirect_for_mutable_link")
+
+    generic_abuse_451 = False
+    for clause in clauses:
+        if not (
+            re.search(
+                r"\b(?:abuse|spam|malware|phishing|malicious|fraudulent|fraud|"
+                r"policy[- ]blocked)\b",
+                clause,
+            )
+            and re.search(r"\b451\b", clause)
+        ):
+            continue
+        legally_unavailable = bool(
+            re.search(
+                r"\b(?:legal|legally|law|court|regulator|regulatory|government|"
+                r"statute|jurisdiction|dmca)\b",
+                clause,
+            )
+        )
+        rejects_451 = bool(
+            re.search(
+                r"\b(?:do not|don't|never|must not|cannot|can't)\b.{0,30}\b451\b|"
+                r"\b451\b.{0,25}\b(?:is|are)\s+not\s+used\b",
+                clause,
+            )
+        )
+        if not (legally_unavailable or rejects_451):
+            generic_abuse_451 = True
+            break
+    if generic_abuse_451:
+        issues.append("unsafe_451_for_generic_abuse_block")
+
+    if re.search(
+        r"\breconcil\w*\b.{0,65}\b(?:payment|charge|card|processor|ledger)\b|"
+        r"\b(?:payment|charge|card|processor|ledger)\b.{0,65}\breconcil\w*\b|"
+        r"\bprovider\s+timeout\b.{0,130}\breconcil\w*\b.{0,90}"
+        r"\b(?:terminal\s+(?:failure|state|outcome)|ambiguous\s+outcome|unknown)\b|"
+        r"\breconcil\w*\b.{0,90}\b(?:terminal\s+(?:failure|state|outcome)|"
+        r"ambiguous\s+outcome|unknown)\b.{0,130}\bprovider\s+timeout\b|"
+        r"\bpayment\s+idempotency\s+key\b.{0,80}\b(?:redirect|url|mapping|link)\b|"
+        r"\b(?:psp|payment\s+service\s+provider|processor|gateway)\s+timeout\b"
+        r".{0,100}\b(?:card|capture|transaction)\w*\b.{0,100}"
+        r"\b(?:unknown|poll\w*\s+(?:the\s+)?gateway)\b",
+        lower,
+    ):
+        issues.append("irrelevant_payment_reconciliation_in_url_design")
+    return issues
+
+
 def self_check_production_answer_contracts() -> None:
     shallow_rag = (
         "Use a golden dataset and score retrieval precision and faithfulness. "
@@ -3512,6 +4236,39 @@ def self_check_production_answer_contracts() -> None:
         "and offline values for parity and skew."
     )
     assert not feature_store_consistency_issues(coordinated_timestamp_store)
+    paraphrased_store = (
+        "A shared versioned transformation definition compiles into live serving and "
+        "offline batch training. Persist the source event timestamp and knowledge "
+        "timestamp. Build rows with a point-in-time join: source event timestamp and "
+        "knowledge timestamp must each be no later than the decision timestamp. A "
+        "watermark quarantines late events, then an idempotent replay deduplicates by "
+        "event ID. Continuously run online/offline equivalence and skew checks."
+    )
+    assert not feature_store_consistency_issues(paraphrased_store)
+    label_equals_decision_store = complete_store.replace(
+        "prediction-time",
+        "label timestamp, which is explicitly identical to the decision timestamp",
+    )
+    assert not feature_store_consistency_issues(label_equals_decision_store)
+    for safe_label_equivalence in (
+        "label timestamp, which equals the decision timestamp",
+        "label timestamp, explicitly defined as the decision timestamp",
+        "label timestamp, defined to be exactly the decision timestamp",
+        "label timestamp, which serves as the decision timestamp",
+        "label timestamp, which coincides exactly with the decision timestamp",
+    ):
+        assert not feature_store_consistency_issues(
+            complete_store.replace("prediction-time", safe_label_equivalence)
+        ), safe_label_equivalence
+    snapshot_store = (
+        "A shared versioned executable transformation compiles for live serving and "
+        "offline batch training. Persist the source event timestamp and knowledge "
+        "timestamp. A snapshot join requires the source event timestamp to precede "
+        "request time and the knowledge timestamp to be earlier than request time. A "
+        "watermark corrects late events through an idempotent replay deduplicated by "
+        "event ID. Continuously compare online/offline values for parity and skew."
+    )
+    assert not feature_store_consistency_issues(snapshot_store)
     negated_coordinated_timestamps = coordinated_timestamp_store.replace(
         "event and availability times are at or before the prediction cutoff",
         "event and availability times are not required to be at or before the prediction cutoff",
@@ -3533,6 +4290,76 @@ def self_check_production_answer_contracts() -> None:
         unsafe_issues = set(feature_store_consistency_issues(unsafe_store))
         assert "missing_point_in_time_join_mechanics" in unsafe_issues
         assert "unsafe_negated_feature_store_correctness" in unsafe_issues
+    for unsafe_wording in (
+        "The availability timestamp may be after the prediction timestamp.",
+        "Include features whose ingestion time is later than decision time.",
+        "Use features not available until after the observation timestamp.",
+        "Availability-time is unconstrained.",
+        "Future availability-time is allowed in training rows.",
+        "Availability time need not be before prediction time.",
+        "Availability timestamps are not required to precede decision time.",
+        "Feature values may arrive after prediction and are still included.",
+        "Values remain eligible even when unavailable at scoring time.",
+        "Availability timestamp may lag prediction timestamp and we still include it.",
+        "Future feature values are allowed in training rows.",
+        "We do not exclude values unavailable at prediction time.",
+    ):
+        unsafe_issues = set(
+            feature_store_consistency_issues(complete_store + " " + unsafe_wording)
+        )
+        assert "unsafe_future_feature_availability_or_label_cutoff" in unsafe_issues
+        assert "missing_point_in_time_join_mechanics" in unsafe_issues
+    for unsafe_label_boundary in (
+        "The as-of join admits event-time and availability-time at or before label cutoff.",
+        "Both event-time and availability-time are bounded by the outcome timestamp.",
+        "The as-of join admits event-time and availability-time at or before label "
+        "timestamp, which is not the decision timestamp.",
+        "The as-of join admits event-time and availability-time at or before label "
+        "timestamp, which is not identical to the decision timestamp.",
+        "The as-of join admits event-time and availability-time at or before label "
+        "timestamp, which differs from the decision timestamp.",
+        "The as-of join admits event-time and availability-time at or before label "
+        "timestamp, which is unrelated to the decision timestamp.",
+        "The as-of join admits event-time and availability-time at or before label "
+        "timestamp, which is never identical to the decision timestamp.",
+        "The as-of join admits event-time and availability-time at or before label "
+        "timestamp, which is approximately the decision timestamp.",
+    ):
+        unsafe_issues = set(
+            feature_store_consistency_issues(
+                complete_store.replace(
+                    "admitting both event-time and availability-time at or before prediction-time",
+                    unsafe_label_boundary,
+                )
+            )
+        )
+        assert "unsafe_future_feature_availability_or_label_cutoff" in unsafe_issues
+        assert "missing_point_in_time_join_mechanics" in unsafe_issues
+    assert "unsafe_future_feature_availability_or_label_cutoff" not in (
+        feature_store_consistency_issues(
+            complete_store
+            + " Never use a feature whose availability time is after prediction time."
+        )
+    )
+    for safe_future_rejection in (
+        "Never include values whose availability time is after prediction time.",
+        "Exclude values unavailable at prediction time.",
+    ):
+        assert "unsafe_future_feature_availability_or_label_cutoff" not in (
+            feature_store_consistency_issues(complete_store + " " + safe_future_rejection)
+        ), safe_future_rejection
+    for independent_wording in (
+        "Streaming and batch transformations are implemented independently.",
+        "Duplicate transformation logic separately.",
+        "The registry shares schemas only; each path has its own implementation.",
+        "Batch and streaming use different code as long as schemas match.",
+        "We do not compile or share executable transformations between paths.",
+    ):
+        independent_issues = set(
+            feature_store_consistency_issues(complete_store + " " + independent_wording)
+        )
+        assert "unsafe_independent_feature_transformations" in independent_issues
+        assert "missing_shared_executable_feature_transformations" in independent_issues
     alternate_store_wording = (
         "We define executable feature transformations once and compile them for batch "
         "training and stream serving. Run an equivalence test between batch training "
@@ -3577,6 +4404,74 @@ def self_check_production_answer_contracts() -> None:
     leaking_issues = set(feature_store_consistency_issues(leaking_store))
     assert "missing_point_in_time_join_mechanics" in leaking_issues
     assert "unsafe_negated_feature_store_correctness" in leaking_issues
+
+    safe_url_design = (
+        "Active mutable mappings use 302 or 307 with bounded cache freshness. "
+        "Deleted or expired mappings return 404 or 410, and abuse-blocked mappings "
+        "return 403 or a safe warning interstitial. A court-ordered legal block returns "
+        "451. Purge caches and retain tombstones; "
+        "never redirect inactive mappings to the stored destination. Reserve 301 or "
+        "308 for explicitly immutable mappings."
+    )
+    assert not url_shortener_safety_issues(safe_url_design)
+    unsafe_url_design = (
+        "For deleted, expired, or blocked links, return 302 or 307 with a tombstone. "
+        "Provider timeout after redirect update, reconcile by identifier and do not "
+        "assume terminal failure."
+    )
+    assert set(url_shortener_safety_issues(unsafe_url_design)) == {
+        "unsafe_redirect_for_inactive_or_blocked_link",
+        "irrelevant_payment_reconciliation_in_url_design",
+    }
+    assert not url_shortener_safety_issues(
+        "Deleted links never return 302; they return 410 and purge cached mappings."
+    )
+    for safe_url_wording in (
+        "Blocked links do not return 307; they return 403 and a safe interstitial.",
+        "For an expired mapping, invalidate the cached 302 redirect and return 410.",
+        "Mutable links use 302, not 301; reserve permanent redirects for immutable links.",
+        "Mutable mappings avoid 301 and 308.",
+        "On a CDN provider timeout, serve the cached active redirect or fall back to origin.",
+        "Never use 451 for generic abuse; reserve it for legally unavailable links.",
+        "A client idempotency key protects creation of a short-link mapping from retries.",
+        "When creating the URL mapping, require an idempotency key for duplicate requests.",
+        "Abuse-blocked links use 302 to a safe warning interstitial, never stored destination.",
+    ):
+        assert not url_shortener_safety_issues(safe_url_wording), safe_url_wording
+    unsafe_url_wording = (
+        ("Blocked links get a 307 to the stored destination.", "unsafe_redirect_for_inactive_or_blocked_link"),
+        ("Redirect expired mappings with 302.", "unsafe_redirect_for_inactive_or_blocked_link"),
+        ("Deleted mappings still resolve to their stored destination with HTTP 302.", "unsafe_redirect_for_inactive_or_blocked_link"),
+        ("Expired links continue redirecting to the target with 307.", "unsafe_redirect_for_inactive_or_blocked_link"),
+        ("Suspended and quarantined links redirect to the original destination.", "unsafe_redirect_for_inactive_or_blocked_link"),
+        ("Deleted mappings continue serving the stored destination.", "unsafe_redirect_for_inactive_or_blocked_link"),
+        ("Expired links fall back to original URL.", "unsafe_redirect_for_inactive_or_blocked_link"),
+        ("Blocked links send the user to stored target.", "unsafe_redirect_for_inactive_or_blocked_link"),
+        ("Do not prevent redirects for deleted links.", "unsafe_redirect_for_inactive_or_blocked_link"),
+        ("Mutable links return 301 for better caching.", "unsafe_permanent_redirect_for_mutable_link"),
+        ("Use a 308 redirect when the mapping is mutable.", "unsafe_permanent_redirect_for_mutable_link"),
+        ("Editable mappings use HTTP 301 even though their destination can change.", "unsafe_permanent_redirect_for_mutable_link"),
+        ("Users can update destination, but redirects use 301.", "unsafe_permanent_redirect_for_mutable_link"),
+        ("Abuse-blocked phishing links return 451.", "unsafe_451_for_generic_abuse_block"),
+        ("Policy-blocked links return 451.", "unsafe_451_for_generic_abuse_block"),
+        ("Fraudulent links return 451.", "unsafe_451_for_generic_abuse_block"),
+        (
+            "Provider timeout after redirect update; reconcile by identifier and keep the "
+            "outcome UNKNOWN instead of assuming terminal failure.",
+            "irrelevant_payment_reconciliation_in_url_design",
+        ),
+        (
+            "Use the payment idempotency key in the URL redirect mapping.",
+            "irrelevant_payment_reconciliation_in_url_design",
+        ),
+        (
+            "On a PSP timeout after card capture, move the transaction to UNKNOWN and "
+            "poll gateway status.",
+            "irrelevant_payment_reconciliation_in_url_design",
+        ),
+    )
+    for value, expected_issue in unsafe_url_wording:
+        assert expected_issue in url_shortener_safety_issues(value), value
 
     shallow_payment = (
         "Move PROCESSING to UNKNOWN, stop retries, query provider status, and use "
@@ -4141,6 +5036,25 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
                 require_webhook_event_dedup=True,
             )
         )
+        core_idempotency_issues = {
+            "unsafe_new_idempotency_key_on_retry",
+            "unsafe_missing_idempotency_key_on_retry",
+            "unsafe_constant_idempotency_key",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+            "missing_stable_idempotency_key_per_operation",
+            "missing_distinct_authorize_capture_refund_keys",
+            "missing_same_operation_idempotency_key_reuse",
+        }
+        for surface_name, surface_text in (
+            ("spoken", attempt.visible_answer),
+            ("canvas", attempt.artifact_body or ""),
+        ):
+            for surface_issue in payment_operation_semantic_issues(
+                surface_text,
+                require_webhook_event_dedup=False,
+            ):
+                if surface_issue in core_idempotency_issues:
+                    issues.append(f"q39_{surface_name}_{surface_issue}")
     if case.id == "Q40":
         if has_unsafe_ambiguous_payment_outcome(combined):
             issues.append("unsafe_ambiguous_payment_retry_or_terminal_failure")
@@ -4153,6 +5067,8 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
             )
         )
         issues.extend(payment_timeout_followup_completeness_issues(combined))
+    if case.id == "Q41":
+        issues.extend(url_shortener_safety_issues(combined))
     if case.id == "Q46":
         q46_visible = attempt.visible_answer
         issues.extend(q46_story_grounding_issues(q46_visible))
@@ -4723,6 +5639,60 @@ def self_check_attempt_integrity_guards() -> None:
     assert "missing_same_operation_idempotency_key_reuse" in payment_issues
     assert not answer_is_success(q39, payment_attempt)
 
+    complete_payment_surface = (
+        "Authorize, capture, and refund each use a distinct operation-scoped "
+        "idempotency key. Retries of the same logical operation reuse its original "
+        "stable key. Persist the payment intent and durable double-entry ledger before "
+        "calling the provider. Deduplicate webhooks by provider event ID and reconcile "
+        "UNKNOWN outcomes through authoritative provider status."
+    )
+    weak_payment_surface = (
+        "Client requests flow through durable ledger storage to the provider, and "
+        "provider webhooks feed a reconciliation worker for uncertain outcomes."
+    )
+    complete_both_surfaces = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=complete_payment_surface,
+        streamed_answer=complete_payment_surface,
+        terminal_answer=complete_payment_surface,
+        billing_received=True,
+        artifact_type="system_design",
+        artifact_body=complete_payment_surface,
+    )
+    complete_surface_issues = set(
+        blocking_answer_issues(q39, complete_both_surfaces)
+    )
+    assert not {
+        issue for issue in complete_surface_issues if issue.startswith("q39_")
+    }, complete_surface_issues
+    spoken_omission = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=weak_payment_surface,
+        streamed_answer=weak_payment_surface,
+        terminal_answer=weak_payment_surface,
+        billing_received=True,
+        artifact_type="system_design",
+        artifact_body=complete_payment_surface,
+    )
+    spoken_issues = set(blocking_answer_issues(q39, spoken_omission))
+    assert "q39_spoken_missing_distinct_authorize_capture_refund_keys" in spoken_issues
+    assert not any(issue.startswith("q39_canvas_missing_") for issue in spoken_issues)
+    canvas_omission = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=complete_payment_surface,
+        streamed_answer=complete_payment_surface,
+        terminal_answer=complete_payment_surface,
+        billing_received=True,
+        artifact_type="system_design",
+        artifact_body=weak_payment_surface,
+    )
+    canvas_issues = set(blocking_answer_issues(q39, canvas_omission))
+    assert "q39_canvas_missing_distinct_authorize_capture_refund_keys" in canvas_issues
+    assert not any(issue.startswith("q39_spoken_missing_") for issue in canvas_issues)
+
     q40 = next(case for case in CASES if case.id == "Q40")
     incomplete_timeout_contract = (
         "I would move the payment to UNKNOWN and PENDING_RECONCILIATION, stop the "
@@ -4902,14 +5872,26 @@ def release_exit_code(
     results_run: int,
     selected_count: int,
     accepted_outcomes: int,
+    first_attempt_accepted_outcomes: int,
+    cases_with_retries: int,
+    failed_partial_stream_attempts: int,
+    first_attempt_latency_gate_passed: bool,
     minimum_reliability_percent: float,
 ) -> int:
-    """Fail closed unless every answer and expected intervention is accepted."""
+    """Fail closed unless every case is fast and accepted on its first attempt."""
     if minimum_reliability_percent != 100.0:
         raise ValueError("the release reliability threshold is fixed at 100 percent")
     if results_run != selected_count or selected_count <= 0:
         return 2
-    return 0 if accepted_outcomes == selected_count else 2
+    return (
+        0
+        if accepted_outcomes == selected_count
+        and first_attempt_accepted_outcomes == selected_count
+        and cases_with_retries == 0
+        and failed_partial_stream_attempts == 0
+        and first_attempt_latency_gate_passed
+        else 2
+    )
 
 
 def self_check_release_exit_gate() -> None:
@@ -4917,25 +5899,59 @@ def self_check_release_exit_gate() -> None:
         results_run=12,
         selected_count=12,
         accepted_outcomes=12,
+        first_attempt_accepted_outcomes=12,
+        cases_with_retries=0,
+        failed_partial_stream_attempts=0,
+        first_attempt_latency_gate_passed=True,
         minimum_reliability_percent=100.0,
     ) == 0
     assert release_exit_code(
         results_run=12,
         selected_count=12,
         accepted_outcomes=11,
+        first_attempt_accepted_outcomes=11,
+        cases_with_retries=0,
+        failed_partial_stream_attempts=0,
+        first_attempt_latency_gate_passed=True,
         minimum_reliability_percent=100.0,
     ) == 2
     assert release_exit_code(
         results_run=11,
         selected_count=12,
         accepted_outcomes=11,
+        first_attempt_accepted_outcomes=11,
+        cases_with_retries=0,
+        failed_partial_stream_attempts=0,
+        first_attempt_latency_gate_passed=True,
         minimum_reliability_percent=100.0,
     ) == 2
+    for overrides in (
+        {"first_attempt_accepted_outcomes": 11},
+        {"cases_with_retries": 1},
+        {"failed_partial_stream_attempts": 1},
+        {"first_attempt_latency_gate_passed": False},
+    ):
+        gate = {
+            "results_run": 12,
+            "selected_count": 12,
+            "accepted_outcomes": 12,
+            "first_attempt_accepted_outcomes": 12,
+            "cases_with_retries": 0,
+            "failed_partial_stream_attempts": 0,
+            "first_attempt_latency_gate_passed": True,
+            "minimum_reliability_percent": 100.0,
+        }
+        gate.update(overrides)
+        assert release_exit_code(**gate) == 2, overrides
     try:
         release_exit_code(
             results_run=12,
             selected_count=12,
             accepted_outcomes=11,
+            first_attempt_accepted_outcomes=11,
+            cases_with_retries=0,
+            failed_partial_stream_attempts=0,
+            first_attempt_latency_gate_passed=True,
             minimum_reliability_percent=90.0,
         )
     except ValueError as exc:
@@ -4954,6 +5970,10 @@ def build_summary(
     finished_at: str,
     account_before: Dict[str, Any],
     account_after: Dict[str, Any],
+    max_answer_first_token_p95_ms: float = DEFAULT_MAX_ANSWER_FIRST_TOKEN_P95_MS,
+    max_intervention_first_token_p95_ms: float = (
+        DEFAULT_MAX_INTERVENTION_FIRST_TOKEN_P95_MS
+    ),
 ) -> Dict[str, Any]:
     case_by_id = {case.id: case for case in CASES}
     answer_results = [
@@ -4991,6 +6011,44 @@ def build_summary(
         for result in intervention_results
         if result.attempts[-1].first_token_ms is not None
     ]
+    first_attempt_first_tokens = [
+        result.attempts[0].first_token_ms
+        for result in results
+        if result.attempts[0].first_token_ms is not None
+    ]
+    first_attempt_answer_first_tokens = [
+        result.attempts[0].first_token_ms
+        for result in answer_results
+        if result.attempts[0].first_token_ms is not None
+    ]
+    first_attempt_intervention_first_tokens = [
+        result.attempts[0].first_token_ms
+        for result in intervention_results
+        if result.attempts[0].first_token_ms is not None
+    ]
+    first_attempt_totals = [result.attempts[0].total_ms for result in results]
+    cumulative_case_elapsed = [result.cumulative_elapsed_ms for result in results]
+    attempt_counts = [len(result.attempts) for result in results]
+    first_attempt_answer_p95 = percentile(first_attempt_answer_first_tokens, 0.95)
+    first_attempt_intervention_p95 = percentile(
+        first_attempt_intervention_first_tokens, 0.95
+    )
+    all_first_attempt_tokens_measured = len(first_attempt_first_tokens) == len(results)
+    answer_first_attempt_latency_passed = not answer_results or bool(
+        len(first_attempt_answer_first_tokens) == len(answer_results)
+        and first_attempt_answer_p95 is not None
+        and first_attempt_answer_p95 <= max_answer_first_token_p95_ms
+    )
+    intervention_first_attempt_latency_passed = not intervention_results or bool(
+        len(first_attempt_intervention_first_tokens) == len(intervention_results)
+        and first_attempt_intervention_p95 is not None
+        and first_attempt_intervention_p95 <= max_intervention_first_token_p95_ms
+    )
+    first_attempt_latency_gate_passed = bool(
+        all_first_attempt_tokens_measured
+        and answer_first_attempt_latency_passed
+        and intervention_first_attempt_latency_passed
+    )
     totals = [result.attempts[-1].total_ms for result in accepted]
     provider_counts: Dict[str, int] = {}
     model_counts: Dict[str, int] = {}
@@ -5023,6 +6081,16 @@ def build_summary(
         ),
         "first_attempt_accepted_outcomes": sum(
             1 for result in results if result.first_attempt_accepted
+        ),
+        "first_attempt_outcome_acceptance_percent": (
+            round(
+                100
+                * sum(1 for result in results if result.first_attempt_accepted)
+                / len(results),
+                1,
+            )
+            if results
+            else 0
         ),
         "cases_with_retries": sum(1 for result in results if len(result.attempts) > 1),
         "failed_partial_stream_attempts": sum(
@@ -5077,6 +6145,139 @@ def build_summary(
             "missing": len(intervention_results) - len(intervention_first_tokens),
             "total_cases": len(intervention_results),
         },
+        "first_attempt_first_token_ms": {
+            "median": (
+                round(statistics.median(first_attempt_first_tokens), 1)
+                if first_attempt_first_tokens
+                else None
+            ),
+            "p90": (
+                round(percentile(first_attempt_first_tokens, 0.9) or 0, 1)
+                if first_attempt_first_tokens
+                else None
+            ),
+            "p95": (
+                round(percentile(first_attempt_first_tokens, 0.95) or 0, 1)
+                if first_attempt_first_tokens
+                else None
+            ),
+            "max": (
+                round(max(first_attempt_first_tokens), 1)
+                if first_attempt_first_tokens
+                else None
+            ),
+            "measured": len(first_attempt_first_tokens),
+            "missing": len(results) - len(first_attempt_first_tokens),
+            "total_cases": len(results),
+        },
+        "first_attempt_answer_first_token_ms": {
+            "median": (
+                round(statistics.median(first_attempt_answer_first_tokens), 1)
+                if first_attempt_answer_first_tokens
+                else None
+            ),
+            "p90": (
+                round(percentile(first_attempt_answer_first_tokens, 0.9) or 0, 1)
+                if first_attempt_answer_first_tokens
+                else None
+            ),
+            "p95": (
+                round(first_attempt_answer_p95, 1)
+                if first_attempt_answer_p95 is not None
+                else None
+            ),
+            "max": (
+                round(max(first_attempt_answer_first_tokens), 1)
+                if first_attempt_answer_first_tokens
+                else None
+            ),
+            "measured": len(first_attempt_answer_first_tokens),
+            "missing": len(answer_results) - len(first_attempt_answer_first_tokens),
+            "total_cases": len(answer_results),
+        },
+        "first_attempt_intervention_first_token_ms": {
+            "median": (
+                round(statistics.median(first_attempt_intervention_first_tokens), 1)
+                if first_attempt_intervention_first_tokens
+                else None
+            ),
+            "p95": (
+                round(first_attempt_intervention_p95, 1)
+                if first_attempt_intervention_p95 is not None
+                else None
+            ),
+            "max": (
+                round(max(first_attempt_intervention_first_tokens), 1)
+                if first_attempt_intervention_first_tokens
+                else None
+            ),
+            "measured": len(first_attempt_intervention_first_tokens),
+            "missing": (
+                len(intervention_results)
+                - len(first_attempt_intervention_first_tokens)
+            ),
+            "total_cases": len(intervention_results),
+        },
+        "first_attempt_latency_gate": {
+            "passed": first_attempt_latency_gate_passed,
+            "all_first_tokens_measured": all_first_attempt_tokens_measured,
+            "answer_p95_limit_ms": max_answer_first_token_p95_ms,
+            "answer_p95_passed": answer_first_attempt_latency_passed,
+            "intervention_p95_limit_ms": max_intervention_first_token_p95_ms,
+            "intervention_p95_passed": intervention_first_attempt_latency_passed,
+        },
+        "first_attempt_total_ms": {
+            "median": (
+                round(statistics.median(first_attempt_totals), 1)
+                if first_attempt_totals
+                else None
+            ),
+            "p90": (
+                round(percentile(first_attempt_totals, 0.9) or 0, 1)
+                if first_attempt_totals
+                else None
+            ),
+            "p95": (
+                round(percentile(first_attempt_totals, 0.95) or 0, 1)
+                if first_attempt_totals
+                else None
+            ),
+            "max": round(max(first_attempt_totals), 1) if first_attempt_totals else None,
+        },
+        "cumulative_case_elapsed_ms": {
+            "median": (
+                round(statistics.median(cumulative_case_elapsed), 1)
+                if cumulative_case_elapsed
+                else None
+            ),
+            "p90": (
+                round(percentile(cumulative_case_elapsed, 0.9) or 0, 1)
+                if cumulative_case_elapsed
+                else None
+            ),
+            "p95": (
+                round(percentile(cumulative_case_elapsed, 0.95) or 0, 1)
+                if cumulative_case_elapsed
+                else None
+            ),
+            "max": (
+                round(max(cumulative_case_elapsed), 1)
+                if cumulative_case_elapsed
+                else None
+            ),
+        },
+        "attempt_count": {
+            "median": (
+                round(statistics.median(attempt_counts), 1) if attempt_counts else None
+            ),
+            "p95": (
+                round(percentile(attempt_counts, 0.95) or 0, 1)
+                if attempt_counts
+                else None
+            ),
+            "max": max(attempt_counts) if attempt_counts else None,
+            "total_attempts": sum(attempt_counts),
+        },
         "total_ms": {
             "median": round(statistics.median(totals), 1) if totals else None,
             "p90": round(percentile(totals, 0.9) or 0, 1) if totals else None,
@@ -5100,6 +6301,14 @@ def render_report(summary: Dict[str, Any], results: Sequence[CaseResult], source
     ft = summary["first_token_ms"]
     answer_ft = summary["answer_first_token_ms"]
     intervention_ft = summary["intervention_first_token_ms"]
+    first_attempt_ft = summary["first_attempt_first_token_ms"]
+    first_attempt_answer_ft = summary["first_attempt_answer_first_token_ms"]
+    first_attempt_intervention_ft = summary[
+        "first_attempt_intervention_first_token_ms"
+    ]
+    latency_gate = summary["first_attempt_latency_gate"]
+    cumulative = summary["cumulative_case_elapsed_ms"]
+    attempt_count = summary["attempt_count"]
     lines = [
         "# Bluey 50-Question Interview Evaluation",
         "",
@@ -5111,8 +6320,14 @@ def render_report(summary: Dict[str, Any], results: Sequence[CaseResult], source
         f"- Normal answers: {summary['final_answer_successes']}/{summary['answer_cases']} ({summary['answer_reliability_percent']}%)",
         f"- Expected safe interventions: {summary['successful_expected_interventions']}/{summary['expected_intervention_cases']}",
         f"- First-attempt normal answers: {summary['first_attempt_answer_successes']}/{summary['answer_cases']} ({summary['first_attempt_answer_reliability_percent']}%)",
-        f"- First-attempt accepted outcomes: {summary['first_attempt_accepted_outcomes']}/{summary['questions_run']}",
+        f"- First-attempt accepted outcomes: {summary['first_attempt_accepted_outcomes']}/{summary['questions_run']} ({summary['first_attempt_outcome_acceptance_percent']}%)",
         f"- Cases requiring retries: {summary['cases_with_retries']}; failed partial-stream attempts: {summary['failed_partial_stream_attempts']}",
+        f"- First-attempt latency gate: {'PASS' if latency_gate['passed'] else 'FAIL'}; all first tokens measured: {latency_gate['all_first_tokens_measured']}",
+        f"- First-attempt token ({first_attempt_ft['measured']}/{first_attempt_ft['total_cases']} measured; {first_attempt_ft['missing']} missing): median {first_attempt_ft['median']} ms, p90 {first_attempt_ft['p90']} ms, p95 {first_attempt_ft['p95']} ms, max {first_attempt_ft['max']} ms",
+        f"- First-attempt normal-answer token ({first_attempt_answer_ft['measured']}/{first_attempt_answer_ft['total_cases']} measured; limit {latency_gate['answer_p95_limit_ms']} ms): median {first_attempt_answer_ft['median']} ms, p90 {first_attempt_answer_ft['p90']} ms, p95 {first_attempt_answer_ft['p95']} ms, max {first_attempt_answer_ft['max']} ms",
+        f"- First-attempt intervention token ({first_attempt_intervention_ft['measured']}/{first_attempt_intervention_ft['total_cases']} measured; limit {latency_gate['intervention_p95_limit_ms']} ms): median {first_attempt_intervention_ft['median']} ms, p95 {first_attempt_intervention_ft['p95']} ms, max {first_attempt_intervention_ft['max']} ms",
+        f"- Cumulative case elapsed: median {cumulative['median']} ms, p90 {cumulative['p90']} ms, p95 {cumulative['p95']} ms, max {cumulative['max']} ms",
+        f"- Attempts per case: median {attempt_count['median']}, p95 {attempt_count['p95']}, max {attempt_count['max']}; {attempt_count['total_attempts']} total attempts",
         f"- Average deterministic score: {summary['average_score']}/100",
         f"- First token ({ft['measured']}/{ft['total_cases']} measured; {ft['missing']} missing): median {ft['median']} ms, p90 {ft['p90']} ms, p95 {ft['p95']} ms, max {ft['max']} ms",
         f"- Normal-answer first token ({answer_ft['measured']}/{answer_ft['total_cases']} measured; {answer_ft['missing']} missing): median {answer_ft['median']} ms, p90 {answer_ft['p90']} ms, p95 {answer_ft['p95']} ms, max {answer_ft['max']} ms",
@@ -5134,10 +6349,11 @@ def render_report(summary: Dict[str, Any], results: Sequence[CaseResult], source
         lines.extend(f"- {issue}: {count}" for issue, count in list(issue_counts.items())[:25])
     else:
         lines.append("- None detected by the deterministic checks.")
-    lines.extend(["", "## Case Results", "", "| ID | Category | First token | Total | Provider/model | Score | Result |", "|---|---|---:|---:|---|---:|---|"])
+    lines.extend(["", "## Case Results", "", "| ID | Category | First-attempt token | Attempts | Cumulative | Provider/model | Score | Result |", "|---|---|---:|---:|---:|---|---:|---|"])
     for result in results:
         attempt = result.attempts[-1]
-        first = f"{attempt.first_token_ms:.0f} ms" if attempt.first_token_ms is not None else "n/a"
+        first_attempt = result.attempts[0]
+        first = f"{first_attempt.first_token_ms:.0f} ms" if first_attempt.first_token_ms is not None else "n/a"
         route = f"{attempt.provider or 'unknown'}/{attempt.model or 'unknown'}"
         if result.accepted_outcome and result.final_ok:
             outcome = "ok"
@@ -5147,7 +6363,7 @@ def render_report(summary: Dict[str, Any], results: Sequence[CaseResult], source
             outcome = "needs_user_input (expected)"
         else:
             outcome = attempt.error_reason or attempt.error or attempt.billing_error or "failed"
-        lines.append(f"| {result.id} | {result.category} | {first} | {attempt.total_ms:.0f} ms | {route} | {result.score} | {outcome[:80]} |")
+        lines.append(f"| {result.id} | {result.category} | {first} | {len(result.attempts)} | {result.cumulative_elapsed_ms:.0f} ms | {route} | {result.score} | {outcome[:80]} |")
     lines.extend(["", "## Review Queue", ""])
     review = sorted(results, key=lambda item: (item.score, item.id))
     for result in review[:20]:
@@ -5170,6 +6386,36 @@ def reliability_percent_arg(value: str) -> float:
     if parsed != 100.0:
         raise argparse.ArgumentTypeError("the release gate is fixed at 100 percent")
     return parsed
+
+
+def select_eval_cases(only: Optional[str], limit: int) -> List[EvalCase]:
+    selected = list(CASES)
+    if only is not None:
+        wanted = {
+            value.strip().upper() for value in only.split(",") if value.strip()
+        }
+        if not wanted:
+            raise ValueError("--only must name at least one case ID")
+        known = {case.id for case in CASES}
+        unknown = sorted(wanted - known)
+        if unknown:
+            raise ValueError(f"unknown --only case IDs: {', '.join(unknown)}")
+        selected = [case for case in selected if case.id in wanted]
+    return selected[: max(0, limit)]
+
+
+def self_check_case_selection() -> None:
+    assert [case.id for case in select_eval_cases("q38,Q41", len(CASES))] == [
+        "Q38",
+        "Q41",
+    ]
+    for invalid in ("Q38,Q99", " , "):
+        try:
+            select_eval_cases(invalid, len(CASES))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid --only selection was accepted: {invalid!r}")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -5209,15 +6455,12 @@ def main(argv: Sequence[str]) -> int:
     self_check_attempt_integrity_guards()
     self_check_failed_attempt_scoring()
     self_check_release_exit_gate()
+    self_check_case_selection()
     self_check_typed_answer_context()
     if args.minimum_reliability_percent != 100.0:
         raise ValueError("--minimum-reliability-percent is fixed at 100")
     base = normalize_base(args.api_base)
-    selected = list(CASES)
-    if args.only:
-        wanted = {value.strip().upper() for value in args.only.split(",") if value.strip()}
-        selected = [case for case in selected if case.id in wanted]
-    selected = selected[: max(0, args.limit)]
+    selected = select_eval_cases(args.only, args.limit)
     if len(CASES) != 50:
         raise AssertionError(f"Expected exactly 50 built-in cases, found {len(CASES)}")
     invalid_outcomes = [
@@ -5285,6 +6528,7 @@ def main(argv: Sequence[str]) -> int:
                 answer_context, context_hash
             )
             attempts: List[AttemptResult] = []
+            case_started = time.perf_counter()
             max_attempts = 1 + max(0, args.capacity_retries)
             for attempt_number in range(1, max_attempts + 1):
                 attempt = run_attempt(
@@ -5311,6 +6555,7 @@ def main(argv: Sequence[str]) -> int:
                     time.sleep(max(1.0, attempt_number * 1.5))
                     continue
                 break
+            cumulative_elapsed_ms = (time.perf_counter() - case_started) * 1000
             final_attempt = attempts[-1]
             reliability, latency, human, accuracy, issues = quality_scores(case, final_attempt)
             for audit_issue in prior_attempt_audit_issues(attempts):
@@ -5325,6 +6570,7 @@ def main(argv: Sequence[str]) -> int:
                 conversation=case.conversation,
                 context_sha256=context_hash,
                 attempts=attempts,
+                cumulative_elapsed_ms=cumulative_elapsed_ms,
                 final_ok=answer_is_success(case, final_attempt),
                 first_attempt_ok=answer_is_success(case, attempts[0]),
                 accepted_outcome=expected_outcome_is_accepted(case, final_attempt),
@@ -5349,16 +6595,25 @@ def main(argv: Sequence[str]) -> int:
                 if issues:
                     handle.write("Issues: " + ", ".join(issues) + "\n\n")
             route = f"{final_attempt.provider or 'unknown'}/{final_attempt.model or 'unknown'}"
-            ft = f"{final_attempt.first_token_ms:.0f}ms" if final_attempt.first_token_ms is not None else "n/a"
+            first_attempt = attempts[0]
+            ft = f"{first_attempt.first_token_ms:.0f}ms" if first_attempt.first_token_ms is not None else "n/a"
             print(
                 f"[{index:02d}/{len(selected)}] {case.id} "
                 f"{'OK' if result.accepted_outcome else 'FAIL'} score={result.score} "
-                f"first={ft} total={final_attempt.total_ms:.0f}ms route={route}"
+                f"first_attempt={'OK' if result.first_attempt_accepted else 'FAIL'} "
+                f"first={ft} attempts={len(attempts)} "
+                f"cumulative={cumulative_elapsed_ms:.0f}ms route={route}"
             )
             time.sleep(max(0, args.pause_ms) / 1000)
         _, account_after = json_request(base, "/account/me", token=token)
         finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        summary = build_summary(results, started_at, finished_at, account_before, account_after)
+        summary = build_summary(
+            results,
+            started_at,
+            finished_at,
+            account_before,
+            account_after,
+        )
         write_json(args.output / "summary.json", summary)
         (args.output / "report.md").write_text(render_report(summary, results, sources))
         write_json(
@@ -5373,6 +6628,16 @@ def main(argv: Sequence[str]) -> int:
             results_run=len(results),
             selected_count=len(selected),
             accepted_outcomes=summary["accepted_outcomes"],
+            first_attempt_accepted_outcomes=summary[
+                "first_attempt_accepted_outcomes"
+            ],
+            cases_with_retries=summary["cases_with_retries"],
+            failed_partial_stream_attempts=summary[
+                "failed_partial_stream_attempts"
+            ],
+            first_attempt_latency_gate_passed=summary[
+                "first_attempt_latency_gate"
+            ]["passed"],
             minimum_reliability_percent=args.minimum_reliability_percent,
         )
     finally:
