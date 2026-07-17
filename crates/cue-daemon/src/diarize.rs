@@ -2,8 +2,9 @@
 //!
 //! Two tiers over the retained meeting audio (see `audio::retention`):
 //!   * LIVE — every `live_interval_secs()`, re-diarize the rolling window with a
-//!     persistent [`cue_diarize::LiveDiarizer`] (stable ids via centroid
-//!     inheritance) and label recent transcript segments by time overlap.
+//!     persistent [`cue_diarize::BankLiveDiarizer`] (stable ids via an
+//!     EMA speaker-profile bank) and label recent transcript segments by time
+//!     overlap.
 //!   * POST — on meeting end, run [`cue_diarize::Diarizer`] over the full buffer
 //!     for authoritative labels, persist utterances + resolved speakers, and
 //!     rewrite the transcript speaker ids.
@@ -18,10 +19,10 @@ use tracing::{debug, info, warn};
 use crate::app::Daemon;
 
 /// Rolling window the live tier re-diarizes (seconds). 90s is the measured
-/// anchor-pinned recipe (docs/work/STT-DIARIZATION-FINDINGS.md): shorter windows
-/// make the clusterer MERGE voices (anchors pin identity but cannot force
-/// splits). Also the retention rolling-buffer length.
-pub const LIVE_WINDOW_SECS: usize = cue_diarize::ANCHOR_WINDOW_SECS;
+/// recipe (docs/work/STT-DIARIZATION-FINDINGS.md): shorter windows make the
+/// clusterer MERGE voices (it needs context to SEPARATE speakers). Also the
+/// retention rolling-buffer length.
+pub const LIVE_WINDOW_SECS: usize = cue_diarize::BANK_WINDOW_SECS;
 
 /// How often the live tier re-diarizes, in seconds. Overridable via
 /// `BLUEY_DIARIZE_INTERVAL_SECS`. Default 15s → 30s window / 15s step: labels firm
@@ -78,9 +79,9 @@ pub(crate) fn spawn_live_diarizer() -> Option<LiveDiarizerHandle> {
         .name("diarize-live".into())
         .spawn(move || {
             let mut diarizer =
-                match cue_diarize::AnchorLiveDiarizer::load(cue_diarize::Backend::preferred()) {
+                match cue_diarize::BankLiveDiarizer::load(cue_diarize::Backend::preferred()) {
                     Ok(d) => {
-                        info!("diarize: anchor-pinned live diarizer loaded (worker thread)");
+                        info!("diarize: profile-bank live diarizer loaded (worker thread)");
                         d
                     }
                     Err(e) => {
@@ -126,13 +127,14 @@ pub(crate) fn live_tick(daemon: &Arc<Daemon>, handle: &mut LiveDiarizerHandle) {
     }
 
     // 2) Grab + submit the ROLLING WINDOW (last ~90s) on a detached task. The
-    //    anchor-pinned diarizer carries every enrolled speaker forward as an
-    //    audio anchor, so a bounded window is all it needs — per-tick cost stays
-    //    CONSTANT for the whole meeting. (The previous design re-submitted the
-    //    FULL buffer each tick; its growing cost saturated the worker ~15 min in
-    //    and live labels went stale.) A speaker's early segments keep their live
-    //    labels; the post-meeting pass remains the authoritative corrector.
-    //    (retention lock + clone must NOT run on the audio select! loop.)
+    //    profile-bank diarizer carries every enrolled speaker forward as an EMA
+    //    voice centroid, so a bounded window is all it needs — per-tick cost
+    //    stays CONSTANT (and memory constant) for the whole meeting. (The
+    //    original design re-submitted the FULL buffer each tick; its growing cost
+    //    saturated the worker ~15 min in and live labels went stale.) Early
+    //    segments keep their live labels; the post-meeting pass is the
+    //    authoritative corrector. (retention lock + clone must NOT run on the
+    //    audio select! loop.)
     let d = daemon.clone();
     let tx = handle.window_tx.clone();
     tokio::spawn(async move {
@@ -163,7 +165,8 @@ async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize
     // Collect what changed while holding the meeting lock; broadcast after
     // releasing it (broadcast::send is sync and non-blocking, but keep the
     // lock scope tight).
-    let mut updates: Vec<(String, String, String, i64, u64)> = Vec::new();
+    // (segment id, text, source label, primary speaker, secondary speakers, ts_ms)
+    let mut updates: Vec<(String, String, String, i64, Vec<i64>, u64)> = Vec::new();
     let session_id;
     // Snapshot to persist AFTER releasing the meeting lock. Saving under the lock
     // is a ~50-200ms synchronous disk write that would block the STT sink from
@@ -181,15 +184,20 @@ async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize
             if seg.speaker.is_me() {
                 continue;
             }
-            if let Some(speaker) = assign_speaker(seg, segments) {
-                if seg.speaker_id != Some(speaker) {
-                    seg.speaker_id = Some(speaker);
+            if let Some(SpeakerAssignment { primary, secondary }) = assign_speaker(seg, segments) {
+                // Re-broadcast when the primary OR the co-speaker set changed, so
+                // a fragment that turns out to be talk-over upgrades its label
+                // even if the dominant speaker stayed the same.
+                if seg.speaker_id != Some(primary) || seg.secondary_speaker_ids != secondary {
+                    seg.speaker_id = Some(primary);
+                    seg.secondary_speaker_ids = secondary.clone();
                     let ts_ms = seg.created_at.parse::<u64>().unwrap_or(0);
                     updates.push((
                         seg.id.to_string(),
                         seg.text.clone(),
                         seg.speaker.to_string(),
-                        speaker,
+                        primary,
+                        secondary,
                         ts_ms,
                     ));
                 }
@@ -207,10 +215,12 @@ async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize
         }
     }
 
-    for (seg_id, text, source, speaker_id, ts_ms) in updates {
-        // Upgrade the OVERLAY's already-rendered line in place ("Speaker N").
-        crate::app::push_transcript_speaker(daemon, seg_id, format!("Speaker {}", speaker_id + 1))
-            .await;
+    for (seg_id, text, source, speaker_id, secondary, ts_ms) in updates {
+        // Upgrade the OVERLAY's already-rendered line in place. A clean line is
+        // "Speaker N"; a talk-over line surfaces the co-speakers honestly rather
+        // than silently attributing everyone's words to the dominant voice.
+        let label = speaker_display_label(speaker_id, &secondary);
+        crate::app::push_transcript_speaker(daemon, seg_id, label).await;
         // Dev-view WebSocket (bluey listen) gets the same upgrade.
         crate::app::broadcast_speaker_update(
             daemon,
@@ -221,6 +231,19 @@ async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize
             ts_ms,
         );
     }
+}
+
+/// The display label for a fragment's speakers: `"Speaker N"` when a single
+/// voice, or `"Speaker N + M"` (co-speakers appended) when the fragment was
+/// talk-over. Ids are shown 1-based to match the rest of the UI.
+fn speaker_display_label(primary: i64, secondary: &[i64]) -> String {
+    let mut label = format!("Speaker {}", primary + 1);
+    if !secondary.is_empty() {
+        let others: Vec<String> = secondary.iter().map(|s| (s + 1).to_string()).collect();
+        label.push_str(" + ");
+        label.push_str(&others.join(" + "));
+    }
+    label
 }
 
 /// Distance (seconds) from a point to a [start, end] range: 0 if inside, else
@@ -245,16 +268,37 @@ const DEFAULT_SEGMENT_DUR_SECS: f64 = 0.6;
 /// `fill_nearest`; this is the capped compromise).
 const NEAREST_FALLBACK_CAP_SECS: f64 = 2.0;
 
-/// Assign a diarized speaker to a transcript segment using WhisperX-style
+/// A transcript fragment's speaker attribution: the dominant speaker plus EVERY
+/// other speaker who had a real share of the fragment's audio (talk-over /
+/// interruption). One ASR fragment can only carry one lexical stream, so we
+/// attribute the whole text to `primary` (most overlap) but SURFACE the others
+/// as `secondary` rather than discarding them — the honest "this line had more
+/// than one voice in it" signal. `secondary` is sorted by share, descending, and
+/// empty for the clean single-speaker case.
+#[derive(Debug, Clone, PartialEq)]
+struct SpeakerAssignment {
+    primary: i64,
+    secondary: Vec<i64>,
+}
+
+/// A secondary speaker must hold at least this fraction of the PRIMARY speaker's
+/// overlap to be surfaced — filters out a diarizer's incidental sub-frame grazes
+/// at a boundary (which are not real co-speech) while catching genuine talk-over.
+const SECONDARY_MIN_SHARE_RATIO: f64 = 0.25;
+
+/// Attribute a transcript segment to diarized speakers using WhisperX-style
 /// **max-total-overlap**: the segment forms an interval `[start, start+dur]` on
 /// the shared audio clock; for each diarized turn accumulate the overlap
-/// `max(0, min(ends) − max(starts))`, and pick the speaker with the most total
-/// overlap. If nothing overlaps, fall back to the nearest turn within
-/// [`NEAREST_FALLBACK_CAP_SECS`]; beyond that, return `None` (don't mislabel).
+/// `max(0, min(ends) − max(starts))`. The speaker with the most total overlap is
+/// `primary`; any OTHER speaker whose overlap is ≥ [`SECONDARY_MIN_SHARE_RATIO`]
+/// of the primary's is a co-speaker (talk-over) surfaced in `secondary`. If
+/// nothing overlaps, fall back to the nearest turn within
+/// [`NEAREST_FALLBACK_CAP_SECS`] (never a secondary — a fallback is a guess, not
+/// co-speech); beyond that, return `None` (don't mislabel).
 fn assign_speaker(
     seg: &cue_core::meeting::TranscriptSegment,
     turns: &[cue_diarize::Segment],
-) -> Option<i64> {
+) -> Option<SpeakerAssignment> {
     let start = seg.audio_start_secs?;
     let end = start + seg.audio_dur_secs.unwrap_or(DEFAULT_SEGMENT_DUR_SECS);
 
@@ -262,8 +306,7 @@ fn assign_speaker(
     // sentinel — an unmatched turn must never stamp -1 onto a transcript segment).
     let labelled = || turns.iter().filter(|t| t.speaker >= 0);
 
-    // 1) Max-total-overlap.
-    let mut best: Option<(i64, f64)> = None;
+    // 1) Max-total-overlap, accumulating EVERY overlapping speaker's share.
     let mut overlap_by_speaker: std::collections::HashMap<i64, f64> =
         std::collections::HashMap::new();
     for t in labelled() {
@@ -272,16 +315,26 @@ fn assign_speaker(
             *overlap_by_speaker.entry(t.speaker).or_insert(0.0) += ov;
         }
     }
-    for (&spk, &ov) in &overlap_by_speaker {
-        if best.map(|(_, b)| ov > b).unwrap_or(true) {
-            best = Some((spk, ov));
-        }
-    }
-    if let Some((spk, _)) = best {
-        return Some(spk);
+    if !overlap_by_speaker.is_empty() {
+        // Sort speakers by descending share (ties broken by id for determinism).
+        let mut ranked: Vec<(i64, f64)> = overlap_by_speaker.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        let (primary, top_share) = ranked[0];
+        let threshold = top_share * SECONDARY_MIN_SHARE_RATIO;
+        let secondary: Vec<i64> = ranked[1..]
+            .iter()
+            .filter(|(_, share)| *share >= threshold)
+            .map(|(spk, _)| *spk)
+            .collect();
+        return Some(SpeakerAssignment { primary, secondary });
     }
 
-    // 2) Nearest-turn fallback, capped.
+    // 2) Nearest-turn fallback, capped. A fallback is a best-guess single label —
+    // never carries secondaries (there was no co-speech, just no direct overlap).
     let point = start;
     let nearest = labelled().min_by(|a, b| {
         dist_to_range(point, a.start, a.end)
@@ -289,7 +342,10 @@ fn assign_speaker(
             .unwrap_or(std::cmp::Ordering::Equal)
     })?;
     if dist_to_range(point, nearest.start, nearest.end) <= NEAREST_FALLBACK_CAP_SECS {
-        Some(nearest.speaker)
+        Some(SpeakerAssignment {
+            primary: nearest.speaker,
+            secondary: Vec::new(),
+        })
     } else {
         None
     }
@@ -361,8 +417,9 @@ pub(crate) async fn post_process_meeting(
         if seg.speaker.is_me() {
             continue;
         }
-        if let Some(speaker) = assign_speaker(seg, &out.segments) {
-            seg.speaker_id = Some(speaker);
+        if let Some(SpeakerAssignment { primary, secondary }) = assign_speaker(seg, &out.segments) {
+            seg.speaker_id = Some(primary);
+            seg.secondary_speaker_ids = secondary;
             labeled += 1;
         }
     }
@@ -458,28 +515,83 @@ mod tests {
         }
     }
 
+    fn primary(seg: &TranscriptSegment, turns: &[Segment]) -> Option<i64> {
+        assign_speaker(seg, turns).map(|a| a.primary)
+    }
+
     #[test]
     fn max_overlap_picks_the_dominant_speaker() {
-        // Segment [10.0, 11.0]. Speaker 0 covers 10.0–10.2 (0.2s overlap),
-        // Speaker 1 covers 10.2–11.5 (0.8s overlap) → Speaker 1 wins.
+        // Segment [10.0, 11.0]. Speaker 0 covers 10.0–10.4 (0.4s overlap),
+        // Speaker 1 covers 10.4–11.5 (0.6s overlap) → Speaker 1 wins, and
+        // Speaker 0's 0.4s is 67% of the primary's 0.6s (well above the 25%
+        // ratio) → surfaced as a co-speaker (real talk-over in the fragment).
         let s = seg(10.0, 1.0);
-        let turns = [turn(9.0, 10.2, 0), turn(10.2, 11.5, 1)];
-        assert_eq!(assign_speaker(&s, &turns), Some(1));
+        let turns = [turn(9.0, 10.4, 0), turn(10.4, 11.5, 1)];
+        assert_eq!(
+            assign_speaker(&s, &turns),
+            Some(SpeakerAssignment {
+                primary: 1,
+                secondary: vec![0]
+            })
+        );
     }
 
     #[test]
-    fn full_containment_assigns_that_speaker() {
+    fn full_containment_assigns_that_speaker_no_secondary() {
         let s = seg(5.0, 0.6);
         let turns = [turn(4.0, 6.0, 2), turn(6.0, 8.0, 3)];
-        assert_eq!(assign_speaker(&s, &turns), Some(2));
+        assert_eq!(
+            assign_speaker(&s, &turns),
+            Some(SpeakerAssignment {
+                primary: 2,
+                secondary: vec![]
+            })
+        );
     }
 
     #[test]
-    fn no_overlap_uses_nearest_within_cap() {
+    fn trivial_graze_is_not_a_secondary() {
+        // Segment [10.0, 11.0]. Speaker 1 owns 0.9s; Speaker 0 grazes only
+        // 0.1s (11% of primary < 25% ratio) → NOT surfaced.
+        let s = seg(10.0, 1.0);
+        let turns = [turn(9.0, 10.1, 0), turn(10.1, 12.0, 1)];
+        assert_eq!(
+            assign_speaker(&s, &turns),
+            Some(SpeakerAssignment {
+                primary: 1,
+                secondary: vec![]
+            })
+        );
+    }
+
+    #[test]
+    fn three_way_talkover_surfaces_all_co_speakers() {
+        // A crowded 3.0s fragment: spk 2 owns 1.5s, spk 0 owns 1.0s, spk 1 owns
+        // 0.5s. Thresholds off 1.5s primary: 0.375s. Both 1.0 and 0.5 clear it →
+        // both surfaced, ordered by share (0 before 1).
+        let s = seg(0.0, 3.0);
+        let turns = [turn(0.0, 1.0, 0), turn(1.0, 1.5, 1), turn(1.5, 3.0, 2)];
+        assert_eq!(
+            assign_speaker(&s, &turns),
+            Some(SpeakerAssignment {
+                primary: 2,
+                secondary: vec![0, 1]
+            })
+        );
+    }
+
+    #[test]
+    fn no_overlap_uses_nearest_within_cap_no_secondary() {
         // Segment at 20.0; nearest turn ends at 19.5 (0.5s away < 2s cap).
         let s = seg(20.0, 0.6);
         let turns = [turn(10.0, 19.5, 7)];
-        assert_eq!(assign_speaker(&s, &turns), Some(7));
+        assert_eq!(
+            assign_speaker(&s, &turns),
+            Some(SpeakerAssignment {
+                primary: 7,
+                secondary: vec![]
+            })
+        );
     }
 
     #[test]
@@ -487,13 +599,13 @@ mod tests {
         // Nearest turn ends 5s before the segment → beyond the 2s cap → unlabeled.
         let s = seg(30.0, 0.6);
         let turns = [turn(10.0, 25.0, 4)];
-        assert_eq!(assign_speaker(&s, &turns), None);
+        assert_eq!(primary(&s, &turns), None);
     }
 
     #[test]
     fn no_audio_clock_returns_none() {
         let s = TranscriptSegment::new(Speaker::System, "x", true); // audio_start_secs = None
         let turns = [turn(0.0, 10.0, 0)];
-        assert_eq!(assign_speaker(&s, &turns), None);
+        assert_eq!(primary(&s, &turns), None);
     }
 }

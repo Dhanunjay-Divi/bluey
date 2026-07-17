@@ -323,7 +323,10 @@ pub enum OverlayCommand {
     /// push carries no speaker and this patches it in place. `id` is the segment
     /// id carried on the original push_card; `speaker` is the display label
     /// (e.g. "Speaker 2").
-    TranscriptSpeaker { id: String, speaker: String },
+    TranscriptSpeaker {
+        id: String,
+        speaker: String,
+    },
     /// Snapshot of the active meeting for rehydration (Fix B). `transcript` is
     /// the finalized spoken lines; `conversation` is the prior Q&A turns. Both
     /// empty when no meeting is active (so the UI's request promise still

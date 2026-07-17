@@ -229,3 +229,118 @@ opt-in via `BLUEY_PARAKEET_MODEL_DIR`).
 Investigate a `parakeet-rs` version exposing `att_context_size`/right-context,
 or plan a vendored-encoder patch (~480ms lookahead at 8×/80ms-per-frame) to fix
 mid-word splits at the model level.
+
+---
+
+## 6. Variant matrix (2026-07-14) — profile bank BEATS pins; freeze policies refuted
+
+Full mechanism × freeze-policy matrix on the same 15 VoxConverse files/trims as
+abatch3 (`scratchpad/diar-test`, `diarprobe matrix`; modules bank.rs /
+policies.rs / overlap.rs / embcheck.rs; results in `matrix-results.txt`).
+PINS/once reproduced abatch3's ANCH-LIVE exactly (12.3%, 8/15) — harness sane.
+
+**Phase-0 unlock:** speakrs pipeline embeddings in `DiarizationResult` are RAW
+WeSpeaker 256-dim outputs (NOT per-run whitened — post_inference.rs moves them
+untouched; PLDA only transforms a VBx-internal copy). The documented "~0
+cross-run self-similarity" was an ID-NUMBERING confound, not a vector property.
+Measured cross-window centroid cosine (time-overlap-matched clusters):
+same-window 1.000; cross-window median 0.943 (2 spk) / 0.697 (7 spk) / 0.664
+(11 spk), worst pairs ~0.47. So cross-run identity by embedding IS viable —
+anchors are NOT the only way.
+
+**Live-tier results (label-once policy, aggregate):**
+| mechanism | live DER | spk exact | per-tick cost |
+|---|---|---|---|
+| PINS (shipped anchor design) | 12.3% | 8/15 | 1327ms mean, **7.7s p95 (grows with gallery)** |
+| **BANK (profile bank)** | **9.1%** | **10/15** | **425ms mean, 629ms p95 (constant)** |
+| PINS+OVX (clean-audio pins) | 12.9% | 9/15 | ~PINS |
+| BANK+OVX (skip overlapped centroid updates) | 9.1% (identical) | 10/15 | ~BANK |
+| BANK mint_patience=2 | 16.9% (+100% DER on a 26s file: 1 tick → NOTHING ever labels) | 8/15 | ~BANK |
+| PINS final pass (reference) | 8.2% | 10/15 | end-of-meeting |
+
+BANK = window-only `diarize_with_centroids` per tick + persistent ProfileBank
+(cosine match ≥0.55 → EMA α=0.1; ambiguous margin <0.10 → no update; mint at
+≥3s speech, patience 1). Live BANK (9.1%) lands within 0.9% of the pinned
+FINAL pass and matches its speaker counting — while 3× cheaper mean / 12×
+cheaper p95 than pins, constant in meeting length (the Mamba/MLA-shaped state).
+
+**Freeze policies (all mechanisms, same ordering):** label-once ≡ fix4 (zero
+late flips) is the sweet spot. AlwaysRevise buys only 0.3% DER (BANK 8.8 vs
+9.1) for 8% of frames flipping after 8s; fixed horizons are strictly WORSE than
+label-once as H grows (partial revision inherits early under-split views without
+the ability to fix old mistakes); confidence-freeze ≡ label-once (no gain).
+Margin calibration too weak to trust as a gate (BANK top bin 86.6% vs ~74%
+elsewhere; PINS claim-strength ~uninformative). VERDICT: keep label-once live +
+authoritative end pass; do NOT build horizon/confidence machinery.
+
+**Keep / cut:** ADOPT profile bank as the production live tier (port: bank
+logic into cue-diarize; live tick = window `diarize_with_centroids` + bank
+match; final pass can map full-audio clusters to bank centroids — no pins
+needed at all). CUT mint-patience≥2 (fails short audio), CUT PINS+OVX (mixed).
+BANK+OVX identical on VoxConverse (little overlap trips the 30% gate) — keep
+the clean-flag plumbing, unproven benefit. Label latency (tts p50 ≈ 15s) is
+tick-cadence-bound (TICK_S=30 in harness), not policy-bound.
+
+**Long-meeting drift check — PASSED, gap WIDENS (2026-07-14).** 3 full-length
+VoxConverse files, 1200s each (~40 ticks, 5× the trimmed run), 2/4/6 speakers
+(`matrix-long-results.txt`):
+| mechanism | live DER (20-min) | spk exact |
+|---|---|---|
+| PINS (shipped) | 17.2% | 0/3 |
+| **BANK** | **6.9%** | **2/3** |
+| BANK mint_patience=2 | 6.8% | **3/3** |
+| PINS final pass | 6.4% | 2/3 |
+
+EMA centroids do NOT drift — BANK actually IMPROVES at length (9.1%→6.9%) while
+PINS DEGRADES (12.3%→17.2%, speaker counting collapses to 0/3: the gallery
+accretes duplicate anchors for the same voice over 40 ticks). Live BANK (6.9%)
+is within 0.5% of the pinned final pass (6.4%) at 20 min. Cost gap persists
+(WINDOW 343ms mean vs PINS 508ms; PINS grows with gallery size).
+
+REVERSAL on mint_patience: on LONG audio patience=2 is BEST (3/3 exact) — it
+suppresses the transient over-count that one-tick minting causes; it only failed
+the 240s set because a 26s file has too few ticks. So patience should scale with
+meeting length, not be a fixed 1 or 2. And BANK's confidence calibration is now
+STRONG and monotone (top bin 99.3% correct, bottom 92.4%) — margin IS a usable
+gate on real-length audio, unlike the trimmed run. (Still not needed given
+label-once wins, but it's real.)
+
+### Fragment-level overlap handling (2026-07-14)
+
+The STT and diarization timelines are produced independently and joined only by
+time overlap (`assign_speaker`). When one ASR fragment straddles a talk-over,
+the old code silently stamped the whole line with the single dominant speaker.
+Word-level attribution (the "elegant" WhisperX-style split) is BLOCKED: verified
+in parakeet-rs 0.3.6 source that the streaming `Nemotron::transcribe_chunk`
+returns a bare `String` and keeps only `accumulated_tokens: Vec<usize>` (token
+ids, no frame times); `TimedToken`/`TimestampMode::Words` exist but only on the
+BATCH decoders (decoder_tdt.rs, parakeet.rs). So word times aren't available on
+our live path — the word-level reconciler must wait for the same parakeet-rs
+fork the causal-encoder/right-context (Phase 3) fix needs.
+
+Shipped the production-correct fragment-level fix instead (matches how
+Deepgram/AWS/Sortformer operate without word times): `assign_speaker` now
+returns `SpeakerAssignment { primary, secondary }` — the dominant speaker plus
+EVERY co-speaker with ≥ 25% of the primary's overlap share (not just a boolean,
+not just the runner-up). Persisted on `TranscriptSegment.secondary_speaker_ids`;
+surfaced in the label as "Speaker 2 + 3" (live via `TranscriptSpeaker`, snapshot
+via `to_wire_line`). The overlay renders `line.speaker` verbatim → no UI change.
+Trivial sub-frame grazes at a boundary are filtered by the 25% ratio.
+
+Two AI-context bugs found + fixed while wiring this (the transcript sent to the
+agent is built by `MeetingRecord::last_transcript_text*` → `context_label()`):
+1. **Off-by-one:** `context_label` emitted 0-based "Speaker 0" while every
+   user-facing surface (overlay, wire, dev socket) is 1-based "Speaker 1" — so
+   the AI and the user named the SAME person differently. Now 1-based everywhere.
+2. **Overlap not reaching the AI:** `context_label` read only `speaker_id`, so
+   the co-speaker flag we persist never entered the prompt. Now it appends
+   "Speaker 2 + 3" so the agent knows a line was talk-over when extracting
+   decisions/owners. (Saved on disk already; this closes the save→AI seam.)
+
+VERDICT: profile bank confirmed as the production live tier. It beats the
+shipped anchor design by 3.2 pts on short meetings and 10.3 pts on 20-min
+meetings, counts speakers better, costs less, and is constant-memory. Anchors
+can be retired entirely (even the final pass maps to bank centroids). Port
+plan: lift bank.rs/overlap.rs logic into cue-diarize as the live diarizer;
+mint_patience scales with elapsed ticks; keep label-once + authoritative end
+pass; no freeze/confidence machinery.

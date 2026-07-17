@@ -6,14 +6,17 @@
 //!
 //!   * [`Diarizer`] — offline/post-process. Diarize a whole recording in one
 //!     pass (authoritative labels, ~6-8% DER). Run at meeting end.
-//!   * [`AnchorLiveDiarizer`] — near-real-time, anchor-pinned. The live tier the
-//!     daemon uses: carries each speaker's voice forward AS an ~8s audio anchor
-//!     and re-identifies speakers by construction each tick. Measured 12.3% DER
-//!     live on VoxConverse vs 26.6% for the old window stitcher (see
-//!     docs/work/STT-DIARIZATION-FINDINGS.md). Constant per-tick cost.
-//!   * [`LiveDiarizer`] — the SUPERSEDED window stitcher (time-overlap mapping
-//!     across rolling windows). Kept for reference/tests; measured to hallucinate
-//!     phantom speakers as windows accumulate. Prefer [`AnchorLiveDiarizer`].
+//!   * [`BankLiveDiarizer`] — near-real-time, profile-bank. The live tier the
+//!     daemon uses: carries each speaker forward as ONE EMA-updated embedding
+//!     centroid and re-identifies by cosine match each tick. Measured 9.1% DER
+//!     on 240s trims / 6.9% on 20-min files, beating anchor pinning on accuracy,
+//!     speaker counting, AND cost — and constant in meeting length (see
+//!     docs/work/STT-DIARIZATION-FINDINGS.md).
+//!   * [`AnchorLiveDiarizer`] — SUPERSEDED anchor-pinned tier (carried voices as
+//!     ~8s audio anchors). Kept for reference; measured to DEGRADE on long
+//!     meetings (the gallery accretes duplicate pins → phantom speakers).
+//!   * [`LiveDiarizer`] — the original SUPERSEDED window stitcher (time-overlap
+//!     mapping across rolling windows). Kept for reference/tests.
 //!
 //! All take 16 kHz mono f32 samples (the daemon's capture format). Speaker
 //! identity is a per-meeting integer id, orthogonal to the coarse mic-vs-system
@@ -23,7 +26,10 @@ use anyhow::{Context, Result};
 use speakrs::{ExecutionMode, OwnedDiarizationPipeline};
 
 mod anchor;
+mod bank;
+mod overlap;
 pub use anchor::{AnchorLiveDiarizer, ANCHOR_WINDOW_SECS};
+pub use bank::{BankLiveDiarizer, BANK_WINDOW_SECS};
 
 /// One diarized speech span with a per-meeting speaker id.
 #[derive(Debug, Clone)]

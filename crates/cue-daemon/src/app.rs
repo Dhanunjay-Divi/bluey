@@ -4275,8 +4275,22 @@ fn to_wire_line(segment: &TranscriptSegment) -> MeetingTranscriptLine {
         source: speaker_channel(segment.speaker).to_string(),
         // Diarized display label when the live/post pass has resolved one (the
         // rehydrate/past-meeting paths carry labels this way; live lines get
-        // theirs via OverlayCommand::TranscriptSpeaker upgrades instead).
-        speaker: segment.speaker_id.map(|id| format!("Speaker {}", id + 1)),
+        // theirs via OverlayCommand::TranscriptSpeaker upgrades instead). A
+        // talk-over fragment surfaces its co-speakers ("Speaker 2 + 3") rather
+        // than hiding that more than one voice was in the line.
+        speaker: segment.speaker_id.map(|id| {
+            let mut label = format!("Speaker {}", id + 1);
+            if !segment.secondary_speaker_ids.is_empty() {
+                let others: Vec<String> = segment
+                    .secondary_speaker_ids
+                    .iter()
+                    .map(|s| (s + 1).to_string())
+                    .collect();
+                label.push_str(" + ");
+                label.push_str(&others.join(" + "));
+            }
+            label
+        }),
         text: segment.text.clone(),
         is_final: true,
     }

@@ -65,6 +65,14 @@ pub struct TranscriptSegment {
     /// (default)]` so transcripts persisted before this field deserialize.
     #[serde(default)]
     pub speaker_id: Option<i64>,
+    /// Other diarized speakers who had a real share of THIS fragment's audio
+    /// (talk-over / interruption). One ASR fragment carries a single lexical
+    /// stream, so the text is attributed to `speaker_id` (the dominant voice),
+    /// but co-speakers are surfaced here rather than discarded — the honest
+    /// "more than one person was speaking in this line" signal. Empty for the
+    /// normal single-speaker case. `#[serde(default)]` for back-compat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary_speaker_ids: Vec<i64>,
     /// Audio position (seconds since capture start) for this segment, on the SAME
     /// sample clock the diarizer uses (retention buffer's cumulative sample count
     /// ÷ 16 kHz). This is what lets live diarization align a diarized speaker-time
@@ -91,6 +99,7 @@ impl TranscriptSegment {
             created_at: clock::now_epoch_ms_string(),
             is_final,
             speaker_id: None,
+            secondary_speaker_ids: Vec::new(),
             audio_start_secs: None,
             audio_dur_secs: None,
         }
@@ -118,12 +127,30 @@ impl TranscriptSegment {
     /// present ("You" stays "You" since the mic side is 100%-reliably the user;
     /// the system side becomes "Speaker N" when diarization has resolved it),
     /// else falls back to the coarse channel label.
+    ///
+    /// Speaker ids are shown **1-based** to match every user-facing surface (the
+    /// overlay label, the wire, the dev socket) — so the AI and the user name the
+    /// same person identically ("Speaker 2" in the app == "Speaker 2" to the AI).
+    /// A talk-over fragment surfaces its co-speakers ("Speaker 2 + 3") so the AI
+    /// knows more than one voice was in the line when extracting decisions/owners.
     pub fn context_label(&self) -> String {
         match (self.speaker.is_me(), self.speaker_id) {
             // The mic channel is always the user — keep the reliable "You".
             (true, _) => self.speaker.display_label().to_string(),
-            // A resolved individual on the far side.
-            (false, Some(id)) => format!("Speaker {id}"),
+            // A resolved individual on the far side (1-based; + co-speakers).
+            (false, Some(id)) => {
+                let mut label = format!("Speaker {}", id + 1);
+                if !self.secondary_speaker_ids.is_empty() {
+                    let others: Vec<String> = self
+                        .secondary_speaker_ids
+                        .iter()
+                        .map(|s| (s + 1).to_string())
+                        .collect();
+                    label.push_str(" + ");
+                    label.push_str(&others.join(" + "));
+                }
+                label
+            }
             // No diarization yet — coarse channel label ("They"/"Other"/…).
             (false, None) => self.speaker.display_label().to_string(),
         }
@@ -541,6 +568,27 @@ pub struct MemoryHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_label_is_1_based_and_surfaces_co_speakers() {
+        // Mic side is always "You" regardless of any diarized id.
+        let me = TranscriptSegment::new(Speaker::User, "hi", true).with_speaker_id(Some(3));
+        assert_eq!(me.context_label(), "You");
+
+        // Far side, single speaker: 1-based to match the UI ("Speaker 2", not 1).
+        let solo = TranscriptSegment::new(Speaker::System, "hi", true).with_speaker_id(Some(1));
+        assert_eq!(solo.context_label(), "Speaker 2");
+
+        // Talk-over: co-speakers appended so the AI sees the line was mixed.
+        let mut mixed =
+            TranscriptSegment::new(Speaker::System, "hi", true).with_speaker_id(Some(1));
+        mixed.secondary_speaker_ids = vec![2, 4];
+        assert_eq!(mixed.context_label(), "Speaker 2 + 3 + 5");
+
+        // No diarization yet → coarse channel label, not "Speaker N".
+        let unlabeled = TranscriptSegment::new(Speaker::System, "hi", true);
+        assert_eq!(unlabeled.context_label(), unlabeled.speaker.display_label());
+    }
 
     #[test]
     fn test_meeting_is_substantive_thresholds() {
