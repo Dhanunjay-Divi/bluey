@@ -90,7 +90,9 @@ export function inferProfileFromResume(profile: CareerProfile, imported: Importe
   const phone = imported.text.match(/(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}/)?.[0];
   const linkedin = imported.text.match(/(?:https?:\/\/)?(?:www\.)?linkedin\.com\/in\/[^\s|,;]+/i)?.[0];
   const urls = imported.text.match(/https?:\/\/[^\s|,;]+/gi) || [];
-  const portfolio = urls.find((url) => !/linkedin\.com/i.test(url));
+  const portfolio =
+    urls.find((url) => !/linkedin\.com/i.test(url)) ||
+    imported.text.match(/(?:https?:\/\/)?(?:www\.)?(?:github|gitlab)\.com\/[^\s|,;]+/i)?.[0];
   const location = contactLines.map(extractLocation).find(Boolean);
   const inferredEmployment = parseEmployment(sections.employment);
   const inferredEducation = parseEducation(sections.education);
@@ -208,6 +210,12 @@ function detectSection(
   if (current === "projects" && /^(?:technologies|tech|stack)\s*:\s*.+/i.test(line)) {
     return null;
   }
+  if (
+    current === "skills" &&
+    /^(?:languages?|ai(?:\/ml)?|machine learning|backend|frontend|cloud(?:\/devops)?|devops|databases?|tools?|frameworks?|platforms?|technologies)\s*:\s*.+/i.test(line)
+  ) {
+    return null;
+  }
   const aliases: Array<[ResumeSection, RegExp]> = [
     ["summary", /^(?:professional\s+)?(?:summary|profile|objective|about)(?:\s*[:|-]\s*(.*))?$/i],
     ["employment", /^(?:professional\s+)?(?:experience|employment|work history|career history)(?:\s*[:|-]\s*(.*))?$/i],
@@ -262,11 +270,12 @@ function parseEmployment(lines: string[]): EmploymentEntry[] {
       .map(splitEmploymentCandidate);
     const location = parsedCandidates.map((candidate) => candidate.location).find(Boolean) || "";
     const roleCandidates = uniqueStrings(parsedCandidates.map((candidate) => candidate.value).filter(Boolean));
-    let title = pickByPositiveScore(roleCandidates, titleScore);
-    let company = pickByPositiveScore(
-      roleCandidates.filter((candidate) => candidate !== title),
-      companyScore,
-    );
+    const combined = roleCandidates.map(splitCombinedTitleCompany).find(Boolean);
+    let title = combined?.title || pickByPositiveScore(roleCandidates, titleScore);
+    let company = combined?.company || pickByPositiveScore(
+        roleCandidates.filter((candidate) => candidate !== title),
+        companyScore,
+      );
     if (!title) {
       title = roleCandidates.find((candidate) => candidate !== company && companyScore(candidate) === 0) || "";
     }
@@ -285,7 +294,7 @@ function parseEmployment(lines: string[]): EmploymentEntry[] {
       start_date: normalizeDate(block.start),
       end_date: block.current ? "" : normalizeDate(block.end),
       current: block.current,
-      highlights: uniqueStrings(block.body.map(stripBullet).filter(isUsefulHighlight)),
+      highlights: parseHighlights(block.body),
     };
   }).filter((entry) => entry.company || entry.title);
 }
@@ -321,14 +330,16 @@ function parseProjects(lines: string[]): ProjectEntry[] {
   let current: { name: string; details: string[] } | null = null;
   const finish = () => {
     if (!current?.name) return;
-    const details = current.details.map(stripBullet).filter(Boolean);
+    const details = joinWrappedLines(current.details.map(stripBullet).filter(Boolean));
     const technologyLine = details.find((line) => /^(?:technologies|tech|stack)\s*:/i.test(line));
     const url = details.join(" ").match(/https?:\/\/[^\s|,;]+/i)?.[0] || "";
     projects.push({
       id: stableResumeId("project", `${current.name}|${projects.length}`),
       name: current.name,
       role: "",
-      summary: details.filter((line) => line !== technologyLine && !line.includes(url)).join(" "),
+      summary: details
+        .filter((line) => line !== technologyLine && (!url || !line.includes(url)))
+        .join(" "),
       technologies: technologyLine
         ? parseDelimitedList(technologyLine.replace(/^[^:]+:/, ""))
         : [],
@@ -377,7 +388,20 @@ function datedBlocks(lines: string[], allowSingleYear: boolean): DatedBlock[] {
     .map((line, index) => ({ index, range: extractDateRange(line, allowSingleYear) }))
     .filter((item): item is { index: number; range: NonNullable<ReturnType<typeof extractDateRange>> } => Boolean(item.range));
   if (!dates.length) return [];
+  const firstInlineRemainder = lines[dates[0].index]
+    .replace(dates[0].range.raw, "")
+    .replace(/^[|,; -]+|[|,; -]+$/g, "")
+    .trim();
+  const inlineEducationDateStartsBlock =
+    allowSingleYear && Boolean(firstInlineRemainder) && dates[0].index === 0;
   const headerStarts = dates.map(({ index }, dateIndex) => {
+    const inlineRemainder = lines[index]
+      .replace(dates[dateIndex].range.raw, "")
+      .replace(/^[|,; -]+|[|,; -]+$/g, "")
+      .trim();
+    if (allowSingleYear && inlineRemainder && inlineEducationDateStartsBlock) {
+      return index;
+    }
     const lowerBound = dateIndex ? dates[dateIndex - 1].index + 1 : 0;
     let start = index;
     while (start > lowerBound && index - start < 3) {
@@ -487,6 +511,32 @@ function splitEmploymentCandidate(candidate: string): { value: string; location:
   return { value: clean, location: "" };
 }
 
+function splitCombinedTitleCompany(candidate: string): { title: string; company: string } | null {
+  const parts = candidate.split(/\s*,\s*/).map((part) => part.trim()).filter(Boolean);
+  if (parts.length < 2 || titleScore(parts[0]) === 0) return null;
+  const legalSuffix = /^(?:inc\.?|llc|ltd\.?|corp\.?|plc|co\.?)$/i;
+  const scored = Array.from({ length: parts.length - 1 }, (_, offset) => {
+    const boundary = offset + 1;
+    const title = parts.slice(0, boundary).join(", ");
+    const company = parts.slice(boundary).join(", ");
+    return {
+      title,
+      company,
+      boundary,
+      titleScore: titleScore(title),
+      companyScore: companyScore(company),
+      legalOnly: legalSuffix.test(company),
+    };
+  })
+    .filter((value) => value.titleScore > 0 && value.company)
+    .sort((left, right) => {
+      if (left.legalOnly !== right.legalOnly) return left.legalOnly ? 1 : -1;
+      return right.companyScore - left.companyScore || right.boundary - left.boundary;
+    });
+  const best = scored.find((value) => value.companyScore > 0) || scored[0];
+  return best ? { title: best.title, company: best.company } : null;
+}
+
 function pickByScore(values: string[], score: (value: string) => number): string {
   return values
     .map((value, index) => ({ value, index, score: score(value) }))
@@ -516,6 +566,8 @@ function companyScore(value: string): number {
     "inc", "llc", "ltd", "corp", "company", "group", "labs", "technologies", "systems",
     "solutions", "consulting", "bank", "university", "health", "media",
     "hospital", "hospitals", "medical", "clinic", "care", "system", "center", "centre",
+    "insurance", "manufacturing", "manufacturers", "library", "communications", "telecom",
+    "foundation", "association",
   ]);
 }
 
@@ -557,7 +609,7 @@ function stripContactParts(line: string): string {
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "")
     .replace(/(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}/g, "")
     .replace(/https?:\/\/\S+/gi, "")
-    .replace(/\s*[|•]\s*/g, " ")
+    .replace(/\s*[|•—–]\s*/g, " ")
     .trim();
 }
 
@@ -570,10 +622,61 @@ function looksLikeLocation(line: string): boolean {
 function extractLocation(line: string): string {
   return (
     line
-      .split(/\s*[|•]\s*/)
+      .split(/\s*[|•—–]\s*/)
       .map(stripContactParts)
       .find((part) => part && looksLikeLocation(part)) || ""
   );
+}
+
+function parseHighlights(lines: string[]): string[] {
+  const highlights: string[] = [];
+  let current = "";
+  const finish = () => {
+    if (current) highlights.push(current.trim());
+    current = "";
+  };
+  for (const line of lines) {
+    const value = stripBullet(line);
+    if (!value) continue;
+    if (isBullet(line)) {
+      finish();
+      current = value;
+      continue;
+    }
+    if (!current) {
+      if (isUsefulHighlight(line)) current = value;
+      continue;
+    }
+    if (/[.!?]$/.test(current) && isUsefulHighlight(line)) {
+      finish();
+      current = value;
+    } else {
+      current = joinWrappedText(current, value);
+    }
+  }
+  finish();
+  return uniqueStrings(highlights);
+}
+
+function joinWrappedLines(lines: string[]): string[] {
+  const joined: string[] = [];
+  for (const line of lines) {
+    if (!line) continue;
+    if (!joined.length || /^(?:technologies|tech|stack)\s*:/i.test(line)) {
+      joined.push(line);
+      continue;
+    }
+    const previous = joined[joined.length - 1];
+    if (/[.!?]$/.test(previous)) joined.push(line);
+    else joined[joined.length - 1] = joinWrappedText(previous, line);
+  }
+  return joined;
+}
+
+function joinWrappedText(left: string, right: string): string {
+  return /[A-Za-z]-$/.test(left)
+    ? `${left.slice(0, -1)}${right}`
+    : `${left} ${right}`;
 }
 
 function parseDelimitedList(value: string): string[] {

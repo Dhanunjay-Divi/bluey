@@ -212,4 +212,92 @@ Example Clinical Association - Peer Reviewer`,
     });
     expect(result.skills).toEqual(["Epic EMR", "REDCap"]);
   });
+
+  it("parses compact PDF rows with inline dates, grouped skills, and combined role-company headings", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "fictional-ai-resume.pdf",
+      text: `Casey Morgan
+Columbus, OH — casey@example.com — (614) 555-0135
+linkedin.com/in/casey-morgan — github.com/casey-morgan
+Summary
+Early-career AI engineer building reliable document and retrieval systems.
+Education
+Northern University, School of Computing Aug 2022 – May 2024
+M.S. in Computer Science
+State Institute of Technology Jun 2018 – May 2022
+B.Tech in Mechanical Engineering
+Experience
+Software Developer, AI, Meridian Insurance Feb 2024 – Present
+• Built a document pipeline that reduced review time by 30% across customer operations.
+AI Engineer, Northstar Communications Aug 2023 – Feb 2024
+• Deployed retrieval systems across 100+ internal teams.
+Research Intern, City Research Library May 2022 – Aug 2022
+• Improved text recognition accu-
+racy by 17% across historical documents.
+Projects
+Application Intelligence Platform
+Built a multi-agent research platform for structured decision support.
+Tech: Python, React, PostgreSQL
+Skills
+Languages: Python, Java, TypeScript
+AI/ML: RAG, PyTorch, OCR
+Backend: FastAPI, Kafka, PostgreSQL
+Cloud/DevOps: AWS, Docker, Kubernetes`,
+    });
+
+    expect(result.current_location).toBe("Columbus, OH");
+    expect(result.portfolio_url).toBe("https://github.com/casey-morgan");
+    expect(result.headline).toBe("Software Developer, AI");
+    expect(result.employment).toHaveLength(3);
+    expect(result.employment[0]).toMatchObject({
+      company: "Meridian Insurance",
+      title: "Software Developer, AI",
+      start_date: "2024-02",
+      current: true,
+    });
+    expect(result.employment[1]).toMatchObject({
+      company: "Northstar Communications",
+      title: "AI Engineer",
+    });
+    expect(result.employment[2]).toMatchObject({
+      company: "City Research Library",
+      title: "Research Intern",
+    });
+    expect(result.employment[2].highlights).toEqual([
+      "Improved text recognition accuracy by 17% across historical documents.",
+    ]);
+    expect(result.education).toEqual([
+      expect.objectContaining({
+        school: "Northern University, School of Computing",
+        degree: "M.S. in Computer Science",
+        start_date: "2022-08",
+        end_date: "2024-05",
+      }),
+      expect.objectContaining({
+        school: "State Institute of Technology",
+        degree: "B.Tech in Mechanical Engineering",
+        start_date: "2018-06",
+        end_date: "2022-05",
+      }),
+    ]);
+    expect(result.projects[0]).toMatchObject({
+      name: "Application Intelligence Platform",
+      summary: "Built a multi-agent research platform for structured decision support.",
+      technologies: ["Python", "React", "PostgreSQL"],
+    });
+    expect(result.skills).toEqual([
+      "Python",
+      "Java",
+      "TypeScript",
+      "RAG",
+      "PyTorch",
+      "OCR",
+      "FastAPI",
+      "Kafka",
+      "PostgreSQL",
+      "AWS",
+      "Docker",
+      "Kubernetes",
+    ]);
+  });
 });
