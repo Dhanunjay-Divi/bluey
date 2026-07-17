@@ -2249,38 +2249,44 @@ def payment_platform_safety_issues(text: str) -> List[str]:
 
     provider_before_persist = any(has_unnegated_order(pattern) for pattern in provider_first_patterns)
 
-    volatile_boundary = False
-    volatile = re.compile(r"\b(?:redis|setnx|short[- ]lived\s+(?:redis\s+)?lock)\b")
-    boundary_claim = re.compile(
-        r"(?:financial\s+correctness|correctness\s+boundary|source\s+of\s+truth|"
-        r"authoritative|guarantee\w*.{0,50}(?:no\s+)?duplicate|"
-        r"prevent\w*.{0,40}duplicate)"
+    def has_affirmative_volatile_boundary(clause: str) -> bool:
+        volatile_subject = (
+            r"(?:redis(?:\s+(?:setnx|locks?))?|setnx|"
+            r"(?:(?:short[- ]lived|ephemeral|volatile|distributed)\s+)+"
+            r"(?:redis\s+)?locks?)"
+        )
+        authority = (
+            r"(?:financial\s+correctness|correctness\s+boundary|"
+            r"source\s+of\s+truth|authoritative)"
+        )
+        patterns = (
+            rf"\b{volatile_subject}\b\s+(?:is|are|remains?|becomes?|provides?|"
+            rf"acts?\s+as|serves?\s+as)\s+(?:the\s+|our\s+|a\s+)?{authority}\b",
+            rf"\b{authority}\b\s+(?:is|are|remains?)\s+(?:the\s+|our\s+|a\s+)?"
+            rf"{volatile_subject}\b",
+            rf"\b(?:use|treat|make)\w*\s+(?:the\s+)?{volatile_subject}\b"
+            rf"\s+(?:as\s+)?(?:the\s+|our\s+|a\s+)?{authority}\b",
+            rf"\b(?:financial\s+correctness|duplicate\s+prevention)\b"
+            rf"\s+(?:relies|depends)\s+on\s+(?:the\s+)?{volatile_subject}\b",
+            rf"\b{volatile_subject}\b\s+(?:alone\s+)?"
+            r"(?:guarantee\w*|prevent\w*)\b"
+            r".{0,45}\b(?:duplicate|double[- ]charg\w*)\b",
+        )
+        for pattern in patterns:
+            for candidate in re.finditer(pattern, clause):
+                prefix = clause[max(0, candidate.start() - 40) : candidate.start()]
+                if re.search(
+                    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|"
+                    r"cannot|can't|avoid)\b.{0,25}$",
+                    prefix,
+                ):
+                    continue
+                return True
+        return False
+
+    volatile_boundary = any(
+        has_affirmative_volatile_boundary(clause) for clause in clauses
     )
-    for match in volatile.finditer(lower):
-        window = lower[max(0, match.start() - 180) : match.end() + 180]
-        if boundary_claim.search(window):
-            disclaimed = re.search(
-                r"\b(?:redis|setnx|(?:short[- ]lived|volatile)\s+lock)\b.{0,90}"
-                r"\b(?:is\s+not|isn't|isn’t|must\s+not\s+be|cannot\s+be|can't\s+be|"
-                r"can’t\s+be)\b.{0,70}"
-                r"\b(?:correctness\s+boundary|source\s+of\s+truth|authoritative|"
-                r"financial\s+correctness)\b",
-                window,
-            )
-            disclaimed = bool(
-                disclaimed
-                or re.search(
-                    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't)"
-                    r"\b.{0,45}\b(?:use|rely\w*\s+on)\b.{0,45}"
-                    r"\b(?:redis\s+)?lock\b.{0,45}\b(?:as|for)\b.{0,25}"
-                    r"\b(?:the\s+)?(?:correctness\s+boundary|source\s+of\s+truth|"
-                    r"financial\s+correctness)\b",
-                    window,
-                )
-            )
-            if not disclaimed:
-                volatile_boundary = True
-                break
     if not volatile_boundary:
         volatile_boundary = bool(
             re.search(
@@ -2379,6 +2385,10 @@ def self_check_payment_platform_safety_detector() -> None:
         "Only after the database transaction commits do we call the provider. The "
         "transaction writes a durable payment intent and ledger; provider status and "
         "webhooks reconcile ambiguous outcomes.",
+        "Use a durable double-entry ledger and reconcile through provider status and "
+        "webhooks. Do not rely on Redis locks or distributed locks for correctness. "
+        "Use durable DB constraints and ledger immutability as the source of truth. "
+        "Read models can be eventually consistent; the ledger remains authoritative.",
     )
     unsafe = (
         (
@@ -2392,6 +2402,27 @@ def self_check_payment_platform_safety_detector() -> None:
         (
             "Use a durable double-entry ledger and provider webhook reconciliation. "
             "Redis SETNX is the source of truth and guarantees no duplicate charge.",
+            ["unsafe_volatile_payment_correctness_boundary"],
+        ),
+        (
+            "Use a durable double-entry ledger and reconcile through provider status "
+            "and webhooks. Do not rely on Redis locks for correctness. For duplicate "
+            "charges, Redis locks are the correctness boundary.",
+            ["unsafe_volatile_payment_correctness_boundary"],
+        ),
+        (
+            "Use a durable double-entry ledger and reconcile provider status. The "
+            "authoritative source of truth is a volatile distributed lock.",
+            ["unsafe_volatile_payment_correctness_boundary"],
+        ),
+        (
+            "Use a durable double-entry ledger and reconcile provider status. Redis "
+            "locks guarantee no duplicate charges.",
+            ["unsafe_volatile_payment_correctness_boundary"],
+        ),
+        (
+            "Use a durable double-entry ledger and reconcile provider status and "
+            "webhooks. Redis locks provide the correctness boundary.",
             ["unsafe_volatile_payment_correctness_boundary"],
         ),
         (

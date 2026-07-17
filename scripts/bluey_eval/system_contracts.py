@@ -328,7 +328,15 @@ def feature_store_consistency_issues(text: str) -> List[str]:
     lower = re.sub(
         r"\s+",
         " ",
-        re.sub(r"[*`~]+", "", text.casefold().replace("’", "'")),
+        re.sub(
+            r"[*`~]+",
+            "",
+            text.casefold()
+            .replace("’", "'")
+            .replace("_", "-")
+            .replace("≤", "<=")
+            .replace("≥", ">="),
+        ),
     )
     issues: List[str] = []
     decision_time = (
@@ -625,10 +633,14 @@ def feature_store_consistency_issues(text: str) -> List[str]:
         future_relation = bool(
             re.search(
                 rf"\b(?:{availability_time})\b.{{0,65}}"
-                rf"(?:\bafter\b|(?<!no\s)\blater\s+than\b|>)\s*.{{0,20}}"
+                rf"(?:\bafter\b|(?<!no\s)\blater\s+than\b)\s*.{{0,20}}"
+                rf"\b(?:{decision_time})\b|"
+                rf"\b(?:{availability_time})\b\s*>=?\s*"
                 rf"\b(?:{decision_time})\b|"
                 rf"\b(?:{decision_time})\b.{{0,65}}"
-                rf"(?:\bbefore\b|<)\s*.{{0,20}}\b(?:{availability_time})\b|"
+                rf"\bbefore\b\s*.{{0,20}}\b(?:{availability_time})\b|"
+                rf"\b(?:{decision_time})\b\s*<=?\s*"
+                rf"\b(?:{availability_time})\b|"
                 r"\bfeatures?\b.{0,40}\b(?:not\s+)?(?:available|known|ingested)\b"
                 rf".{{0,35}}\b(?:until|after)\b.{{0,20}}\b(?:{decision_time})\b",
                 clause,
@@ -1381,6 +1393,49 @@ def url_shortener_safety_issues(
         if not client_cache_boundary:
             issues.append("missing_revocable_redirect_client_cache_boundary")
 
+        tombstone_not_enforced = bool(
+            re.search(
+                r"\b(?:redirectors?|redirect\s+(?:service|path)|read\s+path)\b"
+                r".{0,55}\b(?:ignore\w*|bypass\w*|do\s+not\s+(?:read|check|honor|"
+                r"enforce|consult|respect)\w*)\b.{0,45}"
+                r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b|"
+                r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b.{0,55}"
+                r"\b(?:is|are|remains?)\s+(?:ignored|bypassed|unenforced|unchecked)\b|"
+                r"\b(?:redirectors?|redirect\s+(?:service|path))\b.{0,70}"
+                r"\b(?:continue\w*|may|can|will)\b.{0,45}"
+                r"\b(?:serve|return|use)?\w*\b.{0,25}"
+                r"\b(?:cached\s+destinations?|redirect\w*)\b|"
+                r"\b(?:redirectors?|redirect\s+(?:service|path)|read\s+path)\b"
+                r".{0,60}\b(?:read|check|honor|enforce|consult|respect)\w*\b"
+                r".{0,45}\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b"
+                r".{0,75}\b(?:only\s+during\b.{0,30}\b(?:eventual|async)\w*|"
+                r"eventual(?:ly)?|asynchronous(?:ly)?|later|delayed?)\b|"
+                r"\b(?:redirectors?|redirect\s+(?:service|path)|read\s+path|they)\b"
+                r".{0,65}\bfail\s+open\b.{0,55}"
+                r"\b(?:cached?\w*|destinations?|redirect\w*)\b|"
+                r"\bfail\s+open\b.{0,55}\b(?:cached?\w*|destinations?|redirect\w*)\b",
+                lower,
+            )
+        )
+        tombstone_enforced = bool(
+            re.search(
+                r"\b(?:redirectors?|redirect\s+(?:service|path)|read\s+path|cache)\b"
+                r".{0,65}\b(?:read|check|honor|enforce|consult|respect)\w*\b"
+                r".{0,50}\b(?:tombstone|deny\s+overlay|revocation\s+overlay|"
+                r"authoritative\s+state)\b|"
+                r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b.{0,55}"
+                r"\b(?:block|prevent|suppress|disable|deny)\w*\b.{0,35}"
+                r"\bredirect\w*\b",
+                lower,
+            )
+        )
+        fail_closed_until_authoritative = bool(
+            re.search(
+                r"\bfail\s+closed\b.{0,80}\buntil\b.{0,45}"
+                r"\bauthoritative\s+state\b.{0,30}\b(?:confirm|check|verif)\w*\b",
+                lower,
+            )
+        )
         inactive_revocation_barrier = False
         for clause in clauses:
             has_inactive_state = bool(
@@ -1406,6 +1461,13 @@ def url_shortener_safety_issues(
                     r"authoritative\s+state\s+check)\w*\b",
                     clause,
                 )
+                or tombstone_enforced
+                or re.search(
+                    r"\bfail\s+closed\b.{0,70}\buntil\b.{0,35}"
+                    r"\bauthoritative\s+state\b.{0,25}"
+                    r"\b(?:confirm|check|verif)\w*\b",
+                    clause,
+                )
             )
             negated_barrier = bool(
                 re.search(
@@ -1415,7 +1477,15 @@ def url_shortener_safety_issues(
                     r"evict|use)?\w*\b.{0,25}"
                     r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay|"
                     r"redirect\s+cache|cached\s+redirect)\b|"
-                    r"\b(?:asynchronous(?:ly)?|eventual(?:ly)?|later|delayed?)\b",
+                    r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b.{0,100}"
+                    r"\b(?:asynchronous(?:ly)?|eventual(?:ly)?|later|delayed?)\b|"
+                    r"\b(?:asynchronous(?:ly)?|eventual(?:ly)?|later|delayed?)\b"
+                    r".{0,100}\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b",
+                    clause,
+                )
+                or re.search(
+                    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|"
+                    r"cannot|can't|without)\b.{0,35}\bfail\s+closed\b",
                     clause,
                 )
             )
@@ -1425,9 +1495,47 @@ def url_shortener_safety_issues(
                 and has_synchronous_boundary
                 and has_redirect_suppression
                 and not negated_barrier
+                and not tombstone_not_enforced
             ):
                 inactive_revocation_barrier = True
                 break
+        if not inactive_revocation_barrier:
+            global_inactive_state = bool(
+                re.search(
+                    r"\b(?:delet\w*|expir\w*|abuse[- ]block\w*|legal[- ]block\w*|"
+                    r"inactive\s+states?)\b",
+                    lower,
+                )
+            )
+            global_barrier_record = bool(
+                re.search(r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b", lower)
+            )
+            global_synchronous_boundary = bool(
+                re.search(
+                    r"\b(?:synchronous(?:ly)?|atomically|before\s+acknowledg\w*|"
+                    r"fail\s+closed|authoritative\s+state\s+check)\b",
+                    lower,
+                )
+            )
+            global_negated_barrier = bool(
+                re.search(
+                    r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b.{0,100}"
+                    r"\b(?:asynchronous(?:ly)?|eventual(?:ly)?|later|delayed?)\b|"
+                    r"\b(?:asynchronous(?:ly)?|eventual(?:ly)?|later|delayed?)\b"
+                    r".{0,100}\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b|"
+                    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|"
+                    r"without)\b.{0,45}\bfail\s+closed\b",
+                    lower,
+                )
+            )
+            inactive_revocation_barrier = bool(
+                global_inactive_state
+                and global_barrier_record
+                and global_synchronous_boundary
+                and (tombstone_enforced or fail_closed_until_authoritative)
+                and not global_negated_barrier
+                and not tombstone_not_enforced
+            )
         if not inactive_revocation_barrier:
             issues.append("missing_inactive_state_revocation_barrier")
 
@@ -1455,6 +1563,22 @@ def q47_director_alignment_issues(text: str) -> List[str]:
         r"escalat|bring|coordinat|review|email|send|ask)\w*"
     )
     directors = r"(?:(?:both|two|the)\s+directors?|the\s+requesting\s+directors?)"
+    visible_shared_engagement = bool(
+        re.search(
+            rf"\b(?:one|same|shared)?\s*(?:comparison|tradeoff|matrix)\b.{{0,80}}"
+            rf"\bvisible\s+to\b.{{0,25}}\b{directors}\b.{{0,180}}"
+            r"\bask\w*\s+them\b.{0,45}\b(?:agree|align)\w*\b.{0,60}"
+            r"\b(?:priority|order|sequence|decision|tradeoff|shared\s+rule|"
+            r"which\s+(?:request|one))\b",
+            lower,
+        )
+        and not re.search(
+            r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|"
+            r"without)\b.{0,25}\bask\w*\s+them\b.{0,35}"
+            r"\b(?:agree|align)\w*\b",
+            lower,
+        )
+    )
     engagement = bool(
         re.search(rf"\b{action}\b.{{0,80}}\b{directors}\b", lower)
         or re.search(
@@ -1462,6 +1586,7 @@ def q47_director_alignment_issues(text: str) -> List[str]:
             r"understand|confirm)\w*\b",
             lower,
         )
+        or visible_shared_engagement
     )
     shared_resolution = bool(
         re.search(
@@ -1474,18 +1599,34 @@ def q47_director_alignment_issues(text: str) -> List[str]:
             rf"\b{directors}\b.{{0,100}}\b(?:agree|align|resolve)\w*\b"
             r".{0,45}\b(?:priority|order|decision|tradeoff)\b|"
             r"\b(?:same|one|shared)\b.{0,30}\b(?:tradeoff|comparison|matrix)\b"
-            rf".{{0,90}}\b{directors}\b.{{0,90}}\b(?:agree|align|shared\s+priority)\w*\b|"
+            rf".{{0,90}}\b{directors}\b.{{0,90}}\b(?:agree|align)\w*\b"
+            r".{0,45}\b(?:priority|order|decision|tradeoff|shared\s+rule|"
+            r"which\s+(?:request|one))\b|"
+            r"\b(?:same|one|shared)\b.{0,30}\b(?:tradeoff|comparison|matrix)\b"
+            rf".{{0,90}}\b{directors}\b.{{0,90}}\b(?:ask|seek)\w*\b"
+            r".{0,40}\b(?:one|same|shared)\b.{0,25}"
+            r"\b(?:priority|order|decision)\b|"
             rf"\b(?:email|send|present|share)\w*\b.{{0,65}}\b{directors}\b"
-            r".{0,65}\b(?:same|shared|one)\b.{0,35}\b(?:matrix|tradeoff|priority)\b"
-            r".{0,65}\b(?:ask|seek|agree|align|confirm)\w*\b|"
+            r".{0,65}\b(?:same|shared|one)\b.{0,35}\b(?:matrix|tradeoff)\b"
+            r".{0,65}\b(?:ask|seek)\w*\b.{0,40}\b(?:one|same|shared)\b"
+            r".{0,25}\b(?:priority|order|decision)\b|"
             r"\bescalat\w*\b.{0,70}\b(?:common|accountable|shared)\b.{0,30}"
             r"\b(?:owner|sponsor|leader|manager|director|vp)\b|"
             r"\bescalat\w*\b.{0,35}\b(?:leadership|common\s+owner|sponsor)\b"
             r".{0,35}\b(?:decid|resolve|priority|order)\w*\b",
             lower,
         )
+        or visible_shared_engagement
     )
-    affirmative = engagement and shared_resolution
+    negated_shared_alignment = bool(
+        re.search(
+            r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|"
+            r"without)\b.{0,35}\b(?:ask|seek|invite)\w*\b.{0,35}"
+            r"\b(?:them|directors?)\b.{0,30}\b(?:agree|align)\w*\b",
+            lower,
+        )
+    )
+    affirmative = engagement and shared_resolution and not negated_shared_alignment
     ignored_director_input = bool(
         re.search(
             r"\b(?:ignore|disregard|dismiss)\w*\b.{0,40}"
@@ -1509,15 +1650,25 @@ def q47_director_alignment_issues(text: str) -> List[str]:
         " ",
         lower,
     )
-    private_decision = bool(
+    first_person_priority_decision = bool(
         re.search(
-            r"\b(?:choose|decide|select|make\s+(?:the\s+)?(?:decision|priority\s+call|call))"
+            r"\bi\s+(?:then\s+|ultimately\s+|personally\s+)?"
+            r"(?:decide|choose|pick|select|set|rank|resolve)\w*\b.{0,45}"
+            r"\b(?:which\s+(?:request|one)|priority|order|wins?|"
+            r"conflict|(?:my\s+)?personal\s+preference)\b",
+            unsafe_scan,
+        )
+    )
+    private_decision = first_person_priority_decision or bool(
+        re.search(
+            r"\b(?:choose|decide|select|pick|resolve|make\s+(?:the\s+)?(?:decision|priority\s+call|call))"
             r"\w*\b.{0,25}"
             r"\b(?:privately|alone|unilaterally|myself|personally|independently|"
-            r"on\s+my\s+own|by\s+myself)\b|"
-            r"\b(?:myself|personally|independently|on\s+my\s+own|by\s+myself)\b"
+            r"on\s+my\s+own|by\s+myself|based\s+on\s+(?:my\s+)?personal\s+preference)\b|"
+            r"\b(?:myself|personally|independently|on\s+my\s+own|by\s+myself|"
+            r"based\s+on\s+(?:my\s+)?personal\s+preference)\b"
             r".{0,30}"
-            r"\b(?:choose|decide|select|set|rank|make\s+(?:the\s+)?"
+            r"\b(?:choose|decide|select|pick|resolve|set|rank|make\s+(?:the\s+)?"
             r"(?:decision|priority\s+call|call))\w*\b",
             unsafe_scan,
         )

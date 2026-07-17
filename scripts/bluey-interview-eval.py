@@ -284,7 +284,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q44", "behavioral", "amazon_de", "Tell me about a time you challenged a decision with data and then committed to the final direction.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("data", "evidence"), g("disagree", "challenge"), g("commit", "align"))),
     EvalCase("Q45", "behavioral", "amazon_de", "Tell me about a failure. What did you change so the same class of failure would not repeat?", "behavioral_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("fail", "mistake"), g("root cause", "learn"), g("guardrail", "test", "monitor", "process"))),
     EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
-    EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("align", "stakeholder", "tradeoff to both directors"), g("communicat", "tradeoff"))),
+    EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("align", "stakeholder", "tradeoff to both directors", "visible to both directors"), g("communicat", "tradeoff"))),
     EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("follow", "ownership"))),
     EvalCase("Q49", "scenario", "ds", "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?", "otter_visible_scenario", speakable=True, required_groups=(g("track", "identity"), g("calibrat", "time", "spatial"), g("dedup", "fusion", "association"))),
     EvalCase("Q50", "behavioral", "ds", "Why this role, and what would you focus on in your first ninety days?", "resume_and_jd_pdf", speakable=True, required_groups=(g("hpe", "datacenter", "telemetry"), g("first", "90", "ninety"), g("stakeholder", "baseline", "production"))),
@@ -1443,6 +1443,35 @@ def self_check_production_answer_contracts() -> None:
         "parity and skew."
     )
     assert not feature_store_consistency_issues(saved_round539_q38_mechanics)
+    snake_case_store = (
+        "One versioned executable feature transformation compiles for streaming and "
+        "batch training. Persist event_time and availability_time. Build rows with an "
+        "as-of join on decision_time, admitting values only when event_time <= "
+        "decision_time and availability_time <= decision_time. A watermark corrects "
+        "late events through idempotent replay by event_id and feature version. "
+        "Continuously compare online and offline values for parity and skew."
+    )
+    assert not feature_store_consistency_issues(snake_case_store)
+    unsafe_snake_case_store = snake_case_store.replace(
+        "availability_time <= decision_time",
+        "availability_time may be after decision_time",
+    )
+    unsafe_snake_case_issues = set(
+        feature_store_consistency_issues(unsafe_snake_case_store)
+    )
+    assert "unsafe_future_feature_availability_or_label_cutoff" in (
+        unsafe_snake_case_issues
+    )
+    assert "missing_point_in_time_join_mechanics" in unsafe_snake_case_issues
+    unsafe_unicode_comparator_store = snake_case_store.replace(
+        "availability_time <= decision_time",
+        "availability_time ≥ decision_time",
+    )
+    unsafe_unicode_issues = set(
+        feature_store_consistency_issues(unsafe_unicode_comparator_store)
+    )
+    assert "unsafe_future_feature_availability_or_label_cutoff" in unsafe_unicode_issues
+    assert "missing_point_in_time_join_mechanics" in unsafe_unicode_issues
     q38_case = next(case for case in CASES if case.id == "Q38")
     assert not missing_required_group_issues(q38_case, saved_round539_q38_mechanics)
     leaking_anchored_store = saved_round539_q38_mechanics.replace(
@@ -1684,6 +1713,27 @@ def self_check_production_answer_contracts() -> None:
             require_revocation_completeness=True,
         )
     )
+    live_tombstone_barrier = (
+        "Revocable redirects use 302 or 307 with Cache-Control: no-store. Inactive "
+        "states synchronously publish a tombstone before acknowledging the transition. "
+        "Redirectors enforce that tombstone and fail closed until authoritative state "
+        "is confirmed."
+    )
+    assert not url_shortener_safety_issues(
+        live_tombstone_barrier,
+        require_revocation_completeness=True,
+    )
+    negated_live_tombstone_barrier = (
+        "Revocable redirects use 302 or 307 with Cache-Control: no-store. For deleted "
+        "links, tombstone propagation is asynchronous; do not fail closed until "
+        "authoritative state is confirmed."
+    )
+    assert "missing_inactive_state_revocation_barrier" in (
+        url_shortener_safety_issues(
+            negated_live_tombstone_barrier,
+            require_revocation_completeness=True,
+        )
+    )
     url_adversarial_cases = (
         (
             "Return HTTP 301 for all active links. Destinations never change. "
@@ -1727,6 +1777,33 @@ def self_check_production_answer_contracts() -> None:
         (
             "Revocable redirects use 302 and Cache-Control: no-store. On deletion, "
             "synchronously do not purge the tombstone or redirect cache before acknowledgement.",
+            "missing_inactive_state_revocation_barrier",
+        ),
+        (
+            "Revocable redirects use 302 and Cache-Control: no-store. On deletion, "
+            "synchronously publish a tombstone before acknowledging the transition. "
+            "Redirectors ignore the tombstone and continue to return cached destinations.",
+            "missing_inactive_state_revocation_barrier",
+        ),
+        (
+            "Revocable redirects use 302 and Cache-Control: no-store. On deletion, "
+            "synchronously publish a tombstone before acknowledging the transition. "
+            "Redirectors consume the tombstone asynchronously and may continue to "
+            "return cached destinations.",
+            "missing_inactive_state_revocation_barrier",
+        ),
+        (
+            "Revocable redirects use 302 with Cache-Control: no-store. On deletion, "
+            "synchronously publish a tombstone before acknowledgement. Redirectors "
+            "check the tombstone only during their eventual refresh and may serve the "
+            "cached destination until then.",
+            "missing_inactive_state_revocation_barrier",
+        ),
+        (
+            "Revocable redirects use 302 with Cache-Control: no-store. On deletion, "
+            "synchronously publish a tombstone before acknowledgement. Redirectors "
+            "check the tombstone, but a network partition means they fail open to "
+            "cached destinations.",
             "missing_inactive_state_revocation_barrier",
         ),
     )
@@ -2483,7 +2560,9 @@ def self_check_attempt_integrity_guards() -> None:
         q47,
         "I would show leadership by selecting the request with the greatest customer "
         "impact, then communicate my tradeoff and final decision.",
-    ) == ["missing_signal:align|stakeholder|tradeoff to both directors"]
+    ) == [
+        "missing_signal:align|stakeholder|tradeoff to both directors|visible to both directors"
+    ]
     assert not q47_director_alignment_issues(
         "I compare customer impact, explain the tradeoff to both directors, and "
         "ask them to align on the order before I communicate the decision."
@@ -2539,8 +2618,47 @@ def self_check_attempt_integrity_guards() -> None:
         "Without making a unilateral call, I present the comparison to both directors "
         "and escalate to their common owner if they cannot agree.",
         "I email both directors the same tradeoff matrix and ask for one shared priority.",
+        "I make one comparison visible to both directors using impact, urgency, effort, "
+        "dependencies, and reversibility. Then I ask them to agree on the order; if "
+        "they cannot, I escalate to their common accountable owner.",
     ):
         assert not q47_director_alignment_issues(safe_alignment), safe_alignment
+    live_q47 = (
+        "I make one comparison visible to both directors using the same criteria: "
+        "impact, deadline urgency, effort, dependencies, and reversibility. Then I ask "
+        "them to agree on the order or a shared rule. If they still disagree, I "
+        "escalate the unresolved decision to their common accountable owner. I make "
+        "the tradeoff explicit and communicate the final order."
+    )
+    assert not missing_required_group_issues(q47, live_q47)
+    assert not q47_director_alignment_issues(live_q47)
+    unsafe_visible_comparison = (
+        "I make one comparison visible to both directors, but do not ask them to agree; "
+        "I choose the priority myself and communicate my tradeoff."
+    )
+    unsafe_visible_issues = set(q47_director_alignment_issues(unsafe_visible_comparison))
+    assert "missing_affirmative_director_alignment" in unsafe_visible_issues
+    assert "unsafe_negated_or_unilateral_director_alignment" in unsafe_visible_issues
+    unsafe_accuracy_agreement = (
+        "I make one comparison visible to both directors and ask them to agree it is "
+        "accurate. I then pick the request to do first based on my personal preference "
+        "and communicate it."
+    )
+    unsafe_accuracy_issues = set(q47_director_alignment_issues(unsafe_accuracy_agreement))
+    assert "missing_affirmative_director_alignment" in unsafe_accuracy_issues
+    assert "unsafe_negated_or_unilateral_director_alignment" in unsafe_accuracy_issues
+    for unsafe_post_alignment in (
+        "I make one comparison visible to both directors, then ask them to agree on "
+        "the order. After listening, I decide based on personal preference.",
+        "I make one comparison visible to both directors and ask them to align on the "
+        "priority. If they cannot agree, I decide which one wins.",
+        "I make one comparison visible to both directors using customer impact, then "
+        "ask them to agree on the priority. If they cannot agree, I resolve the conflict "
+        "myself. I communicate the tradeoff.",
+    ):
+        assert "unsafe_negated_or_unilateral_director_alignment" in (
+            q47_director_alignment_issues(unsafe_post_alignment)
+        ), unsafe_post_alignment
 
     streamed = "This is the complete customer-streamed answer with enough words to evaluate."
     matching = AttemptResult(
