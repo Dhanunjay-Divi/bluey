@@ -34,6 +34,7 @@ import type {
   AnswerChunk,
   AnswerStatusStep,
   ContinueResult,
+  FixProposal,
   ListeningState,
   MeetingConversationTurn,
   MeetingState,
@@ -171,6 +172,18 @@ type OverlayCommand =
       command: string;
       prerequisite?: string | null;
     }
+  // A review-gated fix proposal for an agent answer (Fix-button slice F3). The
+  // daemon drove the attached agent in propose-only mode; nothing is applied.
+  // `diff` is absent for commands-only / prose-only fixes.
+  | {
+      type: "push_fix_proposal";
+      proposal_id: string;
+      diagnosis: string;
+      reasoning: string;
+      fix: string;
+      diff?: string | null;
+      apply_supported: boolean;
+    }
   | { type: string; [k: string]: unknown };
 
 // The daemon's AnswerStatusStep wire shape (serde: `kind` tag, snake_case
@@ -246,6 +259,19 @@ function toMeetingSummary(w: WireMeetingSummary): MeetingSummary {
     isActive: w.is_active,
     agentSessionId: w.agent_session_id ?? undefined,
     agentKind: w.agent_kind ?? undefined,
+  };
+}
+
+function toFixProposal(
+  w: Extract<OverlayCommand, { type: "push_fix_proposal" }>,
+): FixProposal {
+  return {
+    id: w.proposal_id,
+    diagnosis: w.diagnosis,
+    reasoning: w.reasoning,
+    fix: w.fix,
+    diff: w.diff ?? undefined,
+    applySupported: w.apply_supported,
   };
 }
 
@@ -692,6 +718,36 @@ export function createTauriClient(): MeetingClient {
 
     respondAgentInstall(kind, approved) {
       sendEvent({ type: "agent_install_responded", kind, approved });
+    },
+
+    requestFix(question, cardId) {
+      // Fire the daemon's fix_requested event: it drives the attached agent in
+      // propose-only mode and later PUSHES a push_fix_proposal we catch in
+      // onFixProposal. Include card_id only when given so an unattached fix
+      // carries exactly { type, question } and the daemon's serde default (None)
+      // applies.
+      sendEvent({
+        type: "fix_requested",
+        question,
+        ...(cardId ? { card_id: cardId } : {}),
+      });
+    },
+
+    onFixProposal(cb) {
+      // Persistent subscriber to daemon-PUSHED fix proposals. Mirrors
+      // onForMeQuestion: the proposal arrives asynchronously (driving a real
+      // agent is slow) as its own command, so this stays registered rather than
+      // resolving a one-shot request. Nothing is applied — the UI previews it.
+      const handler = (cmd: OverlayCommand) => {
+        if (cmd.type !== "push_fix_proposal") return;
+        cb(
+          toFixProposal(
+            cmd as Extract<OverlayCommand, { type: "push_fix_proposal" }>,
+          ),
+        );
+      };
+      handlers.add(handler);
+      return () => handlers.delete(handler);
     },
 
     ask(question, onChunk, opts): AskHandle {

@@ -23,13 +23,11 @@ export function AnswerCard({
   answer,
   onCopy,
   onFix,
-  onSendToChat,
   onRetry,
 }: {
   answer: AnswerState;
   onCopy?: () => void;
   onFix?: () => void;
-  onSendToChat?: () => void;
   onRetry?: () => void;
 }) {
   // Error state: a distinct, honest, retryable card — never styled as if the
@@ -174,9 +172,6 @@ export function AnswerCard({
               real fix handler is wired) — not on a plain conversational answer. */}
           {onFix && (
             <CardAction glyph="✦" label="Fix this" accent onClick={onFix} />
-          )}
-          {onSendToChat && (
-            <CardAction glyph="⤴" label="Send to chat" onClick={onSendToChat} />
           )}
           <span style={{ flex: 1 }} />
           {answer.cost && (

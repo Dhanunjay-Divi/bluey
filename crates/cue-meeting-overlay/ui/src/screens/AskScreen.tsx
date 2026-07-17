@@ -20,6 +20,7 @@ import {
 } from "../components/AgentInstallCard";
 import { AnswerCard, type AnswerState } from "../components/AnswerCard";
 import { Composer } from "../components/Composer";
+import { FixProposalCard } from "../components/FixProposalCard";
 import { ThinkingState } from "../components/primitives";
 import { StatusFeed } from "../components/StatusFeed";
 
@@ -54,6 +55,8 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
     turns,
     detectedQ,
     setDetectedQ,
+    fixProposal,
+    setFixProposal,
     appendTurn,
     patchTurn,
     turnSeq,
@@ -345,6 +348,16 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
                   onCopy={() =>
                     navigator.clipboard?.writeText(turn.answer.text)
                   }
+                  onFix={
+                    // "Fix this" only on a completed, non-error answer — a fix
+                    // proposes against the diagnosis text. Fires requestFix; the
+                    // daemon drives the agent in propose-only mode and PUSHES a
+                    // proposal that MeetingProvider stores as `fixProposal`. In
+                    // beta the resulting card previews only (Apply disabled).
+                    turn.answer.done && !turn.answer.error
+                      ? () => client.requestFix(turn.answer.text)
+                      : undefined
+                  }
                   onRetry={
                     turn.answer.error
                       ? () => runAsk(turn.sendQuestion ?? turn.question, turn.sendQuestion ? turn.question : undefined)
@@ -356,7 +369,17 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
           );
         })}
 
-        {turns.length === 0 && !detectedQ && (
+        {/* The proposed fix (Fix-button slice F3): the agent's diagnosis +
+            reasoning + diff, pushed after a Fix click. BETA: preview-only — the
+            card's Apply button is disabled; Dismiss clears the proposal. */}
+        {fixProposal && (
+          <FixProposalCard
+            proposal={fixProposal}
+            onDismiss={() => setFixProposal(null)}
+          />
+        )}
+
+        {turns.length === 0 && !detectedQ && !fixProposal && (
           <div
             style={{
               padding: "28px 16px",

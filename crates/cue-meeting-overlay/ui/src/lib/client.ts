@@ -15,6 +15,7 @@ import type {
   AnswerChunk,
   AskOptions,
   ContinueResult,
+  FixProposal,
   ListeningState,
   MeetingState,
   MeetingSummary,
@@ -114,6 +115,18 @@ export interface MeetingClient {
   /** Answer an install offer. `approved` runs the vetted recipe on the daemon
    *  (which reports the outcome as a card); Bluey never signs the user in. */
   respondAgentInstall(kind: string, approved: boolean): void;
+  /** Ask the daemon to propose a fix for an agent answer (Fix-button slice F3).
+   *  The daemon drives the ATTACHED agent in PROPOSE-ONLY mode and replies by
+   *  PUSHING an {@link onFixProposal} — nothing is applied at this step.
+   *  `cardId` optionally references the source answer card the Fix launched
+   *  from. Fire-and-subscribe: the proposal arrives asynchronously (driving a
+   *  real agent is slow), so callers listen via {@link onFixProposal}. */
+  requestFix(question: string, cardId?: string): void;
+  /** Subscribe to daemon-PUSHED fix proposals (push_fix_proposal); returns an
+   *  unsubscribe fn. Mirrors {@link onForMeQuestion}: the single owner
+   *  subscribes once and stores the proposal in shared state. Nothing is
+   *  applied — the UI previews the diagnosis + diff for review. */
+  onFixProposal(cb: (proposal: FixProposal) => void): () => void;
   /**
    * Ask the attached agent a question; streams chunks (text / tool-fired /
    * source / done) to `onChunk`. The agent answer is SLOW by nature (driving a

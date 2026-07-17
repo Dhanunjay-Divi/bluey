@@ -40,7 +40,12 @@ import {
   PAUSE_MS,
   type TranscriptGrouper,
 } from "./transcriptGrouping";
-import type { AnswerStatusStep, MeetingState, TranscriptLine } from "./types";
+import type {
+  AnswerStatusStep,
+  FixProposal,
+  MeetingState,
+  TranscriptLine,
+} from "./types";
 
 /** One Q&A exchange in the conversation feed: the question asked + the streamed
  *  answer + the live status steps for that turn. Past turns stay on screen so
@@ -75,6 +80,10 @@ interface MeetingStateValue {
   /** The current detected for-me question, or null when none/dismissed. */
   detectedQ: DetectedQuestion | null;
   setDetectedQ: (q: DetectedQuestion | null) => void;
+  /** The current review-gated fix proposal, or null when none/dismissed. In
+   *  beta this is preview-only (the card's Apply is disabled). */
+  fixProposal: FixProposal | null;
+  setFixProposal: (p: FixProposal | null) => void;
   /** Append a fresh turn to the feed (used by runAsk when a new ask starts). */
   appendTurn: (turn: Turn) => void;
   /** Patch an existing turn by id as its answer streams in. */
@@ -98,6 +107,7 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
   const [history, setHistory] = useState<TranscriptLine[]>([]);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [detectedQ, setDetectedQ] = useState<DetectedQuestion | null>(null);
+  const [fixProposal, setFixProposal] = useState<FixProposal | null>(null);
   const [rehydrated, setRehydrated] = useState(false);
 
   // The authoritative grouped history, keyed by member segment ids. This grouper
@@ -189,6 +199,7 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
     setTurns(seededTurns);
     turnSeq.current = snap.conversation.length;
     setDetectedQ(null);
+    setFixProposal(null);
   };
 
   // ---- Fix B: seed once from the active meeting's persisted snapshot ----
@@ -292,6 +303,16 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
   // ---- detected for-me question (single owner) ----
   useEffect(() => client.onForMeQuestion((q) => setDetectedQ(q)), [client]);
 
+  // ---- proposed fix (single owner) ----
+  // The daemon PUSHES a fix proposal after driving the attached agent in
+  // propose-only mode (the reply to a requestFix). Store it in shared state so
+  // it survives a collapse/tab switch and there's no double-subscribe. In beta
+  // this is preview-only; the card's Apply is disabled.
+  useEffect(
+    () => client.onFixProposal((p) => setFixProposal(p)),
+    [client],
+  );
+
   // ---- continue-past-meeting reseed (single owner) ----
   // Apply a daemon-pushed active reseed ONLY after the initial rehydrate seed
   // has run, so the meetingState() reply that shares this bus shape (the mount
@@ -313,6 +334,8 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
     turns,
     detectedQ,
     setDetectedQ,
+    fixProposal,
+    setFixProposal,
     appendTurn,
     patchTurn,
     turnSeq,

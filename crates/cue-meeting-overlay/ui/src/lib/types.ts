@@ -196,6 +196,32 @@ export interface AskOptions {
   model?: string;
 }
 
+/** A review-gated fix proposal pushed by the daemon in response to a Fix click
+ *  (Fix-button slice F3). Mirrors the daemon's OverlayCommand::PushFixProposal
+ *  wire shape — the daemon drove the attached agent in PROPOSE-ONLY mode: this
+ *  is a diagnosis + reasoning + the raw fix text + an optional renderable diff.
+ *  Nothing has been applied. In beta the UI previews this proposal only; the
+ *  Apply action is disabled (no agent may edit a tester's repo). */
+export interface FixProposal {
+  /** PushFixProposal.proposal_id (Uuid) as string — the id the daemon expects
+   *  echoed back on approval. Carried so a future (non-beta) apply path can
+   *  reference the still-pending proposal. */
+  id: string;
+  /** What's wrong: the agent's diagnosis of the problem. */
+  diagnosis: string;
+  /** Why this fix: the agent's reasoning for the proposed change. */
+  reasoning: string;
+  /** The full fix text as the agent produced it (the FIX section). */
+  fix: string;
+  /** A renderable unified diff extracted from the fix, when the fix contained
+   *  one. Absent for commands-only / prose-only fixes. */
+  diff?: string;
+  /** true when the producing agent CAN be driven to apply (has a CLI, etc.).
+   *  In beta the Apply button stays disabled regardless — this flag is carried
+   *  for the post-beta apply path and for honest labeling. */
+  applySupported: boolean;
+}
+
 /** A grounding source row shown under an answer. */
 export interface AnswerSource {
   /** "jira" | "github" | "supabase" | … — drives the dot color + label. */

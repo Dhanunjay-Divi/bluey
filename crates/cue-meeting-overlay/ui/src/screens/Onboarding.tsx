@@ -5,6 +5,7 @@
 
 import { useState } from "react";
 import { Glass, Mark } from "../components/primitives";
+import { getClient } from "../lib";
 import type { AgentSummary } from "../lib/types";
 
 type Step = "welcome" | "mic" | "attach" | "consent" | "ready";
@@ -22,6 +23,7 @@ export function Onboarding({
   const [step, setStep] = useState<Step>("welcome");
   const idx = ORDER.indexOf(step);
   const next = () => setStep(ORDER[Math.min(idx + 1, ORDER.length - 1)]);
+  const client = getClient();
 
   return (
     // Fill the window and center the card — the panel IS the window (no empty
@@ -53,7 +55,14 @@ export function Onboarding({
               text="Bluey listens to your system audio locally to catch questions as they come up. Audio is transcribed on your machine and never uploaded."
               cta="Allow microphone"
               secondary="Skip for now"
-              onCta={next}
+              onCta={() => {
+                // Actually start capture — this triggers the OS permission
+                // prompt and begins listening, mirroring the composer mic
+                // button (v1 captures SYSTEM audio: the other people on the
+                // call). Without this the step was cosmetic (next() only).
+                client.startListening({ microphone: false, system: true });
+                next();
+              }}
               onSecondary={next}
             />
           )}
@@ -83,7 +92,13 @@ export function Onboarding({
               text="Allow Bluey to read your agent's prior session history so answers carry your project context. Read-only, on this machine, and you can turn it off anytime."
               cta="Allow & continue"
               secondary="Not now"
-              onCta={next}
+              onCta={() => {
+                // Persist the consent (read prior agent sessions) before
+                // advancing — the step was cosmetic (next() only) so a new
+                // user finished setup with nothing granted.
+                void client.setSessionHistoryConsent(true);
+                next();
+              }}
               onSecondary={next}
             />
           )}
