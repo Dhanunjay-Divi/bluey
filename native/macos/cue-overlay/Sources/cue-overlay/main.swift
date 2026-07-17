@@ -95,6 +95,18 @@ private func scrollViewDirectly(_ scrollView: NSScrollView, withWheelEvent event
     return true
 }
 
+private func shouldStageNewContextItemsForNextAnswer(
+    mutationExpected: Bool,
+    attachPickerPending: Bool,
+    screenContextReadyForAnswer: Bool,
+    answerStreamActive: Bool
+) -> Bool {
+    mutationExpected
+        || attachPickerPending
+        || screenContextReadyForAnswer
+        || answerStreamActive
+}
+
 private let privateInstructionRefusal = "I can’t share Bluey’s private instructions, prompts, guardrails, tokens, or internal configuration. Ask me what you want to do, and I’ll help with the answer itself."
 
 private func sanitizeOverlayOutput(kind: String, body: String) -> String {
@@ -11502,16 +11514,24 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func setContextItems(_ items: [OverlayContextItem]) {
+        let attachPickerWasPending = attachPickerPending
+        let screenContextWasReady = screenContextReadyForAnswer
+        let answerStreamWasActive = !answerStreamStats.isEmpty
         endAttachPickerHandoff()
         let previousIds = Set(contextItems.map(\.id))
         let currentIds = Set(items.map(\.id))
         let newlyAddedIds = currentIds.subtracting(previousIds)
         let mutationExpected = isExpectingContextMutationForPendingSend()
+        let shouldStageNewItems = shouldStageNewContextItemsForNextAnswer(
+            mutationExpected: mutationExpected,
+            attachPickerPending: attachPickerWasPending,
+            screenContextReadyForAnswer: screenContextWasReady,
+            answerStreamActive: answerStreamWasActive)
         contextItems = items
         hasVisibleContextAttachments = !items.isEmpty
         pendingContextItemIds.formIntersection(currentIds)
         if !newlyAddedIds.isEmpty {
-            if mutationExpected {
+            if shouldStageNewItems {
                 pendingContextItemIds.formUnion(newlyAddedIds)
             }
             // New files are prepared for the next answer immediately. Show
@@ -17125,6 +17145,38 @@ private func runMeetingEvidenceTests() {
 }
 
 runMeetingEvidenceTests()
+#elseif BLUEY_CONTEXT_STAGING_TESTS
+private func runContextStagingTests() {
+    precondition(!shouldStageNewContextItemsForNextAnswer(
+        mutationExpected: false,
+        attachPickerPending: false,
+        screenContextReadyForAnswer: false,
+        answerStreamActive: false))
+    precondition(shouldStageNewContextItemsForNextAnswer(
+        mutationExpected: true,
+        attachPickerPending: false,
+        screenContextReadyForAnswer: false,
+        answerStreamActive: false))
+    precondition(shouldStageNewContextItemsForNextAnswer(
+        mutationExpected: false,
+        attachPickerPending: true,
+        screenContextReadyForAnswer: false,
+        answerStreamActive: false))
+    precondition(shouldStageNewContextItemsForNextAnswer(
+        mutationExpected: false,
+        attachPickerPending: false,
+        screenContextReadyForAnswer: true,
+        answerStreamActive: false))
+    precondition(shouldStageNewContextItemsForNextAnswer(
+        mutationExpected: false,
+        attachPickerPending: false,
+        screenContextReadyForAnswer: false,
+        answerStreamActive: true))
+
+    print("Overlay context staging tests passed")
+}
+
+runContextStagingTests()
 #elseif BLUEY_OVERLAY_SEQUENCE_PROTOCOL_TESTS
 private func runOverlaySequenceProtocolTests() {
     let parsed = parseCommand(
