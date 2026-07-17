@@ -28,6 +28,7 @@ function packet(overrides: Partial<ApplicationPacket> = {}): ApplicationPacket {
     applicationId: "application-1",
     jobId: "job-1",
     resumeVersionId: "resume-1",
+    approvedPacketChecksum: "c".repeat(64),
     answers: { email: "ada@example.com" },
     verifiedClaimIds: ["claim-1"],
     applicationIdentityId: "identity-1",
@@ -63,6 +64,7 @@ function receipt(overrides: Partial<ApplicationReceiptBundle> = {}): Application
     packet: {
       jobId: "job-1",
       resumeVersionId: "resume-1",
+      approvedPacketChecksum: "c".repeat(64),
       answers: { email: "ada@example.com" },
       verifiedClaimIds: ["claim-1"],
       applicationEmail: "ada@example.com",

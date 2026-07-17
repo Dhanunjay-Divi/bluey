@@ -189,6 +189,7 @@ function packet(overrides: Partial<ApplicationPacket> = {}): ApplicationPacket {
     applicationId: "application-1",
     jobId: "job-1",
     resumeVersionId: "resume-version-1",
+    approvedPacketChecksum: "c".repeat(64),
     resumeContent: {
       contact: { name: "Ada Lovelace", email: "ada@example.com", location: "New York, NY" },
       summary: "Builds reliable systems.",

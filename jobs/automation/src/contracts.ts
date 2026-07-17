@@ -85,6 +85,7 @@ export interface ApplicationPacket {
   applicationId: string;
   jobId: string;
   resumeVersionId: string;
+  approvedPacketChecksum: string;
   resumePath?: string;
   resumeContent?: Record<string, unknown>;
   coverLetterPath?: string;

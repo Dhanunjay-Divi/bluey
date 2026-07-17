@@ -614,6 +614,17 @@ pub async fn prepare_application(
     .map_err(internal)?;
     let mut metering = None;
     if application.state == "queued" {
+        let posting = jobs::get_posting(&state.pool, &account.id, &application.job_id)
+            .map_err(internal)?
+            .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
+        application = freeze_approved_execution(
+            &state,
+            &account.id,
+            &account.email,
+            &application,
+            &posting,
+            &resume_version,
+        )?;
         if let Err(error) = jobs::reserve_application_attempt(
             &state.pool,
             &account.id,
@@ -707,7 +718,7 @@ pub async fn approve_application_packet(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(application_id): Path<String>,
 ) -> Result<Json<ApproveApplicationResponse>, ApiError> {
-    let application = jobs::get_application(&state.pool, &account.id, &application_id)
+    let mut application = jobs::get_application(&state.pool, &account.id, &application_id)
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
     if application.state != "awaiting_review" {
@@ -736,6 +747,24 @@ pub async fn approve_application_packet(
             .unwrap_or_else(|| "This packet cannot be queued yet.".to_string());
         return Err((StatusCode::CONFLICT, message));
     }
+    let resume_id = application.resume_version_id.clone().ok_or((
+        StatusCode::CONFLICT,
+        "Create the tailored resume before approving this packet.".to_string(),
+    ))?;
+    let resume = jobs::get_resume_version(&state.pool, &account.id, &resume_id)
+        .map_err(internal)?
+        .ok_or((
+            StatusCode::CONFLICT,
+            "Tailored resume not found.".to_string(),
+        ))?;
+    application = freeze_approved_execution(
+        &state,
+        &account.id,
+        &account.email,
+        &application,
+        &posting,
+        &resume,
+    )?;
     jobs::reserve_application_attempt(&state.pool, &account.id, &application.id, "unassigned")
         .map_err(domain_error)?;
     let metering =
@@ -923,30 +952,7 @@ pub async fn queue_application_run(
             .unwrap_or_else(|| "This site is not eligible for that runner.".to_string());
         return Err((StatusCode::CONFLICT, message));
     }
-    let identity = application
-        .receipt
-        .pointer("/application_identity")
-        .and_then(Value::as_object)
-        .ok_or((
-            StatusCode::CONFLICT,
-            "Choose and verify the application email before starting.".to_string(),
-        ))?;
-    let identity_id = identity
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let identity_email = identity
-        .get("email")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    if identity_id.is_empty() || identity_email.is_empty() {
-        return Err((
-            StatusCode::CONFLICT,
-            "Choose and verify the application email before starting.".to_string(),
-        ));
-    }
+    let (identity_id, identity_email) = approved_application_identity(&application)?;
     let existing_run = if matches!(
         application.state.as_str(),
         "queued" | "running" | "needs_input"
@@ -990,6 +996,20 @@ pub async fn queue_application_run(
                 application.updated_at_ms,
             )
         });
+    let cloud_gateway = if req.runner == "cloud" {
+        let origin = std::env::var("BLUEY_JOBS_WORKFLOW_ORIGIN")
+            .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
+        let token = std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN").unwrap_or_default();
+        if token.is_empty() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The cloud runner is temporarily unavailable.".to_string(),
+            ));
+        }
+        Some((origin, token))
+    } else {
+        None
+    };
     jobs::reserve_application_attempt(&state.pool, &account.id, &application.id, &req.runner)
         .map_err(domain_error)?;
     jobs::commit_packet(&state.pool, &account.id, &application.id).map_err(|error| {
@@ -1013,10 +1033,25 @@ pub async fn queue_application_run(
         .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
     }
 
-    let profile = jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?;
+    let (mut frozen_packet, frozen_job, approved_packet_checksum) =
+        approved_execution_snapshot(&application)?;
+    validate_approved_execution_matches(
+        &application,
+        &posting,
+        &resume,
+        &identity_id,
+        &identity_email,
+        &frozen_packet,
+        &frozen_job,
+    )?;
     let browser_profile_id = browser_profile_id(&account.id, &identity_id);
-    let answers = execution_answers(&profile, &application, &identity_email);
-    let verified_claim_ids = confirmed_resume_claim_ids(&state, &account.id, &resume)?;
+    frozen_packet
+        .as_object_mut()
+        .expect("approved packet is an object")
+        .insert(
+            "approvedPacketChecksum".to_string(),
+            Value::String(approved_packet_checksum),
+        );
     let workflow_input = json!({
         "accountId": account.id,
         "applicationId": application.id,
@@ -1025,35 +1060,40 @@ pub async fn queue_application_run(
         "packetId": resume.id,
         "applicationIdentityId": identity_id,
         "browserProfileId": browser_profile_id,
-        "packet": {
-            "applicationId": application.id,
-            "jobId": posting.id,
-            "resumeVersionId": resume.id,
-            "resumeContent": resume.content,
-            "coverLetterContent": application.cover_letter,
-            "answers": answers,
-            "verifiedClaimIds": verified_claim_ids,
-            "applicationIdentityId": identity_id,
-            "applicationEmail": identity_email,
-            "browserProfileId": browser_profile_id,
-        },
-        "job": {
-            "externalId": posting.external_id,
-            "canonicalUrl": posting.canonical_url,
-            "company": posting.company,
-            "title": posting.title,
-            "location": posting.location,
-            "workplace": normalized_workplace(&posting.workplace),
-            "description": posting.description,
-            "source": source,
-            "compensation": posting.compensation,
-        },
+        "packet": frozen_packet,
+        "job": frozen_job,
         "runner": req.runner,
         "url": posting.canonical_url,
         "idempotencyKey": run_id,
         "runId": run_id,
         "browserSessionId": format!("{}-{}", req.runner, application.id),
     });
+    if let Some((gateway_origin, gateway_token)) = cloud_gateway.as_ref() {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/workflows/applications",
+                gateway_origin.trim_end_matches('/')
+            ))
+            .bearer_auth(gateway_token)
+            .json(&workflow_input)
+            .send()
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, "Bluey Jobs workflow gateway failed");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Bluey could not start the cloud application. Try again.".to_string(),
+                )
+            })?;
+        if !response.status().is_success() && response.status() != StatusCode::CONFLICT {
+            tracing::error!(status = %response.status(), "Bluey Jobs workflow gateway rejected run");
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Bluey could not start the cloud application. Try again.".to_string(),
+            ));
+        }
+    }
+
     let mut browser_session =
         existing_run
             .map(|(_, session)| session)
@@ -1106,38 +1146,6 @@ pub async fn queue_application_run(
         }));
     }
 
-    let gateway_origin = std::env::var("BLUEY_JOBS_WORKFLOW_ORIGIN")
-        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-    let gateway_token = std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN").unwrap_or_default();
-    if gateway_token.is_empty() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The cloud runner is temporarily unavailable.".to_string(),
-        ));
-    }
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{}/workflows/applications",
-            gateway_origin.trim_end_matches('/')
-        ))
-        .bearer_auth(gateway_token)
-        .json(&workflow_input)
-        .send()
-        .await
-        .map_err(|error| {
-            tracing::error!(error = %error, "Bluey Jobs workflow gateway failed");
-            (
-                StatusCode::BAD_GATEWAY,
-                "Bluey could not start the cloud application. Try again.".to_string(),
-            )
-        })?;
-    if !response.status().is_success() && response.status() != StatusCode::CONFLICT {
-        tracing::error!(status = %response.status(), "Bluey Jobs workflow gateway rejected run");
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            "Bluey could not start the cloud application. Try again.".to_string(),
-        ));
-    }
     let workflow_id = format!("bluey-jobs:{}:{}", account.id, run_id);
     Ok(Json(QueueApplicationRunResponse {
         application,
@@ -1163,6 +1171,207 @@ fn application_run_id(
 
 fn browser_profile_id(account_id: &str, identity_id: &str) -> String {
     jobs::execution_browser_profile_id(account_id, identity_id)
+}
+
+fn approved_application_identity(
+    application: &JobApplication,
+) -> Result<(String, String), ApiError> {
+    let identity = application
+        .receipt
+        .pointer("/application_identity")
+        .and_then(Value::as_object)
+        .ok_or((
+            StatusCode::CONFLICT,
+            "Choose and verify the application email before starting.".to_string(),
+        ))?;
+    let identity_id = identity
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let identity_email = identity
+        .get("email")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if identity_id.is_empty() || identity_email.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            "Choose and verify the application email before starting.".to_string(),
+        ));
+    }
+    Ok((identity_id, identity_email))
+}
+
+fn freeze_approved_execution(
+    state: &AppState,
+    account_id: &str,
+    account_email: &str,
+    application: &JobApplication,
+    posting: &JobPosting,
+    resume: &ResumeVersion,
+) -> Result<JobApplication, ApiError> {
+    let (identity_id, identity_email) = approved_application_identity(application)?;
+    if application.receipt.get("approved_execution").is_some() {
+        let (packet, job, _) = approved_execution_snapshot(application)?;
+        validate_approved_execution_matches(
+            application,
+            posting,
+            resume,
+            &identity_id,
+            &identity_email,
+            &packet,
+            &job,
+        )?;
+        return Ok(application.clone());
+    }
+
+    let profile = jobs::get_profile(&state.pool, account_id, account_email).map_err(internal)?;
+    let answers = execution_answers(&profile, application, &identity_email);
+    let verified_claim_ids = confirmed_resume_claim_ids(state, account_id, resume)?;
+    let packet = json!({
+        "applicationId": application.id,
+        "jobId": posting.id,
+        "resumeVersionId": resume.id,
+        "resumeContent": resume.content,
+        "coverLetterContent": application.cover_letter,
+        "answers": answers,
+        "verifiedClaimIds": verified_claim_ids,
+        "applicationIdentityId": identity_id,
+        "applicationEmail": identity_email,
+        "browserProfileId": browser_profile_id(account_id, &identity_id),
+    });
+    let job = json!({
+        "externalId": posting.external_id,
+        "canonicalUrl": posting.canonical_url,
+        "company": posting.company,
+        "title": posting.title,
+        "location": posting.location,
+        "workplace": normalized_workplace(&posting.workplace),
+        "description": posting.description,
+        "source": ats_kind(&posting.canonical_url),
+        "compensation": posting.compensation,
+    });
+    let checksum = approved_execution_checksum(&packet, &job)?;
+    let approved_execution = json!({
+        "schema_version": 1,
+        "approved_at_ms": jobs::now_ms(),
+        "checksum": checksum,
+        "packet": packet,
+        "job": job,
+    });
+    let mut receipt = application.receipt.clone();
+    if !receipt.is_object() {
+        receipt = json!({});
+    }
+    receipt
+        .as_object_mut()
+        .expect("application receipt is an object")
+        .insert("approved_execution".to_string(), approved_execution);
+    jobs::replace_application_receipt(&state.pool, account_id, &application.id, receipt)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))
+}
+
+fn approved_execution_snapshot(
+    application: &JobApplication,
+) -> Result<(Value, Value, String), ApiError> {
+    let approved = application
+        .receipt
+        .get("approved_execution")
+        .and_then(Value::as_object)
+        .ok_or((
+            StatusCode::CONFLICT,
+            "Approve this exact application packet before starting a browser runner.".to_string(),
+        ))?;
+    if approved.get("schema_version").and_then(Value::as_i64) != Some(1) {
+        return Err((
+            StatusCode::CONFLICT,
+            "This approved packet uses an unsupported version. Prepare it again.".to_string(),
+        ));
+    }
+    let packet = approved
+        .get("packet")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or((
+            StatusCode::CONFLICT,
+            "The approved application packet is incomplete. Prepare it again.".to_string(),
+        ))?;
+    let job = approved
+        .get("job")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or((
+            StatusCode::CONFLICT,
+            "The approved job snapshot is incomplete. Prepare it again.".to_string(),
+        ))?;
+    let checksum = approved
+        .get("checksum")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if checksum.len() != 64 || approved_execution_checksum(&packet, &job)? != checksum {
+        return Err((
+            StatusCode::CONFLICT,
+            "The approved application packet changed after review. Prepare it again.".to_string(),
+        ));
+    }
+    Ok((packet, job, checksum))
+}
+
+fn approved_execution_checksum(packet: &Value, job: &Value) -> Result<String, ApiError> {
+    let canonical = canonical_json_value(&json!({
+        "schema_version": 1,
+        "packet": packet,
+        "job": job,
+    }));
+    let bytes = serde_json::to_vec(&canonical).map_err(|error| internal(error.into()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
+        Value::Object(values) => {
+            let sorted = values
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_json_value(value)))
+                .collect::<BTreeMap<_, _>>();
+            Value::Object(sorted.into_iter().collect())
+        }
+        other => other.clone(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_approved_execution_matches(
+    application: &JobApplication,
+    posting: &JobPosting,
+    resume: &ResumeVersion,
+    identity_id: &str,
+    identity_email: &str,
+    packet: &Value,
+    job: &Value,
+) -> Result<(), ApiError> {
+    let matches = packet.get("applicationId").and_then(Value::as_str)
+        == Some(application.id.as_str())
+        && packet.get("jobId").and_then(Value::as_str) == Some(posting.id.as_str())
+        && packet.get("resumeVersionId").and_then(Value::as_str) == Some(resume.id.as_str())
+        && packet.get("applicationIdentityId").and_then(Value::as_str) == Some(identity_id)
+        && packet.get("applicationEmail").and_then(Value::as_str) == Some(identity_email)
+        && job.get("canonicalUrl").and_then(Value::as_str)
+            == Some(posting.canonical_url.as_str());
+    if !matches {
+        return Err((
+            StatusCode::CONFLICT,
+            "The approved packet no longer matches this job, resume, or application email. Prepare it again."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn random_local_run_ticket() -> String {
@@ -3552,6 +3761,25 @@ fn validate_receipt_bundle(
     receipt: &Value,
     verified_objects: &BTreeMap<String, String>,
 ) -> Result<(), ApiError> {
+    let (approved_packet, approved_job, approved_checksum) =
+        approved_execution_snapshot(application)?;
+    validate_approved_execution_matches(
+        application,
+        posting,
+        resume,
+        application
+            .receipt
+            .pointer("/application_identity/id")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        application
+            .receipt
+            .pointer("/application_identity/email")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        &approved_packet,
+        &approved_job,
+    )?;
     let identity_id = required_receipt_string(receipt, "applicationIdentityId")?;
     let expected_identity_id = application
         .receipt
@@ -3586,6 +3814,16 @@ fn validate_receipt_bundle(
     {
         return bad_request(
             "Receipt packet does not match the approved job, resume, and application email.",
+        );
+    }
+    if packet
+        .get("approvedPacketChecksum")
+        .and_then(Value::as_str)
+        != Some(approved_checksum.as_str())
+        || packet.get("answers") != approved_packet.get("answers")
+    {
+        return bad_request(
+            "Receipt answers do not match the exact application packet that was approved.",
         );
     }
     if receipt.pointer("/job/canonicalUrl").and_then(Value::as_str)
@@ -4138,7 +4376,7 @@ mod tests {
         let screenshot_key = "accounts/acct-test/jobs/app-test/confirmation.png";
         let resume_sha = "a".repeat(64);
         let screenshot_sha = "b".repeat(64);
-        let application = JobApplication {
+        let mut application = JobApplication {
             id: "app-test".to_string(),
             job_id: "job-test".to_string(),
             resume_version_id: Some("resume-test".to_string()),
@@ -4193,6 +4431,38 @@ mod tests {
             checksum: "structured-resume-checksum".to_string(),
             created_at_ms: 0,
         };
+        let approved_packet = json!({
+            "applicationId": "app-test",
+            "jobId": "job-test",
+            "resumeVersionId": "resume-test",
+            "resumeContent": resume.content,
+            "coverLetterContent": "",
+            "answers": { "email": "apply@example.com" },
+            "verifiedClaimIds": [],
+            "applicationIdentityId": identity_id,
+            "applicationEmail": "apply@example.com",
+            "browserProfileId": browser_profile_id(account_id, identity_id)
+        });
+        let approved_job = json!({
+            "externalId": posting.external_id,
+            "canonicalUrl": posting.canonical_url,
+            "company": posting.company,
+            "title": posting.title,
+            "location": posting.location,
+            "workplace": posting.workplace,
+            "description": posting.description,
+            "source": posting.source,
+            "compensation": posting.compensation
+        });
+        let approved_checksum =
+            approved_execution_checksum(&approved_packet, &approved_job).unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": 1,
+            "approved_at_ms": 1,
+            "checksum": approved_checksum,
+            "packet": approved_packet,
+            "job": approved_job
+        });
         let receipt = json!({
             "applicationIdentityId": identity_id,
             "browserProfileId": browser_profile_id(account_id, identity_id),
@@ -4201,7 +4471,10 @@ mod tests {
             "packet": {
                 "jobId": "job-test",
                 "resumeVersionId": "resume-test",
-                "applicationEmail": "apply@example.com"
+                "approvedPacketChecksum": approved_checksum,
+                "applicationEmail": "apply@example.com",
+                "answers": { "email": "apply@example.com" },
+                "verifiedClaimIds": []
             },
             "job": { "canonicalUrl": posting.canonical_url },
             "documents": [{
@@ -4396,6 +4669,34 @@ mod tests {
             .0,
             StatusCode::BAD_REQUEST
         );
+
+        let mut changed_answers = receipt.clone();
+        changed_answers["packet"]["answers"] = json!({ "email": "other@example.com" });
+        let changed_answers_error = validate_receipt_bundle(
+            "acct-test",
+            &application,
+            &posting,
+            &resume,
+            &changed_answers,
+            &verified_objects,
+        )
+        .unwrap_err();
+        assert_eq!(changed_answers_error.0, StatusCode::BAD_REQUEST);
+        assert!(changed_answers_error.1.contains("exact application packet"));
+
+        let mut wrong_approval = receipt.clone();
+        wrong_approval["packet"]["approvedPacketChecksum"] = json!("d".repeat(64));
+        let wrong_approval_error = validate_receipt_bundle(
+            "acct-test",
+            &application,
+            &posting,
+            &resume,
+            &wrong_approval,
+            &verified_objects,
+        )
+        .unwrap_err();
+        assert_eq!(wrong_approval_error.0, StatusCode::BAD_REQUEST);
+        assert!(wrong_approval_error.1.contains("exact application packet"));
 
         let unverified = BTreeMap::new();
         let error = validate_receipt_bundle(

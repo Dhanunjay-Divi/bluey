@@ -37,6 +37,7 @@ function receipt(): ApplicationReceiptBundle {
       applicationId: "application-1",
       jobId: "job-1",
       resumeVersionId: "resume-1",
+      approvedPacketChecksum: "c".repeat(64),
       answers: {
         motivation: "I enjoy turning complex workflows into dependable products.",
         candidate_email: "ada@example.com",

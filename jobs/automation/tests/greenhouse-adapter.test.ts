@@ -255,6 +255,7 @@ function context(
       applicationId: "application-123",
       jobId: "job-123",
       resumeVersionId: "resume-version-123",
+      approvedPacketChecksum: "c".repeat(64),
       resumePath: "/tmp/resume.pdf",
       verifiedClaimIds: ["claim-1"],
       applicationIdentityId: "identity-123",

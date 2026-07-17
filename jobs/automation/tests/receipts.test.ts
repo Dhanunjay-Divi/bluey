@@ -27,6 +27,7 @@ describe("application receipt bundles", () => {
         applicationId: "application-1",
         jobId: "job-1",
         resumeVersionId: "resume-job-1",
+        approvedPacketChecksum: "c".repeat(64),
         resumePath: "/packets/job-1/resume.pdf",
         answers: { sponsorship: "No", location: "New York, NY" },
         verifiedClaimIds: ["claim-2", "claim-1"],

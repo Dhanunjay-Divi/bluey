@@ -406,6 +406,7 @@ function makeContext(page: BrowserPage, answers: Record<string, string> = {}): A
       applicationId: "application-provider-beta",
       jobId: "job-provider-beta",
       resumeVersionId: "resume-provider-beta",
+      approvedPacketChecksum: "c".repeat(64),
       resumePath: "/packets/resume.pdf",
       coverLetterPath: "/packets/cover-letter.pdf",
       answers: {
