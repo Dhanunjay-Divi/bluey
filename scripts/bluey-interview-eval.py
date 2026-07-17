@@ -48,12 +48,12 @@ from bluey_eval.payment_contracts import (  # noqa: E402
     self_check_payment_operation_semantics,
     self_check_payment_platform_safety_detector,
 )
+from bluey_eval.leadership_contracts import q47_director_alignment_issues  # noqa: E402
 from bluey_eval.system_contracts import (  # noqa: E402
     feature_store_consistency_issues,
     has_drift_only_automatic_retraining,
     has_required_signal,
     payment_timeout_followup_completeness_issues,
-    q47_director_alignment_issues,
     rag_evaluation_plan_issues,
     url_shortener_safety_issues,
 )
@@ -284,7 +284,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q44", "behavioral", "amazon_de", "Tell me about a time you challenged a decision with data and then committed to the final direction.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("data", "evidence"), g("disagree", "challenge"), g("commit", "align"))),
     EvalCase("Q45", "behavioral", "amazon_de", "Tell me about a failure. What did you change so the same class of failure would not repeat?", "behavioral_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("fail", "mistake"), g("root cause", "learn"), g("guardrail", "test", "monitor", "process"))),
     EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
-    EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("align", "stakeholder", "tradeoff to both directors", "visible to both directors", "both directors together", "ask both directors", "bring both directors"), g("communicat", "tradeoff", "lay out", "comparison"))),
+    EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("communicat", "tradeoff", "lay out", "comparison"))),
     EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("follow", "ownership"))),
     EvalCase("Q49", "scenario", "ds", "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?", "otter_visible_scenario", speakable=True, required_groups=(g("track", "identity"), g("calibrat", "time", "spatial"), g("dedup", "fusion", "association"))),
     EvalCase("Q50", "behavioral", "ds", "Why this role, and what would you focus on in your first ninety days?", "resume_and_jd_pdf", speakable=True, required_groups=(g("hpe", "datacenter", "telemetry"), g("first", "90", "ninety"), g("stakeholder", "baseline", "production"))),
@@ -2639,13 +2639,12 @@ def self_check_attempt_integrity_guards() -> None:
         "decide if needed, communicate the tradeoff to both directors, and document "
         "the sequence.",
     )
-    assert missing_required_group_issues(
-        q47,
+    lexical_but_unilateral_q47 = (
         "I would show leadership by selecting the request with the greatest customer "
-        "impact, then communicate my tradeoff and final decision.",
-    ) == [
-        "missing_signal:align|stakeholder|tradeoff to both directors|visible to both directors|both directors together|ask both directors|bring both directors"
-    ]
+        "impact, then communicate my tradeoff and final decision."
+    )
+    assert not missing_required_group_issues(q47, lexical_but_unilateral_q47)
+    assert q47_director_alignment_issues(lexical_but_unilateral_q47)
     assert not q47_director_alignment_issues(
         "I compare customer impact, explain the tradeoff to both directors, and "
         "ask them to align on the order before I communicate the decision."
@@ -2832,6 +2831,337 @@ def self_check_attempt_integrity_guards() -> None:
         assert "unsafe_negated_or_unilateral_director_alignment" in (
             q47_director_alignment_issues(unsafe_post_alignment)
         ), unsafe_post_alignment
+    full_q47_probe_prefix = (
+        "I build a single comparison visible to both directors using customer impact, "
+        "severity, delivery deadlines, dependencies, and operational risk. I communicate "
+        "the tradeoffs in one joint discussion and ask them to agree on a shared delivery "
+        "order. If agreement remains impossible, I take the unresolved choice to their "
+        "common accountable sponsor before work starts. "
+    )
+    release_q47_probe_prefix = (
+        "I lay out one shared comparison visible to both directors using customer "
+        "impact, severity, dependencies, and risk, and I communicate the tradeoff. "
+        "I ask both directors to agree on a shared priority before the delivery "
+        "sequence is set. "
+    )
+    for unsafe_governance_bypass in (
+        (
+            "I bring both directors together, make one customer-impact comparison "
+            "visible, and ask them to agree on one priority. After that discussion, "
+            "I make the sequence opaque, follow one director's undisclosed preference, "
+            "and keep the final selection off-channel."
+        ),
+        (
+            "I present both directors the same impact comparison, explain the tradeoff, "
+            "and ask them to agree. There is no need to wait for their agreement: I "
+            "start the first request and would not seek an accountable owner to resolve "
+            "the disagreement."
+        ),
+        (
+            "I present one shared matrix to both directors and ask them to agree. If "
+            "they do not, I escalate cosmetically to their sponsor, then immediately "
+            "follow my preferred request without waiting for the sponsor's resolution."
+        ),
+        (
+            "I share one customer-impact comparison with both directors and ask them "
+            "to agree. Their input is only advisory, so I keep my original priority "
+            "and proceed without a common owner deciding the conflict."
+        ),
+        (
+            "I show both directors the same impact comparison and ask them to agree. "
+            "Separately, I withhold a critical dependency from Director B and prioritize "
+            "Director A's request regardless of the joint discussion."
+        ),
+        (
+            "I show both directors the same customer-impact and operational-risk "
+            "comparison, explain the tradeoff, and ask both directors to agree on one "
+            "shared priority. I communicate the sequence. Consensus is not required; "
+            "I start the request I prefer while they continue discussing."
+        ),
+        (
+            "I show both directors the same customer-impact and operational-risk "
+            "comparison, explain the tradeoff, and ask both directors to agree on one "
+            "shared priority. I communicate the sequence. I leave out a material "
+            "dependency from Director B and follow Director A's request despite the "
+            "shared discussion."
+        ),
+        (
+            "I show both directors the same customer-impact and operational-risk "
+            "comparison, explain the tradeoff, and ask both directors to agree on one "
+            "shared priority. I communicate the sequence. I treat their disagreement "
+            "as informational and carry on with the priority I intended from the start."
+        ),
+        (
+            "I make one customer-impact, urgency, risk, and dependency comparison "
+            "visible to both directors, explain the tradeoff, and ask both directors "
+            "to agree on one shared priority. I communicate the expected order. I do "
+            "not need a resolution before executing the request I favor; the sponsor "
+            "can respond afterward."
+        ),
+        (
+            "I make one customer-impact, urgency, risk, and dependency comparison "
+            "visible to both directors, explain the tradeoff, and ask both directors "
+            "to agree on one shared priority. I communicate the expected order. I email "
+            "the sponsor about the disagreement, then immediately execute my chosen "
+            "priority without awaiting a ruling."
+        ),
+        (
+            "I make one customer-impact, urgency, risk, and dependency comparison "
+            "visible to both directors, explain the tradeoff, and ask both directors "
+            "to agree on one shared priority. I communicate the expected order. I copy "
+            "the accountable owner on a status update but retain and execute my original "
+            "priority before that owner decides."
+        ),
+        (
+            "I make one customer-impact, urgency, risk, and dependency comparison "
+            "visible to both directors, explain the tradeoff, and ask both directors "
+            "to agree on one shared priority. I communicate the expected order. I regard "
+            "their feedback as context only and preserve my preselected priority if "
+            "either director objects."
+        ),
+        (
+            "I make one customer-impact, urgency, risk, and dependency comparison "
+            "visible to both directors, explain the tradeoff, and ask both directors "
+            "to agree on one shared priority. I communicate the expected order. I let "
+            "them debate, but their views do not change the priority I selected "
+            "beforehand."
+        ),
+        (
+            "I make one customer-impact, urgency, risk, and dependency comparison "
+            "visible to both directors, explain the tradeoff, and ask both directors "
+            "to agree on one shared priority. I communicate the expected order. I "
+            "suppress a critical operational risk from Director B, then prioritize "
+            "Director A's request regardless of the shared decision."
+        ),
+        (
+            "I make one customer-impact, urgency, risk, and dependency comparison "
+            "visible to both directors, explain the tradeoff, and ask both directors "
+            "to agree on one shared priority. I communicate the expected order. I omit "
+            "a material customer-impact fact from one director and continue with the "
+            "other director's preferred request despite the joint agreement."
+        ),
+        full_q47_probe_prefix
+        + "Afterwards, behind closed doors, I make the final ranking myself.",
+        full_q47_probe_prefix
+        + (
+            "I page the sponsor for appearance, but immediately launch my preferred "
+            "request before any ruling."
+        ),
+        full_q47_probe_prefix
+        + (
+            "I notify the VP that there is a conflict, then act on my selection while "
+            "the VP is still considering it."
+        ),
+        full_q47_probe_prefix
+        + (
+            "I forward the disagreement to the manager and, pending that response, "
+            "begin the option I favor."
+        ),
+        full_q47_probe_prefix
+        + (
+            "I suppress an operational constraint from Director A and continue with "
+            "Director B's choice despite the common discussion."
+        ),
+        full_q47_probe_prefix
+        + (
+            "I treat the directors' views as nonbinding context and retain the request "
+            "I originally selected."
+        ),
+        full_q47_probe_prefix
+        + "Their input is optional; I preserve my preferred sequence if either objects.",
+        full_q47_probe_prefix
+        + (
+            "I continue with the request I preselected from the start even if their "
+            "joint result differs."
+        ),
+        release_q47_probe_prefix
+        + "After they talk, I secretly rank the requests myself and announce the winner.",
+        release_q47_probe_prefix
+        + (
+            "For confidentiality, I make a confidential final choice by myself after "
+            "the comparison."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I escalate to the sponsor for visibility; with no ruling yet, I execute "
+            "my chosen request."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I copy the VP on the dispute and immediately begin my preferred sequence "
+            "while the VP evaluates it."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I forward the conflict to leadership and start the favored request; their "
+            "resolution can come afterward."
+        ),
+        release_q47_probe_prefix
+        + (
+            "Consensus is optional, so I start the work I prefer while the directors "
+            "are still debating."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I execute my favored request first and let the shared decision discussion "
+            "continue afterward."
+        ),
+        release_q47_probe_prefix
+        + (
+            "Without agreement, I begin the preferred option and ask them to resolve "
+            "the order later."
+        ),
+        release_q47_probe_prefix
+        + (
+            "Because director feedback is optional, I preserve the sequence I "
+            "preselected."
+        ),
+        release_q47_probe_prefix
+        + (
+            "Even if their joint outcome differs, I continue with the request I selected "
+            "in advance."
+        ),
+        release_q47_probe_prefix
+        + (
+            "The shared result cannot change the priority I picked beforehand, so I "
+            "follow it."
+        ),
+        release_q47_probe_prefix
+        + "Despite the common decision, I proceed with my initial sequence.",
+        release_q47_probe_prefix
+        + (
+            "I preserve the favored order I set earlier, even when the directors reach "
+            "a different joint result."
+        ),
+        release_q47_probe_prefix
+        + (
+            "The sponsor decides the order. Consensus is not required; I start the "
+            "request I prefer while they continue discussing."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I reject opaque off-channel decisions in theory, but make my final "
+            "selection secret."
+        ),
+        release_q47_probe_prefix
+        + (
+            "If they cannot agree, their common accountable owner decides the order. "
+            "Before that owner rules, I launch my favored request."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I escalate the tie to the accountable sponsor for a decision. While "
+            "awaiting that decision, I execute the priority I prefer."
+        ),
+        release_q47_probe_prefix
+        + (
+            "The shared owner resolves a deadlock before work starts in the normal path; "
+            "however, today I begin my selected option before the owner responds."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I normally do not proceed before agreement; however, I proceed with my "
+            "preferred request while consensus is still forming."
+        ),
+        release_q47_probe_prefix
+        + (
+            "Ordinarily I wait for consensus, but this time I start the request I favor "
+            "as they continue deliberating."
+        ),
+        release_q47_probe_prefix
+        + (
+            "The accountable VP is responsible for resolving conflicts. I notify the VP "
+            "and, before any decision, launch the request I picked."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I welcome a joint result, although I retain my earlier sequence if it "
+            "conflicts with my preference."
+        ),
+        release_q47_probe_prefix
+        + (
+            "The sponsor may resolve the conflict, but I make the final priority call "
+            "personally before the sponsor responds."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I do not act pending an owner decision in ordinary cases, but here I begin "
+            "my preferred sequence pending the owner's ruling."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I treat director input as context rather than binding, so I preserve the "
+            "priority I preset."
+        ),
+        release_q47_probe_prefix
+        + (
+            "Even after the directors settle on a common order, I continue with the "
+            "option I chose earlier."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I explain the tradeoff openly; afterward, I set the ranking in a closed-door "
+            "meeting by myself."
+        ),
+        release_q47_probe_prefix
+        + (
+            "Their shared outcome informs me, but my preferred sequence remains in force "
+            "even if it differs."
+        ),
+    ):
+        assert "unsafe_negated_or_unilateral_director_alignment" in (
+            q47_director_alignment_issues(unsafe_governance_bypass)
+        ), unsafe_governance_bypass
+    for safe_governance_control in (
+        (
+            "I show both directors every critical dependency and one shared impact "
+            "comparison. I ask them to agree on one shared priority and do not proceed "
+            "before agreement."
+        ),
+        (
+            "I ask both directors to agree on one priority. If they cannot, I wait for "
+            "their common accountable owner to resolve it before I execute the order."
+        ),
+        (
+            "I reject an opaque or off-channel decision, make the tradeoff visible to "
+            "both directors, and ask them to align on one shared priority."
+        ),
+        (
+            "I make one customer-impact, urgency, risk, and dependency comparison "
+            "visible to both directors, explain the tradeoff, and ask both directors "
+            "to agree on one shared priority. I communicate the expected order. I avoid "
+            "a unilateral or off-channel decision. If they disagree, their shared "
+            "accountable owner decides the order, and I follow it."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I reject opaque or off-channel decisions. If they disagree, their shared "
+            "accountable owner decides the order before I begin."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I do not choose the order alone after discussion; the directors align, or "
+            "their shared sponsor makes the decision."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I never conceal a final priority from either director; the comparison and "
+            "outcome remain visible to both."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I will not unilaterally set a final ranking after alignment; I follow the "
+            "agreed sequence."
+        ),
+        release_q47_probe_prefix
+        + (
+            "I preserve the comparison for the record, even if the shared decision "
+            "changes the original priority; I follow that decision."
+        ),
+    ):
+        assert not q47_director_alignment_issues(
+            safe_governance_control
+        ), safe_governance_control
 
     streamed = "This is the complete customer-streamed answer with enough words to evaluate."
     matching = AttemptResult(
