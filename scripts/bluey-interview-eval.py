@@ -1723,6 +1723,41 @@ def self_check_production_answer_contracts() -> None:
         live_tombstone_barrier,
         require_revocation_completeness=True,
     )
+    exact_worker_boundary = (
+        "For public links that can expire, be deleted, blocked, or legally removed, "
+        "use 302 or 307 with Cache-Control: no-store. On deletion, synchronously write "
+        "a versioned deny overlay before acknowledgement. Every redirect worker checks "
+        "the versioned deny overlay before serving any cached active mapping and fails "
+        "closed to an authoritative state check or non-redirect response when overlay "
+        "or cache state is uncertain."
+    )
+    assert not url_shortener_safety_issues(
+        exact_worker_boundary,
+        require_revocation_completeness=True,
+    )
+    unsafe_lifecycle_qualification = exact_worker_boundary.replace(
+        "use 302 or 307 with Cache-Control: no-store",
+        "use 302 or 307 with Cache-Control: no-store even after they are deleted",
+    )
+    assert "unsafe_redirect_for_inactive_or_blocked_link" in (
+        url_shortener_safety_issues(
+            unsafe_lifecycle_qualification,
+            require_revocation_completeness=True,
+        )
+    )
+    for unsafe_worker_boundary in (
+        "Every redirect worker fails open to cached destinations.",
+        "Every redirect worker uses fail-open behavior and serves cached destinations.",
+        "Every redirect worker does not check the deny overlay and serves cached destinations.",
+        "Every redirect worker eventually checks the deny overlay and serves cached "
+        "destinations meanwhile.",
+    ):
+        assert "missing_inactive_state_revocation_barrier" in (
+            url_shortener_safety_issues(
+                f"{exact_worker_boundary} {unsafe_worker_boundary}",
+                require_revocation_completeness=True,
+            )
+        ), unsafe_worker_boundary
     negated_live_tombstone_barrier = (
         "Revocable redirects use 302 or 307 with Cache-Control: no-store. For deleted "
         "links, tombstone propagation is asynchronous; do not fail closed until "

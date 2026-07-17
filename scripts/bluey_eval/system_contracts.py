@@ -1041,10 +1041,24 @@ def url_shortener_safety_issues(
                 clause,
             )
         )
+        revocable_lifecycle_class = bool(
+            re.search(
+                r"\b(?:public\s+)?(?:links?|mappings?)\b.{0,45}"
+                r"\b(?:that|which)\s+(?:can|may|might|could)\b.{0,70}"
+                rf"\b{state}\b",
+                clause,
+            )
+            and not re.search(
+                rf"\b(?:after|once|when|while|if)\b.{{0,35}}\b{state}\b|"
+                rf"\b{state}\b.{{0,35}}\b(?:still|continue\w*|currently|now)\b",
+                clause,
+            )
+        )
         safely_rejected = bool(
             not double_negation
             and (
-                re.search(
+                revocable_lifecycle_class
+                or re.search(
                     rf"\b{state}\b.{{0,70}}"
                     r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't)\s+"
                     rf"(?:(?:return|serve|send|use|issue|perform)\w*\s+)?\b{redirect}\b",
@@ -1399,31 +1413,36 @@ def url_shortener_safety_issues(
 
         tombstone_not_enforced = bool(
             re.search(
-                r"\b(?:redirectors?|redirect\s+(?:service|path)|read\s+path)\b"
-                r".{0,55}\b(?:ignore\w*|bypass\w*|do\s+not\s+(?:read|check|honor|"
+                r"\b(?:redirectors?|redirect\s+(?:service|path|workers?)|read\s+path)\b"
+                r".{0,55}\b(?:ignore\w*|bypass\w*|does?\s+not\s+(?:read|check|honor|"
                 r"enforce|consult|respect)\w*)\b.{0,45}"
                 r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b|"
                 r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b.{0,55}"
                 r"\b(?:is|are|remains?)\s+(?:ignored|bypassed|unenforced|unchecked)\b|"
-                r"\b(?:redirectors?|redirect\s+(?:service|path))\b.{0,70}"
+                r"\b(?:redirectors?|redirect\s+(?:service|path|workers?))\b.{0,70}"
                 r"\b(?:continue\w*|may|can|will)\b.{0,45}"
                 r"\b(?:serve|return|use)?\w*\b.{0,25}"
                 r"\b(?:cached\s+destinations?|redirect\w*)\b|"
-                r"\b(?:redirectors?|redirect\s+(?:service|path)|read\s+path)\b"
+                r"\b(?:redirectors?|redirect\s+(?:service|path|workers?)|read\s+path)\b"
                 r".{0,60}\b(?:read|check|honor|enforce|consult|respect)\w*\b"
                 r".{0,45}\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b"
                 r".{0,75}\b(?:only\s+during\b.{0,30}\b(?:eventual|async)\w*|"
                 r"eventual(?:ly)?|asynchronous(?:ly)?|later|delayed?)\b|"
-                r"\b(?:redirectors?|redirect\s+(?:service|path)|read\s+path|they)\b"
-                r".{0,65}\bfail\s+open\b.{0,55}"
+                r"\b(?:redirectors?|redirect\s+(?:service|path|workers?)|read\s+path|they)\b"
+                r".{0,65}\bfail(?:s|ed|ing)?[- ]open\b.{0,55}"
                 r"\b(?:cached?\w*|destinations?|redirect\w*)\b|"
-                r"\bfail\s+open\b.{0,55}\b(?:cached?\w*|destinations?|redirect\w*)\b",
+                r"\bfail(?:s|ed|ing)?[- ]open\b.{0,55}"
+                r"\b(?:cached?\w*|destinations?|redirect\w*)\b|"
+                r"\b(?:redirectors?|redirect\s+(?:service|path|workers?)|read\s+path)\b"
+                r".{0,55}\b(?:eventual(?:ly)?|asynchronous(?:ly)?|later|delayed?)\b"
+                r".{0,45}\b(?:read|check|honor|enforce|consult|respect)\w*\b"
+                r".{0,45}\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b",
                 lower,
             )
         )
         tombstone_enforced = bool(
             re.search(
-                r"\b(?:redirectors?|redirect\s+(?:service|path)|read\s+path|cache)\b"
+                r"\b(?:redirectors?|redirect\s+(?:service|path|workers?)|read\s+path|cache)\b"
                 r".{0,65}\b(?:read|check|honor|enforce|consult|respect)\w*\b"
                 r".{0,50}\b(?:tombstone|deny\s+overlay|revocation\s+overlay|"
                 r"authoritative\s+state)\b|"
