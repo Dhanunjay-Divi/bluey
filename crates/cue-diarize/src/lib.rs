@@ -9,26 +9,19 @@
 //!   * [`BankLiveDiarizer`] — near-real-time, profile-bank. The live tier the
 //!     daemon uses: carries each speaker forward as ONE EMA-updated embedding
 //!     centroid and re-identifies by cosine match each tick. Measured 9.1% DER
-//!     on 240s trims / 6.9% on 20-min files, beating anchor pinning on accuracy,
-//!     speaker counting, AND cost — and constant in meeting length (see
-//!     docs/work/STT-DIARIZATION-FINDINGS.md).
-//!   * [`AnchorLiveDiarizer`] — SUPERSEDED anchor-pinned tier (carried voices as
-//!     ~8s audio anchors). Kept for reference; measured to DEGRADE on long
-//!     meetings (the gallery accretes duplicate pins → phantom speakers).
-//!   * [`LiveDiarizer`] — the original SUPERSEDED window stitcher (time-overlap
-//!     mapping across rolling windows). Kept for reference/tests.
+//!     on 240s trims / 6.9% on 20-min files — beating the earlier anchor-pinned
+//!     and window-stitcher tiers on accuracy, speaker counting, AND cost, and
+//!     constant in meeting length (see docs/work/STT-DIARIZATION-FINDINGS.md).
 //!
-//! All take 16 kHz mono f32 samples (the daemon's capture format). Speaker
+//! Both take 16 kHz mono f32 samples (the daemon's capture format). Speaker
 //! identity is a per-meeting integer id, orthogonal to the coarse mic-vs-system
 //! `Speaker` channel tag.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use speakrs::{ExecutionMode, OwnedDiarizationPipeline};
 
-mod anchor;
 mod bank;
 mod overlap;
-pub use anchor::{AnchorLiveDiarizer, ANCHOR_WINDOW_SECS};
 pub use bank::{BankLiveDiarizer, BANK_WINDOW_SECS};
 
 /// One diarized speech span with a per-meeting speaker id.
@@ -118,159 +111,6 @@ pub struct DiarizeOutput {
 /// (`assign_speaker` in the daemon) treats it as no-overlap → the segment waits
 /// for the next tick rather than being forced into the wrong id.
 pub const UNLABELED: i64 = -1;
-
-/// Min speech (secs) a new-looking raw speaker must have in the window before it
-/// is minted as a new global id (cold-start guard; below this it stays
-/// [`UNLABELED`]). AssemblyAI "first turns least stable".
-const MIN_ENROLL_SECS: f64 = 2.0;
-
-/// One previously-labelled global segment, kept to anchor the NEXT window by time
-/// overlap (the reliable cross-run signal — speakrs per-run centroids are NOT
-/// comparable across separate diarize() calls, measured ~0 self-similarity).
-#[derive(Clone)]
-struct GlobalSeg {
-    start: f64, // absolute secs
-    end: f64,
-    id: i64,
-}
-
-/// Live diarizer — re-diarize a rolling window each tick and keep stable ids.
-///
-/// The daemon calls [`LiveDiarizer::push_window`] every ~N seconds with the most
-/// recent ~30s of audio and the window's absolute start time. Each call runs
-/// speakrs on the window and maps the window's raw speakers to STABLE, arrival-
-/// ordered global ids by **time overlap with the previous window's labels**.
-///
-/// Why time overlap and NOT centroid matching: speakrs computes speaker embeddings
-/// per run, and they are NOT comparable across separate `diarize()` calls (the
-/// same voice measures ~0 cosine self-similarity across two runs). But the SAME
-/// audio region re-diarized keeps the same speaker over time, so overlap of a new
-/// window's segments with the previous window's labelled segments is a rock-solid
-/// anchor. A raw speaker whose segments don't overlap any prior global id is a
-/// genuinely new voice → the next arrival-ordered id (append-only, never reused).
-pub struct LiveDiarizer {
-    diarizer: Diarizer,
-    /// Global segments emitted by the previous window (absolute times) — the
-    /// anchor a new window's raw speakers are mapped against by max time overlap.
-    prev: Vec<GlobalSeg>,
-    /// Arrival order of enrolled ids (append-only; id, first_seen_secs).
-    enrolled: Vec<(i64, f64)>,
-    next_id: i64,
-}
-
-impl LiveDiarizer {
-    pub fn load(backend: Backend) -> Result<Self> {
-        Ok(Self {
-            diarizer: Diarizer::load(backend)?,
-            prev: Vec::new(),
-            enrolled: Vec::new(),
-            next_id: 0,
-        })
-    }
-
-    /// Diarize one window and map its raw speakers to STABLE, arrival-ordered
-    /// global ids by **time overlap with the previous window's labels** — NOT by
-    /// centroid (speakrs centroids aren't comparable across runs). The same audio
-    /// region re-diarized keeps the same speaker over time, so overlap is a rock-
-    /// solid anchor; a raw speaker whose segments don't overlap any prior global id
-    /// is a genuinely new voice → next arrival-ordered id.
-    pub fn push_window(&mut self, audio: &[f32], window_start_secs: f64) -> Result<Vec<Segment>> {
-        let out = self
-            .diarizer
-            .diarize(audio)
-            .context("live window diarize")?;
-
-        // Shift this window's segments to absolute time.
-        let win: Vec<GlobalSeg> = out
-            .iter()
-            .map(|s| GlobalSeg {
-                start: s.start + window_start_secs,
-                end: s.end + window_start_secs,
-                id: s.speaker, // raw id for now
-            })
-            .collect();
-
-        // Per-raw: total in-window speech + overlap with each prior global id.
-        let mut raw_dur: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
-        let mut overlap: std::collections::HashMap<(i64, i64), f64> =
-            std::collections::HashMap::new(); // (raw, global_id) → overlap secs
-        for w in &win {
-            *raw_dur.entry(w.id).or_insert(0.0) += (w.end - w.start).max(0.0);
-            for p in &self.prev {
-                let ov = (w.end.min(p.end) - w.start.max(p.start)).max(0.0);
-                if ov > 0.0 {
-                    *overlap.entry((w.id, p.id)).or_insert(0.0) += ov;
-                }
-            }
-        }
-        let mut raws: Vec<i64> = raw_dur.keys().copied().collect();
-        raws.sort_unstable();
-
-        // Map each raw → global by MAX overlap (one-to-one: a global id is claimed
-        // by the raw that overlaps it most). New voices → arrival-ordered mint.
-        let mut raw_to_global: std::collections::HashMap<i64, i64> =
-            std::collections::HashMap::new();
-        let mut claimed: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        // Best (overlap, raw, global) triples, strongest first.
-        let mut cand: Vec<(f64, i64, i64)> =
-            overlap.iter().map(|(&(r, g), &o)| (o, r, g)).collect();
-        cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        for (_o, raw, gid) in cand {
-            if raw_to_global.contains_key(&raw) || claimed.contains(&gid) {
-                continue;
-            }
-            raw_to_global.insert(raw, gid);
-            claimed.insert(gid);
-        }
-        // Unmatched raws → new arrival-ordered global id (if enough speech).
-        for &raw in &raws {
-            if raw_to_global.contains_key(&raw) {
-                continue;
-            }
-            if *raw_dur.get(&raw).unwrap_or(&0.0) >= MIN_ENROLL_SECS {
-                let id = self.next_id;
-                self.next_id += 1;
-                self.enrolled.push((id, window_start_secs));
-                raw_to_global.insert(raw, id);
-            } else {
-                raw_to_global.insert(raw, UNLABELED);
-            }
-        }
-
-        // Build this window's GLOBAL-labelled segments → they anchor the next tick.
-        let labelled: Vec<GlobalSeg> = win
-            .into_iter()
-            .map(|w| GlobalSeg {
-                start: w.start,
-                end: w.end,
-                id: *raw_to_global.get(&w.id).unwrap_or(&UNLABELED),
-            })
-            .collect();
-        // Keep only real (labelled) segments as the anchor.
-        self.prev = labelled.iter().filter(|s| s.id >= 0).cloned().collect();
-
-        Ok(labelled
-            .into_iter()
-            .map(|s| Segment {
-                start: s.start,
-                end: s.end,
-                speaker: s.id,
-            })
-            .collect())
-    }
-
-    /// Number of distinct stable speakers enrolled so far.
-    pub fn speaker_count(&self) -> usize {
-        self.enrolled.len()
-    }
-
-    /// Enrolled global ids in arrival order — asserts the arrival-order invariant.
-    pub fn enrolled_ids_in_arrival_order(&self) -> Vec<i64> {
-        let mut v = self.enrolled.clone();
-        v.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        v.into_iter().map(|(id, _)| id).collect()
-    }
-}
 
 // ---- helpers ----
 

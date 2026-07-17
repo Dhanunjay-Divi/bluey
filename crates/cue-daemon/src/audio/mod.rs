@@ -1,7 +1,6 @@
-//! Audio capture + VAD pipeline for cue-daemon.
+//! Audio capture pipeline for cue-daemon.
 
 pub mod framer;
-pub mod vad;
 
 // Meeting audio retention for speaker diarization — only compiled with the
 // `diarize` feature, so the default build keeps no audio buffer.

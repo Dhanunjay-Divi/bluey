@@ -87,10 +87,8 @@ async fn parakeet_transcribes_a_real_wav() {
         return;
     };
 
-    let sortformer = dir.join("diar_streaming_sortformer_4spk-v2.onnx");
     let paths = ParakeetPaths {
         nemotron_dir: dir.clone(),
-        sortformer_model: sortformer.is_file().then_some(sortformer),
     };
 
     let wav = std::fs::read(&wav_path).expect("read fixture wav");
@@ -144,7 +142,7 @@ async fn parakeet_transcribes_a_real_wav() {
                     transcript.push_str(text.trim());
                 }
             }
-            Ok(Some(Ok(_))) => {} // partial / speaker label
+            Ok(Some(Ok(_))) => {} // partial
             Ok(Some(Err(e))) => panic!("parakeet error: {e}"),
             Ok(None) => break, // provider closed
             Err(_) => {

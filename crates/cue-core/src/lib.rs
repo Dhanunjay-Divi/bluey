@@ -20,7 +20,6 @@ pub mod state;
 pub mod overlay_ipc;
 pub mod pcm;
 pub mod stt;
-pub mod vad;
 
 pub use agent_ui::{AgentConnectorInfo, AgentSessionSummary, AgentSummary, SourceCoverageInfo};
 pub use ai::{
