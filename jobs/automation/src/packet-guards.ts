@@ -6,6 +6,7 @@ export function assertRunnablePacket(packet: ApplicationPacket): void {
     ["applicationId", packet.applicationId],
     ["jobId", packet.jobId],
     ["resumeVersionId", packet.resumeVersionId],
+    ["approvedPacketChecksum", packet.approvedPacketChecksum],
     ["applicationIdentityId", packet.applicationIdentityId],
     ["applicationEmail", packet.applicationEmail],
     ["browserProfileId", packet.browserProfileId],
@@ -30,6 +31,7 @@ export function assertSubmissionReceiptComplete(receipt: ApplicationReceiptBundl
     ["adapterVersion", receipt.adapterVersion],
     ["packet.applicationEmail", receipt.packet.applicationEmail],
     ["packet.resumeVersionId", receipt.packet.resumeVersionId],
+    ["packet.approvedPacketChecksum", receipt.packet.approvedPacketChecksum],
   ]
     .filter(([, value]) => !String(value ?? "").trim())
     .map(([field]) => field);

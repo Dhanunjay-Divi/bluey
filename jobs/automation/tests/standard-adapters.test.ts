@@ -149,6 +149,7 @@ function context(page: BrowserPage, events: string[], submitHooks?: string[]): A
       applicationId: "application-123",
       jobId: "job-123",
       resumeVersionId: "resume-version-123",
+      approvedPacketChecksum: "c".repeat(64),
       resumePath: "/tmp/resume.pdf",
       answers: { first_name: "Ada", email: "ada@example.com" },
       verifiedClaimIds: ["claim-1"],

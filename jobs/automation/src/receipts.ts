@@ -41,6 +41,7 @@ export interface ApplicationReceiptBundle {
   packet: {
     jobId: string;
     resumeVersionId: string;
+    approvedPacketChecksum: string;
     answers: Record<string, string>;
     verifiedClaimIds: string[];
     applicationEmail?: string;
@@ -114,6 +115,7 @@ export function createApplicationReceipt(input: CreateReceiptInput): Application
     packet: {
       jobId: input.packet.jobId,
       resumeVersionId: input.packet.resumeVersionId,
+      approvedPacketChecksum: input.packet.approvedPacketChecksum,
       answers: sortRecord(input.packet.answers),
       verifiedClaimIds: [...input.packet.verifiedClaimIds].sort(),
       applicationEmail: input.packet.applicationEmail,

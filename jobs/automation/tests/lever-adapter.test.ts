@@ -369,6 +369,7 @@ function makeContext(
       applicationId: "application-123",
       jobId: "job-123",
       resumeVersionId: "resume-version-123",
+      approvedPacketChecksum: "c".repeat(64),
       resumePath: "/packets/resume.pdf",
       coverLetterPath: "/packets/cover-letter.pdf",
       answers: { ...answers },
