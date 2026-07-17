@@ -5675,6 +5675,17 @@ fn prompt_with_answer_plan(
     let evidence = plan.evidence_labels().join(", ");
     let normalized_question = normalize_guardrail_text(&extract_search_question(user));
     let direct_technical_plan = looks_like_direct_technical_plan_question(&normalized_question);
+    let rag_evaluation_plan = direct_technical_plan
+        && contains_any(&normalized_question, &["rag", "retrieval augmented"])
+        && contains_any(
+            &normalized_question,
+            &[
+                "evaluation plan",
+                "evaluate",
+                "production launch",
+                "launch plan",
+            ],
+        );
     let payment_related = contains_any(
         &normalized_question,
         &[
@@ -5840,6 +5851,12 @@ fn prompt_with_answer_plan(
         instructions.push_str(DIRECT_TECHNICAL_PLAN_OUTPUT_CONTRACT);
     }
 
+    if rag_evaluation_plan {
+        instructions.push_str(
+            "\nRAG launch-evaluation correctness contract: use a versioned, representative golden set with blinded human labels and explicit common, rare, no-answer or unanswerable, adversarial or prompt-injection, ACL or cross-tenant permission, and PII or privacy slices. Measure retrieval recall@k plus a ranking metric such as MRR or nDCG, answer faithfulness, citation correctness, end-to-end task success, correct refusal or abstention, safety, latency, and cost. Compare a named baseline or champion on every slice, predeclare per-slice launch gates, and fail the launch on any critical-slice regression rather than hiding it in an aggregate. Calibrate any automated judge against blinded human labels, report inter-rater agreement, and sample human review with a stratified, risk-weighted design, never only the top-scoring subset. Exercise shadow or canary monitoring after offline gates. Do not invent numeric dataset sizes, quality thresholds, latency targets, or cost targets; if a number is useful, label it explicitly as an assumption and say it must be derived from product SLOs and baseline distributions."
+        );
+    }
+
     if plan.interview_context
         && !direct_technical_plan
         && (plan.intent == AnswerIntent::Behavioral || plan.output == AnswerOutput::InterviewAnswer)
@@ -5869,7 +5886,7 @@ fn prompt_with_answer_plan(
 
     if large_foreign_key_migration_question {
         instructions.push_str(
-            "\nLarge-table foreign-key migration contract: answer as a proposed production approach, starting with `I would first confirm the database engine and version`. Never recommend copying and renaming the whole production table as the default, and never claim foreign-key validation universally blocks all reads and writes. First audit orphaned rows, parent/child indexes, dependent objects, lock behavior, replication lag, and concurrent writes. Clean or backfill violations in bounded, restartable batches with monitoring and a rollback or abort threshold. For a supported PostgreSQL version, add the foreign key as `NOT VALID` in a short controlled lock window, then run `VALIDATE CONSTRAINT` separately while monitoring blockers and load. Explicitly say that PostgreSQL syntax is not portable to MySQL or every engine; for another engine, use its version-specific online DDL or vetted migration tooling and test the exact plan on production-scale data."
+            "\nLarge-table foreign-key migration contract: answer as a proposed production approach, starting with `I would first confirm the database engine and version`. Never recommend copying and renaming the whole production table as the default, and never claim foreign-key validation universally blocks all reads and writes. First audit orphaned rows, parent/child indexes, dependent objects, lock behavior, replication lag, and concurrent writes. Clean or backfill violations in bounded, restartable batches with monitoring and a rollback or abort threshold. Use PostgreSQL 17 only as a clearly labeled example: `ADD FOREIGN KEY ... NOT VALID` takes `SHARE ROW EXCLUSIVE` on both the referencing and referenced tables, not `ACCESS EXCLUSIVE`; ordinary `SELECT` queries can continue, while conflicting writes or DDL may wait. Then run `VALIDATE CONSTRAINT` separately using that version's documented weaker validation locks while monitoring blockers and load. Do not cite end-of-life PostgreSQL versions such as 9.2. Do not suggest `pg_repack` or MySQL's `pt-online-schema-change` as PostgreSQL foreign-key tools. Explicitly say that PostgreSQL syntax and lock behavior are not portable to MySQL or every engine; for another engine, use its version-specific online DDL or vetted migration tooling and test the exact plan on production-scale data."
         );
     }
 
@@ -5896,19 +5913,19 @@ fn prompt_with_answer_plan(
 
     if feature_store_design {
         instructions.push_str(
-            "\nOnline feature-store correctness contract: materialize real-time features from the event stream through a stream processor into the online store, while the offline store supports historical point-in-time training data, backfills, and batch materialization. Never synchronously fall back to the offline store on the live inference path. On an online miss or stale feature, follow an explicit per-feature policy such as a safe default, bounded stale value, or fail closed, and surface freshness and missingness telemetry. Keep feature definitions and transformation versions consistent across streaming, batch, training, and serving paths."
+            "\nOnline feature-store correctness contract: materialize real-time features from the event stream through a stream processor into the online store, while the offline store supports historical point-in-time training data, backfills, and batch materialization. Define each feature once as versioned executable transformation code that is compiled or adapted into both streaming and batch jobs, with equivalence tests; a registry or matching schema alone does not establish training-serving parity. Persist event-time and availability-time, and build training rows with an as-of join that admits only values whose event and availability timestamps are at or before the prediction cutoff. State a watermark and late-event correction policy. Make replay and backfill idempotent by event ID plus feature or materialization version. Continuously compare sampled online values with offline recomputation and alert on feature skew or parity failures. Never synchronously fall back to the offline store on the live inference path. On an online miss or stale feature, follow an explicit per-feature policy such as a safe default, bounded stale value, or fail closed, and surface freshness and missingness telemetry."
         );
     }
 
     if messaging_design {
         instructions.push_str(
-            "\nMessaging-system correctness contract: durably accept each message before acknowledgment, using a transactional outbox or equivalent atomic handoff from the canonical message store. Define per-conversation sequence assignment and idempotent replay, connection gateways for online delivery, durable offline inbox delivery, and a group-fanout strategy with its threshold tradeoff. Name one authoritative region or shard for conversation ordering and explain failover without split-brain sequence allocation."
+            "\nMessaging-system correctness contract: on one authoritative conversation shard, atomically allocate the per-conversation sequence and commit the message plus transactional outbox before acknowledging the sender; ordering cannot be assigned after durable acceptance. Use idempotent client message IDs and replay, connection gateways for online delivery, durable offline inbox delivery, and a group-fanout strategy with its threshold tradeoff. Explain authoritative-shard failover without split-brain sequence allocation."
         );
     }
 
     if url_shortener_design {
         instructions.push_str(
-            "\nURL-shortener correctness contract: label every unsupplied numeric traffic, latency, retention, or availability value as an assumption. Create each short-code mapping through one strongly consistent canonical write path with a uniqueness constraint or conditional insert; generate a new candidate on collision rather than using check-then-act. Populate caches only from committed mappings, and keep cache propagation and click analytics asynchronous and eventually consistent. State the main tradeoff explicitly: mapping creation chooses strong consistency for uniqueness, while cache propagation and click analytics choose eventual consistency for scale. For mutable links, use redirect semantics such as 302 or 307 plus versioned invalidation so clients and CDNs do not pin an obsolete target; reserve 301 for explicitly immutable links. Do not describe competing dual write paths for the source of truth."
+            "\nURL-shortener correctness contract: label every unsupplied numeric traffic, latency, retention, or availability value as an assumption. Protect ambiguous create retries with a client idempotency key that returns the already committed mapping. Create each short-code mapping through one strongly consistent canonical write path with a uniqueness constraint or conditional insert; generate a new candidate on collision rather than using check-then-act. Populate caches only from committed mappings, and keep cache propagation and click analytics asynchronous and eventually consistent. State the main tradeoff explicitly: mapping creation chooses strong consistency for uniqueness, while cache propagation and click analytics choose eventual consistency for scale. For mutable, deleted, expired, or abuse-blocked links, use 302 or 307 plus versioned invalidation or tombstones with short bounded staleness so clients and CDNs do not retain obsolete or unsafe targets; reserve 301 for explicitly immutable links. Deliver click analytics at least once, deduplicate by event ID when exact counts matter, durably sink before committing the consumer offset, and replay after a pre-commit failure. Do not describe competing dual write paths for the source of truth."
         );
     }
 
@@ -5918,7 +5935,7 @@ fn prompt_with_answer_plan(
         );
         if payment_timeout_question {
             instructions.push_str(
-                "\nPayment timeout follow-up output: answer in one compact, ready-to-say paragraph. Start exactly with `I would transition the payment intent from PROCESSING to UNKNOWN and stop automatic charge retries.` Then say that provider status checks by payment ID or client reference and webhook events deduplicated by provider event ID determine the confirmed terminal state. The original operation's idempotency key is reused only if the same provider command must be replayed; it is not the webhook deduplication key."
+                "\nPayment timeout follow-up output: answer in one compact, ready-to-say paragraph. Start exactly with `I would transition the payment intent from PROCESSING to UNKNOWN and stop automatic charge retries.` State that provider status checks by payment ID or client reference and webhooks persisted under a database uniqueness constraint on provider event ID move `UNKNOWN` to `SUCCEEDED`, `FAILED`, or `CANCELED` only from authoritative evidence. Reconcile first. Only if the result remains inconclusive and the provider contract guarantees idempotent replay may the exact same provider command be retried under a bounded policy with the original operation's idempotency key, never a new key. If it remains unresolved, keep it `UNKNOWN` and escalate to a manual reconciliation workflow; never release a second charge. The operation key is not the webhook deduplication key."
             );
         }
     }
@@ -14718,7 +14735,8 @@ mod tests {
 
         assert!(system.contains("Messaging-system correctness contract"));
         assert!(system.contains("transactional outbox"));
-        assert!(system.contains("per-conversation sequence assignment"));
+        assert!(system.contains("atomically allocate the per-conversation sequence"));
+        assert!(system.contains("before acknowledging the sender"));
         assert!(system.contains("durable offline inbox delivery"));
         assert!(system.contains("group-fanout strategy"));
         assert!(system.contains("without split-brain sequence allocation"));
@@ -14744,10 +14762,16 @@ mod tests {
         assert!(system.contains("Online feature-store correctness contract"));
         assert!(system.contains("event stream through a stream processor into the online store"));
         assert!(system.contains("historical point-in-time training data"));
+        assert!(system.contains("versioned executable transformation code"));
+        assert!(system.contains("registry or matching schema alone"));
+        assert!(system.contains("event-time and availability-time"));
+        assert!(system.contains("as-of join"));
+        assert!(system.contains("watermark and late-event correction policy"));
+        assert!(system.contains("idempotent by event ID"));
+        assert!(system.contains("feature skew or parity failures"));
         assert!(system.contains("Never synchronously fall back to the offline store"));
         assert!(system.contains("explicit per-feature policy"));
         assert!(system.contains("freshness and missingness telemetry"));
-        assert!(system.contains("transformation versions consistent"));
     }
 
     #[test]
@@ -14769,14 +14793,17 @@ mod tests {
 
         assert!(system.contains("URL-shortener correctness contract"));
         assert!(system.contains("unsupplied numeric traffic"));
+        assert!(system.contains("client idempotency key"));
         assert!(system.contains("one strongly consistent canonical write path"));
         assert!(system.contains("uniqueness constraint or conditional insert"));
         assert!(system.contains("cache propagation and click analytics"));
         assert!(system.contains("asynchronous and eventually consistent"));
         assert!(system.contains("mapping creation chooses strong consistency"));
         assert!(system.contains("click analytics choose eventual consistency"));
-        assert!(system.contains("For mutable links"));
+        assert!(system.contains("For mutable, deleted, expired, or abuse-blocked links"));
         assert!(system.contains("302 or 307"));
+        assert!(system.contains("durably sink before committing the consumer offset"));
+        assert!(system.contains("replay after a pre-commit failure"));
         assert!(system.contains("reserve 301 for explicitly immutable links"));
         assert!(system.contains("Do not describe competing dual write paths"));
     }
@@ -14809,11 +14836,13 @@ mod tests {
         assert!(system.contains("transactional outbox command"));
         assert!(system.contains("provider payment ID or client reference"));
         assert!(system.contains("Deduplicate webhooks by provider event ID"));
-        assert!(system.contains(
-            "webhook events deduplicated by provider event ID determine the confirmed terminal state"
-        ));
+        assert!(system.contains("database uniqueness constraint on provider event ID"));
+        assert!(system.contains("move `UNKNOWN` to `SUCCEEDED`, `FAILED`, or `CANCELED`"));
+        assert!(system.contains("provider contract guarantees idempotent replay"));
+        assert!(system.contains("keep it `UNKNOWN`"));
+        assert!(system.contains("manual reconciliation workflow"));
         assert!(system.contains("original operation's idempotency key"));
-        assert!(system.contains("not the webhook deduplication key"));
+        assert!(system.contains("operation key is not the webhook deduplication key"));
     }
 
     #[test]
@@ -15104,8 +15133,15 @@ mod tests {
         ));
         assert!(system.contains("audit orphaned rows, parent/child indexes, dependent objects"));
         assert!(system.contains("bounded, restartable batches"));
-        assert!(system.contains("add the foreign key as `NOT VALID`"));
+        assert!(system.contains("`ADD FOREIGN KEY ... NOT VALID`"));
         assert!(system.contains("run `VALIDATE CONSTRAINT` separately"));
+        assert!(system.contains("Use PostgreSQL 17 only as a clearly labeled example"));
+        assert!(system.contains("`SHARE ROW EXCLUSIVE` on both"));
+        assert!(system.contains("not `ACCESS EXCLUSIVE`"));
+        assert!(system.contains("ordinary `SELECT` queries can continue"));
+        assert!(system.contains("Do not cite end-of-life PostgreSQL versions such as 9.2"));
+        assert!(system.contains("Do not suggest `pg_repack`"));
+        assert!(system.contains("MySQL's `pt-online-schema-change`"));
         assert!(system.contains("not portable to MySQL or every engine"));
     }
 
@@ -15135,6 +15171,16 @@ mod tests {
         assert!(system.contains("exactly one compact paragraph of 140-220 words"));
         assert!(system.contains("representative golden dataset with human labels"));
         assert!(system.contains("answer faithfulness or grounding"));
+        assert!(system.contains("RAG launch-evaluation correctness contract"));
+        assert!(system.contains("retrieval recall@k"));
+        assert!(system.contains("MRR or nDCG"));
+        assert!(system.contains("no-answer or unanswerable"));
+        assert!(system.contains("ACL or cross-tenant permission"));
+        assert!(system.contains("PII or privacy slices"));
+        assert!(system.contains("per-slice launch gates"));
+        assert!(system.contains("inter-rater agreement"));
+        assert!(system.contains("stratified, risk-weighted"));
+        assert!(system.contains("Do not invent numeric dataset sizes"));
         assert!(system.contains("a `Reasoning` section"));
         assert!(system.contains("source or provenance commentary"));
         assert!(system.contains("keep it in exactly one paragraph"));

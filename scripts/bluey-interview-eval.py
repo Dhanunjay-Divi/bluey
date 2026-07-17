@@ -212,7 +212,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q08", "coding", "general", "Implement an LRU cache from first principles in Python. Include comments, explanation, and time and space complexity.", "curated", "lru_code", max_tokens=1200, expect_code=True, required_groups=(g("class lrucache",), g("get",), g("put",), g("time complexity", "complexity"))),
     EvalCase("Q09", "code_followup", "general", "Make that same LRU implementation thread-safe without replacing it with a library cache. Return the complete updated code.", "curated", "lru_code", max_tokens=1400, expect_code=True, expect_followup_context=True, required_groups=(g("lock", "rlock"), g("class lrucache",), g("get",), g("put",))),
     EvalCase("Q10", "scenario", "general", "A junior engineer wants to add a foreign key constraint to a 200 million row production table. What do you tell them?", "otter_interview_style", speakable=True, required_groups=(g("lock", "blocking"), g("not valid", "validate constraint", "online"), g("batch", "backfill"))),
-    EvalCase("Q11", "scenario", "sde", "A release improves average latency but makes p99 worse. Would you ship it? Walk me through the decision.", speakable=True, required_groups=(g("p99", "tail"), g("segment", "workload", "trace"), g("rollback", "canary", "slo"))),
+    EvalCase("Q11", "scenario", "sde", "A release improves average latency but makes p99 worse. Would you ship it? Walk me through the decision.", speakable=True, required_groups=(g("p99", "tail"), g("segment", "workload", "trace", "endpoint", "transaction type", "code path", "cohort"), g("rollback", "canary", "slo"))),
     EvalCase("Q12", "behavioral", "sde", "Tell me about a time you disagreed with a product or engineering decision and how you handled it.", "behavioral_doc", speakable=True, required_groups=(g("disagree", "concern", "tradeoff"), g("data", "evidence", "experiment"), g("align", "decision", "commit"))),
 
     EvalCase("Q13", "behavioral", "de", "Tell me about yourself for a senior data engineering role.", "resume_pdf", speakable=True, self_intro=True, required_groups=(g("data engineer",), g("spark", "kafka"), g("capital one", "fidelity"))),
@@ -225,12 +225,12 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q20", "scenario", "de", "Snowflake spend doubled this month but row volume grew only ten percent. Where do you start?", speakable=True, required_groups=(g("query", "warehouse"), g("credit", "cost"), g("scan", "partition", "cache"))),
     EvalCase("Q21", "technical", "de", "What does exactly-once really mean in a Kafka-to-warehouse pipeline, and where can it still break?", speakable=True, required_groups=(g("idempot", "transaction"), g("offset",), g("sink", "warehouse"))),
     EvalCase("Q22", "scenario", "de", "Finance says Monday revenue is different in the dashboard and source table. How do you isolate the problem?", speakable=True, required_groups=(g("definition", "timezone", "filter"), g("source", "lineage", "pipeline"), g("reconcil", "row", "aggregate"))),
-    EvalCase("Q23", "behavioral", "amazon_de", "Tell me about a time you reduced cloud data-platform cost without hurting reliability.", "leadership_doc", speakable=True, required_groups=(g("glue", "spark"), g("70%", "30%", "cost"), g("reliab", "sla", "monitor"))),
+    EvalCase("Q23", "behavioral", "amazon_de", "Tell me about a time you reduced cloud data-platform cost without hurting reliability.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("glue", "spark"), g("70%", "30%", "cost"), g("reliab", "sla", "monitor"))),
 
     EvalCase("Q24", "behavioral", "ds", "Tell me about yourself for this data science and AI platform role.", "resume_and_jd_pdf", speakable=True, self_intro=True, required_groups=(g("data scientist", "machine learning", "genai"), g("rag", "fraud"), g("hpe", "datacenter", "platform"))),
     EvalCase("Q25", "behavioral", "ds", "Walk me through the secure RAG system you built and the decision you personally owned.", "otter_interview_style", "rag_project", speakable=True, required_groups=(g("2m", "document"), g("98%", "precision"), g("secure", "access"))),
     EvalCase("Q26", "followup", "ds", "Where could that RAG system hallucinate, and what did you put in place to catch it?", "otter_interview_style", "rag_project", speakable=True, expect_followup_context=True, required_groups=(g("retriev", "ground"), g("citation", "source"), g("eval", "threshold", "fallback"))),
-    EvalCase("Q27", "technical", "ds", "Design an evaluation plan for a RAG assistant before production launch.", speakable=True, required_groups=(g("retrieval",), g("faithful", "ground", "hallucin"), g("latency", "cost"), g("human", "golden", "dataset"))),
+    EvalCase("Q27", "technical", "ds", "Design an evaluation plan for a RAG assistant before production launch.", speakable=True, required_groups=(g("recall@k", "recall at k", "mrr", "ndcg"), g("faithful", "ground", "hallucin"), g("citation correctness", "citation precision", "citation recall"), g("no-answer", "unanswerable", "refusal", "abstain"), g("adversarial", "prompt injection"), g("acl", "permission", "tenant leakage"), g("pii", "privacy"), g("latency",), g("cost",), g("human", "golden", "dataset"), g("baseline", "champion"), g("slice", "segment"), g("regression", "launch gate"))),
     EvalCase("Q28", "scenario", "ds", "A fraud model has 99.8 percent accuracy but misses expensive fraud. What is wrong with the evaluation?", speakable=True, required_groups=(g("class imbalance", "imbalanc"), g("precision", "recall"), g("cost", "threshold", "loss"))),
     EvalCase("Q29", "scenario", "ds", "A model was strong offline but degrades two months after launch. How do you determine whether this is drift or a pipeline bug?", speakable=True, required_groups=(g("drift",), g("feature", "pipeline"), g("distribution", "monitor"), g("label", "ground truth"))),
     EvalCase("Q30", "technical", "ds", "How would you reduce p95 latency for a large language model service without silently reducing answer quality?", speakable=True, required_groups=(g("batch", "cache", "quant", "vllm"), g("p95", "latency"), g("quality", "eval"), g("canary", "measure"))),
@@ -242,15 +242,15 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q35", "design_followup", "general", "How would you preserve per-conversation ordering when users reconnect and servers fail?", "curated", "messaging_design", max_tokens=800, speakable=True, expect_followup_context=True, required_groups=(g("sequence", "offset", "order"), g("idempot", "dedup"), g("reconnect", "replay"))),
     EvalCase("Q36", "system_design", "general", "Design a real-time monitoring platform ingesting 100,000 events per second with alerting and historical queries.", "resume_inspired", "monitoring_design", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("kafka", "queue", "stream"), g("time series", "storage"), g("alert",), g("partition", "scale"))),
     EvalCase("Q37", "design_followup", "general", "One tenant becomes a hot partition. Change the design without breaking ordering for that tenant.", "curated", "monitoring_design", max_tokens=850, speakable=True, expect_followup_context=True, required_groups=(g("partition", "shard"), g("order", "sequence"), g("tenant",))),
-    EvalCase("Q38", "system_design", "ds", "Design an online feature store that serves low-latency features and keeps training data consistent with serving.", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("offline",), g("online",), g("point-in-time", "training-serving"), g("fresh", "stream"))),
+    EvalCase("Q38", "system_design", "ds", "Design an online feature store that serves low-latency features and keeps training data consistent with serving.", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("offline",), g("online",), g("event time",), g("availability time", "ingestion time"), g("as-of", "as of", "temporal join"), g("executable transformation", "compiled feature definition", "shared feature code", "versioned dsl"), g("late event", "out-of-order", "watermark"), g("idempot", "dedup"), g("skew", "parity"), g("fresh", "stream"))),
     EvalCase("Q39", "system_design", "general", "Design a payment processing platform that safely handles retries and duplicate requests.", "curated", "payment_design", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("idempot",), g("ledger",), g("webhook", "processor"), g("reconcil",))),
     EvalCase("Q40", "design_followup", "general", "The provider times out after charging the card. What exact state transition and retry behavior do you use?", "curated", "payment_design", max_tokens=850, speakable=True, expect_followup_context=True, required_groups=(g("unknown", "pending", "reconcil"), g("idempot",), g("webhook", "query"))),
     EvalCase("Q41", "system_design", "general", "Design a URL shortener and make the main scale and consistency tradeoff explicit.", max_tokens=950, speakable=True, expect_design=True, required_groups=(g("key", "id"), g("cache",), g("redirect",), g("consistency", "collision"))),
     EvalCase("Q42", "system_design", "ds", "Design a multi-tenant enterprise RAG platform with document permissions, citations, and cost controls.", max_tokens=1200, speakable=True, expect_design=True, required_groups=(g("tenant", "permission", "acl"), g("chunk", "embedding"), g("citation",), g("cost", "quota"))),
 
-    EvalCase("Q43", "behavioral", "amazon_de", "Tell me about a time the requirements were ambiguous and you still moved the work forward safely.", "behavioral_doc", speakable=True, required_groups=(g("clarif", "stakeholder", "requirement"), g("assumption", "scope", "prototype"), g("result", "outcome"))),
-    EvalCase("Q44", "behavioral", "amazon_de", "Tell me about a time you challenged a decision with data and then committed to the final direction.", "leadership_doc", speakable=True, required_groups=(g("data", "evidence"), g("disagree", "challenge"), g("commit", "align"))),
-    EvalCase("Q45", "behavioral", "amazon_de", "Tell me about a failure. What did you change so the same class of failure would not repeat?", "behavioral_doc", speakable=True, required_groups=(g("fail", "mistake"), g("root cause", "learn"), g("guardrail", "test", "monitor", "process"))),
+    EvalCase("Q43", "behavioral", "amazon_de", "Tell me about a time the requirements were ambiguous and you still moved the work forward safely.", "behavioral_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("clarif", "stakeholder", "requirement"), g("assumption", "scope", "prototype"), g("result", "outcome"))),
+    EvalCase("Q44", "behavioral", "amazon_de", "Tell me about a time you challenged a decision with data and then committed to the final direction.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("data", "evidence"), g("disagree", "challenge"), g("commit", "align"))),
+    EvalCase("Q45", "behavioral", "amazon_de", "Tell me about a failure. What did you change so the same class of failure would not repeat?", "behavioral_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("fail", "mistake"), g("root cause", "learn"), g("guardrail", "test", "monitor", "process"))),
     EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
     EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("align", "stakeholder"), g("communicat", "tradeoff"))),
     EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("follow", "ownership"))),
@@ -418,10 +418,10 @@ def build_typed_answer_context(
 ) -> List[Dict[str, Any]]:
     """Build the exact v1 provenance envelope exercised by current clients."""
     contexts = [dict(item) for item in profile_context]
-    # Q46 is the deliberate truth-gap fixture: its preparation document has
-    # story-shaped material, but this turn supplies no verified candidate
-    # resume or user-confirmed STAR story. Synthesis must safely ask for facts.
-    if case.id == "Q46":
+    # Deliberate truth-gap fixtures have story-shaped preparation material but
+    # no matching user-confirmed STAR story. Do not let a generic resume bullet
+    # create fabricate-or-fail pressure for these lived-story questions.
+    if case.expected_outcome == "needs_user_input":
         contexts = [
             item for item in contexts if item.get("role") != "candidate_resume"
         ]
@@ -525,7 +525,9 @@ def context_provenance_manifest(
 
 
 def self_check_typed_answer_context() -> None:
-    q46 = next(case for case in CASES if case.id == "Q46")
+    truth_gap_cases = [
+        case for case in CASES if case.expected_outcome == "needs_user_input"
+    ]
     fixture = [
         {
             "kind": "document",
@@ -544,11 +546,16 @@ def self_check_typed_answer_context() -> None:
             "role": "interview_preparation",
         },
     ]
-    q46_context = build_typed_answer_context(q46, fixture, {})
-    validate_typed_answer_context(q46_context)
-    assert all(item["role"] != "candidate_resume" for item in q46_context)
-    assert any(item["role"] == "interview_preparation" for item in q46_context)
-    assert all(item["role"] != "user_confirmed_story" for item in q46_context)
+    for case in truth_gap_cases:
+        truth_gap_context = build_typed_answer_context(case, fixture, {})
+        validate_typed_answer_context(truth_gap_context)
+        assert all(item["role"] != "candidate_resume" for item in truth_gap_context)
+        assert any(
+            item["role"] == "interview_preparation" for item in truth_gap_context
+        )
+        assert all(
+            item["role"] != "user_confirmed_story" for item in truth_gap_context
+        )
 
 
 def iter_sse(response: Any) -> Iterable[Tuple[str, str]]:
@@ -976,7 +983,10 @@ def large_fk_migration_safety_issues(text: str) -> List[str]:
             break
 
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", lower):
-        if not re.search(r"\b(?:foreign key|constraint|validation|validate)\w*\b", sentence):
+        if not re.search(
+            r"\b(?:foreign key|constraint|validation|validate|not valid)\w*\b",
+            sentence,
+        ):
             continue
         categorical = bool(
             re.search(
@@ -998,7 +1008,7 @@ def large_fk_migration_safety_issues(text: str) -> List[str]:
         explicit_universal = bool(re.search(r"\b(?:always|universally)\b", sentence))
         qualified = bool(
             re.search(
-                r"\b(?:can|could|may|might|risk|depending|brief|short|"
+                r"\b(?:can|could|may|might|risk|depending|"
                 r"not universally|does not universally|doesn't universally)\b",
                 sentence,
             )
@@ -1015,6 +1025,103 @@ def large_fk_migration_safety_issues(text: str) -> List[str]:
         )
         if categorical and all_io and not qualified:
             issues.append("unsafe_universal_fk_read_write_block_claim")
+            break
+
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", lower):
+        if "access exclusive" not in sentence:
+            continue
+        if not re.search(r"\b(?:foreign key|not valid|validate constraint)\b", sentence):
+            continue
+        safely_rejected = bool(
+            re.search(
+                r"\b(?:not|never)\s+(?:an?\s+)?access exclusive\b|"
+                r"\b(?:does\s+not|doesn't)\s+(?:take|require|use)\b.{0,25}"
+                r"\baccess exclusive\b|"
+                r"\brather\s+than\s+(?:an?\s+)?access exclusive\b|"
+                r"\bunlike\s+access exclusive\b|"
+                r"\baccess exclusive\b.{0,90}\b(?:but|whereas|while)\b"
+                r".{0,90}\bshare row exclusive\b|"
+                r"\bconflicts?\s+with\s+access exclusive\s+(?:operations?|locks?)\b|"
+                r"\bblocks?\s+conflicting\s+access exclusive\s+"
+                r"(?:ddl|operations?|locks?|requests?)\b",
+                sentence,
+            )
+        )
+        if not safely_rejected:
+            issues.append("unsafe_postgres_fk_access_exclusive_claim")
+            break
+
+    normalized_text = re.sub(r"\s+", " ", text.casefold().replace("’", "'"))
+    for match in re.finditer(r"\bpt-online-schema-change\b", normalized_text):
+        clause_start = max(
+            normalized_text.rfind(delimiter, 0, match.start())
+            for delimiter in (".", "!", "?", ";")
+        )
+        clause_ends = [
+            index
+            for delimiter in (".", "!", "?", ";")
+            if (index := normalized_text.find(delimiter, match.end())) >= 0
+        ]
+        clause_end = min(clause_ends) if clause_ends else len(normalized_text)
+        tool_clause = normalized_text[clause_start + 1 : clause_end]
+        normalized_paragraph = normalized_text[
+            max(0, match.start() - 180) : min(len(normalized_text), match.end() + 180)
+        ]
+        postgres_context = bool(
+            re.search(
+                r"\b(?:postgres(?:ql)?|not valid|validate constraint|pg_repack)\b",
+                normalized_paragraph,
+            )
+        )
+        mysql_applicability = bool(
+            re.search(
+                r"\b(?:for|on|with)\s+(?:a\s+)?(?:tested\s+)?mysql\b.{0,100}"
+                r"\bpt-online-schema-change\b|"
+                r"\bpt-online-schema-change\b.{0,100}"
+                r"\b(?:for|on|with)\s+(?:a\s+)?(?:tested\s+)?mysql\b",
+                tool_clause,
+            )
+        )
+        rejected = bool(
+            re.search(
+                r"\b(?:do not|don't|never|avoid)\b.{0,80}"
+                r"\bpt-online-schema-change\b",
+                normalized_paragraph,
+            )
+            or re.search(
+                r"\b(?:inappropriate|unsuitable|wrong)\b.{0,60}"
+                r"\bpt-online-schema-change\b|"
+                r"\bpt-online-schema-change\b.{0,60}"
+                r"\b(?:inappropriate|unsuitable|not\s+(?:a\s+)?postgresql\s+tool)\b|"
+                r"\bunlike\s+pt-online-schema-change\b|"
+                r"\bpt-online-schema-change\b.{0,40}\b(?:is|does)\s+not\b"
+                r".{0,40}\b(?:for|support|apply\w*\s+to)\b.{0,30}\bpostgres(?:ql)?\b",
+                normalized_paragraph,
+            )
+        )
+        if postgres_context and not mysql_applicability and not rejected:
+            issues.append("unsafe_mysql_tool_in_postgres_migration_advice")
+            break
+
+    eol_version = re.compile(r"\bpostgres(?:ql)?\s+(?:9\.\d+|10|11|12|13)\b")
+    for match in eol_version.finditer(lower):
+        window = lower[max(0, match.start() - 90) : match.end() + 90]
+        safely_rejected = bool(
+            re.search(
+                r"\b(?:do not|don't|never|avoid|reject|wouldn't|would\s+not|unsupported|"
+                r"end[- ]of[- ]life|eol|obsolete)\b.{0,80}"
+                + re.escape(match.group()),
+                window,
+            )
+            or re.search(
+                re.escape(match.group())
+                + r".{0,80}\b(?:is|isn't|it's|as)\s+(?:now\s+)?(?:unsupported|"
+                r"end[- ]of[- ]life|eol|obsolete)\b",
+                window,
+            )
+        )
+        if not safely_rejected:
+            issues.append("unsupported_eol_postgresql_migration_baseline")
             break
     return issues
 
@@ -1039,6 +1146,19 @@ def self_check_large_fk_migration_safety() -> None:
     assert large_fk_migration_safety_issues(
         "Validation can always block all reads and writes."
     ) == ["unsafe_universal_fk_read_write_block_claim"]
+    second_failed_live_answer = (
+        "For PostgreSQL 9.2 or later, add the foreign key as NOT VALID. The NOT "
+        "VALID approach still takes an ACCESS EXCLUSIVE lock briefly, which blocks "
+        "all reads and writes. Use pg_repack or pt-online-schema-change if the lock "
+        "is unacceptable."
+    )
+    second_failed_issues = set(
+        large_fk_migration_safety_issues(second_failed_live_answer)
+    )
+    assert "unsafe_postgres_fk_access_exclusive_claim" in second_failed_issues
+    assert "unsafe_universal_fk_read_write_block_claim" in second_failed_issues
+    assert "unsafe_mysql_tool_in_postgres_migration_advice" in second_failed_issues
+    assert "unsupported_eol_postgresql_migration_baseline" in second_failed_issues
     safe_answers = (
         "I would not create a new table, copy all rows, and rename it as the default. "
         "For PostgreSQL 15, use NOT VALID and validate separately in a monitored window.",
@@ -1048,9 +1168,36 @@ def self_check_large_fk_migration_safety() -> None:
         "last resort with a vetted online schema change tool and CDC for concurrent "
         "write sync: create a shadow table, copy the rows, then cut over.",
         "Never claim that foreign-key validation universally blocks all reads and writes.",
+        "For PostgreSQL 17, ADD FOREIGN KEY uses SHARE ROW EXCLUSIVE on both tables, "
+        "not ACCESS EXCLUSIVE; ordinary SELECT queries can continue.",
+        "Most ALTER TABLE forms use ACCESS EXCLUSIVE, but ADD FOREIGN KEY NOT VALID "
+        "uses only SHARE ROW EXCLUSIVE.",
+        "Unlike ACCESS EXCLUSIVE, the SHARE ROW EXCLUSIVE lock used by ADD FOREIGN "
+        "KEY still permits ordinary SELECT queries.",
+        "For PostgreSQL 17, adding the foreign key takes SHARE ROW EXCLUSIVE, which "
+        "is compatible with ordinary SELECTs but conflicts with ACCESS EXCLUSIVE operations.",
+        "In PostgreSQL 17, ADD FOREIGN KEY NOT VALID takes a SHARE ROW EXCLUSIVE lock, "
+        "which blocks conflicting ACCESS EXCLUSIVE DDL while ordinary reads continue.",
+        "PostgreSQL 17 uses SHARE ROW EXCLUSIVE, so it doesn't require ACCESS EXCLUSIVE "
+        "for ADD FOREIGN KEY NOT VALID.",
+        "For a tested MySQL version, a vetted pt-online-schema-change workflow may "
+        "be an explicit fallback with CDC and cutover monitoring.",
+        "pt-online-schema-change is inappropriate for PostgreSQL foreign keys; use "
+        "native NOT VALID and VALIDATE CONSTRAINT instead.",
+        "Unlike pt-online-schema-change, PostgreSQL should use its native NOT VALID "
+        "constraint workflow.",
+        "Do not use PostgreSQL 13 as a migration baseline because it is end-of-life.",
+        "I wouldn't use PostgreSQL 13 as a migration baseline because it's end-of-life.",
     )
     for answer in safe_answers:
         assert not large_fk_migration_safety_issues(answer), answer
+    unsafe_mixed_engine = (
+        "PostgreSQL supports NOT VALID. MySQL has different online DDL. For PostgreSQL, "
+        "use pt-online-schema-change to avoid locking."
+    )
+    assert "unsafe_mysql_tool_in_postgres_migration_advice" in (
+        large_fk_migration_safety_issues(unsafe_mixed_engine)
+    )
 
 
 def has_exactly_once_processing_overclaim(text: str) -> bool:
@@ -1107,6 +1254,80 @@ def self_check_exactly_once_processing_detector() -> None:
     assert all(not has_exactly_once_processing_overclaim(text) for text in safe)
 
 
+def has_safe_payment_same_operation_replay_condition(text: str) -> bool:
+    """Recognize a reconciled, provider-guaranteed replay of the original command."""
+    lower = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[*_`~]+", "", text.casefold().replace("’", "'")),
+    )
+    conditional_replay = bool(
+        re.search(
+            r"\b(?:only\s+if|after|unless)\b.{0,220}"
+            r"\b(?:replay|retry|resubmit)\w*\b",
+            lower,
+        )
+    )
+    explicit_provider_capability = bool(
+        re.search(
+            r"\bprovider(?:'s)?\s+(?:contract\s+)?"
+            r"(?:guarantees?|supports?|honors?|deduplicates?)\b.{0,50}"
+            r"\bidempoten\w*\b|"
+            r"\bidempoten\w*\b.{0,50}\b(?:guaranteed|supported|honored|"
+            r"deduplicated)\b.{0,30}\bby\s+(?:the\s+)?provider\b",
+            lower,
+        )
+    )
+    inconclusive_reconciliation = bool(
+        re.search(
+            r"\b(?:reconcil\w*|status\s+(?:check|lookup|query)|webhooks?)\b"
+            r".{0,110}\b(?:inconclusive|unresolved|unknown|no\s+terminal\s+outcome)\b|"
+            r"\b(?:inconclusive|unresolved|unknown|no\s+terminal\s+outcome)\b"
+            r".{0,110}\b(?:reconcil\w*|status\s+(?:check|lookup|query)|webhooks?)\b",
+            lower,
+        )
+    )
+    original_key = bool(
+        re.search(r"\b(?:same|original)\b.{0,35}\bidempotency\s+key\b", lower)
+    )
+    original_command = bool(
+        re.search(
+            r"\b(?:exact\s+same|same|original)\b.{0,35}"
+            r"\b(?:provider\s+)?(?:operation|command|charge|authorization|payment)\b|"
+            r"\b(?:retry|replay|resubmit)\w*\s+(?:the\s+)?"
+            r"(?:same|original)?\s*(?:provider\s+)?"
+            r"(?:operation|command|charge|authorization|payment)\b",
+            lower,
+        )
+    )
+    bounded_policy = bool(
+        re.search(
+            r"\bbounded\s+(?:policy|attempts?|retries|retry|replay|budget|window)\b|"
+            r"\b(?:retry|replay)\s+(?:budget|deadline|limit)\b|"
+            r"\b(?:at\s+most|no\s+more\s+than|maximum)\s+\d+\b",
+            lower,
+        )
+    )
+    unsafe_unbounded = bool(
+        re.search(
+            r"\b(?:forever|indefinitely|until\s+it\s+succeeds?|until\s+success|"
+            r"without\s+(?:a\s+)?(?:limit|deadline|bound))\b|"
+            r"\bevery\s+(?:\d+\s+)?(?:seconds?|minutes?|hours?)\b.{0,80}"
+            r"\b(?:forever|until\s+it\s+succeeds?|until\s+success)\b",
+            lower,
+        )
+    )
+    return bool(
+        conditional_replay
+        and explicit_provider_capability
+        and inconclusive_reconciliation
+        and original_key
+        and original_command
+        and bounded_policy
+        and not unsafe_unbounded
+    )
+
+
 def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
     lower = re.sub(r"\s+", " ", re.sub(r"[*_`~]+", "", text.casefold()))
     action_words = r"mark(?:ed)?|move(?:d)?|transition(?:ed)?|set"
@@ -1160,6 +1381,36 @@ def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
                 return True
         return False
 
+    def provider_authoritatively_resolves_terminal_state(context: str) -> bool:
+        provider_source = bool(
+            re.search(r"\b(?:provider|processor|gateway|acquirer)\b", context)
+            and re.search(r"\b(?:status|lookup|query|webhook|evidence)\b", context)
+        )
+        authoritative_gate = bool(
+            re.search(
+                r"\b(?:only\s+from|after|based\s+on|when)\b.{0,80}"
+                r"\b(?:authoritative|confirmed|definitive)\b.{0,30}"
+                r"\b(?:provider\s+)?(?:status|webhook|evidence|response)\b|"
+                r"\b(?:authoritative|confirmed|definitive)\b.{0,30}"
+                r"\b(?:provider\s+)?(?:status|webhook|evidence|response)\b"
+                r".{0,80}\b(?:moves?|transitions?|resolves?|sets?)\b",
+                context,
+            )
+            or re.search(
+                r"\b(?:moves?|transitions?|resolves?|sets?)\b.{0,120}"
+                r"\bonly\s+from\s+authoritative\s+evidence\b",
+                context,
+            )
+        )
+        negated = bool(
+            re.search(
+                r"\b(?:without|before|not\s+waiting\s+for|despite\s+missing)\b"
+                r".{0,50}\b(?:authoritative|confirmed|definitive)\b",
+                context,
+            )
+        )
+        return provider_source and authoritative_gate and not negated
+
     terminal_failure = False
     for outcome in re.finditer(
         r"\b(?:timeout|timed out|unknown|ambiguous|no record|maximum retries|max retries)\b",
@@ -1183,17 +1434,35 @@ def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
             confirmation_prefix = lower[max(outcome.end(), action_start - 220) : action_start]
             if provider_definitively_confirmed_no_charge(confirmation_prefix):
                 continue
+            transition_context = lower[
+                max(0, outcome.start() - 100) : min(
+                    len(lower), outcome.start() + action.end() + 160
+                )
+            ]
+            if provider_authoritatively_resolves_terminal_state(transition_context):
+                continue
             terminal_failure = True
             break
         if terminal_failure:
             break
-    charge_retry = re.search(
+    charge_retry = False
+    retry_pattern = re.compile(
         r"\b(?:retry|retries|retrying|resubmit|resubmits|resubmitting|re-submit|re-submits)"
-        r"\s+(?:the\s+|a\s+)?(?:charge|payment|gateway call|charge submission|payment submission)\b",
-        lower,
+        r"\s+(?:the\s+|a\s+)?(?:charge|payment|gateway call|charge submission|payment submission)\b"
     )
-    if charge_retry:
-        prefix = lower[max(0, charge_retry.start() - 120) : charge_retry.start()]
+    for retry in retry_pattern.finditer(lower):
+        sentence_start = max(
+            lower.rfind(delimiter, 0, retry.start()) for delimiter in (".", "!", "?", ";")
+        )
+        sentence_ends = [
+            index
+            for delimiter in (".", "!", "?", ";")
+            if (index := lower.find(delimiter, retry.end())) >= 0
+        ]
+        sentence_end = min(sentence_ends) if sentence_ends else len(lower)
+        retry_sentence = lower[sentence_start + 1 : sentence_end]
+        local_start = retry.start() - sentence_start - 1
+        prefix = retry_sentence[max(0, local_start - 120) : local_start]
         direct_negation = re.search(
             r"(?:do not|don't|don’t|never|must not|cannot|can't|can’t)\s*$", prefix
         )
@@ -1204,7 +1473,18 @@ def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
             prefix,
         )
         if direct_negation or coordinated_negation:
-            charge_retry = None
+            continue
+        retry_context = retry_sentence
+        if re.search(r"\b(?:only\s+if|after|unless)\b", retry_sentence):
+            previous_start = max(
+                lower.rfind(delimiter, 0, max(0, sentence_start))
+                for delimiter in (".", "!", "?", ";")
+            )
+            retry_context = lower[previous_start + 1 : sentence_end]
+        if has_safe_payment_same_operation_replay_condition(retry_context):
+            continue
+        charge_retry = True
+        break
     return bool(terminal_failure or charge_retry)
 
 
@@ -1537,6 +1817,7 @@ def payment_operation_semantic_issues(
             r".{0,30}\b(?:retry|replay)\w*\b",
             lower,
         )
+        or has_safe_payment_same_operation_replay_condition(lower)
     )
     negated_same_operation_retry_reuse = bool(
         re.search(
@@ -1643,6 +1924,10 @@ def payment_operation_semantic_issues(
         rf"\b(?:{provider_event_id})\b[^.!?;]{{0,45}}"
         rf"\b(?:dedup\w*|unique\s+(?:constraint|index))\b"
         rf"[^.!?;]{{0,55}}\bwebhooks?\b",
+        rf"\bwebhooks?\b[^.!?;]{{0,55}}\b(?:persist|store|record|insert)\w*\b"
+        rf"[^.!?;]{{0,55}}\b(?:database\s+)?(?:uniqueness|unique)\s+"
+        rf"(?:constraint|index)\b[^.!?;]{{0,25}}\b(?:on|for)\b"
+        rf"[^.!?;]{{0,20}}\b(?:{provider_event_id})\b",
     )
     provider_event_dedup = any(
         re.search(pattern, lower) for pattern in provider_event_dedup_patterns
@@ -2725,6 +3010,8 @@ REQUIRED_SIGNAL_STEMS = frozenset(
         "clarif",
         "communicat",
         "deprecat",
+        "dedup",
+        "eval",
         "faithful",
         "hallucin",
         "idempot",
@@ -2768,6 +3055,553 @@ def has_required_signal(text: str, term: str) -> bool:
             lower,
         )
     )
+
+
+def rag_evaluation_plan_issues(text: str) -> List[str]:
+    """Require an actionable launch evaluation, not a keyword-only RAG sketch."""
+    lower = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[*`~]+", "", text.casefold().replace("’", "'")),
+    )
+    issues: List[str] = []
+
+    required_signals = (
+        (
+            "missing_retrieval_recall_or_ranking_metric",
+            ("recall@k", "recall at k", "mrr", "mean reciprocal rank", "ndcg"),
+        ),
+        (
+            "missing_citation_correctness_evaluation",
+            ("citation correctness", "citation precision", "citation recall"),
+        ),
+        (
+            "missing_no_answer_refusal_evaluation",
+            ("no-answer", "no answer", "unanswerable", "refusal", "abstain"),
+        ),
+        (
+            "missing_adversarial_rag_slice",
+            ("adversarial", "prompt injection", "jailbreak"),
+        ),
+        (
+            "missing_acl_isolation_rag_slice",
+            ("acl", "permission", "tenant leakage", "cross-tenant"),
+        ),
+        (
+            "missing_pii_privacy_rag_slice",
+            ("pii", "privacy", "personal data"),
+        ),
+        (
+            "missing_baseline_and_regression_gate",
+            ("baseline", "champion", "regression"),
+        ),
+        (
+            "missing_per_slice_launch_gates",
+            ("per-slice", "per slice", "slice gate", "slice threshold"),
+        ),
+        (
+            "missing_judge_human_calibration",
+            ("judge calibration", "calibrate the judge", "inter-rater", "interrater"),
+        ),
+    )
+    for issue, signals in required_signals:
+        if not any(signal in lower for signal in signals):
+            issues.append(issue)
+
+    if re.search(
+        r"\b(?:do\s+not|don't|never)\s+(?:evaluate|test|include|cover)\w*\b"
+        r".{0,80}\b(?:no[- ]answer|unanswerable|adversarial|prompt\s+injection|"
+        r"acl|permission|cross[- ]tenant|pii|privacy|citation|refusal)\b|"
+        r"\b(?:skip|omit|exclude|ignore)\w*\b.{0,80}"
+        r"\b(?:no[- ]answer|unanswerable|adversarial|prompt\s+injection|"
+        r"acl|permission|cross[- ]tenant|pii|privacy|citation|refusal)\b",
+        lower,
+    ):
+        issues.append("unsafe_omitted_rag_safety_slice")
+
+    top_subset_review = bool(
+        re.search(
+            r"\btop\s+\d+(?:\.\d+)?\s*(?:%|\bpercent\b).{0,100}"
+            r"\b(?:(?:human|manual)\s+review|with\s+humans?|reviewed\s+by\s+humans?)\b|"
+            r"\b(?:human|manual)\s+review\b.{0,100}"
+            r"\btop\s+\d+(?:\.\d+)?\s*(?:%|\bpercent\b)",
+            lower,
+        )
+    )
+    explicitly_only_top_subset = bool(
+        re.search(
+            r"\b(?:review|validate|inspect|score)\w*\b.{0,30}\bonly\b.{0,20}"
+            r"\btop\s+\d+(?:\.\d+)?\s*(?:%|\bpercent\b)|"
+            r"\b(?:review|validate|inspect|score)\w*\b.{0,30}"
+            r"\btop\s+\d+(?:\.\d+)?\s*(?:%|\bpercent\b).{0,30}\bonly\b|"
+            r"\bonly\b.{0,20}\btop\s+\d+(?:\.\d+)?\s*(?:%|\bpercent\b)"
+            r".{0,80}\b(?:human|manual|review)\b",
+            lower,
+        )
+    )
+    review_is_representative = bool(
+        re.search(
+            r"\b(?:stratified|random|risk[- ]weighted|risk[- ]based|"
+            r"all\s+high[- ]risk)\b|"
+            r"\brepresentative\s+(?:human\s+)?(?:sample|sampling|review)\b",
+            lower,
+        )
+    )
+    safely_rejects_top_only = bool(
+        re.search(
+            r"\b(?:never|do\s+not|don't|avoid)\b.{0,35}"
+            r"\b(?:review|validate|inspect|score)\w*\b.{0,35}"
+            r"\b(?:only\s+)?top\s+\d+(?:\.\d+)?\s*(?:%|\bpercent\b)|"
+            r"\b(?:never|do\s+not|don't|avoid)\b.{0,35}\bonly\b.{0,25}"
+            r"\btop\s+\d+(?:\.\d+)?\s*(?:%|\bpercent\b)",
+            lower,
+        )
+    )
+    if not safely_rejects_top_only and (
+        explicitly_only_top_subset or (top_subset_review and not review_is_representative)
+    ):
+        issues.append("unsafe_top_score_only_human_review")
+
+    numeric_targets = bool(
+        re.search(
+            r"\b(?:target\w*|under|below|less\s+than|at\s+most|no\s+more\s+than)\b"
+            r".{0,45}(?:\$?\d+(?:\.\d+)?|\d+\s*(?:ms|seconds?|queries|examples?))|"
+            r"\b(?:p\d{2}|latency|cost)\b.{0,35}"
+            r"(?:<=|>=|<|>|under|below|at\s+most)\s*\$?\d+(?:\.\d+)?|"
+            r"\b(?:golden\s+)?(?:dataset|review\s+set)\b.{0,20}"
+            r"\b(?:of|with)\b.{0,10}\d+(?:\s*[–-]\s*\d+)?\b",
+            lower,
+        )
+    )
+    labeled_assumption = bool(
+        re.search(
+            r"\b(?:assumption|illustrative|example\s+target|to\s+be\s+set|"
+            r"derive\w*\s+from\s+(?:the\s+)?(?:product\s+)?slo)\b",
+            lower,
+        )
+    )
+    if numeric_targets and not labeled_assumption:
+        issues.append("unlabeled_numeric_rag_launch_target")
+    return issues
+
+
+def feature_store_consistency_issues(text: str) -> List[str]:
+    """Enforce the mechanics that make offline training match online serving."""
+    lower = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[*`~]+", "", text.casefold().replace("’", "'")),
+    )
+    issues: List[str] = []
+
+    shared_executable = bool(
+        (
+            re.search(
+                r"\b(?:one|single|same|shared|versioned)\b.{0,55}"
+                r"\b(?:executable|compiled|feature\s+code|transformation\s+code|dsl)\b",
+                lower,
+            )
+            or re.search(
+                r"\bexecutable\s+(?:feature\s+)?transformations?\b.{0,45}"
+                r"\b(?:once|shared|compile\w*)\b",
+                lower,
+            )
+            or re.search(
+                r"\bdefine\w*\b.{0,35}\bfeatures?\b.{0,35}\bonce\b"
+                r".{0,80}\bcompile\w*\b.{0,40}\b(?:definition|dsl|code)\b|"
+                r"\bversioned\s+dsl\b.{0,80}\bcompile\w*\b",
+                lower,
+            )
+        )
+        and re.search(r"\b(?:stream|streaming|online|serving)\b", lower)
+        and re.search(r"\b(?:batch|offline|training)\b", lower)
+    )
+    if not shared_executable:
+        issues.append("missing_shared_executable_feature_transformations")
+
+    if not re.search(r"\bevent[- ]time\b", lower):
+        issues.append("missing_feature_event_time")
+    if not re.search(r"\b(?:availability|ingestion|processing)[- ]time\b", lower):
+        issues.append("missing_feature_availability_time")
+    as_of_join = bool(re.search(r"\b(?:as[- ]of|temporal)\s+join\b", lower))
+    both_times_bounded = bool(
+        re.search(
+            r"\bboth\b.{0,40}\bevent[- ]time\b.{0,60}"
+            r"\bavailability[- ]time\b.{0,100}"
+            r"\b(?:at\s+or\s+before|before|not\s+after|<=)\b.{0,50}"
+            r"\b(?:prediction|cutoff|observation)[- ]time\b|"
+            r"\bevent[- ]time\b.{0,80}\b(?:and|plus)\b.{0,40}"
+            r"\bavailability[- ]time\b.{0,100}"
+            r"\b(?:at\s+or\s+before|before|not\s+after|<=)\b.{0,50}"
+            r"\b(?:prediction|cutoff|observation)[- ]time\b",
+            lower,
+        )
+    )
+    event_time_bounded = bool(
+        both_times_bounded
+        or re.search(
+            r"\bevent[- ]time\b.{0,100}(?:<=|at\s+or\s+before|before|not\s+after)"
+            r".{0,80}\b(?:prediction|cutoff|observation)[- ]time\b",
+            lower,
+        )
+    )
+    availability_time_bounded = bool(
+        both_times_bounded
+        or re.search(
+            r"\b(?:availability|ingestion)[- ]time\b.{0,100}"
+            r"(?:<=|at\s+or\s+before|before|not\s+after).{0,80}"
+            r"\b(?:prediction|cutoff|observation)[- ]time\b",
+            lower,
+        )
+    )
+    if re.search(
+        r"\bevent[- ]time\b.{0,35}\b(?:is|are)\s+not\s+"
+        r"(?:filtered|bounded|checked|enforced)\b",
+        lower,
+    ):
+        event_time_bounded = False
+    if re.search(
+        r"\b(?:availability|ingestion)[- ]time\b.{0,35}"
+        r"\b(?:is|are)\s+not\s+(?:filtered|bounded|checked|enforced)\b",
+        lower,
+    ):
+        availability_time_bounded = False
+    if not (as_of_join and event_time_bounded and availability_time_bounded):
+        issues.append("missing_point_in_time_join_mechanics")
+
+    negation_scan = re.sub(
+        r"\b(?:never|do\s+not|don't|avoid)\s+(?:skip|omit)\w*\b.{0,70}"
+        r"\b(?:as[- ]of\s+join|event[- ]time|availability[- ]time|"
+        r"late\s+events?|skew|parity)\b",
+        " ",
+        lower,
+    )
+    if re.search(
+        r"\b(?:do\s+not|don't|never)\s+(?:share|persist|store|record|filter|"
+        r"correct|recompute|dedup|compare|validate|enforce)\w*\b.{0,90}"
+        r"\b(?:executable\s+transform|event[- ]time|availability[- ]time|"
+        r"as[- ]of\s+join|late\s+events?|replay|backfill|online|offline|skew|parity)\b|"
+        r"\b(?:skip|omit)\w*\b.{0,70}\b(?:as[- ]of\s+join|event[- ]time|"
+        r"availability[- ]time|late\s+events?|skew|parity)\b|"
+        r"\bnon[- ]idempotent\b.{0,60}\b(?:replay|backfill)\b|"
+        r"\b(?:event|availability|ingestion)[- ]time\b.{0,35}"
+        r"\b(?:is|are)\s+not\s+(?:filtered|bounded|checked|enforced)\b|"
+        r"\b(?:replay|backfill)\b.{0,60}\bnon[- ]idempotent\b",
+        negation_scan,
+    ):
+        issues.append("unsafe_negated_feature_store_correctness")
+
+    late_signal = re.search(r"\b(?:late\s+events?|out[- ]of[- ]order|watermark)\b", lower)
+    late_policy = re.search(
+        r"\b(?:correct|recompute|backfill|drop|quarantine|window|revision|supersed)\w*\b",
+        lower,
+    )
+    if not (late_signal and late_policy):
+        issues.append("missing_late_event_correction_policy")
+
+    replay_signal = re.search(r"\b(?:replay|backfill|reprocess)\w*\b", lower)
+    replay_safety = re.search(
+        r"\b(?:idempot\w*|dedup\w*|event[- ]id|materialization[- ]version)\b",
+        lower,
+    )
+    if not (replay_signal and replay_safety):
+        issues.append("missing_idempotent_feature_replay")
+
+    parity_check = bool(
+        re.search(r"\b(?:skew|parity|diff|compare|equivalence)\w*\b", lower)
+        and re.search(r"\b(?:online|serving|live)\b", lower)
+        and re.search(r"\b(?:offline|training|batch)\b", lower)
+    )
+    if not parity_check:
+        issues.append("missing_online_offline_feature_skew_check")
+
+    numeric_target = bool(
+        re.search(
+            r"\b(?:p\d{2}|latency|throughput|availability|retention|scale)\b"
+            r".{0,35}(?:[<>]=?\s*)?\d+(?:\.\d+)?\s*"
+            r"(?:ms|milliseconds?|seconds?|qps|rps|events?(?:/|\s+per\s+)"
+            r"seconds?|%|percent)\b|"
+            r"\b\d+(?:\.\d+)?\s*[km]?\+?\s*events?(?:/|\s+per\s+)seconds?\b",
+            lower,
+        )
+    )
+    labeled_assumption = bool(
+        re.search(
+            r"\b(?:assumption|illustrative|example\s+target|to\s+be\s+set|"
+            r"derive\w*\s+from\s+(?:the\s+)?(?:product\s+)?slo)\b",
+            lower,
+        )
+    )
+    if numeric_target and not labeled_assumption:
+        issues.append("unlabeled_numeric_feature_store_target")
+    return issues
+
+
+def payment_timeout_followup_completeness_issues(text: str) -> List[str]:
+    """Require exact, operator-safe resolution for an ambiguous charged timeout."""
+    lower = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[*`~]+", "", text.casefold().replace("’", "'")),
+    )
+    issues: List[str] = []
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?;])\s+", lower)
+        if sentence.strip()
+    ]
+    transition_sentences = [
+        sentence
+        for sentence in sentences
+        if "unknown" in sentence
+        and "succeeded" in sentence
+        and "failed" in sentence
+        and re.search(r"\b(?:move|transition|resolve|confirm|set)\w*\b", sentence)
+    ]
+    authoritative_transition = any(
+        re.search(r"\b(?:provider|processor)\b", sentence)
+        and re.search(r"\b(?:status|lookup|query|webhook|evidence|response)\b", sentence)
+        and re.search(r"\b(?:authoritative|confirm|definitive)\w*\b", sentence)
+        for sentence in transition_sentences
+    )
+    authoritative_boundary = any(
+        "unknown" in sentence
+        and re.search(r"\b(?:move|transition|resolve|remain|stay)\w*\b", sentence)
+        and re.search(r"\b(?:provider|processor)\b", sentence)
+        and re.search(r"\b(?:status|lookup|query|webhook|evidence|response)\b", sentence)
+        and re.search(r"\b(?:authoritative|confirm|definitive)\w*\b", sentence)
+        for sentence in sentences
+    )
+    succeeded_mapping = any(
+        "succeeded" in sentence
+        and re.search(r"\b(?:confirm|authoritative|definitive)\w*\b", sentence)
+        and re.search(r"\b(?:become|map|move|transition|set|resolve)\w*\b", sentence)
+        for sentence in sentences
+    )
+    failed_mapping = any(
+        "failed" in sentence
+        and re.search(r"\b(?:confirm|authoritative|definitive)\w*\b", sentence)
+        and re.search(r"\b(?:become|map|move|transition|set|resolve)\w*\b", sentence)
+        for sentence in sentences
+    )
+    authoritative_transition = bool(
+        authoritative_transition
+        or (authoritative_boundary and succeeded_mapping and failed_mapping)
+    )
+    unsafe_local_transition = any(
+        re.search(
+            r"\b(?:timer|cron|retry\s+exhaustion|retries\s+(?:end|expire)|"
+            r"local\s+timeout|our\s+(?:clock|timer|policy))\b",
+            sentence,
+        )
+        and not (
+            re.search(r"\b(?:provider|processor)\b", sentence)
+            and re.search(r"\b(?:authoritative|confirm|definitive)\w*\b", sentence)
+        )
+        for sentence in transition_sentences
+    )
+    if not authoritative_transition:
+        issues.append("missing_authoritative_unknown_terminal_transitions")
+    if unsafe_local_transition:
+        issues.append("unsafe_non_authoritative_unknown_terminal_transition")
+
+    unresolved_policy = bool(
+        re.search(r"\b(?:remain|stay|keep)\w*\b.{0,30}\bunknown\b", lower)
+        and re.search(
+            r"\b(?:manual|operator|operations|case|escalat|dead[- ]letter)\w*\b"
+            r".{0,50}\b(?:reconcil|review|queue|workflow)\w*\b|"
+            r"\b(?:reconcil|review)\w*\b.{0,50}"
+            r"\b(?:manual|operator|operations|escalat)\w*\b",
+            lower,
+        )
+    )
+    if not unresolved_policy:
+        issues.append("missing_unresolved_manual_reconciliation_policy")
+
+    safe_replay_condition = has_safe_payment_same_operation_replay_condition(lower)
+    if not safe_replay_condition:
+        issues.append("missing_safe_same_operation_replay_condition")
+    return issues
+
+
+def self_check_production_answer_contracts() -> None:
+    shallow_rag = (
+        "Use a golden dataset and score retrieval precision and faithfulness. "
+        "Review the top 10% with humans. Target p95 latency under 2 seconds."
+    )
+    assert {
+        "missing_retrieval_recall_or_ranking_metric",
+        "missing_citation_correctness_evaluation",
+        "missing_no_answer_refusal_evaluation",
+        "unsafe_top_score_only_human_review",
+        "unlabeled_numeric_rag_launch_target",
+    }.issubset(set(rag_evaluation_plan_issues(shallow_rag)))
+    assert "unlabeled_numeric_rag_launch_target" not in rag_evaluation_plan_issues(
+        "Measure cost per 1,000 tokens and p95 latency against a named baseline."
+    )
+    complete_rag = (
+        "Use a versioned golden set sliced by common, rare, no-answer, adversarial "
+        "prompt-injection, ACL permission leakage, and PII privacy cases. Measure "
+        "recall@k and nDCG, faithfulness, citation correctness, correct refusal, latency, "
+        "and cost. Compare the champion baseline with predeclared per-slice launch gates "
+        "and regression checks. Calibrate the judge against blinded human labels, report "
+        "inter-rater agreement, and use stratified risk-weighted human review."
+    )
+    assert not rag_evaluation_plan_issues(complete_rag)
+    biased_review = complete_rag + " Review only the top 10% with humans."
+    assert "unsafe_top_score_only_human_review" in rag_evaluation_plan_issues(
+        biased_review
+    )
+    safely_rejected_bias = complete_rag + " Never review only the top 10% with humans."
+    assert "unsafe_top_score_only_human_review" not in rag_evaluation_plan_issues(
+        safely_rejected_bias
+    )
+    omitted_safety = complete_rag + (
+        " Do not evaluate ACL permission leakage or PII privacy cases."
+    )
+    assert "unsafe_omitted_rag_safety_slice" in rag_evaluation_plan_issues(
+        omitted_safety
+    )
+
+    shallow_store = (
+        "Use online and offline stores, a stream processor, point-in-time training, "
+        "backfills, and a registry with the same schema and transformations."
+    )
+    assert {
+        "missing_shared_executable_feature_transformations",
+        "missing_feature_event_time",
+        "missing_feature_availability_time",
+        "missing_point_in_time_join_mechanics",
+        "missing_late_event_correction_policy",
+        "missing_idempotent_feature_replay",
+        "missing_online_offline_feature_skew_check",
+    } == set(feature_store_consistency_issues(shallow_store))
+    complete_store = (
+        "One versioned executable feature code package is compiled for streaming and "
+        "batch training jobs. Persist event-time and availability-time, then build "
+        "training rows with an as-of join admitting both event-time and availability-time "
+        "at or before prediction-time. A watermark defines late events; corrections "
+        "trigger an idempotent backfill replay deduplicated by event-id and materialization "
+        "version. Continuously compare online and offline values for skew and parity."
+    )
+    assert not feature_store_consistency_issues(complete_store)
+    alternate_store_wording = (
+        "We define executable feature transformations once and compile them for batch "
+        "training and stream serving. Run an equivalence test between batch training "
+        "outputs and live serving outputs."
+    )
+    alternate_store_issues = set(feature_store_consistency_issues(alternate_store_wording))
+    assert "missing_shared_executable_feature_transformations" not in alternate_store_issues
+    assert "missing_online_offline_feature_skew_check" not in alternate_store_issues
+    dsl_store_wording = (
+        "Define every feature once in a versioned DSL and compile that definition into "
+        "both streaming and batch jobs."
+    )
+    assert "missing_shared_executable_feature_transformations" not in (
+        feature_store_consistency_issues(dsl_store_wording)
+    )
+    invented_store_slos = (
+        "Serve at p99 under 50ms and ingest 10k events per second with the feature store."
+    )
+    assert "unlabeled_numeric_feature_store_target" in feature_store_consistency_issues(
+        invented_store_slos
+    )
+    assert "unlabeled_numeric_feature_store_target" not in feature_store_consistency_issues(
+        "Assumption: serve at p99 under 50ms and ingest 10k events per second."
+    )
+    negated_store = complete_store + (
+        " Do not share executable transformation code. Do not persist event-time or "
+        "availability-time, skip the as-of join, do not correct late events, make replay "
+        "and backfill non-idempotent without dedup, and do not compare online and offline "
+        "values for skew or parity."
+    )
+    assert "unsafe_negated_feature_store_correctness" in (
+        feature_store_consistency_issues(negated_store)
+    )
+    safe_join_warning = complete_store + " Never skip the as-of join."
+    assert "unsafe_negated_feature_store_correctness" not in (
+        feature_store_consistency_issues(safe_join_warning)
+    )
+    leaking_store = complete_store.replace(
+        "admitting both event-time and availability-time at or before prediction-time",
+        "where event-time is before prediction-time but availability-time is not filtered",
+    )
+    leaking_issues = set(feature_store_consistency_issues(leaking_store))
+    assert "missing_point_in_time_join_mechanics" in leaking_issues
+    assert "unsafe_negated_feature_store_correctness" in leaking_issues
+
+    shallow_payment = (
+        "Move PROCESSING to UNKNOWN, stop retries, query provider status, and use "
+        "deduplicated webhooks. Reuse the original key if the command is replayed."
+    )
+    assert set(payment_timeout_followup_completeness_issues(shallow_payment)) == {
+        "missing_authoritative_unknown_terminal_transitions",
+        "missing_unresolved_manual_reconciliation_policy",
+        "missing_safe_same_operation_replay_condition",
+    }
+    complete_payment = (
+        "UNKNOWN moves to SUCCEEDED or FAILED only from authoritative provider status or webhook "
+        "evidence. If unresolved, remain UNKNOWN and escalate to a manual reconciliation "
+        "workflow. Only if reconciliation remains inconclusive and the provider guarantees "
+        "idempotency do I retry the same operation under a bounded policy with the "
+        "original idempotency key."
+    )
+    assert not payment_timeout_followup_completeness_issues(complete_payment)
+    prompt_contract_payment = (
+        "I would transition the payment intent from PROCESSING to UNKNOWN and stop "
+        "automatic charge retries. Provider status checks by payment ID and webhooks "
+        "persisted under a database uniqueness constraint on provider event ID move "
+        "UNKNOWN to SUCCEEDED, FAILED, or CANCELED only from authoritative evidence. "
+        "Reconcile first. Only if the result remains inconclusive and the provider "
+        "contract guarantees idempotent replay may the exact same provider command be "
+        "retried under a bounded policy with the original operation's idempotency key, "
+        "never a new key. If unresolved, keep it UNKNOWN and escalate to a manual "
+        "reconciliation workflow; never release a second charge. The operation key is "
+        "not the webhook deduplication key."
+    )
+    assert not has_unsafe_ambiguous_payment_outcome(prompt_contract_payment)
+    assert not payment_operation_semantic_issues(
+        prompt_contract_payment,
+        require_webhook_event_dedup=False,
+        require_complete_idempotency_semantics=False,
+        require_same_operation_retry_reuse=True,
+    )
+    assert not payment_timeout_followup_completeness_issues(prompt_contract_payment)
+    split_transition_payment = prompt_contract_payment.replace(
+        "Provider status checks by payment ID and webhooks persisted under a database "
+        "uniqueness constraint on provider event ID move UNKNOWN to SUCCEEDED, FAILED, "
+        "or CANCELED only from authoritative evidence.",
+        "UNKNOWN moves only from authoritative provider status or webhook evidence. "
+        "A confirmed charge becomes SUCCEEDED. A confirmed no-charge result becomes "
+        "FAILED. Webhooks are persisted under a database uniqueness constraint on "
+        "provider event ID.",
+    )
+    assert not payment_timeout_followup_completeness_issues(split_transition_payment)
+    timer_payment = prompt_contract_payment.replace(
+        "Provider status checks by payment ID and webhooks persisted under a database "
+        "uniqueness constraint on provider event ID move UNKNOWN to SUCCEEDED, FAILED, "
+        "or CANCELED only from authoritative evidence.",
+        "After a timeout, UNKNOWN moves to SUCCEEDED, FAILED, or CANCELED on our timer. "
+        "Provider webhooks are persisted under a database uniqueness constraint on "
+        "provider event ID.",
+    )
+    timer_issues = set(payment_timeout_followup_completeness_issues(timer_payment))
+    assert "missing_authoritative_unknown_terminal_transitions" in timer_issues
+    assert "unsafe_non_authoritative_unknown_terminal_transition" in timer_issues
+    unsafe_extra_retry = prompt_contract_payment + (
+        " Separately, retry the payment automatically every minute until it succeeds."
+    )
+    assert has_unsafe_ambiguous_payment_outcome(unsafe_extra_retry)
+    active_safe_retry = prompt_contract_payment.replace(
+        "Reconcile first. Only if the result remains inconclusive and the provider "
+        "contract guarantees idempotent replay may the exact same provider command be "
+        "retried under a bounded policy with the original operation's idempotency key, "
+        "never a new key.",
+        "Reconcile first. Only if the result remains inconclusive and the provider "
+        "guarantees idempotency do I retry the payment with the original idempotency "
+        "key under a bounded policy, never a new key.",
+    )
+    assert not has_unsafe_ambiguous_payment_outcome(active_safe_retry)
 
 
 def missing_required_group_issues(case: EvalCase, text: str) -> List[str]:
@@ -3090,8 +3924,11 @@ def has_valid_needs_story_facts_artifact(body: Optional[str]) -> bool:
 
 
 def is_safe_needs_user_input_outcome(case: EvalCase, attempt: AttemptResult) -> bool:
-    """Recognize Q46's safe abstention without treating it as answer success."""
-    if case.id != "Q46" or attempt.artifact_type != "needs_story_facts":
+    """Recognize a configured truth-gap intervention as the safe customer outcome."""
+    if (
+        case.expected_outcome != "needs_user_input"
+        or attempt.artifact_type != "needs_story_facts"
+    ):
         return False
     return bool(
         has_valid_needs_story_facts_artifact(attempt.artifact_body)
@@ -3186,6 +4023,8 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
         issues.append("unsafe_mysql_not_valid_portability_claim")
     if case.id == "Q10":
         issues.extend(large_fk_migration_safety_issues(combined))
+    if case.id == "Q27":
+        issues.extend(rag_evaluation_plan_issues(combined))
     if case.id == "Q39" and has_exactly_once_processing_overclaim(combined):
         issues.append("unsafe_exactly_once_processing_claim")
     if case.id == "Q39":
@@ -3207,6 +4046,7 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
                 require_same_operation_retry_reuse=True,
             )
         )
+        issues.extend(payment_timeout_followup_completeness_issues(combined))
     if case.id == "Q46":
         q46_visible = attempt.visible_answer
         issues.extend(q46_story_grounding_issues(q46_visible))
@@ -3217,8 +4057,10 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
             safe_truth_gap and has_valid_needs_story_facts_artifact(attempt.artifact_body)
         ):
             issues.append("q46_invalid_needs_story_facts_artifact")
-    if case.id == "Q38" and has_drift_only_automatic_retraining(combined):
+    if case.id in ("Q29", "Q38") and has_drift_only_automatic_retraining(combined):
         issues.append("unsafe_drift_only_automatic_retraining")
+    if case.id == "Q38":
+        issues.extend(feature_store_consistency_issues(combined))
     return issues
 
 
@@ -3344,15 +4186,19 @@ def self_check_attempt_integrity_guards() -> None:
         artifact_type="needs_story_facts",
         artifact_body=story_facts_artifact,
     )
-    q46 = next(case for case in CASES if case.id == "Q46")
-    assert blocking_answer_issues(q46, needs_facts) == ["needs_user_input"]
-    assert is_safe_needs_user_input_outcome(q46, needs_facts)
-    assert not answer_is_success(q46, needs_facts)
-    assert expected_outcome_is_accepted(q46, needs_facts)
-    _, _, _, safe_accuracy, safe_issues = quality_scores(q46, needs_facts)
-    assert safe_accuracy == 25
-    assert "answer_quality_gate_failed" not in safe_issues
-    assert "not_first_person_speakable" not in safe_issues
+    truth_gap_cases = [
+        case for case in CASES if case.expected_outcome == "needs_user_input"
+    ]
+    q46 = next(case for case in truth_gap_cases if case.id == "Q46")
+    for case in truth_gap_cases:
+        assert blocking_answer_issues(case, needs_facts) == ["needs_user_input"]
+        assert is_safe_needs_user_input_outcome(case, needs_facts)
+        assert not answer_is_success(case, needs_facts)
+        assert expected_outcome_is_accepted(case, needs_facts)
+        _, _, _, safe_accuracy, safe_issues = quality_scores(case, needs_facts)
+        assert safe_accuracy == 25
+        assert "answer_quality_gate_failed" not in safe_issues
+        assert "not_first_person_speakable" not in safe_issues
 
     unlabeled_needs_facts = AttemptResult(
         attempt=1,
@@ -3748,9 +4594,14 @@ def self_check_attempt_integrity_guards() -> None:
         "stable key. A timeout leaves the original payment UNKNOWN in "
         "PENDING_RECONCILIATION and blocks that charge. Query provider status and "
         "deduplicate webhooks by provider event ID while reconciling the original "
-        "payment. After the provider status lookup confirms it FAILED with no charge, "
-        "the customer explicitly authorizes a distinct later purchase, so create a "
-        "new payment intent with its own new operation-scoped key."
+        "payment. Authoritative provider evidence moves UNKNOWN to SUCCEEDED or "
+        "FAILED. Only if reconciliation is inconclusive and the provider guarantees "
+        "idempotency do we retry the same operation under a bounded policy with its "
+        "original idempotency key. "
+        "If still unresolved, keep it UNKNOWN and escalate to manual reconciliation. "
+        "After the provider status lookup confirms it FAILED with no charge, the "
+        "customer explicitly authorizes a distinct later purchase, so create a new "
+        "payment intent with its own new operation-scoped key."
     )
     reconciled_attempt = AttemptResult(
         attempt=1,
@@ -4111,6 +4962,7 @@ def main(argv: Sequence[str]) -> int:
     self_check_payment_operation_semantics()
     self_check_payment_platform_safety_detector()
     self_check_q46_story_grounding_detector()
+    self_check_production_answer_contracts()
     self_check_attempt_integrity_guards()
     self_check_release_exit_gate()
     self_check_typed_answer_context()
