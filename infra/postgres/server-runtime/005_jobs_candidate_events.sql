@@ -1,3 +1,4 @@
+-- Target: Postgres only
 -- Append-only candidate feedback, support issues, and confirmed outcomes.
 -- Optional notes and reasons are authenticated-encrypted in event_json.
 

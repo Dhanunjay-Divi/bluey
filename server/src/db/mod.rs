@@ -1530,6 +1530,8 @@ const POSTGRES_OBJECT_UPLOAD_CONTROLS: &str =
     include_str!("../../../infra/postgres/server-runtime/003_object_upload_controls.sql");
 const POSTGRES_STRIPE_AUTO_RELOAD: &str =
     include_str!("../../../infra/postgres/server-runtime/004_stripe_auto_reload.sql");
+const POSTGRES_JOBS_CANDIDATE_EVENTS: &str =
+    include_str!("../../../infra/postgres/server-runtime/005_jobs_candidate_events.sql");
 const POSTGRES_CONTEXT_ARTIFACT_REVISIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/006_context_artifact_revisions.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -1540,6 +1542,10 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
         POSTGRES_OBJECT_UPLOAD_CONTROLS,
     ),
     ("004_stripe_auto_reload.sql", POSTGRES_STRIPE_AUTO_RELOAD),
+    (
+        "005_jobs_candidate_events.sql",
+        POSTGRES_JOBS_CANDIDATE_EVENTS,
+    ),
 ];
 const POSTGRES_JOBS_SCHEMA: &str =
     include_str!("../../../infra/postgres/server-runtime/002_jobs.sql");
@@ -1664,5 +1670,20 @@ mod blocking_boundary_tests {
         assert!(!in_db_blocking_context());
         assert!(run_blocking_db(in_db_blocking_context));
         assert!(!in_db_blocking_context());
+    }
+}
+
+#[cfg(test)]
+mod postgres_migration_tests {
+    use super::POSTGRES_MIGRATIONS;
+
+    #[test]
+    fn candidate_events_are_part_of_runtime_postgres_migrations() {
+        let (_, sql) = POSTGRES_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == "005_jobs_candidate_events.sql")
+            .expect("candidate event migration must run before Jobs routes are served");
+
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS jobs_candidate_events"));
     }
 }
