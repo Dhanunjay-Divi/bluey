@@ -547,14 +547,17 @@ fn resolve_provider_mix_candidates(lane: &str, seed: &str) -> Vec<(&'static str,
         ),
         "local" => vec![],
         _ => rotate_preferred_routes(
+            // Live answer evaluation keeps balanced first attempts on the
+            // three routes that combined the best latency and answer quality.
+            // Anthropic/Gemini remain immediate fallbacks for resilience.
             vec![
-                ("anthropic", ANTHROPIC_BALANCED_MODEL),
                 ("deepseek", DEEPSEEK_FLASH_MODEL),
-                ("gemini", GEMINI_FLASH_MODEL),
                 ("openai", OPENAI_FAST_MODEL),
                 ("zai", ZAI_FAST_MODEL),
             ],
             vec![
+                ("anthropic", ANTHROPIC_BALANCED_MODEL),
+                ("gemini", GEMINI_FLASH_MODEL),
                 ("anthropic", ANTHROPIC_FAST_MODEL),
                 ("openai", OPENAI_ACCURATE_MODEL),
                 ("gemini", GEMINI_PRO_MODEL),
@@ -1027,6 +1030,44 @@ fn anthropic_stream_usage_or_estimate(
     Ok((input_tokens.unwrap_or(fallback_input), output_tokens))
 }
 
+/// Provider terminal reasons are intentionally handled with a small allowlist.
+/// New provider reasons must not silently turn a truncated or blocked answer
+/// into a billable successful completion.
+fn terminal_reason_is_success(reason: &str) -> bool {
+    let normalized = reason.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    matches!(normalized.as_str(), "stop" | "end_turn" | "stop_sequence")
+}
+
+fn first_abnormal_terminal_reason<'a>(
+    reasons: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    reasons
+        .into_iter()
+        .map(str::trim)
+        .find(|reason| !reason.is_empty() && !terminal_reason_is_success(reason))
+        .map(str::to_string)
+}
+
+fn abnormal_terminal_error(provider: &str, reason: &str) -> anyhow::Error {
+    anyhow!("{provider} completion ended with abnormal terminal reason `{reason}`")
+}
+
+fn ensure_successful_terminal_reasons<'a>(
+    provider: &str,
+    reasons: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    if let Some(reason) = first_abnormal_terminal_reason(reasons) {
+        return Err(abnormal_terminal_error(provider, &reason));
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedTextStreamChunk {
+    deltas: Vec<String>,
+    abnormal_terminal_reason: Option<String>,
+}
+
 #[derive(Serialize)]
 struct OpenAiMessage<'a> {
     role: &'static str,
@@ -1063,6 +1104,7 @@ struct OpenAiChatResp {
 #[derive(Deserialize)]
 struct OpenAiChoice {
     message: OpenAiResponseMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1076,6 +1118,16 @@ struct OpenAiUsage {
     prompt_tokens: i64,
     #[serde(default)]
     completion_tokens: i64,
+}
+
+fn ensure_openai_completion_finished(provider: &str, response: &OpenAiChatResp) -> Result<()> {
+    ensure_successful_terminal_reasons(
+        provider,
+        response
+            .choices
+            .iter()
+            .filter_map(|choice| choice.finish_reason.as_deref()),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1164,6 +1216,7 @@ async fn openai_compatible_complete(
         .json()
         .await
         .with_context(|| format!("{provider} json"))?;
+    ensure_openai_completion_finished(provider, &parsed)?;
     let text = parsed
         .choices
         .into_iter()
@@ -1206,6 +1259,7 @@ struct OpenAiStreamError {
 #[derive(Deserialize)]
 struct OpenAiStreamChoice {
     delta: OpenAiStreamDelta,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1322,11 +1376,23 @@ async fn openai_compatible_complete_stream(
                     seen_done = true;
                     continue;
                 }
-                for delta in
-                    parse_openai_stream_chunk(stream_provider.as_str(), data, &mut final_usage)?
-                {
+                let ParsedTextStreamChunk {
+                    deltas,
+                    abnormal_terminal_reason,
+                } = parse_openai_stream_chunk(
+                    stream_provider.as_str(),
+                    data,
+                    &mut final_usage,
+                )?;
+                for delta in deltas {
                     output_chars = output_chars.saturating_add(delta.chars().count());
                     yield CompletionStreamEvent::Delta(delta);
+                }
+                if let Some(reason) = abnormal_terminal_reason {
+                    Err::<(), anyhow::Error>(abnormal_terminal_error(
+                        &stream_provider,
+                        &reason,
+                    ))?;
                 }
             }
         }
@@ -1341,11 +1407,23 @@ async fn openai_compatible_complete_stream(
                 seen_done = seen_done || data == "[DONE]";
                 continue;
             }
-            for delta in
-                parse_openai_stream_chunk(stream_provider.as_str(), data, &mut final_usage)?
-            {
+            let ParsedTextStreamChunk {
+                deltas,
+                abnormal_terminal_reason,
+            } = parse_openai_stream_chunk(
+                stream_provider.as_str(),
+                data,
+                &mut final_usage,
+            )?;
+            for delta in deltas {
                 output_chars = output_chars.saturating_add(delta.chars().count());
                 yield CompletionStreamEvent::Delta(delta);
+            }
+            if let Some(reason) = abnormal_terminal_reason {
+                Err::<(), anyhow::Error>(abnormal_terminal_error(
+                    &stream_provider,
+                    &reason,
+                ))?;
             }
         }
         let usage = openai_stream_usage_or_estimate(
@@ -1374,7 +1452,7 @@ fn parse_openai_stream_chunk(
     provider: &str,
     data: &str,
     final_usage: &mut Option<OpenAiUsage>,
-) -> Result<Vec<String>> {
+) -> Result<ParsedTextStreamChunk> {
     let parsed: OpenAiStreamChunk =
         serde_json::from_str(data).with_context(|| format!("openai stream json: {data}"))?;
     if let Some(error) = parsed.error {
@@ -1396,12 +1474,22 @@ fn parse_openai_stream_chunk(
     if let Some(usage) = parsed.usage {
         *final_usage = Some(usage);
     }
-    Ok(parsed
+    let abnormal_terminal_reason = first_abnormal_terminal_reason(
+        parsed
+            .choices
+            .iter()
+            .filter_map(|choice| choice.finish_reason.as_deref()),
+    );
+    let deltas = parsed
         .choices
         .into_iter()
         .filter_map(|choice| choice.delta.content)
         .filter(|content| !content.is_empty())
-        .collect())
+        .collect();
+    Ok(ParsedTextStreamChunk {
+        deltas,
+        abnormal_terminal_reason,
+    })
 }
 
 fn openai_user_content<'a>(
@@ -1479,6 +1567,8 @@ struct GeminiGenerateResp {
     candidates: Vec<GeminiCandidate>,
     #[serde(rename = "usageMetadata")]
     usage_metadata: Option<GeminiUsage>,
+    #[serde(rename = "promptFeedback")]
+    prompt_feedback: Option<GeminiPromptFeedback>,
     error: Option<GeminiError>,
 }
 
@@ -1498,6 +1588,12 @@ struct GeminiRespContent {
 #[derive(Deserialize)]
 struct GeminiRespPart {
     text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GeminiPromptFeedback {
+    #[serde(rename = "blockReason")]
+    block_reason: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1526,6 +1622,31 @@ impl GeminiGenerateResp {
             .collect::<Vec<_>>()
             .join("")
     }
+}
+
+fn gemini_abnormal_terminal_reason(response: &GeminiGenerateResp) -> Option<String> {
+    response
+        .prompt_feedback
+        .as_ref()
+        .and_then(|feedback| feedback.block_reason.as_deref())
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            first_abnormal_terminal_reason(
+                response
+                    .candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.finish_reason.as_deref()),
+            )
+        })
+}
+
+fn ensure_gemini_completion_finished(response: &GeminiGenerateResp) -> Result<()> {
+    if let Some(reason) = gemini_abnormal_terminal_reason(response) {
+        return Err(abnormal_terminal_error("gemini", &reason));
+    }
+    Ok(())
 }
 
 impl GeminiUsage {
@@ -1582,12 +1703,13 @@ async fn gemini_complete(
         ));
     }
     let parsed: GeminiGenerateResp = resp.json().await.context("gemini json")?;
-    if let Some(error) = parsed.error {
+    if let Some(error) = parsed.error.as_ref() {
         let message = error
             .message
-            .or(error.status)
-            .unwrap_or_else(|| "unknown upstream error".to_string());
-        if explicit_media_rejection_body(&message) {
+            .as_deref()
+            .or(error.status.as_deref())
+            .unwrap_or("unknown upstream error");
+        if explicit_media_rejection_body(message) {
             return Err(anyhow!(UpstreamMediaRejectionError {
                 provider: "gemini".to_string(),
                 status: 400,
@@ -1595,6 +1717,7 @@ async fn gemini_complete(
         }
         return Err(anyhow!("gemini error: {message}"));
     }
+    ensure_gemini_completion_finished(&parsed)?;
     let fallback_input = fallback_input_tokens.unwrap_or(0);
     let (input_tokens, output_tokens) = parsed
         .usage_metadata
@@ -1672,8 +1795,15 @@ async fn gemini_complete_stream(
                     seen_done = true;
                     continue;
                 }
-                for delta in parse_gemini_stream_chunk(data, &mut final_usage, &mut seen_terminal)? {
+                let ParsedTextStreamChunk {
+                    deltas,
+                    abnormal_terminal_reason,
+                } = parse_gemini_stream_chunk(data, &mut final_usage, &mut seen_terminal)?;
+                for delta in deltas {
                     yield CompletionStreamEvent::Delta(delta);
+                }
+                if let Some(reason) = abnormal_terminal_reason {
+                    Err::<(), anyhow::Error>(abnormal_terminal_error("gemini", &reason))?;
                 }
             }
         }
@@ -1690,8 +1820,15 @@ async fn gemini_complete_stream(
                 seen_done = true;
                 continue;
             }
-            for delta in parse_gemini_stream_chunk(data, &mut final_usage, &mut seen_terminal)? {
+            let ParsedTextStreamChunk {
+                deltas,
+                abnormal_terminal_reason,
+            } = parse_gemini_stream_chunk(data, &mut final_usage, &mut seen_terminal)?;
+            for delta in deltas {
                 yield CompletionStreamEvent::Delta(delta);
+            }
+            if let Some(reason) = abnormal_terminal_reason {
+                Err::<(), anyhow::Error>(abnormal_terminal_error("gemini", &reason))?;
             }
         }
         if !seen_done && !seen_terminal {
@@ -1803,9 +1940,10 @@ fn parse_gemini_stream_chunk(
     data: &str,
     final_usage: &mut Option<GeminiUsage>,
     seen_terminal: &mut bool,
-) -> Result<Vec<String>> {
+) -> Result<ParsedTextStreamChunk> {
     let parsed: GeminiGenerateResp =
         serde_json::from_str(data).with_context(|| format!("gemini stream json: {data}"))?;
+    let abnormal_terminal_reason = gemini_abnormal_terminal_reason(&parsed);
     if let Some(error) = parsed.error {
         let message = error
             .message
@@ -1828,22 +1966,28 @@ fn parse_gemini_stream_chunk(
     if let Some(usage) = parsed.usage_metadata.clone() {
         *final_usage = Some(usage);
     }
-    if parsed.candidates.iter().any(|candidate| {
-        candidate
-            .finish_reason
-            .as_deref()
-            .is_some_and(|reason| !reason.is_empty())
-    }) {
+    if abnormal_terminal_reason.is_some()
+        || parsed.candidates.iter().any(|candidate| {
+            candidate
+                .finish_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
+        })
+    {
         *seen_terminal = true;
     }
-    Ok(parsed
+    let deltas = parsed
         .candidates
         .into_iter()
         .filter_map(|candidate| candidate.content)
         .flat_map(|content| content.parts)
         .filter_map(|part| part.text)
         .filter(|text| !text.is_empty())
-        .collect())
+        .collect();
+    Ok(ParsedTextStreamChunk {
+        deltas,
+        abnormal_terminal_reason,
+    })
 }
 
 // ─── Anthropic ───────────────────────────────────────────────────────────
@@ -1879,6 +2023,7 @@ struct AnthropicMessage<'a> {
 struct AnthropicResp {
     content: Vec<AnthropicContent>,
     usage: Option<AnthropicUsage>,
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1893,6 +2038,10 @@ struct AnthropicContent {
 struct AnthropicUsage {
     input_tokens: i64,
     output_tokens: i64,
+}
+
+fn ensure_anthropic_completion_finished(response: &AnthropicResp) -> Result<()> {
+    ensure_successful_terminal_reasons("anthropic", response.stop_reason.as_deref())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1957,6 +2106,7 @@ async fn anthropic_complete(
         return Err(error);
     }
     let parsed: AnthropicResp = resp.json().await.context("anthropic json")?;
+    ensure_anthropic_completion_finished(&parsed)?;
     let text = parsed
         .content
         .into_iter()
@@ -1998,6 +2148,7 @@ struct AnthropicStreamDelta {
     #[serde(rename = "type")]
     kind: Option<String>,
     text: Option<String>,
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2089,9 +2240,22 @@ async fn anthropic_complete_stream(
             let chunk = chunk.context("anthropic stream read")?;
             append_utf8_chunk(&chunk, &mut pending_utf8, &mut buffer)?;
             while let Some((event, data)) = take_sse_event(&mut buffer) {
-                if let Some(delta) = parse_anthropic_stream_event(&event, &data, &mut input_tokens, &mut output_tokens, &mut seen_stop)? {
+                let ParsedTextStreamChunk {
+                    deltas,
+                    abnormal_terminal_reason,
+                } = parse_anthropic_stream_event(
+                    &event,
+                    &data,
+                    &mut input_tokens,
+                    &mut output_tokens,
+                    &mut seen_stop,
+                )?;
+                for delta in deltas {
                     output_chars = output_chars.saturating_add(delta.chars().count());
                     yield CompletionStreamEvent::Delta(delta);
+                }
+                if let Some(reason) = abnormal_terminal_reason {
+                    Err::<(), anyhow::Error>(abnormal_terminal_error("anthropic", &reason))?;
                 }
             }
         }
@@ -2100,9 +2264,22 @@ async fn anthropic_complete_stream(
             buffer.push_str(tail);
         }
         while let Some((event, data)) = take_sse_event(&mut buffer) {
-            if let Some(delta) = parse_anthropic_stream_event(&event, &data, &mut input_tokens, &mut output_tokens, &mut seen_stop)? {
+            let ParsedTextStreamChunk {
+                deltas,
+                abnormal_terminal_reason,
+            } = parse_anthropic_stream_event(
+                &event,
+                &data,
+                &mut input_tokens,
+                &mut output_tokens,
+                &mut seen_stop,
+            )?;
+            for delta in deltas {
                 output_chars = output_chars.saturating_add(delta.chars().count());
                 yield CompletionStreamEvent::Delta(delta);
+            }
+            if let Some(reason) = abnormal_terminal_reason {
+                Err::<(), anyhow::Error>(abnormal_terminal_error("anthropic", &reason))?;
             }
         }
         let (input_tokens, output_tokens) = anthropic_stream_usage_or_estimate(
@@ -2132,10 +2309,13 @@ fn parse_anthropic_stream_event(
     input_tokens: &mut Option<i64>,
     output_tokens: &mut Option<i64>,
     seen_stop: &mut bool,
-) -> Result<Option<String>> {
+) -> Result<ParsedTextStreamChunk> {
     let data = data.trim();
     if data.is_empty() || data == "[DONE]" {
-        return Ok(None);
+        return Ok(ParsedTextStreamChunk {
+            deltas: Vec::new(),
+            abnormal_terminal_reason: None,
+        });
     }
     let parsed: AnthropicStreamPayload =
         serde_json::from_str(data).with_context(|| format!("anthropic stream json: {data}"))?;
@@ -2159,6 +2339,17 @@ fn parse_anthropic_stream_event(
         }
         return Err(anyhow!("anthropic stream error: {message}"));
     }
+    let is_message_delta = event == "message_delta" || parsed.kind == "message_delta";
+    let abnormal_terminal_reason = is_message_delta
+        .then(|| {
+            first_abnormal_terminal_reason(
+                parsed
+                    .delta
+                    .as_ref()
+                    .and_then(|delta| delta.stop_reason.as_deref()),
+            )
+        })
+        .flatten();
     if event == "message_start" || parsed.kind == "message_start" {
         if let Some(usage) = parsed.message.and_then(|message| message.usage) {
             if let Some(value) = usage.input_tokens {
@@ -2169,7 +2360,7 @@ fn parse_anthropic_stream_event(
             }
         }
     }
-    if event == "message_delta" || parsed.kind == "message_delta" {
+    if is_message_delta {
         if let Some(usage) = parsed.usage {
             if let Some(value) = usage.input_tokens.filter(|value| *value > 0) {
                 *input_tokens = Some(value);
@@ -2185,11 +2376,21 @@ fn parse_anthropic_stream_event(
     if event == "content_block_delta" || parsed.kind == "content_block_delta" {
         if let Some(delta) = parsed.delta {
             if delta.kind.as_deref() == Some("text_delta") || delta.text.is_some() {
-                return Ok(delta.text.filter(|text| !text.is_empty()));
+                return Ok(ParsedTextStreamChunk {
+                    deltas: delta
+                        .text
+                        .filter(|text| !text.is_empty())
+                        .into_iter()
+                        .collect(),
+                    abnormal_terminal_reason,
+                });
             }
         }
     }
-    Ok(None)
+    Ok(ParsedTextStreamChunk {
+        deltas: Vec::new(),
+        abnormal_terminal_reason,
+    })
 }
 
 fn provider_stream_capacity_error(
@@ -2716,13 +2917,13 @@ mod tests {
         assert_eq!(resolve_route("instant"), ("openai", "gpt-5.4-mini"));
         assert_eq!(
             resolve_route("balanced"),
-            ("anthropic", "claude-sonnet-4-6"),
+            ("deepseek", "deepseek-v4-flash"),
         );
         assert_eq!(resolve_route("deep"), ("anthropic", "claude-opus-4-8"),);
         assert_eq!(resolve_route("vision"), ("gemini", "gemini-3.5-flash"));
         assert_eq!(resolve_route("local"), ("unsupported", "local"));
         // Unknown → balanced default.
-        assert_eq!(resolve_route("???"), ("anthropic", "claude-sonnet-4-6"),);
+        assert_eq!(resolve_route("???"), ("deepseek", "deepseek-v4-flash"),);
     }
 
     #[test]
@@ -2851,7 +3052,12 @@ mod tests {
                 }
             }
 
-            for provider in ["anthropic", "deepseek", "gemini", "openai", "zai"] {
+            let expected = if lane == "balanced" {
+                vec!["deepseek", "openai", "zai"]
+            } else {
+                vec!["anthropic", "deepseek", "gemini", "openai", "zai"]
+            };
+            for provider in expected {
                 assert!(
                     first_providers.contains(&provider),
                     "provider mix should rotate {lane} first attempts across {provider}; got {first_providers:?}"
@@ -2865,18 +3071,20 @@ mod tests {
         for lane in ["instant", "balanced", "deep"] {
             let routes =
                 resolve_route_candidates_for_policy_and_seed(lane, RoutePolicy::ProviderMix, "");
+            let preferred_count = if lane == "balanced" { 3 } else { 5 };
             let mut providers = routes
                 .iter()
-                .take(5)
+                .take(preferred_count)
                 .map(|(provider, _model)| *provider)
                 .collect::<Vec<_>>();
             providers.sort_unstable();
             providers.dedup();
-            assert_eq!(
-                providers,
-                vec!["anthropic", "deepseek", "gemini", "openai", "zai"],
-                "{lane} preferred routes must spread first attempts evenly: {routes:?}"
-            );
+            let expected = if lane == "balanced" {
+                vec!["deepseek", "openai", "zai"]
+            } else {
+                vec!["anthropic", "deepseek", "gemini", "openai", "zai"]
+            };
+            assert_eq!(providers, expected, "unexpected {lane} preferred tier: {routes:?}");
         }
     }
 
@@ -3052,16 +3260,197 @@ mod tests {
     fn gemini_stream_chunk_tracks_final_usage() {
         let mut usage = None;
         let mut seen_terminal = false;
-        let deltas = parse_gemini_stream_chunk(
+        let parsed = parse_gemini_stream_chunk(
             r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"totalTokenCount":10}}"#,
             &mut usage,
             &mut seen_terminal,
         )
         .unwrap();
 
-        assert_eq!(deltas, vec!["hello"]);
+        assert_eq!(parsed.deltas, vec!["hello"]);
+        assert!(parsed.abnormal_terminal_reason.is_none());
         assert_eq!(usage.unwrap().token_counts(0), (7, 3));
         assert!(seen_terminal);
+    }
+
+    #[test]
+    fn normal_non_streaming_terminal_reasons_remain_successful() {
+        let openai: OpenAiChatResp = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        ensure_openai_completion_finished("openai", &openai).unwrap();
+
+        let gemini: GeminiGenerateResp = serde_json::from_str(
+            r#"{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}]}"#,
+        )
+        .unwrap();
+        ensure_gemini_completion_finished(&gemini).unwrap();
+
+        for reason in ["end_turn", "stop_sequence"] {
+            let anthropic: AnthropicResp = serde_json::from_value(serde_json::json!({
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": reason
+            }))
+            .unwrap();
+            ensure_anthropic_completion_finished(&anthropic).unwrap();
+        }
+    }
+
+    #[test]
+    fn normal_streaming_terminal_reasons_remain_successful() {
+        let mut openai_usage = None;
+        let openai = parse_openai_stream_chunk(
+            "openai",
+            r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+            &mut openai_usage,
+        )
+        .unwrap();
+        assert_eq!(openai.deltas, vec!["done"]);
+        assert!(openai.abnormal_terminal_reason.is_none());
+
+        for reason in ["end_turn", "stop_sequence"] {
+            let mut input_tokens = None;
+            let mut output_tokens = None;
+            let mut seen_stop = false;
+            let anthropic = parse_anthropic_stream_event(
+                "message_delta",
+                &serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": reason},
+                    "usage": {"output_tokens": 4}
+                })
+                .to_string(),
+                &mut input_tokens,
+                &mut output_tokens,
+                &mut seen_stop,
+            )
+            .unwrap();
+            assert!(anthropic.deltas.is_empty());
+            assert!(anthropic.abnormal_terminal_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn abnormal_non_streaming_terminal_reasons_are_rejected() {
+        for reason in ["length", "content_filter"] {
+            let openai: OpenAiChatResp = serde_json::from_value(serde_json::json!({
+                "choices": [{
+                    "message": {"content": "partial"},
+                    "finish_reason": reason
+                }]
+            }))
+            .unwrap();
+            let err = ensure_openai_completion_finished("openai", &openai).unwrap_err();
+            assert!(err.to_string().contains(reason));
+        }
+
+        for reason in ["MAX_TOKENS", "SAFETY"] {
+            let gemini: GeminiGenerateResp = serde_json::from_value(serde_json::json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "partial"}]},
+                    "finishReason": reason
+                }]
+            }))
+            .unwrap();
+            let err = ensure_gemini_completion_finished(&gemini).unwrap_err();
+            assert!(err.to_string().contains(reason));
+        }
+
+        for reason in ["max_tokens", "refusal"] {
+            let anthropic: AnthropicResp = serde_json::from_value(serde_json::json!({
+                "content": [{"type": "text", "text": "partial"}],
+                "stop_reason": reason
+            }))
+            .unwrap();
+            let err = ensure_anthropic_completion_finished(&anthropic).unwrap_err();
+            assert!(err.to_string().contains(reason));
+        }
+    }
+
+    #[test]
+    fn openai_stream_preserves_final_delta_before_abnormal_finish_error() {
+        let mut usage = None;
+        let parsed = parse_openai_stream_chunk(
+            "openai",
+            r#"{"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}"#,
+            &mut usage,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.deltas, vec!["partial"]);
+        assert_eq!(parsed.abnormal_terminal_reason.as_deref(), Some("length"));
+        let err = abnormal_terminal_error(
+            "openai",
+            parsed.abnormal_terminal_reason.as_deref().unwrap(),
+        );
+        assert!(err.to_string().contains("length"));
+    }
+
+    #[test]
+    fn gemini_stream_preserves_final_delta_before_abnormal_finish_error() {
+        let mut usage = None;
+        let mut seen_terminal = false;
+        let parsed = parse_gemini_stream_chunk(
+            r#"{"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}"#,
+            &mut usage,
+            &mut seen_terminal,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.deltas, vec!["partial"]);
+        assert_eq!(
+            parsed.abnormal_terminal_reason.as_deref(),
+            Some("MAX_TOKENS")
+        );
+        assert!(seen_terminal);
+    }
+
+    #[test]
+    fn gemini_prompt_safety_block_is_an_abnormal_terminal_reason() {
+        let mut usage = None;
+        let mut seen_terminal = false;
+        let parsed = parse_gemini_stream_chunk(
+            r#"{"promptFeedback":{"blockReason":"SAFETY"},"usageMetadata":{"promptTokenCount":7,"totalTokenCount":7}}"#,
+            &mut usage,
+            &mut seen_terminal,
+        )
+        .unwrap();
+
+        assert!(parsed.deltas.is_empty());
+        assert_eq!(parsed.abnormal_terminal_reason.as_deref(), Some("SAFETY"));
+        assert!(seen_terminal);
+    }
+
+    #[test]
+    fn anthropic_stream_preserves_text_then_rejects_abnormal_stop_reason() {
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let mut seen_stop = false;
+        let text = parse_anthropic_stream_event(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}"#,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut seen_stop,
+        )
+        .unwrap();
+        let terminal = parse_anthropic_stream_event(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4}}"#,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut seen_stop,
+        )
+        .unwrap();
+
+        assert_eq!(text.deltas, vec!["partial"]);
+        assert!(text.abnormal_terminal_reason.is_none());
+        assert!(terminal.deltas.is_empty());
+        assert_eq!(
+            terminal.abnormal_terminal_reason.as_deref(),
+            Some("max_tokens")
+        );
     }
 
     #[test]

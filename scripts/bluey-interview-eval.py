@@ -76,6 +76,13 @@ META_OPENERS = (
     "as an ai",
 )
 
+# Some providers do not expose a finish reason through Bluey's billing event.
+# An answer that lands exactly on one of these historical/server output caps and
+# ends mid-structure is therefore treated as incomplete rather than as a clean
+# success. Requested per-case caps are checked separately.
+KNOWN_OUTPUT_TOKEN_CAPS = frozenset((256, 512, 1024, 2048, 4096))
+MIN_SUBSTANTIVE_ANSWER_WORDS = 30
+
 
 @dataclass(frozen=True)
 class ProfileSpec:
@@ -548,6 +555,161 @@ def has_first_person(text: str) -> bool:
     return bool(re.search(r"\b(?:I|I'm|I've|I'd|my|me)\b", text, re.I))
 
 
+def answer_evidence_text(attempt: AttemptResult) -> str:
+    """Return all customer-visible answer material used by quality gates."""
+    return (attempt.visible_answer + "\n" + (attempt.artifact_body or "")).strip()
+
+
+def looks_structurally_incomplete(text: str) -> bool:
+    """Detect strong static evidence that an answer stopped mid-structure."""
+    stripped = text.rstrip()
+    if not stripped:
+        return True
+    if stripped.count("```") % 2:
+        return True
+
+    last_line = next(
+        (line.strip() for line in reversed(stripped.splitlines()) if line.strip()),
+        "",
+    )
+    if re.fullmatch(r"#{1,6}\s+.+", last_line):
+        return True
+    if stripped[-1] in ":,;/\\([{":
+        return True
+    # At an exact output cap, prose ending on a bare word is materially
+    # different from a completed sentence or a closed code/data structure.
+    if stripped[-1].isalnum():
+        return True
+    return bool(
+        re.search(
+            r"\b(?:and|or|but|because|including|such as|for example|the|a|an|to|with)\s*$",
+            stripped,
+            re.I,
+        )
+    )
+
+
+def has_mysql_not_valid_portability_claim(text: str) -> bool:
+    lower = re.sub(r"\s+", " ", text.casefold())
+    if "mysql" not in lower or "not valid" not in lower:
+        return False
+    if re.search(
+        r"mysql.{0,100}(?:does not|doesn't|doesn’t|cannot|can't|can’t|lacks).{0,80}(?:support|have).{0,60}not valid",
+        lower,
+    ) or re.search(
+        r"not valid.{0,120}(?:is not|isn't|isn’t|not).{0,60}(?:supported|available).{0,50}mysql",
+        lower,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"not valid.{0,240}(?:works?|supported|available|introduced).{0,100}mysql",
+            lower,
+        )
+        or re.search(
+            r"mysql.{0,160}(?:supports?|has|offers|allows).{0,100}not valid",
+            lower,
+        )
+        or re.search(r"works?.{0,100}(?:recent|current|newer).{0,40}mysql", lower)
+    )
+
+
+def has_exactly_once_processing_overclaim(text: str) -> bool:
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text.casefold()):
+        if not re.search(r"exactly[- ]once", sentence):
+            continue
+        caveated = bool(
+            re.search(
+                r"(?:cannot|can't|can’t|not possible|not truly|no true|"
+                r"effectively[- ]once|exactly[- ]once effect|limited to|only within)",
+                sentence,
+            )
+        )
+        if caveated:
+            continue
+        if re.search(
+            r"(?:guarantee|guarantees|guaranteed|ensure|ensures|achieve|achieves)"
+            r".{0,80}exactly[- ]once|exactly[- ]once.{0,50}processing semantics",
+            sentence,
+        ):
+            return True
+    return False
+
+
+def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
+    lower = re.sub(r"\s+", " ", text.casefold())
+    terminal_failure = re.search(
+        r"(?:timeout|timed out|unknown|ambiguous|no record|maximum retries|max retries)"
+        r".{0,320}(?:mark|marked|move|moved|transition|transitioned|set)"
+        r".{0,80}\bfailed\b",
+        lower,
+    )
+    charge_retry = re.search(
+        r"\b(?:retry|retries|retrying|resubmit|resubmits|resubmitting|re-submit|re-submits)"
+        r"\s+(?:the\s+|a\s+)?(?:charge|payment|gateway call|charge submission|payment submission)\b",
+        lower,
+    )
+    if charge_retry:
+        prefix = lower[max(0, charge_retry.start() - 45) : charge_retry.start()]
+        if re.search(r"(?:do not|don't|don’t|never|must not|cannot|can't|can’t)\s*$", prefix):
+            charge_retry = None
+    return bool(terminal_failure or charge_retry)
+
+
+def has_drift_only_automatic_retraining(text: str) -> bool:
+    lower = re.sub(r"\s+", " ", text.casefold())
+    pattern = re.compile(
+        r"(?:automated|automatic)\s+retrain(?:ing)?|"
+        r"automatically\s+(?:trigger\s+)?retrain(?:s|ed|ing)?|"
+        r"trigger(?:s|ed|ing)?\s+(?:an?\s+)?automated\s+retraining"
+    )
+    for match in pattern.finditer(lower):
+        window = lower[max(0, match.start() - 220) : match.end() + 260]
+        if not re.search(r"(?:drift|distribution shift|threshold)", window):
+            continue
+        guarded = re.search(
+            r"(?:labeled? outcome|ground truth|offline (?:evaluation|validation)|"
+            r"holdout (?:evaluation|validation)|human approval|manual approval|"
+            r"champion[- ]challenger|canary (?:evaluation|rollout)|shadow evaluation)",
+            window,
+        )
+        if not guarded:
+            return True
+    return False
+
+
+def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
+    """Return deterministic defects that prevent an answer from being success."""
+    if not attempt.ok:
+        return []
+    combined = answer_evidence_text(attempt)
+    issues: List[str] = []
+    word_count = len(re.findall(r"\b[\w'’+-]+\b", combined))
+    if word_count < MIN_SUBSTANTIVE_ANSWER_WORDS:
+        issues.append("answer_too_short")
+
+    exact_cap = attempt.output_tokens is not None and (
+        attempt.output_tokens == case.max_tokens
+        or attempt.output_tokens in KNOWN_OUTPUT_TOKEN_CAPS
+    )
+    if exact_cap and looks_structurally_incomplete(combined):
+        issues.append("visibly_truncated_at_token_cap")
+
+    if case.id == "Q10" and has_mysql_not_valid_portability_claim(combined):
+        issues.append("unsafe_mysql_not_valid_portability_claim")
+    if case.id == "Q39" and has_exactly_once_processing_overclaim(combined):
+        issues.append("unsafe_exactly_once_processing_claim")
+    if case.id == "Q40" and has_unsafe_ambiguous_payment_outcome(combined):
+        issues.append("unsafe_ambiguous_payment_retry_or_terminal_failure")
+    if case.id == "Q38" and has_drift_only_automatic_retraining(combined):
+        issues.append("unsafe_drift_only_automatic_retraining")
+    return issues
+
+
+def answer_is_success(case: EvalCase, attempt: AttemptResult) -> bool:
+    return attempt.ok and not blocking_answer_issues(case, attempt)
+
+
 def quality_scores(case: EvalCase, attempt: AttemptResult) -> Tuple[int, int, int, int, List[str]]:
     issues: List[str] = []
     reliability = 35 if attempt.ok else 0
@@ -571,7 +733,7 @@ def quality_scores(case: EvalCase, attempt: AttemptResult) -> Tuple[int, int, in
         latency = 0
         issues.append("no_first_token")
 
-    combined = (attempt.visible_answer + "\n" + (attempt.artifact_body or "")).strip()
+    combined = answer_evidence_text(attempt)
     lower = combined.casefold()
     visible_lower = attempt.visible_answer.strip().casefold()
     human = 25
@@ -625,6 +787,11 @@ def quality_scores(case: EvalCase, attempt: AttemptResult) -> Tuple[int, int, in
     if case.expect_design and attempt.artifact_type not in ("system_design", "diagram"):
         accuracy -= 7
         issues.append("missing_design_artifact")
+    blocking_issues = blocking_answer_issues(case, attempt)
+    if blocking_issues:
+        accuracy = 0
+        issues.append("answer_quality_gate_failed")
+        issues.extend(blocking_issues)
     accuracy = max(0, accuracy)
     return reliability, latency, human, accuracy, issues
 
@@ -854,8 +1021,8 @@ def main(argv: Sequence[str]) -> int:
                 conversation=case.conversation,
                 context_sha256=context_hash,
                 attempts=attempts,
-                final_ok=final_attempt.ok,
-                first_attempt_ok=attempts[0].ok,
+                final_ok=answer_is_success(case, final_attempt),
+                first_attempt_ok=answer_is_success(case, attempts[0]),
                 score=reliability + latency + human + accuracy,
                 reliability_score=reliability,
                 latency_score=latency,

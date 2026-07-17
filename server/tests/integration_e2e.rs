@@ -3130,6 +3130,71 @@ async fn router_complete_stream_proxies_openai_deltas_then_billing() {
 
 #[tokio::test]
 #[serial]
+async fn router_complete_stream_releases_multiple_guarded_deltas_losslessly() {
+    let h = boot_harness().await;
+    let access = signup_and_login(
+        &h,
+        "stream-openai-multiple-deltas@example.com",
+        "longenoughpw",
+    )
+    .await;
+
+    let first = "Start with a clear API contract, explicit ownership, durable state, bounded retries, idempotency, structured logs, metrics, traces, dashboards, alerts, and a tested rollback path. ";
+    let second = "Then canary the worker, verify latency and error budgets, reconcile every uncertain outcome, and keep the previous release ready until production evidence is stable. ";
+    let third = "Finally, document the failure modes and practice recovery before increasing traffic.";
+    let stream = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n\
+         data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n\
+         data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n\
+         data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":12,\"completion_tokens\":80}}}}\n\n\
+         data: [DONE]\n\n",
+        serde_json::to_string(first).unwrap(),
+        serde_json::to_string(second).unwrap(),
+        serde_json::to_string(third).unwrap(),
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(stream),
+        )
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete/stream")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "stream-openai-1",
+                "system": "you are helpful",
+                "user": "answer quickly",
+                "lane": "instant"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(
+        body.matches("data: {\"choices\"").count() >= 2,
+        "guarded streaming collapsed back to one full-answer delta: {body}"
+    );
+    assert!(body.contains("Start with a clear API contract"));
+    assert!(body.contains("Finally, document the failure modes"));
+    assert!(body.contains("event: billing"));
+    assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+#[serial]
 async fn router_complete_stream_openai_error_frame_is_retryable() {
     let h = boot_harness().await;
     let email = "stream-openai-error@example.com";
@@ -3180,6 +3245,7 @@ async fn router_complete_stream_openai_error_frame_is_retryable() {
 #[tokio::test]
 #[serial]
 async fn router_complete_stream_falls_back_after_pre_output_provider_error() {
+    std::env::set_var("BLUEY_ROUTE_POLICY", "quality_first");
     let h = boot_harness().await;
     let access =
         signup_and_login(&h, "stream-pre-output-fallback@example.com", "longenoughpw").await;
@@ -3239,6 +3305,7 @@ async fn router_complete_stream_falls_back_after_pre_output_provider_error() {
     assert!(body.contains("\"provider\":\"openai\""));
     assert!(body.contains("event: billing"));
     assert!(!body.contains("event: error"));
+    std::env::remove_var("BLUEY_ROUTE_POLICY");
 }
 
 #[tokio::test]
