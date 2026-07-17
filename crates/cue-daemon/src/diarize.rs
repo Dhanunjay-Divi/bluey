@@ -510,6 +510,16 @@ async fn persist_diarization(
             return;
         }
     };
+    // The utterance / meeting_speaker tables FK to sessions(id), but a meeting is
+    // persisted as a JSON file, not a sessions row — so the meeting id has no
+    // parent row and every insert below would fail the foreign-key check. Ensure
+    // an idempotent placeholder parent row exists first. Best-effort: if this
+    // fails we still attempt the inserts (they'll just warn as before).
+    if let Ok(uuid) = uuid::Uuid::parse_str(session_id) {
+        if let Err(e) = db.ensure_meeting_session(uuid, None) {
+            warn!("diarize: could not ensure sessions row for meeting: {e:#}");
+        }
+    }
     let now_ms = cue_core::clock::now_epoch_ms_string()
         .parse::<i64>()
         .unwrap_or(0);

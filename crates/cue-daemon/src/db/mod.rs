@@ -146,6 +146,30 @@ impl Database {
             .context("session not found after insert")
     }
 
+    /// Ensure a `sessions` row exists for a meeting id, idempotently.
+    ///
+    /// Meetings are persisted as JSON files (see `storage.rs`), not as rows in
+    /// the `sessions` table — that table is the agent-session store. But several
+    /// SQLite tables written during/after a meeting (`utterance`,
+    /// `meeting_speaker`, `transcripts`, `speakers`, `cue_responses`) key on
+    /// `session_id TEXT REFERENCES sessions(id)`. Persisting any of those with a
+    /// meeting id that has no matching `sessions` row fails the foreign-key check.
+    ///
+    /// This inserts a placeholder parent row so the FK is satisfied. It is
+    /// `INSERT OR IGNORE`, so a pre-existing session (agent or a prior call) is
+    /// left untouched — the meeting's own title/status/timestamps are never
+    /// clobbered. Returns `true` if a new row was created.
+    pub fn ensure_meeting_session(&self, id: Uuid, title: Option<&str>) -> Result<bool> {
+        let now = now_ms();
+        let title = title.unwrap_or("Meeting");
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, title, status, created_at, updated_at, last_active_at) \
+             VALUES (?1, ?2, 'active', ?3, ?3, ?3)",
+            params![id.to_string(), title, now],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn get_session(&self, id: Uuid) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, status, created_at, updated_at, last_active_at, \

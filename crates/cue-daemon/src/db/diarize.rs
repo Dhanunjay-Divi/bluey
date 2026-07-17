@@ -142,4 +142,75 @@ mod tests {
         let v = vec![0.1_f32, -0.5, 1.0, 0.0];
         assert_eq!(blob_to_embedding(&embedding_to_blob(&v)), v);
     }
+
+    // A meeting id is NOT an agent-session id: meetings are stored as JSON files,
+    // never inserted into `sessions`. Persisting diarization for such an id would
+    // fail the `utterance` / `meeting_speaker` FK to `sessions(id)` unless a
+    // parent row is ensured first. This proves that after `ensure_meeting_session`
+    // (idempotent, as the daemon does before persisting), both inserts succeed.
+    #[test]
+    fn diarize_insert_succeeds_for_non_agent_meeting_id() {
+        let db = Database::open(":memory:").expect("open in-memory db");
+
+        // A brand-new meeting id that was never created via `create_session`.
+        let meeting_id = uuid::Uuid::new_v4();
+        let sid = meeting_id.to_string();
+        let embedding = vec![0.1_f32, 0.2, 0.3, 0.4];
+
+        // Sanity: without a parent sessions row the FK must reject the insert.
+        assert!(
+            db.insert_utterance(&sid, "system", 0, 1000, Some(0), &embedding, 42)
+                .is_err(),
+            "insert_utterance should fail the FK when no sessions row exists"
+        );
+
+        // Ensure the placeholder parent row (idempotent — call twice).
+        assert!(
+            db.ensure_meeting_session(meeting_id, None)
+                .expect("ensure_meeting_session"),
+            "first ensure should create the row"
+        );
+        assert!(
+            !db.ensure_meeting_session(meeting_id, None)
+                .expect("ensure_meeting_session idempotent"),
+            "second ensure must be a no-op, not clobber the row"
+        );
+
+        // Now both diarization writes must succeed.
+        let row_id = db
+            .insert_utterance(&sid, "system", 0, 1000, Some(0), &embedding, 42)
+            .expect("insert_utterance should succeed after ensure_meeting_session");
+        db.set_utterance_final_speaker(row_id, 0)
+            .expect("set_utterance_final_speaker");
+        db.upsert_meeting_speaker(&sid, 0, &embedding, 1, 1000, 42)
+            .expect("upsert_meeting_speaker should succeed after ensure_meeting_session");
+
+        // Round-trip the utterance back out to confirm it persisted.
+        let rows = db.load_utterances(&sid).expect("load_utterances");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].speaker_final, Some(0));
+        assert_eq!(rows[0].embedding, embedding);
+    }
+
+    // `ensure_meeting_session` must never clobber a real agent session that
+    // happens to share the id space (both are UUID strings in `sessions`).
+    #[test]
+    fn ensure_meeting_session_preserves_existing_session() {
+        let db = Database::open(":memory:").expect("open in-memory db");
+        let session = db
+            .create_session(Some("Agent session".into()))
+            .expect("create_session");
+
+        // Ensuring the same id must be a no-op and must NOT rename it.
+        assert!(
+            !db.ensure_meeting_session(session.id, Some("Meeting"))
+                .expect("ensure_meeting_session"),
+            "ensure on an existing session id must not insert"
+        );
+        let fetched = db
+            .get_session(session.id)
+            .expect("get_session")
+            .expect("session still present");
+        assert_eq!(fetched.title, "Agent session");
+    }
 }
