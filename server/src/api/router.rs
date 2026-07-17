@@ -392,10 +392,8 @@ impl BufferedDisclosureOutput {
             return None;
         }
 
-        let release_bytes = disclosure_safe_release_bytes(
-            &self.pending,
-            DISCLOSURE_STREAM_HOLDBACK_ALNUM_CHARS,
-        );
+        let release_bytes =
+            disclosure_safe_release_bytes(&self.pending, DISCLOSURE_STREAM_HOLDBACK_ALNUM_CHARS);
         if release_bytes == 0 {
             return None;
         }
@@ -1855,9 +1853,11 @@ fn answer_plan_for_request(
         && looks_like_system_design_canvas_followup_question(&normalized);
     let diagram_request = looks_like_diagram_request(&normalized);
     let explicit_code_generation = looks_like_explicit_code_generation_request(&normalized);
-    let direct_behavioral = looks_like_behavioral_question(&normalized);
-    let direct_system_design =
-        !direct_behavioral && (diagram_request || looks_like_system_design_question(&normalized));
+    let direct_technical_plan = looks_like_direct_technical_plan_question(&normalized);
+    let direct_behavioral = !direct_technical_plan && looks_like_behavioral_question(&normalized);
+    let direct_system_design = !direct_technical_plan
+        && !direct_behavioral
+        && (diagram_request || looks_like_system_design_question(&normalized));
     let coding = !quick_conceptual
         && !direct_behavioral
         && !direct_system_design
@@ -1997,6 +1997,8 @@ fn answer_plan_for_request(
         AnswerIntent::Research
     } else if missing_context {
         AnswerIntent::MissingContext
+    } else if direct_technical_plan {
+        AnswerIntent::General
     } else if behavioral {
         AnswerIntent::Behavioral
     } else if system_design {
@@ -2255,11 +2257,27 @@ fn generated_answer_quality_failure(
     None
 }
 
-fn likely_truncated_at_budget(
-    text: &str,
-    output_tokens: i64,
-    max_tokens: Option<u32>,
-) -> bool {
+fn upstream_stream_failure_reason(error: &anyhow::Error) -> &'static str {
+    let Some(reason) = routing::upstream_terminal_reason(error) else {
+        return "upstream_stream_error";
+    };
+    let normalized = reason.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if matches!(
+        normalized.as_str(),
+        "length" | "max_tokens" | "max_output_tokens" | "token_limit"
+    ) {
+        "upstream_output_truncated"
+    } else if matches!(
+        normalized.as_str(),
+        "content_filter" | "safety" | "blocked" | "refusal" | "recitation" | "prohibited_content"
+    ) {
+        "upstream_output_blocked"
+    } else {
+        "upstream_output_incomplete"
+    }
+}
+
+fn likely_truncated_at_budget(text: &str, output_tokens: i64, max_tokens: Option<u32>) -> bool {
     let Some(max_tokens) = max_tokens else {
         return false;
     };
@@ -2432,6 +2450,7 @@ fn is_hard_answer_plan_signal(normalized: &str) -> bool {
     looks_like_behavioral_question(normalized)
         || looks_like_coding_question(normalized)
         || looks_like_system_design_question(normalized)
+        || looks_like_direct_technical_plan_question(normalized)
 }
 
 #[derive(Debug, Deserialize)]
@@ -3242,6 +3261,38 @@ fn looks_like_explanation_only_coding_question(normalized: &str) -> bool {
     )
 }
 
+fn looks_like_direct_technical_plan_question(normalized: &str) -> bool {
+    let evaluation_plan_request = contains_any(
+        normalized,
+        &[
+            "design an evaluation plan",
+            "design a test plan",
+            "create an evaluation plan",
+            "create a test plan",
+            "propose an evaluation plan",
+            "evaluation plan for",
+            "test plan for",
+        ],
+    );
+    let technical_target = contains_any(
+        normalized,
+        &[
+            "rag",
+            "retrieval",
+            "assistant",
+            "model",
+            "system",
+            "service",
+            "api",
+            "pipeline",
+            "production",
+            "launch",
+        ],
+    );
+
+    evaluation_plan_request && technical_target
+}
+
 fn looks_like_new_topic_request(normalized: &str) -> bool {
     contains_any(
         normalized,
@@ -3915,9 +3966,19 @@ fn prompt_with_answer_plan(
     web_search: &WebSearchOutcome,
 ) -> (String, String) {
     let evidence = plan.evidence_labels().join(", ");
+    let normalized_question = normalize_guardrail_text(&extract_search_question(user));
+    let direct_technical_plan = looks_like_direct_technical_plan_question(&normalized_question);
     let style = match plan.intent {
+        _ if direct_technical_plan => {
+            "Give a concise, ready-to-say technical plan in roughly 180-320 words. Start with the plan itself, using `I would...` when the request is interview-style. State the evaluation set, offline quality dimensions, human review, latency and cost checks, launch gates, and shadow or canary monitoring only when relevant. For RAG or AI evaluation, explicitly cover retrieval quality, answer faithfulness or grounding, a representative golden dataset with human labels, end-to-end task quality, safety, latency, and cost. Use measurable categories, but never invent thresholds, resume accomplishments, employers, tool stacks, or outcomes that the user did not supply. Do not add a `Reasoning` section, explain the candidate's background, restate the question, or append meta-commentary about how the answer should be written."
+        }
         AnswerIntent::Quick => {
             "Answer directly in 1-4 sentences. Do not open with setup unless it prevents confusion."
+        }
+        AnswerIntent::Coding | AnswerIntent::CodingFollowUp
+            if plan.output == AnswerOutput::Compact =>
+        {
+            "Start with a direct spoken lead-in, then give a concise explanation in roughly 120-260 words. Explain the core idea, relevant data structures or control flow, why the choice works, and time and space complexity when applicable. Do not include code, a fenced implementation, `Line notes`, or a code artifact unless the user explicitly asks for code or an implementation. Finish the explanation cleanly instead of expanding to fill the token budget."
         }
         AnswerIntent::Coding => {
             "For first-time coding or algorithm answers, start with a short spoken lead-in the user could say on a call: the core idea and why it works, in one or two natural sentences. Then use this exact scan-friendly shape when code is needed: `Approach`, then `Code`, then `Explanation`, then `Complexity`, then `Edge cases` when useful. Under Approach, give 2-4 clear bullets before the code. Under Code, give complete working code in a fenced code block with a language tag. Use the language implied by the prompt or screen; if none is specified for an interview algorithm prompt, use Python. If the user asks for the same code in another language, regenerate the complete solution in that language with the full wrapper/signature. For Python/LeetCode-style answers, include required imports or avoid type hints that need imports. Put each statement on its own line with correct indentation; never compress class, function, assignments, and return onto one wrapped line. Add concise comments inside non-trivial code: place a short comment above each major block and on the important decision lines that explain why that line or block exists. Do not comment every trivial assignment. For LeetCode/interview algorithm prompts, include the full class/function signature, initialization, loop/body, return value, and any sentinel/cleanup step; never provide only the inner loop or a pseudocode fragment. For data-structure interview prompts such as LRU cache, implement from first principles with a hashmap plus doubly linked list unless the user explicitly asks for a library shortcut; mention library helpers only as alternatives after the real implementation. For non-trivial code, add a short `Line notes:` block outside the code fence using `1: ...` or small `2-4: ...` notes for the important executable lines. Keep explanatory notes outside the code so copied code stays clean. Always include Time Complexity and Space Complexity explicitly. Do not give only a summary."
@@ -3929,7 +3990,7 @@ fn prompt_with_answer_plan(
             "Answer like a polished interview coach and candidate voice: natural, first-person when appropriate, specific, and conversational. For self-introductions, resume introductions, or prompts like \"tell me about yourself\", write the answer as the candidate speaking, not as Bluey advising them. Start self-introductions as the candidate, for example with \"I'm...\" or \"My name is...\" when a name is available from context, then continue with the present-past-fit arc. Do not start those answers with \"I would say\", \"You can say\", \"Based on the resume\", or a meta explanation. Use the supplied resume, JD, documents, transcript, and screen context to infer the role and domain, such as SDE, data engineer, BI engineer, data scientist, DevOps, security, product, or another role. First infer what the interviewer is testing, such as Dive Deep, ownership, technical depth, data quality, system judgment, prioritization, stakeholder communication, or tradeoffs, then make the response prove that signal. For resume-based introductions, self-introductions, or prompts like \"tell me about yourself\", do not compress the resume into one facts paragraph and do not ask the user what kind of long answer they want when the resume/context is already supplied. Use a speakable present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role. For introductions, give the full ready-to-say answer on the first response and aim for a 45-60 second answer unless the user explicitly asks for a shorter version. For role/domain interview questions, give a ready-to-say answer anchored only in the supplied company, project, tools, metrics, constraints, and role expectations; when useful, include a brief why-it-works or if-they-push-back recovery line. Do not defend weak story logic blindly: reframe it in a production-realistic way, such as code ownership, incident debugging, architecture tradeoffs, upstream data, ETL validation, reporting impact, stakeholder communication, or KPI definition. For interview stories, aim for a 45-90 second answer in tight paragraphs, not generic bullets, unless the user asks for notes. Do not invent metrics, employers, tools, source systems, clinical/finance details, latency windows, outcomes, or motivation beyond the supplied resume/JD/context. If exact story detail is missing, say the framing safely with phrases like \"I would frame it as...\" or \"the signal I would emphasize is...\" instead of fabricating a result. Never route resume/self-intro or interview-coaching prompts into system design just because they mention architecture or systems."
         }
         AnswerIntent::SystemDesign => {
-            "Begin with `### Spoken answer` and give the decision and main tradeoff in 2-4 speakable sentences, at most 120 words. Then put the durable detail under `### Canvas detail` using compact sections for requirements, architecture, data flow, tradeoffs, scaling, and failure modes. Keep the complete response under about 800 words unless the user explicitly asks for exhaustive depth. When this is a follow-up to an existing system-design canvas, answer only the requested continuation or section; do not repeat the entire previous design, because the canvas keeps the earlier material. When the user asks for a diagram, pictorial representation, flowchart, sequence diagram, or visual explanation, add a `### Diagram` subsection with a compact ASCII box/arrow diagram or a fenced `mermaid` diagram with short labels. Keep it practical and avoid overexplaining obvious basics."
+            "Begin with `### Spoken answer` and give the decision and main tradeoff in 2-4 speakable sentences, at most 80 words. Then put the durable detail under `### Canvas detail` using only concise, relevant sections for requirements, architecture, data flow, tradeoffs, scaling, and failure modes. Keep the entire response under 500 words unless the user explicitly asks for exhaustive depth. Do not restate the prompt, repeat requirements in multiple sections, or expand to fill the token budget. When this is a follow-up to an existing system-design canvas, answer only the requested continuation or section; do not repeat the entire previous design, because the canvas keeps the earlier material. When the user asks for a diagram, pictorial representation, flowchart, sequence diagram, or visual explanation, add a `### Diagram` subsection with a compact ASCII box/arrow diagram or a fenced `mermaid` diagram with short labels, at most 12 nodes and 18 edges. Keep it practical and avoid overexplaining obvious basics."
         }
         AnswerIntent::Screen => {
             "Use visible screen details first. Say when an important detail is not visible instead of inventing it."
@@ -6103,14 +6164,16 @@ async fn complete_stream_inner(
                     let already_delivered = output.has_delivered();
                     let partial = output.take_safe();
                     let delivered_delta = already_delivered || !partial.trim().is_empty();
+                    let failure_reason = upstream_stream_failure_reason(&e);
                     fail_stream_llm_usage(
                         &state.pool,
                         &account.id,
                         &req.request_id,
                         delivered_delta,
-                        "upstream_stream_error",
+                        failure_reason,
                     );
                     let retry_after_secs = routing::upstream_retry_after(&e);
+                    let terminal_reason = routing::upstream_terminal_reason(&e);
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                         request_id = %req.request_id,
@@ -6130,20 +6193,21 @@ async fn complete_stream_inner(
                             trace_id: Some(&trace_id),
                             event_type: "answer_failed",
                             status: if retry_after_secs.is_some() {
-                            "provider_capacity"
-                        } else {
-                            "upstream_stream_error"
-                        },
+                                "provider_capacity"
+                            } else {
+                                failure_reason
+                            },
                             metadata: serde_json::json!({
-                            "lane": lane_log.as_str(),
-                            "effective_lane": effective_lane_log.as_str(),
-                            "provider": streaming.provider.as_str(),
-                            "model": streaming.model.as_str(),
-                            "streaming": true,
-                            "delivered_delta": delivered_delta,
-                            "partial_chars": partial_chars,
-                            "retry_after_secs": retry_after_secs,
-                            "error_preview": truncate_chars(&e.to_string(), 180)
+                                "lane": lane_log.as_str(),
+                                "effective_lane": effective_lane_log.as_str(),
+                                "provider": streaming.provider.as_str(),
+                                "model": streaming.model.as_str(),
+                                "streaming": true,
+                                "delivered_delta": delivered_delta,
+                                "partial_chars": partial_chars,
+                                "retry_after_secs": retry_after_secs,
+                                "terminal_reason": terminal_reason,
+                                "error_preview": truncate_chars(&e.to_string(), 180)
                             }),
                         },
                     );
@@ -6156,10 +6220,20 @@ async fn complete_stream_inner(
                             "reason": "provider_key_cooling_down",
                             "retry_after_secs": retry_after_secs.max(1),
                         })
+                    } else if failure_reason == "upstream_output_truncated" {
+                        serde_json::json!({
+                            "error": "upstream answer reached its output limit; retry for a shorter answer",
+                            "reason": failure_reason,
+                        })
+                    } else if failure_reason == "upstream_output_blocked" {
+                        serde_json::json!({
+                            "error": "upstream provider could not complete this answer",
+                            "reason": failure_reason,
+                        })
                     } else {
                         serde_json::json!({
                             "error": "upstream provider stream interrupted; please retry",
-                            "reason": "upstream_stream_error",
+                            "reason": failure_reason,
                         })
                     };
                     yield Ok(Event::default().event("error").data(payload.to_string()));
@@ -10702,6 +10776,28 @@ mod tests {
     }
 
     #[test]
+    fn upstream_terminal_reasons_are_exposed_as_actionable_stream_failures() {
+        for (reason, expected) in [
+            ("length", "upstream_output_truncated"),
+            ("MAX_TOKENS", "upstream_output_truncated"),
+            ("content_filter", "upstream_output_blocked"),
+            ("refusal", "upstream_output_blocked"),
+            ("unexpected_reason", "upstream_output_incomplete"),
+        ] {
+            let error = anyhow::anyhow!(crate::routing::dispatcher::UpstreamTerminalReasonError {
+                provider: "test".to_string(),
+                reason: reason.to_string(),
+            });
+            assert_eq!(upstream_stream_failure_reason(&error), expected);
+        }
+
+        assert_eq!(
+            upstream_stream_failure_reason(&anyhow::anyhow!("socket closed")),
+            "upstream_stream_error"
+        );
+    }
+
+    #[test]
     fn internal_disclosure_guard_allows_coding_followup_context() {
         let user = "Question:\nSo can you give me Java code for the same?\n\nSession context:\n[Recent coding context from active session coding context]\nPrior coding question:\nYou are given an array of positive integers nums. Alice can choose either all single-digit numbers or all double-digit numbers from nums. Return true if Alice can win this game, otherwise return false.\n\nPrior answer summary:\nI would sum both choices and compare either choice against Bob's remaining total.";
 
@@ -11624,6 +11720,58 @@ mod tests {
     }
 
     #[test]
+    fn answer_plan_live_lru_explanation_does_not_demand_code() {
+        let req = complete_request(
+            "Question:\nExplain an LRU cache as if an interviewer asked you on a call.",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Coding);
+        assert_eq!(plan.output, AnswerOutput::Compact);
+        assert_eq!(plan.recommended_lane, "balanced");
+
+        let (system, _user) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(system.contains("roughly 120-260 words"));
+        assert!(system.contains("Do not include code, a fenced implementation"));
+        assert!(!system.contains("give complete working code in a fenced code block"));
+        assert!(!system.contains("The code artifact must be a full in-place replacement"));
+    }
+
+    #[test]
+    fn answer_plan_rag_evaluation_plan_is_compact_technical_not_behavioral() {
+        let req = complete_request(
+            "Question:\nDesign an evaluation plan for a RAG assistant before production launch.\n\nSession context:\n[Resume]\nSenior data scientist.\n\n[Job description]\nAI platform role.",
+        );
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+        let normalized = normalize_guardrail_text(&extract_search_question(&req.user));
+
+        assert!(looks_like_direct_technical_plan_question(&normalized));
+        assert!(is_hard_answer_plan_signal(&normalized));
+        assert_eq!(plan.intent, AnswerIntent::General);
+        assert_eq!(plan.output, AnswerOutput::Compact);
+        assert_eq!(plan.recommended_lane, "balanced");
+
+        let (system, _user) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(system.contains("roughly 180-320 words"));
+        assert!(system.contains("representative golden dataset with human labels"));
+        assert!(system.contains("answer faithfulness or grounding"));
+        assert!(system.contains("Do not add a `Reasoning` section"));
+        assert!(!system.contains("Answer like a polished interview coach"));
+    }
+
+    #[test]
     fn answer_plan_mixed_write_and_explain_keeps_code_artifact() {
         let req = complete_request(
             "Question:\nCan you write Fibonacci series? Then answer this follow-up: is there a way to reduce time complexity? New question: explain LRU cache.",
@@ -11920,6 +12068,10 @@ mod tests {
         assert!(system.contains("### Diagram"));
         assert!(system.contains("pictorial representation"));
         assert!(system.contains("mermaid"));
+        assert!(system.contains("at most 80 words"));
+        assert!(system.contains("entire response under 500 words"));
+        assert!(system.contains("at most 12 nodes and 18 edges"));
+        assert!(system.contains("Do not restate the prompt"));
     }
 
     #[test]

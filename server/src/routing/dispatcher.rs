@@ -91,10 +91,23 @@ pub struct UpstreamMediaRejectionError {
     pub status: u16,
 }
 
+#[derive(Debug, Error)]
+#[error("{provider} completion ended with abnormal terminal reason `{reason}`")]
+pub struct UpstreamTerminalReasonError {
+    pub provider: String,
+    pub reason: String,
+}
+
 pub fn upstream_retry_after(error: &anyhow::Error) -> Option<u64> {
     error
         .downcast_ref::<UpstreamHttpError>()
         .and_then(|error| error.retry_after_secs)
+}
+
+pub fn upstream_terminal_reason(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<UpstreamTerminalReasonError>()
+        .map(|error| error.reason.as_str())
 }
 
 fn upstream_http_error(
@@ -1049,7 +1062,10 @@ fn first_abnormal_terminal_reason<'a>(
 }
 
 fn abnormal_terminal_error(provider: &str, reason: &str) -> anyhow::Error {
-    anyhow!("{provider} completion ended with abnormal terminal reason `{reason}`")
+    anyhow!(UpstreamTerminalReasonError {
+        provider: provider.to_string(),
+        reason: reason.to_string(),
+    })
 }
 
 fn ensure_successful_terminal_reasons<'a>(
@@ -2915,10 +2931,7 @@ mod tests {
     #[test]
     fn resolve_route_known_lanes() {
         assert_eq!(resolve_route("instant"), ("openai", "gpt-5.4-mini"));
-        assert_eq!(
-            resolve_route("balanced"),
-            ("deepseek", "deepseek-v4-flash"),
-        );
+        assert_eq!(resolve_route("balanced"), ("deepseek", "deepseek-v4-flash"),);
         assert_eq!(resolve_route("deep"), ("anthropic", "claude-opus-4-8"),);
         assert_eq!(resolve_route("vision"), ("gemini", "gemini-3.5-flash"));
         assert_eq!(resolve_route("local"), ("unsupported", "local"));
@@ -3084,7 +3097,10 @@ mod tests {
             } else {
                 vec!["anthropic", "deepseek", "gemini", "openai", "zai"]
             };
-            assert_eq!(providers, expected, "unexpected {lane} preferred tier: {routes:?}");
+            assert_eq!(
+                providers, expected,
+                "unexpected {lane} preferred tier: {routes:?}"
+            );
         }
     }
 
@@ -3385,6 +3401,7 @@ mod tests {
             parsed.abnormal_terminal_reason.as_deref().unwrap(),
         );
         assert!(err.to_string().contains("length"));
+        assert_eq!(upstream_terminal_reason(&err), Some("length"));
     }
 
     #[test]

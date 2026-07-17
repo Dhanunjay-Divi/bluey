@@ -637,13 +637,32 @@ def has_exactly_once_processing_overclaim(text: str) -> bool:
 
 
 def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
-    lower = re.sub(r"\s+", " ", text.casefold())
-    terminal_failure = re.search(
-        r"(?:timeout|timed out|unknown|ambiguous|no record|maximum retries|max retries)"
-        r".{0,320}(?:mark|marked|move|moved|transition|transitioned|set)"
-        r".{0,80}\bfailed\b",
+    lower = re.sub(r"\s+", " ", re.sub(r"[*_`~]+", "", text.casefold()))
+    action_words = r"mark(?:ed)?|move(?:d)?|transition(?:ed)?|set"
+    terminal_failure = False
+    for outcome in re.finditer(
+        r"\b(?:timeout|timed out|unknown|ambiguous|no record|maximum retries|max retries)\b",
         lower,
-    )
+    ):
+        window = lower[outcome.start() : outcome.end() + 320]
+        actions = re.finditer(
+            rf"\b(?:{action_words})\b"
+            rf"(?:(?!\b(?:{action_words})\b).){{0,80}}\bfailed\b",
+            window,
+        )
+        for action in actions:
+            action_start = outcome.start() + action.start()
+            prefix = lower[max(0, action_start - 60) : action_start]
+            if re.search(
+                r"(?:do not|don't|don’t|never|must not|should not|cannot|can't|can’t)"
+                r"(?:\s+(?:ever|be))?\s*$",
+                prefix,
+            ) or re.search(r"\bnot\b.{0,20}\bfailed\b", action.group()):
+                continue
+            terminal_failure = True
+            break
+        if terminal_failure:
+            break
     charge_retry = re.search(
         r"\b(?:retry|retries|retrying|resubmit|resubmits|resubmitting|re-submit|re-submits)"
         r"\s+(?:the\s+|a\s+)?(?:charge|payment|gateway call|charge submission|payment submission)\b",
@@ -654,6 +673,20 @@ def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
         if re.search(r"(?:do not|don't|don’t|never|must not|cannot|can't|can’t)\s*$", prefix):
             charge_retry = None
     return bool(terminal_failure or charge_retry)
+
+
+def self_check_ambiguous_payment_detector() -> None:
+    safe = (
+        "A timeout leaves the outcome UNKNOWN, not failed. "
+        "Move it to PENDING_RECONCILIATION; do not mark it FAILED.",
+        "After a timeout, never retry the charge; retry only the status lookup.",
+    )
+    unsafe = (
+        "After a timeout, mark the payment FAILED and retry the charge.",
+        "The outcome is unknown. After maximum retries, transition it to FAILED.",
+    )
+    assert not any(has_unsafe_ambiguous_payment_outcome(text) for text in safe)
+    assert all(has_unsafe_ambiguous_payment_outcome(text) for text in unsafe)
 
 
 def has_drift_only_automatic_retraining(text: str) -> bool:
@@ -944,6 +977,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
+    self_check_ambiguous_payment_detector()
     base = normalize_base(args.api_base)
     selected = list(CASES)
     if args.only:

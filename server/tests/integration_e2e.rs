@@ -3141,7 +3141,8 @@ async fn router_complete_stream_releases_multiple_guarded_deltas_losslessly() {
 
     let first = "Start with a clear API contract, explicit ownership, durable state, bounded retries, idempotency, structured logs, metrics, traces, dashboards, alerts, and a tested rollback path. ";
     let second = "Then canary the worker, verify latency and error budgets, reconcile every uncertain outcome, and keep the previous release ready until production evidence is stable. ";
-    let third = "Finally, document the failure modes and practice recovery before increasing traffic.";
+    let third =
+        "Finally, document the failure modes and practice recovery before increasing traffic.";
     let stream = format!(
         "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n\
          data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n\
@@ -3353,6 +3354,58 @@ async fn router_complete_stream_openai_truncated_after_delta_is_not_billed_or_re
 
     let account = Account::fetch_by_email(&h.pool, email).unwrap().unwrap();
     let replay = idempotency::reserve(&h.pool, &account.id, "stream-openai-truncated-1").unwrap();
+    assert_eq!(replay, idempotency::ReserveOutcome::CachedFailed);
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_stream_openai_length_finish_reports_output_truncated() {
+    let h = boot_harness().await;
+    let email = "stream-openai-length@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+
+    let stream = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Partial answer that reached the configured output budget\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(stream),
+        )
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete/stream")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "stream-openai-length-1",
+                "system": "you are helpful",
+                "user": "answer quickly",
+                "lane": "instant",
+                "max_tokens": 64
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Partial answer"));
+    assert!(body.contains("event: error"));
+    assert!(body.contains("upstream_output_truncated"));
+    assert!(!body.contains("event: billing"));
+
+    let account = Account::fetch_by_email(&h.pool, email).unwrap().unwrap();
+    let replay = idempotency::reserve(&h.pool, &account.id, "stream-openai-length-1").unwrap();
     assert_eq!(replay, idempotency::ReserveOutcome::CachedFailed);
 }
 
