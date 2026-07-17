@@ -46,14 +46,14 @@ use cue_core::{
     analyze_segment, clock, generate_recap, load_account, load_settings, local_answer,
     new_trace_id, sanitize_observability_id, trace_id_from_env, update_settings, AiCapabilities,
     AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerContext, AnswerContextKind,
-    AudioCaptureConfig, AudioCaptureStatus, AudioChunkMetadata, AudioDeviceDescriptor,
-    AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig,
-    CloudEnvironment, CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind,
-    ContextProcessingStatus, ContextWatchSettings, ConversationTurn, CueCard, CueCardArtifact,
-    CueCardAttachment, DaemonSessionLifecycle, DaemonSessionRecord, DaemonState, MeetingRecord,
-    MeetingState, MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent, OverlaySessionItem,
-    PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget, Speaker,
-    TranscriptSegment,
+    AnswerContextRole, AudioCaptureConfig, AudioCaptureStatus, AudioChunkMetadata,
+    AudioDeviceDescriptor, AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind,
+    CloudEndpointConfig, CloudEnvironment, CloudSyncState, CloudSyncStatus, ContextArtifact,
+    ContextKind, ContextProcessingStatus, ContextWatchSettings, ConversationTurn, CueCard,
+    CueCardArtifact, CueCardAttachment, DaemonSessionLifecycle, DaemonSessionRecord, DaemonState,
+    MeetingRecord, MeetingState, MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent,
+    OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
+    Speaker, TranscriptSegment,
 };
 use cue_llm::{
     bluey_managed::{BlueyManagedProvider, ManagedLane},
@@ -116,6 +116,12 @@ const OVERLAY_RESTART_MAX_DELAY_MS: u64 = 5_000;
 const CONTEXT_WATCH_NOTE_MARKER: &str = "Context mode observation.";
 const OVERLAY_ANSWER_FRAME_INTERVAL: Duration = Duration::from_millis(24);
 const OVERLAY_ANSWER_FRAME_CHAR_THRESHOLD: usize = 2_048;
+const MANAGED_ANSWER_CONTEXT_MAX_ITEMS: usize = 64;
+const MANAGED_ANSWER_CONTEXT_MAX_CONTENT_BYTES: usize = 32 * 1024;
+const MANAGED_ANSWER_CONTEXT_MAX_TITLE_BYTES: usize = 1024;
+const MANAGED_ANSWER_CONTEXT_MAX_SOURCE_BYTES: usize = 4 * 1024;
+const MANAGED_ANSWER_CONTEXT_MAX_TOTAL_BYTES: usize = 256 * 1024;
+const MANAGED_ANSWER_CONTEXT_MAX_TOTAL_METADATA_BYTES: usize = 32 * 1024;
 
 struct LiveProviderAnswer {
     provider: ProviderSelector,
@@ -2743,8 +2749,14 @@ async fn handle_request_inner(
                 answer_with_provider_runtime(daemon, request, "answer ipc").await?;
             Ok(DaemonResponse::Answer { response, events })
         }
-        DaemonRequest::ContextAdd { path, title, note } => {
-            let artifact = build_context_artifact(&daemon.paths, path, title, note)?;
+        DaemonRequest::ContextAdd {
+            path,
+            title,
+            note,
+            answer_context_role,
+        } => {
+            let artifact = build_context_artifact(&daemon.paths, path, title, note)?
+                .with_answer_context_role(answer_context_role);
             let mut artifact_files = ContextArtifactFileGuard::new(&daemon.paths, artifact.clone());
             let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact.clone()]).await?;
             artifact_files.commit();
@@ -2797,6 +2809,20 @@ async fn handle_request_inner(
             };
             Ok(DaemonResponse::ContextItems {
                 items: meeting.map(|m| m.context).unwrap_or_default(),
+            })
+        }
+        DaemonRequest::ContextRoleSet {
+            id,
+            answer_context_role,
+        } => {
+            let (meeting_snapshot, artifact) =
+                set_context_artifact_role(daemon, id, answer_context_role).await?;
+            update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+            refresh_overlay_context_items(daemon, &meeting_snapshot).await;
+            refresh_overlay_sessions(daemon).await;
+            schedule_auto_cloud_sync(daemon, "context_role_set", Some(trace_id.to_string())).await;
+            Ok(DaemonResponse::ContextItems {
+                items: vec![artifact],
             })
         }
         DaemonRequest::ActivePageCapture => {
@@ -9999,6 +10025,35 @@ async fn handle_remove_context_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) -
     Ok(())
 }
 
+async fn set_context_artifact_role(
+    daemon: &Arc<Daemon>,
+    id: uuid::Uuid,
+    answer_context_role: AnswerContextRole,
+) -> Result<(MeetingRecord, ContextArtifact)> {
+    let mut meeting_guard = daemon.meeting.lock().await;
+    let current = meeting_guard
+        .as_ref()
+        .ok_or_else(|| anyhow!("no active session is available for context role assignment"))?;
+    let mut next = current.clone();
+    let artifact = next
+        .context
+        .iter_mut()
+        .find(|artifact| artifact.id == id)
+        .ok_or_else(|| anyhow!("context artifact {id} is not attached to the active session"))?;
+    if answer_context_role != AnswerContextRole::Other
+        && artifact_has_derived_one_shot_summary(artifact)
+    {
+        return Err(anyhow!(
+            "this saved screen summary includes Bluey's previous answer and can only remain General; reattach the original user evidence before assigning a trusted context role"
+        ));
+    }
+    artifact.set_answer_context_role(answer_context_role);
+    let updated = artifact.clone();
+    daemon.store.save_active(&next)?;
+    *meeting_guard = Some(next.clone());
+    Ok((next, updated))
+}
+
 async fn handle_instructions_requested(daemon: &Arc<Daemon>) -> Result<()> {
     let current = daemon
         .meeting
@@ -12448,6 +12503,205 @@ fn source_attachment_title(source: &LlmSourceMetadata, idx: usize) -> String {
     }
 }
 
+/// Keep managed-answer evidence within the API's hard request limits before it
+/// leaves the daemon. When the total budget is contested, each retained item
+/// gets a fair byte budget so a large summary cannot starve the live transcript.
+fn compact_managed_answer_context(context: &[AnswerContext]) -> Vec<AnswerContext> {
+    let retained = select_managed_answer_context(context);
+    let desired_metadata_bytes = retained
+        .iter()
+        .flat_map(|item| {
+            [
+                item.title
+                    .as_ref()
+                    .map_or(0, |title| title.len())
+                    .min(MANAGED_ANSWER_CONTEXT_MAX_TITLE_BYTES),
+                item.source
+                    .as_ref()
+                    .map_or(0, |source| source.len())
+                    .min(MANAGED_ANSWER_CONTEXT_MAX_SOURCE_BYTES),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let metadata_budgets = fair_managed_context_byte_budgets(
+        &desired_metadata_bytes,
+        MANAGED_ANSWER_CONTEXT_MAX_TOTAL_METADATA_BYTES,
+    );
+    let mut metadata_budgets = metadata_budgets.chunks_exact(2);
+    let mut compacted = retained
+        .iter()
+        .map(|item| {
+            let [title_budget, source_budget] = metadata_budgets
+                .next()
+                .expect("each managed context item has two metadata budgets")
+            else {
+                unreachable!("managed context metadata budgets are paired")
+            };
+            let mut compacted = (*item).clone();
+            compacted.title = item
+                .title
+                .as_deref()
+                .map(|title| managed_context_utf8_head(title, *title_budget));
+            compacted.source = item
+                .source
+                .as_deref()
+                .map(|source| managed_context_utf8_head(source, *source_budget));
+            compacted
+        })
+        .collect::<Vec<_>>();
+    let metadata_bytes = compacted
+        .iter()
+        .map(|item| {
+            item.title.as_ref().map_or(0, String::len) + item.source.as_ref().map_or(0, String::len)
+        })
+        .sum::<usize>();
+    let remaining_content_bytes =
+        MANAGED_ANSWER_CONTEXT_MAX_TOTAL_BYTES.saturating_sub(metadata_bytes);
+    let desired_content_bytes = retained
+        .iter()
+        .map(|item| {
+            item.content
+                .len()
+                .min(MANAGED_ANSWER_CONTEXT_MAX_CONTENT_BYTES)
+        })
+        .collect::<Vec<_>>();
+    let content_budgets =
+        fair_managed_context_byte_budgets(&desired_content_bytes, remaining_content_bytes);
+
+    for ((compacted, item), content_budget) in
+        compacted.iter_mut().zip(retained).zip(content_budgets)
+    {
+        compacted.content = if item.kind == AnswerContextKind::Transcript {
+            managed_context_utf8_tail(&item.content, content_budget)
+        } else {
+            managed_context_utf8_head(&item.content, content_budget)
+        };
+    }
+    compacted
+}
+
+fn select_managed_answer_context(context: &[AnswerContext]) -> Vec<&AnswerContext> {
+    if context.len() <= MANAGED_ANSWER_CONTEXT_MAX_ITEMS {
+        return context.iter().collect();
+    }
+
+    let mut selected = vec![false; context.len()];
+    let mut slots = MANAGED_ANSWER_CONTEXT_MAX_ITEMS;
+    for priority in [2u8, 1u8] {
+        let tier = context
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                (managed_answer_context_priority(item) == priority).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let skip = tier.len().saturating_sub(slots);
+        for index in tier.into_iter().skip(skip) {
+            selected[index] = true;
+            slots -= 1;
+        }
+        if slots == 0 {
+            break;
+        }
+    }
+    for (index, item) in context.iter().enumerate() {
+        if slots == 0 {
+            break;
+        }
+        if managed_answer_context_priority(item) == 0 {
+            selected[index] = true;
+            slots -= 1;
+        }
+    }
+
+    context
+        .iter()
+        .zip(selected)
+        .filter_map(|(item, selected)| selected.then_some(item))
+        .collect()
+}
+
+fn managed_answer_context_priority(item: &AnswerContext) -> u8 {
+    if item.kind == AnswerContextKind::Transcript
+        || item.role == AnswerContextRole::UserConfirmedStory
+    {
+        2
+    } else if matches!(
+        item.role,
+        AnswerContextRole::CandidateResume | AnswerContextRole::JobDescription
+    ) {
+        1
+    } else {
+        0
+    }
+}
+
+fn fair_managed_context_byte_budgets(desired: &[usize], total_budget: usize) -> Vec<usize> {
+    if desired.iter().sum::<usize>() <= total_budget {
+        return desired.to_vec();
+    }
+
+    // Find the largest equal per-field cap that fits the aggregate budget.
+    // Short values keep their full bytes and leave capacity for long values.
+    let mut low = 0usize;
+    let mut high = desired.iter().copied().max().unwrap_or(0);
+    while low < high {
+        let midpoint = low + (high - low).div_ceil(2);
+        let required = desired
+            .iter()
+            .map(|desired| (*desired).min(midpoint))
+            .sum::<usize>();
+        if required <= total_budget {
+            low = midpoint;
+        } else {
+            high = midpoint - 1;
+        }
+    }
+
+    let mut budgets = desired
+        .iter()
+        .map(|desired| (*desired).min(low))
+        .collect::<Vec<_>>();
+    let mut remaining = total_budget.saturating_sub(budgets.iter().sum::<usize>());
+    for (budget, desired) in budgets.iter_mut().zip(desired) {
+        if remaining == 0 {
+            break;
+        }
+        if *budget < *desired {
+            *budget += 1;
+            remaining -= 1;
+        }
+    }
+    budgets
+}
+
+fn managed_context_utf8_head(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+
+    let mut end = max_bytes.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn managed_context_utf8_tail(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+
+    let mut start = value.len() - max_bytes;
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value[start..].to_string()
+}
+
 struct AnswerRouteOutcome {
     provider: ProviderSelector,
     answer: String,
@@ -12519,7 +12773,7 @@ async fn resolve_answer_route(
         }
 
         let budget = step.budget_override.unwrap_or(request.route.budgets);
-        let payload = ProviderRequestPayload::from_request(
+        let mut payload = ProviderRequestPayload::from_request(
             request,
             step.provider.clone(),
             config.endpoint.clone(),
@@ -12553,6 +12807,7 @@ async fn resolve_answer_route(
         }
 
         if matches!(step.provider.provider_kind, AiProviderKind::CueManaged) {
+            payload.context = compact_managed_answer_context(&payload.context);
             let stream_ref = stream.as_mut().map(|stream| &mut **stream);
             match call_bluey_managed_provider(paths, request, &step.provider, &payload, stream_ref)
                 .await
@@ -12668,6 +12923,7 @@ async fn call_bluey_managed_provider(
         thinking_budget_tokens: None,
         request_id: Some(payload.request_id.to_string()),
         image_data_urls: prompt.image_data_urls,
+        context: payload.context.clone(),
     };
     let started_at = Instant::now();
 
@@ -15262,11 +15518,8 @@ fn recent_sent_attachment_context_for_follow_up(
         }
 
         let mut content = format!(
-            "Previous answer attachment for the user's immediate follow-up.\nTitle: {}\nKind: {}\nPrevious question: {}\nPrevious answer: {}\nFollow-up instruction: use this retained attachment context and the recent Q&A to answer the user's follow-up. Do not say the prior attachment or original screen is unavailable only because it was not reattached. If the user asks whether the previous answer was right, compare against the retained context and say the likely correction or the exact assumption that is missing.",
-            artifact.title,
-            artifact.kind,
-            compact_snippet(previous_question, 480),
-            compact_snippet(previous_answer, 900),
+            "Retained attachment evidence for the user's immediate follow-up.\nTitle: {}\nKind: {}",
+            artifact.title, artifact.kind,
         );
         if let Some(note) = artifact
             .note
@@ -15304,7 +15557,24 @@ fn recent_sent_attachment_context_for_follow_up(
         contexts.push(
             AnswerContext::new(AnswerContextKind::MeetingMemory, content)
                 .with_title(format!("Previous attachment: {}", artifact.title))
-                .with_source(artifact.path.clone()),
+                .with_source(artifact.path.clone())
+                .with_role(safe_artifact_answer_context_role(artifact)),
+        );
+    }
+
+    if !previous_question.trim().is_empty() || !previous_answer.trim().is_empty() {
+        contexts.push(
+            AnswerContext::new(
+                AnswerContextKind::MeetingMemory,
+                format!(
+                    "Previous Bluey Q&A for the user's immediate attachment follow-up. This is conversation history, not verified artifact evidence.\nPrevious question: {}\nPrevious answer: {}\nFollow-up instruction: use the retained attachment evidence and this recent Q&A to answer the user's follow-up. Do not say the prior attachment or original screen is unavailable only because it was not reattached. If the user asks whether the previous answer was right, compare it against the retained evidence and say the likely correction or the exact assumption that is missing.",
+                    compact_snippet(previous_question, 480),
+                    compact_snippet(previous_answer, 900),
+                ),
+            )
+            .with_title("Previous Q&A for attachment follow-up")
+            .with_source("previous Bluey Q&A")
+            .with_role(AnswerContextRole::Other),
         );
     }
 
@@ -16076,6 +16346,21 @@ fn answer_context_from_artifact_for_question(
     AnswerContext::new(answer_context_kind(artifact.kind), content)
         .with_title(artifact.title.clone())
         .with_source(artifact.path.clone())
+        .with_role(safe_artifact_answer_context_role(artifact))
+}
+
+fn safe_artifact_answer_context_role(artifact: &ContextArtifact) -> AnswerContextRole {
+    if artifact_has_derived_one_shot_summary(artifact) {
+        AnswerContextRole::Other
+    } else {
+        artifact.answer_context_role
+    }
+}
+
+fn artifact_has_derived_one_shot_summary(artifact: &ContextArtifact) -> bool {
+    artifact.text_preview.as_deref().is_some_and(|preview| {
+        preview.starts_with("One-shot image context used with a Bluey answer.")
+    })
 }
 
 fn retained_image_memory_context_from_artifact(artifact: &ContextArtifact) -> AnswerContext {
@@ -16088,6 +16373,7 @@ fn retained_image_memory_context_from_artifact(artifact: &ContextArtifact) -> An
     )
     .with_title(format!("Retained summary: {}", artifact.title))
     .with_source(artifact.path.clone())
+    .with_role(safe_artifact_answer_context_role(artifact))
 }
 
 fn answer_context_content_from_artifact(
@@ -16467,13 +16753,25 @@ fn mark_visible_image_context_used_once(
             continue;
         }
 
+        let reset_trusted_role = artifact.answer_context_role != AnswerContextRole::Other;
         artifact.text_preview = Some(one_shot_image_context_preview(artifact, question, answer));
+        artifact.answer_context_role = AnswerContextRole::Other;
         let marker = "Sent once with an Answer. Future answers use the saved summary unless you capture or attach the image again.";
         artifact.note = Some(match artifact.note.take() {
             Some(note) if note.contains(marker) => note,
             Some(note) if !note.trim().is_empty() => format!("{}\n{}", note.trim(), marker),
             _ => marker.to_string(),
         });
+        if reset_trusted_role {
+            let role_marker = "Context role reset to General because this saved summary includes Bluey's previous answer and is not original user-confirmed evidence.";
+            artifact.note = Some(match artifact.note.take() {
+                Some(note) if note.contains(role_marker) => note,
+                Some(note) if !note.trim().is_empty() => {
+                    format!("{}\n{}", note.trim(), role_marker)
+                }
+                _ => role_marker.to_string(),
+            });
+        }
         if let Err(error) = retain_lightweight_image_memory(paths, artifact) {
             warn!(
                 artifact_id = %artifact.id,
@@ -21087,6 +21385,95 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn setting_context_role_persists_explicit_provenance_and_revisions_artifact() {
+        let (base, paths) = isolated_test_paths("context-role-set");
+        let store = MeetingStore::new(&paths).expect("meeting store");
+        let mut meeting = MeetingRecord::new(Some("Role assignment".to_string()));
+        let artifact = ContextArtifact::new(
+            ContextKind::Document,
+            "/tmp/resume.pdf",
+            "Resume",
+            None,
+            Some(10),
+        );
+        let artifact_id = artifact.id;
+        let original_revision = artifact.updated_at.parse::<i64>().unwrap();
+        meeting.context.push(artifact);
+        store.save_active(&meeting).expect("save active meeting");
+        let daemon = test_daemon(&paths);
+
+        let (snapshot, updated) =
+            set_context_artifact_role(&daemon, artifact_id, AnswerContextRole::CandidateResume)
+                .await
+                .expect("set explicit context role");
+
+        assert_eq!(
+            updated.answer_context_role,
+            AnswerContextRole::CandidateResume
+        );
+        assert!(updated.updated_at.parse::<i64>().unwrap() > original_revision);
+        assert_eq!(
+            snapshot.context[0].answer_context_role,
+            AnswerContextRole::CandidateResume
+        );
+        assert_eq!(
+            daemon
+                .store
+                .load_active()
+                .expect("load persisted meeting")
+                .expect("active meeting")
+                .context[0]
+                .answer_context_role,
+            AnswerContextRole::CandidateResume
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn derived_bluey_image_summary_rejects_trusted_role_assignment() {
+        let (base, paths) = isolated_test_paths("derived-context-role-reject");
+        let store = MeetingStore::new(&paths).expect("meeting store");
+        let mut meeting = MeetingRecord::new(Some("Derived screen summary".to_string()));
+        let artifact = ContextArtifact::new(
+            ContextKind::Image,
+            "/tmp/retained-screen.jpg",
+            "Retained screen",
+            None,
+            Some(128),
+        )
+        .with_text_preview(
+            "One-shot image context used with a Bluey answer.\nAnswer summary: model-generated text.",
+        )
+        .with_processing_status(ContextProcessingStatus::Ready);
+        let artifact_id = artifact.id;
+        meeting.context.push(artifact);
+        store.save_active(&meeting).expect("save active meeting");
+        let daemon = test_daemon(&paths);
+
+        for role in [
+            AnswerContextRole::UserConfirmedStory,
+            AnswerContextRole::CandidateResume,
+        ] {
+            let error = set_context_artifact_role(&daemon, artifact_id, role)
+                .await
+                .expect_err("derived model summary must not gain a trusted role");
+            assert!(error.to_string().contains("can only remain General"));
+        }
+        let persisted = daemon
+            .store
+            .load_active()
+            .expect("load persisted meeting")
+            .expect("active meeting");
+        assert_eq!(
+            persisted.context[0].answer_context_role,
+            AnswerContextRole::Other
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     fn write_test_png(path: &Path) {
         let png = base64::Engine::decode(
             &BASE64_STANDARD,
@@ -21447,6 +21834,219 @@ mod tests {
             managed.system.chars().count() * 3 < full.system.chars().count(),
             "managed prompt should not resend the daemon's full task contract"
         );
+    }
+
+    #[test]
+    fn managed_answer_context_compaction_matches_server_limits_and_keeps_transcript_tail() {
+        let long_unicode = "界🙂".repeat(20_000);
+        let long_title = format!("TITLE_HEAD::{long_unicode}::TITLE_TAIL");
+        let long_source = format!("SOURCE_HEAD::{long_unicode}::SOURCE_TAIL");
+        let mut context = vec![
+            AnswerContext::new(
+                AnswerContextKind::MeetingMemory,
+                format!("SUMMARY_HEAD::{long_unicode}::SUMMARY_TAIL"),
+            )
+            .with_title(long_title.clone())
+            .with_source(long_source.clone())
+            .with_role(AnswerContextRole::Other)
+            .with_sensitivity(cue_core::ai::DataSensitivity::Confidential),
+            AnswerContext::new(
+                AnswerContextKind::MeetingMemory,
+                format!("CONVERSATION_HEAD::{long_unicode}::CONVERSATION_TAIL"),
+            )
+            .with_title(long_title.clone())
+            .with_source(long_source.clone())
+            .with_role(AnswerContextRole::Other)
+            .with_sensitivity(cue_core::ai::DataSensitivity::Internal),
+        ];
+        for index in 0..66 {
+            context.push(
+                AnswerContext::new(
+                    AnswerContextKind::Document,
+                    format!("ATTACHMENT_{index}_HEAD::{long_unicode}::ATTACHMENT_TAIL"),
+                )
+                .with_title(format!("Attachment {index}"))
+                .with_source(format!("/tmp/attachment-{index}.txt"))
+                .with_role(AnswerContextRole::Other)
+                .with_sensitivity(cue_core::ai::DataSensitivity::Confidential),
+            );
+        }
+        context.push(
+            AnswerContext::transcript(format!(
+                "STALE_TRANSCRIPT_HEAD::{long_unicode}::LATEST_TRANSCRIPT_TAIL"
+            ))
+            .with_title(long_title.clone())
+            .with_source(long_source.clone())
+            .with_role(AnswerContextRole::Other)
+            .with_sensitivity(cue_core::ai::DataSensitivity::Restricted),
+        );
+        context.push(
+            AnswerContext::new(
+                AnswerContextKind::UserNote,
+                format!("CONFIRMED_STORY_HEAD::{long_unicode}::CONFIRMED_STORY_TAIL"),
+            )
+            .with_title("Confirmed outage story")
+            .with_source("user-confirmed story")
+            .with_role(AnswerContextRole::UserConfirmedStory)
+            .with_sensitivity(cue_core::ai::DataSensitivity::Confidential),
+        );
+        context.push(
+            AnswerContext::new(
+                AnswerContextKind::Document,
+                format!("RESUME_HEAD::{long_unicode}::RESUME_TAIL"),
+            )
+            .with_title("Candidate resume")
+            .with_source("resume.pdf")
+            .with_role(AnswerContextRole::CandidateResume)
+            .with_sensitivity(cue_core::ai::DataSensitivity::Confidential),
+        );
+        context.push(
+            AnswerContext::new(
+                AnswerContextKind::Document,
+                format!("JOB_DESCRIPTION_HEAD::{long_unicode}::JOB_DESCRIPTION_TAIL"),
+            )
+            .with_title("Job description")
+            .with_source("job-description.pdf")
+            .with_role(AnswerContextRole::JobDescription)
+            .with_sensitivity(cue_core::ai::DataSensitivity::Internal),
+        );
+
+        let compacted = compact_managed_answer_context(&context);
+
+        assert_eq!(compacted.len(), MANAGED_ANSWER_CONTEXT_MAX_ITEMS);
+        assert!(
+            compacted
+                .iter()
+                .map(|item| {
+                    item.content.len()
+                        + item.title.as_ref().map_or(0, String::len)
+                        + item.source.as_ref().map_or(0, String::len)
+                })
+                .sum::<usize>()
+                <= MANAGED_ANSWER_CONTEXT_MAX_TOTAL_BYTES
+        );
+        assert!(
+            compacted
+                .iter()
+                .map(|item| item.content.len())
+                .sum::<usize>()
+                <= MANAGED_ANSWER_CONTEXT_MAX_TOTAL_BYTES
+        );
+        for item in &compacted {
+            assert!(item.content.len() <= MANAGED_ANSWER_CONTEXT_MAX_CONTENT_BYTES);
+            assert!(item
+                .title
+                .as_ref()
+                .is_none_or(|title| title.len() <= MANAGED_ANSWER_CONTEXT_MAX_TITLE_BYTES));
+            assert!(item
+                .source
+                .as_ref()
+                .is_none_or(|source| source.len() <= MANAGED_ANSWER_CONTEXT_MAX_SOURCE_BYTES));
+        }
+
+        assert!(compacted[0].content.starts_with("SUMMARY_HEAD::"));
+        assert!(!compacted[0].content.ends_with("SUMMARY_TAIL"));
+        assert!(compacted[1].content.starts_with("CONVERSATION_HEAD::"));
+        assert!(!compacted[1].content.ends_with("CONVERSATION_TAIL"));
+        let transcript = compacted
+            .iter()
+            .find(|item| item.kind == AnswerContextKind::Transcript)
+            .expect("late transcript must survive the item cap");
+        assert!(transcript.content.ends_with("LATEST_TRANSCRIPT_TAIL"));
+        assert!(!transcript.content.starts_with("STALE_TRANSCRIPT_HEAD::"));
+        assert_eq!(transcript.role, AnswerContextRole::Other);
+        assert_eq!(
+            transcript.sensitivity,
+            cue_core::ai::DataSensitivity::Restricted
+        );
+        assert!(transcript
+            .title
+            .as_deref()
+            .is_some_and(|title| title.starts_with("TITLE_HEAD::")));
+        assert!(transcript
+            .source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("SOURCE_HEAD::")));
+        let confirmed_story = compacted
+            .iter()
+            .find(|item| item.role == AnswerContextRole::UserConfirmedStory)
+            .expect("late confirmed story must survive the item cap");
+        assert!(confirmed_story
+            .content
+            .starts_with("CONFIRMED_STORY_HEAD::"));
+        assert_eq!(confirmed_story.kind, AnswerContextKind::UserNote);
+        assert_eq!(
+            confirmed_story.sensitivity,
+            cue_core::ai::DataSensitivity::Confidential
+        );
+        let resume = compacted
+            .iter()
+            .find(|item| item.role == AnswerContextRole::CandidateResume)
+            .expect("late candidate resume must survive before general memory");
+        assert!(resume.content.starts_with("RESUME_HEAD::"));
+        let job_description = compacted
+            .iter()
+            .find(|item| item.role == AnswerContextRole::JobDescription)
+            .expect("late job description must survive before general memory");
+        assert!(job_description
+            .content
+            .starts_with("JOB_DESCRIPTION_HEAD::"));
+        assert!(!compacted
+            .iter()
+            .any(|item| item.content.starts_with("ATTACHMENT_65_HEAD::")));
+    }
+
+    #[test]
+    fn managed_answer_context_compaction_counts_metadata_in_aggregate_budget() {
+        let long_unicode = "界🙂".repeat(20_000);
+        let context = (0..MANAGED_ANSWER_CONTEXT_MAX_ITEMS)
+            .map(|index| {
+                let kind = if index + 1 == MANAGED_ANSWER_CONTEXT_MAX_ITEMS {
+                    AnswerContextKind::Transcript
+                } else {
+                    AnswerContextKind::Document
+                };
+                let role = if index + 2 == MANAGED_ANSWER_CONTEXT_MAX_ITEMS {
+                    AnswerContextRole::UserConfirmedStory
+                } else {
+                    AnswerContextRole::Other
+                };
+                AnswerContext::new(kind, format!("content-{index}"))
+                    .with_title(format!("TITLE_{index}::{long_unicode}"))
+                    .with_source(format!("SOURCE_{index}::{long_unicode}"))
+                    .with_role(role)
+            })
+            .collect::<Vec<_>>();
+
+        let compacted = compact_managed_answer_context(&context);
+        let combined_bytes = compacted
+            .iter()
+            .map(|item| {
+                item.content.len()
+                    + item.title.as_ref().map_or(0, String::len)
+                    + item.source.as_ref().map_or(0, String::len)
+            })
+            .sum::<usize>();
+
+        assert_eq!(compacted.len(), MANAGED_ANSWER_CONTEXT_MAX_ITEMS);
+        assert!(combined_bytes <= MANAGED_ANSWER_CONTEXT_MAX_TOTAL_BYTES);
+        assert!(compacted.iter().all(|item| !item.content.is_empty()));
+        assert!(compacted
+            .iter()
+            .find(|item| item.kind == AnswerContextKind::Transcript)
+            .is_some_and(|item| !item.content.is_empty()));
+        assert!(compacted
+            .iter()
+            .find(|item| item.role == AnswerContextRole::UserConfirmedStory)
+            .is_some_and(|item| !item.content.is_empty()));
+        assert!(compacted.iter().all(|item| item
+            .title
+            .as_ref()
+            .is_none_or(|title| title.len() <= MANAGED_ANSWER_CONTEXT_MAX_TITLE_BYTES)));
+        assert!(compacted.iter().all(|item| item
+            .source
+            .as_ref()
+            .is_none_or(|source| source.len() <= MANAGED_ANSWER_CONTEXT_MAX_SOURCE_BYTES)));
     }
 
     #[test]
@@ -22221,6 +22821,7 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             None,
             Some(128),
         )
+        .with_answer_context_role(AnswerContextRole::UserConfirmedStory)
         .with_processing_status(ContextProcessingStatus::Ready);
         let pending_id = pending_screen.id;
         let saved_doc = ContextArtifact::new(
@@ -22257,6 +22858,13 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             .note
             .as_deref()
             .is_some_and(|note| note.contains("Future answers use the saved summary")));
+        assert_eq!(screen.answer_context_role, AnswerContextRole::Other);
+        assert!(screen.note.as_deref().is_some_and(|note| note
+            .contains("Context role reset to General because this saved summary includes")));
+        assert_eq!(
+            safe_artifact_answer_context_role(screen),
+            AnswerContextRole::Other
+        );
         let doc = meeting
             .context
             .iter()
@@ -22304,21 +22912,23 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             "that's not the answer right?",
         );
 
-        assert_eq!(context.len(), 1);
+        assert_eq!(context.len(), 2);
         assert_eq!(context[0].kind, AnswerContextKind::MeetingMemory);
         assert_eq!(
             context[0].title.as_deref(),
             Some("Previous attachment: Screen context")
         );
-        assert!(context[0]
+        assert!(context[1]
             .content
             .contains("Do not say the prior attachment or original screen is unavailable"));
-        assert!(context[0].content.contains("Previous question:"));
-        assert!(context[0].content.contains("Previous answer:"));
-        assert!(context[0]
+        assert!(!context[0].content.contains("Previous answer:"));
+        assert!(context[1].content.contains("Previous question:"));
+        assert!(context[1].content.contains("Previous answer:"));
+        assert!(context[1]
             .content
-            .contains("compare against the retained context"));
+            .contains("compare it against the retained evidence"));
         assert!(context[0].content.contains("aggregate orders"));
+        assert_eq!(context[1].role, AnswerContextRole::Other);
     }
 
     #[test]
@@ -22349,16 +22959,55 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             "that's not the answer right?",
         );
 
-        assert_eq!(context.len(), 1);
+        assert_eq!(context.len(), 2);
         assert_eq!(context[0].kind, AnswerContextKind::MeetingMemory);
         assert_eq!(
             context[0].title.as_deref(),
             Some("Previous attachment: Screen context")
         );
         assert!(context[0].content.contains("customer/day aggregate"));
-        assert!(context[0]
+        assert!(context[1]
             .content
             .contains("Do not say the prior attachment or original screen is unavailable"));
+    }
+
+    #[test]
+    fn follow_up_keeps_confirmed_artifact_separate_from_previous_bluey_answer() {
+        let mut meeting = MeetingRecord::new(Some("Behavioral interview".to_string()));
+        let story = ContextArtifact::new(
+            ContextKind::Document,
+            "/tmp/confirmed-story.txt",
+            "Confirmed outage story",
+            None,
+            Some(512),
+        )
+        .with_text_preview("Situation: A queue stalled. Task: I owned recovery. Action: I repaired the consumer and replayed safely. Result: Processing recovered without data loss.")
+        .with_answer_context_role(AnswerContextRole::UserConfirmedStory)
+        .with_processing_status(ContextProcessingStatus::Ready);
+        let story_id = story.id;
+        meeting.context.push(story);
+        meeting.push_conversation_turn(
+            ConversationTurn::new(
+                "Tell me about a time you handled an outage.",
+                "A polished Bluey draft that is not itself verified evidence.",
+                Some("overlay ask".to_string()),
+                Some("Bluey managed".to_string()),
+            )
+            .with_attachment_ids(vec![story_id]),
+        );
+
+        let context = recent_sent_attachment_context_for_follow_up(
+            &meeting,
+            &[],
+            "Use that story for this follow-up.",
+        );
+
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[0].role, AnswerContextRole::UserConfirmedStory);
+        assert!(context[0].content.contains("A queue stalled"));
+        assert!(!context[0].content.contains("polished Bluey draft"));
+        assert_eq!(context[1].role, AnswerContextRole::Other);
+        assert!(context[1].content.contains("polished Bluey draft"));
     }
 
     #[test]
@@ -23184,6 +23833,28 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
         assert_eq!(
             attachments[0].path.as_deref(),
             Some("/tmp/bluey-screen.png")
+        );
+    }
+
+    #[test]
+    fn answer_context_role_comes_only_from_persisted_artifact_provenance() {
+        let filename_only = ContextArtifact::new(
+            ContextKind::Document,
+            "/tmp/candidate_resume.pdf",
+            "Candidate Resume",
+            None,
+            Some(10),
+        )
+        .with_text_preview("Candidate experience");
+        assert_eq!(
+            answer_context_from_artifact_for_question(&filename_only, None).role,
+            AnswerContextRole::Other
+        );
+
+        let assigned = filename_only.with_answer_context_role(AnswerContextRole::CandidateResume);
+        assert_eq!(
+            answer_context_from_artifact_for_question(&assigned, None).role,
+            AnswerContextRole::CandidateResume
         );
     }
 

@@ -23,10 +23,11 @@ use cue_core::process_aliases::{is_daemon_identity_path, DAEMON_EXECUTABLE_STEMS
 use cue_core::{capture_windows_screen, WindowsCaptureRegion};
 use cue_core::{
     load_account, load_settings, new_trace_id, trace_id_from_env, update_settings, AccountConfig,
-    ActionItem, AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerRequest, AnswerResponse,
-    AudioPipelineStatus, CardKind, CloudSyncStatus, ContextArtifact, CueCard, CueSettings,
-    MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, PrivacyFlags, ProviderRoute,
-    ProviderSelector, RouteBudget, RouteSelectionPolicy, Speaker, BLUEY_TRACE_ID_ENV,
+    ActionItem, AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerContextRole, AnswerRequest,
+    AnswerResponse, AudioPipelineStatus, CardKind, CloudSyncStatus, ContextArtifact, CueCard,
+    CueSettings, MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, PrivacyFlags,
+    ProviderRoute, ProviderSelector, RouteBudget, RouteSelectionPolicy, Speaker,
+    BLUEY_TRACE_ID_ENV,
 };
 use tokio::time::{sleep, Duration, Instant};
 
@@ -429,6 +430,8 @@ enum MeetingCommands {
 #[derive(Debug, Subcommand)]
 enum ContextCommands {
     Add(ContextAddArgs),
+    /// Set how an attached item may be used when grounding interview answers.
+    Role(ContextRoleArgs),
     Capture(ContextCaptureArgs),
     Page,
     List,
@@ -445,6 +448,23 @@ struct ContextAddArgs {
     title: Option<String>,
     #[arg(long)]
     note: Option<String>,
+    /// Declare the item's answer-grounding role. General content stays unverified.
+    #[arg(long, value_enum, default_value_t = ContextRoleArg::General)]
+    role: ContextRoleArg,
+    /// Affirm that --role my-story describes your own lived experience.
+    #[arg(long)]
+    confirm_my_story: bool,
+}
+
+#[derive(Debug, Args)]
+struct ContextRoleArgs {
+    /// Context artifact ID shown by `bluey context list`.
+    artifact_id: String,
+    #[arg(value_enum)]
+    role: ContextRoleArg,
+    /// Affirm that role `my-story` describes your own lived experience.
+    #[arg(long)]
+    confirm_my_story: bool,
 }
 
 #[derive(Debug, Args)]
@@ -608,6 +628,32 @@ enum SpeakerArg {
     User,
     Other,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ContextRoleArg {
+    /// General content that is not verified as personal evidence.
+    General,
+    /// The current user's resume or candidate profile.
+    Resume,
+    /// A target role or job description.
+    JobDescription,
+    /// Interview preparation, examples, or reference material.
+    InterviewPrep,
+    /// A story from the current user's own lived experience.
+    MyStory,
+}
+
+impl From<ContextRoleArg> for AnswerContextRole {
+    fn from(value: ContextRoleArg) -> Self {
+        match value {
+            ContextRoleArg::General => Self::Other,
+            ContextRoleArg::Resume => Self::CandidateResume,
+            ContextRoleArg::JobDescription => Self::JobDescription,
+            ContextRoleArg::InterviewPrep => Self::InterviewPreparation,
+            ContextRoleArg::MyStory => Self::UserConfirmedStory,
+        }
+    }
 }
 
 impl From<SpeakerArg> for Speaker {
@@ -809,10 +855,24 @@ pub async fn cli_main() -> Result<()> {
         }
         Commands::Context { command } => match command {
             ContextCommands::Add(args) => {
+                let answer_context_role = confirmed_context_role(args.role, args.confirm_my_story)?;
                 let response = request(DaemonRequest::ContextAdd {
                     path: args.path.display().to_string(),
                     title: args.title,
                     note: args.note,
+                    answer_context_role,
+                })
+                .await?;
+                print_response(response)
+            }
+            ContextCommands::Role(args) => {
+                let answer_context_role = confirmed_context_role(args.role, args.confirm_my_story)?;
+                let id = args.artifact_id.parse().with_context(|| {
+                    format!("invalid context artifact ID: {}", args.artifact_id)
+                })?;
+                let response = request(DaemonRequest::ContextRoleSet {
+                    id,
+                    answer_context_role,
                 })
                 .await?;
                 print_response(response)
@@ -2664,6 +2724,7 @@ async fn add_context(
         path: path.to_string(),
         title,
         note,
+        answer_context_role: AnswerContextRole::Other,
     })
     .await?;
     match response {
@@ -2674,6 +2735,18 @@ async fn add_context(
             Ok(Vec::new())
         }
     }
+}
+
+fn confirmed_context_role(
+    role: ContextRoleArg,
+    confirm_my_story: bool,
+) -> Result<AnswerContextRole> {
+    if role == ContextRoleArg::MyStory && !confirm_my_story {
+        bail!(
+            "role my-story is a trust boundary: rerun with --confirm-my-story only if this item describes your own lived experience"
+        );
+    }
+    Ok(role.into())
 }
 
 fn parse_transcript_line(line: &str, default_speaker: Speaker) -> (Speaker, String) {
@@ -3417,8 +3490,12 @@ fn print_context_items(items: Vec<ContextArtifact>) {
             .map(|note| format!(" - {note}"))
             .unwrap_or_default();
         println!(
-            "- [{}:{}] {}{}",
-            item.kind, item.processing_status, item.title, note
+            "- {} [{}:{}] {}{}",
+            item.id, item.kind, item.processing_status, item.title, note
+        );
+        println!(
+            "  Answer role: {}",
+            answer_context_role_label(item.answer_context_role)
         );
         println!("  {}", item.path);
         if let Some(error) = item
@@ -3428,6 +3505,16 @@ fn print_context_items(items: Vec<ContextArtifact>) {
         {
             println!("  {}", error);
         }
+    }
+}
+
+fn answer_context_role_label(role: AnswerContextRole) -> &'static str {
+    match role {
+        AnswerContextRole::CandidateResume => "Resume",
+        AnswerContextRole::JobDescription => "Job description",
+        AnswerContextRole::InterviewPreparation => "Interview prep / unverified",
+        AnswerContextRole::UserConfirmedStory => "My confirmed story",
+        AnswerContextRole::Other => "General / unverified",
     }
 }
 
@@ -3958,11 +4045,11 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 mod tests {
     use super::{
         answer_request_from_args, apply_cli_settings, bluey_on_boot_lines, bluey_on_boot_title,
-        default_bluey_signin_url, device_login_url, install_root_from_exe, login_account_provider,
-        resolve_daemon_bin_from_roots, resolve_login_api_url_from, AskArgs, BlueyOnAuthState, Cli,
-        Commands,
+        confirmed_context_role, default_bluey_signin_url, device_login_url, install_root_from_exe,
+        login_account_provider, resolve_daemon_bin_from_roots, resolve_login_api_url_from, AskArgs,
+        BlueyOnAuthState, Cli, Commands, ContextCommands, ContextRoleArg,
     };
-    use cue_core::{AiProviderKind, CueSettings};
+    use cue_core::{AiProviderKind, AnswerContextRole, CueSettings};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -3980,6 +4067,57 @@ mod tests {
         let json = <Cli as clap::Parser>::try_parse_from(["bluey", "legal", "--json"])
             .expect("parse JSON legal command");
         assert!(matches!(json.command, Commands::Legal { json: true }));
+    }
+
+    #[test]
+    fn context_roles_parse_as_deliberate_user_labels() {
+        let add = <Cli as clap::Parser>::try_parse_from([
+            "bluey",
+            "context",
+            "add",
+            "resume.pdf",
+            "--role",
+            "job-description",
+        ])
+        .expect("parse context add role");
+        let Commands::Context {
+            command: ContextCommands::Add(args),
+        } = add.command
+        else {
+            panic!("expected context add command");
+        };
+        assert_eq!(args.role, ContextRoleArg::JobDescription);
+
+        let set = <Cli as clap::Parser>::try_parse_from([
+            "bluey",
+            "context",
+            "role",
+            "7c07837e-b725-4684-886f-c45cb27bbe2a",
+            "interview-prep",
+        ])
+        .expect("parse context role command");
+        let Commands::Context {
+            command: ContextCommands::Role(args),
+        } = set.command
+        else {
+            panic!("expected context role command");
+        };
+        assert_eq!(args.role, ContextRoleArg::InterviewPrep);
+    }
+
+    #[test]
+    fn my_story_role_requires_an_explicit_affirmation() {
+        let error = confirmed_context_role(ContextRoleArg::MyStory, false)
+            .expect_err("unconfirmed story must be rejected");
+        assert!(error.to_string().contains("--confirm-my-story"));
+        assert_eq!(
+            confirmed_context_role(ContextRoleArg::MyStory, true).unwrap(),
+            AnswerContextRole::UserConfirmedStory
+        );
+        assert_eq!(
+            confirmed_context_role(ContextRoleArg::General, false).unwrap(),
+            AnswerContextRole::Other
+        );
     }
 
     #[test]

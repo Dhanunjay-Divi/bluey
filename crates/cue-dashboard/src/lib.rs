@@ -141,6 +141,7 @@ pub fn run() {
             commands::daemon_context_stop,
             commands::daemon_capture_active_page,
             commands::daemon_context_items,
+            commands::daemon_set_context_role,
             // R7: Live Transcript
             commands::get_live_transcripts,
             // R6: Permission UX

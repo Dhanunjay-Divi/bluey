@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    sanitize_observability_id, ActionItem, AiRuntimeStatus, AnswerRequest, AnswerResponse,
-    AnswerStreamEvent, AudioPipelineStatus, CloudSyncStatus, ContextArtifact, CueCard, DaemonState,
-    MeetingRecap, MemoryHit, OverlayPosition, Speaker,
+    sanitize_observability_id, ActionItem, AiRuntimeStatus, AnswerContextRole, AnswerRequest,
+    AnswerResponse, AnswerStreamEvent, AudioPipelineStatus, CloudSyncStatus, ContextArtifact,
+    CueCard, DaemonState, MeetingRecap, MemoryHit, OverlayPosition, Speaker,
 };
 
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:57321";
@@ -101,6 +101,12 @@ pub enum DaemonRequest {
         path: String,
         title: Option<String>,
         note: Option<String>,
+        #[serde(default)]
+        answer_context_role: AnswerContextRole,
+    },
+    ContextRoleSet {
+        id: uuid::Uuid,
+        answer_context_role: AnswerContextRole,
     },
     ContextList,
     ActivePageCapture,
@@ -248,6 +254,45 @@ mod tests {
     #[test]
     fn shutdown_is_detected_inside_trace_envelope() {
         assert!(DaemonRequest::Shutdown.with_trace_id("trace").is_shutdown());
+    }
+
+    #[test]
+    fn legacy_context_add_defaults_to_untrusted_other_role() {
+        let decoded: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "type": "context_add",
+            "path": "/tmp/resume.pdf",
+            "title": "Resume",
+            "note": null
+        }))
+        .expect("decode legacy context add");
+
+        assert!(matches!(
+            decoded,
+            DaemonRequest::ContextAdd {
+                answer_context_role: AnswerContextRole::Other,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn context_role_set_round_trips_explicit_role() {
+        let id = uuid::Uuid::new_v4();
+        let request = DaemonRequest::ContextRoleSet {
+            id,
+            answer_context_role: AnswerContextRole::UserConfirmedStory,
+        };
+        let decoded: DaemonRequest = serde_json::from_str(
+            &serde_json::to_string(&request).expect("serialize context role mutation"),
+        )
+        .expect("decode context role mutation");
+        assert!(matches!(
+            decoded,
+            DaemonRequest::ContextRoleSet {
+                id: decoded_id,
+                answer_context_role: AnswerContextRole::UserConfirmedStory,
+            } if decoded_id == id
+        ));
     }
 
     #[test]

@@ -7,6 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use cue_core::AnswerContext;
+
+/// Current provenance-bearing answer-context wire schema understood by Bluey.
+pub const ANSWER_CONTEXT_SCHEMA_VERSION_V1: u16 = 1;
+
 // ─── Auth ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -137,6 +142,15 @@ pub struct CompleteRequest {
     /// size before routing these to a vision lane.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_data_urls: Vec<String>,
+    /// Explicit capability gate for provenance-bearing answer context. New
+    /// clients send v1 even when `context` is empty; legacy clients omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_schema_version: Option<u16>,
+    /// Typed evidence supplied by the daemon. Keeping source kind/title out of
+    /// concatenated prompt text prevents an attached document from forging a
+    /// transcript, resume, or user-confirmed story boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<AnswerContext>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

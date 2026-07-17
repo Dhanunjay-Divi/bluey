@@ -41,6 +41,10 @@ pub struct LlmRequest {
     /// These are provider-compatible `data:image/...;base64,...` URLs. Direct
     /// text providers ignore this field unless they explicitly support vision.
     pub image_data_urls: Vec<String>,
+    /// Structured Bluey evidence for managed routes. Direct providers keep
+    /// using `user`; the managed server uses this provenance separately from
+    /// untrusted document text.
+    pub context: Vec<cue_cloud_client::AnswerContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

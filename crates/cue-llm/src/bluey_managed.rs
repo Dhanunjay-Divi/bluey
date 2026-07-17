@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use cue_cloud_client::{
     CloudClient, CompleteRequest as CloudCompleteRequest,
     CompleteResponse as CloudCompleteResponse, Error as CloudError,
+    ANSWER_CONTEXT_SCHEMA_VERSION_V1,
 };
 use futures_util::StreamExt;
 
@@ -93,6 +94,8 @@ impl LlmProvider for BlueyManagedProvider {
             lane: self.lane.as_str().to_string(),
             estimated_input_tokens: None,
             image_data_urls: req.image_data_urls.clone(),
+            context_schema_version: Some(ANSWER_CONTEXT_SCHEMA_VERSION_V1),
+            context: req.context.clone(),
         };
         let resp = self
             .client
@@ -128,6 +131,8 @@ impl LlmProvider for BlueyManagedProvider {
             lane: self.lane.as_str().to_string(),
             estimated_input_tokens: None,
             image_data_urls: req.image_data_urls.clone(),
+            context_schema_version: Some(ANSWER_CONTEXT_SCHEMA_VERSION_V1),
+            context: req.context.clone(),
         };
         let response = self
             .client
@@ -867,7 +872,7 @@ mod tests {
     use cue_cloud_client::{client::ClientConfig, tokens::MemoryStore, CloudClient, Tokens};
     use futures_util::StreamExt;
     use std::{sync::Arc, time::Duration};
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -1039,6 +1044,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/router/complete/stream"))
             .and(header("authorization", "Bearer access"))
+            .and(body_partial_json(serde_json::json!({
+                "context_schema_version": ANSWER_CONTEXT_SCHEMA_VERSION_V1
+            })))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/x-ndjson")
@@ -1081,6 +1089,7 @@ mod tests {
                 thinking_budget_tokens: None,
                 request_id: Some("req-1".into()),
                 image_data_urls: Vec::new(),
+                context: Vec::new(),
             })
             .await
             .unwrap();
@@ -1143,6 +1152,7 @@ mod tests {
                 thinking_budget_tokens: None,
                 request_id: Some("req-truncated".into()),
                 image_data_urls: Vec::new(),
+                context: Vec::new(),
             })
             .await
             .unwrap();
@@ -1205,6 +1215,7 @@ mod tests {
                 thinking_budget_tokens: None,
                 request_id: Some("req-done-before-billing".into()),
                 image_data_urls: Vec::new(),
+                context: Vec::new(),
             })
             .await
             .unwrap();

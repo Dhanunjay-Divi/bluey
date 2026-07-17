@@ -19,9 +19,9 @@ use cue_cloud_client::{
     SyncRagChunkRecord, SyncSessionRecord, SyncTranscriptSegment,
 };
 use cue_core::{
-    short_session_code, CardArtifactType, ContextArtifact, ContextKind, ContextProcessingStatus,
-    ConversationMemory, ConversationTurn, CueCardArtifact, MeetingDiagnostics, MeetingRecord,
-    Speaker, TranscriptSegment,
+    short_session_code, AnswerContextRole, CardArtifactType, ContextArtifact, ContextKind,
+    ContextProcessingStatus, ConversationMemory, ConversationTurn, CueCardArtifact,
+    MeetingDiagnostics, MeetingRecord, Speaker, TranscriptSegment,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -400,6 +400,7 @@ fn audit_metadata_key_is_safe(key: &str) -> bool {
             | "task_type"
             | "question_intent"
             | "artifact_type"
+            | "answer_context_role"
             | "processing_status"
             | "speaker"
             | "status"
@@ -1120,6 +1121,14 @@ fn reconcile_cloud_meeting(
 }
 
 fn merge_missing_context_fields(local: &mut ContextArtifact, cloud: ContextArtifact) {
+    let local_updated_at = parse_ms(&local.updated_at);
+    let cloud_updated_at = parse_ms(&cloud.updated_at);
+    if cloud_updated_at > local_updated_at
+        || (cloud_updated_at == local_updated_at
+            && local.answer_context_role == AnswerContextRole::Other)
+    {
+        local.answer_context_role = cloud.answer_context_role;
+    }
     if local.path.trim().is_empty() {
         local.path = cloud.path;
     }
@@ -1726,6 +1735,7 @@ fn assemble_session_audit_bundle(
             "markdown_path": artifact.markdown_path,
             "processing_status": artifact.processing_status.to_string(),
             "processing_error": artifact.processing_error,
+            "answer_context_role": artifact.answer_context_role,
             "created_at_ms": parse_ms(&artifact.created_at),
         });
         push_audit_record(
@@ -3574,6 +3584,7 @@ async fn context_artifact_from_cloud(
             .get("processing_error")
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
+        answer_context_role: answer_context_role_from_metadata(&record.metadata),
         created_at: record.created_at_ms.to_string(),
         updated_at: record.updated_at_ms.max(record.created_at_ms).to_string(),
     })
@@ -3846,6 +3857,14 @@ fn processing_status_from_metadata(
     }
 }
 
+fn answer_context_role_from_metadata(metadata: &serde_json::Value) -> AnswerContextRole {
+    metadata
+        .get("answer_context_role")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
 fn maybe_flush(
     batches: &mut Vec<SyncBatchRequest>,
     batch: &mut SyncBatchRequest,
@@ -4048,6 +4067,7 @@ fn context_record(
         "size_bytes": artifact.size_bytes,
         "processing_status": artifact.processing_status.to_string(),
         "processing_error": artifact.processing_error.as_deref(),
+        "answer_context_role": artifact.answer_context_role,
     });
     if let Some(uploaded) = uploaded {
         current_metadata["object_key"] = Value::String(uploaded.object_key.clone());
@@ -4816,7 +4836,8 @@ mod tests {
         let mut meeting = MeetingRecord::new(Some("Docs".into()));
         meeting.context.push(
             ContextArtifact::new(ContextKind::Document, "/tmp/a.pdf", "Spec", None, Some(10))
-                .with_text_preview("the spec mentions blue ocean cache invalidation"),
+                .with_text_preview("the spec mentions blue ocean cache invalidation")
+                .with_answer_context_role(AnswerContextRole::JobDescription),
         );
 
         let batches = build_sync_batches(&[meeting], &HashMap::new(), &HashMap::new());
@@ -4824,6 +4845,59 @@ mod tests {
         assert_eq!(batch.context_artifacts.len(), 1);
         assert_eq!(batch.rag_chunks.len(), 1);
         assert_eq!(batch.rag_chunks[0].source_kind, "context");
+        assert_eq!(
+            batch.context_artifacts[0].metadata["answer_context_role"],
+            json!("job_description")
+        );
+    }
+
+    #[test]
+    fn cloud_context_role_metadata_defaults_to_other_and_decodes_known_roles() {
+        assert_eq!(
+            answer_context_role_from_metadata(&json!({})),
+            AnswerContextRole::Other
+        );
+        assert_eq!(
+            answer_context_role_from_metadata(
+                &json!({ "answer_context_role": "user_confirmed_story" })
+            ),
+            AnswerContextRole::UserConfirmedStory
+        );
+        assert_eq!(
+            answer_context_role_from_metadata(&json!({ "answer_context_role": "invalid" })),
+            AnswerContextRole::Other
+        );
+    }
+
+    #[test]
+    fn context_role_merge_respects_artifact_revision() {
+        let mut local = ContextArtifact::new(
+            ContextKind::Document,
+            "/tmp/local.pdf",
+            "Local",
+            None,
+            Some(10),
+        );
+        local.updated_at = "10".to_string();
+        let mut newer_cloud = local
+            .clone()
+            .with_answer_context_role(AnswerContextRole::CandidateResume);
+        newer_cloud.updated_at = "20".to_string();
+        merge_missing_context_fields(&mut local, newer_cloud);
+        assert_eq!(
+            local.answer_context_role,
+            AnswerContextRole::CandidateResume
+        );
+
+        local.updated_at = "30".to_string();
+        let mut older_cloud = local.clone();
+        older_cloud.answer_context_role = AnswerContextRole::Other;
+        older_cloud.updated_at = "25".to_string();
+        merge_missing_context_fields(&mut local, older_cloud);
+        assert_eq!(
+            local.answer_context_role,
+            AnswerContextRole::CandidateResume
+        );
     }
 
     #[test]
@@ -5606,7 +5680,8 @@ mod tests {
                 deleted_at_ms: None,
                 metadata: json!({
                     "size_bytes": 1234,
-                    "processing_status": "ready"
+                    "processing_status": "ready",
+                    "answer_context_role": "candidate_resume"
                 }),
             }],
         };
@@ -5625,6 +5700,10 @@ mod tests {
         assert_eq!(
             meeting.context[0].processing_status,
             ContextProcessingStatus::Ready
+        );
+        assert_eq!(
+            meeting.context[0].answer_context_role,
+            AnswerContextRole::CandidateResume
         );
         assert!(meeting.context[0]
             .markdown_path
