@@ -1255,9 +1255,19 @@ const DEFAULT_BALANCED_FIRST_TOKEN_TIMEOUT_MS: u64 = 4_000;
 const DEFAULT_VISION_FIRST_TOKEN_TIMEOUT_MS: u64 = 6_000;
 const DEFAULT_DEEP_FIRST_TOKEN_TIMEOUT_MS: u64 = 8_000;
 const DEFAULT_INSTANT_STREAM_ROUTE_CONNECT_TIMEOUT_MS: u64 = 4_000;
-const DEFAULT_BALANCED_STREAM_ROUTE_CONNECT_TIMEOUT_MS: u64 = 7_000;
+// The pre-header connect phase and first-delta phase are sequential. Keep the
+// measured balanced-lane connect budget below its first-delta budget so one
+// stalled provider cannot consume the interactive latency envelope before a
+// healthy fallback is attempted. Other lanes retain their existing budgets
+// until lane-specific production evidence supports tightening them.
+const DEFAULT_BALANCED_STREAM_ROUTE_CONNECT_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_VISION_STREAM_ROUTE_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_DEEP_STREAM_ROUTE_CONNECT_TIMEOUT_MS: u64 = 15_000;
+const _: () = {
+    assert!(
+        DEFAULT_BALANCED_STREAM_ROUTE_CONNECT_TIMEOUT_MS <= DEFAULT_BALANCED_FIRST_TOKEN_TIMEOUT_MS
+    );
+};
 const DEFAULT_INSTANT_STREAM_IDLE_TIMEOUT_MS: u64 = 8_000;
 const DEFAULT_BALANCED_STREAM_IDLE_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_VISION_STREAM_IDLE_TIMEOUT_MS: u64 = 25_000;
@@ -1648,6 +1658,40 @@ fn priced_routes_for(
             })
         })
         .collect()
+}
+
+const BALANCED_PROVIDER_MIX_PREFERRED_TIER_SIZE: usize = 3;
+
+/// Prefer the measured fast-quality route for structured design answers while
+/// keeping the operator's route policy authoritative. OpenAI is moved only
+/// when it already appears in the balanced provider-mix preferred tier; cost-
+/// optimized and static quality policies have different top tiers and are not
+/// silently overridden. Capacity and provider-health fallback remain intact.
+fn prioritize_routes_for_answer_plan(
+    routes: &mut [PricedRoute],
+    effective_lane: &str,
+    plan: &AnswerPlan,
+    enabled: bool,
+) -> bool {
+    if !enabled
+        || effective_lane != "balanced"
+        || plan.intent != AnswerIntent::SystemDesign
+        || plan.output != AnswerOutput::CanvasDetail
+    {
+        return false;
+    }
+    let Some(index) = routes
+        .iter()
+        .take(BALANCED_PROVIDER_MIX_PREFERRED_TIER_SIZE)
+        .position(|route| route.provider == "openai")
+    else {
+        return false;
+    };
+    if index == 0 {
+        return false;
+    }
+    routes[..=index].rotate_right(1);
+    true
 }
 
 fn priced_transcribe_routes_for(
@@ -7355,7 +7399,13 @@ async fn complete_stream_inner(
         thinking = ?thinking.mode,
         "managed chat pre-dispatch phases completed"
     );
-    let routes = priced_routes_for(&effective_lane, est_in, max_out, &req.request_id);
+    let mut routes = priced_routes_for(&effective_lane, est_in, max_out, &req.request_id);
+    let design_quality_route_prioritized = prioritize_routes_for_answer_plan(
+        &mut routes,
+        &effective_lane,
+        &answer_plan,
+        !env_flag_is_false("BLUEY_BALANCED_DESIGN_QUALITY_ROUTE"),
+    );
     if routes.is_empty() {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
         return Err((
@@ -7373,6 +7423,7 @@ async fn complete_stream_inner(
             first_provider = %first_route.provider,
             first_model = %first_route.model,
             candidate_count = routes.len(),
+            design_quality_route_prioritized,
             "resolved streaming LLM route candidates"
         );
     }
@@ -9027,7 +9078,13 @@ async fn complete_inner(
         .estimated_input_tokens
         .unwrap_or_default()
         .max(server_est_in);
-    let routes = priced_routes_for(&effective_lane, est_in, max_out, &req.request_id);
+    let mut routes = priced_routes_for(&effective_lane, est_in, max_out, &req.request_id);
+    let design_quality_route_prioritized = prioritize_routes_for_answer_plan(
+        &mut routes,
+        &effective_lane,
+        &answer_plan,
+        !env_flag_is_false("BLUEY_BALANCED_DESIGN_QUALITY_ROUTE"),
+    );
     if routes.is_empty() {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
         return Err((
@@ -9045,6 +9102,7 @@ async fn complete_inner(
             first_provider = %first_route.provider,
             first_model = %first_route.model,
             candidate_count = routes.len(),
+            design_quality_route_prioritized,
             "resolved LLM route candidates"
         );
     }
@@ -13286,6 +13344,64 @@ mod tests {
             .expect("deep lane keeps a Sonnet fallback");
 
         assert_eq!(sonnet_fallback.pricing.markup_percent, 150);
+    }
+
+    #[test]
+    fn balanced_system_design_prefers_measured_fast_quality_route() {
+        let req = complete_request(
+            "Question:\nDesign a production messaging app for tens of millions of users. Explain it like a system design interview.",
+        );
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+        assert_eq!(plan.intent, AnswerIntent::SystemDesign);
+        assert_eq!(plan.output, AnswerOutput::CanvasDetail);
+
+        let mut routes = priced_routes_for("balanced", 1_000, 1_000, "design-route-test");
+        assert_eq!(routes.first().map(|route| route.provider), Some("deepseek"));
+        assert_eq!(routes.get(1).map(|route| route.provider), Some("openai"));
+        assert!(prioritize_routes_for_answer_plan(
+            &mut routes,
+            "balanced",
+            &plan,
+            true,
+        ));
+        assert_eq!(routes.first().map(|route| route.provider), Some("openai"));
+
+        let mut disabled = priced_routes_for("balanced", 1_000, 1_000, "design-route-test");
+        assert!(!prioritize_routes_for_answer_plan(
+            &mut disabled,
+            "balanced",
+            &plan,
+            false,
+        ));
+        assert_eq!(
+            disabled.first().map(|route| route.provider),
+            Some("deepseek")
+        );
+    }
+
+    #[test]
+    fn balanced_non_design_answer_preserves_provider_mix_rotation() {
+        let req = complete_request("Question:\nExplain an LRU cache.");
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+        let mut routes = priced_routes_for("balanced", 1_000, 1_000, "design-route-test");
+        let original = routes
+            .iter()
+            .map(|route| route.provider)
+            .collect::<Vec<_>>();
+
+        assert!(!prioritize_routes_for_answer_plan(
+            &mut routes,
+            "balanced",
+            &plan,
+            true,
+        ));
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route.provider)
+                .collect::<Vec<_>>(),
+            original
+        );
     }
 
     #[test]

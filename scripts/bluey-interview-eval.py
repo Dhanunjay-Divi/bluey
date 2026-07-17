@@ -242,7 +242,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q35", "design_followup", "general", "How would you preserve per-conversation ordering when users reconnect and servers fail?", "curated", "messaging_design", max_tokens=800, speakable=True, expect_followup_context=True, required_groups=(g("sequence", "offset", "order"), g("idempot", "dedup"), g("reconnect", "replay"))),
     EvalCase("Q36", "system_design", "general", "Design a real-time monitoring platform ingesting 100,000 events per second with alerting and historical queries.", "resume_inspired", "monitoring_design", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("kafka", "queue", "stream"), g("time series", "storage"), g("alert",), g("partition", "scale"))),
     EvalCase("Q37", "design_followup", "general", "One tenant becomes a hot partition. Change the design without breaking ordering for that tenant.", "curated", "monitoring_design", max_tokens=850, speakable=True, expect_followup_context=True, required_groups=(g("partition", "shard"), g("order", "sequence"), g("tenant",))),
-    EvalCase("Q38", "system_design", "ds", "Design an online feature store that serves low-latency features and keeps training data consistent with serving.", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("offline",), g("online",), g("event time",), g("availability time", "ingestion time"), g("as-of", "as of", "temporal join"), g("executable transformation", "compiled feature definition", "shared feature code", "versioned dsl"), g("late event", "out-of-order", "watermark"), g("idempot", "dedup"), g("skew", "parity"), g("fresh", "stream"))),
+    EvalCase("Q38", "system_design", "ds", "Design an online feature store that serves low-latency features and keeps training data consistent with serving.", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("offline",), g("online",), g("event time",), g("availability time", "ingestion time"), g("as-of", "as of", "temporal join"), g("executable transformation", "executable transformations", "compiled feature definition", "shared feature code", "versioned dsl"), g("late event", "out-of-order", "watermark"), g("idempot", "dedup"), g("skew", "parity"), g("fresh", "stream"))),
     EvalCase("Q39", "system_design", "general", "Design a payment processing platform that safely handles retries and duplicate requests.", "curated", "payment_design", max_tokens=1100, speakable=True, expect_design=True, required_groups=(g("idempot",), g("ledger",), g("webhook", "processor"), g("reconcil",))),
     EvalCase("Q40", "design_followup", "general", "The provider times out after charging the card. What exact state transition and retry behavior do you use?", "curated", "payment_design", max_tokens=850, speakable=True, expect_followup_context=True, required_groups=(g("unknown", "pending", "reconcil"), g("idempot",), g("webhook", "query"))),
     EvalCase("Q41", "system_design", "general", "Design a URL shortener and make the main scale and consistency tradeoff explicit.", max_tokens=950, speakable=True, expect_design=True, required_groups=(g("key", "id"), g("cache",), g("redirect",), g("consistency", "collision"))),
@@ -252,7 +252,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q44", "behavioral", "amazon_de", "Tell me about a time you challenged a decision with data and then committed to the final direction.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("data", "evidence"), g("disagree", "challenge"), g("commit", "align"))),
     EvalCase("Q45", "behavioral", "amazon_de", "Tell me about a failure. What did you change so the same class of failure would not repeat?", "behavioral_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("fail", "mistake"), g("root cause", "learn"), g("guardrail", "test", "monitor", "process"))),
     EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
-    EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("align", "stakeholder"), g("communicat", "tradeoff"))),
+    EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("align", "stakeholder", "tradeoff to both directors"), g("communicat", "tradeoff"))),
     EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("follow", "ownership"))),
     EvalCase("Q49", "scenario", "ds", "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?", "otter_visible_scenario", speakable=True, required_groups=(g("track", "identity"), g("calibrat", "time", "spatial"), g("dedup", "fusion", "association"))),
     EvalCase("Q50", "behavioral", "ds", "Why this role, and what would you focus on in your first ninety days?", "resume_and_jd_pdf", speakable=True, required_groups=(g("hpe", "datacenter", "telemetry"), g("first", "90", "ninety"), g("stakeholder", "baseline", "production"))),
@@ -3233,7 +3233,10 @@ def feature_store_consistency_issues(text: str) -> List[str]:
             r"\bevent[- ]time\b.{0,80}\b(?:and|plus)\b.{0,40}"
             r"\bavailability[- ]time\b.{0,100}"
             r"\b(?:at\s+or\s+before|before|not\s+after|<=)\b.{0,50}"
-            r"\b(?:prediction|cutoff|observation)[- ]time\b",
+            r"\b(?:prediction|cutoff|observation)[- ]time\b|"
+            r"\bevent\s+and\s+availability\s+times?\b.{0,100}"
+            r"\b(?:at\s+or\s+before|before|not\s+after|<=)\b.{0,50}"
+            r"\b(?:prediction[- ]time|prediction\s+cutoff|observation[- ]time)\b",
             lower,
         )
     )
@@ -3254,6 +3257,18 @@ def feature_store_consistency_issues(text: str) -> List[str]:
             lower,
         )
     )
+    coordinated_times_unbounded = bool(
+        re.search(
+            r"\bevent\s+and\s+availability\s+times?\b.{0,60}"
+            r"(?:\b(?:are\s+)?not\s+(?:required\s+to\s+be\s+|"
+            r"necessarily\s+(?:required\s+to\s+be\s+)?)?"
+            r"(?:filtered|bounded|checked|enforced|at\s+or\s+before|before|<=)|"
+            r"\b(?:need\s+not|(?:do\s+not|don't)\s+need\s+to)\s+be\s+"
+            r"(?:filtered|bounded|checked|enforced|at\s+or\s+before|before|<=)|"
+            r"\bcan\s+be\s+(?:either\s+)?before\s+or\s+after\b)",
+            lower,
+        )
+    )
     if re.search(
         r"\bevent[- ]time\b.{0,35}\b(?:is|are)\s+not\s+"
         r"(?:filtered|bounded|checked|enforced)\b",
@@ -3266,6 +3281,9 @@ def feature_store_consistency_issues(text: str) -> List[str]:
         lower,
     ):
         availability_time_bounded = False
+    if coordinated_times_unbounded:
+        event_time_bounded = False
+        availability_time_bounded = False
     if not (as_of_join and event_time_bounded and availability_time_bounded):
         issues.append("missing_point_in_time_join_mechanics")
 
@@ -3276,7 +3294,7 @@ def feature_store_consistency_issues(text: str) -> List[str]:
         " ",
         lower,
     )
-    if re.search(
+    if coordinated_times_unbounded or re.search(
         r"\b(?:do\s+not|don't|never)\s+(?:share|persist|store|record|filter|"
         r"correct|recompute|dedup|compare|validate|enforce)\w*\b.{0,90}"
         r"\b(?:executable\s+transform|event[- ]time|availability[- ]time|"
@@ -3485,6 +3503,36 @@ def self_check_production_answer_contracts() -> None:
         "version. Continuously compare online and offline values for skew and parity."
     )
     assert not feature_store_consistency_issues(complete_store)
+    coordinated_timestamp_store = (
+        "Use versioned executable transformations for streaming and batch jobs. "
+        "Persist event time and availability time. The training builder performs an "
+        "as-of join using only values whose event and availability times are at or "
+        "before the prediction cutoff. A watermark handles late events through "
+        "idempotent correction and replay by event ID. Continuously compare online "
+        "and offline values for parity and skew."
+    )
+    assert not feature_store_consistency_issues(coordinated_timestamp_store)
+    negated_coordinated_timestamps = coordinated_timestamp_store.replace(
+        "event and availability times are at or before the prediction cutoff",
+        "event and availability times are not required to be at or before the prediction cutoff",
+    )
+    negated_coordinated_issues = set(
+        feature_store_consistency_issues(negated_coordinated_timestamps)
+    )
+    assert "missing_point_in_time_join_mechanics" in negated_coordinated_issues
+    assert "unsafe_negated_feature_store_correctness" in negated_coordinated_issues
+    for unsafe_wording in (
+        "event and availability times need not be at or before the prediction cutoff",
+        "event and availability times are not necessarily at or before the prediction cutoff",
+        "event and availability times can be before or after the prediction cutoff",
+    ):
+        unsafe_store = coordinated_timestamp_store.replace(
+            "event and availability times are at or before the prediction cutoff",
+            unsafe_wording,
+        )
+        unsafe_issues = set(feature_store_consistency_issues(unsafe_store))
+        assert "missing_point_in_time_join_mechanics" in unsafe_issues
+        assert "unsafe_negated_feature_store_correctness" in unsafe_issues
     alternate_store_wording = (
         "We define executable feature transformations once and compile them for batch "
         "training and stream serving. Run an equivalence test between batch training "
@@ -3610,6 +3658,64 @@ def missing_required_group_issues(case: EvalCase, text: str) -> List[str]:
         for group in case.required_groups
         if not any(has_required_signal(text, term) for term in group)
     ]
+
+
+def q47_director_alignment_issues(text: str) -> List[str]:
+    """Require an affirmative alignment action, not a negated keyword match."""
+    lower = re.sub(r"\s+", " ", text.casefold().replace("’", "'"))
+    action = (
+        r"(?:align|communicat|speak|meet|consult|discuss|share|present|explain|"
+        r"escalat|bring|coordinat|review)\w*"
+    )
+    directors = r"(?:(?:both|two|the)\s+directors?|the\s+requesting\s+directors?)"
+    affirmative = bool(
+        re.search(rf"\b{action}\b.{{0,80}}\b{directors}\b", lower)
+        or re.search(
+            rf"\b{directors}\b.{{0,80}}\b(?:align|agree|review|decid|resolve|"
+            r"understand|confirm)\w*\b",
+            lower,
+        )
+    )
+    ignored_director_input = bool(
+        re.search(
+            r"\b(?:ignore|disregard|dismiss)\w*\b.{0,40}"
+            r"\b(?:their|directors?'?|the)?\s*(?:input|feedback|views?|priorit(?:y|ies))\b",
+            lower,
+        )
+    ) and not bool(
+        re.search(
+            r"\b(?:do\s+not|don't|never|avoid)\s+"
+            r"(?:ignore|disregard|dismiss)\w*\b.{0,40}"
+            r"\b(?:input|feedback|views?|priorit(?:y|ies))\b",
+            lower,
+        )
+    )
+    private_decision = bool(
+        re.search(
+            r"\b(?:choose|decide|select|make\s+the\s+decision)\w*\b.{0,25}"
+            r"\b(?:privately|alone|unilaterally)\b",
+            lower,
+        )
+    )
+    negated = ignored_director_input or private_decision or bool(
+        re.search(
+            rf"\b(?:do\s+not|don't|never|won't|wouldn't|without|avoid(?:ing)?|"
+            rf"refuse\s+to)\b"
+            rf".{{0,55}}\b{action}\b.{{0,65}}\b{directors}\b|"
+            rf"\b{action}\b.{{0,55}}\b(?:not|never|without)\b.{{0,30}}"
+            rf"\b{directors}\b|"
+            r"\b(?:make|take|reach)\w*\b.{0,20}\bunilateral\w*\b"
+            r".{0,20}\b(?:decision|call)\b|"
+            r"\bunilateral\w*\b.{0,20}\b(?:decid|decision|call)\w*\b",
+            lower,
+        )
+    )
+    issues: List[str] = []
+    if not affirmative:
+        issues.append("missing_affirmative_director_alignment")
+    if negated:
+        issues.append("unsafe_negated_or_unilateral_director_alignment")
+    return issues
 
 
 def has_complete_code_artifact_body(body: str) -> bool:
@@ -4057,6 +4163,8 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
             safe_truth_gap and has_valid_needs_story_facts_artifact(attempt.artifact_body)
         ):
             issues.append("q46_invalid_needs_story_facts_artifact")
+    if case.id == "Q47":
+        issues.extend(q47_director_alignment_issues(combined))
     if case.id in ("Q29", "Q38") and has_drift_only_automatic_retraining(combined):
         issues.append("unsafe_drift_only_automatic_retraining")
     if case.id == "Q38":
@@ -4083,6 +4191,54 @@ def self_check_attempt_integrity_guards() -> None:
     assert not has_required_signal("We worked together on the output.", "get")
     assert not has_required_signal("The database stores rows.", "data")
     assert not has_required_signal("Identity is generated.", "id")
+    q47 = next(case for case in CASES if case.id == "Q47")
+    assert not missing_required_group_issues(
+        q47,
+        "I would compare customer impact and severity, escalate to leadership to "
+        "decide if needed, communicate the tradeoff to both directors, and document "
+        "the sequence.",
+    )
+    assert missing_required_group_issues(
+        q47,
+        "I would show leadership by selecting the request with the greatest customer "
+        "impact, then communicate my tradeoff and final decision.",
+    ) == ["missing_signal:align|stakeholder|tradeoff to both directors"]
+    assert not q47_director_alignment_issues(
+        "I compare customer impact, explain the tradeoff to both directors, and "
+        "ask them to align on the order before I communicate the decision."
+    )
+    adversarial_q47 = (
+        "I compare customer impact, but I do not speak with both directors or seek "
+        "their agreement. I communicate the tradeoff only to my team and make a "
+        "unilateral decision."
+    )
+    assert "unsafe_negated_or_unilateral_director_alignment" in (
+        q47_director_alignment_issues(adversarial_q47)
+    )
+    adversarial_attempt = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=adversarial_q47,
+        streamed_answer=adversarial_q47,
+        terminal_answer=adversarial_q47,
+        billing_received=True,
+    )
+    assert not answer_is_success(q47, adversarial_attempt)
+    for unsafe_director_answer in (
+        "I compare customer impact and severity, but avoid explaining the tradeoff "
+        "to both directors. I choose privately, then communicate my order to the team.",
+        "I compare customer impact and explain the tradeoff to both directors, but "
+        "ignore their input, choose privately, and communicate my final order.",
+    ):
+        unsafe_attempt = AttemptResult(
+            attempt=1,
+            ok=True,
+            visible_answer=unsafe_director_answer,
+            streamed_answer=unsafe_director_answer,
+            terminal_answer=unsafe_director_answer,
+            billing_received=True,
+        )
+        assert not answer_is_success(q47, unsafe_attempt)
 
     streamed = "This is the complete customer-streamed answer with enough words to evaluate."
     matching = AttemptResult(
@@ -4620,7 +4776,9 @@ def quality_scores(case: EvalCase, attempt: AttemptResult) -> Tuple[int, int, in
     reliability = 35 if attempt.ok else 0
     if not attempt.ok:
         issues.append("request_failed")
-    if attempt.ok and attempt.first_token_ms is not None:
+        if attempt.first_token_ms is not None or attempt.delta_count > 0:
+            issues.append("request_failed_after_partial_stream")
+    if attempt.first_token_ms is not None:
         if attempt.first_token_ms <= 2000:
             latency = 15
         elif attempt.first_token_ms <= 3500:
@@ -4665,6 +4823,9 @@ def quality_scores(case: EvalCase, attempt: AttemptResult) -> Tuple[int, int, in
         human -= 4
         issues.append("chat_too_long")
     human = max(0, human)
+    if not attempt.ok:
+        human = 0
+        issues.append("incomplete_response_not_human_scored")
 
     accuracy = 25
     if case.expect_followup_context and any(phrase in lower for phrase in CONTEXT_LOSS_PHRASES):
@@ -4678,12 +4839,51 @@ def quality_scores(case: EvalCase, attempt: AttemptResult) -> Tuple[int, int, in
         blocking_issues = [
             issue for issue in blocking_issues if issue != "needs_user_input"
         ]
-    if blocking_issues:
+    if not attempt.ok:
+        accuracy = 0
+        issues.append("answer_quality_gate_failed")
+    elif blocking_issues:
         accuracy = 0
         issues.append("answer_quality_gate_failed")
         issues.extend(blocking_issues)
     accuracy = max(0, accuracy)
     return reliability, latency, human, accuracy, issues
+
+
+def prior_attempt_audit_issues(attempts: Sequence[AttemptResult]) -> List[str]:
+    """Surface failures hidden by a later successful retry."""
+    prior_failures = [attempt for attempt in attempts[:-1] if not attempt.ok]
+    if not prior_failures:
+        return []
+    issues = ["recovered_after_retry"]
+    if any(
+        attempt.first_token_ms is not None or attempt.delta_count > 0
+        for attempt in prior_failures
+    ):
+        issues.append("request_failed_after_partial_stream")
+    return issues
+
+
+def self_check_failed_attempt_scoring() -> None:
+    case = next(case for case in CASES if case.id == "Q41")
+    partial = AttemptResult(
+        attempt=1,
+        ok=False,
+        first_token_ms=100.0,
+        delta_count=1,
+        visible_answer="A fluent but incomplete partial response.",
+        streamed_answer="A fluent but incomplete partial response.",
+    )
+    reliability, latency, human, accuracy, issues = quality_scores(case, partial)
+    assert (reliability, latency, human, accuracy) == (0, 15, 0, 0)
+    assert "request_failed_after_partial_stream" in issues
+    assert "incomplete_response_not_human_scored" in issues
+
+    recovered = AttemptResult(attempt=2, ok=True)
+    assert prior_attempt_audit_issues([partial, recovered]) == [
+        "recovered_after_retry",
+        "request_failed_after_partial_stream",
+    ]
 
 
 def percentile(values: Sequence[float], percent: float) -> Optional[float]:
@@ -4778,7 +4978,17 @@ def build_summary(
     ]
     first_tokens = [
         result.attempts[-1].first_token_ms
-        for result in accepted
+        for result in results
+        if result.attempts[-1].first_token_ms is not None
+    ]
+    answer_first_tokens = [
+        result.attempts[-1].first_token_ms
+        for result in answer_results
+        if result.attempts[-1].first_token_ms is not None
+    ]
+    intervention_first_tokens = [
+        result.attempts[-1].first_token_ms
+        for result in intervention_results
         if result.attempts[-1].first_token_ms is not None
     ]
     totals = [result.attempts[-1].total_ms for result in accepted]
@@ -4814,6 +5024,14 @@ def build_summary(
         "first_attempt_accepted_outcomes": sum(
             1 for result in results if result.first_attempt_accepted
         ),
+        "cases_with_retries": sum(1 for result in results if len(result.attempts) > 1),
+        "failed_partial_stream_attempts": sum(
+            1
+            for result in results
+            for attempt in result.attempts
+            if not attempt.ok
+            and (attempt.first_token_ms is not None or attempt.delta_count > 0)
+        ),
         "answer_reliability_percent": (
             round(100 * len(final_answers) / len(answer_results), 1)
             if answer_results
@@ -4838,6 +5056,26 @@ def build_summary(
             "p90": round(percentile(first_tokens, 0.9) or 0, 1) if first_tokens else None,
             "p95": round(percentile(first_tokens, 0.95) or 0, 1) if first_tokens else None,
             "max": round(max(first_tokens), 1) if first_tokens else None,
+            "measured": len(first_tokens),
+            "missing": len(results) - len(first_tokens),
+            "total_cases": len(results),
+        },
+        "answer_first_token_ms": {
+            "median": round(statistics.median(answer_first_tokens), 1) if answer_first_tokens else None,
+            "p90": round(percentile(answer_first_tokens, 0.9) or 0, 1) if answer_first_tokens else None,
+            "p95": round(percentile(answer_first_tokens, 0.95) or 0, 1) if answer_first_tokens else None,
+            "max": round(max(answer_first_tokens), 1) if answer_first_tokens else None,
+            "measured": len(answer_first_tokens),
+            "missing": len(answer_results) - len(answer_first_tokens),
+            "total_cases": len(answer_results),
+        },
+        "intervention_first_token_ms": {
+            "median": round(statistics.median(intervention_first_tokens), 1) if intervention_first_tokens else None,
+            "p95": round(percentile(intervention_first_tokens, 0.95) or 0, 1) if intervention_first_tokens else None,
+            "max": round(max(intervention_first_tokens), 1) if intervention_first_tokens else None,
+            "measured": len(intervention_first_tokens),
+            "missing": len(intervention_results) - len(intervention_first_tokens),
+            "total_cases": len(intervention_results),
         },
         "total_ms": {
             "median": round(statistics.median(totals), 1) if totals else None,
@@ -4860,6 +5098,8 @@ def build_summary(
 
 def render_report(summary: Dict[str, Any], results: Sequence[CaseResult], sources: Dict[str, List[str]]) -> str:
     ft = summary["first_token_ms"]
+    answer_ft = summary["answer_first_token_ms"]
+    intervention_ft = summary["intervention_first_token_ms"]
     lines = [
         "# Bluey 50-Question Interview Evaluation",
         "",
@@ -4872,8 +5112,11 @@ def render_report(summary: Dict[str, Any], results: Sequence[CaseResult], source
         f"- Expected safe interventions: {summary['successful_expected_interventions']}/{summary['expected_intervention_cases']}",
         f"- First-attempt normal answers: {summary['first_attempt_answer_successes']}/{summary['answer_cases']} ({summary['first_attempt_answer_reliability_percent']}%)",
         f"- First-attempt accepted outcomes: {summary['first_attempt_accepted_outcomes']}/{summary['questions_run']}",
+        f"- Cases requiring retries: {summary['cases_with_retries']}; failed partial-stream attempts: {summary['failed_partial_stream_attempts']}",
         f"- Average deterministic score: {summary['average_score']}/100",
-        f"- First token: median {ft['median']} ms, p90 {ft['p90']} ms, p95 {ft['p95']} ms, max {ft['max']} ms",
+        f"- First token ({ft['measured']}/{ft['total_cases']} measured; {ft['missing']} missing): median {ft['median']} ms, p90 {ft['p90']} ms, p95 {ft['p95']} ms, max {ft['max']} ms",
+        f"- Normal-answer first token ({answer_ft['measured']}/{answer_ft['total_cases']} measured; {answer_ft['missing']} missing): median {answer_ft['median']} ms, p90 {answer_ft['p90']} ms, p95 {answer_ft['p95']} ms, max {answer_ft['max']} ms",
+        f"- Intervention first token ({intervention_ft['measured']}/{intervention_ft['total_cases']} measured; {intervention_ft['missing']} missing): median {intervention_ft['median']} ms, p95 {intervention_ft['p95']} ms, max {intervention_ft['max']} ms",
         f"- Customer charge recorded by Bluey: {summary['customer_cost_cents']} cents",
         f"- Balance: {summary['balance_cents_before']} -> {summary['balance_cents_after']} cents",
         f"- Trial seconds: {summary['trial_seconds_before']} -> {summary['trial_seconds_after']}",
@@ -4964,6 +5207,7 @@ def main(argv: Sequence[str]) -> int:
     self_check_q46_story_grounding_detector()
     self_check_production_answer_contracts()
     self_check_attempt_integrity_guards()
+    self_check_failed_attempt_scoring()
     self_check_release_exit_gate()
     self_check_typed_answer_context()
     if args.minimum_reliability_percent != 100.0:
@@ -5069,6 +5313,9 @@ def main(argv: Sequence[str]) -> int:
                 break
             final_attempt = attempts[-1]
             reliability, latency, human, accuracy, issues = quality_scores(case, final_attempt)
+            for audit_issue in prior_attempt_audit_issues(attempts):
+                if audit_issue not in issues:
+                    issues.append(audit_issue)
             result = CaseResult(
                 id=case.id,
                 category=case.category,
