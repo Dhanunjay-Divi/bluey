@@ -106,6 +106,8 @@ pub async fn generate(
             lane: "balanced".to_string(),
             estimated_input_tokens: Some(estimated_input_tokens),
             image_data_urls: Vec::new(),
+            context_schema_version: Some(router::ANSWER_CONTEXT_SCHEMA_VERSION_V1),
+            context: Vec::new(),
         },
         trace_id,
     )

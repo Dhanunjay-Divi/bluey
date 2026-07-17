@@ -13,6 +13,7 @@ the output directory under ``tmp/`` and do not commit it.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -107,6 +108,7 @@ class EvalCase:
     expect_code: bool = False
     expect_design: bool = False
     expect_followup_context: bool = False
+    expected_outcome: str = "answer"
     required_groups: Tuple[Tuple[str, ...], ...] = ()
 
 
@@ -127,6 +129,11 @@ class AttemptResult:
     error_reason: Optional[str] = None
     error_ref: Optional[str] = None
     visible_answer: str = ""
+    streamed_answer: str = ""
+    terminal_answer: str = ""
+    billing_received: bool = False
+    billing_event_count: int = 0
+    billing_error: Optional[str] = None
     artifact_type: Optional[str] = None
     artifact_body: Optional[str] = None
     provider: Optional[str] = None
@@ -152,6 +159,8 @@ class CaseResult:
     attempts: List[AttemptResult]
     final_ok: bool
     first_attempt_ok: bool
+    accepted_outcome: bool
+    first_attempt_accepted: bool
     score: int
     reliability_score: int
     latency_score: int
@@ -242,7 +251,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q43", "behavioral", "amazon_de", "Tell me about a time the requirements were ambiguous and you still moved the work forward safely.", "behavioral_doc", speakable=True, required_groups=(g("clarif", "stakeholder", "requirement"), g("assumption", "scope", "prototype"), g("result", "outcome"))),
     EvalCase("Q44", "behavioral", "amazon_de", "Tell me about a time you challenged a decision with data and then committed to the final direction.", "leadership_doc", speakable=True, required_groups=(g("data", "evidence"), g("disagree", "challenge"), g("commit", "align"))),
     EvalCase("Q45", "behavioral", "amazon_de", "Tell me about a failure. What did you change so the same class of failure would not repeat?", "behavioral_doc", speakable=True, required_groups=(g("fail", "mistake"), g("root cause", "learn"), g("guardrail", "test", "monitor", "process"))),
-    EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
+    EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
     EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("align", "stakeholder"), g("communicat", "tradeoff"))),
     EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("follow", "ownership"))),
     EvalCase("Q49", "scenario", "ds", "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?", "otter_visible_scenario", speakable=True, required_groups=(g("track", "identity"), g("calibrat", "time", "spatial"), g("dedup", "fusion", "association"))),
@@ -332,31 +341,90 @@ def compact(text: str, limit: int) -> str:
     return value[:limit].rstrip() + "\n...[compacted for evaluation]"
 
 
-def profile_context(profile: ProfileSpec, downloads: Path) -> Tuple[str, List[str]]:
-    blocks: List[str] = []
+def profile_context(
+    profile: ProfileSpec, downloads: Path
+) -> Tuple[List[str], List[Dict[str, Any]]]:
     sources: List[str] = []
-    for label, filename, limit in (
-        ("Resume", profile.resume, 6000),
-        ("Job description", profile.job_description, 6000),
-        ("Interview preparation document", profile.extra_document, 5000),
+    typed: List[Dict[str, Any]] = []
+    for label, filename, limit, role, sensitivity in (
+        ("Resume", profile.resume, 6000, "candidate_resume", "confidential"),
+        (
+            "Job description",
+            profile.job_description,
+            6000,
+            "job_description",
+            "internal",
+        ),
+        (
+            "Interview preparation document",
+            profile.extra_document,
+            5000,
+            "interview_preparation",
+            "confidential",
+        ),
     ):
         if not filename:
             continue
         path = downloads / filename
         if not path.is_file():
             raise FileNotFoundError(path)
+        content = compact(extract_document(path), limit)
         sources.append(path.name)
-        blocks.append(f"[{label} from {path.name}]\n{compact(extract_document(path), limit)}")
-    blocks.append(f"[Role target from evaluation]\n{profile.role}")
-    return "\n\n".join(blocks), sources
+        typed.append(
+            {
+                "kind": "document",
+                "content": content,
+                "title": label,
+                "source": path.name,
+                "sensitivity": sensitivity,
+                "role": role,
+            }
+        )
+    typed.append(
+        {
+            "kind": "user_note",
+            "content": profile.role,
+            "title": "Role target from evaluation",
+            "source": "curated evaluation profile",
+            "sensitivity": "internal",
+            "role": "other",
+        }
+    )
+    return sources, typed
 
 
 def build_user_prompt(
     case: EvalCase,
-    context: str,
-    prior_results: Dict[str, CaseResult],
+    answer_context: Sequence[Dict[str, Any]],
 ) -> str:
-    blocks = [context] if context else []
+    """Mirror Bluey's current flattened user envelope alongside typed context."""
+    blocks = [
+        f"[{item['title']} from {item['source']}]\n{item['content']}"
+        for item in answer_context
+    ]
+    context = "\n\n".join(blocks)
+    if len(context) > 32_000:
+        context = context[:32_000].rstrip()
+        context += "\n\n[older context compacted to stay within the active model window]"
+    if not context:
+        return case.question
+    return f"Question:\n{case.question}\n\nSession context:\n{context}"
+
+
+def build_typed_answer_context(
+    case: EvalCase,
+    profile_context: Sequence[Dict[str, Any]],
+    prior_results: Dict[str, CaseResult],
+) -> List[Dict[str, Any]]:
+    """Build the exact v1 provenance envelope exercised by current clients."""
+    contexts = [dict(item) for item in profile_context]
+    # Q46 is the deliberate truth-gap fixture: its preparation document has
+    # story-shaped material, but this turn supplies no verified candidate
+    # resume or user-confirmed STAR story. Synthesis must safely ask for facts.
+    if case.id == "Q46":
+        contexts = [
+            item for item in contexts if item.get("role") != "candidate_resume"
+        ]
     if case.conversation:
         prior = [
             result
@@ -368,14 +436,119 @@ def build_user_prompt(
             prior_text = attempt.visible_answer
             if attempt.artifact_body:
                 prior_text += "\n\n[Previous workbench artifact]\n" + attempt.artifact_body
-            blocks.append(
-                "[Retained conversation context]\n"
-                f"Previous question: {result.question}\n"
-                f"Previous Bluey answer: {compact(prior_text, 9000)}"
+            contexts.append(
+                {
+                    "kind": "meeting_memory",
+                    "content": (
+                        f"Previous question: {result.question}\n"
+                        f"Previous Bluey answer: {compact(prior_text, 9000)}"
+                    ),
+                    "title": "Retained conversation context",
+                    "source": "prior evaluation turn",
+                    "sensitivity": "internal",
+                    "role": "other",
+                }
             )
-    if not blocks:
-        return case.question
-    return f"Question:\n{case.question}\n\nSession context:\n" + "\n\n".join(blocks)
+    return contexts
+
+
+def validate_typed_answer_context(contexts: Sequence[Dict[str, Any]]) -> None:
+    """Fail locally if the evaluator no longer matches Bluey's v1 envelope."""
+    valid_kinds = {
+        "transcript",
+        "meeting_memory",
+        "screenshot",
+        "document",
+        "user_note",
+        "system",
+        "other",
+    }
+    valid_roles = {
+        "candidate_resume",
+        "job_description",
+        "interview_preparation",
+        "user_confirmed_story",
+        "other",
+    }
+    valid_sensitivity = {"public", "internal", "confidential", "restricted"}
+    if len(contexts) > 64:
+        raise ValueError("typed context exceeds Bluey's 64-item limit")
+    combined_bytes = 0
+    for index, item in enumerate(contexts):
+        if item.get("kind") not in valid_kinds:
+            raise ValueError(f"context[{index}] has invalid kind")
+        if item.get("role") not in valid_roles:
+            raise ValueError(f"context[{index}] has invalid role")
+        if item.get("sensitivity") not in valid_sensitivity:
+            raise ValueError(f"context[{index}] has invalid sensitivity")
+        content = item.get("content")
+        title = item.get("title")
+        source = item.get("source")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(f"context[{index}] has empty content")
+        if not isinstance(title, str) or not isinstance(source, str):
+            raise ValueError(f"context[{index}] has invalid provenance")
+        content_bytes = len(content.encode())
+        title_bytes = len(title.encode())
+        source_bytes = len(source.encode())
+        if content_bytes > 32 * 1024:
+            raise ValueError(f"context[{index}] content exceeds 32 KiB")
+        if title_bytes > 1024:
+            raise ValueError(f"context[{index}] title exceeds 1 KiB")
+        if source_bytes > 4096:
+            raise ValueError(f"context[{index}] source exceeds 4 KiB")
+        combined_bytes += content_bytes + title_bytes + source_bytes
+    if combined_bytes > 256 * 1024:
+        raise ValueError("typed context exceeds Bluey's 256 KiB combined limit")
+
+
+def context_provenance_manifest(
+    contexts: Sequence[Dict[str, Any]], aggregate_sha256: str
+) -> Dict[str, Any]:
+    """Record exact roles and hashes without duplicating private source text."""
+    return {
+        "context_schema_version": 1,
+        "aggregate_sha256": aggregate_sha256,
+        "items": [
+            {
+                "kind": item["kind"],
+                "role": item["role"],
+                "sensitivity": item["sensitivity"],
+                "title": item["title"],
+                "source": item["source"],
+                "content_bytes": len(item["content"].encode()),
+                "content_sha256": hashlib.sha256(item["content"].encode()).hexdigest(),
+            }
+            for item in contexts
+        ],
+    }
+
+
+def self_check_typed_answer_context() -> None:
+    q46 = next(case for case in CASES if case.id == "Q46")
+    fixture = [
+        {
+            "kind": "document",
+            "content": "verified resume facts",
+            "title": "Resume",
+            "source": "resume.pdf",
+            "sensitivity": "confidential",
+            "role": "candidate_resume",
+        },
+        {
+            "kind": "document",
+            "content": "style guidance with an incomplete example",
+            "title": "Interview preparation document",
+            "source": "prep.docx",
+            "sensitivity": "confidential",
+            "role": "interview_preparation",
+        },
+    ]
+    q46_context = build_typed_answer_context(q46, fixture, {})
+    validate_typed_answer_context(q46_context)
+    assert all(item["role"] != "candidate_resume" for item in q46_context)
+    assert any(item["role"] == "interview_preparation" for item in q46_context)
+    assert all(item["role"] != "user_confirmed_story" for item in q46_context)
 
 
 def iter_sse(response: Any) -> Iterable[Tuple[str, str]]:
@@ -443,11 +616,135 @@ def parse_error_payload(data: str) -> Tuple[str, Optional[str], Optional[str]]:
     return message[:500], str(reason) if reason else None, str(ref) if ref else None
 
 
+def finalize_attempt_answers(result: AttemptResult, streamed_chunks: Sequence[str]) -> None:
+    """Preserve both SSE text surfaces and score exactly what the customer saw."""
+    result.streamed_answer = "".join(streamed_chunks)
+    result.visible_answer = result.streamed_answer or result.terminal_answer
+
+
+def validate_billing_payload(data: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Validate the terminal CompleteResponse before it can prove billing success."""
+    try:
+        value = json.loads(data)
+    except json.JSONDecodeError:
+        return None, "malformed_billing_event:invalid_json"
+    if not isinstance(value, dict):
+        return None, "malformed_billing_event:not_an_object"
+
+    for key in ("text", "provider", "model"):
+        field_value = value.get(key)
+        if not isinstance(field_value, str) or not field_value.strip():
+            return None, f"malformed_billing_event:invalid_{key}"
+
+    integer_fields = (
+        "input_tokens",
+        "output_tokens",
+        "cost_cents",
+        "balance_cents_after",
+        "trial_seconds_remaining",
+    )
+    for key in integer_fields:
+        field_value = value.get(key)
+        if (
+            not isinstance(field_value, int)
+            or isinstance(field_value, bool)
+            or field_value < 0
+        ):
+            return None, f"malformed_billing_event:invalid_{key}"
+
+    for key in ("artifact_type", "artifact_body"):
+        if key in value and value[key] is not None and not isinstance(value[key], str):
+            return None, f"malformed_billing_event:invalid_{key}"
+    if "sources" in value and (
+        not isinstance(value["sources"], list)
+        or not all(isinstance(source, dict) for source in value["sources"])
+    ):
+        return None, "malformed_billing_event:invalid_sources"
+    return value, None
+
+
+def record_billing_event(result: AttemptResult, data: str) -> None:
+    """Accept exactly one schema-valid billing event without overwriting evidence."""
+    result.billing_event_count += 1
+    if result.billing_event_count > 1:
+        result.billing_received = False
+        result.billing_error = "duplicate_billing_event"
+        return
+
+    value, validation_error = validate_billing_payload(data)
+    if value is None:
+        result.billing_received = False
+        result.billing_error = validation_error or "malformed_billing_event"
+        return
+
+    result.terminal_answer = value["text"]
+    result.artifact_type = value.get("artifact_type")
+    result.artifact_body = value.get("artifact_body")
+    result.provider = value["provider"]
+    result.model = value["model"]
+    result.input_tokens = value["input_tokens"]
+    result.output_tokens = value["output_tokens"]
+    result.cost_cents = value["cost_cents"]
+    result.balance_cents_after = value["balance_cents_after"]
+    result.trial_seconds_remaining = value["trial_seconds_remaining"]
+    if isinstance(value.get("sources"), list):
+        result.sources = value["sources"]
+    result.billing_error = None
+    result.billing_received = True
+
+
+def self_check_billing_event_validation() -> None:
+    valid = {
+        "text": "A complete terminal answer.",
+        "provider": "test-provider",
+        "model": "test-model",
+        "input_tokens": 12,
+        "output_tokens": 7,
+        "cost_cents": 1,
+        "balance_cents_after": 499,
+        "trial_seconds_remaining": 0,
+    }
+    accepted = AttemptResult(attempt=1)
+    record_billing_event(accepted, json.dumps(valid))
+    assert accepted.billing_received
+    assert accepted.billing_event_count == 1
+    assert accepted.billing_error is None
+    assert accepted.terminal_answer == valid["text"]
+
+    malformed_payloads = (
+        "not-json",
+        json.dumps({**valid, "provider": ""}),
+        json.dumps({**valid, "input_tokens": "12"}),
+        json.dumps({key: value for key, value in valid.items() if key != "balance_cents_after"}),
+        json.dumps({**valid, "text": "   "}),
+    )
+    for payload in malformed_payloads:
+        rejected = AttemptResult(attempt=1)
+        record_billing_event(rejected, payload)
+        assert not rejected.billing_received, payload
+        assert rejected.billing_error and rejected.billing_error.startswith(
+            "malformed_billing_event:"
+        )
+        assert not rejected.terminal_answer
+
+    duplicate = AttemptResult(attempt=1)
+    record_billing_event(duplicate, json.dumps(valid))
+    record_billing_event(
+        duplicate,
+        json.dumps({**valid, "text": "A conflicting second terminal answer."}),
+    )
+    assert duplicate.billing_event_count == 2
+    assert not duplicate.billing_received
+    assert duplicate.billing_error == "duplicate_billing_event"
+    assert duplicate.terminal_answer == valid["text"]
+
+
 def run_attempt(
     base: str,
     token: str,
     case: EvalCase,
     user_prompt: str,
+    answer_context: Sequence[Dict[str, Any]],
     session_id: str,
     attempt_number: int,
     timeout: float,
@@ -461,6 +758,8 @@ def run_attempt(
         "lane": "balanced",
         "max_tokens": case.max_tokens,
         "temperature": 0.35,
+        "context_schema_version": 1,
+        "context": list(answer_context),
     }
     result = AttemptResult(attempt=attempt_number, request_id=request_id, session_id=session_id)
     encoded = json.dumps(payload).encode()
@@ -508,23 +807,7 @@ def run_attempt(
                     result.error, result.error_reason, result.error_ref = parse_error_payload(data)
                     continue
                 if event_name == "billing":
-                    try:
-                        value = json.loads(data)
-                    except json.JSONDecodeError:
-                        value = {}
-                    if isinstance(value, dict):
-                        result.visible_answer = str(value.get("text") or "")
-                        result.artifact_type = value.get("artifact_type")
-                        result.artifact_body = value.get("artifact_body")
-                        result.provider = value.get("provider")
-                        result.model = value.get("model")
-                        result.input_tokens = value.get("input_tokens")
-                        result.output_tokens = value.get("output_tokens")
-                        result.cost_cents = int(value.get("cost_cents") or 0)
-                        result.balance_cents_after = value.get("balance_cents_after")
-                        result.trial_seconds_remaining = value.get("trial_seconds_remaining")
-                        if isinstance(value.get("sources"), list):
-                            result.sources = value["sources"]
+                    record_billing_event(result, data)
                     continue
                 chunk = delta_text(data)
                 if chunk:
@@ -539,12 +822,13 @@ def run_attempt(
     except Exception as exc:  # network and stream failures must be recorded
         result.error = f"{type(exc).__name__}: {exc}"[:500]
     result.total_ms = (time.perf_counter() - started) * 1000
-    if not result.visible_answer:
-        result.visible_answer = "".join(streamed_text).strip()
+    finalize_attempt_answers(result, streamed_text)
     result.ok = bool(
         result.status is not None
         and 200 <= result.status < 300
         and result.done
+        and result.billing_received
+        and not result.billing_error
         and result.visible_answer.strip()
         and not result.error
     )
@@ -558,6 +842,36 @@ def has_first_person(text: str) -> bool:
 def answer_evidence_text(attempt: AttemptResult) -> str:
     """Return all customer-visible answer material used by quality gates."""
     return (attempt.visible_answer + "\n" + (attempt.artifact_body or "")).strip()
+
+
+def stream_terminal_integrity_issues(attempt: AttemptResult) -> List[str]:
+    """Report when persisted terminal text differs from what the customer saw."""
+    streamed = attempt.streamed_answer.replace("\r\n", "\n").replace("\r", "\n").strip()
+    terminal = attempt.terminal_answer.replace("\r\n", "\n").replace("\r", "\n").strip()
+    visible = attempt.visible_answer.replace("\r\n", "\n").replace("\r", "\n").strip()
+    issues: List[str] = []
+    if streamed and visible != streamed:
+        issues.append("streamed_answer_not_preserved")
+    if (
+        attempt.billing_received
+        and streamed != terminal
+        and attempt.artifact_type != "code"
+    ):
+        issues.append("stream_terminal_answer_mismatch")
+    return issues
+
+
+def stream_terminal_audit_issues(attempt: AttemptResult) -> List[str]:
+    """Retain intentional code-shape divergence as nonblocking audit evidence."""
+    streamed = attempt.streamed_answer.replace("\r\n", "\n").replace("\r", "\n").strip()
+    terminal = attempt.terminal_answer.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if (
+        attempt.billing_received
+        and attempt.artifact_type == "code"
+        and streamed != terminal
+    ):
+        return ["code_stream_terminal_shape_mismatch"]
+    return []
 
 
 def looks_structurally_incomplete(text: str) -> bool:
@@ -639,6 +953,56 @@ def has_exactly_once_processing_overclaim(text: str) -> bool:
 def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
     lower = re.sub(r"\s+", " ", re.sub(r"[*_`~]+", "", text.casefold()))
     action_words = r"mark(?:ed)?|move(?:d)?|transition(?:ed)?|set"
+
+    def provider_definitively_confirmed_no_charge(prefix: str) -> bool:
+        """Allow FAILED only when a provider-confirmed no-charge clause gates it."""
+        actor = r"(?:the\s+)?(?:payment\s+)?(?:provider|processor|gateway|acquirer)"
+        source = (
+            rf"(?:{actor}(?:'s)?(?:\s+(?:authoritative|definitive))?"
+            r"(?:\s+(?:status(?:\s+(?:api|lookup|query|response|result))?|"
+            r"signed\s+webhook))?|"
+            r"(?:an?\s+)?(?:authoritative\s+|definitive\s+)?"
+            r"(?:status(?:\s+(?:api|lookup|query|response|result))?|signed\s+webhook)"
+            rf"\s+from\s+{actor})"
+        )
+        evidence_verb = r"(?:confirms?|verifies?|certifies?|reports?|returns?|shows?|indicates?|states?)"
+        no_charge = (
+            r"(?:no\s+(?:charge|authorization|capture|payment|debit|funds?\s+movement)"
+            r"(?:\s+(?:occurred|exists?|was\s+(?:made|created|submitted|recorded)))?|"
+            r"(?:the\s+)?(?:card|account|customer|payment)\s+(?:was|is)\s+not\s+"
+            r"(?:charged|debited|authorized)|"
+            r"(?:request|attempt|payment)\s+(?:was|is)\s+(?:declined|rejected)\s+"
+            r"before\s+(?:authorization|capture|funds?\s+movement)|"
+            r"zero\s+(?:funds?|dollars?)\s+(?:moved|captured|authorized)|"
+            r"no\s+(?:payment|authorization|capture)\s+record\s+(?:exists?|was\s+created))"
+        )
+        for gate in re.finditer(
+            r"\b(?:only\s+)?(?:if|when|once|after|until)\b", prefix
+        ):
+            clause = prefix[gate.start() :]
+            if len(clause) > 360:
+                clause = clause[-360:]
+            direct_evidence = re.search(
+                rf"\b{source}\b.{{0,80}}\b{evidence_verb}\b"
+                rf".{{0,110}}\b(?:that\s+)?{no_charge}\b",
+                clause,
+            )
+            received_confirmation = re.search(
+                rf"\b(?:receiving|obtaining)\b.{{0,40}}"
+                rf"\b(?:explicit|definitive|authoritative)\b.{{0,30}}"
+                rf"\bconfirmation\b.{{0,50}}\bfrom\s+{actor}\b"
+                rf".{{0,100}}\b(?:that\s+)?{no_charge}\b",
+                clause,
+            )
+            negated_evidence = re.search(
+                rf"\b{source}\b.{{0,40}}\b(?:does|did|has|had|is|was)\s+not\b"
+                rf".{{0,30}}\b{evidence_verb}\b",
+                clause,
+            )
+            if (direct_evidence or received_confirmation) and not negated_evidence:
+                return True
+        return False
+
     terminal_failure = False
     for outcome in re.finditer(
         r"\b(?:timeout|timed out|unknown|ambiguous|no record|maximum retries|max retries)\b",
@@ -659,6 +1023,9 @@ def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
                 prefix,
             ) or re.search(r"\bnot\b.{0,20}\bfailed\b", action.group()):
                 continue
+            confirmation_prefix = lower[max(outcome.end(), action_start - 220) : action_start]
+            if provider_definitively_confirmed_no_charge(confirmation_prefix):
+                continue
             terminal_failure = True
             break
         if terminal_failure:
@@ -669,8 +1036,17 @@ def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
         lower,
     )
     if charge_retry:
-        prefix = lower[max(0, charge_retry.start() - 45) : charge_retry.start()]
-        if re.search(r"(?:do not|don't|don’t|never|must not|cannot|can't|can’t)\s*$", prefix):
+        prefix = lower[max(0, charge_retry.start() - 120) : charge_retry.start()]
+        direct_negation = re.search(
+            r"(?:do not|don't|don’t|never|must not|cannot|can't|can’t)\s*$", prefix
+        )
+        coordinated_negation = re.search(
+            r"(?:do not|don't|don’t|never|must not|cannot|can't|can’t)\b"
+            r"\s+(?:mark|set|move|transition|submit|resubmit|charge|call|send|attempt)\b"
+            r"(?:(?![.!?]).){0,80}\b(?:or|and)\s*$",
+            prefix,
+        )
+        if direct_negation or coordinated_negation:
             charge_retry = None
     return bool(terminal_failure or charge_retry)
 
@@ -680,13 +1056,1299 @@ def self_check_ambiguous_payment_detector() -> None:
         "A timeout leaves the outcome UNKNOWN, not failed. "
         "Move it to PENDING_RECONCILIATION; do not mark it FAILED.",
         "After a timeout, never retry the charge; retry only the status lookup.",
+        "Provider timeout after the charge attempt. Do not mark the payment FAILED or "
+        "retry the charge; keep it UNKNOWN and reconcile. If the provider confirms no "
+        "charge, transition to FAILED.",
+        "The outcome is ambiguous. Only after the payment processor definitively "
+        "confirms that the card was not charged, transition it to FAILED.",
+        "The result remains PENDING_RECONCILIATION. Once receiving definitive "
+        "confirmation from the gateway that no charge occurred, set it FAILED.",
+        "The result is UNKNOWN. Only after the processor status lookup "
+        "authoritatively confirms no authorization exists, transition it to FAILED.",
+        "The outcome is ambiguous. Once a signed webhook from the gateway reports "
+        "that the request was declined before authorization, mark it FAILED.",
+        "Keep the payment UNKNOWN until the provider confirms no charge occurred, "
+        "then mark it FAILED. Do not retry the charge with a new key.",
     )
     unsafe = (
         "After a timeout, mark the payment FAILED and retry the charge.",
         "The outcome is unknown. After maximum retries, transition it to FAILED.",
+        "The outcome is unknown. If the provider has not confirmed whether a charge "
+        "occurred, transition it to FAILED.",
+        "After max retries, if the provider still has not confirmed a charge, "
+        "transition to FAILED.",
+        "After a timeout, if our database shows no charge, mark it FAILED.",
+        "The provider confirms the timeout. Transition the payment to FAILED.",
+        "After a timeout, our database shows no charge, so transition it to FAILED.",
+        "After a timeout, do not mark it failed. Retry the charge immediately.",
+        "We do not know whether the provider charged the card, and retry the payment.",
+        "We don't know whether the charge succeeded, so retry the payment.",
     )
     assert not any(has_unsafe_ambiguous_payment_outcome(text) for text in safe)
     assert all(has_unsafe_ambiguous_payment_outcome(text) for text in unsafe)
+
+
+def payment_operation_semantic_issues(
+    text: str,
+    *,
+    require_webhook_event_dedup: bool,
+    require_complete_idempotency_semantics: bool = True,
+    require_same_operation_retry_reuse: bool = False,
+) -> List[str]:
+    """Enforce operation-scoped idempotency and webhook correctness."""
+    lower = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[*`~]+", "", text.casefold().replace("’", "'")).replace("_", " "),
+    )
+    clauses = [
+        clause.strip()
+        for clause in re.split(r"(?<=[.!?;])\s+|\n+", lower)
+        if clause.strip()
+    ]
+    semantic_windows = list(clauses)
+    semantic_windows.extend(
+        " ".join(clauses[index : index + width])
+        for width in (2, 3)
+        for index in range(0, max(0, len(clauses) - width + 1))
+    )
+    issues: List[str] = []
+
+    retry_signal = r"retry|retries|retrying|replay|replays|replaying|resubmit|attempt"
+    new_key_signal = (
+        r"(?:fresh|new|different|rotated|replacement|unique)\s+"
+        r"(?:operation\s+)?(?:idempotency\s+)?keys?|"
+        r"(?:rotate|change|replace)\w*\s+(?:the\s+)?idempotency\s+keys?"
+    )
+    unsafe_new_key = False
+    for clause in clauses:
+        direct_new_key_on_retry = bool(
+            re.search(
+                rf"\b(?:{retry_signal})\w*\b.{{0,55}}"
+                rf"\b(?:use|using|with|under|generate|create|mint|get|receive|"
+                rf"choose|select|assign|derive|switch|rotate|change)\w*"
+                rf"\b.{{0,20}}\b(?:{new_key_signal})\b",
+                clause,
+            )
+            or re.search(
+                rf"\b(?:{new_key_signal})\b.{{0,55}}"
+                rf"\b(?:for|on|per|upon|when|each|every)\b.{{0,25}}"
+                rf"\b(?:{retry_signal})\w*\b",
+                clause,
+            )
+        )
+        if not direct_new_key_on_retry:
+            continue
+        safely_rejected = bool(
+            re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't)\s+"
+                r"(?:(?:generate|create|mint|rotate|replace|change|use|get|issue)\w*\s+)?"
+                rf"(?:a\s+|the\s+)?(?:{new_key_signal})\b",
+                clause,
+            )
+            or re.search(
+                rf"\b(?:{new_key_signal})\b.{{0,35}}\b(?:must|should|can)\s+not\s+"
+                r"be\s+(?:generated|created|used|issued|rotated)",
+                clause,
+            )
+            or (
+                re.search(r"\b(?:rather than|instead of)\b", clause)
+                and re.search(r"\b(?:reuse|preserve|keep)\w*\b.{0,35}\b(?:same|stable)\b", clause)
+            )
+            or re.search(
+                rf"\b(?:not|never)\s+(?:a\s+|the\s+)?(?:{new_key_signal})\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't)\s+"
+                rf"(?:{retry_signal})\w*\b.{{0,80}}\b(?:{new_key_signal})\b",
+                clause,
+            )
+        )
+        if not safely_rejected:
+            unsafe_new_key = True
+            break
+    if unsafe_new_key:
+        issues.append("unsafe_new_idempotency_key_on_retry")
+
+    operation_pattern = {
+        "authorize": r"\bauthoriz\w*\b",
+        "capture": r"\bcaptur\w*\b",
+        "refund": r"\brefund\w*\b",
+    }
+    unsafe_shared_key = False
+    for clause in semantic_windows:
+        operations = {
+            operation
+            for operation, pattern in operation_pattern.items()
+            if re.search(pattern, clause)
+        }
+        if len(operations) < 2 or "key" not in clause:
+            continue
+        if re.search(r"\b(?:encryption|signing|hmac|webhook\s+secret)\s+key\b", clause):
+            continue
+        shared = bool(
+            re.search(
+                r"\b(?:same|single|one|shared)\b.{0,35}\b(?:idempotency\s+)?key\b|"
+                r"\b(?:reuse|reused|reusing)\b.{0,35}\b(?:idempotency\s+)?key\b|"
+                r"\b(?:idempotency\s+)?key\b.{0,35}\b(?:same|single|one|shared)\b|"
+                r"\b(?:share|reuse|reuses|reused|reusing)\b.{0,25}"
+                r"\b(?:it|that\s+key|this\s+key)\b",
+                clause,
+            )
+        )
+        if not shared:
+            continue
+        operation_scoped = bool(
+            re.search(
+                r"\b(?:one|a|distinct|separate|derived)\b.{0,30}"
+                r"\b(?:idempotency\s+)?key\b"
+                r".{0,20}\bper\s+(?:payment\s+)?operation\b|"
+                r"\b(?:distinct|separate|derived)\b.{0,30}\bkeys?\b"
+                r".{0,25}\b(?:for|across)\b.{0,100}"
+                r"\b(?:authoriz\w*|captur\w*|refund\w*)\b|"
+                r"\b(?:authoriz\w*|captur\w*|refund\w*)\b.{0,140}"
+                r"\b(?:use|uses|have|has|get|gets)\b.{0,30}"
+                r"\b(?:distinct|separate|derived)\b.{0,50}\bkeys?\b|"
+                r"\b(?:each|every)\b.{0,100}\boperation\b.{0,100}"
+                r"\b(?:its\s+)?own\b.{0,35}\b(?:idempotency\s+)?key\b|"
+                r"\b(?:each|every)\b.{0,100}\boperation\b.{0,40}"
+                r"\b(?:gets?|has|uses?)\b.{0,20}\b(?:a\s+)?unique\b"
+                r".{0,20}\b(?:idempotency\s+)?key\b|"
+                r"\b(?:its|their)\s+own\b.{0,25}\bidempotency\s+key\b|"
+                r"\b(?:same|stable)\b.{0,25}\bkey\b.{0,60}\bonly\b.{0,60}"
+                r"\b(?:same|that)\s+operation\b",
+                clause,
+            )
+        )
+        safely_rejected = bool(
+            re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't)\s+"
+                r"(?:use|reuse|share)?\w*\b.{0,45}\b(?:same|single|one|shared)\b"
+                r".{0,35}\b(?:idempotency\s+)?key\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't)\b"
+                r".{0,45}\b(?:share|reuse|use)\w*\b.{0,30}"
+                r"\b(?:key|it|that\s+key|this\s+key)\b",
+                clause,
+            )
+        )
+        if not operation_scoped and not safely_rejected:
+            unsafe_shared_key = True
+            break
+    if unsafe_shared_key:
+        issues.append("unsafe_shared_idempotency_key_across_payment_operations")
+
+    has_all_payment_operations = all(
+        re.search(pattern, lower) for pattern in operation_pattern.values()
+    )
+    distinct_operation_keys = bool(
+        has_all_payment_operations
+        and (
+            re.search(
+                r"\b(?:distinct|separate|different|independent|operation[- ]specific)\b"
+                r".{0,50}\b(?:idempotency\s+)?keys?\b",
+                lower,
+            )
+            or re.search(
+                r"\b(?:each|every)\b.{0,180}\b(?:authoriz\w*|captur\w*|refund\w*)\b"
+                r".{0,180}\b(?:its\s+own|their\s+own|a\s+unique|an\s+independent)\b"
+                r".{0,35}\b(?:idempotency\s+)?key\b",
+                lower,
+            )
+            or re.search(
+                r"\b(?:do not|don't|never|must not|cannot|can't)\b.{0,60}"
+                r"\b(?:share|reuse|use)\w*\b.{0,45}"
+                r"\b(?:same|single|one|shared)?\s*(?:idempotency\s+)?key\b"
+                r".{0,120}\b(?:across|between|for)\b",
+                lower,
+            )
+        )
+    )
+    if re.search(
+        r"\b(?:without|no|not|never|do\s+not|don't|does\s+not|doesn't|"
+        r"must\s+not|cannot|can't|fails?\s+to)\b.{0,70}"
+        r"\b(?:distinct|separate|different|independent|operation[- ]specific)\b"
+        r".{0,50}\b(?:idempotency\s+)?keys?\b",
+        lower,
+    ):
+        distinct_operation_keys = False
+    same_operation_retry_reuse = bool(
+        re.search(
+            r"\b(?:retry|replay|resubmit)\w*\b.{0,80}"
+            r"\b(?:same|original)\b.{0,30}"
+            r"\b(?:operation|command|authorization|capture|refund|charge|payment\s+request)\b"
+            r".{0,80}\b(?:same|stable|original|existing)\b.{0,30}"
+            r"\b(?:idempotency\s+)?key\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:reuse|preserve|keep)\w*\b.{0,35}"
+            r"\b(?:same|stable|original|existing|that)\b.{0,20}"
+            r"\b(?:idempotency\s+)?key\b.{0,80}"
+            r"\b(?:retry|replay|resubmit)\w*\b.{0,50}"
+            r"\b(?:same|that|original)\b.{0,20}"
+            r"\b(?:operation|command|authorization|capture|refund|charge)\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:retry|replay|resubmit)\w*\b.{0,45}"
+            r"\b(?:reuse|preserve|keep)\w*\b.{0,45}"
+            r"\b(?:same|stable|original|existing|operation(?:'s)?)\b.{0,35}"
+            r"\b(?:idempotency\s+)?key\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:idempotency\s+)?keys?\b.{0,35}\b(?:remain|stay|are)\b"
+            r".{0,20}\bstable\b.{0,45}\b(?:retry|replay)\w*\b"
+            r".{0,45}\b(?:same|original)\s+(?:operation|command)\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:reuse|reuses|reused|reusing)\b.{0,45}"
+            r"\b(?:operation(?:'s)?|command(?:'s)?)\b.{0,30}"
+            r"\b(?:same|stable|original|existing)\b.{0,25}\bkey\b"
+            r".{0,50}\b(?:retry|replay)\w*\b",
+            lower,
+        )
+    )
+    operation_scoped_stable_key = bool(
+        re.search(
+            r"\b(?:each|every)\b.{0,80}\b(?:logical\s+|provider\s+|payment\s+)?"
+            r"(?:operation|command)\b.{0,80}"
+            r"\b(?:its\s+own|their\s+own|a\s+(?:stable|unique|distinct))\b"
+            r".{0,35}\bidempotency\s+key\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:stable|persistent|durable|operation[- ]scoped)\b.{0,25}"
+            r"\bidempotency\s+key\b.{0,45}"
+            r"\b(?:per|for\s+each|for\s+every)\b.{0,30}"
+            r"\b(?:logical\s+|provider\s+|payment\s+)?(?:operation|command)\b",
+            lower,
+        )
+        or re.search(
+            r"\bidempotency\s+key\b.{0,25}\bper\b.{0,25}"
+            r"\b(?:logical\s+|provider\s+|payment\s+)?(?:operation|command)\b",
+            lower,
+        )
+        or (distinct_operation_keys and same_operation_retry_reuse)
+    )
+    if require_complete_idempotency_semantics:
+        if not operation_scoped_stable_key:
+            issues.append("missing_stable_idempotency_key_per_operation")
+        if not distinct_operation_keys:
+            issues.append("missing_distinct_authorize_capture_refund_keys")
+        if not same_operation_retry_reuse:
+            issues.append("missing_same_operation_idempotency_key_reuse")
+    elif require_same_operation_retry_reuse and not same_operation_retry_reuse:
+        issues.append("missing_same_operation_idempotency_key_reuse")
+
+    provider_event_id = (
+        r"(?:provider|processor|gateway)(?:'s)?(?:[- ]supplied)?\s+"
+        r"(?:event|notification|webhook)?\s*(?:id|identifier)|"
+        r"webhook(?:[- ]supplied)?\s+event\s+(?:id|identifier)|"
+        r"(?:provider|processor|gateway|webhook)[-_]event[-_]?id|"
+        r"(?:event\s+(?:id|identifier))\s+(?:supplied|assigned|returned)\s+by\s+"
+        r"(?:the\s+)?(?:provider|processor|gateway)"
+    )
+    provider_event_dedup_patterns = (
+        rf"\bdedup\w*\b[^.!?;]{{0,45}}\bwebhooks?\b[^.!?;]{{0,45}}"
+        rf"\b(?:by|using|with|on|keyed\s+by)\b[^.!?;]{{0,25}}"
+        rf"\b(?:{provider_event_id})\b",
+        rf"\bwebhooks?\b[^.!?;]{{0,55}}\bdedup\w*\b[^.!?;]{{0,45}}"
+        rf"\b(?:by|using|with|on|keyed\s+by)\b[^.!?;]{{0,25}}"
+        rf"\b(?:{provider_event_id})\b",
+        rf"\b(?:use|using|persist|store|record|insert)\w*\b[^.!?;]{{0,35}}"
+        rf"\b(?:{provider_event_id})\b[^.!?;]{{0,55}}"
+        rf"\b(?:to\s+dedup\w*|unique\s+(?:constraint|index))\b"
+        rf"[^.!?;]{{0,55}}\bwebhooks?\b",
+        rf"\bwebhooks?\b[^.!?;]{{0,55}}\b(?:use|using|persist|store|record|insert)\w*\b"
+        rf"[^.!?;]{{0,35}}\b(?:{provider_event_id})\b[^.!?;]{{0,55}}"
+        rf"\b(?:to\s+dedup\w*|unique\s+(?:constraint|index))\b",
+        rf"\b(?:{provider_event_id})\b[^.!?;]{{0,45}}"
+        rf"\b(?:dedup\w*|unique\s+(?:constraint|index))\b"
+        rf"[^.!?;]{{0,55}}\bwebhooks?\b",
+    )
+    provider_event_dedup = any(
+        re.search(pattern, lower) for pattern in provider_event_dedup_patterns
+    )
+
+    operation_key = (
+        r"idempotency\s+key|operation\s+(?:key|id)|payment(?:\s+operation)?\s+id|"
+        r"payment_id"
+    )
+    unsafe_webhook_operation_key = False
+    bad_webhook_patterns = (
+        rf"\bdedup\w*\b[^.!?;]{{0,45}}\bwebhooks?\b[^.!?;]{{0,45}}"
+        rf"\b(?:by|using|with|on|keyed\s+by)\b[^.!?;]{{0,25}}"
+        rf"\b(?:{operation_key})\b",
+        rf"\bwebhooks?\b[^.!?;]{{0,55}}\b(?:dedup\w*|idempotent\w*)\b"
+        rf"[^.!?;]{{0,45}}\b(?:by|using|with|on|keyed\s+by)\b"
+        rf"[^.!?;]{{0,25}}\b(?:{operation_key})\b",
+        rf"\b(?:use|using)\b[^.!?;]{{0,35}}\b(?:{operation_key})\b"
+        rf"[^.!?;]{{0,45}}\b(?:as|to|for)\b[^.!?;]{{0,35}}"
+        rf"\b(?:dedup\w*|idempotent\w*)\b[^.!?;]{{0,35}}\bwebhooks?\b",
+        rf"\b(?:use|using)\b[^.!?;]{{0,35}}\b(?:{operation_key})\b"
+        rf"[^.!?;]{{0,45}}\bas\b[^.!?;]{{0,25}}\bwebhook\b"
+        rf"[^.!?;]{{0,25}}\bdedup\w*\b",
+    )
+    for pattern in bad_webhook_patterns:
+        for match in re.finditer(pattern, lower):
+            prefix = lower[max(0, match.start() - 80) : match.start()]
+            if re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't)\s*$",
+                prefix,
+            ) or re.search(
+                r"\b(?:not|rather\s+than|instead\s+of)\b.{0,40}"
+                r"\b(?:idempotency|operation|payment)\b",
+                match.group(),
+            ):
+                continue
+            unsafe_webhook_operation_key = True
+            break
+        if unsafe_webhook_operation_key:
+            break
+    if unsafe_webhook_operation_key:
+        issues.append("unsafe_webhook_dedup_by_operation_key")
+
+    webhook_used = any(
+        "webhook" in clause
+        and not re.search(
+            r"\b(?:do not|don't|never|without|instead of|not rely(?:ing)? on)\b"
+            r".{0,40}\bwebhooks?\b",
+            clause,
+        )
+        for clause in clauses
+    )
+    if (require_webhook_event_dedup or webhook_used) and not provider_event_dedup:
+        issues.append("missing_provider_event_id_webhook_dedup")
+
+    def is_distinct_user_authorized_payment_after_reconciliation(
+        action_start: int,
+        action_end: int,
+    ) -> bool:
+        """Allow only a new logical purchase after the ambiguous one is resolved."""
+        prefix = lower[max(0, action_start - 700) : action_start]
+        context = lower[max(0, action_start - 360) : action_end + 120]
+        near_action = lower[max(0, action_start - 160) : action_end + 80]
+        if re.search(
+            r"\b(?:retry|replay|resubmit)\w*\b.{0,70}"
+            r"\b(?:same|original|ambiguous)\b.{0,35}"
+            r"\b(?:operation|charge|payment|request|purchase|order)\b",
+            near_action,
+        ):
+            return False
+        distinct_purchase = bool(
+            re.search(
+                r"\b(?:distinct|separate|unrelated)\b.{0,45}"
+                r"\b(?:later|subsequent|new)?\s*"
+                r"(?:payment|purchase|order|payment\s+intent|logical\s+operation)\b",
+                context,
+            )
+            or re.search(
+                r"\b(?:later|subsequent)\b.{0,35}\bnew\b.{0,25}"
+                r"\b(?:purchase|order|payment\s+intent)\b",
+                context,
+            )
+        )
+        user_authorized = bool(
+            re.search(
+                r"\b(?:user|customer|cardholder)\b.{0,70}"
+                r"\b(?:explicitly\s+)?(?:authoriz|approv|request|initiat|confirm)\w*\b",
+                context,
+            )
+            or re.search(
+                r"\bexplicit\s+(?:user|customer|cardholder)\s+"
+                r"(?:authorization|approval|request|confirmation)\b",
+                context,
+            )
+        )
+        authoritative_resolution = bool(
+            re.search(
+                r"\b(?:provider|processor|gateway|acquirer)(?:'s)?\b.{0,80}"
+                r"\b(?:status(?:\s+(?:api|query|lookup|response|result))?|"
+                r"signed\s+webhook|webhook)\b.{0,100}"
+                r"\b(?:confirm|report|return|show|verify|reconcil|resolv)\w*\b"
+                r".{0,100}\b(?:succeeded|failed|canceled|cancelled|declined|"
+                r"no\s+charge|charged|captured|terminal)\b",
+                prefix,
+            )
+            or re.search(
+                r"\b(?:signed\s+webhook|status(?:\s+(?:api|query|lookup|response|result))?)\b"
+                r".{0,70}\bfrom\s+(?:the\s+)?(?:provider|processor|gateway|acquirer)\b"
+                r".{0,100}\b(?:confirm|report|return|show|verify|reconcil|resolv)\w*\b"
+                r".{0,100}\b(?:succeeded|failed|canceled|cancelled|declined|"
+                r"no\s+charge|charged|captured|terminal)\b",
+                prefix,
+            )
+        )
+        original_resolved = bool(
+            re.search(
+                r"\b(?:original|previous|ambiguous|timed[- ]out)\b.{0,50}"
+                r"\b(?:operation|charge|payment|request|attempt)\b.{0,100}"
+                r"\b(?:reconcil|resolv|terminal|confirm)\w*\b",
+                prefix,
+            )
+            or re.search(
+                r"\b(?:reconcil|resolv|terminal|confirm)\w*\b.{0,100}"
+                r"\b(?:original|previous|ambiguous|timed[- ]out)\b.{0,50}"
+                r"\b(?:operation|charge|payment|request|attempt)\b",
+                prefix,
+            )
+        )
+        return bool(
+            distinct_purchase
+            and user_authorized
+            and authoritative_resolution
+            and original_resolved
+        )
+
+    ambiguous_outcome = (
+        r"timeout|timed out|unknown|ambiguous|pending[-_ ]reconciliation|"
+        r"outcome\s+(?:is|remains)\s+uncertain"
+    )
+    new_charge_action = (
+        r"(?:issue|send|submit|create|initiate|make|start|dispatch|enqueue|attempt)\w*"
+        r"\s+(?:a\s+|the\s+)?(?:another|new|fresh|replacement|second)\s+"
+        r"(?:charge|payment|authorization|payment\s+request|processor\s+request)"
+    )
+    unsafe_new_charge = False
+    for match in re.finditer(rf"\b(?:{new_charge_action})\b", lower):
+        window = lower[max(0, match.start() - 260) : match.end() + 260]
+        if not re.search(rf"\b(?:{ambiguous_outcome})\b", window):
+            continue
+        if is_distinct_user_authorized_payment_after_reconciliation(
+            match.start(), match.end()
+        ):
+            continue
+        prefix = lower[max(0, match.start() - 100) : match.start()]
+        if re.search(
+            r"\b(?:do not|don't|never|must not|should not|cannot|can't|without|"
+            r"block|blocks|blocked|prevent|prevents|prevented)\s*$",
+            prefix,
+        ) or re.search(
+            r"\b(?:block|prevent)\w*\s+(?:(?:a|the|any)\s+)?"
+            r"(?:(?:worker|system|client)\s+)?(?:from\s+)?$",
+            prefix,
+        ):
+            continue
+        unsafe_new_charge = True
+        break
+    if not unsafe_new_charge:
+        passive_new_charge = re.finditer(
+            r"\b(?:another|new|fresh|replacement|second)\s+"
+            r"(?:charge|payment|authorization)\b.{0,30}"
+            r"\b(?:is|gets?)\s+(?:issued|sent|submitted|created|initiated|made)\b",
+            lower,
+        )
+        for match in passive_new_charge:
+            window = lower[max(0, match.start() - 260) : match.end() + 260]
+            prefix = lower[max(0, match.start() - 30) : match.start()]
+            if (
+                re.search(rf"\b(?:{ambiguous_outcome})\b", window)
+                and not re.search(r"\b(?:not|never)\b", match.group())
+                and not re.search(r"\b(?:no|without)\s*$", prefix)
+            ):
+                if is_distinct_user_authorized_payment_after_reconciliation(
+                    match.start(), match.end()
+                ):
+                    continue
+                unsafe_new_charge = True
+                break
+    if not unsafe_new_charge:
+        keyed_charge = re.finditer(
+            r"\b(?:issue|send|submit|create|initiate|make|start|dispatch)\w*\s+"
+            r"(?:a\s+|the\s+)?(?:charge|payment|authorization)\b",
+            lower,
+        )
+        for match in keyed_charge:
+            window = lower[max(0, match.start() - 260) : match.end() + 260]
+            if not re.search(rf"\b(?:{ambiguous_outcome})\b", window):
+                continue
+            second_effect = bool(
+                re.search(r"\b(?:again|anew)\b", window)
+                or re.search(rf"\b(?:{new_key_signal})\b", window)
+            )
+            prefix = lower[max(0, match.start() - 100) : match.start()]
+            if second_effect and not re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't|without|"
+                r"block|blocks|blocked|prevent|prevents|prevented)\s*$",
+                prefix,
+            ):
+                if is_distinct_user_authorized_payment_after_reconciliation(
+                    match.start(), match.end()
+                ):
+                    continue
+                unsafe_new_charge = True
+                break
+    if unsafe_new_charge:
+        issues.append("unsafe_new_charge_after_ambiguous_outcome")
+
+    return issues
+
+
+def self_check_payment_operation_semantics() -> None:
+    safe = (
+        "Give each logical provider operation, such as authorize, capture, or refund, "
+        "its own stable idempotency key, and reuse that same key only when replaying "
+        "that same operation. Deduplicate webhooks by provider event ID under a "
+        "unique constraint. UNKNOWN blocks a new charge.",
+        "Retry the same authorization operation with the same stable idempotency key. "
+        "Derive separate keys for authorize, capture, and refund. Deduplicate signed "
+        "webhooks by the provider event ID stored under a unique constraint. If the "
+        "outcome is UNKNOWN, block another charge and reconcile by provider status.",
+        "Never generate a fresh idempotency key on retry, and never share one key "
+        "across authorize, capture, and refund. Reuse the same stable key only when "
+        "replaying that same logical operation. Deduplicate webhooks by the processor "
+        "event ID stored under a unique constraint. Do not use the operation key for "
+        "webhook deduplication.",
+        "Each authorize, capture, and refund operation gets a unique idempotency key; "
+        "every retry reuses that operation's same stable key. Deduplicate webhooks by "
+        "provider_event_id under a unique constraint. A timeout remains UNKNOWN and "
+        "blocks any new charge.",
+    )
+    for value in safe:
+        assert not payment_operation_semantic_issues(
+            value, require_webhook_event_dedup=True
+        ), value
+
+    unsafe = (
+        (
+            "Generate a fresh idempotency key for every retry. Deduplicate webhooks "
+            "using provider event ID under a unique constraint.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "Replay the payment with a different idempotency key. Deduplicate webhooks "
+            "using provider event ID under a unique constraint.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "On every replay, select new idempotency keys. Deduplicate webhooks using "
+            "provider event ID under a unique constraint.",
+            "unsafe_new_idempotency_key_on_retry",
+        ),
+        (
+            "Use one shared idempotency key across authorize, capture, and refund. "
+            "Deduplicate webhooks using provider event ID under a unique constraint.",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+        ),
+        (
+            "Reuse the same key for authorization and capture. Deduplicate webhooks "
+            "using provider event ID under a unique constraint.",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+        ),
+        (
+            "Use one shared key. Authorization happens first. Capture reuses it, and "
+            "refund reuses it too. Deduplicate webhooks using provider event ID.",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+        ),
+        (
+            "Authorization uses key A. Capture reuses it in the next step. Refund "
+            "gets a separate key. Deduplicate webhooks using provider event ID.",
+            "unsafe_shared_idempotency_key_across_payment_operations",
+        ),
+        (
+            "Deduplicate webhooks using the operation idempotency key.",
+            "unsafe_webhook_dedup_by_operation_key",
+        ),
+        (
+            "Webhook deduplication is keyed by payment_id.",
+            "unsafe_webhook_dedup_by_operation_key",
+        ),
+        (
+            "Process signed webhooks and update the payment state.",
+            "missing_provider_event_id_webhook_dedup",
+        ),
+        (
+            "After a timeout leaves the outcome UNKNOWN, create another charge with "
+            "a fresh idempotency key.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "After the outcome becomes UNKNOWN, issue another authorization with a "
+            "fresh key.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "If the payment remains UNKNOWN, send a new payment under a different "
+            "idempotency key.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "Following a provider timeout, send a new payment request.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "After the timeout leaves the result UNKNOWN, submit the charge using a "
+            "fresh idempotency key.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+    )
+    for value, expected in unsafe:
+        found = payment_operation_semantic_issues(
+            value, require_webhook_event_dedup=True
+        )
+        assert expected in found, (value, found)
+
+    incomplete_positive_contracts = (
+        (
+            "Use idempotency keys for provider calls. Deduplicate webhooks by provider "
+            "event ID and reconcile UNKNOWN payments.",
+            {
+                "missing_stable_idempotency_key_per_operation",
+                "missing_distinct_authorize_capture_refund_keys",
+                "missing_same_operation_idempotency_key_reuse",
+            },
+        ),
+        (
+            "Give every logical operation a stable idempotency key and reuse it on "
+            "same-operation retries. Deduplicate webhooks by provider event ID.",
+            {"missing_distinct_authorize_capture_refund_keys"},
+        ),
+        (
+            "Authorize, capture, and refund use distinct operation-scoped keys. "
+            "Deduplicate webhooks by provider event ID.",
+            {"missing_same_operation_idempotency_key_reuse"},
+        ),
+        (
+            "Give every logical operation a stable idempotency key and reuse the same "
+            "key only for same-operation retries. Authorize, capture, and refund do "
+            "not use distinct keys. Deduplicate webhooks by provider event ID.",
+            {"missing_distinct_authorize_capture_refund_keys"},
+        ),
+    )
+    for value, expected in incomplete_positive_contracts:
+        found = set(
+            payment_operation_semantic_issues(
+                value,
+                require_webhook_event_dedup=True,
+            )
+        )
+        assert expected.issubset(found), (value, found)
+
+    query_only = (
+        "Keep the result UNKNOWN, do not submit the charge again, block another "
+        "charge, and query provider status. Reuse the same stable idempotency key only "
+        "when replaying that same original logical operation. Do not retry the charge "
+        "with a new idempotency key."
+    )
+    assert not payment_operation_semantic_issues(
+        query_only,
+        require_webhook_event_dedup=False,
+        require_complete_idempotency_semantics=False,
+        require_same_operation_retry_reuse=True,
+    )
+    assert "missing_same_operation_idempotency_key_reuse" in payment_operation_semantic_issues(
+        "Keep the payment UNKNOWN, block the original charge, and query provider status.",
+        require_webhook_event_dedup=False,
+        require_complete_idempotency_semantics=False,
+        require_same_operation_retry_reuse=True,
+    )
+
+    distinct_later_payment = (
+        "Authorize, capture, and refund use distinct operation-scoped idempotency "
+        "keys. Reuse the same stable idempotency key only when replaying that same "
+        "logical operation. A timeout leaves the original payment UNKNOWN and blocks "
+        "that charge. Reconcile the original payment until the provider status lookup "
+        "confirms it FAILED with no charge. The customer then explicitly authorizes a "
+        "distinct later purchase, so create a new payment intent with its own new "
+        "operation-scoped key for that separate purchase."
+    )
+    assert not payment_operation_semantic_issues(
+        distinct_later_payment,
+        require_webhook_event_dedup=False,
+        require_complete_idempotency_semantics=False,
+        require_same_operation_retry_reuse=True,
+    )
+    ambiguous_same_purchase = (
+        "Authorize, capture, and refund use distinct operation-scoped idempotency "
+        "keys. Reuse the same stable idempotency key only when replaying that same "
+        "logical operation. A timeout leaves the original payment UNKNOWN. The "
+        "customer asks us to try the same purchase again, so create a new payment "
+        "with a fresh key."
+    )
+    assert "unsafe_new_charge_after_ambiguous_outcome" in payment_operation_semantic_issues(
+        ambiguous_same_purchase,
+        require_webhook_event_dedup=False,
+        require_complete_idempotency_semantics=False,
+        require_same_operation_retry_reuse=True,
+    )
+
+
+def payment_platform_safety_issues(text: str) -> List[str]:
+    """Find missing durable boundaries or unsafe volatile ones in payment designs."""
+    lower = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[*_`~]+", "", text.casefold().replace("’", "'")),
+    )
+    ledger_property = (
+        r"durable|persistent|transactional|append[- ]only|double[- ]entry|"
+        r"database[- ]backed|postgres(?:ql)?|relational\s+database"
+    )
+    clauses = [
+        clause.strip()
+        for clause in re.split(
+            r"(?<=[.!?;:])\s+|\n+|\b(?:but|however|instead)\b",
+            lower,
+        )
+        if clause.strip()
+    ]
+
+    def negates_ledger(clause: str) -> bool:
+        return bool(
+            re.search(r"\b(?:no|without)\s+(?:a\s+)?(?:\w+[- ]?){0,3}ledger\b", clause)
+            or re.search(
+                rf"\bnot\s+(?:a\s+)?(?:{ledger_property})\s+ledger\b",
+                clause,
+            )
+            or re.search(
+                r"\bnon[- ](?:durable|persistent|transactional)\b.{0,40}\bledger\b|"
+                r"\bledger\b.{0,40}\bnon[- ](?:durable|persistent|transactional)\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't|"
+                r"avoid|skip|omit)\s+(?:(?:use|write|persist|create|maintain|"
+                r"record|keep|rely on)\s+)?(?:\w+[- ]?){0,4}ledger\b",
+                clause,
+            )
+            or re.search(
+                rf"\bledger\b.{{0,35}}\b(?:is|should be|must be|will be|remain)\s+"
+                rf"(?:not|never)\s+(?:{ledger_property})\b",
+                clause,
+            )
+        )
+
+    durable_ledger = any(
+        not negates_ledger(clause)
+        and (
+            re.search(rf"\b(?:{ledger_property})\b.{{0,100}}\bledger\b", clause)
+            or re.search(rf"\bledger\b.{{0,100}}\b(?:{ledger_property})\b", clause)
+        )
+        for clause in clauses
+    )
+
+    def negates_reconciliation(clause: str) -> bool:
+        return bool(
+            re.search(r"\b(?:no|without)\s+(?:provider\s+)?reconcil\w*\b", clause)
+            or re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't|"
+                r"avoid|skip|omit)\s+(?:(?:perform|run|use|attempt)\s+)?"
+                r"reconcil\w*\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't|"
+                r"avoid|skip|omit)\s+(?:query|check|lookup|poll|accept|process|use)"
+                r".{0,35}\b(?:provider|processor|gateway|status|webhooks?)\b",
+                clause,
+            )
+            or re.search(
+                r"\breconcil\w*\b.{0,30}\b(?:is|will be|should be|must be)\s+"
+                r"(?:not|never)\s+(?:performed|used|run|required|supported|available)|"
+                r"\breconcil\w*\b.{0,20}\b(?:is|becomes?)\s+(?:unnecessary|"
+                r"disabled|omitted)",
+                clause,
+            )
+            or re.search(
+                r"\b(?:provider\s+status|webhooks?)\b.{0,30}\b(?:is|are|will be)\s+"
+                r"(?:not|never)\s+(?:used|queried|checked|accepted|processed)",
+                clause,
+            )
+        )
+
+    reconciliation = any(
+        not negates_reconciliation(clause)
+        and (
+            re.search(r"\breconcil\w*\b", clause)
+            or re.search(
+                r"\b(?:provider|processor|gateway)\b.{0,100}"
+                r"\b(?:status(?:\s+(?:query|lookup|check))?|webhooks?)\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:status(?:\s+(?:query|lookup|check))?|webhooks?)\b.{0,100}"
+                r"\b(?:provider|processor|gateway)\b",
+                clause,
+            )
+        )
+        for clause in clauses
+    )
+
+    provider_call = (
+        r"(?:(?:call|invoke|contact)\w*\s+(?:the\s+)?(?:payment\s+)?"
+        r"(?:provider|processor|gateway)|"
+        r"(?:dispatch|send|submit)\w*\s+(?:the\s+)?(?:charge|payment|request)"
+        r"\s+to\s+(?:the\s+)?(?:provider|processor|gateway)|"
+        r"(?:charge|authorize|capture)\w*\s+(?:the\s+)?(?:card|payment))"
+    )
+    durable_persist = (
+        r"(?:(?:persist|write|create|insert|store|save|commit|record)\w*\b.{0,60}"
+        r"\b(?:payment\s+intent|idempotency\s+(?:key|record)|ledger|"
+        r"durable\s+(?:record|state)))"
+    )
+    provider_first_patterns = (
+        (
+            rf"\b{provider_call}\b.{{0,80}}\b(?:first\b.{{0,50}}\bthen|then|before|"
+            rf"and\s+(?:only\s+)?then)"
+            rf"\b.{{0,100}}\b{durable_persist}\b"
+        ),
+        rf"\b{provider_call}\b.{{0,40}}\bfirst\b.{{0,130}}\b{durable_persist}\b",
+        (
+            rf"\b{provider_call}\b.{{0,120}}\b{durable_persist}\b.{{0,30}}"
+            r"\b(?:afterward|afterwards)\b"
+        ),
+    )
+
+    def has_unnegated_order(pattern: str) -> bool:
+        for match in re.finditer(pattern, lower):
+            prefix = lower[max(0, match.start() - 70) : match.start()]
+            if re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't)"
+                r"(?:\s+\w+){0,4}\s*$",
+                prefix,
+            ):
+                continue
+            return True
+        return False
+
+    provider_before_persist = any(has_unnegated_order(pattern) for pattern in provider_first_patterns)
+
+    volatile_boundary = False
+    volatile = re.compile(r"\b(?:redis|setnx|short[- ]lived\s+(?:redis\s+)?lock)\b")
+    boundary_claim = re.compile(
+        r"(?:financial\s+correctness|correctness\s+boundary|source\s+of\s+truth|"
+        r"authoritative|guarantee\w*.{0,50}(?:no\s+)?duplicate|"
+        r"prevent\w*.{0,40}duplicate)"
+    )
+    for match in volatile.finditer(lower):
+        window = lower[max(0, match.start() - 180) : match.end() + 180]
+        if boundary_claim.search(window):
+            disclaimed = re.search(
+                r"\b(?:redis|setnx|(?:short[- ]lived|volatile)\s+lock)\b.{0,90}"
+                r"\b(?:is\s+not|isn't|isn’t|must\s+not\s+be|cannot\s+be|can't\s+be|"
+                r"can’t\s+be)\b.{0,70}"
+                r"\b(?:correctness\s+boundary|source\s+of\s+truth|authoritative|"
+                r"financial\s+correctness)\b",
+                window,
+            )
+            if not disclaimed:
+                volatile_boundary = True
+                break
+    if not volatile_boundary:
+        volatile_boundary = bool(
+            re.search(
+                r"\bcheck\w*\b.{0,50}\bredis\b.{0,100}\b(?:missing|absent|not\s+found)\b"
+                r".{0,100}\bcharg\w*\b.{0,100}\b(?:write|put|set|store)\w*\b",
+                lower,
+            )
+        )
+
+    issues: List[str] = []
+    if not durable_ledger:
+        issues.append("missing_durable_payment_ledger")
+    if not reconciliation:
+        issues.append("missing_payment_reconciliation_path")
+    if volatile_boundary:
+        issues.append("unsafe_volatile_payment_correctness_boundary")
+    if provider_before_persist:
+        issues.append("unsafe_provider_before_durable_persistence")
+    return issues
+
+
+def self_check_payment_platform_safety_detector() -> None:
+    safe = (
+        "Record every state transition in a durable double-entry ledger, then "
+        "reconcile unknown outcomes with provider status queries and webhooks.",
+        "PostgreSQL holds the append-only ledger. Redis is only a cache and is not "
+        "the correctness boundary; processor webhook reconciliation resolves UNKNOWN.",
+        "Persist a durable payment intent and append-only ledger before calling the "
+        "provider. Reconcile ambiguous outcomes through status checks and webhooks.",
+        "Never call the provider first; persist the durable payment intent and ledger "
+        "before dispatch. Reconcile through provider status and webhooks.",
+        "Persist the payment intent. After commit, call the provider. Use a durable "
+        "double-entry ledger and reconcile through provider status and webhooks.",
+        "Only after the database transaction commits do we call the provider. The "
+        "transaction writes a durable payment intent and ledger; provider status and "
+        "webhooks reconcile ambiguous outcomes.",
+    )
+    unsafe = (
+        (
+            "Store idempotency results durably and reconcile through provider status.",
+            ["missing_durable_payment_ledger"],
+        ),
+        (
+            "Write an append-only PostgreSQL ledger and return the stored result.",
+            ["missing_payment_reconciliation_path"],
+        ),
+        (
+            "Use a durable double-entry ledger and provider webhook reconciliation. "
+            "Redis SETNX is the source of truth and guarantees no duplicate charge.",
+            ["unsafe_volatile_payment_correctness_boundary"],
+        ),
+        (
+            "Use a transactional ledger and gateway status reconciliation. Check Redis; "
+            "if the key is missing, charge the card, then write the result.",
+            ["unsafe_volatile_payment_correctness_boundary"],
+        ),
+        (
+            "Do not use a durable ledger. Reconcile unknown outcomes through provider "
+            "status checks and webhooks.",
+            ["missing_durable_payment_ledger"],
+        ),
+        (
+            "Use a non-durable ledger. Reconcile unknown outcomes through provider "
+            "status checks and webhooks.",
+            ["missing_durable_payment_ledger"],
+        ),
+        (
+            "Use a durable append-only ledger, but do not reconcile unknown outcomes "
+            "with the provider or accept webhooks.",
+            ["missing_payment_reconciliation_path"],
+        ),
+        (
+            "Use a durable append-only ledger. Provider reconciliation is not "
+            "performed, and webhooks are not accepted.",
+            ["missing_payment_reconciliation_path"],
+        ),
+        (
+            "Call the provider first, then persist the payment intent in a durable "
+            "append-only ledger. Reconcile through provider status and webhooks.",
+            ["unsafe_provider_before_durable_persistence"],
+        ),
+        (
+            "Send the payment to the gateway, then create the idempotency record and "
+            "append-only ledger. Reconcile through the gateway webhook.",
+            ["unsafe_provider_before_durable_persistence"],
+        ),
+    )
+    assert all(not payment_platform_safety_issues(text) for text in safe)
+    for text, expected in unsafe:
+        issues = payment_platform_safety_issues(text)
+        assert all(issue in issues for issue in expected), (text, issues)
+
+
+Q46_GENERIC_PLACEHOLDER = re.compile(
+    r"\[(?:company(?:/project)?|project|situation|task|(?:2-3\s+)?actions?|"
+    r"result|(?:verified\s+)?outcome|problem|constraint)\]",
+    re.I,
+)
+
+
+def q46_non_placeholder_prose(text: str) -> str:
+    """Remove only recognized fill-in grammar while retaining every factual claim."""
+    prose = text
+    placeholder = Q46_GENERIC_PLACEHOLDER.pattern
+    safe_template_clauses = (
+        rf"\b(?:i\s+was|we\s+were)\s+responsible\s+for\s*{placeholder}",
+        rf"\b(?:my|our)\s+(?:task|responsibility|goal)\s+was\s*{placeholder}",
+        rf"\b(?:the\s+)?result\s+was\s*{placeholder}",
+        rf"\b(?:i|we)\s*{placeholder}",
+    )
+    for pattern in safe_template_clauses:
+        prose = re.sub(pattern, " ", prose, flags=re.I)
+    prose = Q46_GENERIC_PLACEHOLDER.sub(" ", prose)
+    return re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[*_`~]+", "", prose.casefold().replace("’", "'")),
+    ).strip()
+
+
+def has_q46_unsupported_lived_claim(text: str) -> bool:
+    """Detect first-person lived claims using grammar plus irregular actions."""
+    lower = q46_non_placeholder_prose(text)
+    regular_past = r"[a-z][a-z-]{2,}ed"
+    irregular_past = (
+        r"built|brought|chose|chosen|cut|did|done|drove|driven|found|grew|grown|"
+        r"had|kept|led|made|overcame|overseen|oversaw|put|ran|run|rose|seen|set|"
+        r"shown|sold|spent|taught|taken|took|went|won|written|wrote"
+    )
+    past_action = rf"(?:{regular_past}|{irregular_past})"
+    first_person_action = re.search(
+        rf"\b(?:i|we)\s+(?:(?:personally|directly|successfully)\s+)?"
+        rf"(?:(?:have|had)\s+(?:(?:personally|directly)\s+)?{past_action}|"
+        rf"{past_action})\b",
+        lower,
+    )
+    present_story_action = (
+        r"own|lead|manage|coordinate|build|run|operate|maintain|support|fix|restore|"
+        r"improve|reduce|increase|drive|deliver|design|develop|implement|launch|ship|"
+        r"create|resolve|handle|oversee|optimize|stabilize|automate|migrate|scale|"
+        r"mentor|partner|champion|spearhead|debug|deploy|architect"
+    )
+    first_person_present_action = re.search(
+        rf"\b(?:i|we)\s+(?:(?:personally|directly|currently|regularly|successfully)\s+)?"
+        rf"(?:{present_story_action})(?:s|es|ing)?\b",
+        lower,
+    )
+    concrete_locative_identity = re.search(
+        r"\b(?:at|for|within|during)\s+"
+        r"(?:(?:a|the)\s+(?:previous|former|current)\s+(?:company|team|project)|"
+        r"[a-z0-9&][a-z0-9&.'-]*(?:\s+[a-z0-9&][a-z0-9&.'-]*){0,4})"
+        r"\s*,\s*(?:i|we)\b",
+        lower,
+    )
+    first_person_role = re.search(
+        r"\b(?:i\s+(?:was|have\s+been|had\s+been)|"
+        r"we\s+(?:were|have\s+been|had\s+been))\s+"
+        r"(?:(?:personally|directly|solely|only)\s+)?"
+        r"(?:responsible|accountable|the\s+owner|in\s+charge)\b",
+        lower,
+    )
+    possessive_story = re.search(
+        r"\b(?:my|our)\s+(?:role|task|responsibility|goal|project|initiative)\s+"
+        r"(?:was|became|included|involved)\b(?!.{0,20}\[[^]]+\])",
+        lower,
+    )
+    return bool(
+        first_person_action
+        or first_person_present_action
+        or concrete_locative_identity
+        or first_person_role
+        or possessive_story
+    )
+
+
+def has_q46_unsupported_passive_story_claim(text: str) -> bool:
+    """Detect passive or outcome-shaped factual stories without enumerating verbs."""
+    lower = q46_non_placeholder_prose(text)
+    regular_participle = r"[a-z][a-z-]{2,}ed"
+    irregular_participle = (
+        r"built|brought|cut|done|driven|found|grown|kept|made|overseen|put|"
+        r"rebuilt|redone|rewritten|run|set|shown|taken|won|written"
+    )
+    story_participle = rf"(?:{regular_participle}|{irregular_participle})"
+    story_subject = (
+        r"(?:(?:my|our|the)\s+team|(?:the\s+)?(?:engineers?|pipeline|system|"
+        r"service|process|delivery|project|initiative|awards?|customer\s+impact|"
+        r"costs?|latency|errors?|incident|outcome|result))"
+    )
+    return bool(
+        re.search(
+            rf"\b{story_subject}\s+(?:was|were)\s+(?:successfully\s+)?"
+            rf"{story_participle}\b",
+            lower,
+        )
+        or re.search(
+            rf"\b{story_subject}\s+(?:fell|grew|rose|dropped|ran|became|"
+            rf"{story_participle})\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:result|outcome|impact)\s+(?:was|included|became)\s+"
+            r"(?:an?\s+|the\s+)?[a-z0-9]",
+            lower,
+        )
+        or re.search(r"\bas a result,?\s+[a-z0-9]", lower)
+    )
+
+
+def has_q46_concrete_filled_template_claim(text: str) -> bool:
+    """Reject bracketed facts masquerading as generic template placeholders."""
+    if not re.search(r"\b(?:fill[- ]in\s+)?template\b", text, re.I):
+        return False
+    bracketed = re.findall(r"\[[^\]\n]{2,100}\]", text)
+    concrete = [value for value in bracketed if not Q46_GENERIC_PLACEHOLDER.fullmatch(value)]
+    return len(concrete) >= 2
+
+
+def is_q46_truth_gap_or_fill_in_template(text: str) -> bool:
+    """Accept a useful facts request or unmistakably non-factual STAR template."""
+    lower = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[*_`~]+", "", text.casefold().replace("’", "'")),
+    )
+    has_all_star_fields = all(
+        re.search(rf"\b{field}\b", lower)
+        for field in ("situation", "task", "action", "result")
+    )
+    truth_gap = bool(
+        re.search(
+            r"\b(?:do\s+not|don't|cannot|can't)\s+have\b.{0,120}"
+            r"\b(?:verified|confirmed|factual|real|complete|end[- ]to[- ]end|"
+            r"story|example|facts?|details?)\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:need|missing|send|provide|share)\b.{0,120}"
+            r"\b(?:verified|confirmed|factual|real|facts?|details?|situation|"
+            r"task|action|result)\b",
+            lower,
+        )
+    )
+    placeholders = Q46_GENERIC_PLACEHOLDER.findall(text)
+    template_match = re.search(r"\b(?:fill[- ]in\s+)?template\b", lower)
+    labeled_template = bool(template_match and len(placeholders) >= 3)
+    if not has_all_star_fields or not (truth_gap or labeled_template):
+        return False
+    # Scan all remaining prose, including text after the template. Only the
+    # recognized placeholders and their fill-in grammar are exempt.
+    return not (
+        has_q46_unsupported_lived_claim(text)
+        or has_q46_unsupported_passive_story_claim(text)
+        or has_q46_concrete_filled_template_claim(text)
+    )
+
+
+def q46_story_grounding_issues(text: str) -> List[str]:
+    """Enforce the Q46 fixture's cross-source, incomplete-story truth boundary."""
+    safe_fallback = is_q46_truth_gap_or_fill_in_template(text)
+    lived_claim = has_q46_unsupported_lived_claim(text)
+    passive_claim = has_q46_unsupported_passive_story_claim(text)
+    filled_template_claim = has_q46_concrete_filled_template_claim(text)
+    prose = q46_non_placeholder_prose(text)
+    foreign_story_anchor = bool(
+        re.search(
+            r"\b(?:marriott|loyalty|free\s+night\s+awards?|fnas?)\b",
+            prose,
+            re.I,
+        )
+    )
+
+    issues: List[str] = []
+    if not safe_fallback:
+        issues.append("q46_missing_verified_story_truth_gap_or_template")
+    if lived_claim and not safe_fallback:
+        issues.append("q46_unsupported_first_person_story")
+    if passive_claim and not safe_fallback:
+        issues.append("q46_unsupported_passive_story")
+    if filled_template_claim and not safe_fallback:
+        issues.append("q46_unsupported_filled_template_story")
+    if (
+        lived_claim or passive_claim or filled_template_claim
+    ) and foreign_story_anchor and not safe_fallback:
+        issues.append("q46_cross_source_identity_story")
+    return issues
+
+
+def self_check_q46_story_grounding_detector() -> None:
+    safe = (
+        "I don't have one verified end-to-end story I can safely put in your voice "
+        "yet. Send these four facts: Situation (company/project and problem), Task "
+        "(what you personally owned), Action (two or three actions you took), and "
+        "Result (a verified outcome; qualitative is fine). Fill-in template (not a "
+        "factual answer): At [company/project], [situation]. I was responsible for "
+        "[task]. I [actions]. As a result, [verified outcome].",
+        "Verified story gap: I need your factual Situation, Task, Action, and Result. "
+        "Fill-in template, replace the brackets: At [company], [situation]. My task "
+        "was [task]. I [action]. The result was [outcome].",
+    )
+    unsafe = (
+        (
+            "At Marriott, I was only responsible for part of the loyalty ETL flow, "
+            "but I coordinated across teams and restored Free Night Awards.",
+            {
+                "q46_missing_verified_story_truth_gap_or_template",
+                "q46_unsupported_first_person_story",
+                "q46_cross_source_identity_story",
+            },
+        ),
+        (
+            "At a previous company, I led an incident response and improved the "
+            "customer outcome.",
+            {
+                "q46_missing_verified_story_truth_gap_or_template",
+                "q46_unsupported_first_person_story",
+            },
+        ),
+        (
+            "At a previous company, I championed a reliability initiative and the "
+            "service stabilized afterward.",
+            {
+                "q46_missing_verified_story_truth_gap_or_template",
+                "q46_unsupported_first_person_story",
+            },
+        ),
+        (
+            "At a previous company, I ran the recovery program and cut customer "
+            "latency in half.",
+            {
+                "q46_missing_verified_story_truth_gap_or_template",
+                "q46_unsupported_first_person_story",
+            },
+        ),
+        (
+            "At a previous company, I have overseen the recovery program and the "
+            "service was rebuilt for reliability.",
+            {
+                "q46_missing_verified_story_truth_gap_or_template",
+                "q46_unsupported_first_person_story",
+                "q46_unsupported_passive_story",
+            },
+        ),
+        (
+            "My role was to coordinate the incident. The platform was hardened and "
+            "the customer impact was eliminated.",
+            {
+                "q46_missing_verified_story_truth_gap_or_template",
+                "q46_unsupported_first_person_story",
+                "q46_unsupported_passive_story",
+            },
+        ),
+        (
+            "I would frame the answer around ownership and customer impact.",
+            {"q46_missing_verified_story_truth_gap_or_template"},
+        ),
+        (
+            "Fill-in template: At Marriott, I worked on loyalty data and fixed the "
+            "FNA issue.",
+            {
+                "q46_missing_verified_story_truth_gap_or_template",
+                "q46_unsupported_first_person_story",
+                "q46_cross_source_identity_story",
+            },
+        ),
+        (
+            "At Marriott, I led the loyalty fix and restored FNAs. Fill-in template: "
+            "At [company], [situation]. My task was [task]. I [action]. The result "
+            "was [outcome].",
+            {
+                "q46_missing_verified_story_truth_gap_or_template",
+                "q46_unsupported_first_person_story",
+                "q46_cross_source_identity_story",
+            },
+        ),
+        (
+            "Fill-in template: At [company], [situation]. My task was [task]. I "
+            "[action]. The result was [outcome]. At Marriott, the loyalty issue was "
+            "resolved and Free Night Awards were restored.",
+            {
+                "q46_missing_verified_story_truth_gap_or_template",
+                "q46_unsupported_passive_story",
+                "q46_cross_source_identity_story",
+            },
+        ),
+        (
+            "Fill-in template: At [Marriott], [loyalty issue]. My task was [restore "
+            "FNAs]. I [fixed the pipeline]. The result was [97 percent restored].",
+            {
+                "q46_missing_verified_story_truth_gap_or_template",
+                "q46_unsupported_filled_template_story",
+                "q46_cross_source_identity_story",
+            },
+        ),
+        (
+            "Fill-in template: At [company], [situation]. My task was [task]. I "
+            "[action]. The result was [outcome]. At Marriott, I fixed the loyalty "
+            "pipeline and restored FNAs.",
+            {
+                "q46_missing_verified_story_truth_gap_or_template",
+                "q46_unsupported_first_person_story",
+                "q46_cross_source_identity_story",
+            },
+        ),
+    )
+    assert all(not q46_story_grounding_issues(text) for text in safe)
+    for text, expected in unsafe:
+        issues = set(q46_story_grounding_issues(text))
+        assert expected.issubset(issues), (text, issues)
 
 
 def has_drift_only_automatic_retraining(text: str) -> bool:
@@ -711,14 +2373,411 @@ def has_drift_only_automatic_retraining(text: str) -> bool:
     return False
 
 
+REQUIRED_SIGNAL_STEMS = frozenset(
+    {
+        "anomal",
+        "calibrat",
+        "clarif",
+        "communicat",
+        "deprecat",
+        "faithful",
+        "hallucin",
+        "idempot",
+        "imbalanc",
+        "observ",
+        "quant",
+        "reconcil",
+        "reliab",
+        "retriev",
+    }
+)
+
+
+def has_required_signal(text: str, term: str) -> bool:
+    """Match curated evidence as a token or intentional stem, not a substring."""
+    lower = re.sub(r"\s+", " ", text.casefold().replace("_", " "))
+    candidate = re.sub(r"\s+", " ", term.casefold().replace("_", " ").strip())
+    if not candidate:
+        return False
+    if candidate in REQUIRED_SIGNAL_STEMS:
+        return bool(re.search(rf"(?<!\w){re.escape(candidate)}\w*", lower))
+    if re.fullmatch(r"[a-z0-9]+(?:[ -]+[a-z0-9]+)+", candidate):
+        parts = re.findall(r"[a-z0-9]+", candidate)
+        pattern = r"[\s/-]+".join(re.escape(part) for part in parts)
+        return bool(re.search(rf"(?<!\w){pattern}(?!\w)", lower))
+    if re.fullmatch(r"[a-z0-9]+", candidate):
+        escaped = re.escape(candidate)
+        if len(candidate) <= 3:
+            pattern = rf"{escaped}(?:s)?"
+        elif candidate.endswith("y"):
+            pattern = rf"(?:{escaped}(?:s|ing)?|{re.escape(candidate[:-1])}(?:ies|ied))"
+        elif candidate.endswith("e"):
+            stem = re.escape(candidate[:-1])
+            pattern = rf"(?:{escaped}(?:s|d)?|{stem}(?:ing|able))"
+        else:
+            pattern = rf"{escaped}(?:s|es|ed|ing)?"
+        return bool(re.search(rf"(?<!\w)(?:{pattern})(?!\w)", lower))
+    return bool(
+        re.search(
+            rf"(?<!\w){re.escape(candidate)}(?!\w)",
+            lower,
+        )
+    )
+
+
+def missing_required_group_issues(case: EvalCase, text: str) -> List[str]:
+    return [
+        "missing_signal:" + "|".join(group)
+        for group in case.required_groups
+        if not any(has_required_signal(text, term) for term in group)
+    ]
+
+
+def has_complete_code_artifact_body(body: str) -> bool:
+    stripped = body.strip()
+    if len(stripped) < 80:
+        return False
+    python_shape = bool(
+        re.search(
+            r"(?:^|\n)\s*(?:class\s+[A-Za-z_]\w*(?:\([^\n)]*\))?\s*:|"
+            r"(?:async\s+)?def\s+[A-Za-z_]\w*\s*\([^\n)]*\)\s*:)",
+            stripped,
+        )
+    )
+    fenced_code = stripped.count("```") >= 2 and python_shape
+    return fenced_code or python_shape
+
+
+def python_source_from_code_artifact(body: str) -> str:
+    """Extract Python/untagged fenced blocks without executing them."""
+    blocks = re.findall(
+        r"```[ \t]*([^\n`]*)\n(.*?)```",
+        body.replace("\r\n", "\n").replace("\r", "\n"),
+        re.S,
+    )
+    candidates = [
+        code.strip()
+        for language, code in blocks
+        if language.strip().casefold() in ("", "py", "python", "python3")
+        and code.strip()
+    ]
+    if candidates:
+        return "\n\n".join(candidates)
+    return body.strip()
+
+
+def _attribute_tokens(node: ast.AST) -> set[str]:
+    tokens: set[str] = set()
+    for candidate in ast.walk(node):
+        if isinstance(candidate, ast.Attribute):
+            tokens.add(candidate.attr.casefold())
+        elif isinstance(candidate, ast.Name):
+            tokens.add(candidate.id.casefold())
+    return tokens
+
+
+def _reachable_class_methods(
+    start: ast.AST,
+    methods: Dict[str, ast.AST],
+) -> List[ast.AST]:
+    """Follow self.method() calls so helpers count only when the answer uses them."""
+    reachable: List[ast.AST] = []
+    pending = [start]
+    visited: set[str] = set()
+    while pending:
+        node = pending.pop()
+        name = getattr(node, "name", "")
+        if name in visited:
+            continue
+        visited.add(name)
+        reachable.append(node)
+        for candidate in ast.walk(node):
+            if not isinstance(candidate, ast.Call) or not isinstance(
+                candidate.func, ast.Attribute
+            ):
+                continue
+            owner = candidate.func.value
+            if isinstance(owner, ast.Name) and owner.id == "self":
+                called = methods.get(candidate.func.attr)
+                if called is not None and candidate.func.attr not in visited:
+                    pending.append(called)
+    return reachable
+
+
+def _mutated_link_attributes(nodes: Sequence[ast.AST]) -> set[str]:
+    mutated: set[str] = set()
+
+    def collect(target: ast.AST) -> None:
+        if isinstance(target, ast.Attribute):
+            if target.attr.casefold() in {"prev", "next", "head", "tail"}:
+                mutated.add(target.attr.casefold())
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for item in target.elts:
+                collect(item)
+
+    for node in nodes:
+        for candidate in ast.walk(node):
+            if isinstance(candidate, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = (
+                    candidate.targets
+                    if isinstance(candidate, ast.Assign)
+                    else [candidate.target]
+                )
+                for target in targets:
+                    collect(target)
+    return mutated
+
+
+def _initialized_lock_attributes(class_node: ast.ClassDef) -> set[str]:
+    initialized: set[str] = set()
+
+    def is_lock_call(value: ast.AST) -> bool:
+        if not isinstance(value, ast.Call):
+            return False
+        function = value.func
+        if isinstance(function, ast.Attribute):
+            name = function.attr
+        elif isinstance(function, ast.Name):
+            name = function.id
+        else:
+            return False
+        return name.casefold() in {"lock", "rlock"}
+
+    for candidate in ast.walk(class_node):
+        if isinstance(candidate, ast.Assign):
+            targets = candidate.targets
+            value = candidate.value
+        elif isinstance(candidate, ast.AnnAssign):
+            targets = [candidate.target]
+            value = candidate.value
+        else:
+            continue
+        if value is None or not is_lock_call(value):
+            continue
+        for target in targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                initialized.add(target.attr)
+            elif isinstance(target, ast.Name):
+                initialized.add(target.id)
+    return initialized
+
+
+def _used_lock_attributes(nodes: Sequence[ast.AST]) -> set[str]:
+    used: set[str] = set()
+    for node in nodes:
+        for candidate in ast.walk(node):
+            if isinstance(candidate, (ast.With, ast.AsyncWith)):
+                for item in candidate.items:
+                    expression = item.context_expr
+                    if (
+                        isinstance(expression, ast.Attribute)
+                        and isinstance(expression.value, ast.Name)
+                        and expression.value.id == "self"
+                    ):
+                        used.add(expression.attr)
+            if not isinstance(candidate, ast.Call) or not isinstance(
+                candidate.func, ast.Attribute
+            ):
+                continue
+            if candidate.func.attr not in {"acquire", "release"}:
+                continue
+            lock = candidate.func.value
+            if (
+                isinstance(lock, ast.Attribute)
+                and isinstance(lock.value, ast.Name)
+                and lock.value.id == "self"
+            ):
+                used.add(lock.attr)
+    return used
+
+
+def lru_code_semantic_issues(case: EvalCase, body: str) -> List[str]:
+    """Validate runnable LRU behavior and Q09's lock in the returned Python AST."""
+    source = python_source_from_code_artifact(body)
+    try:
+        tree = ast.parse(source)
+        compile(tree, "<bluey-code-artifact>", "exec")
+    except (SyntaxError, ValueError, TypeError, MemoryError):
+        return ["invalid_python_code_artifact"]
+
+    lru_class = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+            and re.sub(r"[^a-z0-9]", "", node.name.casefold()) == "lrucache"
+        ),
+        None,
+    )
+    if lru_class is None:
+        return ["missing_lru_cache_class"]
+
+    method_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+    methods: Dict[str, ast.AST] = {
+        node.name: node for node in lru_class.body if isinstance(node, method_types)
+    }
+    get_method = methods.get("get")
+    put_method = methods.get("put")
+    if get_method is None or put_method is None:
+        return ["missing_lru_get_or_put_implementation"]
+
+    issues: List[str] = []
+    class_tokens = _attribute_tokens(tree)
+    has_linked_recency = (
+        {"prev", "next"}.issubset(class_tokens)
+        and bool({"head", "tail"} & class_tokens)
+        and not bool({"ordereddict", "functools.lru_cache"} & class_tokens)
+    )
+    if not has_linked_recency:
+        issues.append("missing_lru_linked_recency_structure")
+
+    get_scope = _reachable_class_methods(get_method, methods)
+    put_scope = _reachable_class_methods(put_method, methods)
+    get_mutations = _mutated_link_attributes(get_scope)
+    if not get_mutations:
+        issues.append("missing_lru_recency_update_in_get")
+
+    put_tokens = set().union(*(_attribute_tokens(node) for node in put_scope))
+    has_capacity_guard = any(
+        isinstance(candidate, (ast.If, ast.While))
+        and "capacity" in _attribute_tokens(candidate.test)
+        and bool({"len", "size", "cache", "nodes", "map"} & _attribute_tokens(candidate.test))
+        for node in put_scope
+        for candidate in ast.walk(node)
+    )
+    has_destructive_eviction = any(
+        isinstance(candidate, ast.Delete)
+        or (
+            isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Attribute)
+            and candidate.func.attr.casefold() in {"pop", "popitem"}
+        )
+        or (
+            isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Attribute)
+            and isinstance(candidate.func.value, ast.Name)
+            and candidate.func.value.id == "self"
+            and "evict" in candidate.func.attr.casefold()
+        )
+        for node in put_scope
+        for candidate in ast.walk(node)
+    )
+    has_lru_eviction_target = bool({"head", "tail", "prev", "next", "lru", "least"} & put_tokens)
+    if not (has_capacity_guard and has_destructive_eviction and has_lru_eviction_target):
+        issues.append("missing_lru_capacity_eviction")
+
+    if case.id == "Q09":
+        initialized_locks = _initialized_lock_attributes(lru_class)
+        get_locks = _used_lock_attributes(get_scope) & initialized_locks
+        put_locks = _used_lock_attributes(put_scope) & initialized_locks
+        if not initialized_locks:
+            issues.append("missing_shared_lock_initialization")
+        if not get_locks:
+            issues.append("missing_lock_usage_in_get")
+        if not put_locks:
+            issues.append("missing_lock_usage_in_put")
+        if get_locks and put_locks and not (get_locks & put_locks):
+            issues.append("get_and_put_use_different_locks")
+    return issues
+
+
+def code_complexity_issues(text: str) -> List[str]:
+    lower = text.casefold()
+    has_time = "time complexity" in lower or bool(
+        re.search(r"(?:^|\n)\s*(?:[-*]\s*)?(?:\*\*)?time(?:\*\*)?\s*:", text, re.I)
+    ) or bool(re.search(r"\bO\([^\n)]*\)\s+time\b", text, re.I))
+    has_space = "space complexity" in lower or bool(
+        re.search(r"(?:^|\n)\s*(?:[-*]\s*)?(?:\*\*)?space(?:\*\*)?\s*:", text, re.I)
+    )
+    return [] if has_time and has_space else ["missing_complexity"]
+
+
+def is_safe_needs_user_input_outcome(case: EvalCase, attempt: AttemptResult) -> bool:
+    """Recognize Q46's safe abstention without treating it as answer success."""
+    if case.id != "Q46" or attempt.artifact_type != "needs_story_facts":
+        return False
+    text = answer_evidence_text(attempt)
+    return bool(
+        is_q46_truth_gap_or_fill_in_template(text)
+        and not q46_story_grounding_issues(text)
+    )
+
+
+def mandatory_answer_shape_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
+    """Return evidence and artifact defects that must block final success."""
+    if is_safe_needs_user_input_outcome(case, attempt):
+        return []
+
+    combined = answer_evidence_text(attempt)
+    issues = missing_required_group_issues(case, combined)
+    if case.expect_code:
+        if attempt.artifact_type != "code":
+            issues.append("missing_code_artifact")
+        elif not has_complete_code_artifact_body(attempt.artifact_body or ""):
+            issues.append("incomplete_code_body")
+        else:
+            if case.id in ("Q08", "Q09"):
+                issues.extend(lru_code_semantic_issues(case, attempt.artifact_body or ""))
+            artifact_group_hits = sum(
+                1
+                for group in case.required_groups
+                if any(
+                    has_required_signal(attempt.artifact_body or "", term)
+                    for term in group
+                )
+            )
+            if artifact_group_hits < min(3, len(case.required_groups)):
+                issues.append("code_artifact_not_grounded")
+        issues.extend(code_complexity_issues(combined))
+        visible_group_hits = sum(
+            1
+            for group in case.required_groups
+            if any(has_required_signal(attempt.visible_answer, term) for term in group)
+        )
+        visible_words = len(re.findall(r"\b[\w'’+-]+\b", attempt.visible_answer))
+        visible_has_code = bool(
+            re.search(
+                r"(?:^|\n)\s*(?:```|class\s+\w+|def\s+\w+)",
+                attempt.visible_answer,
+            )
+        )
+        if visible_words < 12 or (visible_group_hits < 2 and not visible_has_code):
+            issues.append("code_visible_answer_not_grounded")
+    if case.expect_design:
+        if attempt.artifact_type not in ("system_design", "diagram"):
+            issues.append("missing_design_artifact")
+        else:
+            artifact_body = (attempt.artifact_body or "").strip()
+            if len(artifact_body) < 40 or len(re.findall(r"\b\w+\b", artifact_body)) < 6:
+                issues.append("incomplete_design_artifact")
+            else:
+                artifact_group_hits = sum(
+                    1
+                    for group in case.required_groups
+                    if any(has_required_signal(artifact_body, term) for term in group)
+                )
+                if artifact_group_hits < min(2, len(case.required_groups)):
+                    issues.append("design_artifact_not_grounded")
+    return issues
+
+
 def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
     """Return deterministic defects that prevent an answer from being success."""
+    issues = stream_terminal_integrity_issues(attempt)
+    if attempt.billing_error:
+        issues.append(attempt.billing_error)
+    if attempt.artifact_type == "needs_story_facts":
+        issues.append("needs_user_input")
     if not attempt.ok:
-        return []
+        return issues
     combined = answer_evidence_text(attempt)
-    issues: List[str] = []
+    safe_needs_user_input = is_safe_needs_user_input_outcome(case, attempt)
     word_count = len(re.findall(r"\b[\w'’+-]+\b", combined))
-    if word_count < MIN_SUBSTANTIVE_ANSWER_WORDS:
+    if word_count < MIN_SUBSTANTIVE_ANSWER_WORDS and not safe_needs_user_input:
         issues.append("answer_too_short")
 
     exact_cap = attempt.output_tokens is not None and (
@@ -728,12 +2787,38 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
     if exact_cap and looks_structurally_incomplete(combined):
         issues.append("visibly_truncated_at_token_cap")
 
+    issues.extend(mandatory_answer_shape_issues(case, attempt))
+
     if case.id == "Q10" and has_mysql_not_valid_portability_claim(combined):
         issues.append("unsafe_mysql_not_valid_portability_claim")
     if case.id == "Q39" and has_exactly_once_processing_overclaim(combined):
         issues.append("unsafe_exactly_once_processing_claim")
-    if case.id == "Q40" and has_unsafe_ambiguous_payment_outcome(combined):
-        issues.append("unsafe_ambiguous_payment_retry_or_terminal_failure")
+    if case.id == "Q39":
+        issues.extend(payment_platform_safety_issues(combined))
+        issues.extend(
+            payment_operation_semantic_issues(
+                combined,
+                require_webhook_event_dedup=True,
+            )
+        )
+    if case.id == "Q40":
+        if has_unsafe_ambiguous_payment_outcome(combined):
+            issues.append("unsafe_ambiguous_payment_retry_or_terminal_failure")
+        issues.extend(
+            payment_operation_semantic_issues(
+                combined,
+                require_webhook_event_dedup=False,
+                require_complete_idempotency_semantics=False,
+                require_same_operation_retry_reuse=True,
+            )
+        )
+    if case.id == "Q46":
+        issues.extend(q46_story_grounding_issues(combined))
+        safe_truth_gap = is_q46_truth_gap_or_fill_in_template(combined)
+        if safe_truth_gap and attempt.artifact_type != "needs_story_facts":
+            issues.append("q46_truth_gap_missing_needs_story_facts_artifact")
+        if attempt.artifact_type == "needs_story_facts" and not safe_truth_gap:
+            issues.append("q46_invalid_needs_story_facts_artifact")
     if case.id == "Q38" and has_drift_only_automatic_retraining(combined):
         issues.append("unsafe_drift_only_automatic_retraining")
     return issues
@@ -743,8 +2828,515 @@ def answer_is_success(case: EvalCase, attempt: AttemptResult) -> bool:
     return attempt.ok and not blocking_answer_issues(case, attempt)
 
 
+def expected_outcome_is_accepted(case: EvalCase, attempt: AttemptResult) -> bool:
+    """Judge the configured customer outcome without relabeling interventions."""
+    if case.expected_outcome == "answer":
+        return answer_is_success(case, attempt)
+    if case.expected_outcome == "needs_user_input":
+        return attempt.ok and is_safe_needs_user_input_outcome(case, attempt)
+    raise ValueError(f"unsupported expected outcome for {case.id}: {case.expected_outcome}")
+
+
+def self_check_attempt_integrity_guards() -> None:
+    assert has_required_signal("def get(self, key):", "get")
+    assert has_required_signal("point in time training-serving data", "point-in-time")
+    assert not has_required_signal("We worked together on the output.", "get")
+    assert not has_required_signal("The database stores rows.", "data")
+    assert not has_required_signal("Identity is generated.", "id")
+
+    streamed = "This is the complete customer-streamed answer with enough words to evaluate."
+    matching = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=streamed,
+        streamed_answer=streamed,
+        terminal_answer=streamed,
+        billing_received=True,
+    )
+    assert not stream_terminal_integrity_issues(matching)
+
+    preserved = AttemptResult(
+        attempt=1,
+        terminal_answer="Billing tried to replace the answer.",
+        billing_received=True,
+    )
+    finalize_attempt_answers(preserved, ["Customer ", "streamed answer."])
+    assert preserved.streamed_answer == "Customer streamed answer."
+    assert preserved.visible_answer == "Customer streamed answer."
+    assert preserved.terminal_answer == "Billing tried to replace the answer."
+
+    mismatched = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer="The terminal answer incorrectly replaced what the customer saw.",
+        streamed_answer="Unsafe text that the customer actually saw while streaming.",
+        terminal_answer="Different sanitized terminal text persisted by billing.",
+        billing_received=True,
+    )
+    mismatch_issues = set(stream_terminal_integrity_issues(mismatched))
+    assert mismatch_issues == {
+        "streamed_answer_not_preserved",
+        "stream_terminal_answer_mismatch",
+    }
+
+    code_shape = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer="Streamed explanation plus complete code.",
+        streamed_answer="Streamed explanation plus complete code.",
+        terminal_answer="Streamed explanation only.",
+        billing_received=True,
+        artifact_type="code",
+    )
+    assert not stream_terminal_integrity_issues(code_shape)
+    assert stream_terminal_audit_issues(code_shape) == [
+        "code_stream_terminal_shape_mismatch"
+    ]
+    q05 = next(case for case in CASES if case.id == "Q05")
+    assert "stream_terminal_answer_mismatch" not in blocking_answer_issues(
+        q05, code_shape
+    )
+
+    canvas_shape = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer="Streamed spoken answer plus canvas detail.",
+        streamed_answer="Streamed spoken answer plus canvas detail.",
+        terminal_answer="Streamed spoken answer only.",
+        billing_received=True,
+        artifact_type="system_design",
+    )
+    assert stream_terminal_integrity_issues(canvas_shape) == [
+        "stream_terminal_answer_mismatch"
+    ]
+    assert "stream_terminal_answer_mismatch" in blocking_answer_issues(
+        q05, canvas_shape
+    )
+
+    needs_facts_text = (
+        "I don't have one verified story yet. Send Situation, Task, Action, and Result. "
+        "Fill-in template: At [company], [situation]. My task was [task]. I [action]. "
+        "The result was [outcome]."
+    )
+    needs_facts = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=needs_facts_text,
+        streamed_answer=needs_facts_text,
+        terminal_answer=needs_facts_text,
+        billing_received=True,
+        artifact_type="needs_story_facts",
+    )
+    q46 = next(case for case in CASES if case.id == "Q46")
+    assert blocking_answer_issues(q46, needs_facts) == ["needs_user_input"]
+    assert is_safe_needs_user_input_outcome(q46, needs_facts)
+    assert not answer_is_success(q46, needs_facts)
+    assert expected_outcome_is_accepted(q46, needs_facts)
+    _, _, _, safe_accuracy, safe_issues = quality_scores(q46, needs_facts)
+    assert safe_accuracy == 25
+    assert "answer_quality_gate_failed" not in safe_issues
+    assert "not_first_person_speakable" not in safe_issues
+
+    unlabeled_needs_facts = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=needs_facts_text,
+        streamed_answer=needs_facts_text,
+        terminal_answer=needs_facts_text,
+        billing_received=True,
+    )
+    assert "q46_truth_gap_missing_needs_story_facts_artifact" in blocking_answer_issues(
+        q46, unlabeled_needs_facts
+    )
+    assert not is_safe_needs_user_input_outcome(q46, unlabeled_needs_facts)
+    assert not answer_is_success(q46, unlabeled_needs_facts)
+
+    fabricated_story = (
+        "At a previous company, I championed the recovery and cut latency in half. "
+        "The customer impact was eliminated after the platform was hardened."
+    )
+    mislabeled_fabrication = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=fabricated_story,
+        streamed_answer=fabricated_story,
+        terminal_answer=fabricated_story,
+        billing_received=True,
+        artifact_type="needs_story_facts",
+    )
+    fabricated_issues = set(blocking_answer_issues(q46, mislabeled_fabrication))
+    assert "q46_unsupported_first_person_story" in fabricated_issues
+    assert "q46_invalid_needs_story_facts_artifact" in fabricated_issues
+    assert not is_safe_needs_user_input_outcome(q46, mislabeled_fabrication)
+
+    appended_present_fabrication_text = (
+        needs_facts_text
+        + " At Marriott, I own the loyalty pipeline, coordinate incident response, "
+        "restore Free Night Awards, and improve customer outcomes every quarter."
+    )
+    appended_present_fabrication = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=appended_present_fabrication_text,
+        streamed_answer=appended_present_fabrication_text,
+        terminal_answer=appended_present_fabrication_text,
+        billing_received=True,
+        artifact_type="needs_story_facts",
+    )
+    appended_issues = set(blocking_answer_issues(q46, appended_present_fabrication))
+    assert "q46_unsupported_first_person_story" in appended_issues
+    assert "q46_invalid_needs_story_facts_artifact" in appended_issues
+    assert not is_safe_needs_user_input_outcome(q46, appended_present_fabrication)
+
+    q08 = next(case for case in CASES if case.id == "Q08")
+    code_visible = (
+        "The LRUCache class keeps get and put operations constant time with a hash "
+        "map and linked ordering. Time complexity is O(1) per operation, while space "
+        "complexity is O(capacity). The complete implementation is in the code artifact."
+    )
+    code_body = (
+        "```python\n"
+        "class Node:\n"
+        "    def __init__(self, key, value):\n"
+        "        self.key = key\n"
+        "        self.value = value\n"
+        "        self.prev = None\n"
+        "        self.next = None\n\n"
+        "class LRUCache:\n"
+        "    def __init__(self, capacity):\n"
+        "        self.capacity = capacity\n"
+        "        self.cache = {}\n"
+        "        self.head = Node(None, None)\n"
+        "        self.tail = Node(None, None)\n"
+        "        self.head.next = self.tail\n"
+        "        self.tail.prev = self.head\n\n"
+        "    def _remove(self, node):\n"
+        "        node.prev.next = node.next\n"
+        "        node.next.prev = node.prev\n\n"
+        "    def _add_recent(self, node):\n"
+        "        node.prev = self.head\n"
+        "        node.next = self.head.next\n"
+        "        self.head.next.prev = node\n"
+        "        self.head.next = node\n\n"
+        "    def get(self, key):\n"
+        "        if key not in self.cache:\n"
+        "            return -1\n"
+        "        node = self.cache[key]\n"
+        "        self._remove(node)\n"
+        "        self._add_recent(node)\n"
+        "        return node.value\n\n"
+        "    def put(self, key, value):\n"
+        "        if key in self.cache:\n"
+        "            self._remove(self.cache[key])\n"
+        "        node = Node(key, value)\n"
+        "        self.cache[key] = node\n"
+        "        self._add_recent(node)\n"
+        "        if len(self.cache) > self.capacity:\n"
+        "            lru = self.tail.prev\n"
+        "            self._remove(lru)\n"
+        "            del self.cache[lru.key]\n"
+        "```"
+    )
+    valid_code = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=code_visible,
+        streamed_answer=code_visible,
+        terminal_answer="A shorter terminal code summary.",
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=code_body,
+    )
+    assert not mandatory_answer_shape_issues(q08, valid_code)
+    assert not blocking_answer_issues(q08, valid_code)
+    assert answer_is_success(q08, valid_code)
+    _, _, _, _, code_quality_issues = quality_scores(q08, valid_code)
+    assert "code_stream_terminal_shape_mismatch" in code_quality_issues
+
+    invalid_python_body = (
+        "```python\n"
+        "class LRUCache:\n"
+        "    def get(self, key):\n"
+        "        return -1\n"
+        "    def put(self, key, value):\n"
+        "        # Missing executable body must not pass the release gate.\n"
+        "```"
+    )
+    invalid_python = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=code_visible,
+        streamed_answer=code_visible,
+        terminal_answer=code_visible,
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=invalid_python_body,
+    )
+    assert "invalid_python_code_artifact" in mandatory_answer_shape_issues(
+        q08, invalid_python
+    )
+    assert not answer_is_success(q08, invalid_python)
+
+    fake_lru_body = (
+        "```python\n"
+        "class LRUCache:\n"
+        "    def __init__(self, capacity):\n"
+        "        self.capacity, self.cache = capacity, {}\n"
+        "    def get(self, key):\n"
+        "        return self.cache.get(key, -1)\n"
+        "    def put(self, key, value):\n"
+        "        self.cache[key] = value\n"
+        "        if len(self.cache) > self.capacity:\n"
+        "            return  # Never evicts the least-recently-used entry.\n"
+        "```"
+    )
+    fake_lru = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=code_visible,
+        streamed_answer=code_visible,
+        terminal_answer=code_visible,
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=fake_lru_body,
+    )
+    fake_lru_issues = set(mandatory_answer_shape_issues(q08, fake_lru))
+    assert "missing_lru_linked_recency_structure" in fake_lru_issues
+    assert "missing_lru_recency_update_in_get" in fake_lru_issues
+    assert "missing_lru_capacity_eviction" in fake_lru_issues
+    assert not answer_is_success(q08, fake_lru)
+
+    q09 = next(case for case in CASES if case.id == "Q09")
+    q09_visible = (
+        "The complete LRUCache keeps get and put at O(1) and uses one shared RLock "
+        "around both operations. Time complexity is O(1) per call and space "
+        "complexity is O(capacity). The artifact contains the complete updated code."
+    )
+    unlocked_q09 = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=q09_visible,
+        streamed_answer=q09_visible,
+        terminal_answer=q09_visible,
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=code_body,
+    )
+    unlocked_issues = set(mandatory_answer_shape_issues(q09, unlocked_q09))
+    assert "missing_shared_lock_initialization" in unlocked_issues
+    assert "missing_lock_usage_in_get" in unlocked_issues
+    assert "missing_lock_usage_in_put" in unlocked_issues
+    assert not answer_is_success(q09, unlocked_q09)
+
+    locked_code_body = (
+        "```python\n"
+        "import threading\n\n"
+        "class Node:\n"
+        "    def __init__(self, key, value):\n"
+        "        self.key, self.value = key, value\n"
+        "        self.prev = self.next = None\n\n"
+        "class LRUCache:\n"
+        "    def __init__(self, capacity):\n"
+        "        self.capacity = capacity\n"
+        "        self.cache = {}\n"
+        "        self._lock = threading.RLock()\n"
+        "        self.head, self.tail = Node(None, None), Node(None, None)\n"
+        "        self.head.next, self.tail.prev = self.tail, self.head\n\n"
+        "    def _remove(self, node):\n"
+        "        node.prev.next, node.next.prev = node.next, node.prev\n\n"
+        "    def _add_recent(self, node):\n"
+        "        node.prev, node.next = self.head, self.head.next\n"
+        "        self.head.next.prev = node\n"
+        "        self.head.next = node\n\n"
+        "    def get(self, key):\n"
+        "        with self._lock:\n"
+        "            if key not in self.cache:\n"
+        "                return -1\n"
+        "            node = self.cache[key]\n"
+        "            self._remove(node)\n"
+        "            self._add_recent(node)\n"
+        "            return node.value\n\n"
+        "    def put(self, key, value):\n"
+        "        with self._lock:\n"
+        "            if key in self.cache:\n"
+        "                self._remove(self.cache[key])\n"
+        "            node = Node(key, value)\n"
+        "            self.cache[key] = node\n"
+        "            self._add_recent(node)\n"
+        "            if len(self.cache) > self.capacity:\n"
+        "                lru = self.tail.prev\n"
+        "                self._remove(lru)\n"
+        "                del self.cache[lru.key]\n"
+        "```"
+    )
+    locked_q09 = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=q09_visible,
+        streamed_answer=q09_visible,
+        terminal_answer=q09_visible,
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=locked_code_body,
+    )
+    assert not mandatory_answer_shape_issues(q09, locked_q09)
+    assert answer_is_success(q09, locked_q09)
+
+    unrelated_code = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=code_visible,
+        streamed_answer=code_visible,
+        terminal_answer="A different terminal summary.",
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=(
+            "```python\nclass Unrelated:\n    def alpha(self, value):\n"
+            "        return value + 1\n    def beta(self, value):\n"
+            "        return value * 2\n```"
+        ),
+    )
+    assert "code_artifact_not_grounded" in mandatory_answer_shape_issues(
+        q08, unrelated_code
+    )
+    assert not answer_is_success(q08, unrelated_code)
+
+    for case_id, prose in (
+        (
+            "Q08",
+            "The class LRUCache would expose get and put methods and use a dictionary "
+            "plus a linked list. Time complexity is O(1), and space complexity is "
+            "O(capacity), but this response intentionally contains no implementation.",
+        ),
+        (
+            "Q09",
+            "The class LRUCache would wrap get and put with an RLock to make access "
+            "thread safe. Time complexity remains O(1), and space complexity remains "
+            "O(capacity), but this response intentionally contains no updated code.",
+        ),
+    ):
+        code_case = next(case for case in CASES if case.id == case_id)
+        prose_only = AttemptResult(
+            attempt=1,
+            ok=True,
+            visible_answer=prose,
+            streamed_answer=prose,
+            terminal_answer=prose,
+            billing_received=True,
+        )
+        assert "missing_code_artifact" in blocking_answer_issues(code_case, prose_only)
+        assert not answer_is_success(code_case, prose_only)
+
+    q34 = next(case for case in CASES if case.id == "Q34")
+    design_prose = (
+        "Clients maintain WebSocket connections through a connection tier. Messages "
+        "flow through a durable queue into database storage, with retry handling for "
+        "failure recovery. This prose explains the messaging design in detail but "
+        "intentionally supplies no diagram or system design artifact."
+    )
+    design_without_artifact = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=design_prose,
+        streamed_answer=design_prose,
+        terminal_answer=design_prose,
+        billing_received=True,
+    )
+    assert "missing_design_artifact" in blocking_answer_issues(
+        q34, design_without_artifact
+    )
+    assert not answer_is_success(q34, design_without_artifact)
+
+    valid_design = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=design_prose.replace(
+            "intentionally supplies no diagram or system design artifact",
+            "is paired with the complete system design artifact",
+        ),
+        billing_received=True,
+        artifact_type="system_design",
+        artifact_body=(
+            "Clients -> WebSocket connection tier -> message queue -> database storage\n"
+            "Failure -> retry queue -> delivery worker -> client acknowledgment"
+        ),
+    )
+    valid_design.streamed_answer = valid_design.visible_answer
+    valid_design.terminal_answer = valid_design.visible_answer
+    assert not mandatory_answer_shape_issues(q34, valid_design)
+    assert answer_is_success(q34, valid_design)
+
+    q39 = next(case for case in CASES if case.id == "Q39")
+    incomplete_payment_contract = (
+        "Persist the payment intent before calling the processor and record confirmed "
+        "movements in a durable double-entry ledger. Use idempotency for retries. "
+        "Reconcile UNKNOWN outcomes through provider status and deduplicate webhooks "
+        "by provider event ID. Redis is only a cache, not the correctness boundary."
+    )
+    payment_attempt = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=incomplete_payment_contract,
+        streamed_answer=incomplete_payment_contract,
+        terminal_answer=incomplete_payment_contract,
+        billing_received=True,
+        artifact_type="system_design",
+        artifact_body=(
+            "Client -> durable payment intent -> transactional outbox -> provider\n"
+            "Provider status and webhook -> reconciliation worker -> immutable ledger"
+        ),
+    )
+    payment_issues = set(blocking_answer_issues(q39, payment_attempt))
+    assert "missing_stable_idempotency_key_per_operation" in payment_issues
+    assert "missing_distinct_authorize_capture_refund_keys" in payment_issues
+    assert "missing_same_operation_idempotency_key_reuse" in payment_issues
+    assert not answer_is_success(q39, payment_attempt)
+
+    q40 = next(case for case in CASES if case.id == "Q40")
+    incomplete_timeout_contract = (
+        "I would move the payment to UNKNOWN and PENDING_RECONCILIATION, stop the "
+        "automatic charge retry, and query provider status. A provider webhook can "
+        "confirm the terminal outcome. Idempotency protects payment commands, but "
+        "this intentionally omits the exact operation-scoped key contract."
+    )
+    timeout_attempt = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=incomplete_timeout_contract,
+        streamed_answer=incomplete_timeout_contract,
+        terminal_answer=incomplete_timeout_contract,
+        billing_received=True,
+    )
+    timeout_issues = set(blocking_answer_issues(q40, timeout_attempt))
+    assert "missing_distinct_authorize_capture_refund_keys" not in timeout_issues
+    assert "missing_stable_idempotency_key_per_operation" not in timeout_issues
+    assert "missing_same_operation_idempotency_key_reuse" in timeout_issues
+    assert not answer_is_success(q40, timeout_attempt)
+
+    reconciled_new_purchase = (
+        "Authorize, capture, and refund each use distinct operation-scoped "
+        "idempotency keys, and replaying the same logical operation reuses its same "
+        "stable key. A timeout leaves the original payment UNKNOWN in "
+        "PENDING_RECONCILIATION and blocks that charge. Query provider status and "
+        "deduplicate webhooks by provider event ID while reconciling the original "
+        "payment. After the provider status lookup confirms it FAILED with no charge, "
+        "the customer explicitly authorizes a distinct later purchase, so create a "
+        "new payment intent with its own new operation-scoped key."
+    )
+    reconciled_attempt = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=reconciled_new_purchase,
+        streamed_answer=reconciled_new_purchase,
+        terminal_answer=reconciled_new_purchase,
+        billing_received=True,
+    )
+    assert not blocking_answer_issues(q40, reconciled_attempt)
+    assert answer_is_success(q40, reconciled_attempt)
+
+
 def quality_scores(case: EvalCase, attempt: AttemptResult) -> Tuple[int, int, int, int, List[str]]:
-    issues: List[str] = []
+    issues: List[str] = stream_terminal_audit_issues(attempt)
     reliability = 35 if attempt.ok else 0
     if not attempt.ok:
         issues.append("request_failed")
@@ -773,7 +3365,11 @@ def quality_scores(case: EvalCase, attempt: AttemptResult) -> Tuple[int, int, in
     if any(visible_lower.startswith(opener) for opener in META_OPENERS):
         human -= 7
         issues.append("assistant_or_meta_opener")
-    if case.speakable and not has_first_person(attempt.visible_answer):
+    if (
+        case.speakable
+        and case.expected_outcome == "answer"
+        and not has_first_person(attempt.visible_answer)
+    ):
         human -= 7
         issues.append("not_first_person_speakable")
     if case.self_intro and not re.match(r"\s*(?:i['’]?m|my name is)\b", attempt.visible_answer, re.I):
@@ -791,36 +3387,17 @@ def quality_scores(case: EvalCase, attempt: AttemptResult) -> Tuple[int, int, in
     human = max(0, human)
 
     accuracy = 25
-    for group in case.required_groups:
-        if not any(term.casefold() in lower for term in group):
-            accuracy -= 4
-            issues.append("missing_signal:" + "|".join(group))
     if case.expect_followup_context and any(phrase in lower for phrase in CONTEXT_LOSS_PHRASES):
         accuracy -= 8
         issues.append("followup_context_lost")
-    if case.expect_code:
-        if attempt.artifact_type != "code":
-            accuracy -= 8
-            issues.append("missing_code_artifact")
-        artifact = attempt.artifact_body or ""
-        if "```" not in artifact and not re.search(r"\b(class|def|func)\b", artifact):
-            accuracy -= 5
-            issues.append("incomplete_code_body")
-        has_time_complexity = "time complexity" in lower or bool(
-            re.search(r"(?:^|\n)\s*(?:[-*]\s*)?(?:\*\*)?time(?:\*\*)?\s*:", combined, re.I)
-        ) or bool(
-            re.search(r"\bO\([^\n)]*\)\s+time\b", combined, re.I)
-        )
-        has_space_complexity = "space complexity" in lower or bool(
-            re.search(r"(?:^|\n)\s*(?:[-*]\s*)?(?:\*\*)?space(?:\*\*)?\s*:", combined, re.I)
-        )
-        if not has_time_complexity or not has_space_complexity:
-            accuracy -= 5
-            issues.append("missing_complexity")
-    if case.expect_design and attempt.artifact_type not in ("system_design", "diagram"):
-        accuracy -= 7
-        issues.append("missing_design_artifact")
     blocking_issues = blocking_answer_issues(case, attempt)
+    if (
+        case.expected_outcome == "needs_user_input"
+        and is_safe_needs_user_input_outcome(case, attempt)
+    ):
+        blocking_issues = [
+            issue for issue in blocking_issues if issue != "needs_user_input"
+        ]
     if blocking_issues:
         accuracy = 0
         issues.append("answer_quality_gate_failed")
@@ -840,6 +3417,53 @@ def percentile(values: Sequence[float], percent: float) -> Optional[float]:
     return ordered[low] + (ordered[high] - ordered[low]) * fraction
 
 
+def release_exit_code(
+    *,
+    results_run: int,
+    selected_count: int,
+    accepted_outcomes: int,
+    minimum_reliability_percent: float,
+) -> int:
+    """Fail closed unless every answer and expected intervention is accepted."""
+    if minimum_reliability_percent != 100.0:
+        raise ValueError("the release reliability threshold is fixed at 100 percent")
+    if results_run != selected_count or selected_count <= 0:
+        return 2
+    return 0 if accepted_outcomes == selected_count else 2
+
+
+def self_check_release_exit_gate() -> None:
+    assert release_exit_code(
+        results_run=12,
+        selected_count=12,
+        accepted_outcomes=12,
+        minimum_reliability_percent=100.0,
+    ) == 0
+    assert release_exit_code(
+        results_run=12,
+        selected_count=12,
+        accepted_outcomes=11,
+        minimum_reliability_percent=100.0,
+    ) == 2
+    assert release_exit_code(
+        results_run=11,
+        selected_count=12,
+        accepted_outcomes=11,
+        minimum_reliability_percent=100.0,
+    ) == 2
+    try:
+        release_exit_code(
+            results_run=12,
+            selected_count=12,
+            accepted_outcomes=11,
+            minimum_reliability_percent=90.0,
+        )
+    except ValueError as exc:
+        assert "fixed at 100" in str(exc)
+    else:
+        raise AssertionError("release gate accepted a threshold below 100 percent")
+
+
 def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
 
@@ -851,13 +3475,33 @@ def build_summary(
     account_before: Dict[str, Any],
     account_after: Dict[str, Any],
 ) -> Dict[str, Any]:
-    final_ok = [result for result in results if result.final_ok]
+    case_by_id = {case.id: case for case in CASES}
+    answer_results = [
+        result
+        for result in results
+        if case_by_id[result.id].expected_outcome == "answer"
+    ]
+    intervention_results = [
+        result
+        for result in results
+        if case_by_id[result.id].expected_outcome == "needs_user_input"
+    ]
+    final_answers = [result for result in answer_results if result.final_ok]
+    accepted = [result for result in results if result.accepted_outcome]
+    needs_user_input = [
+        result
+        for result in results
+        if result.id in case_by_id
+        and is_safe_needs_user_input_outcome(
+            case_by_id[result.id], result.attempts[-1]
+        )
+    ]
     first_tokens = [
         result.attempts[-1].first_token_ms
-        for result in final_ok
+        for result in accepted
         if result.attempts[-1].first_token_ms is not None
     ]
-    totals = [result.attempts[-1].total_ms for result in final_ok]
+    totals = [result.attempts[-1].total_ms for result in accepted]
     provider_counts: Dict[str, int] = {}
     model_counts: Dict[str, int] = {}
     issue_counts: Dict[str, int] = {}
@@ -876,10 +3520,38 @@ def build_summary(
         "finished_at": finished_at,
         "questions_planned": len(results),
         "questions_run": len(results),
-        "final_successes": len(final_ok),
-        "first_attempt_successes": sum(1 for result in results if result.first_attempt_ok),
-        "reliability_percent": round(100 * len(final_ok) / len(results), 1) if results else 0,
-        "first_attempt_reliability_percent": round(100 * sum(1 for result in results if result.first_attempt_ok) / len(results), 1) if results else 0,
+        "answer_cases": len(answer_results),
+        "final_answer_successes": len(final_answers),
+        "expected_intervention_cases": len(intervention_results),
+        "successful_expected_interventions": sum(
+            1 for result in intervention_results if result.accepted_outcome
+        ),
+        "accepted_outcomes": len(accepted),
+        "needs_user_input_outcomes": len(needs_user_input),
+        "first_attempt_answer_successes": sum(
+            1 for result in answer_results if result.first_attempt_ok
+        ),
+        "first_attempt_accepted_outcomes": sum(
+            1 for result in results if result.first_attempt_accepted
+        ),
+        "answer_reliability_percent": (
+            round(100 * len(final_answers) / len(answer_results), 1)
+            if answer_results
+            else 100.0
+        ),
+        "first_attempt_answer_reliability_percent": (
+            round(
+                100
+                * sum(1 for result in answer_results if result.first_attempt_ok)
+                / len(answer_results),
+                1,
+            )
+            if answer_results
+            else 100.0
+        ),
+        "outcome_acceptance_percent": (
+            round(100 * len(accepted) / len(results), 1) if results else 0
+        ),
         "average_score": round(statistics.mean(result.score for result in results), 1) if results else 0,
         "first_token_ms": {
             "median": round(statistics.median(first_tokens), 1) if first_tokens else None,
@@ -915,8 +3587,11 @@ def render_report(summary: Dict[str, Any], results: Sequence[CaseResult], source
         "",
         "## Summary",
         "",
-        f"- Final reliability: {summary['final_successes']}/{summary['questions_run']} ({summary['reliability_percent']}%)",
-        f"- First-attempt reliability: {summary['first_attempt_successes']}/{summary['questions_run']} ({summary['first_attempt_reliability_percent']}%)",
+        f"- Accepted outcomes: {summary['accepted_outcomes']}/{summary['questions_run']} ({summary['outcome_acceptance_percent']}%)",
+        f"- Normal answers: {summary['final_answer_successes']}/{summary['answer_cases']} ({summary['answer_reliability_percent']}%)",
+        f"- Expected safe interventions: {summary['successful_expected_interventions']}/{summary['expected_intervention_cases']}",
+        f"- First-attempt normal answers: {summary['first_attempt_answer_successes']}/{summary['answer_cases']} ({summary['first_attempt_answer_reliability_percent']}%)",
+        f"- First-attempt accepted outcomes: {summary['first_attempt_accepted_outcomes']}/{summary['questions_run']}",
         f"- Average deterministic score: {summary['average_score']}/100",
         f"- First token: median {ft['median']} ms, p90 {ft['p90']} ms, p95 {ft['p95']} ms, max {ft['max']} ms",
         f"- Customer charge recorded by Bluey: {summary['customer_cost_cents']} cents",
@@ -941,7 +3616,14 @@ def render_report(summary: Dict[str, Any], results: Sequence[CaseResult], source
         attempt = result.attempts[-1]
         first = f"{attempt.first_token_ms:.0f} ms" if attempt.first_token_ms is not None else "n/a"
         route = f"{attempt.provider or 'unknown'}/{attempt.model or 'unknown'}"
-        outcome = "ok" if result.final_ok else (attempt.error_reason or attempt.error or "failed")
+        if result.accepted_outcome and result.final_ok:
+            outcome = "ok"
+        elif result.accepted_outcome and is_safe_needs_user_input_outcome(
+            next(case for case in CASES if case.id == result.id), attempt
+        ):
+            outcome = "needs_user_input (expected)"
+        else:
+            outcome = attempt.error_reason or attempt.error or attempt.billing_error or "failed"
         lines.append(f"| {result.id} | {result.category} | {first} | {attempt.total_ms:.0f} ms | {route} | {result.score} | {outcome[:80]} |")
     lines.extend(["", "## Review Queue", ""])
     review = sorted(results, key=lambda item: (item.score, item.id))
@@ -957,6 +3639,16 @@ def render_report(summary: Dict[str, Any], results: Sequence[CaseResult], source
     return "\n".join(lines).rstrip() + "\n"
 
 
+def reliability_percent_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number from 0 through 100") from exc
+    if parsed != 100.0:
+        raise argparse.ArgumentTypeError("the release gate is fixed at 100 percent")
+    return parsed
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-base", default=os.environ.get("BLUEY_API_BASE", DEFAULT_API_BASE))
@@ -970,6 +3662,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--pause-ms", type=int, default=350)
     parser.add_argument("--capacity-retries", type=int, default=1)
     parser.add_argument("--max-customer-cost-cents", type=int, default=900)
+    parser.add_argument(
+        "--minimum-reliability-percent",
+        type=reliability_percent_arg,
+        default=100.0,
+        help="release success threshold; fixed at 100",
+    )
     parser.add_argument("--keep-login", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
@@ -977,7 +3675,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
+    self_check_billing_event_validation()
     self_check_ambiguous_payment_detector()
+    self_check_payment_operation_semantics()
+    self_check_payment_platform_safety_detector()
+    self_check_q46_story_grounding_detector()
+    self_check_attempt_integrity_guards()
+    self_check_release_exit_gate()
+    self_check_typed_answer_context()
+    if args.minimum_reliability_percent != 100.0:
+        raise ValueError("--minimum-reliability-percent is fixed at 100")
     base = normalize_base(args.api_base)
     selected = list(CASES)
     if args.only:
@@ -986,11 +3693,22 @@ def main(argv: Sequence[str]) -> int:
     selected = selected[: max(0, args.limit)]
     if len(CASES) != 50:
         raise AssertionError(f"Expected exactly 50 built-in cases, found {len(CASES)}")
+    invalid_outcomes = [
+        case.id
+        for case in selected
+        if case.expected_outcome not in {"answer", "needs_user_input"}
+    ]
+    if invalid_outcomes:
+        raise ValueError(f"unsupported expected outcomes: {', '.join(invalid_outcomes)}")
 
-    contexts: Dict[str, str] = {}
     sources: Dict[str, List[str]] = {}
+    typed_contexts: Dict[str, List[Dict[str, Any]]] = {}
     for profile_name in sorted({case.profile for case in selected}):
-        contexts[profile_name], sources[profile_name] = profile_context(PROFILES[profile_name], args.downloads)
+        (
+            sources[profile_name],
+            typed_contexts[profile_name],
+        ) = profile_context(PROFILES[profile_name], args.downloads)
+        validate_typed_answer_context(typed_contexts[profile_name])
     print(f"Prepared {len(selected)} cases from {sum(len(v) for v in sources.values())} local source files.")
     print("Raw evaluation output will stay local under:", args.output)
     if args.dry_run:
@@ -1011,6 +3729,7 @@ def main(argv: Sequence[str]) -> int:
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     results: List[CaseResult] = []
     result_by_id: Dict[str, CaseResult] = {}
+    case_context_manifest: Dict[str, Dict[str, Any]] = {}
     conversation_sessions: Dict[str, str] = {}
     spent = 0
     try:
@@ -1022,13 +3741,34 @@ def main(argv: Sequence[str]) -> int:
             session_id = conversation_sessions.setdefault(
                 session_key, f"interview-eval-{session_key}-{uuid.uuid4()}"
             )
-            user_prompt = build_user_prompt(case, contexts[case.profile], result_by_id)
-            context_hash = hashlib.sha256(contexts[case.profile].encode()).hexdigest()
+            answer_context = build_typed_answer_context(
+                case, typed_contexts[case.profile], result_by_id
+            )
+            validate_typed_answer_context(answer_context)
+            user_prompt = build_user_prompt(case, answer_context)
+            context_hash = hashlib.sha256(
+                json.dumps(
+                    answer_context,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            case_context_manifest[case.id] = context_provenance_manifest(
+                answer_context, context_hash
+            )
             attempts: List[AttemptResult] = []
             max_attempts = 1 + max(0, args.capacity_retries)
             for attempt_number in range(1, max_attempts + 1):
                 attempt = run_attempt(
-                    base, token, case, user_prompt, session_id, attempt_number, args.timeout
+                    base,
+                    token,
+                    case,
+                    user_prompt,
+                    answer_context,
+                    session_id,
+                    attempt_number,
+                    args.timeout,
                 )
                 attempts.append(attempt)
                 spent += attempt.cost_cents
@@ -1057,6 +3797,8 @@ def main(argv: Sequence[str]) -> int:
                 attempts=attempts,
                 final_ok=answer_is_success(case, final_attempt),
                 first_attempt_ok=answer_is_success(case, attempts[0]),
+                accepted_outcome=expected_outcome_is_accepted(case, final_attempt),
+                first_attempt_accepted=expected_outcome_is_accepted(case, attempts[0]),
                 score=reliability + latency + human + accuracy,
                 reliability_score=reliability,
                 latency_score=latency,
@@ -1080,7 +3822,7 @@ def main(argv: Sequence[str]) -> int:
             ft = f"{final_attempt.first_token_ms:.0f}ms" if final_attempt.first_token_ms is not None else "n/a"
             print(
                 f"[{index:02d}/{len(selected)}] {case.id} "
-                f"{'OK' if result.final_ok else 'FAIL'} score={result.score} "
+                f"{'OK' if result.accepted_outcome else 'FAIL'} score={result.score} "
                 f"first={ft} total={final_attempt.total_ms:.0f}ms route={route}"
             )
             time.sleep(max(0, args.pause_ms) / 1000)
@@ -1089,9 +3831,20 @@ def main(argv: Sequence[str]) -> int:
         summary = build_summary(results, started_at, finished_at, account_before, account_after)
         write_json(args.output / "summary.json", summary)
         (args.output / "report.md").write_text(render_report(summary, results, sources))
-        write_json(args.output / "source-manifest.json", {"profiles": sources})
+        write_json(
+            args.output / "source-manifest.json",
+            {
+                "profiles": sources,
+                "cases": case_context_manifest,
+            },
+        )
         print(json.dumps(summary, indent=2))
-        return 0 if len(results) == len(selected) and summary["reliability_percent"] >= 90 else 2
+        return release_exit_code(
+            results_run=len(results),
+            selected_count=len(selected),
+            accepted_outcomes=summary["accepted_outcomes"],
+            minimum_reliability_percent=args.minimum_reliability_percent,
+        )
     finally:
         if not args.keep_login:
             try:

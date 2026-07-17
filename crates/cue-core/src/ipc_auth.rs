@@ -198,6 +198,7 @@ impl DaemonRequest {
             | Self::Ask { .. }
             | Self::Answer { .. }
             | Self::ContextAdd { .. }
+            | Self::ContextRoleSet { .. }
             | Self::ActivePageCapture
             | Self::ScreenCaptureStart { .. }
             | Self::ScreenCaptureStop
@@ -986,6 +987,14 @@ mod tests {
         );
         assert_eq!(
             DaemonRequest::SessionContinue.ipc_authorization(),
+            IpcAuthorization::Mutation
+        );
+        assert_eq!(
+            DaemonRequest::ContextRoleSet {
+                id: uuid::Uuid::new_v4(),
+                answer_context_role: crate::AnswerContextRole::CandidateResume,
+            }
+            .ipc_authorization(),
             IpcAuthorization::Mutation
         );
         assert_eq!(

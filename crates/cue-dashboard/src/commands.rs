@@ -1847,6 +1847,7 @@ pub struct ContextItemSummaryPayload {
     pub processing_status: String,
     pub created_at: String,
     pub context_mode_observation: bool,
+    pub answer_context_role: cue_core::AnswerContextRole,
 }
 
 fn context_item_summary_payload(item: cue_core::ContextArtifact) -> ContextItemSummaryPayload {
@@ -1856,10 +1857,50 @@ fn context_item_summary_payload(item: cue_core::ContextArtifact) -> ContextItemS
         kind: item.kind.to_string(),
         processing_status: item.processing_status.to_string(),
         created_at: item.created_at,
+        answer_context_role: item.answer_context_role,
         context_mode_observation: item
             .note
             .as_deref()
             .is_some_and(|note| note.contains("Context mode observation.")),
+    }
+}
+
+fn validate_context_role_confirmation(
+    answer_context_role: cue_core::AnswerContextRole,
+    confirmed_by_user: bool,
+) -> Result<(), String> {
+    if answer_context_role == cue_core::AnswerContextRole::UserConfirmedStory && !confirmed_by_user
+    {
+        return Err(
+            "My confirmed story requires your explicit confirmation that this item describes your own lived experience."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn daemon_set_context_role(
+    artifact_id: String,
+    answer_context_role: cue_core::AnswerContextRole,
+    confirmed_by_user: bool,
+) -> Result<ContextItemSummaryPayload, String> {
+    validate_context_role_confirmation(answer_context_role, confirmed_by_user)?;
+    let id = Uuid::parse_str(artifact_id.trim())
+        .map_err(|error| format!("invalid context artifact ID: {error}"))?;
+    match daemon_ipc(DaemonRequest::ContextRoleSet {
+        id,
+        answer_context_role,
+    })
+    .await?
+    {
+        DaemonResponse::ContextItems { items } => items
+            .into_iter()
+            .find(|item| item.id == id)
+            .map(context_item_summary_payload)
+            .ok_or_else(|| "daemon did not return the updated context item".to_string()),
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
     }
 }
 
@@ -2639,10 +2680,32 @@ mod tests {
         assert_eq!(payload.title, "ChatGPT · Release planning");
         assert_eq!(payload.kind, "text");
         assert_eq!(payload.processing_status, "ready");
+        assert_eq!(
+            payload.answer_context_role,
+            cue_core::AnswerContextRole::Other
+        );
         assert!(payload.context_mode_observation);
         let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"answer_context_role\":\"other\""));
         assert!(!json.contains("/private/bluey"));
         assert!(!json.contains("private page content"));
+    }
+
+    #[test]
+    fn confirmed_story_role_requires_an_affirmative_dashboard_action() {
+        assert!(validate_context_role_confirmation(
+            cue_core::AnswerContextRole::UserConfirmedStory,
+            false
+        )
+        .is_err());
+        assert!(validate_context_role_confirmation(
+            cue_core::AnswerContextRole::UserConfirmedStory,
+            true
+        )
+        .is_ok());
+        assert!(
+            validate_context_role_confirmation(cue_core::AnswerContextRole::Other, false).is_ok()
+        );
     }
 
     #[test]
@@ -3277,6 +3340,7 @@ async fn try_speculative_dispatch(
         // server idempotency cache instead of double-charging.
         request_id: Some(response_id.to_string()),
         image_data_urls: Vec::new(),
+        context: Vec::new(),
     };
 
     let stream = router

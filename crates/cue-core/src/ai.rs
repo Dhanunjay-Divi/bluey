@@ -670,6 +670,20 @@ pub enum AnswerContextKind {
     Other,
 }
 
+/// Semantic provenance assigned by Bluey before evidence is flattened into a
+/// provider prompt. Document content cannot promote itself into one of these
+/// roles by printing a forged heading.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerContextRole {
+    CandidateResume,
+    JobDescription,
+    InterviewPreparation,
+    UserConfirmedStory,
+    #[default]
+    Other,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataSensitivity {
@@ -693,6 +707,8 @@ pub struct AnswerContext {
     pub source: Option<String>,
     #[serde(default)]
     pub sensitivity: DataSensitivity,
+    #[serde(default)]
+    pub role: AnswerContextRole,
 }
 
 impl AnswerContext {
@@ -703,6 +719,7 @@ impl AnswerContext {
             title: None,
             source: None,
             sensitivity: DataSensitivity::default(),
+            role: AnswerContextRole::default(),
         }
     }
 
@@ -717,6 +734,11 @@ impl AnswerContext {
 
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    pub fn with_role(mut self, role: AnswerContextRole) -> Self {
+        self.role = role;
         self
     }
 

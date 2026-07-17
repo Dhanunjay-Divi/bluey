@@ -17,6 +17,12 @@ import {
   ShieldCheck,
   Sparkles,
 } from "lucide-react";
+import {
+  CONTEXT_ROLE_OPTIONS,
+  contextRoleNeedsConfirmation,
+  contextRoleOption,
+} from "../lib/contextRoles";
+import type { AnswerContextRole } from "../lib/contextRoles";
 import { invoke } from "../lib/tauri";
 
 interface Session {
@@ -51,6 +57,7 @@ interface ContextItemSummary {
   processing_status: string;
   created_at: string;
   context_mode_observation: boolean;
+  answer_context_role: AnswerContextRole;
 }
 
 export function Context() {
@@ -62,8 +69,10 @@ export function Context() {
   const [contextInterval, setContextInterval] = useState(12);
   const [contextItems, setContextItems] = useState<ContextItemSummary[]>([]);
   const [modeBusy, setModeBusy] = useState<"start" | "stop" | "capture" | null>(null);
+  const [roleBusyId, setRoleBusyId] = useState<string | null>(null);
   const [captureCountdown, setCaptureCountdown] = useState<number | null>(null);
   const [modeMessage, setModeMessage] = useState("");
+  const [roleMessage, setRoleMessage] = useState("");
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -131,6 +140,10 @@ export function Context() {
         .filter((item) => item.context_mode_observation)
         .sort((a, b) => Number(b.created_at) - Number(a.created_at))
         .slice(0, 4),
+    [contextItems],
+  );
+  const roleItems = useMemo(
+    () => [...contextItems].sort((a, b) => Number(b.created_at) - Number(a.created_at)),
     [contextItems],
   );
 
@@ -228,6 +241,38 @@ export function Context() {
     captureArmGeneration.current += 1;
     setCaptureCountdown(null);
     setModeMessage("Page capture cancelled. Nothing was added.");
+  }
+
+  async function setContextRole(item: ContextItemSummary, nextRole: AnswerContextRole) {
+    if (roleBusyId || item.answer_context_role === nextRole) return;
+    let confirmedByUser = false;
+    if (contextRoleNeedsConfirmation(nextRole)) {
+      confirmedByUser = window.confirm(
+        "Confirm this is your story\n\nChoose OK only if this item describes your own lived experience. Bluey may use it as grounded evidence in interview answers. Example or practice stories should stay Interview prep / unverified.",
+      );
+      if (!confirmedByUser) return;
+    }
+
+    setRoleBusyId(item.id);
+    setError("");
+    setRoleMessage("");
+    try {
+      const updated = await invoke<ContextItemSummary>("daemon_set_context_role", {
+        artifactId: item.id,
+        answerContextRole: nextRole,
+        confirmedByUser,
+      });
+      setContextItems((current) =>
+        current.map((candidate) => (candidate.id === updated.id ? updated : candidate)),
+      );
+      setRoleMessage(
+        `“${updated.title}” is now ${contextRoleOption(updated.answer_context_role).label}.`,
+      );
+    } catch (nextError) {
+      setError(String(nextError));
+    } finally {
+      setRoleBusyId(null);
+    }
   }
 
   const modeLocked = modeBusy !== null || captureCountdown !== null;
@@ -397,6 +442,79 @@ export function Context() {
             )}
           </div>
         </div>
+      </section>
+
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold text-zinc-100">Choose how answers use each item</h2>
+            <p className="mt-1 max-w-3xl text-sm leading-6 text-zinc-500">
+              Roles are an evidence boundary, not a tag inferred from file text. Keep examples and
+              practice material unverified. Mark “My confirmed story” only for your own lived
+              experience.
+            </p>
+          </div>
+          <ShieldCheck aria-hidden="true" className="text-emerald-300" size={21} />
+        </div>
+
+        {roleMessage ? (
+          <p
+            role="status"
+            className="mt-3 rounded-md border border-emerald-400/25 bg-emerald-400/10 px-3 py-2 text-xs leading-5 text-emerald-200"
+          >
+            {roleMessage}
+          </p>
+        ) : null}
+
+        {roleItems.length ? (
+          <ul className="mt-4 divide-y divide-zinc-800 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950/55">
+            {roleItems.map((item) => {
+              const selectedRole = contextRoleOption(item.answer_context_role);
+              return (
+                <li
+                  key={item.id}
+                  className="grid gap-3 px-4 py-3.5 lg:grid-cols-[minmax(0,1fr)_310px] lg:items-center"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-zinc-200">{item.title}</p>
+                    <p className="mt-1 text-[11px] text-zinc-500">
+                      {titleCase(item.kind)} · {titleCase(item.processing_status)} ·{" "}
+                      {formatEpoch(item.created_at)}
+                    </p>
+                  </div>
+                  <label className="block">
+                    <span className="sr-only">Answer role for {item.title}</span>
+                    <select
+                      value={item.answer_context_role}
+                      disabled={roleBusyId !== null}
+                      onChange={(event) =>
+                        void setContextRole(item, event.target.value as AnswerContextRole)
+                      }
+                      className="min-h-10 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 text-sm font-medium text-zinc-200 outline-none focus:border-violet-400 disabled:opacity-50"
+                    >
+                      {CONTEXT_ROLE_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="mt-1.5 block text-[11px] leading-4 text-zinc-500">
+                      {roleBusyId === item.id ? "Saving role…" : selectedRole.description}
+                    </span>
+                  </label>
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <div className="mt-4 rounded-lg border border-dashed border-zinc-800 px-4 py-6 text-center">
+            <FileSearch aria-hidden="true" className="mx-auto text-zinc-600" size={22} />
+            <p className="mt-2 text-sm font-medium text-zinc-300">No context items to classify</p>
+            <p className="mt-1 text-xs text-zinc-600">
+              Capture a supported page or attach context from the Bluey CLI first.
+            </p>
+          </div>
+        )}
       </section>
 
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">

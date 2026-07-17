@@ -238,6 +238,7 @@ fn spawn_lane(
             thinking_budget_tokens: request.thinking_budget_tokens,
             request_id: lane_request_id,
             image_data_urls: request.image_data_urls.clone(),
+            context: request.context.clone(),
         };
         // Honor route.stream: if the lane wants streaming, use complete_stream;
         // otherwise use complete() and emit a single synthetic chunk in the
@@ -470,6 +471,7 @@ mod tests {
             thinking_budget_tokens: None,
             request_id: None,
             image_data_urls: Vec::new(),
+            context: Vec::new(),
         }
     }
 

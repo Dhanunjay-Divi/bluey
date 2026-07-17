@@ -27,9 +27,10 @@ pub mod windows_capture;
 
 pub use ai::{
     AiCapabilities, AiCapability, AiModelId, AiProviderId, AiProviderKind, AiRuntimeStatus,
-    AnswerContext, AnswerContextKind, AnswerRequest, AnswerResponse, AnswerStreamEvent, CostBudget,
-    LatencyBudget, PrivacyFlags, ProviderClientConfig, ProviderRequestPayload, ProviderRoute,
-    ProviderSelector, ProviderStatus, RouteBudget, RouteSelectionPolicy, SafetyFlags,
+    AnswerContext, AnswerContextKind, AnswerContextRole, AnswerRequest, AnswerResponse,
+    AnswerStreamEvent, CostBudget, LatencyBudget, PrivacyFlags, ProviderClientConfig,
+    ProviderRequestPayload, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
+    RouteSelectionPolicy, SafetyFlags,
 };
 pub use audio::{
     AudioBackend, AudioCaptureConfig, AudioCapturePlan, AudioCaptureState, AudioCaptureStatus,
