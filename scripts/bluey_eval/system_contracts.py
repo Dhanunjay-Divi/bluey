@@ -1056,10 +1056,23 @@ def url_shortener_safety_issues(
                 clause,
             )
         )
+        cached_mapping_explicitly_guarded = bool(
+            re.search(
+                r"\b(?:serve|return|send|issue|allow|perform|resolve|map|redirect)\w*\b"
+                r".{0,85}\b(?:only\s+)?(?:when|if|provided)\b.{0,55}"
+                r"\b(?:not|isn't|is\s+not)\b.{0,25}"
+                rf"\b{state}\b",
+                clause,
+            )
+        )
         safely_rejected = bool(
             not double_negation
             and (
                 revocable_lifecycle_class
+                # A cache read guarded by an explicit active-state condition is not an
+                # inactive redirect.  For example, "serve only when ... not blocked"
+                # is the safety boundary, not an instruction to redirect blocked links.
+                or cached_mapping_explicitly_guarded
                 or re.search(
                     rf"\b{state}\b.{{0,70}}"
                     r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't)\s+"
@@ -1413,7 +1426,31 @@ def url_shortener_safety_issues(
         if not client_cache_boundary:
             issues.append("missing_revocable_redirect_client_cache_boundary")
 
-        tombstone_not_enforced = bool(
+        overlay_record = r"(?:tombstone|deny\s+overlay|revocation\s+overlay)"
+        overlay_enforcement_action = (
+            r"(?:(?:read|check|honor|enforce|consult|respect)\w*|"
+            r"appl(?:y|ies|ied|ying))"
+        )
+        explicit_overlay_non_enforcement = any(
+            re.search(
+                rf"\b{overlay_record}\b[^.!?;]{{0,55}}"
+                rf"\b(?:(?:(?:is|are|remains?)\s+(?:not|never)|isn't|aren't)\s+"
+                rf"{overlay_enforcement_action}|"
+                r"(?:is|are|remains?)\s+(?:unenforced|unchecked|advisory|optional|"
+                r"disabled|ignored|bypassed))\b|"
+                rf"\b{overlay_record}\s+(?:checks?|enforcement)\b[^.!?;]{{0,35}}"
+                r"\b(?:is|are|remains?)\s+(?:disabled|skipped|absent|optional|advisory)\b|"
+                r"\b(?:redirectors?|redirect\s+(?:service|path|workers?)|read\s+path)\b"
+                rf"[^.!?;]{{0,55}}\b(?:do(?:es)?\s+not|never|fails?\s+to)\s+"
+                rf"{overlay_enforcement_action}\b[^.!?;]{{0,45}}\b{overlay_record}\b|"
+                r"\bno\s+(?:redirector|redirect\s+(?:service|path|worker)|read\s+path)\b"
+                rf"[^.!?;]{{0,45}}\b{overlay_enforcement_action}\b"
+                rf"[^.!?;]{{0,45}}\b{overlay_record}\b",
+                clause,
+            )
+            for clause in clauses
+        )
+        tombstone_not_enforced = explicit_overlay_non_enforcement or bool(
             re.search(
                 r"\b(?:redirectors?|redirect\s+(?:service|path|workers?)|read\s+path)\b"
                 r".{0,55}\b(?:ignore\w*|bypass\w*|does?\s+not\s+(?:read|check|honor|"
@@ -1428,8 +1465,14 @@ def url_shortener_safety_issues(
                 r"\b(?:redirectors?|redirect\s+(?:service|path|workers?)|read\s+path)\b"
                 r".{0,60}\b(?:read|check|honor|enforce|consult|respect)\w*\b"
                 r".{0,45}\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b"
-                r".{0,75}\b(?:only\s+during\b.{0,30}\b(?:eventual|async)\w*|"
+                r"[^.!?;]{0,75}\b(?:only\s+during\b[^.!?;]{0,30}\b(?:eventual|async)\w*|"
                 r"eventual(?:ly)?|asynchronous(?:ly)?|later|delayed?)\b|"
+                r"\b(?:redirectors?|redirect\s+(?:service|path|workers?)|read\s+path)\b"
+                r".{0,65}\b(?:read|check|serve|consult|use)\w*\b.{0,35}"
+                r"\b(?:cache|cached\s+(?:active\s+)?mapping|destination)\b"
+                r".{0,50}\b(?:before|then)\b.{0,45}"
+                r"\b(?:read|check|honor|enforce|consult)\w*\b.{0,45}"
+                r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b|"
                 r"\b(?:redirectors?|redirect\s+(?:service|path|workers?)|read\s+path|they)\b"
                 r".{0,65}\bfail(?:s|ed|ing)?[- ]open\b.{0,55}"
                 r"\b(?:cached?\w*|destinations?|redirect\w*)\b|"
@@ -1460,6 +1503,42 @@ def url_shortener_safety_issues(
                 r"\bauthoritative\s+state\b.{0,30}\b(?:confirm|check|verif)\w*\b",
                 lower,
             )
+        )
+        overlay_checked_before_cache = bool(
+            re.search(
+                r"\b(?:redirect\s+(?:path|worker|service)|redirectors?)\b"
+                r".{0,70}\b(?:check|read|consult|enforce)\w*\b.{0,35}"
+                r"\b(?:versioned\s+)?(?:deny\s+overlay|revocation\s+overlay)\b"
+                r".{0,55}\b(?:first|before)\b.{0,55}"
+                r"\b(?:cache|cached\s+(?:active\s+)?mapping|destination)\b|"
+                r"\b(?:deny\s+overlay|revocation\s+overlay)\b.{0,45}"
+                r"\b(?:first|before)\b.{0,65}"
+                r"\b(?:cache|cached\s+(?:active\s+)?mapping|destination)\b",
+                lower,
+            )
+        )
+        fail_closed_on_overlay_or_cache_uncertainty = bool(
+            re.search(
+                r"\bfail(?:s|ed|ing)?\s+closed\b.{0,170}"
+                r"\b(?:overlay(?:\s+or\s+cache)?|cache)\s+state\b.{0,45}"
+                r"\b(?:uncertain|unknown|unavailable)\b|"
+                r"\b(?:overlay(?:\s+or\s+cache)?|cache)\s+state\b.{0,115}"
+                r"\b(?:uncertain|unknown|unavailable)\b.{0,170}"
+                r"\bfail(?:s|ed|ing)?\s+closed\b",
+                lower,
+            )
+        )
+        explicit_inactive_non_redirect_outcomes = bool(
+            re.search(
+                r"\bdeleted\b.{0,55}\bexpired\b.{0,55}\b(?:404|410)\b",
+                lower,
+            )
+            and re.search(
+                r"\babuse[- ]blocked\b.{0,55}"
+                r"\b(?:403|safe\s+interstitial)\b",
+                lower,
+            )
+            and re.search(r"\blegal\s+block\b.{0,55}\b451\b", lower)
         )
         inactive_revocation_barrier = False
         for clause in clauses:
@@ -1544,10 +1623,10 @@ def url_shortener_safety_issues(
             )
             global_negated_barrier = bool(
                 re.search(
-                    r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b.{0,100}"
+                    r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b[^.!?;]{0,100}"
                     r"\b(?:asynchronous(?:ly)?|eventual(?:ly)?|later|delayed?)\b|"
-                    r"\b(?:asynchronous(?:ly)?|eventual(?:ly)?|later|delayed?)\b"
-                    r".{0,100}\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b|"
+                    r"\b(?:asynchronous(?:ly)?|eventual(?:ly)?|later|delayed?)\b[^.!?;]{0,100}"
+                    r"\b(?:tombstone|deny\s+overlay|revocation\s+overlay)\b|"
                     r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|"
                     r"without)\b.{0,45}\bfail\s+closed\b",
                     lower,
@@ -1558,6 +1637,20 @@ def url_shortener_safety_issues(
                 and global_barrier_record
                 and global_synchronous_boundary
                 and (tombstone_enforced or fail_closed_until_authoritative)
+                and not global_negated_barrier
+                and not tombstone_not_enforced
+            )
+            # A versioned deny-overlay read before cache plus fail-closed handling for
+            # overlay/cache uncertainty is an equivalent per-request revocation
+            # boundary.  It is safe even when the response does not describe the write
+            # acknowledgement sequence, provided it also states non-redirect outcomes
+            # for each inactive lifecycle class.
+            inactive_revocation_barrier = inactive_revocation_barrier or bool(
+                global_inactive_state
+                and global_barrier_record
+                and overlay_checked_before_cache
+                and fail_closed_on_overlay_or_cache_uncertainty
+                and explicit_inactive_non_redirect_outcomes
                 and not global_negated_barrier
                 and not tombstone_not_enforced
             )

@@ -16,7 +16,7 @@ def q47_director_alignment_issues(text: str) -> List[str]:
     directors = r"(?:(?:both|two|the)\s+directors?|the\s+requesting\s+directors?)"
     visible_shared_engagement = bool(
         re.search(
-            rf"\b(?:one|same|shared)?\s*(?:comparison|tradeoff|matrix)\b.{{0,80}}"
+            rf"\b(?:one|same|shared)?\s*(?:comparison|tradeoff|matrix|decision)\b.{{0,80}}"
             rf"\bvisible\s+to\b.{{0,25}}\b{directors}\b.{{0,180}}"
             r"\bask\w*\s+them\b.{0,45}\b(?:agree|align)\w*\b.{0,60}"
             r"\b(?:priority|order|sequence|decision|tradeoff|shared\s+rule|"
@@ -182,6 +182,73 @@ def q47_director_alignment_issues(text: str) -> List[str]:
         f"{decision_windows[index]} {decision_windows[index + 1]}"
         for index in range(len(decision_windows) - 1)
     )
+    # Escalation must pause ordinary contested work.  A comparison may suggest a
+    # likely winner, but it does not authorize the candidate to act before the
+    # directors agree or their accountable owner rules.  Deliberately keep the
+    # incident exception narrow: only the containment action itself is allowed;
+    # mentioning containment never authorizes work on a contested request.
+    ordinary_conflicting_work_while_waiting = False
+    for window in decision_windows:
+        awaiting_resolution = bool(
+            re.search(
+                r"\b(?:while|pending|before)\b.{0,55}"
+                r"\b(?:wait|await|no\s+(?:decision|ruling|resolution)\s+yet)\w*\b"
+                r".{0,50}\b(?:decision|ruling|resolution|owner|sponsor|leader|vp)\b|"
+                r"\b(?:wait|await)\w*\b.{0,55}"
+                r"\b(?:decision|ruling|resolution|owner|sponsor|leader|vp)\b|"
+                r"\bpending\b.{0,55}\b(?:decision|ruling|resolution)\b|"
+                r"\bbefore\b.{0,55}\b(?:owner|sponsor|leader|vp)\b.{0,35}"
+                r"\b(?:decid|resolv|rul)\w*\b|"
+                r"\bwhile\b.{0,55}\b(?:owner|sponsor|leader|vp)\b.{0,35}"
+                r"\b(?:consider|review|decid|resolv|rul)\w*\b",
+                window,
+            )
+        )
+        contested_work_verb = (
+            r"(?:keep|continue|start|begin|execute|proceed|prioritize|work|"
+            r"implement|ship|deploy|release|carry\s+on|tackle)\w*"
+        )
+        contested_work_target = (
+            r"(?:item|request|priority|work|one|option|task|change|deliverable|"
+            r"feature|project|fix)"
+        )
+        # Remove only an explicitly prohibited action, rather than exempting the
+        # whole sentence. This keeps contrastive phrases such as "I would not
+        # normally start A, but I deploy B while waiting" visible to the gate.
+        contested_action_scan = re.sub(
+            rf"\b(?:do\s+not|don't|never|will\s+not|won't)\b.{{0,55}}"
+            rf"\b{contested_work_verb}\b.{{0,80}}\b{contested_work_target}\b",
+            " ",
+            window,
+        )
+        contested_action_scan = re.sub(
+            rf"\b(?:do\s+not|don't|never|will\s+not|won't)\b.{{0,55}}"
+            rf"\b{contested_work_verb}\b.{{0,25}}"
+            r"\b(?:immediately|now|right\s+away)\b",
+            " ",
+            contested_action_scan,
+        )
+        contested_action_scan = re.sub(
+            rf"\b(?:wait|await)\w*\b.{{0,65}}\bbefore\b.{{0,45}}"
+            rf"\b{contested_work_verb}\b.{{0,80}}\b{contested_work_target}\b",
+            " ",
+            contested_action_scan,
+        )
+        selects_or_works_contested_item = bool(
+            re.search(
+                rf"\b{contested_work_verb}\b.{{0,80}}\b{contested_work_target}\b|"
+                r"\bkeep\s+working\b|\bwork(?:ing)?\s+on\b.{0,45}\b"
+                rf"{contested_work_target}\b|\b{contested_work_verb}\b.{{0,25}}"
+                r"\b(?:immediately|now|right\s+away)\b",
+                contested_action_scan,
+            )
+        )
+        if (
+            awaiting_resolution
+            and selects_or_works_contested_item
+        ):
+            ordinary_conflicting_work_while_waiting = True
+            break
     opaque_private_selection = False
     for window in decision_windows:
         rejects_concealment = bool(
@@ -693,6 +760,7 @@ def q47_director_alignment_issues(text: str) -> List[str]:
         or explicit_action_before_resolution
         or advisory_preselection
         or settled_result_overridden
+        or ordinary_conflicting_work_while_waiting
         or bool(
             re.search(
                 rf"\b(?:do\s+not|don't|never|won't|wouldn't|without|avoid(?:s|ing)?|"

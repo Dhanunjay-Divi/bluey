@@ -3668,9 +3668,14 @@ fn answer_plan_q47_director_priority_conflict_requires_shared_decision() {
     assert!(system.contains("Present that one comparison to both directors"));
     assert!(system.contains("seek shared agreement"));
     assert!(system.contains("common accountable owner or sponsor"));
+    assert!(system.contains("Until the directors agree or that accountable owner rules"));
+    assert!(system.contains("do not start, continue, select, prioritize, or describe working on either conflicting request"));
     assert!(system.contains("Do not make a unilateral priority call"));
     assert!(system.contains("minimum reversible containment"));
     assert!(system.contains("pre-agreed severity policy"));
+    assert!(system.contains(
+        "still leave the resource-priority decision to the shared agreement or accountable owner"
+    ));
     assert!(system.contains("do not invent that exception"));
 
     let paraphrase = complete_request(

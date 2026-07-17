@@ -2246,19 +2246,35 @@ def self_check_payment_operation_semantics() -> None:
 
 def payment_platform_safety_issues(text: str) -> List[str]:
     """Find missing durable boundaries or unsafe volatile ones in payment designs."""
+    # Keep identifier word boundaries when inspecting schema-oriented canvas output.
+    # Removing Markdown underscores outright turns `ledger_entries` into
+    # `ledgerentries`, so a real immutable double-entry ledger schema is invisible
+    # to the durable-ledger check below.  Split only intra-identifier underscores;
+    # standalone Markdown emphasis markers are still stripped normally.
+    normalized = re.sub(
+        r"(?<=\w)_(?=\w)", " ", text.casefold().replace("’", "'")
+    )
     lower = re.sub(
         r"\s+",
         " ",
-        re.sub(r"[*_`~]+", "", text.casefold().replace("’", "'")),
+        re.sub(r"[*_`~]+", "", normalized),
     )
     ledger_property = (
         r"durable|persistent|transactional|append[- ]only|double[- ]entry|"
         r"database[- ]backed|postgres(?:ql)?|relational\s+database"
     )
+    nondurable_ledger_property = (
+        r"(?:not|never)\s+(?:durable|persistent|transactional)|"
+        r"non[- ](?:durable|persistent|transactional)|volatile|ephemeral|"
+        r"transient|in[- ]memory|memory[- ]only"
+    )
     clauses = [
         clause.strip()
         for clause in re.split(
-            r"(?<=[.!?;:])\s+|\n+|\b(?:but|however|instead)\b",
+            # A colon commonly connects a schema field to its durability contract:
+            # `ledger_entries`: immutable double-entry rows.  It is not a semantic
+            # sentence boundary for this check.
+            r"(?<=[.!?;])\s+|\n+|\b(?:but|however|instead)\b",
             lower,
         )
         if clause.strip()
@@ -2287,15 +2303,58 @@ def payment_platform_safety_issues(text: str) -> List[str]:
                 rf"(?:not|never)\s+(?:{ledger_property})\b",
                 clause,
             )
+            or re.search(
+                # Schema descriptions often use `ledger_entries: not durable ...`
+                # rather than a prose copula.  Do not let the nearby word
+                # "ledger" turn an explicitly non-durable schema into a pass.
+                rf"\bledger\b.{{0,35}}:\s*(?:not|never)\s+(?:{ledger_property})\b",
+                clause,
+            )
+            or re.search(
+                # A positive property followed by a contrastive non-durability
+                # statement describes one contradictory ledger, not two independent
+                # storage boundaries.
+                rf"\bledger\b.{{0,180}}\b(?:but|however|instead)\b.{{0,80}}"
+                rf"\b(?:{nondurable_ledger_property})\b",
+                clause,
+            )
+            or re.search(
+                # Carry an immediately following explicit reference back to the
+                # ledger sentence: "These entries are not durable."
+                rf"\bledger\b.{{0,180}}[.!?]\s*(?:these|those|such|the)\s+"
+                rf"(?:ledger\s+)?(?:entries|rows|records)\b.{{0,60}}"
+                rf"\b(?:is|are|remain\w*)?\s*(?:{nondurable_ledger_property})\b",
+                clause,
+            )
         )
 
-    durable_ledger = any(
-        not negates_ledger(clause)
-        and (
-            re.search(rf"\b(?:{ledger_property})\b.{{0,100}}\bledger\b", clause)
-            or re.search(rf"\bledger\b.{{0,100}}\b(?:{ledger_property})\b", clause)
+    ledger_sentences = [
+        unit.strip()
+        for unit in re.split(r"(?<=[.!?;])\s+|\n+", lower)
+        if unit.strip()
+    ]
+    ledger_evidence_units = []
+    for index, unit in enumerate(ledger_sentences):
+        next_sentence_refers_to_entries = (
+            index + 1 < len(ledger_sentences)
+            and re.match(
+                r"^(?:[-#>]\s*)*(?:these|those|such|the)\s+"
+                r"(?:ledger\s+)?(?:entries|rows|records)\b",
+                ledger_sentences[index + 1],
+            )
         )
-        for clause in clauses
+        ledger_evidence_units.append(
+            f"{unit} {ledger_sentences[index + 1]}"
+            if next_sentence_refers_to_entries
+            else unit
+        )
+    durable_ledger = any(
+        not negates_ledger(unit)
+        and (
+            re.search(rf"\b(?:{ledger_property})\b.{{0,100}}\bledger\b", unit)
+            or re.search(rf"\bledger\b.{{0,100}}\b(?:{ledger_property})\b", unit)
+        )
+        for unit in ledger_evidence_units
     )
 
     def negates_reconciliation(clause: str) -> bool:
@@ -2631,6 +2690,47 @@ def self_check_payment_platform_safety_detector() -> None:
         "status and webhooks. Do not use a distributed lock, or Redis lock, as the "
         "correctness boundary."
     )
+    # Exact durable-ledger evidence from the live Q39 canvas.  The schema uses a
+    # snake_case table name, which must still count as a ledger when its rows are
+    # explicitly immutable and double-entry.
+    live_q39_canvas_ledger = (
+        "- Webhook ingester deduplicates by provider event ID, then updates state "
+        "from authoritative evidence.\n"
+        "- Ledger service appends confirmed hold or movement entries only after "
+        "authoritative confirmation.\n"
+        "- `ledger_entries`: immutable double-entry rows for confirmed auth holds, "
+        "captures, refunds.\n"
+        "- Reconciliation matches by provider payment ID or client reference."
+    )
+    assert not payment_platform_safety_issues(live_q39_canvas_ledger)
+    # A ledger-like table name alone remains insufficient: the answer must state
+    # durable/immutable/transactional ledger semantics, not merely name a table.
+    incomplete_ledger_schema = (
+        "The ledger_entries table stores rows. Reconcile UNKNOWN outcomes through "
+        "provider status and webhooks."
+    )
+    assert "missing_durable_payment_ledger" in payment_platform_safety_issues(
+        incomplete_ledger_schema
+    )
+    explicitly_nondurable_ledger_schema = (
+        "The ledger_entries: not durable rows. Reconcile UNKNOWN outcomes through "
+        "provider status and webhooks."
+    )
+    assert "missing_durable_payment_ledger" in payment_platform_safety_issues(
+        explicitly_nondurable_ledger_schema
+    )
+    contradictory_ledger_schemas = (
+        "`ledger_entries`: immutable double-entry rows but not durable. Reconcile "
+        "UNKNOWN outcomes through provider status and webhooks.",
+        "The ledger_entries are immutable double-entry, however volatile. Reconcile "
+        "UNKNOWN outcomes through provider status and webhooks.",
+        "`ledger_entries`: immutable double-entry rows. These entries are not durable. "
+        "Reconcile UNKNOWN outcomes through provider status and webhooks.",
+    )
+    for contradictory_schema in contradictory_ledger_schemas:
+        assert "missing_durable_payment_ledger" in payment_platform_safety_issues(
+            contradictory_schema
+        ), contradictory_schema
     complete_boundary = (
         "Use a durable double-entry ledger and reconcile by provider status and webhooks. "
     )

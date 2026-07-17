@@ -486,6 +486,52 @@ def self_check_production_answer_contracts(
         exact_worker_boundary,
         require_revocation_completeness=True,
     )
+    # Exact Q41 live-answer shape: a per-request deny-overlay boundary remains safe
+    # when unrelated click analytics are asynchronous in a later sentence.
+    live_q41_per_request_boundary = (
+        "Revocable redirects use 302 or 307 with Cache-Control: no-store. For "
+        "redirects, serve a cached mapping only when it is fresh and not blocked; "
+        "otherwise fall back to the authoritative store. The redirect path checks the "
+        "versioned deny overlay first, then cache, then authoritative store. Every "
+        "redirect worker fails closed to an authoritative state check or non-redirect "
+        "response when overlay or cache state is uncertain. Deleted or expired mappings "
+        "return 404 or 410; abuse-blocked mappings return 403 or a safe interstitial; "
+        "legal blocks return 451. Click analytics are emitted asynchronously."
+    )
+    assert not url_shortener_safety_issues(
+        live_q41_per_request_boundary,
+        require_revocation_completeness=True,
+    )
+    for unsafe_q41_overlay_boundary in (
+        live_q41_per_request_boundary.replace(
+            "checks the versioned deny overlay first, then cache",
+            "reads cache before checking the versioned deny overlay",
+        ),
+        live_q41_per_request_boundary.replace(
+            "fails closed to an authoritative state check or non-redirect response",
+            "fails open to the cached active mapping",
+        ),
+        f"{live_q41_per_request_boundary} The deny overlay is not enforced.",
+        f"{live_q41_per_request_boundary} Redirect workers never enforce the deny overlay.",
+        f"{live_q41_per_request_boundary} No redirect worker applies the deny overlay.",
+        f"{live_q41_per_request_boundary} Deny overlay enforcement is disabled.",
+    ):
+        assert "missing_inactive_state_revocation_barrier" in (
+            url_shortener_safety_issues(
+                unsafe_q41_overlay_boundary,
+                require_revocation_completeness=True,
+            )
+        ), unsafe_q41_overlay_boundary
+    for explicitly_enforced_q41_boundary in (
+        f"{live_q41_per_request_boundary} The deny overlay is enforced on every redirect.",
+        f"{live_q41_per_request_boundary} Deny overlay enforcement is mandatory.",
+        f"{live_q41_per_request_boundary} Redirect workers do not skip enforcement of "
+        "the deny overlay.",
+    ):
+        assert not url_shortener_safety_issues(
+            explicitly_enforced_q41_boundary,
+            require_revocation_completeness=True,
+        ), explicitly_enforced_q41_boundary
     unsafe_lifecycle_qualification = exact_worker_boundary.replace(
         "use 302 or 307 with Cache-Control: no-store",
         "use 302 or 307 with Cache-Control: no-store even after they are deleted",
