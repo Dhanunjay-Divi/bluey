@@ -5011,7 +5011,7 @@ fn behavioral_story_truth_gap_text(missing_fields: &[&str]) -> String {
         missing_fields.join(", ")
     };
     format!(
-        "I don’t have one complete, user-confirmed story I can safely put in your voice yet. I’m missing these facts from one story: {missing}. Send explicit Situation, Task, Action, and Result fields; a qualitative result is fine.\n\nLive bridge: I want to choose a real example and keep the details accurate, so I’d like a moment to structure it.\n\nFill-in template (not a factual answer):\nSituation: [company/project and what happened]\nTask: [what you were responsible for]\nAction: [2-3 actions you personally took]\nResult: [user-confirmed qualitative or quantitative outcome]"
+        "I don’t have one complete, user-confirmed story I can safely put in your voice yet. I’m missing these facts from one story: {missing}. Send explicit Situation, Task, Action, and Result fields; a qualitative result is fine.\n\nLive bridge: I want to choose a real example and keep the details accurate, so I’d like a moment to structure it.\n\nFill-in template (not a factual answer):\nSituation: [company/project], [situation]\nTask: [task]\nAction: [actions]\nResult: [verified outcome]"
     )
 }
 
@@ -5749,6 +5749,20 @@ fn prompt_with_answer_plan(
                 "third-party api",
             ],
         );
+    let large_foreign_key_migration_question = contains_any(
+        &normalized_question,
+        &["foreign key", "fk constraint", "referential constraint"],
+    ) && contains_any(
+        &normalized_question,
+        &[
+            "production",
+            "million row",
+            "million-row",
+            "large table",
+            "online migration",
+            "without downtime",
+        ],
+    );
     let general_technical_interview = plan.interview_context
         && plan.intent == AnswerIntent::General
         && plan.output == AnswerOutput::Compact
@@ -5853,6 +5867,12 @@ fn prompt_with_answer_plan(
         );
     }
 
+    if large_foreign_key_migration_question {
+        instructions.push_str(
+            "\nLarge-table foreign-key migration contract: answer as a proposed production approach, starting with `I would first confirm the database engine and version`. Never recommend copying and renaming the whole production table as the default, and never claim foreign-key validation universally blocks all reads and writes. First audit orphaned rows, parent/child indexes, dependent objects, lock behavior, replication lag, and concurrent writes. Clean or backfill violations in bounded, restartable batches with monitoring and a rollback or abort threshold. For a supported PostgreSQL version, add the foreign key as `NOT VALID` in a short controlled lock window, then run `VALIDATE CONSTRAINT` separately while monitoring blockers and load. Explicitly say that PostgreSQL syntax is not portable to MySQL or every engine; for another engine, use its version-specific online DDL or vetted migration tooling and test the exact plan on production-scale data."
+        );
+    }
+
     if lru_explanation {
         instructions.push_str(
             "\nLRU explanation contract: distinguish O(1) get/put operation time, O(1) auxiliary space per operation, and O(capacity) total data-structure space. A successful read updates recency but never triggers capacity eviction; insertion beyond capacity evicts the least-recently-used entry."
@@ -5894,7 +5914,7 @@ fn prompt_with_answer_plan(
 
     if payment_design_or_followup {
         instructions.push_str(
-            "\nPayment correctness contract: before a provider call, atomically persist the payment intent plus a transactional outbox command. Give each logical provider operation, such as authorize, capture, or refund, its own stable idempotency key, and reuse that same key only when replaying that same operation. Append confirmed authorization, capture, and refund movements idempotently to an immutable double-entry ledger only after authoritative provider evidence from the synchronous response, status lookup, or webhook. A timeout after dispatch moves `PROCESSING` to `UNKNOWN` or `PENDING_RECONCILIATION`; block a new charge command and reconcile by provider payment ID or client reference. Deduplicate webhooks by provider event ID, and transition from UNKNOWN to `SUCCEEDED`, `FAILED`, or `CANCELED` only from authoritative provider evidence. Never use check-then-act deduplication, a Redis lock, or any distributed lock as the correctness boundary; a lock may only reduce duplicate work around the durable database, outbox, and ledger guarantees. Do not claim global exactly-once processing."
+            "\nPayment correctness contract: before a provider call, atomically persist the payment intent plus a transactional outbox command. Give each logical provider operation, such as authorize, capture, or refund, its own stable idempotency key, and reuse that same key only when replaying that same operation. Append confirmed authorization, capture, and refund movements idempotently to an immutable double-entry ledger only after authoritative provider evidence from the synchronous response, status lookup, or webhook. A timeout after dispatch moves `PROCESSING` to `UNKNOWN` or `PENDING_RECONCILIATION`; block a new charge command and reconcile by provider payment ID or client reference. Deduplicate webhooks by provider event ID, and transition from UNKNOWN to `SUCCEEDED`, `FAILED`, or `CANCELED` only from authoritative provider evidence. Never use check-then-act deduplication, a Redis lock, or any distributed lock as the correctness boundary; a lock may only reduce duplicate work around the durable database, outbox, and ledger guarantees. Never write `exactly-once processing` anywhere in the response or artifact. Describe at-least-once delivery with idempotent exactly-once effects instead."
         );
         if payment_timeout_question {
             instructions.push_str(
@@ -14679,7 +14699,8 @@ mod tests {
         assert!(system.contains("Never use check-then-act deduplication"));
         assert!(system.contains("a Redis lock"));
         assert!(system.contains("lock may only reduce duplicate work"));
-        assert!(system.contains("Do not claim global exactly-once processing"));
+        assert!(system.contains("Never write `exactly-once processing` anywhere"));
+        assert!(system.contains("at-least-once delivery with idempotent exactly-once effects"));
     }
 
     #[test]
@@ -15049,6 +15070,40 @@ mod tests {
         assert!(system.contains("retry count, circuit state, saturation"));
         assert!(!system.contains("Interview answer mode:"));
         assert!(!system.contains("sound like a human candidate who did that work"));
+    }
+
+    #[test]
+    fn answer_plan_q10_large_foreign_key_migration_uses_safe_engine_specific_contract() {
+        let req = complete_request(
+            "Question:\nA junior engineer wants to add a foreign key constraint to a 200 million row production table. What do you tell them?",
+        );
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::General);
+        assert_eq!(plan.output, AnswerOutput::Compact);
+
+        let (system, user) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+
+        assert_eq!(user, req.user);
+        assert!(system.contains("Large-table foreign-key migration contract"));
+        assert!(system
+            .contains("starting with `I would first confirm the database engine and version`"));
+        assert!(system.contains(
+            "Never recommend copying and renaming the whole production table as the default"
+        ));
+        assert!(system.contains(
+            "never claim foreign-key validation universally blocks all reads and writes"
+        ));
+        assert!(system.contains("audit orphaned rows, parent/child indexes, dependent objects"));
+        assert!(system.contains("bounded, restartable batches"));
+        assert!(system.contains("add the foreign key as `NOT VALID`"));
+        assert!(system.contains("run `VALIDATE CONSTRAINT` separately"));
+        assert!(system.contains("not portable to MySQL or every engine"));
     }
 
     #[test]

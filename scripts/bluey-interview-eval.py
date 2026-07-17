@@ -928,6 +928,131 @@ def has_mysql_not_valid_portability_claim(text: str) -> bool:
     )
 
 
+def large_fk_migration_safety_issues(text: str) -> List[str]:
+    """Reject the two unsafe claims observed in Q10's first live answer."""
+    lower = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[*_`~]+", "", text.casefold().replace("’", "'")).strip(),
+    )
+    issues: List[str] = []
+
+    table_start = r"(?:create|build|make|provision)\w*\s+(?:a\s+)?(?:new|shadow|replacement)\s+table"
+    copy_data = r"(?:copy|move|migrate)\w*\s+(?:the\s+|all\s+|entire\s+)?(?:data|rows)"
+    table_swap = r"(?:rename|swap|cut\s*over)\w*"
+    for match in re.finditer(
+        rf"{table_start}.{{0,500}}{copy_data}.{{0,500}}{table_swap}",
+        lower,
+    ):
+        window = lower[max(0, match.start() - 120) : min(len(lower), match.end() + 120)]
+        prescriptive = bool(
+            re.search(
+                r"\b(?:should|recommend|instead|proposed solution|approach is|"
+                r"i would|we would|standard pattern)\b",
+                window,
+            )
+        )
+        rejected = bool(
+            re.search(
+                r"\b(?:do not|don't|never|avoid|reject|unsafe|not the default|"
+                r"should not|would not)\b\s+(?:(?:use|recommend)\s+)?" + table_start,
+                window,
+            )
+            or re.search(
+                table_start + r".{0,220}\b(?:is|as)\s+not\s+(?:the\s+)?default\b",
+                window,
+            )
+        )
+        controlled_fallback = bool(
+            re.search(
+                r"\b(?:last resort|fallback|only if)\b.{0,180}"
+                r"\b(?:online schema change|vetted tool|cdc|change data capture|"
+                r"dual write|concurrent write sync)\b",
+                window,
+            )
+        )
+        if prescriptive and not rejected and not controlled_fallback:
+            issues.append("unsafe_whole_table_copy_swap_advice")
+            break
+
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", lower):
+        if not re.search(r"\b(?:foreign key|constraint|validation|validate)\w*\b", sentence):
+            continue
+        categorical = bool(
+            re.search(
+                r"\b(?:will|would|does|always)\b.{0,100}\b(?:block|prevent|stop)\w*\b|"
+                r"\b(?:lock|validation)\w*\b.{0,100}\bprevent\w*\b|"
+                r"\b(?:block|prevent|stop)s?\b",
+                sentence,
+            )
+        )
+        all_io = bool(
+            re.search(
+                r"\b(?:all|any|both)\b.{0,25}\breads?\b.{0,25}\b(?:and|or)\b"
+                r".{0,25}\bwrites?\b|"
+                r"\b(?:all|any|both)\b.{0,25}\bwrites?\b.{0,25}\b(?:and|or)\b"
+                r".{0,25}\breads?\b",
+                sentence,
+            )
+        )
+        explicit_universal = bool(re.search(r"\b(?:always|universally)\b", sentence))
+        qualified = bool(
+            re.search(
+                r"\b(?:can|could|may|might|risk|depending|brief|short|"
+                r"not universally|does not universally|doesn't universally)\b",
+                sentence,
+            )
+            and not explicit_universal
+            or re.search(
+                r"\b(?:do not|don't|never)\b.{0,80}\b(?:claim|assume|say)\b",
+                sentence,
+            )
+            or re.search(
+                r"\b(?:does not|doesn't|will not|won't|would not|wouldn't|never)\b"
+                r".{0,30}\b(?:block|prevent|stop)\w*\b",
+                sentence,
+            )
+        )
+        if categorical and all_io and not qualified:
+            issues.append("unsafe_universal_fk_read_write_block_claim")
+            break
+    return issues
+
+
+def self_check_large_fk_migration_safety() -> None:
+    failed_live_answer = (
+        "You should tell the junior engineer that they should not add the constraint "
+        "directly to the production table. Instead, they should create a new table "
+        "with the desired schema, copy the data into it, rename the old table to a "
+        "backup name, and rename the new table to the original name. This approach "
+        "avoids locking the production table for the "
+        "duration of the constraint creation, which would block all reads and writes. "
+        "This validation process locks the table, preventing any reads or writes."
+    )
+    assert set(large_fk_migration_safety_issues(failed_live_answer)) == {
+        "unsafe_whole_table_copy_swap_advice",
+        "unsafe_universal_fk_read_write_block_claim",
+    }
+    assert large_fk_migration_safety_issues(
+        "Foreign-key validation blocks all reads and writes."
+    ) == ["unsafe_universal_fk_read_write_block_claim"]
+    assert large_fk_migration_safety_issues(
+        "Validation can always block all reads and writes."
+    ) == ["unsafe_universal_fk_read_write_block_claim"]
+    safe_answers = (
+        "I would not create a new table, copy all rows, and rename it as the default. "
+        "For PostgreSQL 15, use NOT VALID and validate separately in a monitored window.",
+        "PostgreSQL constraint creation can require a brief lock window, but concurrent "
+        "reads continue; exact write conflicts depend on the engine and version.",
+        "Only if native online DDL is unavailable would I consider a shadow table as a "
+        "last resort with a vetted online schema change tool and CDC for concurrent "
+        "write sync: create a shadow table, copy the rows, then cut over.",
+        "Never claim that foreign-key validation universally blocks all reads and writes.",
+    )
+    for answer in safe_answers:
+        assert not large_fk_migration_safety_issues(answer), answer
+
+
 def has_exactly_once_processing_overclaim(text: str) -> bool:
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", text.casefold()):
         if not re.search(r"exactly[- ]once", sentence):
@@ -935,7 +1060,18 @@ def has_exactly_once_processing_overclaim(text: str) -> bool:
         caveated = bool(
             re.search(
                 r"(?:cannot|can't|can’t|not possible|not truly|no true|"
-                r"effectively[- ]once|exactly[- ]once effect|limited to|only within)",
+                r"limited to|only within)",
+                sentence,
+            )
+            or re.search(
+                r"\b(?:do not|don't|never|would not|should not)\b.{0,45}"
+                r"\b(?:claim|promise|guarantee)\w*\b.{0,45}\bexactly[- ]once\b",
+                sentence,
+            )
+            or re.search(
+                r"\bno\s+(?:global|end[- ]to[- ]end)\b.{0,45}\bexactly[- ]once\b|"
+                r"\bexactly[- ]once\b.{0,60}\b(?:is\s+impossible|"
+                r"is\s+not\s+guaranteed|cannot\s+be\s+guaranteed)\b",
                 sentence,
             )
         )
@@ -943,11 +1079,32 @@ def has_exactly_once_processing_overclaim(text: str) -> bool:
             continue
         if re.search(
             r"(?:guarantee|guarantees|guaranteed|ensure|ensures|achieve|achieves)"
-            r".{0,80}exactly[- ]once|exactly[- ]once.{0,50}processing semantics",
+            r".{0,80}exactly[- ]once|exactly[- ]once.{0,50}processing(?:\s+semantics)?",
             sentence,
         ):
             return True
     return False
+
+
+def self_check_exactly_once_processing_detector() -> None:
+    unsafe = (
+        "The platform provides exactly-once processing per idempotency key.",
+        "We guarantee exactly-once processing per idempotency key, yielding "
+        "exactly-once effects.",
+        "Exactly-once effects are the goal, and the platform provides exactly-once "
+        "processing per key.",
+    )
+    assert all(has_exactly_once_processing_overclaim(text) for text in unsafe)
+    safe = (
+        "We cannot guarantee exactly-once processing across the provider boundary; "
+        "we provide idempotent exactly-once effects for each logical operation.",
+        "Exactly-once processing is impossible across an external provider boundary.",
+        "Exactly-once processing is not guaranteed end to end.",
+        "I would not claim exactly-once processing across independent systems.",
+        "Do not promise exactly-once processing; use idempotent effects.",
+        "There is no global exactly-once processing guarantee.",
+    )
+    assert all(not has_exactly_once_processing_overclaim(text) for text in safe)
 
 
 def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
@@ -1204,7 +1361,7 @@ def payment_operation_semantic_issues(
                 r"\b(?:one|a|distinct|separate|derived)\b.{0,30}"
                 r"\b(?:idempotency\s+)?key\b"
                 r".{0,20}\bper\s+(?:payment\s+)?operation\b|"
-                r"\b(?:distinct|separate|derived)\b.{0,30}\bkeys?\b"
+                r"\b(?:distinct|separate|unique|derived)\b.{0,30}\bkeys?\b"
                 r".{0,25}\b(?:for|across)\b.{0,100}"
                 r"\b(?:authoriz\w*|captur\w*|refund\w*)\b|"
                 r"\b(?:authoriz\w*|captur\w*|refund\w*)\b.{0,140}"
@@ -1219,6 +1376,15 @@ def payment_operation_semantic_issues(
                 r"\b(?:same|stable)\b.{0,25}\bkey\b.{0,60}\bonly\b.{0,60}"
                 r"\b(?:same|that)\s+operation\b",
                 clause,
+            )
+            or (
+                len(operations) == 3
+                and re.search(
+                    r"\beach\b.{0,35}\b(?:gets?|has|uses?)\b.{0,20}"
+                    r"\b(?:a\s+)?(?:unique|distinct|separate)\b.{0,20}"
+                    r"\b(?:idempotency\s+)?key\b",
+                    clause,
+                )
             )
         )
         safely_rejected = bool(
@@ -1263,6 +1429,13 @@ def payment_operation_semantic_issues(
                 r"\b(?:share|reuse|use)\w*\b.{0,45}"
                 r"\b(?:same|single|one|shared)?\s*(?:idempotency\s+)?key\b"
                 r".{0,120}\b(?:across|between|for)\b",
+                lower,
+            )
+            or re.search(
+                r"\bauthoriz\w*\b.{0,80}\bcaptur\w*\b.{0,80}\brefund\w*\b"
+                r".{0,45}\beach\b.{0,35}\b(?:gets?|has|uses?)\b.{0,20}"
+                r"\b(?:a\s+)?(?:unique|distinct|separate)\b.{0,20}"
+                r"\b(?:idempotency\s+)?key\b",
                 lower,
             )
         )
@@ -1313,7 +1486,55 @@ def payment_operation_semantic_issues(
             r".{0,50}\b(?:retry|replay)\w*\b",
             lower,
         )
+        or re.search(
+            r"\b(?:reuse|reuses|reused|reusing)\b.{0,35}"
+            r"\b(?:the\s+)?same\b.{0,25}\b(?:idempotency\s+)?key\b"
+            r".{0,60}\b(?:retr(?:y|ies)|replay)\w*\b.{0,25}\bof\b"
+            r".{0,25}\b(?:the\s+)?same\b.{0,20}"
+            r"\b(?:operation|command|authorization|capture|refund|charge)\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:same|original)\b.{0,30}"
+            r"\b(?:charge\s+)?(?:operation|command|authorization|capture|refund|charge)\b"
+            r".{0,45}\b(?:keep|keeps|preserve|preserves|reuse|reuses)\w*\b"
+            r".{0,30}\b(?:its\s+|the\s+)?(?:idempotency\s+)?key\b"
+            r".{0,70}\b(?:retr(?:y|ied)|replay)\w*\b",
+            lower,
+        )
     )
+    negated_same_operation_retry_reuse = bool(
+        re.search(
+            r"\b(?:do not|don't|never|must not|should not|avoid)\b\s+"
+            r"(?:reuse|reusing|preserve|preserving|keep|keeping)\w*\b.{0,35}"
+            r"\b(?:the\s+)?same\b.{0,25}\b(?:idempotency\s+)?key\b"
+            r".{0,70}\b(?:retr(?:y|ies)|replay)\w*\b.{0,35}"
+            r"\b(?:the\s+)?same\b.{0,25}"
+            r"\b(?:operation|command|authorization|capture|refund|charge)\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:do not|don't|never|must not|should not|avoid)\b\s+"
+            r"(?:retry|replay)\w*\b.{0,35}\b(?:the\s+)?(?:same|original)\b"
+            r".{0,25}\b(?:charge\s+)?"
+            r"(?:operation|command|authorization|capture|refund|charge)\b"
+            r".{0,45}\b(?:with|using|under)\b.{0,25}"
+            r"\b(?:the\s+)?(?:same|original)\b.{0,20}"
+            r"\b(?:idempotency\s+)?key\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:the\s+)?(?:same|original)\b.{0,25}"
+            r"\b(?:charge\s+)?(?:operation|command|authorization|capture|refund|charge)\b"
+            r".{0,35}\b(?:must|should)\s+not\b.{0,20}"
+            r"\b(?:keep|preserve|reuse)\w*\b.{0,30}"
+            r"\b(?:its\s+|the\s+)?(?:idempotency\s+)?key\b"
+            r".{0,55}\b(?:retr(?:y|ied)|replay)\w*\b",
+            lower,
+        )
+    )
+    if negated_same_operation_retry_reuse:
+        same_operation_retry_reuse = False
     operation_scoped_stable_key = bool(
         re.search(
             r"\b(?:each|every)\b.{0,80}\b(?:logical\s+|provider\s+|payment\s+)?"
@@ -1742,6 +1963,45 @@ def self_check_payment_operation_semantics() -> None:
         require_complete_idempotency_semantics=False,
         require_same_operation_retry_reuse=True,
     )
+    live_q39_wording = (
+        "Authorize, capture, and refund each get a unique idempotency key. Provider "
+        "calls reuse the same idempotency key for retries of the same operation. "
+        "Deduplicate webhooks by provider event ID."
+    )
+    assert not payment_operation_semantic_issues(
+        live_q39_wording,
+        require_webhook_event_dedup=True,
+    )
+    negated_retry_rules = (
+        "Do not reuse the same idempotency key for retries of the same operation.",
+        "Avoid reusing the same idempotency key for retries of the same operation.",
+        "Do not retry the same operation with the same idempotency key.",
+        "Never replay the original charge operation using the original idempotency key.",
+        "The same operation must not keep its idempotency key when replayed.",
+    )
+    for negated_rule in negated_retry_rules:
+        negated_retry_reuse = (
+            "Authorize, capture, and refund each get a unique idempotency key. "
+            + negated_rule
+            + " Deduplicate webhooks by provider event ID."
+        )
+        assert "missing_same_operation_idempotency_key_reuse" in (
+            payment_operation_semantic_issues(
+                negated_retry_reuse,
+                require_webhook_event_dedup=True,
+            )
+        ), negated_rule
+    live_q40_wording = (
+        "The original charge operation keeps its idempotency key so it can be "
+        "replayed if needed. Keep the intent UNKNOWN, block a new charge, query "
+        "provider status, and deduplicate webhooks by provider event ID."
+    )
+    assert not payment_operation_semantic_issues(
+        live_q40_wording,
+        require_webhook_event_dedup=False,
+        require_complete_idempotency_semantics=False,
+        require_same_operation_retry_reuse=True,
+    )
     assert "missing_same_operation_idempotency_key_reuse" in payment_operation_semantic_issues(
         "Keep the payment UNKNOWN, block the original charge, and query provider status.",
         require_webhook_event_dedup=False,
@@ -2034,8 +2294,10 @@ def self_check_payment_platform_safety_detector() -> None:
 
 
 Q46_GENERIC_PLACEHOLDER = re.compile(
-    r"\[(?:company(?:/project)?|project|situation|task|(?:2-3\s+)?actions?|"
-    r"result|(?:verified\s+)?outcome|problem|constraint)\]",
+    r"\[(?:company(?:/project)?(?:\s+and\s+what\s+happened)?|project|situation|"
+    r"task|what\s+you\s+were\s+responsible\s+for|(?:2-3\s+)?actions?|"
+    r"2-3\s+actions\s+you\s+personally\s+took|result|(?:verified\s+)?outcome|"
+    r"user-confirmed\s+qualitative\s+or\s+quantitative\s+outcome|problem|constraint)\]",
     re.I,
 )
 
@@ -2450,9 +2712,19 @@ def has_complete_code_artifact_body(body: str) -> bool:
 
 def python_source_from_code_artifact(body: str) -> str:
     """Extract Python/untagged fenced blocks without executing them."""
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n").strip()
+    # Bluey's persisted code artifact is a sectioned workbench document. Isolate
+    # CODE before scanning fences so an example inside NOTES cannot replace it.
+    sectioned = re.match(r"(?is)^CODE\s*\n-+\s*\n(.*)$", normalized)
+    if sectioned:
+        normalized = re.split(
+            r"(?m)^\s*(?:LINE NOTES|COMPLEXITY|NOTES)\s*\n-+\s*$",
+            sectioned.group(1),
+            maxsplit=1,
+        )[0].strip()
     blocks = re.findall(
         r"```[ \t]*([^\n`]*)\n(.*?)```",
-        body.replace("\r\n", "\n").replace("\r", "\n"),
+        normalized,
         re.S,
     )
     candidates = [
@@ -2463,7 +2735,7 @@ def python_source_from_code_artifact(body: str) -> str:
     ]
     if candidates:
         return "\n\n".join(candidates)
-    return body.strip()
+    return normalized
 
 
 def _attribute_tokens(node: ast.AST) -> set[str]:
@@ -2693,17 +2965,55 @@ def code_complexity_issues(text: str) -> List[str]:
     has_space = "space complexity" in lower or bool(
         re.search(r"(?:^|\n)\s*(?:[-*]\s*)?(?:\*\*)?space(?:\*\*)?\s*:", text, re.I)
     )
+    complexity_section = bool(
+        re.search(r"(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?complexity(?:\*\*)?\s*$", text, re.I | re.M)
+    )
+    operation_bounds = all(
+        re.search(
+            rf"`?\b{operation}\s*\([^\n)]*\)`?\s*:\s*O\([^\n)]+\)",
+            text,
+            re.I,
+        )
+        for operation in ("get", "put")
+    )
+    has_time = has_time or (complexity_section and operation_bounds)
     return [] if has_time and has_space else ["missing_complexity"]
+
+
+def has_valid_needs_story_facts_artifact(body: Optional[str]) -> bool:
+    if not body:
+        return False
+    try:
+        value = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(value, dict) or value.get("state") != "needs_story_facts":
+        return False
+    expected = {"Situation", "Task", "Action", "Result"}
+    all_fields = value.get("all_fields")
+    required_fields = value.get("required_fields")
+    return bool(
+        isinstance(all_fields, list)
+        and len(all_fields) == 4
+        and all(isinstance(field, str) for field in all_fields)
+        and len(set(all_fields)) == 4
+        and set(all_fields) == expected
+        and isinstance(required_fields, list)
+        and 1 <= len(required_fields) <= 4
+        and all(isinstance(field, str) for field in required_fields)
+        and set(required_fields).issubset(expected)
+        and len(required_fields) == len(set(required_fields))
+    )
 
 
 def is_safe_needs_user_input_outcome(case: EvalCase, attempt: AttemptResult) -> bool:
     """Recognize Q46's safe abstention without treating it as answer success."""
     if case.id != "Q46" or attempt.artifact_type != "needs_story_facts":
         return False
-    text = answer_evidence_text(attempt)
     return bool(
-        is_q46_truth_gap_or_fill_in_template(text)
-        and not q46_story_grounding_issues(text)
+        has_valid_needs_story_facts_artifact(attempt.artifact_body)
+        and is_q46_truth_gap_or_fill_in_template(attempt.visible_answer)
+        and not q46_story_grounding_issues(attempt.visible_answer)
     )
 
 
@@ -2791,6 +3101,8 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
 
     if case.id == "Q10" and has_mysql_not_valid_portability_claim(combined):
         issues.append("unsafe_mysql_not_valid_portability_claim")
+    if case.id == "Q10":
+        issues.extend(large_fk_migration_safety_issues(combined))
     if case.id == "Q39" and has_exactly_once_processing_overclaim(combined):
         issues.append("unsafe_exactly_once_processing_claim")
     if case.id == "Q39":
@@ -2813,11 +3125,14 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
             )
         )
     if case.id == "Q46":
-        issues.extend(q46_story_grounding_issues(combined))
-        safe_truth_gap = is_q46_truth_gap_or_fill_in_template(combined)
+        q46_visible = attempt.visible_answer
+        issues.extend(q46_story_grounding_issues(q46_visible))
+        safe_truth_gap = is_q46_truth_gap_or_fill_in_template(q46_visible)
         if safe_truth_gap and attempt.artifact_type != "needs_story_facts":
             issues.append("q46_truth_gap_missing_needs_story_facts_artifact")
-        if attempt.artifact_type == "needs_story_facts" and not safe_truth_gap:
+        if attempt.artifact_type == "needs_story_facts" and not (
+            safe_truth_gap and has_valid_needs_story_facts_artifact(attempt.artifact_body)
+        ):
             issues.append("q46_invalid_needs_story_facts_artifact")
     if case.id == "Q38" and has_drift_only_automatic_retraining(combined):
         issues.append("unsafe_drift_only_automatic_retraining")
@@ -2918,6 +3233,24 @@ def self_check_attempt_integrity_guards() -> None:
         "Fill-in template: At [company], [situation]. My task was [task]. I [action]. "
         "The result was [outcome]."
     )
+    story_facts_artifact = json.dumps(
+        {
+            "state": "needs_story_facts",
+            "required_fields": ["Situation", "Task", "Action", "Result"],
+            "all_fields": ["Situation", "Task", "Action", "Result"],
+        }
+    )
+    assert has_valid_needs_story_facts_artifact(story_facts_artifact)
+    malformed_story_artifacts = (
+        '{"state":"needs_story_facts","all_fields":[{}],"required_fields":["Task"]}',
+        '{"state":"needs_story_facts","all_fields":["Situation","Task","Action","Action"],"required_fields":["Task"]}',
+        '{"state":"needs_story_facts","all_fields":["Situation","Task","Action","Result"],"required_fields":[]}',
+        '{"state":"needs_story_facts","all_fields":["Situation","Task","Action","Result"],"required_fields":[{}]}',
+    )
+    assert all(
+        not has_valid_needs_story_facts_artifact(body)
+        for body in malformed_story_artifacts
+    )
     needs_facts = AttemptResult(
         attempt=1,
         ok=True,
@@ -2926,6 +3259,7 @@ def self_check_attempt_integrity_guards() -> None:
         terminal_answer=needs_facts_text,
         billing_received=True,
         artifact_type="needs_story_facts",
+        artifact_body=story_facts_artifact,
     )
     q46 = next(case for case in CASES if case.id == "Q46")
     assert blocking_answer_issues(q46, needs_facts) == ["needs_user_input"]
@@ -2963,6 +3297,7 @@ def self_check_attempt_integrity_guards() -> None:
         terminal_answer=fabricated_story,
         billing_received=True,
         artifact_type="needs_story_facts",
+        artifact_body=story_facts_artifact,
     )
     fabricated_issues = set(blocking_answer_issues(q46, mislabeled_fabrication))
     assert "q46_unsupported_first_person_story" in fabricated_issues
@@ -2982,6 +3317,7 @@ def self_check_attempt_integrity_guards() -> None:
         terminal_answer=appended_present_fabrication_text,
         billing_received=True,
         artifact_type="needs_story_facts",
+        artifact_body=story_facts_artifact,
     )
     appended_issues = set(blocking_answer_issues(q46, appended_present_fabrication))
     assert "q46_unsupported_first_person_story" in appended_issues
@@ -3037,6 +3373,16 @@ def self_check_attempt_integrity_guards() -> None:
         "            del self.cache[lru.key]\n"
         "```"
     )
+    canonical_code_body = (
+        "CODE\n----\nclass Example:\n    pass\n\n"
+        "LINE NOTES\n----------\n1: class declaration\n\n"
+        "COMPLEXITY\n----------\n- Time: O(1)\n\n"
+        "NOTES\n-----\n```python\nprint('notes example')\n```\n"
+    )
+    assert python_source_from_code_artifact(canonical_code_body) == (
+        "class Example:\n    pass"
+    )
+    ast.parse(python_source_from_code_artifact(canonical_code_body))
     valid_code = AttemptResult(
         attempt=1,
         ok=True,
@@ -3677,6 +4023,8 @@ def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     self_check_billing_event_validation()
     self_check_ambiguous_payment_detector()
+    self_check_large_fk_migration_safety()
+    self_check_exactly_once_processing_detector()
     self_check_payment_operation_semantics()
     self_check_payment_platform_safety_detector()
     self_check_q46_story_grounding_detector()
