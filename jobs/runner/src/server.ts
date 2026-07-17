@@ -4,9 +4,12 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium, type BrowserContext } from "playwright";
 import {
+  ApprovedExecutionIntegrityError,
   PlaywrightBrowserPage,
+  assertApprovedExecutionChecksum,
   assertPublicApplicationUrl,
   createApplicationReceipt,
+  createApprovedExecutionSnapshot,
   executeApplication,
   materializeApplicationDocuments,
   restartDisposition,
@@ -47,6 +50,12 @@ import {
 } from "./run-checkpoint-store.js";
 import { providerRegistryForResumeAction } from "./resume-policy.js";
 import { readResult, ResultStoreError, stageResult, writeResult } from "./result-store.js";
+import {
+  decideRunnerInterventionResolution,
+  parseRunnerInterventionResolution,
+  RunnerInterventionPolicyError,
+  type RunResolution,
+} from "./intervention-policy.js";
 
 interface CloudRunRequest {
   accountId: string;
@@ -58,14 +67,6 @@ interface CloudRunRequest {
   url: string;
   packet: ApplicationPacket;
   job: NormalizedJob;
-}
-
-interface RunResolution {
-  requestId: string;
-  profileScope: string;
-  action?: string;
-  field?: string;
-  answer?: string;
 }
 
 type RunEvent = { id: string; occurredAt: string; type: string; detail?: Record<string, unknown> };
@@ -110,8 +111,7 @@ const runnerServer = createServer(async (request, response) => {
     if (request.url === "/healthz" && request.method === "GET") return json(response, 200, { ok: true });
     if (!authorized(request)) return json(response, 401, { error: "Unauthorized" });
     if (request.url === "/runs" && request.method === "POST") {
-      const input = await body<CloudRunRequest>(request);
-      await validate(input);
+      const input = await validate(await body<CloudRunRequest>(request));
       const requestId = `${input.runId}:initial`;
       const paths = profilePaths(root, input.accountId, input.applicationIdentityId);
       const resultContext = { requestId, profileScope: paths.scope };
@@ -207,12 +207,20 @@ const runnerServer = createServer(async (request, response) => {
     }
     const resume = request.url?.match(/^\/runs\/([A-Za-z0-9_-]{3,160})\/resume$/);
     if (resume && request.method === "POST") {
-      const resolution = await body<RunResolution>(request);
+      const resolution = parseRunnerInterventionResolution(await body<unknown>(request));
       if (!/^[A-Za-z0-9:_-]{3,240}$/.test(resolution.requestId || "")) {
         return json(response, 400, { error: "A valid request ID is required" });
       }
       if (!/^[a-f0-9]{40}$/.test(resolution.profileScope || "")) {
         return json(response, 400, { error: "A valid profile scope is required" });
+      }
+      const interventionDecision = decideRunnerInterventionResolution(resolution);
+      if (interventionDecision.kind === "requires_reapproval") {
+        return json(response, 409, {
+          error: interventionDecision.reason,
+          state: "needs_confirmation",
+          requiresReapproval: true,
+        });
       }
       const resultContext = {
         requestId: resolution.requestId,
@@ -228,9 +236,7 @@ const runnerServer = createServer(async (request, response) => {
         const existing = await readResult<CloudRunResult>(root, resultContext, profileKey);
         if (existing) return existing;
         if (activeRuns.get(resume[1]) !== active) throw new Error("Browser run is no longer active");
-        if (resolution.field && resolution.answer) {
-          active.input.packet.answers[resolution.field] = resolution.answer;
-        }
+        assertApprovedExecutionChecksum(active.input.packet, active.input.job);
         try {
           const executed = await executeRun(
             active.input,
@@ -369,12 +375,12 @@ async function restoreCloudRunCheckpoint(
 async function restoreCheckpoint(
   checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
 ): Promise<void> {
-  await validate(checkpoint.request);
+  const approvedRequest = await validate(checkpoint.request);
   const paths = profilePathsFromScope(root, checkpoint.profileScope);
   if (profilePaths(
     root,
-    checkpoint.request.accountId,
-    checkpoint.request.applicationIdentityId,
+    approvedRequest.accountId,
+    approvedRequest.applicationIdentityId,
   ).scope !== paths.scope) {
     throw new Error("Cloud run checkpoint profile mismatch");
   }
@@ -384,10 +390,10 @@ async function restoreCheckpoint(
   let context: BrowserContext | undefined;
   try {
     lease = await leaseClient.claim({
-      accountId: checkpoint.request.accountId,
-      applicationId: checkpoint.request.applicationId,
-      runId: checkpoint.request.runId,
-      browserProfileId: checkpoint.request.browserProfileId,
+      accountId: approvedRequest.accountId,
+      applicationId: approvedRequest.applicationId,
+      runId: approvedRequest.runId,
+      browserProfileId: approvedRequest.browserProfileId,
     });
     await restoreProfile(paths, profileKey!);
     context = await chromium.launchPersistentContext(paths.directory, {
@@ -399,7 +405,7 @@ async function restoreCheckpoint(
     await installBrowserNetworkGuard(context);
     const recoveryUrl = /^https?:\/\//i.test(checkpoint.browser.url)
       ? checkpoint.browser.url
-      : checkpoint.request.url;
+      : approvedRequest.url;
     await assertPublicApplicationUrl(recoveryUrl);
     const existingPage = context.pages().find((page) => /^https?:\/\//i.test(page.url()));
     const page = existingPage ?? context.pages()[0] ?? await context.newPage();
@@ -409,7 +415,7 @@ async function restoreCheckpoint(
     const active = {
       context,
       paths,
-      input: checkpoint.request,
+      input: approvedRequest,
       events: checkpoint.events,
       lease,
       checkpointCreatedAtMs: checkpoint.createdAtMs,
@@ -417,7 +423,7 @@ async function restoreCheckpoint(
     activeScopes.add(paths.scope);
     activeRuns.set(checkpoint.browserSessionId, active);
     await writeCloudCheckpoint({
-      input: checkpoint.request,
+      input: approvedRequest,
       paths,
       events: checkpoint.events,
       lease,
@@ -592,10 +598,15 @@ async function executeRun(
   requestId = `${input.runId}:initial`,
   checkpointCreatedAtMs = Date.now(),
 ) {
+  assertApprovedExecutionChecksum(input.packet, input.job);
   const runDirectory = join(root, "receipts", paths.scope, input.runId);
   await mkdir(runDirectory, { recursive: true });
   const documents = await materializeApplicationDocuments(input.packet, join(runDirectory, "documents"));
-  input.packet = documents.packet;
+  const runtimePacket: ApplicationPacket = {
+    ...documents.packet,
+    applicationIdentityId: input.applicationIdentityId,
+    browserProfileId: input.browserProfileId,
+  };
   const page = context.pages()[0] || await context.newPage();
   if (navigate) await page.goto(input.url, { waitUntil: "domcontentloaded", timeout: 45_000 });
   const browserPage = new PlaywrightBrowserPage(page);
@@ -604,11 +615,7 @@ async function executeRun(
     runId: input.runId,
     accountId: input.accountId,
     page: browserPage,
-    packet: {
-      ...input.packet,
-      applicationIdentityId: input.applicationIdentityId,
-      browserProfileId: input.browserProfileId,
-    },
+    packet: runtimePacket,
     async log(type: string, detail: Record<string, unknown> = {}) {
       events.push({ id: `${input.runId}:${events.length + 1}`, occurredAt: new Date().toISOString(), type, detail });
     },
@@ -737,7 +744,7 @@ async function evidenceObject(
   };
 }
 
-async function validate(input: CloudRunRequest): Promise<void> {
+async function validate(input: CloudRunRequest): Promise<CloudRunRequest> {
   for (const [name, value] of Object.entries({
     accountId: input.accountId,
     applicationIdentityId: input.applicationIdentityId,
@@ -753,7 +760,13 @@ async function validate(input: CloudRunRequest): Promise<void> {
     && input.packet.applicationIdentityId !== input.applicationIdentityId) throw new Error("Application email mismatch");
   if (input.packet.browserProfileId
     && input.packet.browserProfileId !== input.browserProfileId) throw new Error("Browser profile mismatch");
+  const approved = createApprovedExecutionSnapshot(input.packet, input.job);
   await assertPublicApplicationUrl(input.url);
+  return Object.freeze({
+    ...input,
+    packet: approved.approvedPacket,
+    job: approved.approvedJob,
+  });
 }
 
 async function closeBrowserExecution(
@@ -789,6 +802,16 @@ async function closeActiveRun(
 }
 
 function publicRunnerFailure(error: unknown): { status: number; code: string; message: string } {
+  if (error instanceof RunnerInterventionPolicyError) {
+    return { status: 400, code: "invalid_intervention_resolution", message: error.message };
+  }
+  if (error instanceof ApprovedExecutionIntegrityError) {
+    return {
+      status: 409,
+      code: error.code,
+      message: "This application packet changed after approval and must be reviewed again.",
+    };
+  }
   if (error instanceof RunnerEncryptionError) {
     return {
       status: 500,

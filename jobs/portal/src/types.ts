@@ -260,6 +260,30 @@ export interface AnswerMemory {
   use_count: number;
 }
 
+export type CandidateEventType = "match_feedback" | "application_issue" | "application_outcome";
+
+export interface CandidateEvent {
+  id: string;
+  event_type: CandidateEventType;
+  job_id?: string;
+  application_id?: string;
+  action: string;
+  reasons: string[];
+  note: string;
+  status: "recorded" | "open" | "confirmed" | string;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface CandidateEventInput {
+  event_type: CandidateEventType;
+  job_id?: string;
+  application_id?: string;
+  action: string;
+  reasons?: string[];
+  note?: string;
+}
+
 export interface InterventionResolutionResult {
   intervention: Intervention;
   answer_memory?: AnswerMemory;
@@ -352,6 +376,7 @@ export interface JobsWorkspace {
   browser_sessions: BrowserSession[];
   interventions: Intervention[];
   answer_memory: AnswerMemory[];
+  candidate_events: CandidateEvent[];
   integrations: JobsIntegration[];
   application_identities: ApplicationIdentity[];
   mailbox_connections: MailboxConnection[];

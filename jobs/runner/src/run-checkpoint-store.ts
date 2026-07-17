@@ -12,7 +12,12 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { DurableRunPhase } from "@bluey/jobs-automation";
+import {
+  assertApprovedExecutionChecksum,
+  type ApplicationPacket,
+  type DurableRunPhase,
+  type NormalizedJob,
+} from "@bluey/jobs-automation";
 import { decryptBytes, encryptBytes, replaceFileDurably } from "./crypto-envelope.js";
 import { profilePathsFromScope, sealProfile } from "./profile-store.js";
 
@@ -263,6 +268,7 @@ function validateCheckpoint(value: unknown): asserts value is CloudRunCheckpoint
     throw new Error("Invalid cloud run checkpoint browser profile");
   }
   const packet = requireRecord(request.packet, "cloud checkpoint packet");
+  const job = requireRecord(request.job, "cloud checkpoint job");
   if (packet.applicationId !== request.applicationId
     || (packet.applicationIdentityId !== undefined
       && packet.applicationIdentityId !== request.applicationIdentityId)
@@ -270,6 +276,10 @@ function validateCheckpoint(value: unknown): asserts value is CloudRunCheckpoint
       && packet.browserProfileId !== request.browserProfileId)) {
     throw new Error("Cloud run checkpoint request binding mismatch");
   }
+  assertApprovedExecutionChecksum(
+    packet as unknown as ApplicationPacket,
+    job as unknown as NormalizedJob,
+  );
   const browser = requireRecord(checkpoint.browser, "cloud checkpoint browser");
   if (typeof browser.url !== "string" || browser.url.length === 0 || browser.url.length > 8_192) {
     throw new Error("Invalid cloud run checkpoint browser URL");

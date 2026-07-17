@@ -22,10 +22,10 @@ use crate::{
     api::AppState,
     auth::AuthedAccount,
     db::jobs::{
-        self, AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession, CareerFact,
-        CareerProfile, CareerTrack, Intervention, JobApplication, JobPosting, JobPreferences,
-        JobsEntitlement, JobsIntegration, JobsWorkspace, MailboxConnection, PacketCommitResult,
-        ResumeVersion, RunEvent,
+        self, AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession,
+        CandidateEvent, CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication,
+        JobPosting, JobPreferences, JobsEntitlement, JobsIntegration, JobsWorkspace,
+        MailboxConnection, PacketCommitResult, ResumeVersion, RunEvent,
     },
     object_storage::{sha256_hex, ObjectStorage},
 };
@@ -112,6 +112,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/jobs/answers/:answer_id",
             put(update_answer_memory).delete(delete_answer_memory),
+        )
+        .route(
+            "/api/jobs/candidate-events",
+            get(candidate_events).post(save_candidate_event),
         )
         .route(
             "/api/jobs/integrations",
@@ -286,9 +290,8 @@ pub async fn profile(
 pub async fn save_profile(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-    Json(mut profile): Json<CareerProfile>,
+    Json(profile): Json<CareerProfile>,
 ) -> Result<Json<CareerProfile>, ApiError> {
-    profile.email = account.email.clone();
     validate_profile(&profile)?;
     jobs::save_profile(&state.pool, &account.id, &profile)
         .map(Json)
@@ -308,7 +311,6 @@ pub async fn complete_onboarding(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(mut input): Json<CompleteOnboardingRequest>,
 ) -> Result<Json<JobsWorkspace>, ApiError> {
-    input.profile.email = account.email.clone();
     input.profile.onboarding_step = 6;
     input.profile.onboarding_complete = true;
     validate_profile(&input.profile)?;
@@ -1362,8 +1364,7 @@ fn validate_approved_execution_matches(
         && packet.get("resumeVersionId").and_then(Value::as_str) == Some(resume.id.as_str())
         && packet.get("applicationIdentityId").and_then(Value::as_str) == Some(identity_id)
         && packet.get("applicationEmail").and_then(Value::as_str) == Some(identity_email)
-        && job.get("canonicalUrl").and_then(Value::as_str)
-            == Some(posting.canonical_url.as_str());
+        && job.get("canonicalUrl").and_then(Value::as_str) == Some(posting.canonical_url.as_str());
     if !matches {
         return Err((
             StatusCode::CONFLICT,
@@ -1890,6 +1891,55 @@ pub async fn delete_answer_memory(
     } else {
         Err((StatusCode::NOT_FOUND, "Saved answer not found.".to_string()))
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateEventRequest {
+    pub event_type: String,
+    #[serde(default)]
+    pub job_id: Option<String>,
+    #[serde(default)]
+    pub application_id: Option<String>,
+    pub action: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub note: String,
+}
+
+pub async fn candidate_events(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<Vec<CandidateEvent>>, ApiError> {
+    jobs::list_candidate_events(&state.pool, &account.id)
+        .map(Json)
+        .map_err(internal)
+}
+
+pub async fn save_candidate_event(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(input): Json<CandidateEventRequest>,
+) -> Result<Json<CandidateEvent>, ApiError> {
+    jobs::save_candidate_event(
+        &state.pool,
+        &account.id,
+        &CandidateEvent {
+            id: String::new(),
+            event_type: input.event_type,
+            job_id: input.job_id,
+            application_id: input.application_id,
+            action: input.action,
+            reasons: input.reasons,
+            note: input.note,
+            status: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .map(Json)
+    .map_err(domain_error)
 }
 
 pub async fn integrations(
@@ -3816,9 +3866,7 @@ fn validate_receipt_bundle(
             "Receipt packet does not match the approved job, resume, and application email.",
         );
     }
-    if packet
-        .get("approvedPacketChecksum")
-        .and_then(Value::as_str)
+    if packet.get("approvedPacketChecksum").and_then(Value::as_str)
         != Some(approved_checksum.as_str())
         || packet.get("answers") != approved_packet.get("answers")
     {
@@ -4229,6 +4277,12 @@ fn domain_error(error: anyhow::Error) -> ApiError {
         || message.contains("answer Bluey should remember")
         || message.contains("where this answer should be reused")
         || message.contains("career track not found")
+        || message.contains("candidate feedback")
+        || message.contains("candidate event")
+        || message.contains("match feedback")
+        || message.contains("application issue")
+        || message.contains("application outcome")
+        || message.contains("does not belong to this job")
     {
         StatusCode::BAD_REQUEST
     } else {

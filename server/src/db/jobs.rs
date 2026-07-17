@@ -17,7 +17,7 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
@@ -611,6 +611,28 @@ pub struct AnswerMemory {
     pub use_count: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateEvent {
+    #[serde(default)]
+    pub id: String,
+    pub event_type: String,
+    #[serde(default)]
+    pub job_id: Option<String>,
+    #[serde(default)]
+    pub application_id: Option<String>,
+    pub action: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplicationEvidence {
     #[serde(default)]
@@ -809,6 +831,7 @@ pub struct JobsWorkspace {
     pub browser_sessions: Vec<BrowserSession>,
     pub interventions: Vec<Intervention>,
     pub answer_memory: Vec<AnswerMemory>,
+    pub candidate_events: Vec<CandidateEvent>,
     pub integrations: Vec<JobsIntegration>,
     pub application_identities: Vec<ApplicationIdentity>,
     pub mailbox_connections: Vec<MailboxConnection>,
@@ -4613,11 +4636,9 @@ pub fn prepare_application(
     if !eligibility.can_prepare {
         anyhow::bail!(eligibility_error_message(&eligibility))
     }
-    let login_email = if profile.email.trim().is_empty() {
-        account_login_email(pool, account_id)?
-    } else {
-        profile.email.clone()
-    };
+    // Resume contact data is user-editable and may differ from the Bluey login.
+    // Only the authenticated account email may bootstrap a verified identity.
+    let login_email = account_login_email(pool, account_id)?;
     let _ = ensure_primary_application_identity(pool, account_id, &login_email)?;
     let identities = list_application_identities(pool, account_id)?;
     let track_identity_id = list_tracks(pool, account_id)?
@@ -5961,6 +5982,170 @@ pub fn delete_answer_memory(pool: &DbPool, account_id: &str, answer_id: &str) ->
             "DELETE FROM jobs_answer_memory WHERE account_id = $1 AND id = $2",
             &[&account_id, &answer_id],
         )? > 0),
+    })
+}
+
+pub fn list_candidate_events(pool: &DbPool, account_id: &str) -> Result<Vec<CandidateEvent>> {
+    list_payloads(
+        pool,
+        account_id,
+        "jobs_candidate_events",
+        "event_json",
+        "created_at_ms DESC, id DESC",
+        "candidate event",
+    )
+}
+
+pub fn save_candidate_event(
+    pool: &DbPool,
+    account_id: &str,
+    event: &CandidateEvent,
+) -> Result<CandidateEvent> {
+    let mut value = event.clone();
+    value.event_type = value.event_type.trim().to_ascii_lowercase();
+    value.action = value.action.trim().to_ascii_lowercase();
+    value.note = value.note.trim().to_string();
+    value.reasons = value
+        .reasons
+        .iter()
+        .map(|reason| reason.trim().to_ascii_lowercase())
+        .filter(|reason| !reason.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if value.note.len() > 1_000 || value.reasons.len() > 8 {
+        anyhow::bail!("candidate feedback is too long")
+    }
+
+    let application = if let Some(application_id) = value.application_id.as_deref() {
+        Some(
+            get_application(pool, account_id, application_id)?
+                .ok_or_else(|| anyhow::anyhow!("application not found"))?,
+        )
+    } else {
+        None
+    };
+    if value.job_id.is_none() {
+        value.job_id = application.as_ref().map(|item| item.job_id.clone());
+    }
+    if let Some(application) = application.as_ref() {
+        if value.job_id.as_deref() != Some(application.job_id.as_str()) {
+            anyhow::bail!("application does not belong to this job")
+        }
+    }
+    if let Some(job_id) = value.job_id.as_deref() {
+        if get_posting(pool, account_id, job_id)?.is_none() {
+            anyhow::bail!("job not found")
+        }
+    }
+
+    value.status = match value.event_type.as_str() {
+        "match_feedback" => {
+            if value.application_id.is_some() || value.job_id.is_none() {
+                anyhow::bail!("match feedback must reference one job")
+            }
+            if !matches!(value.action.as_str(), "pass" | "restore") {
+                anyhow::bail!("invalid match feedback action")
+            }
+            if value.action == "pass"
+                && value.reasons.iter().any(|reason| {
+                    !matches!(
+                        reason.as_str(),
+                        "role_mismatch"
+                            | "location"
+                            | "compensation"
+                            | "seniority"
+                            | "company"
+                            | "sponsorship"
+                            | "already_applied"
+                            | "not_interested"
+                            | "other"
+                    )
+                })
+            {
+                anyhow::bail!("invalid match feedback reason")
+            }
+            "recorded"
+        }
+        "application_issue" => {
+            if value.application_id.is_none() {
+                anyhow::bail!("application issue must reference an application")
+            }
+            if !matches!(
+                value.action.as_str(),
+                "site_problem"
+                    | "wrong_information"
+                    | "duplicate_application"
+                    | "submission_status"
+                    | "billing"
+                    | "other"
+            ) {
+                anyhow::bail!("invalid application issue category")
+            }
+            "open"
+        }
+        "application_outcome" => {
+            if value.application_id.is_none() {
+                anyhow::bail!("application outcome must reference an application")
+            }
+            if !matches!(
+                value.action.as_str(),
+                "interview" | "rejected" | "offer" | "withdrawn"
+            ) {
+                anyhow::bail!("invalid application outcome")
+            }
+            "confirmed"
+        }
+        _ => anyhow::bail!("invalid candidate event type"),
+    }
+    .to_string();
+
+    value.id = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
+    value.created_at_ms = now;
+    value.updated_at_ms = now;
+    let payload = to_json(&value, "candidate event")?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            pool.get()?.execute(
+                "INSERT INTO jobs_candidate_events (
+                    id, account_id, event_type, job_id, application_id, status,
+                    event_json, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    value.id,
+                    account_id,
+                    value.event_type,
+                    value.job_id,
+                    value.application_id,
+                    value.status,
+                    payload,
+                    value.created_at_ms,
+                    value.updated_at_ms,
+                ],
+            )?;
+            Ok(value)
+        }
+        DbPool::Postgres(_) => {
+            pool.get_pg()?.execute(
+                "INSERT INTO jobs_candidate_events (
+                    id, account_id, event_type, job_id, application_id, status,
+                    event_json, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &value.id,
+                    &account_id,
+                    &value.event_type,
+                    &value.job_id,
+                    &value.application_id,
+                    &value.status,
+                    &payload,
+                    &value.created_at_ms,
+                    &value.updated_at_ms,
+                ],
+            )?;
+            Ok(value)
+        }
     })
 }
 
@@ -9350,6 +9535,7 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
         browser_sessions: list_browser_sessions(pool, account_id)?,
         interventions: list_interventions(pool, account_id)?,
         answer_memory: list_answer_memory(pool, account_id)?,
+        candidate_events: list_candidate_events(pool, account_id)?,
         integrations: list_integrations(pool, account_id)?,
         application_identities: list_application_identities(pool, account_id)?,
         mailbox_connections: list_mailbox_connections(pool, account_id)?,
@@ -10721,6 +10907,45 @@ mod tests {
     }
 
     #[test]
+    fn resume_contact_email_never_bootstraps_a_verified_application_identity() {
+        let pool = test_pool();
+        let mut profile = default_profile("resume-contact@example.com");
+        profile.full_name = "Taylor Rivera".to_string();
+        profile.headline = "Software Engineer".to_string();
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/contact-email",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, resume) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+
+        assert_eq!(
+            get_profile(&pool, "acct-jobs", "").unwrap().email,
+            "resume-contact@example.com"
+        );
+        let identities = list_application_identities(&pool, "acct-jobs").unwrap();
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].email, "jobs@example.com");
+        assert_eq!(identities[0].verification_status, "verified");
+        assert_eq!(resume.content["contact"]["email"], "jobs@example.com");
+        assert_eq!(
+            application.receipt["application_identity"]["email"],
+            "jobs@example.com"
+        );
+    }
+
+    #[test]
     fn packet_metering_only_counts_a_job_once() {
         let pool = test_pool();
         let profile = default_profile("jobs@example.com");
@@ -11453,6 +11678,130 @@ mod tests {
         assert!(!raw.contains("dependable products"));
         assert!(delete_answer_memory(&pool, "acct-jobs", &second.id).unwrap());
         assert!(list_answer_memory(&pool, "acct-jobs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn candidate_events_are_encrypted_tenant_scoped_and_append_only() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-other', 'other@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/candidate-events",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let base = CandidateEvent {
+            id: String::new(),
+            event_type: "match_feedback".to_string(),
+            job_id: Some(posting.id.clone()),
+            application_id: None,
+            action: "pass".to_string(),
+            reasons: vec!["location".to_string()],
+            note: "The commute is too long.".to_string(),
+            status: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let passed = save_candidate_event(&pool, "acct-jobs", &base).unwrap();
+        let restored = save_candidate_event(
+            &pool,
+            "acct-jobs",
+            &CandidateEvent {
+                action: "restore".to_string(),
+                reasons: Vec::new(),
+                note: String::new(),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        assert_ne!(passed.id, restored.id);
+
+        let issue = save_candidate_event(
+            &pool,
+            "acct-jobs",
+            &CandidateEvent {
+                event_type: "application_issue".to_string(),
+                job_id: None,
+                application_id: Some(application.id.clone()),
+                action: "site_problem".to_string(),
+                reasons: Vec::new(),
+                note: "The employer form did not accept the attachment.".to_string(),
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(issue.job_id.as_deref(), Some(posting.id.as_str()));
+        assert_eq!(issue.status, "open");
+        let outcome = save_candidate_event(
+            &pool,
+            "acct-jobs",
+            &CandidateEvent {
+                event_type: "application_outcome".to_string(),
+                job_id: Some(posting.id.clone()),
+                application_id: Some(application.id.clone()),
+                action: "interview".to_string(),
+                reasons: Vec::new(),
+                note: "Recruiter screen next week.".to_string(),
+                ..base
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.status, "confirmed");
+        assert_eq!(list_candidate_events(&pool, "acct-jobs").unwrap().len(), 4);
+        assert!(list_candidate_events(&pool, "acct-other")
+            .unwrap()
+            .is_empty());
+
+        let raw: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT event_json FROM jobs_candidate_events WHERE id = ?1",
+                params![issue.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(raw.starts_with(ENCRYPTED_PAYLOAD_PREFIX));
+        assert!(!raw.contains("employer form"));
+
+        let cross_account = save_candidate_event(
+            &pool,
+            "acct-other",
+            &CandidateEvent {
+                id: String::new(),
+                event_type: "application_issue".to_string(),
+                job_id: None,
+                application_id: Some(application.id),
+                action: "other".to_string(),
+                reasons: Vec::new(),
+                note: String::new(),
+                status: String::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        );
+        assert!(cross_account
+            .unwrap_err()
+            .to_string()
+            .contains("application not found"));
     }
 
     #[test]

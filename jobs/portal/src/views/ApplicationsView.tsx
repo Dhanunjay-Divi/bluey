@@ -20,12 +20,14 @@ import {
   Search,
   Send,
   Sparkles,
+  TriangleAlert,
 } from "lucide-react";
-import type { ApplicationEvidence, Intervention, JobApplication, JobEligibilityDecision, JobPosting, JobsWorkspace, ResumeVersion } from "../types";
+import type { ApplicationEvidence, CandidateEventInput, Intervention, JobApplication, JobEligibilityDecision, JobPosting, JobsWorkspace, ResumeVersion } from "../types";
 import { relativeTime, titleCase } from "../lib/format";
 import { Dialog } from "../components/Dialog";
 import { InterviewPrepDialog } from "../components/InterviewPrepDialog";
 import { exportResumeDocx, exportResumePdf } from "../lib/documents";
+import { applicationIssueReasons, applicationIssues, applicationOutcomes, eventActionLabel, latestApplicationOutcome } from "../lib/candidate-events";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -34,6 +36,7 @@ interface Props {
   onCommit(application: JobApplication): Promise<void>;
   onLoadResume(id: string): Promise<ResumeVersion | undefined>;
   onResolveIntervention(intervention: Intervention, action: string, resolution?: { answer?: string; remember?: boolean; scope?: string; scope_id?: string }): Promise<void>;
+  onSaveCandidateEvent(event: CandidateEventInput): Promise<unknown>;
 }
 
 const stateGroups = [
@@ -43,7 +46,7 @@ const stateGroups = [
   ["all", "All"],
 ] as const;
 
-export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit, onLoadResume, onResolveIntervention }: Props) {
+export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit, onLoadResume, onResolveIntervention, onSaveCandidateEvent }: Props) {
   const [filter, setFilter] = useState<(typeof stateGroups)[number][0]>("active");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<JobApplication | null>(null);
@@ -55,6 +58,10 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   const [rememberAnswer, setRememberAnswer] = useState(true);
   const [answerScope, setAnswerScope] = useState<"account" | "track" | "company">("account");
   const [prepTarget, setPrepTarget] = useState<{ application: JobApplication; job: JobPosting; resume: ResumeVersion } | null>(null);
+  const [feedbackApplication, setFeedbackApplication] = useState<JobApplication | null>(null);
+  const [feedbackMode, setFeedbackMode] = useState<"outcome" | "issue" | null>(null);
+  const [feedbackAction, setFeedbackAction] = useState("");
+  const [feedbackNote, setFeedbackNote] = useState("");
   const openInterventions = workspace.interventions.filter((item) => item.status === "open");
 
   const jobs = useMemo(() => new Map(workspace.matches.map((job) => [job.id, job])), [workspace.matches]);
@@ -188,6 +195,37 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
     }
   };
 
+  const openFeedback = (application: JobApplication, nextMode: "outcome" | "issue") => {
+    setFeedbackApplication(application);
+    setFeedbackMode(nextMode);
+    setFeedbackAction("");
+    setFeedbackNote("");
+    setSelected(null);
+  };
+
+  const saveFeedback = async () => {
+    if (!feedbackApplication || !feedbackMode || !feedbackAction) return;
+    setBusy(true);
+    setLocalError("");
+    try {
+      await onSaveCandidateEvent({
+        event_type: feedbackMode === "outcome" ? "application_outcome" : "application_issue",
+        job_id: feedbackApplication.job_id,
+        application_id: feedbackApplication.id,
+        action: feedbackAction,
+        note: feedbackNote,
+      });
+      setFeedbackMode(null);
+      setFeedbackApplication(null);
+      setFeedbackAction("");
+      setFeedbackNote("");
+    } catch (cause) {
+      setLocalError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="view-shell applications-view">
       <section className="view-heading">
@@ -220,11 +258,12 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
         {filtered.map((application) => {
           const job = jobs.get(application.job_id);
           const rowResume = application.resume_version_id ? resumeVersions[application.resume_version_id] : undefined;
+          const outcome = latestApplicationOutcome(workspace.candidate_events, application.id);
           return (
             <button key={application.id} className="application-row" onClick={() => setSelected(application)}>
               <div className="company-mark">{(job?.company || "BJ").slice(0, 2).toUpperCase()}</div>
               <div className="application-main"><strong>{job?.title || "Application"}</strong><span>{job?.company || "Unknown company"} · {job?.location || "Location not listed"}</span></div>
-              <div className="application-stage">{stateIcon(application.state)}<span><b>{titleCase(application.state)}</b><small>{relativeTime(application.updated_at_ms)}</small></span></div>
+              <div className="application-stage">{stateIcon(application.state)}<span><b>{titleCase(application.state)}</b><small>{relativeTime(application.updated_at_ms)}{outcome ? ` · ${eventActionLabel(outcome.action)}` : ""}</small></span></div>
               <div className="application-packet"><FileText size={15} /><span>Job-specific resume<small>{rowResume ? `v${rowResume.version_no}` : "Prepared"} · {titleCase(application.submission_mode)}</small></span></div>
               <span className="icon-button" aria-hidden="true"><MoreHorizontal size={18} /></span>
             </button>
@@ -244,6 +283,10 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
                 ["Receipt", selected.state === "submitted"],
               ].map(([label, complete], index) => <div key={String(label)} className={complete ? "complete" : ""}><span>{complete ? <Check size={13} /> : index + 1}</span><b>{label}</b></div>)}
             </div>
+            {(latestApplicationOutcome(workspace.candidate_events, selected.id) || applicationIssues(workspace.candidate_events, selected.id).length > 0) && <div className="candidate-event-summary">
+              {latestApplicationOutcome(workspace.candidate_events, selected.id) && <span className="status-chip success">Outcome: {eventActionLabel(latestApplicationOutcome(workspace.candidate_events, selected.id)?.action || "")}</span>}
+              {applicationIssues(workspace.candidate_events, selected.id).length > 0 && <span className="status-chip warning">{applicationIssues(workspace.candidate_events, selected.id).length} open report{applicationIssues(workspace.candidate_events, selected.id).length === 1 ? "" : "s"}</span>}
+            </div>}
             {selected.state === "side_effect_unknown" && (
               <div className="input-needed" role="alert">
                 <AlertCircle size={17} />
@@ -278,12 +321,32 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
                 <div className="download-row"><button disabled={busy || !selectedResume} onClick={() => void download("pdf")}><Download size={15} />PDF</button><button disabled={busy || !selectedResume} onClick={() => void download("docx")}><Download size={15} />DOCX</button></div>
               </section>
             </div>
-            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : selected.state === "side_effect_unknown" ? "Automatic retry is disabled until the employer-facing outcome is reconciled." : "Approving counts this tailored application once. Retries do not double-charge."}</p><div>{selected.state === "needs_input" && !canAnswerIntervention && selectedSession?.takeover_url && <a className="button secondary" href={selectedSession.takeover_url}><MonitorUp size={16} />Take over browser</a>}{selected.state === "needs_input" && !canAnswerIntervention && !selectedSession?.takeover_url && <button className="button secondary" disabled title="A scoped resume link is not available for this run"><MonitorUp size={16} />Takeover unavailable</button>}{selected.state === "awaiting_review" && applicationEligibility(selected, selectedJob).can_queue_local && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}{selected.state === "awaiting_review" && !applicationEligibility(selected, selectedJob).can_queue_local && ["handoff", "unknown_review"].includes(applicationEligibility(selected, selectedJob).capability) && <button className="button primary" disabled={busy} onClick={() => void openHandoff()}><Send size={16} />Open job site</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && selectedJob && selectedResume && <button className="button primary" onClick={() => { setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume }); setSelected(null); }}><Sparkles size={16} />Prepare interview</button>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
+            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : selected.state === "side_effect_unknown" ? "Automatic retry is disabled until the employer-facing outcome is reconciled." : "Approving counts this tailored application once. Retries do not double-charge."}</p><div><button className="button secondary" onClick={() => openFeedback(selected, "issue")}><TriangleAlert size={16} />Report problem</button>{selected.state === "submitted" && <button className="button secondary" onClick={() => openFeedback(selected, "outcome")}><CalendarDays size={16} />Update outcome</button>}{selected.state === "needs_input" && !canAnswerIntervention && selectedSession?.takeover_url && <a className="button secondary" href={selectedSession.takeover_url}><MonitorUp size={16} />Take over browser</a>}{selected.state === "needs_input" && !canAnswerIntervention && !selectedSession?.takeover_url && <button className="button secondary" disabled title="A scoped resume link is not available for this run"><MonitorUp size={16} />Takeover unavailable</button>}{selected.state === "awaiting_review" && applicationEligibility(selected, selectedJob).can_queue_local && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}{selected.state === "awaiting_review" && !applicationEligibility(selected, selectedJob).can_queue_local && ["handoff", "unknown_review"].includes(applicationEligibility(selected, selectedJob).capability) && <button className="button primary" disabled={busy} onClick={() => void openHandoff()}><Send size={16} />Open job site</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && selectedJob && selectedResume && <button className="button primary" onClick={() => { setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume }); setSelected(null); }}><Sparkles size={16} />Prepare interview</button>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
           </div>
         )}
       </Dialog>
       <Dialog open={receiptOpen} title="Submission receipt" description={selected ? `${jobs.get(selected.job_id)?.company || "Application"} · ${jobs.get(selected.job_id)?.title || ""}` : ""} onClose={() => setReceiptOpen(false)}>
         {selected && <ReceiptView application={selected} resume={selectedResume} evidence={selectedEvidence} />}
+      </Dialog>
+      <Dialog open={feedbackMode === "outcome"} title="Update application outcome" description={feedbackApplication ? `${jobs.get(feedbackApplication.job_id)?.title || "Application"} at ${jobs.get(feedbackApplication.job_id)?.company || ""}` : ""} onClose={() => setFeedbackMode(null)}>
+        <div className="feedback-dialog">
+          <p>Record what the employer told you. Bluey keeps this separate from the locked submission receipt.</p>
+          <div className="choice-chips" role="group" aria-label="Application outcome">
+            {applicationOutcomes.map(([value, label]) => <button key={value} type="button" className={feedbackAction === value ? "active" : ""} onClick={() => setFeedbackAction(value)}>{label}</button>)}
+          </div>
+          <label><span>Note <small>optional</small></span><textarea value={feedbackNote} maxLength={1000} rows={3} onChange={(event) => setFeedbackNote(event.target.value)} placeholder="Interview date, recruiter note, or next step" /></label>
+        </div>
+        <div className="dialog-actions"><button className="button secondary" onClick={() => setFeedbackMode(null)}>Cancel</button><button className="button primary" disabled={busy || !feedbackAction} onClick={() => void saveFeedback()}>{busy ? "Saving..." : "Save outcome"}</button></div>
+      </Dialog>
+      <Dialog open={feedbackMode === "issue"} title="Report an application problem" description={feedbackApplication ? `${jobs.get(feedbackApplication.job_id)?.title || "Application"} at ${jobs.get(feedbackApplication.job_id)?.company || ""}` : ""} onClose={() => setFeedbackMode(null)}>
+        <div className="feedback-dialog">
+          <p>Tell Bluey what went wrong. The report stays attached to this application for support and review.</p>
+          <div className="choice-chips" role="group" aria-label="Problem category">
+            {applicationIssueReasons.map(([value, label]) => <button key={value} type="button" className={feedbackAction === value ? "active" : ""} onClick={() => setFeedbackAction(value)}>{label}</button>)}
+          </div>
+          <label><span>What happened?</span><textarea value={feedbackNote} maxLength={1000} rows={4} onChange={(event) => setFeedbackNote(event.target.value)} placeholder="Include the page or step where Bluey stopped" /></label>
+        </div>
+        <div className="dialog-actions"><button className="button secondary" onClick={() => setFeedbackMode(null)}>Cancel</button><button className="button primary" disabled={busy || !feedbackAction} onClick={() => void saveFeedback()}>{busy ? "Saving..." : "Send report"}</button></div>
       </Dialog>
       <InterviewPrepDialog target={prepTarget} workspace={workspace} onClose={() => setPrepTarget(null)} />
     </div>

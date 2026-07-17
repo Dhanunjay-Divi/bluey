@@ -1,4 +1,9 @@
 import { condition, defineSignal, proxyActivities, setHandler } from "@temporalio/workflow";
+import {
+  assertApprovedExecutionChecksum,
+  createApprovedExecutionSnapshot,
+  type SubmissionReceipt,
+} from "@bluey/jobs-automation";
 import type {
   ApplicationWorkflowInput,
   ApplicationWorkflowResult,
@@ -6,6 +11,7 @@ import type {
   JobsActivities,
   RunnerExecutionResult,
 } from "./contracts.js";
+import { decideInterventionResolution } from "./intervention-policy.js";
 
 export const resolveInterventionSignal = defineSignal<[InterventionResolution]>("resolveIntervention");
 
@@ -32,23 +38,31 @@ export async function applicationWorkflow(
     resolution = value;
   });
 
-  await activities.assertEntitlement(input);
-  await activities.loadPacket(input);
-  await activities.recordState(input, "running");
-  const { browserSessionId } = await activities.allocateBrowser(input);
+  const approved = createApprovedExecutionSnapshot(input.packet, input.job);
+  const approvedInput: ApplicationWorkflowInput = Object.freeze({
+    ...input,
+    packet: approved.approvedPacket,
+    job: approved.approvedJob,
+  });
+
+  await activities.assertEntitlement(approvedInput);
+  await activities.loadPacket(approvedInput);
+  await activities.recordState(approvedInput, "running");
+  const { browserSessionId } = await activities.allocateBrowser(approvedInput);
   try {
-    let execution = await irreversibleActivities.runApplication({ ...input, browserSessionId });
+    assertApprovedExecutionChecksum(approvedInput.packet, approvedInput.job);
+    let execution = await irreversibleActivities.runApplication({ ...approvedInput, browserSessionId });
     for (let interventionCount = 0; interventionCount < 6; interventionCount += 1) {
       // Clear the previous answer before publishing the next intervention. A
       // fast user response that arrives after createIntervention must not be
       // erased before condition observes it.
       resolution = undefined;
-      const outcome = await finishOrPause(input, browserSessionId, execution);
-      if (outcome) return outcome;
+      const step = await finishOrPause(approvedInput, browserSessionId, execution);
+      if (step.result) return step.result;
 
       const resolved = await condition(() => resolution !== undefined, "24 hours");
       if (!resolved || !resolution) {
-        await activities.recordState(input, "failed");
+        await activities.recordState(approvedInput, "failed");
         await activities.releaseBrowser(browserSessionId);
         return {
           state: "failed",
@@ -58,15 +72,41 @@ export async function applicationWorkflow(
           },
         };
       }
-      await activities.recordState(input, "running");
+      const decision = decideInterventionResolution(resolution);
+      if (decision.kind === "requires_reapproval") {
+        await activities.recordState(approvedInput, "needs_confirmation");
+        await activities.releaseBrowser(browserSessionId);
+        return {
+          state: "needs_confirmation",
+          receipt: requiresReapprovalReceipt(execution.receipt, decision.reason),
+          interventionId: step.interventionId,
+          requiresReapproval: true,
+        };
+      }
+      try {
+        assertApprovedExecutionChecksum(approvedInput.packet, approvedInput.job);
+      } catch {
+        await activities.recordState(approvedInput, "needs_confirmation");
+        await activities.releaseBrowser(browserSessionId);
+        return {
+          state: "needs_confirmation",
+          receipt: requiresReapprovalReceipt(
+            execution.receipt,
+            "The approved application packet changed and must be reviewed again.",
+          ),
+          interventionId: step.interventionId,
+          requiresReapproval: true,
+        };
+      }
+      await activities.recordState(approvedInput, "running");
       execution = await irreversibleActivities.resumeApplication({
-        ...input,
+        ...approvedInput,
         browserSessionId,
-        requestId: `${input.idempotencyKey}:resume:${interventionCount + 1}`,
-        resolution,
+        requestId: `${approvedInput.idempotencyKey}:resume:${interventionCount + 1}`,
+        resolution: decision.resolution,
       });
     }
-    await activities.recordState(input, "failed");
+    await activities.recordState(approvedInput, "failed");
     await activities.releaseBrowser(browserSessionId);
     return {
       state: "failed",
@@ -76,7 +116,7 @@ export async function applicationWorkflow(
       },
     };
   } catch (error) {
-    await activities.recordState(input, "side_effect_unknown");
+    await activities.recordState(approvedInput, "side_effect_unknown");
     return {
       state: "side_effect_unknown",
       receipt: {
@@ -95,12 +135,12 @@ async function finishOrPause(
   input: ApplicationWorkflowInput,
   browserSessionId: string,
   execution: RunnerExecutionResult,
-): Promise<ApplicationWorkflowResult | undefined> {
+): Promise<{ result?: ApplicationWorkflowResult; interventionId?: string }> {
   const receipt = execution.receipt;
   if (receipt.status === "needs_input") {
     const interventionId = await activities.createIntervention(input, receipt);
     await activities.recordState(input, "needs_input");
-    return undefined;
+    return { interventionId };
   }
   if (receipt.status === "submitted") {
     if (!execution.receiptBundle) throw new Error("Submitted run is missing its receipt bundle");
@@ -112,9 +152,19 @@ async function finishOrPause(
     });
     await activities.recordState(input, "submitted");
     await activities.releaseBrowser(browserSessionId);
-    return { state: "submitted", receipt };
+    return { result: { state: "submitted", receipt } };
   }
   await activities.recordState(input, "failed");
   await activities.releaseBrowser(browserSessionId);
-  return { state: "failed", receipt };
+  return { result: { state: "failed", receipt } };
+}
+
+function requiresReapprovalReceipt(receipt: SubmissionReceipt, reason: string): SubmissionReceipt {
+  return {
+    ...receipt,
+    issues: [
+      ...receipt.issues,
+      { field: "approved_packet", message: reason, severity: "blocking" },
+    ],
+  };
 }

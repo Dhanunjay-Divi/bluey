@@ -11,6 +11,8 @@ import type {
 export interface ImportedResume {
   name: string;
   text: string;
+  file_type?: "pdf" | "docx" | "txt";
+  page_count?: number;
 }
 
 export interface ResumeImportSummary {
@@ -20,6 +22,23 @@ export interface ResumeImportSummary {
   certifications: number;
   projects: number;
 }
+
+export type ResumeImportMode = "replace" | "merge";
+
+export interface ResumeImportPreview {
+  imported: ImportedResume;
+  parsed: CareerProfile;
+  replacement: CareerProfile;
+  merged: CareerProfile;
+  summary: ResumeImportSummary;
+  likely_different_person: boolean;
+  changed_sections: string[];
+}
+
+export const MAX_RESUME_BYTES = 10 * 1024 * 1024;
+export const MAX_RESUME_PDF_PAGES = 20;
+export const MAX_RESUME_TEXT_CHARACTERS = 200_000;
+const MIN_RESUME_TEXT_CHARACTERS = 40;
 
 interface PdfTextItem {
   str: string;
@@ -42,7 +61,11 @@ interface ResumeSections extends Record<ResumeSection, string[]> {}
 
 export async function importResume(file: File): Promise<ImportedResume> {
   const extension = file.name.split(".").pop()?.toLowerCase();
+  if (file.size > MAX_RESUME_BYTES) {
+    throw new Error("That resume is larger than 10 MB. Choose a smaller PDF, DOCX, or TXT file.");
+  }
   const buffer = await file.arrayBuffer();
+  validateResumeFileBytes(file.name, buffer);
   if (extension === "pdf") {
     const [pdfjs, worker] = await Promise.all([
       import("pdfjs-dist"),
@@ -50,27 +73,81 @@ export async function importResume(file: File): Promise<ImportedResume> {
     ]);
     pdfjs.GlobalWorkerOptions.workerSrc = worker.default;
     const pdf = await pdfjs.getDocument({ data: buffer }).promise;
+    if (pdf.numPages > MAX_RESUME_PDF_PAGES) {
+      throw new Error(`That PDF has ${pdf.numPages} pages. Bluey supports resumes up to ${MAX_RESUME_PDF_PAGES} pages.`);
+    }
     const pages: string[] = [];
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
       const page = await pdf.getPage(pageNumber);
       const content = await page.getTextContent();
       pages.push(pdfTextItemsToText(content.items as PdfTextItem[]));
+      if (pages.reduce((total, pageText) => total + pageText.length, 0) > MAX_RESUME_TEXT_CHARACTERS) {
+        throw new Error("That resume contains too much text. Choose a shorter resume and try again.");
+      }
     }
-    return { name: file.name, text: pages.join("\n\n").trim() };
+    return {
+      name: file.name,
+      text: validateExtractedResumeText(pages.join("\n\n"), "PDF"),
+      file_type: "pdf",
+      page_count: pdf.numPages,
+    };
   }
   if (extension === "docx") {
     const { default: mammoth } = await import("mammoth");
     const result = await mammoth.convertToHtml({ arrayBuffer: buffer });
-    return { name: file.name, text: resumeHtmlToText(result.value) };
+    return {
+      name: file.name,
+      text: validateExtractedResumeText(resumeHtmlToText(result.value), "DOCX"),
+      file_type: "docx",
+    };
   }
   if (extension === "txt") {
-    return { name: file.name, text: new TextDecoder().decode(buffer).trim() };
+    return {
+      name: file.name,
+      text: validateExtractedResumeText(new TextDecoder().decode(buffer), "TXT"),
+      file_type: "txt",
+    };
   }
   throw new Error("Use a PDF, DOCX, or TXT resume.");
 }
 
+export function validateResumeFileBytes(name: string, buffer: ArrayBuffer): void {
+  if (buffer.byteLength > MAX_RESUME_BYTES) {
+    throw new Error("That resume is larger than 10 MB. Choose a smaller PDF, DOCX, or TXT file.");
+  }
+  const extension = name.split(".").pop()?.toLowerCase();
+  const bytes = new Uint8Array(buffer);
+  if (extension === "pdf" && !startsWithAscii(bytes, "%PDF-")) {
+    throw new Error("That file is not a valid PDF. Choose the original PDF instead of a renamed file.");
+  }
+  if (
+    extension === "docx" &&
+    !(bytes[0] === 0x50 && bytes[1] === 0x4b && [0x03, 0x05, 0x07].includes(bytes[2]))
+  ) {
+    throw new Error("That file is not a valid DOCX. Choose the original Word document instead of a renamed file.");
+  }
+  if (!['pdf', 'docx', 'txt'].includes(extension || "")) {
+    throw new Error("Use a PDF, DOCX, or TXT resume.");
+  }
+}
+
+export function validateExtractedResumeText(text: string, label = "resume"): string {
+  const normalized = text.trim();
+  if (normalized.length > MAX_RESUME_TEXT_CHARACTERS) {
+    throw new Error("That resume contains too much text. Choose a shorter resume and try again.");
+  }
+  if (normalized.replace(/\s/g, "").length < MIN_RESUME_TEXT_CHARACTERS) {
+    const scanned = label.toLowerCase() === "pdf" ? " It may be an image-only or scanned PDF." : "";
+    throw new Error(`Bluey could not find readable resume text.${scanned} Export it with selectable text and try again.`);
+  }
+  return normalized;
+}
+
 export function resumeHtmlToText(html: string): string {
   const withStructure = html
+    .replace(/<thead\b[^>]*>[\s\S]*?<\/thead>/gi, (header) =>
+      /@|https?:\/\/|linkedin\.com|\+?\d[\d\s().-]{8,}/i.test(header) ? header : "",
+    )
     .replace(/<br\s*\/?\s*>/gi, "\n")
     .replace(/<li\b[^>]*>/gi, "\n• ")
     .replace(/<\/(?:p|li|td|th|tr|table|ul|ol|h[1-6])>/gi, "\n")
@@ -107,7 +184,12 @@ export function inferProfileFromResume(profile: CareerProfile, imported: Importe
     email: profile.email || email || "",
     phone: profile.phone || phone || "",
     headline: profile.headline || headline || inferredEmployment[0]?.title || "",
-    current_location: profile.current_location || location || "",
+    current_location:
+      profile.current_location ||
+      location ||
+      inferredEmployment.find((entry) => entry.current && entry.location)?.location ||
+      inferredEmployment[0]?.location ||
+      "",
     summary: profile.summary || summary,
     linkedin_url: profile.linkedin_url || normalizeUrl(linkedin),
     portfolio_url: profile.portfolio_url || normalizeUrl(portfolio),
@@ -121,6 +203,207 @@ export function inferProfileFromResume(profile: CareerProfile, imported: Importe
     source_resume_name: imported.name,
     source_resume_text: imported.text,
   };
+}
+
+export function prepareResumeImport(
+  current: CareerProfile,
+  imported: ImportedResume,
+): ResumeImportPreview {
+  const parsed = inferProfileFromResume(resumeImportBase(current), imported);
+  const likelyDifferentPerson = Boolean(
+    current.full_name &&
+    parsed.full_name &&
+    normalizePersonName(current.full_name) !== normalizePersonName(parsed.full_name)
+  );
+  const replacement: CareerProfile = {
+    ...parsed,
+    email: parsed.email || (likelyDifferentPerson ? "" : current.email),
+    street_address: likelyDifferentPerson ? "" : current.street_address,
+    work_authorization: likelyDifferentPerson ? "" : current.work_authorization,
+    sponsorship_required: likelyDifferentPerson ? null : current.sponsorship_required,
+    salary_expectation: likelyDifferentPerson ? "" : current.salary_expectation,
+    notice_period: likelyDifferentPerson ? "" : current.notice_period,
+    reusable_answers: likelyDifferentPerson ? {} : current.reusable_answers,
+    resume_mode: current.resume_mode,
+    review_new_claims: current.review_new_claims,
+    default_submission_mode: current.default_submission_mode,
+    auto_submit_threshold: current.auto_submit_threshold,
+    daily_limit: current.daily_limit,
+    onboarding_step: current.onboarding_step,
+    onboarding_complete: current.onboarding_complete,
+    updated_at_ms: current.updated_at_ms,
+  };
+  const merged = mergeCareerProfiles(current, parsed);
+  const changedSections = [
+    ["Contact", replacement.full_name || replacement.email || replacement.phone],
+    ["Summary", replacement.summary],
+    ["Experience", replacement.employment.length],
+    ["Education", replacement.education.length],
+    ["Skills", replacement.skills.length],
+    ["Certifications", replacement.certifications.length],
+    ["Projects", replacement.projects.length],
+  ].filter(([, present]) => Boolean(present)).map(([label]) => String(label));
+  return {
+    imported,
+    parsed,
+    replacement,
+    merged,
+    summary: summarizeResumeImport(replacement),
+    likely_different_person: likelyDifferentPerson,
+    changed_sections: changedSections,
+  };
+}
+
+export function applyResumeImport(preview: ResumeImportPreview, mode: ResumeImportMode): CareerProfile {
+  if (mode === "merge" && preview.likely_different_person) {
+    throw new Error("Fill blanks is available only when the resume belongs to the current Career Profile.");
+  }
+  return mode === "replace" ? preview.replacement : preview.merged;
+}
+
+function resumeImportBase(profile: CareerProfile): CareerProfile {
+  return {
+    ...profile,
+    full_name: "",
+    email: "",
+    phone: "",
+    headline: "",
+    current_location: "",
+    street_address: "",
+    summary: "",
+    linkedin_url: "",
+    portfolio_url: "",
+    work_authorization: "",
+    sponsorship_required: null,
+    salary_expectation: "",
+    notice_period: "",
+    skills: [],
+    certifications: [],
+    employment: [],
+    education: [],
+    projects: [],
+    reusable_answers: {},
+    source_resume_name: "",
+    source_resume_text: "",
+  };
+}
+
+function mergeCareerProfiles(current: CareerProfile, parsed: CareerProfile): CareerProfile {
+  const fill = (existing: string, incoming: string) => existing.trim() ? existing : incoming;
+  return {
+    ...current,
+    full_name: fill(current.full_name, parsed.full_name),
+    email: fill(current.email, parsed.email),
+    phone: fill(current.phone, parsed.phone),
+    headline: fill(current.headline, parsed.headline),
+    current_location: fill(current.current_location, parsed.current_location),
+    summary: fill(current.summary, parsed.summary),
+    linkedin_url: fill(current.linkedin_url, parsed.linkedin_url),
+    portfolio_url: fill(current.portfolio_url, parsed.portfolio_url),
+    skills: unionStrings(current.skills, parsed.skills),
+    certifications: unionStrings(current.certifications, parsed.certifications),
+    employment: mergeEmployment(current.employment, parsed.employment),
+    education: mergeEducation(current.education, parsed.education),
+    projects: mergeProjects(current.projects, parsed.projects),
+    source_resume_name: parsed.source_resume_name,
+    source_resume_text: parsed.source_resume_text,
+  };
+}
+
+function mergeEmployment(current: EmploymentEntry[], parsed: EmploymentEntry[]): EmploymentEntry[] {
+  const merged = current.map((entry) => ({ ...entry, highlights: [...entry.highlights] }));
+  for (const incoming of parsed) {
+    const index = merged.findIndex((entry) =>
+      normalizedKey(entry.company, entry.title, entry.start_date) ===
+      normalizedKey(incoming.company, incoming.title, incoming.start_date),
+    );
+    if (index < 0) {
+      merged.push(incoming);
+      continue;
+    }
+    const existing = merged[index];
+    merged[index] = {
+      ...existing,
+      company: existing.company || incoming.company,
+      title: existing.title || incoming.title,
+      location: existing.location || incoming.location,
+      start_date: existing.start_date || incoming.start_date,
+      end_date: existing.end_date || incoming.end_date,
+      current: existing.current || (!existing.end_date && incoming.current),
+      highlights: unionStrings(existing.highlights, incoming.highlights),
+    };
+  }
+  return merged;
+}
+
+function mergeEducation(current: EducationEntry[], parsed: EducationEntry[]): EducationEntry[] {
+  const merged = current.map((entry) => ({ ...entry }));
+  for (const incoming of parsed) {
+    const index = merged.findIndex((entry) =>
+      normalizedKey(entry.school, entry.degree, entry.field, entry.start_date) ===
+      normalizedKey(incoming.school, incoming.degree, incoming.field, incoming.start_date),
+    );
+    if (index < 0) {
+      merged.push(incoming);
+      continue;
+    }
+    const existing = merged[index];
+    merged[index] = {
+      ...existing,
+      school: existing.school || incoming.school,
+      degree: existing.degree || incoming.degree,
+      field: existing.field || incoming.field,
+      start_date: existing.start_date || incoming.start_date,
+      end_date: existing.end_date || incoming.end_date,
+      location: existing.location || incoming.location,
+    };
+  }
+  return merged;
+}
+
+function mergeProjects(current: ProjectEntry[], parsed: ProjectEntry[]): ProjectEntry[] {
+  const merged = current.map((entry) => ({ ...entry, technologies: [...entry.technologies] }));
+  for (const incoming of parsed) {
+    const index = merged.findIndex((entry) =>
+      normalizedKey(entry.name, entry.role) === normalizedKey(incoming.name, incoming.role),
+    );
+    if (index < 0) {
+      merged.push(incoming);
+      continue;
+    }
+    const existing = merged[index];
+    merged[index] = {
+      ...existing,
+      name: existing.name || incoming.name,
+      role: existing.role || incoming.role,
+      summary: existing.summary || incoming.summary,
+      technologies: unionStrings(existing.technologies, incoming.technologies),
+      url: existing.url || incoming.url,
+    };
+  }
+  return merged;
+}
+
+function normalizedKey(...parts: string[]): string {
+  return parts.map((part) => part.toLocaleLowerCase().replace(/[^a-z0-9]/g, "")).join("|");
+}
+
+function unionStrings(existing: string[], incoming: string[]): string[] {
+  const seen = new Set(existing.map((value) => value.toLocaleLowerCase().trim()));
+  return [...existing, ...incoming.filter((value) => {
+    const key = value.toLocaleLowerCase().trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  })];
+}
+
+function normalizePersonName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function startsWithAscii(bytes: Uint8Array, value: string): boolean {
+  return value.split("").every((character, index) => bytes[index] === character.charCodeAt(0));
 }
 
 export function summarizeResumeImport(profile: CareerProfile): ResumeImportSummary {
@@ -597,7 +880,12 @@ function isBullet(line: string): boolean {
 
 function isUsefulHighlight(line: string): boolean {
   const value = stripBullet(line);
-  return isBullet(line) || value.length > 90 || /[.!?]$/.test(value);
+  return (
+    isBullet(line) ||
+    value.length > 90 ||
+    /[.!?]$/.test(value) ||
+    /^(?:achieved|administered|analyzed|built|collaborated|coordinated|created|delivered|designed|developed|directed|drove|established|executed|implemented|improved|increased|launched|led|managed|optimized|owned|reduced|supported|trained|verified)\b/i.test(value)
+  );
 }
 
 function looksLikeContact(line: string): boolean {
@@ -631,6 +919,7 @@ function extractLocation(line: string): string {
 function parseHighlights(lines: string[]): string[] {
   const highlights: string[] = [];
   let current = "";
+  let pendingLabel = "";
   const finish = () => {
     if (current) highlights.push(current.trim());
     current = "";
@@ -640,7 +929,13 @@ function parseHighlights(lines: string[]): string[] {
     if (!value) continue;
     if (isBullet(line)) {
       finish();
-      current = value;
+      current = pendingLabel ? `${pendingLabel}: ${value}` : value;
+      pendingLabel = "";
+      continue;
+    }
+    if (isHighlightSubheading(value, current)) {
+      finish();
+      pendingLabel = value;
       continue;
     }
     if (!current) {
@@ -656,6 +951,26 @@ function parseHighlights(lines: string[]): string[] {
   }
   finish();
   return uniqueStrings(highlights);
+}
+
+function isHighlightSubheading(value: string, current: string): boolean {
+  const heading = value.replace(/\s+\([A-Z][A-Z0-9&/-]{1,10}\)\s*$/, "");
+  const words = heading.split(/\s+/).filter(Boolean);
+  const titleLike = words.every((word) =>
+    /^(?:and|for|of|the|to|with|&|[-–—])$/i.test(word) ||
+    /^[A-Z0-9][A-Za-z0-9/&+.'-]*$/.test(word),
+  );
+  const headingContext = /\b(?:administration|clinical|engineering|health|information|leadership|management|operations|project|research|technical)\b/i.test(heading);
+  return (
+    value.length >= 3 &&
+    value.length <= 80 &&
+    !/[.!?]$/.test(value) &&
+    !extractDateRange(value) &&
+    !looksLikeContact(value) &&
+    titleLike &&
+    headingContext &&
+    (!current || /[.!?]$/.test(current))
+  );
 }
 
 function joinWrappedLines(lines: string[]): string[] {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildInterviewPrepPacket,
+  approvedExecutionChecksum,
   createApplicationReceipt,
   extractRoleSignals,
   interviewPrepUserMessage,
@@ -9,6 +10,37 @@ import {
 } from "../src/index.js";
 
 function receipt(): ApplicationReceiptBundle {
+  const job = {
+    externalId: "job-1",
+    canonicalUrl: "https://boards.greenhouse.io/acme/jobs/1",
+    company: "Acme",
+    title: "Senior Product Engineer",
+    location: "New York, NY",
+    workplace: "hybrid" as const,
+    source: "greenhouse" as const,
+    description: [
+      "You will design reliable TypeScript services for customer-facing workflows.",
+      "Collaborate with product and design partners to deliver accessible experiences.",
+      "Experience operating distributed systems in production is preferred.",
+    ].join("\n"),
+  };
+  const packet = {
+    applicationId: "application-1",
+    jobId: "job-1",
+    resumeVersionId: "resume-1",
+    approvedPacketChecksum: "",
+    answers: {
+      motivation: "I enjoy turning complex workflows into dependable products.",
+      candidate_email: "ada@example.com",
+      gender: "Prefer not to say",
+      phone_number: "+1 212 555 0199",
+    },
+    verifiedClaimIds: ["claim-typescript", "claim-collaboration", "claim-contact"],
+    applicationIdentityId: "identity-1",
+    applicationEmail: "ada@example.com",
+    browserProfileId: "profile-1",
+  };
+  packet.approvedPacketChecksum = approvedExecutionChecksum(packet, job);
   return createApplicationReceipt({
     receiptId: "receipt-1",
     accountId: "account-1",
@@ -19,36 +51,8 @@ function receipt(): ApplicationReceiptBundle {
     adapter: "greenhouse",
     adapterVersion: "1.0.0",
     generatedAt: "2026-07-10T12:00:00.000Z",
-    job: {
-      externalId: "job-1",
-      canonicalUrl: "https://boards.greenhouse.io/acme/jobs/1",
-      company: "Acme",
-      title: "Senior Product Engineer",
-      location: "New York, NY",
-      workplace: "hybrid",
-      source: "greenhouse",
-      description: [
-        "You will design reliable TypeScript services for customer-facing workflows.",
-        "Collaborate with product and design partners to deliver accessible experiences.",
-        "Experience operating distributed systems in production is preferred.",
-      ].join("\n"),
-    },
-    packet: {
-      applicationId: "application-1",
-      jobId: "job-1",
-      resumeVersionId: "resume-1",
-      approvedPacketChecksum: "c".repeat(64),
-      answers: {
-        motivation: "I enjoy turning complex workflows into dependable products.",
-        candidate_email: "ada@example.com",
-        gender: "Prefer not to say",
-        phone_number: "+1 212 555 0199",
-      },
-      verifiedClaimIds: ["claim-typescript", "claim-collaboration", "claim-contact"],
-      applicationIdentityId: "identity-1",
-      applicationEmail: "ada@example.com",
-      browserProfileId: "profile-1",
-    },
+    job,
+    packet,
     documents: [{
       kind: "resume",
       versionId: "resume-1",

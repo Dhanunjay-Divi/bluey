@@ -3,7 +3,12 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { Client, Connection, WorkflowExecutionAlreadyStartedError } from "@temporalio/client";
 import type { ApplicationWorkflowInput } from "./contracts.js";
 import { applicationWorkflow, resolveInterventionSignal } from "./workflows.js";
-import type { InterventionResolution } from "./contracts.js";
+import {
+  decideInterventionResolution,
+  InterventionPolicyError,
+  parseInterventionResolution,
+} from "./intervention-policy.js";
+import { assertApprovedExecutionChecksum } from "@bluey/jobs-automation";
 
 const token = process.env.BLUEY_JOBS_WORKFLOW_TOKEN || "";
 const address = process.env.TEMPORAL_ADDRESS || "";
@@ -39,13 +44,22 @@ createServer(async (request, response) => {
     if (request.method === "POST" && resume) {
       const accountId = decodeURIComponent(resume[1]);
       const runId = decodeURIComponent(resume[2]);
-      const resolution = await body<InterventionResolution>(request);
+      const resolution = parseInterventionResolution(await body<unknown>(request));
+      const decision = decideInterventionResolution(resolution);
       const workflowId = `bluey-jobs:${accountId}:${runId}`;
       await client.workflow.getHandle(workflowId).signal(resolveInterventionSignal, resolution);
-      return json(response, 202, { workflowId, resumed: true });
+      return json(response, 202, {
+        workflowId,
+        resumed: decision.kind === "resume",
+        requiresReapproval: decision.kind === "requires_reapproval",
+        ...(decision.kind === "requires_reapproval" ? { state: "needs_confirmation" } : {}),
+      });
     }
     return json(response, 404, { error: "Not found" });
   } catch (error) {
+    if (error instanceof InterventionPolicyError) {
+      return json(response, 400, { error: error.message });
+    }
     if (error instanceof WorkflowExecutionAlreadyStartedError) {
       return json(response, 409, { error: "This application is already queued." });
     }
@@ -65,6 +79,7 @@ function validate(input: ApplicationWorkflowInput): void {
     if (!/^[A-Za-z0-9:_-]{3,200}$/.test(value)) throw new Error(`Invalid ${name}`);
   }
   if (input.packet.applicationId !== input.applicationId) throw new Error("Application bundle mismatch");
+  assertApprovedExecutionChecksum(input.packet, input.job);
   if (new URL(input.url).protocol !== "https:") throw new Error("Application link must use HTTPS");
 }
 

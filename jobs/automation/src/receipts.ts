@@ -1,5 +1,15 @@
 import type { ApplicationPacket, NormalizedJob, SubmissionReceipt } from "./contracts.js";
+import { assertApprovedExecutionChecksum } from "./approved-execution.js";
 import { assertSubmissionReceiptComplete } from "./packet-guards.js";
+
+export {
+  ApprovedExecutionIntegrityError,
+  approvedExecutionChecksum,
+  assertApprovedExecutionChecksum,
+  cloneApprovedPacketForRuntime,
+  createApprovedExecutionSnapshot,
+  type ApprovedExecutionSnapshot,
+} from "./approved-execution.js";
 
 export interface ReceiptDocument {
   kind: "resume" | "cover_letter" | "attachment";
@@ -99,6 +109,7 @@ export interface LinkedProviderEvidenceInput {
 }
 
 export function createApplicationReceipt(input: CreateReceiptInput): ApplicationReceiptBundle {
+  assertApprovedExecutionChecksum(input.packet, input.job);
   const receipt: ApplicationReceiptBundle = {
     schemaVersion: 1,
     receiptId: input.receiptId,
