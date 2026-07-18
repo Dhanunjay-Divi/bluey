@@ -42,6 +42,8 @@ from bluey_eval.payment_contracts import (  # noqa: E402
     large_fk_migration_safety_issues,
     payment_operation_semantic_issues,
     payment_platform_safety_issues,
+)
+from bluey_eval.payment_contract_checks import (  # noqa: E402
     self_check_ambiguous_payment_detector,
     self_check_exactly_once_processing_detector,
     self_check_large_fk_migration_safety,
