@@ -2071,6 +2071,12 @@ fn answer_plan_for_request(
     let resume_intro = looks_like_resume_intro_request(&normalized)
         || (generic_live_transcript_prompt && looks_like_resume_intro_request(&normalized_context));
     let behavioral = direct_behavioral || context_behavioral || resume_intro;
+    // A request the rule engine has classified as a behavioral answer is an
+    // interview surface even when the interviewer omits literal words such as
+    // "interview" or "candidate" (for example, "Why this role?" or a bare
+    // "Tell me about a time..."). Keep the earlier value for disambiguating
+    // lived follow-ups, then make the final plan self-consistent here.
+    let interview_context = interview_context || behavioral;
     let system_design = !behavioral
         && (direct_system_design
             || context_system_design_canvas_followup
@@ -2442,6 +2448,16 @@ fn generated_answer_quality_failure(
         return Some("upstream_answer_too_short");
     }
     None
+}
+
+fn provider_origin_visible_answer<'a>(
+    visible_answer: &'a str,
+    evidence_bound_prefix: Option<&str>,
+) -> &'a str {
+    evidence_bound_prefix
+        .and_then(|prefix| visible_answer.strip_prefix(prefix))
+        .map(str::trim_start)
+        .unwrap_or(visible_answer)
 }
 
 fn upstream_stream_failure_reason(error: &anyhow::Error) -> &'static str {
@@ -8783,6 +8799,11 @@ async fn complete_stream_inner(
         && answer_plan.intent == AnswerIntent::SystemDesign;
     let strip_interview_coaching_appendix =
         should_strip_unsolicited_coaching_appendix(&answer_plan, &req.user);
+    let evidence_bound_answer_prefix = interview_contracts::evidence_bound_answer_prefix(
+        &normalize_guardrail_text(&extract_search_question(&req.user)),
+        &req.context,
+        &answer_plan,
+    );
     let event_stream = async_stream::stream! {
         let mut events = streaming.events;
         let mut pending_first = selected_first_event;
@@ -8795,6 +8816,11 @@ async fn complete_stream_inner(
         }
         if let Some(source_event) = sources_sse_event(&stream_sources) {
             yield Ok(source_event);
+        }
+        if let Some(prefix) = evidence_bound_answer_prefix {
+            if let Some(safe_prefix) = output.push(&format!("{prefix}\n\n")) {
+                yield Ok(completion_delta_event(&safe_prefix));
+            }
         }
 
         loop {
@@ -9104,8 +9130,10 @@ async fn complete_stream_inner(
         } else {
             Some(final_delta)
         };
+        let provider_quality_text =
+            provider_origin_visible_answer(&text, evidence_bound_answer_prefix);
         if let Some(reason) = generated_answer_quality_failure(
-            &text,
+            provider_quality_text,
             output_tokens,
             Some(quality_max_tokens),
             &answer_plan,
@@ -10278,10 +10306,20 @@ async fn complete_inner(
         &answer_plan,
         &req.user,
     ));
+    let evidence_bound_answer_prefix = interview_contracts::evidence_bound_answer_prefix(
+        &normalize_guardrail_text(&extract_search_question(&req.user)),
+        &req.context,
+        &answer_plan,
+    );
+    if let Some(prefix) = evidence_bound_answer_prefix {
+        let _ = output.push(&format!("{prefix}\n\n"));
+    }
     let _ = output.push(&comp.text);
     let (response_text, _) = output.finish();
+    let provider_quality_text =
+        provider_origin_visible_answer(&response_text, evidence_bound_answer_prefix);
     if let Some(reason) = generated_answer_quality_failure(
-        &response_text,
+        provider_quality_text,
         comp.output_tokens,
         Some(quality_max_tokens),
         &answer_plan,

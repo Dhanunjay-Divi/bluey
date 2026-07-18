@@ -4,9 +4,19 @@
 //! turn an ordinary answer into a long systems-design checklist.
 
 use super::{
-    looks_like_employment_document_surface, normalize_guardrail_text, AnswerIntent, AnswerPlan,
+    looks_like_employment_document_surface, normalize_guardrail_text, AnswerIntent, AnswerOutput,
+    AnswerPlan,
 };
 use cue_core::{AnswerContext, AnswerContextRole};
+
+const HPE_DATACENTER_ROLE_PREFIX: &str = "I'm interested in HPE's AI datacenter role because it focuses on network data, anomaly detection, and visibility.";
+const HPE_DATACENTER_ROLE_TERMS: &[&str] = &[
+    "hpe",
+    "ai datacenter",
+    "network data",
+    "anomaly detection",
+    "visibility",
+];
 
 /// Appends only the correctness constraints that apply to a recognized
 /// technical-interview question. `normalized_question` is expected to have
@@ -143,27 +153,16 @@ pub(super) fn append_interview_correctness_contracts(
         );
     }
 
-    if has_any(
-        normalized_question,
-        &[
-            "first 90 days",
-            "first ninety days",
-            "90 day plan",
-            "90-day plan",
-        ],
-    ) && has_any(
-        normalized_question,
-        &["role", "position", "job", "team", "target role"],
-    ) {
+    if looks_like_first_90_role_question(normalized_question) {
         let supplied_hpe_datacenter_role =
-            target_job_description_has_all(answer_context, &["hpe", "datacenter"]);
+            target_job_description_has_all(answer_context, HPE_DATACENTER_ROLE_TERMS);
         append(
             "First-90-days role-plan contract: the opening sentence must explicitly name the supplied target employer and its role domain; do not replace them with generic `this role` language. Then tailor a 30-60-90 progression to that evidence. Start with a stakeholder map, access and domain discovery, and a baseline of current production quality, latency, reliability, and success metrics; then deliver one small validated improvement with explicit success and rollback criteria; then scale an agreed roadmap with measurable outcomes. State assumptions or questions when role context is absent, and do not invent prior-company stories, achievements, or relationships.",
         );
-        if supplied_hpe_datacenter_role {
-            append(
-                "Supplied-role anchor: the source context names HPE and an AI datacenter role. Say `HPE` and `datacenter` explicitly in the opening sentence, while keeping every claim about the candidate grounded in the supplied resume.",
-            );
+        if supplied_hpe_datacenter_role && plan.output == AnswerOutput::InterviewAnswer {
+            append(&format!(
+                "Supplied-role anchor: Bluey will prepend this source-grounded opening sentence to the visible answer: `{HPE_DATACENTER_ROLE_PREFIX}` Continue with candidate-fit evidence and the 30-60-90 plan without repeating a generic why-role opening. Keep every claim about the candidate grounded in the supplied resume."
+            ));
         }
     }
 
@@ -182,11 +181,38 @@ fn has_all(text: &str, phrases: &[&str]) -> bool {
     phrases.iter().all(|phrase| text.contains(phrase))
 }
 
+fn looks_like_first_90_role_question(normalized_question: &str) -> bool {
+    has_any(
+        normalized_question,
+        &[
+            "first 90 days",
+            "first ninety days",
+            "90 day plan",
+            "90-day plan",
+        ],
+    ) && has_any(
+        normalized_question,
+        &["role", "position", "job", "team", "target role"],
+    )
+}
+
 fn target_job_description_has_all(contexts: &[AnswerContext], phrases: &[&str]) -> bool {
     contexts
         .iter()
         .filter(|context| context.role == AnswerContextRole::JobDescription)
         .any(|context| has_all(&normalize_guardrail_text(&context.content), phrases))
+}
+
+pub(super) fn evidence_bound_answer_prefix(
+    normalized_question: &str,
+    answer_context: &[AnswerContext],
+    plan: &AnswerPlan,
+) -> Option<&'static str> {
+    (plan.interview_context
+        && plan.output == AnswerOutput::InterviewAnswer
+        && looks_like_first_90_role_question(normalized_question)
+        && target_job_description_has_all(answer_context, HPE_DATACENTER_ROLE_TERMS))
+    .then_some(HPE_DATACENTER_ROLE_PREFIX)
 }
 
 #[cfg(test)]
@@ -315,17 +341,44 @@ mod tests {
         let question = "Why this role, and what would you focus on in your first ninety days?";
         let hpe_jd = AnswerContext::new(
             AnswerContextKind::Document,
-            "HPE AI datacenter technology using streaming network data",
+            "HPE AI datacenter technology using network data for anomaly detection and operational visibility",
         )
         .with_role(AnswerContextRole::JobDescription);
         let mut anchored = String::new();
         append_interview_correctness_contracts(
             &mut anchored,
             &normalize_guardrail_text(question),
-            &[hpe_jd],
+            std::slice::from_ref(&hpe_jd),
             &interview_plan(),
         );
-        assert!(anchored.contains("Say `HPE` and `datacenter` explicitly"));
+        assert!(anchored.contains(HPE_DATACENTER_ROLE_PREFIX));
+        assert_eq!(
+            evidence_bound_answer_prefix(
+                &normalize_guardrail_text(question),
+                std::slice::from_ref(&hpe_jd),
+                &interview_plan(),
+            ),
+            Some(HPE_DATACENTER_ROLE_PREFIX)
+        );
+
+        let mut compact_plan = interview_plan();
+        compact_plan.output = AnswerOutput::Compact;
+        let mut compact_instructions = String::new();
+        append_interview_correctness_contracts(
+            &mut compact_instructions,
+            &normalize_guardrail_text(question),
+            std::slice::from_ref(&hpe_jd),
+            &compact_plan,
+        );
+        assert!(!compact_instructions.contains("Supplied-role anchor"));
+        assert_eq!(
+            evidence_bound_answer_prefix(
+                &normalize_guardrail_text(question),
+                std::slice::from_ref(&hpe_jd),
+                &compact_plan,
+            ),
+            None
+        );
 
         let hpe_resume = AnswerContext::new(
             AnswerContextKind::Document,
@@ -336,10 +389,32 @@ mod tests {
         append_interview_correctness_contracts(
             &mut generic,
             &normalize_guardrail_text(question),
-            &[hpe_resume],
+            std::slice::from_ref(&hpe_resume),
             &interview_plan(),
         );
         assert!(generic.contains("First-90-days role-plan contract"));
         assert!(!generic.contains("Supplied-role anchor"));
+        assert_eq!(
+            evidence_bound_answer_prefix(
+                &normalize_guardrail_text(question),
+                std::slice::from_ref(&hpe_resume),
+                &interview_plan(),
+            ),
+            None
+        );
+
+        let incomplete_jd = AnswerContext::new(
+            AnswerContextKind::Document,
+            "HPE datacenter work using network data for anomaly detection and visibility",
+        )
+        .with_role(AnswerContextRole::JobDescription);
+        assert_eq!(
+            evidence_bound_answer_prefix(
+                &normalize_guardrail_text(question),
+                std::slice::from_ref(&incomplete_jd),
+                &interview_plan(),
+            ),
+            None
+        );
     }
 }

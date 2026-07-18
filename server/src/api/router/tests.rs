@@ -1032,6 +1032,25 @@ fn answer_quality_guard_rejects_near_empty_interview_answer() {
         ),
         Some("upstream_answer_too_short")
     );
+
+    let prefix =
+        "I'm interested in the supplied target role because its domain fits my background.";
+    let provider_answer =
+        "I would learn the system, meet stakeholders, establish baselines, and ship one improvement.";
+    let visible_answer = format!("{prefix}\n\n{provider_answer}");
+    assert_eq!(
+        provider_origin_visible_answer(&visible_answer, Some(prefix)),
+        provider_answer
+    );
+    assert_eq!(
+        generated_answer_quality_failure(
+            provider_origin_visible_answer(&visible_answer, Some(prefix)),
+            20,
+            Some(700),
+            &plan,
+        ),
+        Some("upstream_answer_too_short")
+    );
 }
 
 #[test]
@@ -1692,6 +1711,7 @@ fn answer_plan_role_interview_prompts_are_behavioral_and_humanized() {
         "Question:\nFor an SDE interview, how should I answer if they ask me about a production incident I debugged?",
         "Question:\nFor a data engineer interview, can you talk about a pipeline that you built and the tradeoffs you made?",
         "Question:\nFor a Goldman AI/ML interview, how did you evaluate the RAG and MCP agents?",
+        "Question:\nWhy this role, and what would you focus on in your first ninety days?",
         "Question:\nAnswer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.\n\nSession context:\nInterviewer: This is a machine learning question. Tell us a little bit about yourself and the perception work you have done.\nMic: I worked on object detection, semantic segmentation, localization, robot pose, sparse maps, and sensor calibration, but my answer is rambling.",
         "Question:\nFor an Amazon BIE interview, talk about a Tableau dashboard where the backend refresh lagged and you had to decide whether to query source tables directly.",
     ];
