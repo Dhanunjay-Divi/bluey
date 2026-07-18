@@ -247,6 +247,48 @@ def self_check_payment_operation_semantics() -> None:
                 require_complete_idempotency_semantics=False,
             )
         ), wrong_webhook_dedup_identity
+    round548_saved_canary_wording = (
+        "Webhook dedupe uses provider event ID, then transitions only from "
+        "authoritative evidence."
+    )
+    assert "missing_provider_event_id_webhook_dedup" not in (
+        payment_operation_semantic_issues(
+            round548_saved_canary_wording,
+            require_webhook_event_dedup=True,
+            require_complete_idempotency_semantics=False,
+        )
+    )
+    for negated_provider_event_id in (
+        "Webhook dedupe does not use provider event ID.",
+        "Webhook dedupe uses no provider event ID.",
+        "Webhook dedupe uses provider event ID only for logging, not deduplication.",
+    ):
+        assert "missing_provider_event_id_webhook_dedup" in (
+            payment_operation_semantic_issues(
+                negated_provider_event_id,
+                require_webhook_event_dedup=True,
+                require_complete_idempotency_semantics=False,
+            )
+        ), negated_provider_event_id
+    for wrong_identifier in ("payment ID", "operation key", "operation ID"):
+        unsafe_webhook_identifier = (
+            f"Webhook dedupe uses {wrong_identifier}, then transitions only from "
+            "authoritative evidence."
+        )
+        assert "missing_provider_event_id_webhook_dedup" in (
+            payment_operation_semantic_issues(
+                unsafe_webhook_identifier,
+                require_webhook_event_dedup=True,
+                require_complete_idempotency_semantics=False,
+            )
+        ), unsafe_webhook_identifier
+        assert "unsafe_webhook_dedup_by_operation_key" in (
+            payment_operation_semantic_issues(
+                unsafe_webhook_identifier,
+                require_webhook_event_dedup=True,
+                require_complete_idempotency_semantics=False,
+            )
+        ), unsafe_webhook_identifier
     complete_local_payment_boundaries = " ".join(
         (
             Q39_INGRESS_IDEMPOTENCY_SENTENCE,

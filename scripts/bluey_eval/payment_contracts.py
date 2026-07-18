@@ -1418,6 +1418,9 @@ def payment_operation_semantic_issues(
         rf"\bdedup\w*\b[^.!?;]{{0,45}}\bwebhooks?\b[^.!?;]{{0,45}}"
         rf"\b(?:by|using|with|on|keyed\s+by)\b[^.!?;]{{0,25}}"
         rf"\b(?:{provider_event_id})\b",
+        rf"\bwebhooks?\s+dedup\w*\s+(?:use|uses|using)\s+(?:the\s+)?"
+        rf"(?:{provider_event_id})\b"
+        rf"(?![^.!?;]{{0,80}}\b(?:not|never)\b[^.!?;]{{0,30}}\bdedup\w*)",
         rf"\bwebhooks?\b[^.!?;]{{0,55}}\bdedup\w*\b[^.!?;]{{0,45}}"
         rf"\b(?:by|using|with|on|keyed\s+by)\b[^.!?;]{{0,25}}"
         rf"\b(?:{provider_event_id})\b",
@@ -1446,6 +1449,8 @@ def payment_operation_semantic_issues(
     )
     unsafe_webhook_operation_key = False
     bad_webhook_patterns = (
+        rf"\bwebhooks?\s+dedup\w*\s+(?:use|uses|using)\s+(?:the\s+)?"
+        rf"(?:{operation_key})\b",
         rf"\bdedup\w*\b[^.!?;]{{0,45}}\bwebhooks?\b[^.!?;]{{0,45}}"
         rf"\b(?:by|using|with|on|keyed\s+by)\b[^.!?;]{{0,25}}"
         rf"\b(?:{operation_key})\b",
