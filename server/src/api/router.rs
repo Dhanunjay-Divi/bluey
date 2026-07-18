@@ -6788,11 +6788,17 @@ fn prompt_with_answer_plan_context(
             && looks_like_url_shortener_domain(&normalized_previous_design))
         || (matches!(plan.intent, AnswerIntent::General | AnswerIntent::FollowUp)
             && url_shortener_safety_question);
-    let messaging_design = plan.intent == AnswerIntent::SystemDesign
+    let messaging_design = (plan.intent == AnswerIntent::SystemDesign
         && contains_any(
             &normalized_question,
             &["messaging app", "chat system", "messaging system"],
-        );
+        ))
+        || (plan.intent == AnswerIntent::FollowUp
+            && !normalized_previous_design.is_empty()
+            && contains_any(
+                &normalized_previous_design,
+                &["messaging app", "chat system", "messaging system"],
+            ));
     let lru_explanation = plan.output == AnswerOutput::Compact
         && contains_any(&normalized_question, &["lru", "least recently used"]);
     let lru_ready_to_say_explanation =
@@ -7149,7 +7155,7 @@ fn prompt_with_answer_plan_context(
 
     if messaging_design {
         instructions.push_str(
-            "\nMessaging-system correctness contract: on one authoritative conversation shard, atomically allocate the per-conversation sequence and commit the message plus transactional outbox before acknowledging the sender; ordering cannot be assigned after durable acceptance. Use idempotent client message IDs and replay, connection gateways for online delivery, durable offline inbox delivery, and a group-fanout strategy with its threshold tradeoff. Explain authoritative-shard failover without split-brain sequence allocation."
+            "\nMessaging-system correctness contract: on one authoritative conversation shard, atomically allocate the per-conversation sequence and commit the message plus transactional outbox before acknowledging the sender; ordering cannot be assigned after durable acceptance. Use stable idempotent client message IDs, deduplicate retries or replay before delivery, use connection gateways for online delivery, durable offline inbox delivery, and a group-fanout strategy with its threshold tradeoff. Explain authoritative-shard failover without split-brain sequence allocation."
         );
     }
 

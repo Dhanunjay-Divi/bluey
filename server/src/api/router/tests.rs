@@ -2714,9 +2714,54 @@ fn answer_plan_messaging_design_requires_durable_ordered_delivery_boundaries() {
     assert!(system.contains("transactional outbox"));
     assert!(system.contains("atomically allocate the per-conversation sequence"));
     assert!(system.contains("before acknowledging the sender"));
+    assert!(system.contains("deduplicate retries or replay before delivery"));
     assert!(system.contains("durable offline inbox delivery"));
     assert!(system.contains("group-fanout strategy"));
     assert!(system.contains("without split-brain sequence allocation"));
+}
+
+#[test]
+fn answer_plan_messaging_followup_inherits_delivery_correctness_contract() {
+    let req = complete_request(
+        "Question:\nHow would you preserve per-conversation ordering when users reconnect and servers fail?\n\nSession context:\nPrevious system design answer:\nDesign a production messaging app for tens of millions of users.",
+    );
+    let plan = answer_plan_for_request(&req, "balanced", &[]);
+    assert_eq!(plan.intent, AnswerIntent::FollowUp);
+
+    let (system, _) = prompt_with_answer_plan(
+        "You are Bluey.",
+        &req.user,
+        &plan,
+        &WebSearchOutcome::default(),
+    );
+    assert!(system.contains("Messaging-system correctness contract"));
+    assert!(system.contains("stable idempotent client message IDs"));
+    assert!(system.contains("deduplicate retries or replay before delivery"));
+
+    let unrelated = complete_request(
+        "Question:\nHow would you preserve per-conversation ordering when users reconnect and servers fail?\n\nSession context:\nPrevious system design answer:\nDesign a real-time monitoring platform for metrics and alerting.",
+    );
+    let unrelated_plan = answer_plan_for_request(&unrelated, "balanced", &[]);
+    let (unrelated_system, _) = prompt_with_answer_plan(
+        "You are Bluey.",
+        &unrelated.user,
+        &unrelated_plan,
+        &WebSearchOutcome::default(),
+    );
+    assert!(!unrelated_system.contains("Messaging-system correctness contract"));
+
+    let behavioral = complete_request(
+        "Question:\nTell me about a time you resolved a difficult stakeholder disagreement.\n\nSession context:\nPrevious system design answer:\nDesign a production messaging app for tens of millions of users.",
+    );
+    let behavioral_plan = answer_plan_for_request(&behavioral, "balanced", &[]);
+    assert_eq!(behavioral_plan.intent, AnswerIntent::Behavioral);
+    let (behavioral_system, _) = prompt_with_answer_plan(
+        "You are Bluey.",
+        &behavioral.user,
+        &behavioral_plan,
+        &WebSearchOutcome::default(),
+    );
+    assert!(!behavioral_system.contains("Messaging-system correctness contract"));
 }
 
 #[test]

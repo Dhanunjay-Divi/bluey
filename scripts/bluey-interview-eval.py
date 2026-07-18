@@ -305,7 +305,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q45", "behavioral", "amazon_de", "Tell me about a failure. What did you change so the same class of failure would not repeat?", "behavioral_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("fail", "mistake"), g("root cause", "learn"), g("guardrail", "test", "monitor", "process"))),
     EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
     EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("communicat", "tradeoff", "lay out", "comparison"))),
-    EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("follow", "ownership"))),
+    EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("on their own", "themselves", "let them own", "they take ownership", "their ownership", "they fix", "they make the correction"))),
     EvalCase("Q49", "scenario", "ds", "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?", "otter_visible_scenario", speakable=True, required_groups=(g("track", "identity"), g("calibrat", "time", "spatial"), g("dedup", "de-duplication", "fusion", "fuse", "association"))),
     EvalCase("Q50", "behavioral", "ds", "Why this role, and what would you focus on in your first ninety days?", "resume_and_jd_pdf", speakable=True, required_groups=(g("hpe", "datacenter", "telemetry"), g("first", "90", "ninety"), g("stakeholder", "baseline", "production"))),
 )
@@ -1653,6 +1653,24 @@ def self_check_attempt_integrity_guards() -> None:
             "then merge the feeds and count every local detection.",
         )
     )
+    q48 = next(case for case in CASES if case.id == "Q48")
+    assert not missing_required_group_issues(
+        q48,
+        "I coach them with one concrete code example and a checklist, then let them "
+        "make the correction on their own so they know what to do next time.",
+    )
+    q48_learner_ownership_issue = (
+        "missing_signal:on their own|themselves|let them own|they take ownership|"
+        "their ownership|they fix|they make the correction"
+    )
+    for takeover_answer in (
+        "I coach them with one concrete example and a checklist. Next time I take "
+        "over and rewrite their code myself.",
+        "I coach them with an example and checklist. I take ownership and fix it myself.",
+    ):
+        assert q48_learner_ownership_issue in missing_required_group_issues(
+            q48, takeover_answer
+        )
     assert not has_required_signal("We worked together on the output.", "get")
     assert not has_required_signal("The database stores rows.", "data")
     assert not has_required_signal("Identity is generated.", "id")
@@ -2566,6 +2584,22 @@ def self_check_attempt_integrity_guards() -> None:
     assert q47_director_alignment_issues(runtime_wait_bypass_q47) == [
         "unsafe_negated_or_unilateral_director_alignment"
     ]
+    round560_live_q47 = (
+        "I’d stop and make the comparison visible to both directors first. I’d ask "
+        "each one, in the same terms, what outcome is needed, what the deadline is, "
+        "what dependency exists, and what the risk is if it waits. Then I’d align "
+        "them on a single decision based on impact, urgency, effort, dependency, and "
+        "reversibility, and get agreement on the order before I start work. The only "
+        "exception is a policy-governed production, security, safety, or compliance "
+        "incident: I take only the minimum reversible containment, notify both "
+        "directors immediately, and leave the resource-priority decision to their "
+        "shared agreement or accountable owner. If they still disagree, I’d escalate "
+        "the unresolved decision, with that comparison, to their common accountable "
+        "owner or sponsor. Until that decision is made, I would not silently choose "
+        "one or split my attention, because that creates hidden risk and usually "
+        "makes both requests slower."
+    )
+    assert not q47_director_alignment_issues(round560_live_q47)
     for unsafe_waiting_action_q47 in (
         (
             "I show both directors one shared comparison and ask them to agree on one "

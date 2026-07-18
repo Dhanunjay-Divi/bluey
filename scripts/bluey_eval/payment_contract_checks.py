@@ -1439,6 +1439,9 @@ def self_check_payment_platform_safety_detector() -> None:
         "Use a durable double-entry ledger and reconcile through provider status and "
         "webhooks. On any provider response, do not post ledger movement until "
         "authoritative evidence exists.",
+        "Use a durable immutable double-entry ledger and reconcile through provider "
+        "status and webhooks. No distributed lock is the correctness boundary, only "
+        "a performance aid around durable writes.",
     )
     unsafe = (
         (
@@ -1468,6 +1471,12 @@ def self_check_payment_platform_safety_detector() -> None:
         (
             "Use a durable double-entry ledger and reconcile provider status. Redis "
             "locks guarantee no duplicate charges.",
+            ["unsafe_volatile_payment_correctness_boundary"],
+        ),
+        (
+            "Use a durable immutable double-entry ledger and reconcile through provider "
+            "status and webhooks. No problem: a distributed lock is the correctness "
+            "boundary for duplicate prevention.",
             ["unsafe_volatile_payment_correctness_boundary"],
         ),
         (

@@ -444,6 +444,16 @@ def q47_director_alignment_issues(text: str) -> List[str]:
     # mentioning containment never authorizes work on a contested request.
     ordinary_conflicting_work_while_waiting = False
     for window in decision_windows:
+        # The consequence question "what is the risk if it waits?" describes a
+        # request's delay cost; it is not the candidate waiting for a decision.
+        # Remove only that bounded phrase so real third-person or first-person
+        # unresolved-work bypasses remain visible to the original detector.
+        awaiting_scan = re.sub(
+            r"\b(?:risk|impact|consequence|cost)\b[^.!?;]{0,35}"
+            r"\bif\s+(?:it|the\s+request)\s+waits?\b",
+            " ",
+            window,
+        )
         awaiting_resolution = bool(
             re.search(
                 r"\b(?:while|pending|before)\b.{0,55}"
@@ -456,7 +466,7 @@ def q47_director_alignment_issues(text: str) -> List[str]:
                 r"\b(?:decid|resolv|rul)\w*\b|"
                 r"\bwhile\b.{0,55}\b(?:owner|sponsor|leader|vp)\b.{0,35}"
                 r"\b(?:consider|review|decid|resolv|rul)\w*\b",
-                window,
+                awaiting_scan,
             )
         )
         contested_work_verb = (

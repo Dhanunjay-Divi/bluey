@@ -458,10 +458,24 @@ def self_check_production_answer_contracts(
         saved_round548_redirect_wording,
         require_revocation_completeness=True,
     )
+    round560_live_redirect_wording = (
+        "Public revocable links must use 302 or 307, never 301 or 308. "
+        "Redirect responses use Cache-Control: no-store. Deleted or expired mappings "
+        "return 404 or 410; abuse-blocked mappings return 403 or a safe warning "
+        "interstitial; legal blocks return 451. Before acknowledging delete or block, "
+        "synchronously publish a versioned tombstone or deny overlay. Every redirect "
+        "worker checks that overlay and fails closed to an authoritative state check "
+        "or non-redirect response when state is uncertain."
+    )
+    assert not url_shortener_safety_issues(
+        round560_live_redirect_wording,
+        require_revocation_completeness=True,
+    )
     for unsafe_permanent_wording in (
         "Revocable public links use 301.",
         "Immutable public links use 301 even though they may later be abuse-blocked.",
         "Revocable public links use 301, but never 308.",
+        "Public revocable links use 301, never 301 or 308.",
     ):
         assert "unsafe_permanent_redirect_for_revocable_link" in (
             url_shortener_safety_issues(

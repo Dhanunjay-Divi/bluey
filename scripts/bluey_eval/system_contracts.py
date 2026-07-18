@@ -1248,25 +1248,35 @@ def url_shortener_safety_issues(
                 )
             )
             for permanent_code in ("301", "308"):
-                positive_permanent = bool(
-                    re.search(
-                        rf"\b(?:return|serve|send|issue|use|respond\s+with)\w*\b"
-                        rf".{{0,35}}\b(?:http\s+)?{permanent_code}\b|"
-                        rf"\b{permanent_code}\b.{{0,35}}\b(?:redirect|response)\w*\b",
-                        clause,
-                    )
+                positive_pattern = (
+                    rf"\b(?:return|serve|send|issue|use|respond\s+with)\w*\b"
+                    rf"(?:(?!\b(?:not|never)\b).){{0,35}}"
+                    rf"\b(?:http\s+)?{permanent_code}\b|"
+                    rf"\b{permanent_code}\b.{{0,35}}\b(?:redirect|response)\w*\b"
                 )
-                safely_rejected = bool(
-                    re.search(
-                        r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|"
-                        r"cannot|can't)\s+(?:return|serve|send|issue|use)\w*\b"
-                        rf".{{0,35}}\b(?:http\s+)?{permanent_code}\b|"
-                        rf"\b(?:not|never)\s+(?:http\s+)?{permanent_code}\b|"
-                        rf"\b{permanent_code}\b.{{0,30}}\b(?:is|are)\s+not\s+used\b",
-                        clause,
+                positive_permanent = False
+                for candidate in re.finditer(positive_pattern, clause):
+                    prefix = clause[max(0, candidate.start() - 45) : candidate.start()]
+                    suffix = clause[candidate.end() : candidate.end() + 45]
+                    negated_before = bool(
+                        re.search(
+                            r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|"
+                            r"cannot|can't)\b.{0,25}$",
+                            prefix,
+                        )
                     )
-                )
-                if positive_permanent and not safely_rejected and not safe_exception:
+                    negated_after = bool(
+                        re.search(
+                            r"^.{0,15}\b(?:is|are|will\s+be|must\s+be|"
+                            r"should\s+be)\s+not\s+(?:used|returned|served|sent|"
+                            r"issued)\b",
+                            suffix,
+                        )
+                    )
+                    if not negated_before and not negated_after:
+                        positive_permanent = True
+                        break
+                if positive_permanent and not safe_exception:
                     issues.append("unsafe_permanent_redirect_for_revocable_link")
                     break
             if "unsafe_permanent_redirect_for_revocable_link" in issues:

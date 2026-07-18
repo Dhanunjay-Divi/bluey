@@ -2049,7 +2049,8 @@ def payment_platform_safety_issues(text: str) -> List[str]:
         for pattern in patterns:
             for candidate in re.finditer(pattern, clause):
                 prefix = clause[max(0, candidate.start() - 40) : candidate.start()]
-                if re.search(
+                grammatical_no = bool(re.search(r"\bno\s+$", prefix))
+                if grammatical_no or re.search(
                     r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|"
                     r"cannot|can't|avoid)\b.{0,25}$",
                     prefix,
