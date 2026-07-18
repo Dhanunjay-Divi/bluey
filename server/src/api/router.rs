@@ -6146,9 +6146,20 @@ fn looks_like_url_shortener_domain(normalized: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn prompt_with_answer_plan(
     system: &str,
     user: &str,
+    plan: &AnswerPlan,
+    web_search: &WebSearchOutcome,
+) -> (String, String) {
+    prompt_with_answer_plan_context(system, user, &[], plan, web_search)
+}
+
+fn prompt_with_answer_plan_context(
+    system: &str,
+    user: &str,
+    answer_context: &[cue_core::AnswerContext],
     plan: &AnswerPlan,
     web_search: &WebSearchOutcome,
 ) -> (String, String) {
@@ -6590,6 +6601,7 @@ fn prompt_with_answer_plan(
     interview_contracts::append_interview_correctness_contracts(
         &mut instructions,
         &normalized_question,
+        answer_context,
         plan,
     );
 
@@ -8017,8 +8029,13 @@ async fn complete_stream_inner(
     );
     let (provider_system, provider_user) =
         prompt_with_web_context(&provider_system, &provider_user, &web_sources);
-    let (provider_system, provider_user) =
-        prompt_with_answer_plan(&provider_system, &provider_user, &answer_plan, &web_search);
+    let (provider_system, provider_user) = prompt_with_answer_plan_context(
+        &provider_system,
+        &provider_user,
+        &req.context,
+        &answer_plan,
+        &web_search,
+    );
     let vision_text_fallback_lane = managed_vision_text_fallback_lane(&answer_plan);
     let (vision_text_fallback_system, vision_text_fallback_user) =
         managed_vision_text_fallback_prompt(&provider_system, &provider_user);
@@ -9740,8 +9757,13 @@ async fn complete_inner(
     );
     let (provider_system, provider_user) =
         prompt_with_web_context(&provider_system, &provider_user, &web_sources);
-    let (provider_system, provider_user) =
-        prompt_with_answer_plan(&provider_system, &provider_user, &answer_plan, &web_search);
+    let (provider_system, provider_user) = prompt_with_answer_plan_context(
+        &provider_system,
+        &provider_user,
+        &req.context,
+        &answer_plan,
+        &web_search,
+    );
 
     // 2. Resolve lane → provider+model candidates. The reservation uses the
     // maximum candidate estimate so provider failover cannot overrun a

@@ -3,7 +3,10 @@
 //! These are deliberately question-scoped: an interview plan alone should not
 //! turn an ordinary answer into a long systems-design checklist.
 
-use super::{looks_like_employment_document_surface, AnswerIntent, AnswerPlan};
+use super::{
+    looks_like_employment_document_surface, normalize_guardrail_text, AnswerIntent, AnswerPlan,
+};
+use cue_core::{AnswerContext, AnswerContextRole};
 
 /// Appends only the correctness constraints that apply to a recognized
 /// technical-interview question. `normalized_question` is expected to have
@@ -11,6 +14,7 @@ use super::{looks_like_employment_document_surface, AnswerIntent, AnswerPlan};
 pub(super) fn append_interview_correctness_contracts(
     instructions: &mut String,
     normalized_question: &str,
+    answer_context: &[AnswerContext],
     plan: &AnswerPlan,
 ) {
     if !plan.interview_context
@@ -67,7 +71,7 @@ pub(super) fn append_interview_correctness_contracts(
         ],
     ) {
         append(
-            "Independent-deploy schema contract: introduce an explicit schema or contract version, validate compatibility in a registry or deployment gate, and use an expand-contract migration with backward and forward compatibility. Add tolerant readers and new optional fields first, deploy producers and consumers independently, dual-read or dual-write and backfill when needed, monitor usage of the old version, and remove it only after every reader is migrated. Do not require lockstep deployment for a breaking change.",
+            "Independent-deploy schema contract: start exactly with `I would use an expand-contract rollout with an explicit schema version.` Then validate compatibility in a registry or deployment gate and preserve backward and forward compatibility. Add tolerant readers and new optional fields first, deploy producers and consumers independently, dual-read or dual-write and backfill when needed, monitor usage of the old version, and remove it only after every reader is migrated. Do not require lockstep deployment for a breaking change.",
         );
     }
 
@@ -135,7 +139,7 @@ pub(super) fn append_interview_correctness_contracts(
     if normalized_question.contains("fraud") && has_any(normalized_question, &["graph", "network"])
     {
         append(
-            "Graph-fraud point-in-time contract: construct each graph feature from a snapshot as of the decision timestamp, using only edges, node attributes, labels, and availability times known then. Split train, validation, and test chronologically, prevent future labels or post-decision edges from propagating through the graph, and reproduce the same as-of feature logic online. Random graph splits alone do not prove leakage safety.",
+            "Graph-fraud point-in-time contract: answer in first person and explicitly explain that connected fraud rings are visible through shared entities, neighborhoods, paths, or communities even when ordinary per-transaction aggregates look normal. Construct each graph feature from a snapshot as of the decision timestamp, using only edges, node attributes, labels, and availability times known then. Split train, validation, and test chronologically, prevent future labels or post-decision edges from propagating through the graph, and reproduce the same as-of feature logic online. Random graph splits alone do not prove leakage safety.",
         );
     }
 
@@ -151,9 +155,16 @@ pub(super) fn append_interview_correctness_contracts(
         normalized_question,
         &["role", "position", "job", "team", "target role"],
     ) {
+        let supplied_hpe_datacenter_telemetry =
+            target_job_description_has_all(answer_context, &["hpe", "datacenter", "telemetry"]);
         append(
-            "First-90-days role-plan contract: name the supplied target employer and domain, then tailor a 30-60-90 progression to that evidence. Start with a stakeholder map, access and domain discovery, and a baseline of current production quality, latency, reliability, and success metrics; then deliver one small validated improvement with explicit success and rollback criteria; then scale an agreed roadmap with measurable outcomes. State assumptions or questions when role context is absent, and do not invent prior-company stories, achievements, or relationships.",
+            "First-90-days role-plan contract: the opening sentence must explicitly name the supplied target employer and its role domain; do not replace them with generic `this role` language. Then tailor a 30-60-90 progression to that evidence. Start with a stakeholder map, access and domain discovery, and a baseline of current production quality, latency, reliability, and success metrics; then deliver one small validated improvement with explicit success and rollback criteria; then scale an agreed roadmap with measurable outcomes. State assumptions or questions when role context is absent, and do not invent prior-company stories, achievements, or relationships.",
         );
+        if supplied_hpe_datacenter_telemetry {
+            append(
+                "Supplied-role anchor: the source context names HPE and datacenter telemetry. Say `HPE` and `datacenter telemetry` explicitly in the opening sentence, while keeping every claim about the candidate grounded in the supplied resume.",
+            );
+        }
     }
 
     if matched_theme {
@@ -171,10 +182,18 @@ fn has_all(text: &str, phrases: &[&str]) -> bool {
     phrases.iter().all(|phrase| text.contains(phrase))
 }
 
+fn target_job_description_has_all(contexts: &[AnswerContext], phrases: &[&str]) -> bool {
+    contexts
+        .iter()
+        .filter(|context| context.role == AnswerContextRole::JobDescription)
+        .any(|context| has_all(&normalize_guardrail_text(&context.content), phrases))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{normalize_guardrail_text, AnswerIntent, AnswerOutput};
     use super::*;
+    use cue_core::AnswerContextKind;
 
     fn interview_plan() -> AnswerPlan {
         AnswerPlan {
@@ -237,6 +256,7 @@ mod tests {
             append_interview_correctness_contracts(
                 &mut instructions,
                 &normalize_guardrail_text(question),
+                &[],
                 &interview_plan(),
             );
             assert!(instructions.contains(marker), "{question}: {instructions}");
@@ -250,6 +270,7 @@ mod tests {
         append_interview_correctness_contracts(
             &mut ordinary,
             "what is the weather today",
+            &[],
             &interview_plan(),
         );
         assert_eq!(ordinary, "base");
@@ -260,6 +281,7 @@ mod tests {
         append_interview_correctness_contracts(
             &mut non_interview,
             "how would you diagnose kafka consumer lag",
+            &[],
             &plan,
         );
         assert_eq!(non_interview, "base");
@@ -270,6 +292,7 @@ mod tests {
         append_interview_correctness_contracts(
             &mut writing,
             "rewrite this resume bullet about reducing rag hallucinations",
+            &[],
             &plan,
         );
         assert_eq!(writing, "base");
@@ -281,8 +304,42 @@ mod tests {
         append_interview_correctness_contracts(
             &mut compact_followup,
             "rewrite this resume bullet about reducing rag hallucinations",
+            &[],
             &plan,
         );
         assert_eq!(compact_followup, "base");
+    }
+
+    #[test]
+    fn supplied_hpe_role_anchor_is_context_scoped() {
+        let question = "Why this role, and what would you focus on in your first ninety days?";
+        let hpe_jd = AnswerContext::new(
+            AnswerContextKind::Document,
+            "HPE datacenter telemetry platform",
+        )
+        .with_role(AnswerContextRole::JobDescription);
+        let mut anchored = String::new();
+        append_interview_correctness_contracts(
+            &mut anchored,
+            &normalize_guardrail_text(question),
+            &[hpe_jd],
+            &interview_plan(),
+        );
+        assert!(anchored.contains("Say `HPE` and `datacenter telemetry` explicitly"));
+
+        let hpe_resume = AnswerContext::new(
+            AnswerContextKind::Document,
+            "Past work at HPE on datacenter telemetry",
+        )
+        .with_role(AnswerContextRole::CandidateResume);
+        let mut generic = String::new();
+        append_interview_correctness_contracts(
+            &mut generic,
+            &normalize_guardrail_text(question),
+            &[hpe_resume],
+            &interview_plan(),
+        );
+        assert!(generic.contains("First-90-days role-plan contract"));
+        assert!(!generic.contains("Supplied-role anchor"));
     }
 }
