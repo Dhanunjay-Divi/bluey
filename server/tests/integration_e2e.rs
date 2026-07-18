@@ -255,7 +255,7 @@ async fn jobs_cross_account_match_ids_are_indistinguishable_from_missing_ids() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
-                        "canonical_url": "https://boards.greenhouse.io/acme/jobs/tenant-test",
+                        "canonical_url": "https://careers.example.com/acme/tenant-test",
                         "pasted_description": "Build reliable services.",
                         "company": "Acme",
                         "title": "Software Engineer",
@@ -325,7 +325,7 @@ async fn jobs_candidate_feedback_is_server_owned_and_tenant_scoped() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
-                        "canonical_url": "https://boards.greenhouse.io/acme/jobs/feedback-test",
+                        "canonical_url": "https://careers.example.com/acme/feedback-test",
                         "pasted_description": "Build reliable customer workflows.",
                         "company": "Acme",
                         "title": "Software Engineer",
@@ -718,6 +718,7 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
             canonical_url: "https://boards.greenhouse.io/acme/jobs/lease-integration".to_string(),
             description: "Build reliable systems.".to_string(),
             compensation: "$170k-$200k".to_string(),
+            employment_type: "full_time".to_string(),
             track_id: String::new(),
             match_score: 92,
             matched_reasons: Vec::new(),

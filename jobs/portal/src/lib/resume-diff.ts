@@ -22,6 +22,8 @@ export function formatResumeDiffValue(value: unknown): string {
 export function resumeDiffLabel(key: string): string {
   const labels: Record<string, string> = {
     evidence_policy: "Evidence policy",
+    data_quality: "Data quality",
+    change: "Change",
     experience_emphasis: "Experience emphasis",
     moved_to_top: "Moved to top",
     previously_first: "Previously first",

@@ -313,6 +313,8 @@ pub struct JobPosting {
     #[serde(default)]
     pub compensation: String,
     #[serde(default)]
+    pub employment_type: String,
+    #[serde(default)]
     pub track_id: String,
     #[serde(default)]
     pub match_score: i64,
@@ -2471,6 +2473,7 @@ pub fn complete_discovery_run(
             canonical_url,
             description: input.description.trim().to_string(),
             compensation: input.compensation.trim().to_string(),
+            employment_type: String::new(),
             track_id: source.track_id.clone(),
             match_score: 0,
             matched_reasons: Vec::new(),
@@ -3933,19 +3936,36 @@ fn has_employment_type_conflict(posting: &JobPosting, preferences: &JobPreferenc
     if allowed.is_empty() {
         return false;
     }
-    let text = format!("{} {}", posting.title, posting.description).to_lowercase();
-    let detected = if text.contains("internship") || text.contains(" intern ") {
+    let detected = normalize_employment_type(&posting.employment_type).or_else(|| {
+        let text = format!("{} {}", posting.title, posting.description).to_lowercase();
+        if text.contains("internship") || text.contains(" intern ") {
+            Some("internship")
+        } else if text.contains("contract") || text.contains("contractor") {
+            Some("contract")
+        } else if text.contains("part-time") || text.contains("part time") {
+            Some("part_time")
+        } else if text.contains("full-time") || text.contains("full time") {
+            Some("full_time")
+        } else {
+            None
+        }
+    });
+    detected.is_some_and(|kind| !allowed.iter().any(|allowed_kind| allowed_kind == kind))
+}
+
+fn normalize_employment_type(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if normalized.contains("intern") {
         Some("internship")
-    } else if text.contains("contract") || text.contains("contractor") {
+    } else if normalized.contains("contract") || normalized.contains("temporary") {
         Some("contract")
-    } else if text.contains("part-time") || text.contains("part time") {
+    } else if normalized.contains("part_time") || normalized == "parttime" {
         Some("part_time")
-    } else if text.contains("full-time") || text.contains("full time") {
+    } else if normalized.contains("full_time") || normalized == "fulltime" {
         Some("full_time")
     } else {
         None
-    };
-    detected.is_some_and(|kind| !allowed.iter().any(|allowed_kind| allowed_kind == kind))
+    }
 }
 
 fn clearly_blocks_sponsorship(posting: &JobPosting) -> bool {
@@ -3953,10 +3973,20 @@ fn clearly_blocks_sponsorship(posting: &JobPosting) -> bool {
     [
         "no sponsorship",
         "not sponsor",
+        "does not sponsor",
+        "do not sponsor",
         "without sponsorship",
         "must be authorized to work",
         "will not sponsor",
         "cannot sponsor",
+        "unable to sponsor",
+        "sponsorship unavailable",
+        "u.s. citizenship required",
+        "us citizenship required",
+        "must be a u.s. citizen",
+        "must be a us citizen",
+        "must be u.s. citizen",
+        "must be us citizen",
     ]
     .iter()
     .any(|phrase| text.contains(phrase))
@@ -9768,6 +9798,7 @@ mod tests {
             canonical_url: url.to_string(),
             description: "Build reliable products with Rust and TypeScript.".to_string(),
             compensation: "$170k-$200k".to_string(),
+            employment_type: "full_time".to_string(),
             track_id: String::new(),
             match_score: 90,
             matched_reasons: vec!["Skills fit".to_string()],
@@ -10763,6 +10794,7 @@ mod tests {
             canonical_url: "https://boards.example/jobs/1/".to_string(),
             description: String::new(),
             compensation: String::new(),
+            employment_type: String::new(),
             track_id: String::new(),
             match_score: 0,
             matched_reasons: Vec::new(),
@@ -10983,6 +11015,7 @@ mod tests {
                 canonical_url: "https://example.com/jobs/42".to_string(),
                 description: "Rust and TypeScript".to_string(),
                 compensation: String::new(),
+                employment_type: String::new(),
                 track_id: String::new(),
                 match_score: 86,
                 matched_reasons: vec!["Skills fit".to_string()],
@@ -11337,6 +11370,7 @@ mod tests {
                 canonical_url: "https://example.com/jobs/1".to_string(),
                 description: String::new(),
                 compensation: String::new(),
+                employment_type: String::new(),
                 track_id: String::new(),
                 match_score: 80,
                 matched_reasons: Vec::new(),
@@ -11384,6 +11418,7 @@ mod tests {
                 canonical_url: "https://linkedin.com/jobs/view/123".to_string(),
                 description: "Distributed systems".to_string(),
                 compensation: String::new(),
+                employment_type: String::new(),
                 track_id: String::new(),
                 match_score: 96,
                 matched_reasons: Vec::new(),
@@ -11546,7 +11581,8 @@ mod tests {
             now_ms(),
             now_ms(),
         );
-        contract.title = "Software Engineer Contract".to_string();
+        contract.title = "Software Engineer".to_string();
+        contract.employment_type = "contract".to_string();
         let contract =
             upsert_posting(&pool, "acct-jobs", &contract, &profile, &preferences).unwrap();
         assert!(
@@ -11564,7 +11600,7 @@ mod tests {
             now_ms(),
         );
         sponsorship.description =
-            "Must be authorized to work in the US. We cannot sponsor visas.".to_string();
+            "Must be a U.S. citizen. We are unable to sponsor visas.".to_string();
         let sponsorship =
             upsert_posting(&pool, "acct-jobs", &sponsorship, &profile, &preferences).unwrap();
         assert!(prepare_application(
@@ -11577,6 +11613,41 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("sponsorship"));
+    }
+
+    #[test]
+    fn stale_imported_job_cannot_prepare_or_enter_a_runner() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let preferences = JobPreferences {
+            max_posting_age_days: 14,
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let mut stale = test_posting(
+            "https://jobs.lever.co/acme/stale-job",
+            now_ms() - (45 * DAY_MS),
+            now_ms(),
+        );
+        stale.source = "lever_import".to_string();
+        let stale = upsert_posting(&pool, "acct-jobs", &stale, &profile, &preferences).unwrap();
+
+        let decision = evaluate_job_eligibility(&pool, "acct-jobs", &stale, true, None).unwrap();
+        assert!(!decision.can_prepare);
+        assert!(!decision.can_queue_local);
+        assert!(!decision.can_queue_cloud);
+        assert!(decision
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "job_too_old"));
+        assert!(
+            prepare_application(&pool, "acct-jobs", &stale.id, "factual", "review_first")
+                .unwrap_err()
+                .to_string()
+                .contains("Posted 45 days ago")
+        );
     }
 
     #[test]
@@ -11778,6 +11849,7 @@ mod tests {
                 canonical_url: "https://boards.greenhouse.io/acme/jobs/state-machine".to_string(),
                 description: String::new(),
                 compensation: String::new(),
+                employment_type: String::new(),
                 track_id: String::new(),
                 match_score: 84,
                 matched_reasons: Vec::new(),
@@ -11984,6 +12056,7 @@ mod tests {
                 canonical_url: "https://example.com/jobs/email-test".to_string(),
                 description: "Product engineering".to_string(),
                 compensation: String::new(),
+                employment_type: String::new(),
                 track_id: track.id,
                 match_score: 88,
                 matched_reasons: Vec::new(),

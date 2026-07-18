@@ -130,6 +130,7 @@ export interface JobPosting {
   canonical_url: string;
   description: string;
   compensation: string;
+  employment_type?: string;
   track_id: string;
   match_score: number;
   matched_reasons: string[];
@@ -146,8 +147,8 @@ export interface JobPosting {
 export interface UserJobInput {
   canonical_url: string;
   pasted_description?: string;
-  company: string;
-  title: string;
+  company?: string;
+  title?: string;
   location?: string;
   workplace?: string;
   compensation?: string;

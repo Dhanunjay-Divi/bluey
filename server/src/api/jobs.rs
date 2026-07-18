@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    api::AppState,
+    api::{jobs_import, AppState},
     auth::AuthedAccount,
     db::jobs::{
         self, AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession,
@@ -509,7 +509,19 @@ pub async fn save_match(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(input): Json<UserJobInput>,
 ) -> Result<Json<JobPosting>, ApiError> {
-    let posting = posting_from_user_input(input);
+    let imported = if input.canonical_url.trim().is_empty() {
+        None
+    } else {
+        jobs_import::import_supported_job(input.canonical_url.trim())
+            .await
+            .map_err(job_import_error)?
+    };
+    if imported.is_none() && (input.company.trim().is_empty() || input.title.trim().is_empty()) {
+        return bad_request(
+            "Bluey cannot import this job site automatically yet. Add the company and role to continue in Review mode.",
+        );
+    }
+    let posting = posting_from_user_input(input, imported);
     validate_posting(&posting)?;
     let profile = jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?;
     let preferences = jobs::get_preferences(&state.pool, &account.id).map_err(internal)?;
@@ -518,7 +530,37 @@ pub async fn save_match(
         .map_err(internal)
 }
 
-fn posting_from_user_input(input: UserJobInput) -> JobPosting {
+fn posting_from_user_input(
+    input: UserJobInput,
+    imported: Option<jobs_import::ImportedJob>,
+) -> JobPosting {
+    if let Some(imported) = imported {
+        return JobPosting {
+            id: String::new(),
+            canonical_key: String::new(),
+            source: imported.source,
+            external_id: imported.external_id,
+            company: imported.company,
+            title: imported.title,
+            location: imported.location,
+            workplace: imported.workplace,
+            canonical_url: imported.canonical_url,
+            description: imported.description,
+            compensation: imported.compensation,
+            employment_type: imported.employment_type,
+            track_id: input.track_id,
+            match_score: 0,
+            matched_reasons: Vec::new(),
+            missing_requirements: Vec::new(),
+            posted_at_ms: imported.posted_at_ms,
+            last_verified_at_ms: Some(chrono::Utc::now().timestamp_millis()),
+            availability_status: "active".to_string(),
+            status: "matched".to_string(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            eligibility: None,
+        };
+    }
     JobPosting {
         id: String::new(),
         canonical_key: String::new(),
@@ -531,6 +573,7 @@ fn posting_from_user_input(input: UserJobInput) -> JobPosting {
         canonical_url: input.canonical_url,
         description: input.pasted_description,
         compensation: input.compensation,
+        employment_type: String::new(),
         track_id: input.track_id,
         match_score: 0,
         matched_reasons: Vec::new(),
@@ -550,7 +593,9 @@ pub struct UserJobInput {
     pub canonical_url: String,
     #[serde(default)]
     pub pasted_description: String,
+    #[serde(default)]
     pub company: String,
+    #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub location: String,
@@ -560,6 +605,14 @@ pub struct UserJobInput {
     pub compensation: String,
     #[serde(default)]
     pub track_id: String,
+}
+
+fn job_import_error(error: jobs_import::JobImportError) -> ApiError {
+    match error {
+        jobs_import::JobImportError::Invalid(message) => (StatusCode::BAD_REQUEST, message),
+        jobs_import::JobImportError::NotFound(message) => (StatusCode::GONE, message),
+        jobs_import::JobImportError::Temporary(message) => (StatusCode::BAD_GATEWAY, message),
+    }
 }
 
 pub async fn applications(
@@ -4171,7 +4224,7 @@ fn ats_kind(raw_url: &str) -> &'static str {
         "workday"
     } else if host == "boards.greenhouse.io" || host == "job-boards.greenhouse.io" {
         "greenhouse"
-    } else if host == "jobs.lever.co" {
+    } else if host == "jobs.lever.co" || host == "jobs.eu.lever.co" {
         "lever"
     } else if host == "jobs.ashbyhq.com" {
         "ashby"
@@ -4462,6 +4515,7 @@ mod tests {
             canonical_url: "https://boards.greenhouse.io/acme/jobs/123".to_string(),
             description: "Build reliable systems".to_string(),
             compensation: String::new(),
+            employment_type: "full_time".to_string(),
             track_id: "track-test".to_string(),
             match_score: 90,
             matched_reasons: Vec::new(),
@@ -4670,13 +4724,50 @@ mod tests {
         }))
         .unwrap();
 
-        let posting = posting_from_user_input(input);
+        let posting = posting_from_user_input(input, None);
         assert_eq!(posting.source, "pasted_link");
         assert_eq!(posting.match_score, 0);
         assert_eq!(posting.availability_status, "unknown");
         assert_eq!(posting.last_verified_at_ms, None);
         assert!(posting.matched_reasons.is_empty());
         assert!(posting.missing_requirements.is_empty());
+    }
+
+    #[test]
+    fn imported_job_facts_replace_manual_authority_fields() {
+        let input: UserJobInput = serde_json::from_value(json!({
+            "canonical_url": "https://jobs.lever.co/acme/job-123",
+            "company": "Forged employer",
+            "title": "Forged role",
+            "location": "Forged location",
+            "track_id": "track-sde"
+        }))
+        .unwrap();
+        let posting = posting_from_user_input(
+            input,
+            Some(jobs_import::ImportedJob {
+                source: "lever_import".to_string(),
+                external_id: "job-123".to_string(),
+                company: "Acme".to_string(),
+                title: "Platform Engineer".to_string(),
+                location: "Sunnyvale, CA".to_string(),
+                workplace: "On-site".to_string(),
+                canonical_url: "https://jobs.lever.co/acme/job-123".to_string(),
+                description: "Build Java services on AWS.".to_string(),
+                compensation: "USD 150000-220000 year".to_string(),
+                employment_type: "full_time".to_string(),
+                posted_at_ms: Some(1_744_222_396_719),
+            }),
+        );
+
+        assert_eq!(posting.source, "lever_import");
+        assert_eq!(posting.company, "Acme");
+        assert_eq!(posting.title, "Platform Engineer");
+        assert_eq!(posting.location, "Sunnyvale, CA");
+        assert_eq!(posting.posted_at_ms, Some(1_744_222_396_719));
+        assert_eq!(posting.match_score, 0);
+        assert_eq!(posting.availability_status, "active");
+        assert!(posting.last_verified_at_ms.is_some());
     }
 
     #[test]

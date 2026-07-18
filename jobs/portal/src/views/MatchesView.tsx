@@ -360,34 +360,56 @@ function postingAgeLabel(job: JobPosting): string {
   return `Posted ${ageDays} days ago`;
 }
 
+export const JOB_IMPORT_DESCRIPTION = "Paste a direct employer link. Bluey imports supported ATS facts, checks freshness, and scores the role.";
+export const JOB_IMPORT_FALLBACK_LABEL = "Can't import this link? Enter details manually";
+export const JOB_IMPORT_ACTION_LABEL = "Import & score";
+
 function AddJobDialog({ open, onClose, onSave, trackId }: { open: boolean; onClose(): void; onSave(job: UserJobInput): Promise<void>; trackId: string }) {
   const [url, setUrl] = useState("");
   const [company, setCompany] = useState("");
   const [title, setTitle] = useState("");
   const [location, setLocation] = useState("");
   const [description, setDescription] = useState("");
+  const [manual, setManual] = useState(false);
+  const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const submit = async () => {
-    if (!company.trim() || !title.trim()) return;
+    if (!url.trim() || (manual && (!company.trim() || !title.trim()))) return;
+    setError("");
     setSaving(true);
     try {
       await onSave({
-        canonical_url: url,
+        canonical_url: url.trim(),
         pasted_description: description,
-        company,
-        title,
-        location,
+        company: company.trim(),
+        title: title.trim(),
+        location: location.trim(),
         workplace: location.toLowerCase().includes("remote") ? "Remote" : "Unknown",
         compensation: "",
         track_id: trackId,
       });
       setUrl(""); setCompany(""); setTitle(""); setLocation(""); setDescription("");
+      setManual(false);
+      onClose();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Bluey could not import that job.");
+      setManual(true);
     } finally { setSaving(false); }
   };
   return (
-    <Dialog open={open} title="Add a job" description="Paste the listing and Bluey will score it against your Career Profile." onClose={onClose}>
-      <div className="dialog-form"><label><span>Job link</span><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://company.com/jobs/..." autoFocus /></label><div className="form-grid two"><label><span>Company</span><input value={company} onChange={(event) => setCompany(event.target.value)} /></label><label><span>Role</span><input value={title} onChange={(event) => setTitle(event.target.value)} /></label></div><label><span>Location</span><input value={location} onChange={(event) => setLocation(event.target.value)} placeholder="New York, NY or Remote - US" /></label><label><span>Job description</span><textarea rows={6} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Paste the job description for a better score and resume diff." /></label></div>
-      <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !company.trim() || !title.trim()} onClick={() => void submit()}>{saving ? "Scoring..." : "Score job"}<ArrowRight size={16} /></button></div>
+    <Dialog open={open} title="Add a job link" description={JOB_IMPORT_DESCRIPTION} onClose={onClose}>
+      <div className="dialog-form">
+        <label><span>Job link</span><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://company.com/jobs/..." autoFocus /></label>
+        <button type="button" className="text-button" onClick={() => { setManual((current) => !current); setError(""); }}>{manual ? "Hide manual details" : JOB_IMPORT_FALLBACK_LABEL}</button>
+        {manual && <>
+          <div className="form-grid two"><label><span>Company</span><input value={company} onChange={(event) => setCompany(event.target.value)} /></label><label><span>Role</span><input value={title} onChange={(event) => setTitle(event.target.value)} /></label></div>
+          <label><span>Location</span><input value={location} onChange={(event) => setLocation(event.target.value)} placeholder="New York, NY or Remote - US" /></label>
+          <label><span>Job description</span><textarea rows={6} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Paste the job description so Bluey can score the fit." /></label>
+          <p className="field-note">Manual jobs remain Review only until Bluey verifies the listing.</p>
+        </>}
+        {error && <div className="inline-error" role="alert">{error}</div>}
+      </div>
+      <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !url.trim() || (manual && (!company.trim() || !title.trim()))} onClick={() => void submit()}>{saving ? "Importing..." : JOB_IMPORT_ACTION_LABEL}<ArrowRight size={16} /></button></div>
     </Dialog>
   );
 }

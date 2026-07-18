@@ -13,13 +13,14 @@ export function previewPosting(input: UserJobInput): JobPosting {
     canonical_key: `preview-${now}`,
     source: "pasted_link",
     external_id: "",
-    company: input.company,
-    title: input.title,
+    company: input.company || "Imported employer",
+    title: input.title || "Imported role",
     location: input.location || "",
     workplace: input.workplace || "Unknown",
     canonical_url: input.canonical_url,
     description: input.pasted_description || "",
     compensation: input.compensation || "",
+    employment_type: "",
     track_id: input.track_id,
     match_score: 84,
     matched_reasons: ["Matches your active Career Track"],
@@ -58,7 +59,7 @@ export function previewResume(
   const normalizedDescription = job.description.toLowerCase();
   const matchedSkills = workspace.profile.skills.filter((skill) => normalizedDescription.includes(skill.toLowerCase())).slice(0, 3);
   const summary = mode === "enhance" && workspace.profile.summary.trim() && matchedSkills.length
-    ? `${workspace.profile.summary.trim().replace(/\.$/, "")} Relevant strengths include ${matchedSkills.join(", ")}.`
+    ? `${/[.!?]$/.test(workspace.profile.summary.trim()) ? workspace.profile.summary.trim() : `${workspace.profile.summary.trim()}.`} Relevant strengths include ${matchedSkills.join(", ")}.`
     : workspace.profile.summary;
   return {
     id,
