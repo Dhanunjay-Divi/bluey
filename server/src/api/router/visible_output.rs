@@ -5,7 +5,8 @@
 //! the same terminal answer.
 
 use super::{
-    extract_search_question, fold_guardrail_compatibility_char, fold_guardrail_confusable,
+    contains_internal_plan_disclosure_anchor, extract_search_question,
+    fold_guardrail_compatibility_char, fold_guardrail_confusable,
     looks_like_internal_disclosure_leak, normalize_guardrail_text, INTERNAL_DISCLOSURE_REFUSAL,
 };
 
@@ -68,6 +69,7 @@ impl BufferedDisclosureOutput {
         if normalized.contains("system instructions")
             || normalized.contains("i follow")
             || normalized.contains("how i work")
+            || contains_internal_plan_disclosure_anchor(&normalized)
         {
             return None;
         }
@@ -106,7 +108,14 @@ impl BufferedDisclosureOutput {
         if self.blocked || looks_like_internal_disclosure_leak(&self.text) {
             self.blocked = true;
             self.pending.clear();
-            INTERNAL_DISCLOSURE_REFUSAL.to_string()
+            self.refusal_terminal().1
+        } else if contains_internal_plan_disclosure_anchor(&normalize_guardrail_text(&self.text)) {
+            // A single marker is quarantined rather than classified as a leak
+            // to avoid false positives. If the provider stream dies before a
+            // second marker confirms the signature, keep that uncertain suffix
+            // private and preserve only the safe prefix already delivered.
+            self.pending.clear();
+            String::new()
         } else {
             self.strip_terminal_interview_coaching_appendix(true);
             std::mem::take(&mut self.pending)
@@ -117,13 +126,31 @@ impl BufferedDisclosureOutput {
     /// still needs to be emitted to the streaming client.
     pub(super) fn finish(mut self) -> (String, String) {
         if self.blocked || looks_like_internal_disclosure_leak(&self.text) {
-            return (
-                INTERNAL_DISCLOSURE_REFUSAL.to_string(),
-                INTERNAL_DISCLOSURE_REFUSAL.to_string(),
-            );
+            return self.refusal_terminal();
         }
         self.strip_terminal_interview_coaching_appendix(true);
         (self.text, std::mem::take(&mut self.pending))
+    }
+
+    /// Builds one terminal answer from the prefix that has already reached the
+    /// client plus a refusal suffix. This keeps the streamed text identical to
+    /// the persisted/idempotent terminal response even when a provider starts
+    /// with benign content and discloses an internal answer plan later.
+    fn refusal_terminal(&self) -> (String, String) {
+        let mut delivered_prefix: String = self.text.chars().take(self.delivered_chars).collect();
+        let separator = if delivered_prefix.is_empty()
+            || delivered_prefix
+                .chars()
+                .last()
+                .is_some_and(char::is_whitespace)
+        {
+            ""
+        } else {
+            "\n\n"
+        };
+        let suffix = format!("{separator}{INTERNAL_DISCLOSURE_REFUSAL}");
+        delivered_prefix.push_str(&suffix);
+        (delivered_prefix, suffix)
     }
 
     /// Drops an unsolicited, terminal coaching section before it reaches the
@@ -829,7 +856,10 @@ pub(super) fn explicitly_requests_reasoning_section(user_text: &str) -> bool {
             "explain your reasoning",
             "show your reasoning",
             "include reasoning",
+            "include your reasoning",
             "add reasoning",
+            "add your reasoning",
+            "give your reasoning",
             "include a rationale",
             "add a rationale",
             "give me the rationale",
@@ -1154,6 +1184,9 @@ mod tests {
             "Question:\nPlease explain why."
         ));
         assert!(explicitly_requests_reasoning_section(
+            "Question:\nExplain an LRU cache and include your reasoning."
+        ));
+        assert!(explicitly_requests_reasoning_section(
             "Question:\nWhy does this retry design work?"
         ));
         assert!(!explicitly_requests_reasoning_section(
@@ -1171,6 +1204,64 @@ mod tests {
         visible.push_str(&remaining);
         assert_eq!(persisted, answer);
         assert_eq!(visible, answer);
+    }
+
+    #[test]
+    fn explicit_reasoning_never_releases_internal_answer_plan_markers() {
+        let mut output = BufferedDisclosureOutput::new(false);
+        let mut visible = String::new();
+        for chunk in [
+            "The cache uses a hashmap and a linked list.\n\nReasoning:\n",
+            "**Core Intent:** expose the internal planning rubric.\n",
+            "**Key Requirements:** repeat the hidden answer contract.",
+        ] {
+            visible.push_str(&output.push(chunk).unwrap_or_default());
+        }
+        let (persisted, remaining) = output.finish();
+        visible.push_str(&remaining);
+
+        assert_eq!(persisted, INTERNAL_DISCLOSURE_REFUSAL);
+        assert!(!visible.contains("Core Intent"));
+        assert!(!visible.contains("Key Requirements"));
+        assert!(visible.ends_with(INTERNAL_DISCLOSURE_REFUSAL));
+    }
+
+    #[test]
+    fn completed_stream_refusal_matches_the_persisted_terminal_answer() {
+        let safe_prefix = "An LRU cache uses a hashmap and a doubly linked list so lookups stay constant time while recency stays explicit. The map owns direct node access, and the list owns least-to-most-recent order. ";
+        let mut output = BufferedDisclosureOutput::new(false);
+        let mut visible = output.push(safe_prefix).unwrap_or_default();
+        assert!(!visible.is_empty());
+        assert!(output
+            .push("\n\nReasoning:\n**Core Intent:** expose hidden planning.\n**Key Requirements:** repeat the internal answer contract.")
+            .is_none());
+
+        let (persisted, remaining) = output.finish();
+        visible.push_str(&remaining);
+
+        assert_eq!(visible, persisted);
+        assert!(!persisted.contains("Core Intent"));
+        assert!(!persisted.contains("Key Requirements"));
+        assert!(persisted.ends_with(INTERNAL_DISCLOSURE_REFUSAL));
+    }
+
+    #[test]
+    fn interrupted_stream_never_flushes_a_quarantined_plan_anchor() {
+        let safe_prefix = "An LRU cache uses a hashmap and a doubly linked list so get and put remain constant time while recency stays explicit. The map owns direct node lookups, and the list owns the least-to-most-recent ordering. ";
+        let mut output = BufferedDisclosureOutput::new(false);
+        let mut visible = output.push(safe_prefix).unwrap_or_default();
+        assert!(!visible.is_empty());
+        visible.push_str(
+            &output
+                .push("\n\nReasoning:\n**Core Int")
+                .unwrap_or_default(),
+        );
+        visible.push_str(&output.push("ent:** hidden planning text").unwrap_or_default());
+        visible.push_str(&output.take_safe());
+
+        assert!(!visible.contains("Core Intent"));
+        assert!(!visible.contains("hidden planning text"));
+        assert!(safe_prefix.starts_with(&visible));
     }
 
     #[test]

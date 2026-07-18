@@ -1532,6 +1532,370 @@ def _lru_implementation_classes(
     return relevant
 
 
+def _assignment_target_value_pairs(
+    target: ast.AST, value: ast.AST
+) -> Iterable[Tuple[ast.AST, ast.AST]]:
+    if (
+        isinstance(target, (ast.Tuple, ast.List))
+        and isinstance(value, (ast.Tuple, ast.List))
+        and len(target.elts) == len(value.elts)
+    ):
+        for nested_target, nested_value in zip(target.elts, value.elts):
+            yield from _assignment_target_value_pairs(nested_target, nested_value)
+        return
+    yield target, value
+
+
+def _direct_self_attribute(node: ast.AST) -> Optional[str]:
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    ):
+        return node.attr
+    return None
+
+
+def _cross_linked_lru_sentinel_pair(
+    lru_class: ast.ClassDef,
+) -> Optional[Tuple[str, str]]:
+    initializer = next(
+        (
+            node
+            for node in lru_class.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "__init__"
+        ),
+        None,
+    )
+    if initializer is None:
+        return None
+
+    initialized: set[str] = set()
+    links: set[Tuple[str, str, str]] = set()
+    for candidate in ast.walk(initializer):
+        if isinstance(candidate, ast.Assign):
+            assignments = [
+                pair
+                for target in candidate.targets
+                for pair in _assignment_target_value_pairs(target, candidate.value)
+            ]
+        elif isinstance(candidate, ast.AnnAssign) and candidate.value is not None:
+            assignments = list(
+                _assignment_target_value_pairs(candidate.target, candidate.value)
+            )
+        else:
+            continue
+
+        for target, value in assignments:
+            if direct := _direct_self_attribute(target):
+                initialized.add(direct)
+                continue
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr in {"next", "prev"}
+                and isinstance(target.value, ast.Attribute)
+            ):
+                boundary = _direct_self_attribute(target.value)
+                peer = _direct_self_attribute(value)
+                if boundary is not None and peer is not None:
+                    links.add((boundary, target.attr, peer))
+
+    for first, second in (("head", "tail"), ("left", "right")):
+        if not {first, second}.issubset(initialized):
+            continue
+        forward = (first, "next", second) in links and (second, "prev", first) in links
+        reverse = (second, "next", first) in links and (first, "prev", second) in links
+        if forward or reverse:
+            return (first, second)
+    return None
+
+
+def _scope_references_sentinel(
+    nodes: Sequence[ast.AST], sentinel_pair: Tuple[str, str]
+) -> bool:
+    sentinels = set(sentinel_pair)
+    return any(
+        _direct_self_attribute(candidate) in sentinels
+        for node in nodes
+        for candidate in ast.walk(node)
+    )
+
+
+def _scope_references_sentinel_neighbor(
+    nodes: Sequence[ast.AST], sentinel_pair: Tuple[str, str]
+) -> bool:
+    sentinels = set(sentinel_pair)
+    return any(
+        isinstance(candidate, ast.Attribute)
+        and candidate.attr in {"next", "prev"}
+        and isinstance(candidate.value, ast.Attribute)
+        and _direct_self_attribute(candidate.value) in sentinels
+        for node in nodes
+        for candidate in ast.walk(node)
+    )
+
+
+def _references_sentinel(node: ast.AST, sentinel_pair: Tuple[str, str]) -> bool:
+    sentinels = set(sentinel_pair)
+    return any(
+        _direct_self_attribute(candidate) in sentinels
+        for candidate in ast.walk(node)
+    )
+
+
+def _scope_relinks_through_sentinel(
+    nodes: Sequence[ast.AST], sentinel_pair: Tuple[str, str]
+) -> bool:
+    """Require one node to be reciprocally attached beside a sentinel."""
+
+    def aliases_for_boundary(scope: ast.AST) -> set[str]:
+        aliases: set[str] = set()
+        assignments: List[Tuple[ast.AST, ast.AST]] = []
+        for candidate in ast.walk(scope):
+            if isinstance(candidate, ast.Assign):
+                assignments.extend(
+                    pair
+                    for target in candidate.targets
+                    for pair in _assignment_target_value_pairs(target, candidate.value)
+                )
+            elif isinstance(candidate, ast.AnnAssign) and candidate.value is not None:
+                assignments.extend(
+                    _assignment_target_value_pairs(candidate.target, candidate.value)
+                )
+        changed = True
+        while changed:
+            changed = False
+            for target, value in assignments:
+                if not isinstance(target, ast.Name) or target.id in aliases:
+                    continue
+                if _references_sentinel(value, sentinel_pair) or any(
+                    isinstance(nested, ast.Name) and nested.id in aliases
+                    for nested in ast.walk(value)
+                ):
+                    aliases.add(target.id)
+                    changed = True
+        return aliases
+
+    def references_boundary_or_alias(node: ast.AST, aliases: set[str]) -> bool:
+        return _references_sentinel(node, sentinel_pair) or any(
+            isinstance(candidate, ast.Name) and candidate.id in aliases
+            for candidate in ast.walk(node)
+        )
+
+    for scope in nodes:
+        aliases = aliases_for_boundary(scope)
+        node_links: Dict[str, set[str]] = {}
+        reciprocal_links: Dict[str, set[str]] = {}
+        for candidate in ast.walk(scope):
+            if isinstance(candidate, ast.Assign):
+                assignments = [
+                    pair
+                    for target in candidate.targets
+                    for pair in _assignment_target_value_pairs(target, candidate.value)
+                ]
+            elif isinstance(candidate, ast.AnnAssign) and candidate.value is not None:
+                assignments = list(
+                    _assignment_target_value_pairs(candidate.target, candidate.value)
+                )
+            else:
+                continue
+            for target, value in assignments:
+                if not (
+                    isinstance(target, ast.Attribute)
+                    and target.attr in {"next", "prev"}
+                ):
+                    continue
+                if isinstance(target.value, ast.Name) and references_boundary_or_alias(
+                    value, aliases
+                ):
+                    node_links.setdefault(target.value.id, set()).add(target.attr)
+                if references_boundary_or_alias(target, aliases) and isinstance(
+                    value, ast.Name
+                ):
+                    reciprocal_links.setdefault(value.id, set()).add(target.attr)
+        if any(
+            {"prev", "next"}.issubset(link_kinds)
+            and {"prev", "next"}.issubset(reciprocal_links.get(node_name, set()))
+            for node_name, link_kinds in node_links.items()
+        ):
+            return True
+    return False
+
+
+def _sentinel_neighbor(node: ast.AST, sentinel_pair: Tuple[str, str]) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr in {"next", "prev"}
+        and isinstance(node.value, ast.Attribute)
+        and _direct_self_attribute(node.value) in set(sentinel_pair)
+    )
+
+
+def _bound_sentinel_neighbors(
+    nodes: Sequence[ast.AST], sentinel_pair: Tuple[str, str]
+) -> set[str]:
+    bound: set[str] = set()
+    for node in nodes:
+        for candidate in ast.walk(node):
+            if isinstance(candidate, ast.Assign):
+                assignments = [
+                    pair
+                    for target in candidate.targets
+                    for pair in _assignment_target_value_pairs(target, candidate.value)
+                ]
+            elif isinstance(candidate, ast.AnnAssign) and candidate.value is not None:
+                assignments = list(
+                    _assignment_target_value_pairs(candidate.target, candidate.value)
+                )
+            else:
+                continue
+            for target, value in assignments:
+                if isinstance(target, ast.Name) and _sentinel_neighbor(
+                    value, sentinel_pair
+                ):
+                    bound.add(target.id)
+    return bound
+
+
+def _references_bound_node_key(node: ast.AST, bound_name: str) -> bool:
+    return any(
+        isinstance(candidate, ast.Attribute)
+        and candidate.attr == "key"
+        and isinstance(candidate.value, ast.Name)
+        and candidate.value.id == bound_name
+        for candidate in ast.walk(node)
+    )
+
+
+def _scope_deletes_bound_node_from_map(
+    nodes: Sequence[ast.AST], bound_name: str
+) -> bool:
+    for node in nodes:
+        for candidate in ast.walk(node):
+            if isinstance(candidate, ast.Delete):
+                if any(
+                    isinstance(target, ast.Subscript)
+                    and _references_bound_node_key(target.slice, bound_name)
+                    for target in candidate.targets
+                ):
+                    return True
+            if not (
+                isinstance(candidate, ast.Call)
+                and isinstance(candidate.func, ast.Attribute)
+                and candidate.func.attr.casefold() in {"pop", "__delitem__"}
+                and candidate.args
+            ):
+                continue
+            if _references_bound_node_key(candidate.args[0], bound_name):
+                return True
+    return False
+
+
+def _scope_unlinks_bound_node(
+    nodes: Sequence[ast.AST], bound_name: str, methods: Dict[str, ast.AST]
+) -> bool:
+    def reciprocally_unlinks(scope: ast.AST, node_name: str) -> bool:
+        aliases: Dict[str, str] = {}
+        assignments: List[Tuple[ast.AST, ast.AST]] = []
+        for candidate in ast.walk(scope):
+            if isinstance(candidate, ast.Assign):
+                assignments.extend(
+                    pair
+                    for target in candidate.targets
+                    for pair in _assignment_target_value_pairs(target, candidate.value)
+                )
+            elif isinstance(candidate, ast.AnnAssign) and candidate.value is not None:
+                assignments.extend(
+                    _assignment_target_value_pairs(candidate.target, candidate.value)
+                )
+
+        def neighbor_kind(expression: ast.AST) -> Optional[str]:
+            if isinstance(expression, ast.Name):
+                return aliases.get(expression.id)
+            if (
+                isinstance(expression, ast.Attribute)
+                and expression.attr in {"prev", "next"}
+                and isinstance(expression.value, ast.Name)
+                and expression.value.id == node_name
+            ):
+                return expression.attr
+            return None
+
+        changed = True
+        while changed:
+            changed = False
+            for target, value in assignments:
+                if not isinstance(target, ast.Name) or target.id in aliases:
+                    continue
+                kind = neighbor_kind(value)
+                if kind is not None:
+                    aliases[target.id] = kind
+                    changed = True
+
+        reconnects_previous = False
+        reconnects_next = False
+        for target, value in assignments:
+            if not isinstance(target, ast.Attribute):
+                continue
+            owner_kind = neighbor_kind(target.value)
+            value_kind = neighbor_kind(value)
+            reconnects_previous = reconnects_previous or (
+                owner_kind == "prev" and target.attr == "next" and value_kind == "next"
+            )
+            reconnects_next = reconnects_next or (
+                owner_kind == "next" and target.attr == "prev" and value_kind == "prev"
+            )
+        return reconnects_previous and reconnects_next
+
+    if any(reciprocally_unlinks(node, bound_name) for node in nodes):
+        return True
+    for node in nodes:
+        for candidate in ast.walk(node):
+            if not (
+                isinstance(candidate, ast.Call)
+                and isinstance(candidate.func, ast.Attribute)
+                and isinstance(candidate.func.value, ast.Name)
+                and candidate.func.value.id == "self"
+                and any(
+                    isinstance(argument, ast.Name) and argument.id == bound_name
+                    for argument in candidate.args
+                )
+            ):
+                continue
+            helper = methods.get(candidate.func.attr)
+            if helper is None:
+                continue
+            parameters = [
+                argument.arg
+                for argument in [*helper.args.posonlyargs, *helper.args.args]
+                if argument.arg != "self"
+            ]
+            for index, argument in enumerate(candidate.args):
+                if (
+                    isinstance(argument, ast.Name)
+                    and argument.id == bound_name
+                    and index < len(parameters)
+                    and reciprocally_unlinks(helper, parameters[index])
+                ):
+                    return True
+    return False
+
+
+def _capacity_guard_evicts_bound_sentinel_neighbor(
+    guard: ast.AST,
+    methods: Dict[str, ast.AST],
+    sentinel_pair: Tuple[str, str],
+) -> bool:
+    scopes = _reachable_class_methods(guard, methods)
+    for bound_name in _bound_sentinel_neighbors(scopes, sentinel_pair):
+        if _scope_deletes_bound_node_from_map(
+            scopes, bound_name
+        ) and _scope_unlinks_bound_node(scopes, bound_name, methods):
+            return True
+    return False
+
+
 def _used_lock_attributes(nodes: Sequence[ast.AST]) -> set[str]:
     used: set[str] = set()
     for node in nodes:
@@ -1600,9 +1964,10 @@ def lru_code_semantic_issues(case: EvalCase, body: str) -> List[str]:
     if suspicious_constructor_assignments:
         issues.append("suspicious_constructor_self_assignment")
     class_tokens = _attribute_tokens(tree)
+    sentinel_pair = _cross_linked_lru_sentinel_pair(lru_class)
     has_linked_recency = (
         {"prev", "next"}.issubset(class_tokens)
-        and bool({"head", "tail"} & class_tokens)
+        and sentinel_pair is not None
         and not bool({"ordereddict", "functools.lru_cache"} & class_tokens)
     )
     if not has_linked_recency:
@@ -1611,17 +1976,25 @@ def lru_code_semantic_issues(case: EvalCase, body: str) -> List[str]:
     get_scope = _reachable_class_methods(get_method, methods)
     put_scope = _reachable_class_methods(put_method, methods)
     get_mutations = _mutated_link_attributes(get_scope)
-    if not get_mutations:
+    if (
+        not {"prev", "next"}.issubset(get_mutations)
+        or sentinel_pair is None
+        or not _scope_relinks_through_sentinel(get_scope, sentinel_pair)
+    ):
         issues.append("missing_lru_recency_update_in_get")
 
-    put_tokens = set().union(*(_attribute_tokens(node) for node in put_scope))
-    has_capacity_guard = any(
-        isinstance(candidate, (ast.If, ast.While))
-        and "capacity" in _attribute_tokens(candidate.test)
-        and bool({"len", "size", "cache", "nodes", "map"} & _attribute_tokens(candidate.test))
+    capacity_guards = [
+        candidate
         for node in put_scope
         for candidate in ast.walk(node)
-    )
+        if isinstance(candidate, (ast.If, ast.While))
+        and "capacity" in _attribute_tokens(candidate.test)
+        and bool(
+            {"len", "size", "cache", "nodes", "map"}
+            & _attribute_tokens(candidate.test)
+        )
+    ]
+    has_capacity_guard = bool(capacity_guards)
     has_destructive_eviction = any(
         isinstance(candidate, ast.Delete)
         or (
@@ -1639,7 +2012,10 @@ def lru_code_semantic_issues(case: EvalCase, body: str) -> List[str]:
         for node in put_scope
         for candidate in ast.walk(node)
     )
-    has_lru_eviction_target = bool({"head", "tail", "prev", "next", "lru", "least"} & put_tokens)
+    has_lru_eviction_target = sentinel_pair is not None and any(
+        _capacity_guard_evicts_bound_sentinel_neighbor(guard, methods, sentinel_pair)
+        for guard in capacity_guards
+    )
     if not (has_capacity_guard and has_destructive_eviction and has_lru_eviction_target):
         issues.append("missing_lru_capacity_eviction")
 
@@ -3234,6 +3610,120 @@ def self_check_attempt_integrity_guards() -> None:
     assert answer_is_success(q08, valid_code)
     _, _, _, _, code_quality_issues = quality_scores(q08, valid_code)
     assert "code_stream_terminal_shape_mismatch" not in code_quality_issues
+
+    # Dummy boundaries are a structural invariant, not a naming convention.
+    # The common left/right sentinel formulation is behaviorally equivalent to
+    # head/tail and must pass the same AST checks.
+    left_right_code = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=code_visible,
+        streamed_answer=code_visible,
+        terminal_answer=code_visible,
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=code_body.replace("head", "left").replace("tail", "right"),
+    )
+    assert not mandatory_answer_shape_issues(q08, left_right_code)
+    assert answer_is_success(q08, left_right_code)
+
+    fake_unused_boundaries_body = (
+        "```python\n"
+        "class Node:\n"
+        "    def __init__(self, key, value):\n"
+        "        self.key, self.value = key, value\n"
+        "        self.prev = self.next = None\n\n"
+        "class LRUCache:\n"
+        "    def __init__(self, capacity):\n"
+        "        self.capacity, self.cache = capacity, {}\n"
+        "        self.left = Node(None, None)\n"
+        "        self.right = Node(None, None)\n"
+        "        self.left.next = self.right\n"
+        "        self.right.prev = self.left\n"
+        "    def get(self, key):\n"
+        "        node = self.cache.get(key)\n"
+        "        if node is None:\n"
+        "            return -1\n"
+        "        marker = self.left\n"
+        "        node.prev = node.next = None\n"
+        "        return node.value\n"
+        "    def put(self, key, value):\n"
+        "        self.cache[key] = Node(key, value)\n"
+        "        if len(self.cache) > self.capacity:\n"
+        "            marker = self.left.next\n"
+        "            del self.cache[next(iter(self.cache))]\n"
+        "```"
+    )
+    fake_unused_boundaries = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=code_visible,
+        streamed_answer=code_visible,
+        terminal_answer=code_visible,
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=fake_unused_boundaries_body,
+    )
+    fake_unused_boundary_issues = mandatory_answer_shape_issues(
+        q08, fake_unused_boundaries
+    )
+    assert "missing_lru_recency_update_in_get" in fake_unused_boundary_issues
+    assert "missing_lru_capacity_eviction" in fake_unused_boundary_issues
+    assert not answer_is_success(q08, fake_unused_boundaries)
+
+    fake_nonreciprocal_links_body = (
+        "```python\n"
+        "class Node:\n"
+        "    def __init__(self, key, value):\n"
+        "        self.key, self.value = key, value\n"
+        "        self.prev = self.next = None\n\n"
+        "class LRUCache:\n"
+        "    def __init__(self, capacity):\n"
+        "        self.capacity, self.cache = capacity, {}\n"
+        "        self.left = Node(None, None)\n"
+        "        self.right = Node(None, None)\n"
+        "        self.left.next = self.right\n"
+        "        self.right.prev = self.left\n"
+        "    def _remove(self, node):\n"
+        "        node.prev = None\n"
+        "        node.next = None\n"
+        "    def _insert(self, node):\n"
+        "        node.prev = self.left\n"
+        "        node.next = self.right\n"
+        "        self.left.next = self.right\n"
+        "    def get(self, key):\n"
+        "        if key not in self.cache:\n"
+        "            return -1\n"
+        "        node = self.cache[key]\n"
+        "        self._remove(node)\n"
+        "        self._insert(node)\n"
+        "        return node.value\n"
+        "    def put(self, key, value):\n"
+        "        node = Node(key, value)\n"
+        "        self.cache[key] = node\n"
+        "        self._insert(node)\n"
+        "        if len(self.cache) > self.capacity:\n"
+        "            lru = self.left.next\n"
+        "            self._remove(lru)\n"
+        "            del self.cache[lru.key]\n"
+        "```"
+    )
+    fake_nonreciprocal_links = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=code_visible,
+        streamed_answer=code_visible,
+        terminal_answer=code_visible,
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=fake_nonreciprocal_links_body,
+    )
+    fake_nonreciprocal_issues = mandatory_answer_shape_issues(
+        q08, fake_nonreciprocal_links
+    )
+    assert "missing_lru_recency_update_in_get" in fake_nonreciprocal_issues
+    assert "missing_lru_capacity_eviction" in fake_nonreciprocal_issues
+    assert not answer_is_success(q08, fake_nonreciprocal_links)
 
     constructor_self_assignment = AttemptResult(
         attempt=1,

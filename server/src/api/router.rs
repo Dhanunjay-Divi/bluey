@@ -248,10 +248,38 @@ fn looks_like_internal_disclosure_leak(text: &str) -> bool {
         return true;
     }
 
+    let internal_plan_markers = [
+        "core intent",
+        "key requirements",
+        "visible answer contract",
+        "grounding and technical safety",
+        "interview closing contract",
+        "bluey answer plan",
+    ]
+    .iter()
+    .filter(|marker| normalized.contains(*marker))
+    .count();
+    if normalized.contains("bluey answer plan") || internal_plan_markers >= 2 {
+        return true;
+    }
+
     normalized.contains("system instructions")
         && (normalized.contains("i follow")
             || normalized.contains("how i work")
             || normalized.contains("bluey"))
+}
+
+fn contains_internal_plan_disclosure_anchor(normalized: &str) -> bool {
+    [
+        "core intent",
+        "key requirements",
+        "visible answer contract",
+        "grounding and technical safety",
+        "interview closing contract",
+        "bluey answer plan",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn normalize_guardrail_text(text: &str) -> String {
@@ -6205,6 +6233,8 @@ fn should_strip_unsolicited_coaching_appendix(plan: &AnswerPlan, user_text: &str
                 | AnswerIntent::General
                 | AnswerIntent::FollowUp
                 | AnswerIntent::Behavioral
+                | AnswerIntent::Coding
+                | AnswerIntent::CodingFollowUp
         )
         && !looks_like_employment_document_surface(&normalized_question)
     {
@@ -6516,6 +6546,12 @@ fn prompt_with_answer_plan_context(
         );
     let lru_explanation = plan.output == AnswerOutput::Compact
         && contains_any(&normalized_question, &["lru", "least recently used"]);
+    let lru_ready_to_say_explanation = lru_explanation
+        && plan.interview_context
+        && !explicitly_requests_reasoning_section(user);
+    let lru_code_implementation = plan.output == AnswerOutput::CodeArtifact
+        && matches!(plan.intent, AnswerIntent::Coding | AnswerIntent::CodingFollowUp)
+        && contains_any(&normalized_question, &["lru", "least recently used"]);
     let self_introduction_question = plan.output == AnswerOutput::InterviewAnswer
         && (looks_like_resume_intro_request(&normalized_question)
             || contains_any(
@@ -6771,7 +6807,7 @@ fn prompt_with_answer_plan_context(
 
     if third_party_reliability_question {
         instructions.push_str(
-            "\nThird-party dependency reliability contract: give each call a timeout inside an end-to-end deadline budget; retry only transient idempotent work with a small bounded attempt count, exponential backoff, and jitter; use circuit breaking and concurrency or bulkhead limits to stop a sick dependency from exhausting the service. State whether degraded mode is semantically safe, and fail explicitly when it is not. Include metrics and traces for latency, error class, retry count, circuit state, saturation, and fallback use."
+            "\nThird-party dependency reliability contract: give each call a timeout inside an end-to-end deadline budget; retry only transient idempotent work with a small bounded attempt count, exponential backoff, and jitter; use circuit breaking and concurrency or bulkhead limits to stop a sick dependency from exhausting the service. State whether degraded mode is semantically safe, and fail explicitly when it is not. Close with one explicit observability sentence that uses the words `metrics` and `distributed traces` and covers latency, error class, retry count, circuit state, saturation, and fallback use."
         );
     }
 
@@ -6808,6 +6844,16 @@ fn prompt_with_answer_plan_context(
     if lru_explanation {
         instructions.push_str(
             "\nLRU explanation contract: distinguish O(1) get/put operation time, O(1) auxiliary space per operation, and O(capacity) total data-structure space. A successful read updates recency but never triggers capacity eviction; insertion beyond capacity evicts the least-recently-used entry."
+        );
+    }
+    if lru_ready_to_say_explanation {
+        instructions.push_str(
+            "\nLRU ready-to-say final output invariant: return only the concise spoken explanation and stop immediately after the final time-and-space-complexity sentence. Never append a `Reasoning`, `Core Intent`, `Key Requirements`, `Evidence`, `Plan`, answer-contract, provenance, or coaching section."
+        );
+    }
+    if lru_code_implementation {
+        instructions.push_str(
+            "\nLRU implementation structural check: use a key-to-node hashmap plus a real doubly linked recency list with two dummy boundary sentinels (`head`/`tail` or clearly equivalent names). A successful get and an existing-key put must move exactly one node to the most-recent position; insertion beyond capacity must unlink the least-recent node and remove the same key from the hashmap. Handle zero capacity without leaving a data node behind."
         );
     }
 

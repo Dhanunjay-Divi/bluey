@@ -2098,6 +2098,18 @@ def payment_platform_safety_issues(text: str) -> List[str]:
         )
         return positive and not negated
 
+    def explicitly_defers_ledger_effect(window: str) -> bool:
+        """Recognize a local prohibition, not a blanket response-to-ledger rule."""
+        return bool(
+            re.search(
+                rf"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't)\b"
+                rf".{{0,45}}\b{effect_verb}\w*\b.{{0,55}}\b{effect_target}\b"
+                r".{0,55}\b(?:until|unless|without)\b.{0,55}"
+                r"\b(?:authoritative|confirmed|approved|settled|successful)\w*\b",
+                window,
+            )
+        )
+
     unqualified_ledger_movement = False
     for window in ledger_windows:
         provider_then_effect = bool(
@@ -2124,8 +2136,10 @@ def payment_platform_safety_issues(text: str) -> List[str]:
                 window,
             )
         )
-        if (provider_then_effect or effect_then_provider) and not has_authoritative_success(
-            window
+        if (
+            (provider_then_effect or effect_then_provider)
+            and not has_authoritative_success(window)
+            and not explicitly_defers_ledger_effect(window)
         ):
             unqualified_ledger_movement = True
             break

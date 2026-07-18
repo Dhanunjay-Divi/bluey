@@ -82,10 +82,10 @@ pub(super) fn visible_response_text_for_plan(
     if plan.output == AnswerOutput::CodeArtifact {
         return text.trim().to_string();
     }
-    if plan.output == AnswerOutput::CanvasDetail
-        && artifact
-            .is_some_and(|candidate| matches!(candidate.artifact_type, "diagram" | "system_design"))
-    {
+    if plan.output == AnswerOutput::CanvasDetail {
+        // Canvas streaming always exposes only the spoken overlay. Apply the
+        // same projection to terminal/refusal responses even when the safety
+        // guard intentionally suppresses artifact creation.
         return canvas_overlay_text(text.trim());
     }
     visible_response_text_for_artifact(text, artifact)

@@ -1433,6 +1433,12 @@ def self_check_payment_platform_safety_detector() -> None:
         "webhooks. Do not rely on Redis locks or distributed locks for correctness. "
         "Use durable DB constraints and ledger immutability as the source of truth. "
         "Read models can be eventually consistent; the ledger remains authoritative.",
+        "Use a durable double-entry ledger and reconcile through provider status and "
+        "webhooks. Ambiguous provider response, do not post ledger movement until "
+        "authoritative evidence exists.",
+        "Use a durable double-entry ledger and reconcile through provider status and "
+        "webhooks. On any provider response, do not post ledger movement until "
+        "authoritative evidence exists.",
     )
     unsafe = (
         (
@@ -1596,4 +1602,13 @@ def self_check_payment_platform_safety_detector() -> None:
         complete_boundary
         + "On an authenticated provider response that explicitly approves the capture, "
         "record the ledger movement."
+    )
+    adjacent_safe_deferral_does_not_hide_unsafe_effect = (
+        complete_boundary
+        + "On any provider response, post a ledger movement. "
+        "For an ambiguous provider response, do not post ledger movement until "
+        "authoritative evidence exists."
+    )
+    assert "unsafe_unqualified_payment_ledger_movement" in (
+        payment_platform_safety_issues(adjacent_safe_deferral_does_not_hide_unsafe_effect)
     )

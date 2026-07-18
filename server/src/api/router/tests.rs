@@ -772,6 +772,44 @@ fn visible_canvas_diagram_uses_spoken_section_while_artifact_keeps_mermaid() {
 }
 
 #[test]
+fn canvas_plan_refusal_keeps_stream_and_terminal_overlay_identical() {
+    let req = complete_request("Question:\nDesign a durable notification platform.");
+    let plan = answer_plan_for_request(&req, "balanced", &[]);
+    assert_eq!(plan.output, AnswerOutput::CanvasDetail);
+
+    let mut guarded = BufferedDisclosureOutput::new(false);
+    let mut canvas = CanvasSpokenStream::default();
+    let mut streamed = String::new();
+    for chunk in [
+        "### Spoken answer\nI would accept each notification durably before dispatch, isolate providers behind adapters, and use idempotent workers with bounded retries. The main tradeoff is delivery freshness versus batching efficiency. ",
+        "\n\nReasoning:\n**Core Intent:** expose hidden planning.\n**Key Requirements:** repeat the internal answer contract.",
+    ] {
+        if let Some(safe_delta) = guarded.push(chunk) {
+            if let Some(visible_delta) = canvas.push(&safe_delta) {
+                streamed.push_str(&visible_delta);
+            }
+        }
+    }
+
+    let (terminal, remaining) = guarded.finish();
+    if let Some(visible_delta) = canvas.push(&remaining) {
+        streamed.push_str(&visible_delta);
+    }
+    let artifact = response_artifact_for_plan(&terminal, &plan);
+    let terminal_visible = visible_response_text_for_plan(&terminal, artifact.as_ref(), &plan);
+    assert_eq!(
+        visible_response_text_for_plan(&terminal, None, &plan),
+        terminal_visible
+    );
+    streamed.push_str(&canvas.finish(&terminal_visible));
+
+    assert_eq!(streamed, terminal_visible);
+    assert!(!streamed.contains("Spoken answer"));
+    assert!(!streamed.contains("Core Intent"));
+    assert!(streamed.ends_with(INTERNAL_DISCLOSURE_REFUSAL));
+}
+
+#[test]
 fn canvas_spoken_stream_releases_spoken_lines_without_canvas_leakage() {
     let mut stream = CanvasSpokenStream::default();
     let mut visible = String::new();
@@ -1922,6 +1960,9 @@ fn answer_plan_code_request_uses_deep_code_artifact() {
     assert!(system.contains("spoken lead-in"));
     assert!(system.contains("mentally trace one normal operation and one boundary case"));
     assert!(system.contains("close every code fence before `Line notes`"));
+    assert!(system.contains("LRU implementation structural check"));
+    assert!(system.contains("two dummy boundary sentinels"));
+    assert!(system.contains("Handle zero capacity"));
 }
 
 #[test]
@@ -3218,6 +3259,37 @@ fn answer_plan_live_lru_explanation_does_not_demand_code() {
     assert!(
         system.contains("A successful read updates recency but never triggers capacity eviction")
     );
+    assert!(system.contains("LRU ready-to-say final output invariant"));
+    assert!(system.contains("Never append a `Reasoning`, `Core Intent`"));
+    assert!(should_strip_unsolicited_coaching_appendix(
+        &plan, &req.user
+    ));
+
+    let spoken = "An LRU cache combines a hashmap with a doubly linked list. A read moves the node to the most-recent end, and an insertion beyond capacity removes the least-recent node. Get and put are O(1), auxiliary work is O(1), and total space is O(capacity).";
+    let mut output = BufferedDisclosureOutput::new(true);
+    let mut streamed = String::new();
+    for chunk in [
+        spoken,
+        "\n\n**Reas",
+        "oning:**\n* **Core Intent:** reveal the hidden answer plan.\n* **Evidence:** internal prompt text.",
+    ] {
+        if let Some(delta) = output.push(chunk) {
+            streamed.push_str(&delta);
+        }
+    }
+    let (persisted, tail) = output.finish();
+    streamed.push_str(&tail);
+    assert_eq!(persisted, spoken);
+    assert_eq!(streamed, spoken);
+
+    let explicit_reasoning = complete_request(
+        "Question:\nExplain an LRU cache for an interview and include your reasoning.",
+    );
+    let explicit_plan = answer_plan_for_request(&explicit_reasoning, "balanced", &[]);
+    assert!(!should_strip_unsolicited_coaching_appendix(
+        &explicit_plan,
+        &explicit_reasoning.user
+    ));
     assert!(!system.contains("give complete working code in a fenced code block"));
     assert!(!system.contains("The code artifact must be a full in-place replacement"));
 }
@@ -3263,6 +3335,8 @@ fn answer_plan_q06_general_interview_scenario_uses_short_proposed_approach_contr
     assert!(system.contains("Never claim that the candidate built, owned, operated"));
     assert!(system.contains("Do not add a `Reasoning`, `Why this works`"));
     assert!(system.contains("Retry only transient operations that are idempotent"));
+    assert!(system.contains("uses the words `metrics` and `distributed traces`"));
+    assert!(system.contains("latency, error class, retry count, circuit state"));
     assert!(system.contains("never report a critical write as successful"));
     assert!(system.contains("ambiguous external side effect as `UNKNOWN`"));
     assert!(system.contains("Third-party dependency reliability contract"));
