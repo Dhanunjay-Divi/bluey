@@ -449,6 +449,7 @@ mod tests {
             "\r\rReasoning -\rCoaching detail.",
             "\n\n### Rationale ###\nCoaching detail.",
             "\n\n**Reasoning:**\nCoaching detail.",
+            "\n\n**Reasoning**\n\n1. Coaching detail.",
             "\n\n> **Why this works:**\nCoaching detail.",
             "\n\nRationale — Coaching detail.",
             "\n\nWhy it works.\nCoaching detail.",

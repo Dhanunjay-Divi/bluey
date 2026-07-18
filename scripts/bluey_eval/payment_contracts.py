@@ -496,6 +496,242 @@ def has_explicit_no_provider_command_replay(text: str) -> bool:
     )
 
 
+_PAYMENT_OPERATION = r"(?:authoriz\w*|captur\w*|refund\w*)"
+_IDEMPOTENCY_CREDENTIAL = r"(?:idempotency\s+)?(?:key|token)"
+_MONEY_COMMAND = (
+    r"(?:charge|payment|provider\s+(?:command|operation)|"
+    r"(?:same|original|logical)\s+(?:provider\s+)?operation|money\s+movement)"
+)
+_MONEY_REPLAY = (
+    rf"(?:retr(?:y|ies|ied|ying)|replay\w*|resubmit\w*)\b.{{0,35}}\b{_MONEY_COMMAND}\b|"
+    rf"\b{_MONEY_COMMAND}\b.{{0,35}}\b(?:retr(?:y|ies|ied|ying)|replay\w*|resubmit\w*)\b"
+)
+
+
+def _has_affirmative_cross_operation_key_sharing(clause: str) -> bool:
+    """Recognize a claim that two payment operation types share one credential."""
+    patterns = (
+        re.compile(
+            rf"\b{_PAYMENT_OPERATION}\b\s+(?:and|or)\s+"
+            rf"\b{_PAYMENT_OPERATION}\b[^,;.!?]{{0,55}}"
+            rf"\b(?:share|use|reuse|have|map)\w*\b(?:\s+(?:to|onto))?\s*.{{0,25}}"
+            rf"\b(?:one|same|common|shared|the\s+same)\b.{{0,20}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
+        ),
+        re.compile(
+            rf"\b{_PAYMENT_OPERATION}\b.{{0,25}}"
+            rf"\b(?:use|reuse|inherit|map)\w*\b(?:\s+(?:to|onto))?.{{0,30}}"
+            rf"\b(?:the\s+)?{_PAYMENT_OPERATION}(?:'s)?\b.{{0,20}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
+        ),
+        re.compile(
+            rf"\b(?:the\s+)?{_PAYMENT_OPERATION}\b.{{0,20}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,25}}\baliase?s?\b.{{0,25}}"
+            rf"\b(?:the\s+)?{_PAYMENT_OPERATION}\b.{{0,20}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
+        ),
+        re.compile(
+            rf"\b(?:the\s+)?{_PAYMENT_OPERATION}(?:'s)?\b.{{0,25}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,35}}"
+            rf"\b(?:(?:is|gets?)\s+(?:also\s+)?(?:used|reused|applied)|"
+            rf"doubles?)\b.{{0,25}}\b(?:as|for|by|to)\b.{{0,20}}"
+            rf"\b{_PAYMENT_OPERATION}\b"
+        ),
+        re.compile(
+            rf"\b(?:one|same|common|shared|the\s+same)\b.{{0,20}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,45}}"
+            rf"\b(?:across|between|for)\b.{{0,30}}\b{_PAYMENT_OPERATION}\b"
+            rf".{{0,40}}\b(?:and|or)\b.{{0,25}}\b{_PAYMENT_OPERATION}\b"
+        ),
+        re.compile(
+            rf"\b{_PAYMENT_OPERATION}\b\s*,?\s*\b{_PAYMENT_OPERATION}\b\s*,?\s*"
+            rf"(?:and\s+|or\s+)?\b{_PAYMENT_OPERATION}\b\s+all\s+"
+            rf"(?:use|reuse|share|have)\w*\b.{{0,20}}"
+            rf"\b(?:one|same|common|shared|the\s+same|that|this)\b.{{0,15}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
+        ),
+        re.compile(
+            rf"\b(?:one|same|shared|the\s+same|a\s+single|that|this|the)\b.{{0,20}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,30}}"
+            rf"\b(?:is\s+)?(?:used|reused|shared|applies?|covers?|spans?)\b"
+            rf"(?:.{{0,35}}\b(?:across|for|to)\b.{{0,15}}|.{{0,20}})"
+            rf"\b(?:all(?:\s+(?:three|3))?|(?:three|3))\b.{{0,15}}\boperations\b"
+        ),
+    )
+    contrast = re.compile(
+        r"\b(?:but|however|yet|nevertheless|although|even\s+though|except)\b"
+    )
+    local_negation = re.compile(
+        r"\b(?:do\s+not|don't|does\s+not|doesn't|must\s+not|should\s+not|"
+        r"cannot|can't|never|is\s+not|isn't|are\s+not|aren't)\b.{0,45}"
+        r"\b(?:share|use|reuse|map|have|inherit|double|alias)\w*\b"
+    )
+    claim_clauses = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?;])\s+", clause)
+        if item.strip()
+    ]
+    for claim_clause in claim_clauses:
+        # Segment first so a negated claim cannot consume an overlapping later
+        # affirmative pair: "never share A/B but A/C share one key".
+        claim_segments = [
+            segment.strip(" ,:")
+            for segment in contrast.split(claim_clause)
+            if segment.strip(" ,:")
+        ]
+        for claim_segment in claim_segments:
+            pattern_segments = [claim_segment]
+            pattern_segments.extend(
+                segment.strip()
+                for segment in re.split(r"[,:]", claim_segment)
+                if segment.strip() and segment.strip() != claim_segment
+            )
+            for pattern_segment in pattern_segments:
+                for pattern in patterns:
+                    for match in pattern.finditer(pattern_segment):
+                        local_claim = pattern_segment[: match.end()]
+                        if not local_negation.search(local_claim):
+                            return True
+    return False
+
+
+def _provider_guarantees_money_command_idempotency(text: str) -> bool:
+    """Bind the provider guarantee to the replayed money command, not a status API."""
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?;])\s+", text)
+        if sentence.strip()
+    ]
+    provider_guarantee = (
+        r"\bprovider(?:'s)?\s+(?:contract\s+)?"
+        r"(?:guarantees?|supports?|honors?|deduplicates?|documents?)\b"
+    )
+    for sentence in sentences:
+        if not re.search(provider_guarantee, sentence) or not re.search(
+            r"\bidempoten\w*\b", sentence
+        ):
+            continue
+        if re.search(
+            r"\bidempoten\w*\s+replay\b.{0,35}"
+            r"\b(?:is|remains?)\s+not\s+(?:supported|honored|guaranteed)\b|"
+            r"\bprovider\b.{0,55}\b(?:does\s+not|doesn't|cannot|can't)\b"
+            r".{0,35}\b(?:support|honor|guarantee)\w*\b.{0,35}"
+            r"\bidempoten\w*\b",
+            sentence,
+        ):
+            continue
+        status_only_coverage = bool(
+            re.search(
+                r"\bidempoten\w*\b.{0,20}\bonly\b.{0,20}"
+                r"\b(?:for\s+)?status(?:[- ]quer(?:y|ies)|\s+(?:queries|lookups?|checks?))\b|"
+                r"\bidempoten\w*\s+status(?:[- ]quer(?:y|ies)|\s+(?:queries|lookups?|checks?))"
+                r"\s+only\b|"
+                r"\bstatus[- ]quer(?:y|ies)\s+idempoten\w*\b.{0,35}"
+                r"\b(?:only|nothing\b.{0,20}\b(?:for|covers?)\b.{0,20}"
+                r"\b(?:charge|payment|replay))\b",
+                sentence,
+            )
+        )
+        explicit_status_and_money_coverage = bool(
+            re.search(
+                r"\bstatus(?:[- ]quer(?:y|ies)|\s+(?:queries|lookups?|checks?))\b"
+                r".{0,35}\b(?:and|plus|as\s+well\s+as)\b.{0,35}"
+                rf"\b{_MONEY_COMMAND}\b|"
+                rf"\b{_MONEY_COMMAND}\b.{0,35}\b(?:and|plus|as\s+well\s+as)\b"
+                r".{0,35}\bstatus(?:[- ]quer(?:y|ies)|\s+(?:queries|lookups?|checks?))\b",
+                sentence,
+            )
+        )
+        denied_money_coverage = bool(
+            re.search(
+                rf"\b(?:nothing|none)\b.{{0,25}}\b(?:for|covers?|applies?)\b"
+                rf".{{0,25}}\b{_MONEY_COMMAND}\b|"
+                rf"\b(?:no|not)\b.{{0,25}}\b{_MONEY_COMMAND}\b.{{0,30}}"
+                r"\bidempoten\w*\b|"
+                rf"\b{_MONEY_COMMAND}\b.{{0,35}}\b(?:is|are|remains?)\s+not\b"
+                r".{0,25}\bidempoten\w*\b",
+                sentence,
+            )
+        )
+        if denied_money_coverage or (
+            status_only_coverage and not explicit_status_and_money_coverage
+        ):
+            continue
+        negated_money_coverage = bool(
+            re.search(
+                rf"\b(?:but\s+)?not\s+(?:(?:for|on|covering)\s+)?"
+                rf"\b{_MONEY_COMMAND}\b|"
+                rf"\bidempoten\w*\b.{{0,30}}\b(?:does\s+not|doesn't|cannot|can't)\b"
+                rf".{{0,20}}\b(?:cover|apply|hold)\w*\b.{{0,20}}\b{_MONEY_COMMAND}\b|"
+                rf"\b{_MONEY_COMMAND}\b.{{0,25}}\b(?:is|are|remains?)\s+not\b"
+                r".{0,20}\bidempoten\w*\b",
+                sentence,
+            )
+        )
+        if negated_money_coverage:
+            continue
+        explicit_money_coverage = bool(
+            re.search(
+                rf"{provider_guarantee}.{{0,80}}\b{_MONEY_COMMAND}\b"
+                rf".{{0,45}}\bidempoten\w*\b|"
+                rf"{provider_guarantee}.{{0,80}}\bidempoten\w*\b"
+                rf".{{0,80}}\b{_MONEY_COMMAND}\b|"
+                rf"{provider_guarantee}.{{0,80}}\bidempoten\w*\s+replay\b",
+                sentence,
+            )
+        )
+        if explicit_money_coverage:
+            return True
+    return False
+
+
+def _has_bounded_money_replay_policy(text: str) -> bool:
+    """Recognize an explicit bound in the same clause as a money-command replay."""
+    for sentence in re.split(r"(?<=[.!?;])\s+", text):
+        if not re.search(_MONEY_REPLAY, sentence):
+            continue
+        if re.search(
+            r"\bbounded\s+(?:policy|attempts?|retries|retry|replay|budget|window)\b|"
+            r"\b(?:retry|replay)\s+(?:budget|deadline|limit)\b|"
+            r"\b(?:at\s+most|no\s+more\s+than)\s+"
+            r"(?:once|one|two|three|\d+)\s*(?:times?|replays?|retries?)?\b|"
+            r"\bmaximum\s+of\s+(?:once|one|two|three|\d+)\s*"
+            r"(?:times?|replays?|retries?)?\b",
+            sentence,
+        ):
+            return True
+    return False
+
+
+def _has_recurring_automatic_money_replay(text: str) -> bool:
+    """Reject timer- or backoff-driven repetition of an ambiguous money command."""
+    text = re.sub(r"\s+", " ", text.casefold().replace("’", "'"))
+    cadence = (
+        r"\b(?:once\s+per|every|each)\s+(?:\d+\s+)?"
+        r"(?:seconds?|minutes?|hours?|scheduler\s+ticks?)\b|"
+        r"\b(?:hourly|periodically|periodic)\b|"
+        r"\bon\s+(?:a\s+)?timer\b|"
+        r"\bat\s+\d+[- ]?(?:second|minute|hour)\s+intervals?\b|"
+        r"\b(?:with|using|under|on)\s+(?:an?\s+)?exponential\s+backoff\b|"
+        r"\bevery\s+scheduler\s+tick\b"
+    )
+    negated_money_replay = (
+        rf"\b(?:never|do\s+not|don't|does\s+not|doesn't|must\s+not|"
+        rf"should\s+not|cannot|can't|will\s+not|won't)\b.{{0,25}}"
+        rf"\b(?:automatically\s+)?(?:retr(?:y|ies|ied|ying)|replay\w*|resubmit\w*)\b"
+        rf".{{0,35}}\b{_MONEY_COMMAND}\b|"
+        rf"\b(?:never|do\s+not|don't|does\s+not|doesn't|must\s+not|"
+        rf"should\s+not|cannot|can't|will\s+not|won't)\b.{{0,25}}"
+        rf"\b{_MONEY_COMMAND}\b.{{0,35}}"
+        rf"\b(?:retr(?:y|ies|ied|ying)|replay\w*|resubmit\w*)\b"
+    )
+    for sentence in re.split(r"(?<=[.!?;])\s+", text):
+        replay_scan = re.sub(negated_money_replay, " ", sentence)
+        if re.search(_MONEY_REPLAY, replay_scan) and re.search(cadence, replay_scan):
+            return True
+    return False
+
+
 def has_safe_payment_same_operation_replay_condition(text: str) -> bool:
     """Recognize a reconciled, provider-guaranteed replay of the original command."""
     lower = re.sub(
@@ -510,28 +746,9 @@ def has_safe_payment_same_operation_replay_condition(text: str) -> bool:
             lower,
         )
     )
-    explicit_provider_capability = bool(
-        re.search(
-            r"\bprovider(?:'s)?\s+(?:contract\s+)?"
-            r"(?:guarantees?|supports?|honors?|deduplicates?)\b.{0,50}"
-            r"\bidempoten\w*\b|"
-            r"\bidempoten\w*\b.{0,50}\b(?:guaranteed|supported|honored|"
-            r"deduplicated)\b.{0,30}\bby\s+(?:the\s+)?provider\b",
-            lower,
-        )
+    explicit_provider_capability = _provider_guarantees_money_command_idempotency(
+        lower
     )
-    negated_provider_capability = bool(
-        re.search(
-            r"\bprovider(?:'s)?\s+(?:contract\s+)?"
-            r"(?:guarantees?|states?|confirms?)\b.{0,65}\bidempoten\w*\b"
-            r".{0,35}\b(?:is\s+)?not\s+(?:supported|honored|guaranteed)|"
-            r"\bprovider\b.{0,55}\b(?:does\s+not|doesn't|cannot|can't)\s+"
-            r"(?:support|honor|guarantee)\w*\b.{0,35}\bidempoten\w*\b",
-            lower,
-        )
-    )
-    if negated_provider_capability:
-        explicit_provider_capability = False
     inconclusive_reconciliation = bool(
         re.search(
             r"\b(?:reconcil\w*|status\s+(?:check|lookup|query)|webhooks?)\b"
@@ -554,14 +771,24 @@ def has_safe_payment_same_operation_replay_condition(text: str) -> bool:
             lower,
         )
     )
-    bounded_policy = bool(
+    bounded_money_replay_policy = _has_bounded_money_replay_policy(lower)
+    # A fail-closed timeout path is at least as restrictive as a numeric retry
+    # budget: it stops automatic money-command retries and leaves unresolved
+    # cases for manual reconciliation.  Do not require an arbitrary numeric
+    # bound when that stronger operator control is stated explicitly.
+    fail_closed_money_replay = bool(
         re.search(
-            r"\bbounded\s+(?:policy|attempts?|retries|retry|replay|budget|window)\b|"
-            r"\b(?:retry|replay)\s+(?:budget|deadline|limit)\b|"
-            r"\b(?:at\s+most|no\s+more\s+than|maximum)\s+\d+\b",
+            r"\b(?:stop|block|disable|halt)\w*\b.{0,45}"
+            r"\bautomatic\b.{0,35}\b(?:charge|payment|provider\s+(?:command|operation))?"
+            r"\s*(?:retr(?:y|ies|ied|ying)|replay\w*|resubmit\w*)\b|"
+            r"\b(?:automatic|scheduled)\b.{0,35}"
+            r"\b(?:charge|payment|provider\s+(?:command|operation))\b.{0,35}"
+            r"\b(?:retr(?:y|ies|ied|ying)|replay\w*|resubmit\w*)\b.{0,35}"
+            r"\b(?:is|are|remain|remains)\s+(?:stopped|blocked|disabled|halted)\b",
             lower,
         )
     )
+    ongoing_automatic_money_replay = _has_recurring_automatic_money_replay(lower)
     unsafe_unbounded = bool(
         re.search(
             r"\b(?:forever|indefinitely|until\s+it\s+succeeds?|until\s+success|"
@@ -577,8 +804,9 @@ def has_safe_payment_same_operation_replay_condition(text: str) -> bool:
         and inconclusive_reconciliation
         and original_key
         and original_command
-        and bounded_policy
+        and (bounded_money_replay_policy or fail_closed_money_replay)
         and not unsafe_unbounded
+        and not ongoing_automatic_money_replay
     )
 
 
@@ -760,7 +988,10 @@ def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
         local_start = retry.start() - sentence_start - 1
         prefix = retry_sentence[max(0, local_start - 120) : local_start]
         direct_negation = re.search(
-            r"(?:do not|don't|don’t|never|must not|cannot|can't|can’t)\s*$", prefix
+            r"(?:do not|don't|don’t|does not|doesn't|never|must not|should not|"
+            r"cannot|can't|can’t|will not|won't)\s+"
+            r"(?:(?:ever|automatically)\s+){0,2}$",
+            prefix,
         )
         coordinated_negation = re.search(
             r"(?:do not|don't|don’t|never|must not|cannot|can't|can’t)\b"
@@ -789,6 +1020,8 @@ def self_check_ambiguous_payment_detector() -> None:
         "A timeout leaves the outcome UNKNOWN, not failed. "
         "Move it to PENDING_RECONCILIATION; do not mark it FAILED.",
         "After a timeout, never retry the charge; retry only the status lookup.",
+        "After a timeout, never automatically retry the charge once per minute; "
+        "reconcile provider status instead.",
         "Provider timeout after the charge attempt. Do not mark the payment FAILED or "
         "retry the charge; keep it UNKNOWN and reconcile. If the provider confirms no "
         "charge, transition to FAILED.",
@@ -1111,7 +1344,13 @@ def payment_operation_semantic_issues(
             r"\b(?:each|every)\b.{0,80}\b(?:logical\s+)?"
             r"(?:provider[- ]?)?operation[- ]instance\b.{0,80}"
             r"\b(?:its|their)\s+own\b.{0,35}"
-            r"\b(?:stable\s+)?idempotency\s+key\b",
+            r"\b(?:stable\s+)?idempotency\s+key\b|"
+            r"\b(?:one|a)\s+(?:stable|durable)?\s*(?:idempotency\s+)?key\b"
+            r".{0,40}\bper\s+(?:logical\s+)?(?:provider[- ]?)?"
+            r"operation[- ]instance\b|"
+            r"\b(?:idempotency\s+)?key\b.{0,60}\bscoped\s+to\b"
+            r".{0,80}\b(?:specific|logical)\s+(?:provider\s+)?"
+            r"(?:operation|action)\b.{0,60}\b(?:instance|id)\b",
             lower,
         )
     )
@@ -1122,64 +1361,34 @@ def payment_operation_semantic_issues(
             for operation, pattern in operation_pattern.items()
             if re.search(pattern, clause)
         }
-        if len(operations) < 2 or "key" not in clause:
+        if len(operations) < 2 or not re.search(r"\b(?:key|token)\b", clause):
             continue
         if re.search(r"\b(?:encryption|signing|hmac|webhook\s+secret)\s+key\b", clause):
             continue
+        if _has_affirmative_cross_operation_key_sharing(clause):
+            unsafe_shared_key = True
+            break
         shared = bool(
             re.search(
                 r"\b(?:same|single|one|shared)\b[^.!?;]{0,35}"
-                r"\b(?:idempotency\s+)?key\b|"
+                r"\b(?:idempotency\s+)?(?:key|token)\b|"
                 r"\b(?:reuse|reused|reusing)\b[^.!?;]{0,35}"
-                r"\b(?:idempotency\s+)?key\b|"
-                r"\b(?:idempotency\s+)?key\b[^.!?;]{0,35}"
+                r"\b(?:idempotency\s+)?(?:key|token)\b|"
+                r"\b(?:idempotency\s+)?(?:key|token)\b[^.!?;]{0,35}"
                 r"\b(?:same|single|one|shared)\b|"
                 r"\b(?:share|reuse|reuses|reused|reusing)\b[^.!?;]{0,25}"
-                r"\b(?:it|that\s+key|this\s+key)\b",
+                r"\b(?:it|that\s+(?:key|token)|this\s+(?:key|token))\b",
                 clause,
             )
         )
         if not shared:
             continue
-        # An explicit affirmative statement that one key spans all payment
-        # operations is unsafe even when an earlier sentence claimed proper
-        # operation-instance scope. Affirmative contradictions must win over
-        # the narrow grouped-retry allowance below.
-        explicit_cross_operation_sharing = bool(
-            re.search(
-                r"\b(?:one(?:\s+shared)?|a\s+(?:single|shared)|that|this|"
-                r"the(?:\s+same)?|same)\s+(?:idempotency\s+)?key\b\s+"
-                r"(?:is\s+)?"
-                r"(?:used|reused|shared)\b.{0,40}"
-                r"\b(?:across|for)\b.{0,15}\b"
-                r"(?:all(?:\s+(?:three|3))?|(?:three|3))\b"
-                r".{0,15}\boperations\b",
-                clause,
-            )
-            or re.search(
-                r"\b(?:one(?:\s+shared)?|a\s+(?:single|shared)|that|this|"
-                r"the(?:\s+same)?|same)\s+(?:idempotency\s+)?key\b\s+"
-                r"(?:applies?|covers?|serves?|spans?)\b.{0,15}\b"
-                r"(?:all(?:\s+(?:three|3))?|(?:three|3))\b"
-                r".{0,15}\boperations\b",
-                clause,
-            )
-            or re.search(
-                r"\bauthoriz\w*\b\s*,?\s*\bcaptur\w*\b\s*,?\s*"
-                r"(?:and\s+|or\s+)?\brefund\w*\b\s+all\s+"
-                r"(?:use|reuse|share)\w*\b.{0,20}"
-                r"\b(?:that|this|the\s+same|one|a\s+shared)\b.{0,12}\bkey\b",
-                clause,
-            )
-        )
-        if explicit_cross_operation_sharing:
-            unsafe_shared_key = True
-            break
         operation_scoped = bool(
             re.search(
                 r"\b(?:one|a|distinct|separate|derived)\b.{0,30}"
                 r"\b(?:idempotency\s+)?key\b"
-                r".{0,20}\bper\s+(?:payment\s+)?operation\b|"
+                r".{0,20}\bper\s+(?:logical\s+)?(?:provider[- ]?)?"
+                r"operation(?:[- ]instance)?\b|"
                 r"\b(?:distinct|separate|different|unique|derived)\b.{0,30}\bkeys?\b"
                 r".{0,25}\b(?:for|across)\b.{0,100}"
                 r"\b(?:authoriz\w*|captur\w*|refund\w*)\b|"
@@ -1202,6 +1411,12 @@ def payment_operation_semantic_issues(
                 r"\boperation[- ]instance\b|"
                 r"\bidempotency\s+key\b.{0,40}\bscoped\s+to\b.{0,140}"
                 r"\boperation[- ]type\b.{0,80}\boperation[- ]instance\b",
+                clause,
+            )
+            or re.search(
+                r"\b(?:idempotency\s+)?key\b.{0,60}\bscoped\s+to\b"
+                r".{0,80}\b(?:specific|logical)\s+(?:provider\s+)?"
+                r"(?:operation|action)\b.{0,60}\b(?:instance|id)\b",
                 clause,
             )
             or re.search(
@@ -1246,6 +1461,18 @@ def payment_operation_semantic_issues(
                     r"\b(?:authoriz\w*|captur\w*|refund\w*)\b.{0,100}"
                     r"\b(?:reuse|reuses|reused|use|uses)\b.{0,30}"
                     r"\b(?:the\s+)?(?:same|original|its|their)\b.{0,30}"
+                    r"\b(?:idempotency\s+)?key\b",
+                    clause,
+                )
+            )
+            or (
+                explicit_per_operation_instance_key_scope
+                and re.search(
+                    r"\bnew\s+partial\s+(?:capture|refund)\b.{0,80}"
+                    r"\bnew\s+(?:logical\s+)?(?:action|operation)\b.{0,45}"
+                    r"\bnew\s+(?:idempotency\s+)?key\b.{0,160}"
+                    r"\b(?:retry|replay)\b.{0,70}\b(?:exact|same)\b"
+                    r".{0,55}\b(?:same|original)\b.{0,35}"
                     r"\b(?:idempotency\s+)?key\b",
                     clause,
                 )
@@ -2154,6 +2381,67 @@ def self_check_payment_operation_semantics() -> None:
     assert payment_platform_safety_issues(saved_round539_q39_canvas) == [
         "unsafe_unqualified_payment_ledger_movement"
     ]
+    # Exact idempotency-rule shape from the Q39 live canvas.  These adjacent
+    # bullets deliberately mention partial capture/refund and a same-key retry,
+    # but establish a new operation instance for each new partial action.
+    canary_q39_canvas_idempotency_rules = (
+        "One stable key per logical provider-operation instance.\n"
+        "New partial capture or partial refund = new logical action, new key.\n"
+        "Retry of that exact partial action = same key.\n"
+        "Never share one key across different operation instances."
+    )
+    assert "unsafe_shared_idempotency_key_across_payment_operations" not in (
+        payment_operation_semantic_issues(
+            canary_q39_canvas_idempotency_rules,
+            require_webhook_event_dedup=False,
+            require_complete_idempotency_semantics=False,
+        )
+    )
+    canary_q39_cross_operation_contradictions = (
+        "Never share one key between authorization and refund, but authorization "
+        "and capture share the same idempotency key.",
+        "Capture and refund map to a common idempotency key.",
+        "Capture inherits the authorization idempotency key.",
+        "The authorization idempotency key is also used for capture.",
+        "Capture and refund share one idempotency token.",
+        "Although authorization and refund have separate keys, authorization and "
+        "capture have a common key.",
+        "Even though capture and refund do not map to a common key, capture uses "
+        "authorization's key.",
+        "Except for refund, authorization and capture have a common idempotency token.",
+        "Capture and refund have a common key.",
+        "Capture uses authorization's key.",
+        "The authorization idempotency key doubles as the capture key.",
+        "Never share one key between authorization and refund but authorization and "
+        "capture share the same idempotency key.",
+        "Never share one key between authorization and refund although authorization "
+        "and capture share the same idempotency key.",
+        "Never share one key between authorization and refund even though authorization "
+        "and capture share the same idempotency key.",
+        "Never share one key between authorization and refund except authorization and "
+        "capture share the same idempotency key.",
+        "Capture maps to authorization's idempotency key.",
+        "The capture token aliases the authorization token.",
+    )
+    for contradiction in canary_q39_cross_operation_contradictions:
+        assert "unsafe_shared_idempotency_key_across_payment_operations" in (
+            payment_operation_semantic_issues(
+                f"{canary_q39_canvas_idempotency_rules} {contradiction}",
+                require_webhook_event_dedup=False,
+                require_complete_idempotency_semantics=False,
+            )
+        ), contradiction
+    for rejected_sharing_claim in (
+        "Capture and refund do not map to a common key.",
+        "Capture must not inherit the authorization idempotency key.",
+    ):
+        assert "unsafe_shared_idempotency_key_across_payment_operations" not in (
+            payment_operation_semantic_issues(
+                f"{canary_q39_canvas_idempotency_rules} {rejected_sharing_claim}",
+                require_webhook_event_dedup=False,
+                require_complete_idempotency_semantics=False,
+            )
+        ), rejected_sharing_claim
     negated_retry_rules = (
         "Do not reuse the same idempotency key for retries of the same operation.",
         "Avoid reusing the same idempotency key for retries of the same operation.",
@@ -2206,6 +2494,114 @@ def self_check_payment_operation_semantics() -> None:
         require_webhook_event_dedup=False,
         require_complete_idempotency_semantics=False,
         require_same_operation_retry_reuse=True,
+    )
+    # Exact Q40 policy shape: a replay is a provider-guaranteed exception to a
+    # fail-closed timeout path, not an unbounded automatic retry loop.
+    canary_q40_replay_policy = (
+        "Transition the payment to UNKNOWN and stop automatic charge retries. "
+        "Provider status checks and webhooks reconcile it first. Only if the result "
+        "remains inconclusive and the provider contract guarantees idempotent replay "
+        "may the exact same provider command be retried under the original operation's "
+        "idempotency key, never a new key. If unresolved, escalate to manual "
+        "reconciliation. Webhooks are deduplicated by provider event ID; the operation "
+        "key is not the webhook deduplication key. "
+        "The idempotency key is scoped to the specific logical action, including a "
+        "partial capture or refund, and its instance; a new partial action gets a new "
+        "key, while only the exact same action can reuse its original key."
+    )
+    assert has_safe_payment_same_operation_replay_condition(canary_q40_replay_policy)
+    assert not payment_operation_semantic_issues(
+        canary_q40_replay_policy,
+        require_webhook_event_dedup=False,
+        require_complete_idempotency_semantics=False,
+        require_same_operation_retry_reuse=True,
+    )
+    # Correct scope language must never mask an affirmative pairwise share.
+    for unsafe_pairwise_share in (
+        "Each logical provider-operation instance gets its own stable idempotency key. "
+        "Capture and refund share one idempotency key.",
+        "One stable key per logical provider-operation instance. New partial capture "
+        "or partial refund is a new logical action with a new key. Retry of that exact "
+        "partial action reuses its original key. Capture and refund use the same key.",
+    ):
+        assert "unsafe_shared_idempotency_key_across_payment_operations" in (
+            payment_operation_semantic_issues(
+                unsafe_pairwise_share,
+                require_webhook_event_dedup=False,
+                require_complete_idempotency_semantics=False,
+            )
+        ), unsafe_pairwise_share
+    assert not has_safe_payment_same_operation_replay_condition(
+        "Keep the payment UNKNOWN and retry the same command forever; the provider "
+        "does not guarantee idempotency."
+    )
+    status_query_guarantee_does_not_cover_charge_replay = (
+        "Keep the payment UNKNOWN and reconcile first. Only if the result remains "
+        "inconclusive, the provider guarantees idempotency for status queries. Run "
+        "at most 3 bounded status queries. Use an automatic charge retry every minute "
+        "with the original operation's idempotency key. If unresolved, escalate to "
+        "manual reconciliation."
+    )
+    assert not has_safe_payment_same_operation_replay_condition(
+        status_query_guarantee_does_not_cover_charge_replay
+    )
+    replay_context = (
+        "Keep the outcome UNKNOWN and reconcile provider status first. Only if "
+        "reconciliation remains inconclusive and {guarantee} may the exact same "
+        "provider command be retried {bound} with the original operation's "
+        "idempotency key."
+    )
+    assert not has_safe_payment_same_operation_replay_condition(
+        replay_context.format(
+            guarantee="the provider guarantees idempotency for status queries",
+            bound="at most once",
+        )
+    )
+    for status_only_guarantee in (
+        "the provider guarantees idempotency only for status queries",
+        "the provider guarantees idempotent status queries only",
+        "the provider guarantees status-query idempotency and nothing for charge replay",
+    ):
+        assert not has_safe_payment_same_operation_replay_condition(
+            replay_context.format(guarantee=status_only_guarantee, bound="at most once")
+        ), status_only_guarantee
+    for money_guarantee in (
+        "the provider guarantees charge replay idempotency, not status-query idempotency",
+        "the provider guarantees idempotency for charge replay, not status queries",
+        "the provider guarantees idempotency for status queries and charge replay",
+        "the provider guarantees charge replay idempotency",
+    ):
+        assert has_safe_payment_same_operation_replay_condition(
+            replay_context.format(guarantee=money_guarantee, bound="at most once")
+        ), money_guarantee
+    for replay_bound in (
+        "at most once",
+        "no more than two times",
+        "a maximum of one replay",
+    ):
+        assert has_safe_payment_same_operation_replay_condition(
+            replay_context.format(
+                guarantee="the provider guarantees idempotent replay",
+                bound=replay_bound,
+            )
+        ), replay_bound
+    for recurring_cadence in (
+        "once per minute",
+        "hourly",
+        "periodically",
+        "on a timer",
+        "at 30-second intervals",
+        "with exponential backoff",
+        "every scheduler tick",
+    ):
+        assert not has_safe_payment_same_operation_replay_condition(
+            replay_context.format(
+                guarantee="the provider guarantees idempotent replay",
+                bound=recurring_cadence,
+            )
+        ), recurring_cadence
+    assert not _has_recurring_automatic_money_replay(
+        "Never automatically retry the charge once per minute."
     )
     assert "missing_same_operation_idempotency_key_reuse" in payment_operation_semantic_issues(
         "Keep the payment UNKNOWN, block the original charge, and query provider status.",

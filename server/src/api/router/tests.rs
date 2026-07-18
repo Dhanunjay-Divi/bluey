@@ -3267,6 +3267,50 @@ fn answer_plan_q40_payment_timeout_followup_is_first_person_and_safe() {
 }
 
 #[test]
+fn q40_compact_and_followup_answers_use_the_visible_coaching_guard() {
+    let standalone = complete_request(
+        "The provider times out after charging the card. What exact state transition and retry behavior do you use?",
+    );
+    let standalone_plan = answer_plan_for_request(&standalone, "balanced", &[]);
+    assert_eq!(standalone_plan.intent, AnswerIntent::General);
+    assert_eq!(standalone_plan.output, AnswerOutput::Compact);
+    assert!(should_strip_unsolicited_coaching_appendix(
+        &standalone_plan,
+        &standalone.user
+    ));
+
+    let followup = complete_request(
+        "Question:\nWhat if the provider times out after dispatch?\n\nSession context:\nPrevious system design answer:\nSystem Design\nA payment processing platform uses intents, a provider adapter, an outbox, and an immutable ledger.",
+    );
+    let followup_plan = answer_plan_for_request(&followup, "balanced", &[]);
+    assert_eq!(followup_plan.intent, AnswerIntent::FollowUp);
+    assert_eq!(followup_plan.output, AnswerOutput::Compact);
+    assert!(should_strip_unsolicited_coaching_appendix(
+        &followup_plan,
+        &followup.user
+    ));
+
+    let explicit_reasoning = complete_request(
+        "The provider times out after charging the card. Please explain your reasoning and give the exact state transition and retry behavior.",
+    );
+    let explicit_reasoning_plan = answer_plan_for_request(&explicit_reasoning, "balanced", &[]);
+    assert!(!should_strip_unsolicited_coaching_appendix(
+        &explicit_reasoning_plan,
+        &explicit_reasoning.user
+    ));
+
+    let ordinary_canvas = complete_request(
+        "Design a production messaging app for tens of millions of users. Explain it like a system design interview.",
+    );
+    let ordinary_canvas_plan = answer_plan_for_request(&ordinary_canvas, "balanced", &[]);
+    assert_eq!(ordinary_canvas_plan.output, AnswerOutput::CanvasDetail);
+    assert!(!should_strip_unsolicited_coaching_appendix(
+        &ordinary_canvas_plan,
+        &ordinary_canvas.user
+    ));
+}
+
+#[test]
 fn payment_contract_uses_current_question_and_does_not_force_known_predispatch_failure() {
     let unrelated = complete_request(
         "Question:\nDesign a URL shortener.\n\nSession context:\nPrevious answer discussed a payment timeout after charging a card.",

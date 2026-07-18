@@ -5925,6 +5925,65 @@ fn looks_like_payment_money_effect_domain(normalized: &str) -> bool {
         )
 }
 
+/// Narrowly identifies the ambiguous, post-dispatch payment-timeout follow-up
+/// that has a one-paragraph interview-style output contract. Keep this shared
+/// between prompt construction and visible-output shaping so a provider cannot
+/// append coaching material after satisfying that contract.
+fn is_post_dispatch_payment_timeout_question(
+    normalized_question: &str,
+    payment_money_effect_domain: bool,
+) -> bool {
+    payment_money_effect_domain
+        && contains_any(
+            normalized_question,
+            &["timeout", "times out", "timed out", "ambiguous outcome"],
+        )
+        && contains_any(
+            normalized_question,
+            &[
+                "after charging",
+                "after the charge",
+                "after dispatch",
+                "after submission",
+                "provider times out",
+                "ambiguous outcome",
+                "outcome is unknown",
+            ],
+        )
+        && !contains_any(
+            normalized_question,
+            &["before dispatch", "before submission", "before sending"],
+        )
+}
+
+/// The streamed and non-streamed paths must agree on whether a terminal
+/// coaching appendix is visible. Interview answers always use the guard; the
+/// post-dispatch payment-timeout follow-up (Q40) is also a ready-to-say,
+/// one-paragraph contract even when its router classification is Compact.
+fn should_strip_unsolicited_coaching_appendix(plan: &AnswerPlan, user_text: &str) -> bool {
+    if explicitly_requests_reasoning_section(user_text) {
+        return false;
+    }
+    if plan.output == AnswerOutput::InterviewAnswer {
+        return true;
+    }
+    if plan.output != AnswerOutput::Compact
+        || !matches!(plan.intent, AnswerIntent::General | AnswerIntent::FollowUp)
+    {
+        return false;
+    }
+
+    let normalized_question = normalize_guardrail_text(&extract_search_question(user_text));
+    let current_payment_money_effect = looks_like_payment_money_effect_domain(&normalized_question);
+    let previous_payment_money_effect = extract_previous_system_design_answer(user_text)
+        .map(normalize_guardrail_text)
+        .is_some_and(|previous| looks_like_payment_money_effect_domain(&previous));
+    is_post_dispatch_payment_timeout_question(
+        &normalized_question,
+        current_payment_money_effect || previous_payment_money_effect,
+    )
+}
+
 fn looks_like_feature_store_domain(normalized: &str) -> bool {
     let product_configuration_store = contains_any(
         normalized,
@@ -6076,27 +6135,10 @@ fn prompt_with_answer_plan(
             ],
         )))
         || payment_correctness_continuation;
-    let payment_timeout_question = (current_payment_money_effect || previous_payment_money_effect)
-        && contains_any(
-            &normalized_question,
-            &["timeout", "times out", "timed out", "ambiguous outcome"],
-        )
-        && contains_any(
-            &normalized_question,
-            &[
-                "after charging",
-                "after the charge",
-                "after dispatch",
-                "after submission",
-                "provider times out",
-                "ambiguous outcome",
-                "outcome is unknown",
-            ],
-        )
-        && !contains_any(
-            &normalized_question,
-            &["before dispatch", "before submission", "before sending"],
-        );
+    let payment_timeout_question = is_post_dispatch_payment_timeout_question(
+        &normalized_question,
+        current_payment_money_effect || previous_payment_money_effect,
+    );
     let card_operation_scope = contains_any_token_phrase(
         &normalized_question,
         &[
@@ -8616,8 +8658,8 @@ async fn complete_stream_inner(
     // streaming artifact so users see useful output without full-answer lag.
     let split_canvas_stream = answer_plan.output == AnswerOutput::CanvasDetail
         && answer_plan.intent == AnswerIntent::SystemDesign;
-    let strip_interview_coaching_appendix = answer_plan.output == AnswerOutput::InterviewAnswer
-        && !explicitly_requests_reasoning_section(&req.user);
+    let strip_interview_coaching_appendix =
+        should_strip_unsolicited_coaching_appendix(&answer_plan, &req.user);
     let event_stream = async_stream::stream! {
         let mut events = streaming.events;
         let mut pending_first = selected_first_event;
@@ -10102,10 +10144,10 @@ async fn complete_inner(
         return Err(err);
     }
 
-    let mut output = BufferedDisclosureOutput::new(
-        answer_plan.output == AnswerOutput::InterviewAnswer
-            && !explicitly_requests_reasoning_section(&req.user),
-    );
+    let mut output = BufferedDisclosureOutput::new(should_strip_unsolicited_coaching_appendix(
+        &answer_plan,
+        &req.user,
+    ));
     let _ = output.push(&comp.text);
     let (response_text, _) = output.finish();
     if let Some(reason) = generated_answer_quality_failure(
