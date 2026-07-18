@@ -58,6 +58,7 @@ from bluey_eval.payment_key_sharing_checks import (  # noqa: E402
     self_check_payment_key_sharing_detector,
 )
 from bluey_eval.coaching_contracts import (  # noqa: E402
+    has_affirmative_q48_learner_ownership,
     q48_coaching_ownership_issues,
     self_check_q48_coaching_ownership,
 )
@@ -310,7 +311,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q45", "behavioral", "amazon_de", "Tell me about a failure. What did you change so the same class of failure would not repeat?", "behavioral_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("fail", "mistake"), g("root cause", "learn"), g("guardrail", "test", "monitor", "process"))),
     EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
     EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("communicat", "tradeoff", "lay out", "comparison"))),
-    EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("on their own", "themselves", "let them own", "they take ownership", "their ownership", "they fix", "they make the correction", "ownership with them", "they still do the work", "ask them to update the code"))),
+    EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("on their own", "themselves", "let them own", "they take ownership", "they keep ownership", "their ownership", "they fix", "they make the correction", "ownership with them", "they still do the work", "ask them to update the code"))),
     EvalCase("Q49", "scenario", "ds", "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?", "otter_visible_scenario", speakable=True, required_groups=(g("track", "identity"), g("calibrat", "time", "spatial"), g("dedup", "de-duplication", "fusion", "fuse", "association"))),
     EvalCase("Q50", "behavioral", "ds", "Why this role, and what would you focus on in your first ninety days?", "resume_and_jd_pdf", speakable=True, required_groups=(g("hpe", "datacenter", "telemetry"), g("first", "90", "ninety"), g("stakeholder", "baseline", "production"))),
 )
@@ -903,6 +904,29 @@ def has_first_person(text: str) -> bool:
     return bool(re.search(r"\b(?:I|I'm|I've|I'd|my|me)\b", text, re.I))
 
 
+def requires_first_person_answer(case: EvalCase) -> bool:
+    """Require candidate voice for decisions and lived answers, not explanations."""
+    if case.self_intro or case.category in {
+        "behavioral",
+        "scenario",
+        "system_design",
+        "design_followup",
+        "followup",
+    }:
+        return True
+    question = re.sub(r"\s+", " ", case.question.casefold()).strip()
+    return any(
+        frame in question
+        for frame in (
+            "how do you",
+            "how would you",
+            "what do you",
+            "what would you",
+            "would you",
+        )
+    )
+
+
 def answer_evidence_text(attempt: AttemptResult) -> str:
     """Return all customer-visible answer material used by quality gates."""
     return (attempt.visible_answer + "\n" + (attempt.artifact_body or "")).strip()
@@ -1288,7 +1312,10 @@ def self_check_q46_story_grounding_detector() -> None:
 def missing_required_group_issues(case: EvalCase, text: str) -> List[str]:
     issues: List[str] = []
     for group in case.required_groups:
-        satisfied = any(has_required_signal(text, term) for term in group)
+        if case.id == "Q48" and group == case.required_groups[-1]:
+            satisfied = has_affirmative_q48_learner_ownership(text)
+        else:
+            satisfied = any(has_required_signal(text, term) for term in group)
         if (
             not satisfied
             and case.id == "Q35"
@@ -1647,6 +1674,12 @@ def expected_outcome_is_accepted(case: EvalCase, attempt: AttemptResult) -> bool
 
 def self_check_attempt_integrity_guards() -> None:
     self_check_q48_coaching_ownership()
+    assert not requires_first_person_answer(next(case for case in CASES if case.id == "Q07"))
+    assert not requires_first_person_answer(next(case for case in CASES if case.id == "Q31"))
+    for first_person_case in ("Q01", "Q05", "Q11", "Q30", "Q39", "Q47"):
+        assert requires_first_person_answer(
+            next(case for case in CASES if case.id == first_person_case)
+        )
     assert has_required_signal("def get(self, key):", "get")
     assert has_required_signal("point in time training-serving data", "point-in-time")
     q31 = next(case for case in CASES if case.id == "Q31")
@@ -1677,8 +1710,8 @@ def self_check_attempt_integrity_guards() -> None:
     )
     q48_learner_ownership_issue = (
         "missing_signal:on their own|themselves|let them own|they take ownership|"
-        "their ownership|they fix|they make the correction|ownership with them|"
-        "they still do the work|ask them to update the code"
+        "they keep ownership|their ownership|they fix|they make the correction|"
+        "ownership with them|they still do the work|ask them to update the code"
     )
     assert not missing_required_group_issues(
         q48,
@@ -1686,6 +1719,21 @@ def self_check_attempt_integrity_guards() -> None:
         "ownership with them. I ask them to update the code, and they still do "
         "the work.",
     )
+    assert not missing_required_group_issues(
+        q48,
+        "I coach them directly, show one concrete example, and give them a "
+        "checklist. Then I ask them to rework the next PR so they keep ownership "
+        "instead of me doing it for them.",
+    )
+    for negated_or_empty_ownership in (
+        "I coach them with an example and checklist. It is false that they keep "
+        "ownership.",
+        "I coach them with an example and checklist. They keep ownership only on "
+        "paper.",
+    ):
+        assert q48_learner_ownership_issue in missing_required_group_issues(
+            q48, negated_or_empty_ownership
+        )
     for takeover_answer in (
         "I coach them with one concrete example and a checklist. Next time I take "
         "over and rewrite their code myself.",
@@ -3555,6 +3603,7 @@ def quality_scores(case: EvalCase, attempt: AttemptResult) -> Tuple[int, int, in
         issues.append("assistant_or_meta_opener")
     if (
         case.speakable
+        and requires_first_person_answer(case)
         and case.expected_outcome == "answer"
         and not has_first_person(attempt.visible_answer)
     ):

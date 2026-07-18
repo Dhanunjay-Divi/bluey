@@ -22,6 +22,11 @@ Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE = (
     "A new partial capture or refund creates a child provider-operation row under "
     "the existing payment intent, not a new payment intent."
 )
+Q39_PARTIAL_ACTION_BOUNDARY_WITH_KEY_SENTENCE = (
+    "A new partial capture or refund is a new logical action with a new key, and "
+    "creates a child provider-operation row under the existing payment intent, not "
+    "a new payment intent."
+)
 
 
 def payment_q39_completeness_issues(text: str) -> List[str]:
@@ -39,7 +44,10 @@ def payment_q39_completeness_issues(text: str) -> List[str]:
             "missing_idempotent_local_ledger_posting",
         ),
         (
-            (Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,),
+            (
+                Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,
+                Q39_PARTIAL_ACTION_BOUNDARY_WITH_KEY_SENTENCE,
+            ),
             "missing_partial_action_child_operation_boundary",
         ),
     )

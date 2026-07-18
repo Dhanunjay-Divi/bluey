@@ -6,6 +6,7 @@ from .payment_contracts import (
     Q39_INGRESS_IDEMPOTENCY_SENTENCE,
     Q39_LEDGER_IDEMPOTENCY_SENTENCE,
     Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,
+    Q39_PARTIAL_ACTION_BOUNDARY_WITH_KEY_SENTENCE,
     has_exactly_once_processing_overclaim,
     has_safe_payment_same_operation_replay_condition,
     has_unsafe_ambiguous_payment_outcome,
@@ -318,6 +319,11 @@ def self_check_payment_operation_semantics() -> None:
         Q39_INGRESS_IDEMPOTENCY_SENTENCE.removeprefix("The "),
     )
     assert not payment_q39_completeness_issues(articleless_ingress)
+    keyed_partial_boundary = complete_payment_contract.replace(
+        Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,
+        Q39_PARTIAL_ACTION_BOUNDARY_WITH_KEY_SENTENCE,
+    )
+    assert not payment_q39_completeness_issues(keyed_partial_boundary)
     assert "unsafe_shared_idempotency_key_across_payment_operations" not in (
         payment_operation_semantic_issues(
             line_wrapped_contract,
@@ -348,6 +354,29 @@ def self_check_payment_operation_semantics() -> None:
     ):
         assert "missing_client_idempotency_intent_mapping" in (
             payment_q39_completeness_issues(hidden_articleless_ingress)
+        )
+    for hidden_keyed_partial_boundary in (
+        f"<!-- {Q39_PARTIAL_ACTION_BOUNDARY_WITH_KEY_SENTENCE} -->",
+        f"~~{Q39_PARTIAL_ACTION_BOUNDARY_WITH_KEY_SENTENCE}~~",
+        f"```text\n{Q39_PARTIAL_ACTION_BOUNDARY_WITH_KEY_SENTENCE}\n```",
+        f"> {Q39_PARTIAL_ACTION_BOUNDARY_WITH_KEY_SENTENCE}",
+    ):
+        assert "missing_partial_action_child_operation_boundary" in (
+            payment_q39_completeness_issues(hidden_keyed_partial_boundary)
+        )
+    for unsafe_keyed_partial_boundary in (
+        Q39_PARTIAL_ACTION_BOUNDARY_WITH_KEY_SENTENCE.replace(
+            "not a new payment intent",
+            "and creates a new payment intent",
+        ),
+        Q39_PARTIAL_ACTION_BOUNDARY_WITH_KEY_SENTENCE.replace(
+            "creates a child provider-operation row under the existing payment intent, ",
+            "",
+        ),
+        f"This is wrong: {Q39_PARTIAL_ACTION_BOUNDARY_WITH_KEY_SENTENCE}",
+    ):
+        assert "missing_partial_action_child_operation_boundary" in (
+            payment_q39_completeness_issues(unsafe_keyed_partial_boundary)
         )
     for unsafe_articleless_ingress in (
         articleless_ingress_sentence.replace(
