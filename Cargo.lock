@@ -1292,6 +1292,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cue-calendar-cloud"
+version = "0.1.10"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "cue-core",
+ "getrandom 0.2.17",
+ "keyring",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "cue-cli"
 version = "0.1.10"
 dependencies = [
@@ -1365,6 +1383,7 @@ dependencies = [
  "clap",
  "cpal",
  "cue-agent-bridge",
+ "cue-calendar-cloud",
  "cue-cloud-client",
  "cue-core",
  "cue-diarize",

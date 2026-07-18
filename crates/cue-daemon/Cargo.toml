@@ -45,6 +45,11 @@ cue-transcribe = { path = "../cue-transcribe" }
 # `diarize` feature: it links OpenBLAS + a native CoreML backend, so it must NOT
 # be in the default build. Enable with `--features diarize`.
 cue-diarize = { path = "../cue-diarize", optional = true }
+# Cloud OAuth calendar sources (Google/Microsoft): PKCE + loopback redirect,
+# tokens in the OS keychain. Optional + behind the `cloud-calendar` feature so
+# the default build stays lean and cross-platform (unlike the macOS-only
+# `calendar`/EventKit feature). Enable with `--features cloud-calendar`.
+cue-calendar-cloud = { path = "../cue-calendar-cloud", optional = true }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -101,6 +106,11 @@ local-memory = ["cue-rag/local-embed", "dep:ort", "dep:tokenizers"]
 # meeting fires the warm-up trigger. Off by default (macOS-only, needs the TCC
 # usage string on the packaged app). Falls back to the env fake / no events.
 calendar = ["dep:objc2-event-kit", "dep:block2"]
+# Cloud OAuth calendar sources (Google/Microsoft) via the cue-calendar-cloud
+# crate. Off by default; cross-platform. Gates the CalendarConnect* IPC handlers
+# (the interactive connect flow + per-provider token store). Enable with
+# `--features cloud-calendar`.
+cloud-calendar = ["dep:cue-calendar-cloud"]
 
 [dev-dependencies]
 # WAV reader for the on-device Parakeet inference smoke test + debug example

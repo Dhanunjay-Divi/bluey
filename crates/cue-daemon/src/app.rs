@@ -2624,7 +2624,192 @@ async fn handle_request_inner(
             info!(enabled, "agent session-history consent updated via IPC");
             Ok(DaemonResponse::Ok)
         }
+        DaemonRequest::CalendarConnectStart { provider } => {
+            calendar_connect_start(daemon, &provider).await
+        }
+        DaemonRequest::CalendarConnectStatus => calendar_connect_status(daemon).await,
+        DaemonRequest::CalendarDisconnect { provider } => {
+            calendar_disconnect(daemon, &provider).await
+        }
     }
+}
+
+/// The cloud-calendar providers the UI can connect, in the order the status
+/// response reports them. Kept as a plain slice so both the feature-on and
+/// feature-off paths agree on the provider ids without importing the cloud crate.
+const CLOUD_CALENDAR_PROVIDERS: [&str; 2] = ["google", "microsoft"];
+
+/// Open `url` in the user's default browser (macOS `open` / Windows `start` /
+/// Linux `xdg-open`). Mirrors cue-cli's `open_browser`; used by the interactive
+/// cloud-calendar connect flow so the OAuth consent page appears. It just opens
+/// the browser — nothing is hidden or capture-excluded. Gated on the
+/// `cloud-calendar` feature (its only caller), so the default build stays clean.
+#[cfg(feature = "cloud-calendar")]
+fn open_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg("start").arg("");
+        command
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = Command::new("xdg-open");
+
+    let status = command
+        .arg(url)
+        .status()
+        .context("failed to open browser")?;
+    if !status.success() {
+        anyhow::bail!("browser opener exited with status {status}");
+    }
+    Ok(())
+}
+
+// --- Cloud-calendar connect flow (D) -------------------------------------
+//
+// The handler bodies live behind the `cloud-calendar` cargo feature (agent E
+// enables it on cue-daemon). The feature-OFF fallbacks below keep the DEFAULT
+// build compiling and honestly report that the cloud calendar isn't built.
+//
+// SEAM (E, reconciled): the connect flow drives cue-calendar-cloud's source-level
+// `connect` constructors (`GoogleCalendarSource::connect(open_browser)` /
+// `MicrosoftCalendarSource::connect(open_browser)`). These wrap the same PKCE +
+// loopback flow as the lower-level `connect_interactive`, but ADDITIONALLY enrich
+// the connected-account email (a userinfo / Graph `/me` call) and persist the
+// tokens to the per-provider OS keychain themselves — so E no longer needs a
+// separate `KeyringCalStore.save` here, and the follow-up status reports a
+// populated email for the connected-account UI label. `default_source()` builds
+// the live source from those same stored tokens.
+
+#[cfg(feature = "cloud-calendar")]
+async fn calendar_connect_start(_daemon: &Arc<Daemon>, provider: &str) -> Result<DaemonResponse> {
+    use cue_calendar_cloud::google::GoogleCalendarSource;
+    use cue_calendar_cloud::microsoft::MicrosoftCalendarSource;
+
+    // The daemon supplies the browser opener; the crate stays browser-agnostic.
+    let open = |url: &str| {
+        if let Err(error) = open_browser(url) {
+            warn!(%error, "failed to open browser for calendar OAuth");
+        }
+    };
+
+    // The interactive source-level connect: PKCE → loopback bind → open browser →
+    // wait for the authorization code → exchange → enrich email → persist to the
+    // per-provider keychain. A ~2min timeout bounds the wait so a user who
+    // abandons the consent page doesn't hang the IPC caller forever.
+    let timeout = std::time::Duration::from_secs(120);
+    let result = match provider {
+        "google" => tokio::time::timeout(timeout, GoogleCalendarSource::connect(open)).await,
+        "microsoft" => tokio::time::timeout(timeout, MicrosoftCalendarSource::connect(open)).await,
+        other => {
+            return Ok(DaemonResponse::Error {
+                message: format!("unknown calendar provider \"{other}\""),
+            });
+        }
+    };
+
+    // The source-level connect already saved the tokens to the keyring; we only
+    // need to surface success/failure. (The email it enriched is read back by the
+    // follow-up `CalendarConnectStatus`.)
+    match result {
+        Ok(Ok(_tokens)) => {
+            info!(provider, "cloud calendar connected");
+            Ok(DaemonResponse::Ok)
+        }
+        Ok(Err(error)) => Ok(DaemonResponse::Error {
+            message: format!("calendar connect failed: {error:#}"),
+        }),
+        Err(_elapsed) => Ok(DaemonResponse::Error {
+            message: "calendar connect timed out waiting for authorization".to_string(),
+        }),
+    }
+}
+
+#[cfg(not(feature = "cloud-calendar"))]
+async fn calendar_connect_start(_daemon: &Arc<Daemon>, _provider: &str) -> Result<DaemonResponse> {
+    Ok(DaemonResponse::Error {
+        message: "cloud calendar not built".to_string(),
+    })
+}
+
+#[cfg(feature = "cloud-calendar")]
+async fn calendar_connect_status(_daemon: &Arc<Daemon>) -> Result<DaemonResponse> {
+    use cue_calendar_cloud::{CalTokenStore, KeyringCalStore, Provider};
+
+    // Read each provider's keychain store off the async runtime (blocking I/O).
+    let connections = tokio::task::spawn_blocking(|| {
+        CLOUD_CALENDAR_PROVIDERS
+            .iter()
+            .map(|&provider| {
+                let provider_enum = match provider {
+                    "google" => Provider::Google,
+                    _ => Provider::Microsoft,
+                };
+                // Fail-soft: a keyring error reads as "not connected" rather than
+                // failing the whole status request.
+                let tokens = KeyringCalStore::new(provider_enum.keyring_service())
+                    .load()
+                    .ok()
+                    .flatten();
+                cue_core::CalendarConnection {
+                    provider: provider.to_string(),
+                    connected: tokens.is_some(),
+                    email: tokens.map(|t| t.email).unwrap_or_default(),
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("calendar status task panicked: {e}"))?;
+
+    Ok(DaemonResponse::CalendarStatus { connections })
+}
+
+#[cfg(not(feature = "cloud-calendar"))]
+async fn calendar_connect_status(_daemon: &Arc<Daemon>) -> Result<DaemonResponse> {
+    // Fallback: report every provider as disconnected so the UI renders the
+    // connect buttons but the flow honestly errors when the feature is off.
+    let connections = CLOUD_CALENDAR_PROVIDERS
+        .iter()
+        .map(|&provider| cue_core::CalendarConnection {
+            provider: provider.to_string(),
+            connected: false,
+            email: String::new(),
+        })
+        .collect();
+    Ok(DaemonResponse::CalendarStatus { connections })
+}
+
+#[cfg(feature = "cloud-calendar")]
+async fn calendar_disconnect(_daemon: &Arc<Daemon>, provider: &str) -> Result<DaemonResponse> {
+    use cue_calendar_cloud::{CalTokenStore, KeyringCalStore, Provider};
+
+    let provider_enum = match provider {
+        "google" => Provider::Google,
+        "microsoft" => Provider::Microsoft,
+        other => {
+            return Ok(DaemonResponse::Error {
+                message: format!("unknown calendar provider \"{other}\""),
+            });
+        }
+    };
+
+    let service = provider_enum.keyring_service();
+    tokio::task::spawn_blocking(move || KeyringCalStore::new(service).clear())
+        .await
+        .map_err(|e| anyhow::anyhow!("calendar token clear task panicked: {e}"))??;
+
+    info!(provider, "cloud calendar disconnected");
+    Ok(DaemonResponse::Ok)
+}
+
+#[cfg(not(feature = "cloud-calendar"))]
+async fn calendar_disconnect(_daemon: &Arc<Daemon>, _provider: &str) -> Result<DaemonResponse> {
+    Ok(DaemonResponse::Error {
+        message: "cloud calendar not built".to_string(),
+    })
 }
 
 /// Discover agents and map them to [`AgentSummary`] DTOs off the async runtime.

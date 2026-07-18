@@ -100,6 +100,42 @@ pub async fn set_agent_session_history(
     array_field(resp, "_ignored").map(|_| ())
 }
 
+/// Start the interactive cloud-calendar OAuth connect flow for `provider`
+/// (`"google"` | `"microsoft"`). The daemon opens the system browser, waits for
+/// the OAuth code, and stores the tokens in the OS keychain — this command
+/// resolves once that round-trip completes (or the daemon errors/times out).
+#[tauri::command]
+pub async fn calendar_connect(link: State<'_, DaemonLink>, provider: String) -> Result<(), String> {
+    let resp = request(
+        &link.addr,
+        json!({ "type": "calendar_connect_start", "provider": provider }),
+    )
+    .await?;
+    // Ok / error only; surface the daemon's error message if the flow failed.
+    array_field(resp, "_ignored").map(|_| ())
+}
+
+/// Report the current cloud-calendar connection state (one row per provider).
+#[tauri::command]
+pub async fn calendar_status(link: State<'_, DaemonLink>) -> Result<Value, String> {
+    let resp = request(&link.addr, json!({ "type": "calendar_connect_status" })).await?;
+    array_field(resp, "connections")
+}
+
+/// Clear the stored tokens for `provider`, disconnecting that cloud calendar.
+#[tauri::command]
+pub async fn calendar_disconnect(
+    link: State<'_, DaemonLink>,
+    provider: String,
+) -> Result<(), String> {
+    let resp = request(
+        &link.addr,
+        json!({ "type": "calendar_disconnect", "provider": provider }),
+    )
+    .await?;
+    array_field(resp, "_ignored").map(|_| ())
+}
+
 /// Ask the attached agent.
 ///
 /// **Preferred (socket / push path):** when the daemon launched us over the Unix

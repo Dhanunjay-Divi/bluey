@@ -9,6 +9,7 @@
 
 import type {
   AgentConnectorInfo,
+  CalendarConnection,
   SourceCoverageInfo,
   AgentSessionSummary,
   AgentSummary,
@@ -54,6 +55,18 @@ export interface MeetingClient {
       coverage meter). Empty when no agent is attached. */
   sourceCoverage(): Promise<SourceCoverageInfo[]>;
   setSessionHistoryConsent(enabled: boolean): Promise<void>;
+
+  // ---- cloud calendar (Connect Google / Microsoft) ----
+  /** Start the interactive OAuth connect flow for a cloud calendar. The daemon
+   *  opens the system browser and waits for the user to authorize; the returned
+   *  promise resolves once tokens are stored (or rejects with the daemon's error
+   *  message on failure/timeout). `provider` is "google" | "microsoft". */
+  calendarConnect(provider: string): Promise<void>;
+  /** Fetch the current cloud-calendar connection state (one row per provider).
+   *  Reflects which providers are connected + the connected account email. */
+  calendarStatus(): Promise<CalendarConnection[]>;
+  /** Disconnect a cloud calendar: clears that provider's stored tokens. */
+  calendarDisconnect(provider: string): Promise<void>;
 
   /** Fetch the active meeting's transcript + Q&A once, to rehydrate on mount
    *  (Fix B). The MEETING is the source of truth (the daemon persists it); the

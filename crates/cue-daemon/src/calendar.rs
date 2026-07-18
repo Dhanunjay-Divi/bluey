@@ -22,45 +22,18 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// The shared calendar seam types now live in `cue-core` so the out-of-daemon
+// cloud calendar crate (`cue-calendar-cloud`) can implement `CalendarSource`
+// without a dependency cycle. Everything below (EventKit / env-fake / no-op
+// sources, dedupe, and the warm-fire trigger core) stays in the daemon.
+pub use cue_core::calendar::{CalendarSource, Participant, UpcomingEvent};
+
 /// Fire the warm drive this many seconds before the event starts.
 pub const WARM_LEAD_SECS: u64 = 180;
 /// Rolling look-ahead window the poll scans.
 pub const LOOKAHEAD_SECS: u64 = 600;
 /// Poll cadence.
 pub const POLL_SECS: u64 = 30;
-
-/// One meeting participant (invitee or organizer) from the calendar event.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Participant {
-    /// Display name when the calendar provides one (else empty).
-    pub name: String,
-    /// Email address, parsed from the participant's `mailto:` URL (else empty).
-    pub email: String,
-    /// True for the meeting organizer.
-    pub is_organizer: bool,
-}
-
-/// One upcoming meeting occurrence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpcomingEvent {
-    /// Stable event id (iCalUID / EventKit identifier / fake title).
-    pub id: String,
-    pub title: String,
-    /// Occurrence start (epoch seconds) — part of the dedupe key so a MOVED
-    /// event re-arms.
-    pub start_epoch_secs: u64,
-    /// The meeting's invitees + organizer, when the calendar exposes them
-    /// (EventKit does; the env fake leaves it empty). Names + emails let Bluey
-    /// map diarized speakers to real people and hand the agent the roster.
-    pub participants: Vec<Participant>,
-}
-
-/// Where upcoming events come from (EventKit or the env fake).
-pub trait CalendarSource: Send + 'static {
-    /// Events starting within `[now, now + LOOKAHEAD_SECS]`. Fail-soft:
-    /// permission denied / source errors return an empty list.
-    fn upcoming(&self, now_epoch_secs: u64) -> Vec<UpcomingEvent>;
-}
 
 /// Real system-calendar source via EventKit (macOS, feature `calendar`). Reads
 /// the user's connected accounts (Outlook / Google / iCloud) through the OS
@@ -203,14 +176,29 @@ impl CalendarSource for NoopSource {
     }
 }
 
-/// Pick the calendar source the daemon should poll: the env fake when
-/// `BLUEY_CALENDAR_FAKE_EVENTS` is set (the deterministic test hook wins so a
-/// test never races the real calendar), else the real EventKit source when the
-/// `calendar` feature is compiled on macOS, else a no-op (the trigger stays
-/// dormant rather than erroring).
+/// Pick the calendar source the daemon should poll, in priority order:
+/// 1. the env fake when `BLUEY_CALENDAR_FAKE_EVENTS` is set (the deterministic
+///    test hook wins first so a test never races a real calendar);
+/// 2. a connected cloud OAuth calendar (feature `cloud-calendar`) — Google, then
+///    Microsoft — when that provider has tokens stored in its keychain;
+/// 3. the real EventKit source (feature `calendar`, macOS);
+/// 4. a no-op (the trigger stays dormant rather than erroring).
+///
+/// The cloud branch needs the daemon's tokio [`Handle`] to spawn the source's
+/// background refresh task. `default_source()` is called from within the daemon's
+/// calendar-poll task (an async context — see `app.rs`), so
+/// [`Handle::try_current`] resolves it without a signature change; if this were
+/// ever called off the runtime, the cloud branch is skipped (falling through to
+/// EventKit/Noop) rather than panicking.
 pub fn default_source() -> Box<dyn CalendarSource> {
     if std::env::var("BLUEY_CALENDAR_FAKE_EVENTS").is_ok() {
         return Box::new(EnvFakeSource);
+    }
+    #[cfg(feature = "cloud-calendar")]
+    {
+        if let Some(source) = cloud_source() {
+            return source;
+        }
     }
     #[cfg(all(feature = "calendar", target_os = "macos"))]
     {
@@ -218,6 +206,44 @@ pub fn default_source() -> Box<dyn CalendarSource> {
     }
     #[allow(unreachable_code)]
     Box::new(NoopSource)
+}
+
+/// Build a cloud calendar source when a provider is connected (tokens present in
+/// its per-provider keychain), preferring Google, then Microsoft. Returns `None`
+/// when neither is connected or when no tokio runtime handle is available (so the
+/// caller falls through to EventKit / no-op). Keychain-read errors are treated as
+/// "not connected" (fail-soft) — never a panic.
+#[cfg(feature = "cloud-calendar")]
+fn cloud_source() -> Option<Box<dyn CalendarSource>> {
+    use cue_calendar_cloud::google::GoogleCalendarSource;
+    use cue_calendar_cloud::microsoft::MicrosoftCalendarSource;
+    use cue_calendar_cloud::{CalTokenStore, KeyringCalStore, Provider};
+    use std::sync::Arc;
+
+    // Spawning the source's background refresh task needs a runtime handle; if
+    // we're somehow off the runtime, skip the cloud branch rather than panic.
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+
+    // A provider is "connected" iff its keychain store holds tokens. A keyring
+    // error reads as not-connected (fail-soft) instead of failing the pick.
+    let is_connected = |provider: Provider| -> bool {
+        matches!(
+            KeyringCalStore::new(provider.keyring_service()).load(),
+            Ok(Some(_))
+        )
+    };
+
+    if is_connected(Provider::Google) {
+        let store: Arc<dyn CalTokenStore> =
+            Arc::new(KeyringCalStore::new(Provider::Google.keyring_service()));
+        return Some(Box::new(GoogleCalendarSource::spawn(store, handle)));
+    }
+    if is_connected(Provider::Microsoft) {
+        let store: Arc<dyn CalTokenStore> =
+            Arc::new(KeyringCalStore::new(Provider::Microsoft.keyring_service()));
+        return Some(Box::new(MicrosoftCalendarSource::spawn(store, handle)));
+    }
+    None
 }
 
 /// The env-driven fake (`BLUEY_CALENDAR_FAKE_EVENTS="Standup@1783560000;…"`).

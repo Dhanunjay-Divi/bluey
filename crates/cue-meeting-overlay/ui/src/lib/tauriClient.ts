@@ -33,6 +33,7 @@ import type {
   AgentSummary,
   AnswerChunk,
   AnswerStatusStep,
+  CalendarConnection,
   ContinueResult,
   FixProposal,
   ListeningState,
@@ -417,6 +418,31 @@ export function createTauriClient(): MeetingClient {
         via: r.via ?? null,
         connectHint: r.connect_hint ?? null,
       }));
+    },
+
+    // ---- cloud calendar. Direct tauri commands (like sourceCoverage): the
+    // shell forwards a DaemonRequest over the socket and returns the
+    // DaemonResponse. A daemon-side error rejects the invoke promise with the
+    // error message, which the caller renders. ----
+    calendarConnect: async (provider) => {
+      // Resolves when the daemon finishes the browser round-trip + token store;
+      // rejects (invoke throws) with the daemon's error message on failure.
+      await invoke<void>("calendar_connect", { provider });
+    },
+
+    calendarStatus: async () => {
+      // The daemon's CalendarConnection fields are single-word, so its snake_case
+      // serde already matches the UI shape — pass the rows through as-is.
+      const rows = await invoke<CalendarConnection[]>("calendar_status");
+      return rows.map((r) => ({
+        provider: r.provider,
+        connected: r.connected,
+        email: r.email,
+      }));
+    },
+
+    calendarDisconnect: async (provider) => {
+      await invoke<void>("calendar_disconnect", { provider });
     },
 
     connectors: (kind) =>

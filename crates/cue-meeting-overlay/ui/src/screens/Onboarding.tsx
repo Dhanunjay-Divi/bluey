@@ -8,8 +8,15 @@ import { Glass, Mark } from "../components/primitives";
 import { getClient } from "../lib";
 import type { AgentSummary } from "../lib/types";
 
-type Step = "welcome" | "mic" | "attach" | "consent" | "ready";
-const ORDER: Step[] = ["welcome", "mic", "attach", "consent", "ready"];
+type Step = "welcome" | "mic" | "attach" | "calendar" | "consent" | "ready";
+const ORDER: Step[] = [
+  "welcome",
+  "mic",
+  "attach",
+  "calendar",
+  "consent",
+  "ready",
+];
 
 export function Onboarding({
   agents,
@@ -85,6 +92,10 @@ export function Onboarding({
             </div>
           )}
 
+          {step === "calendar" && (
+            <CalendarStep onNext={next} onSkip={next} />
+          )}
+
           {step === "consent" && (
             <Body
               icon={<Glyph>📂</Glyph>}
@@ -143,6 +154,139 @@ function Body({
       <div style={{ display: "flex", gap: 9, marginTop: 20 }}>
         <button onClick={onCta} style={primary}>{cta}</button>
         {secondary && <button onClick={onSecondary} style={ghost}>{secondary}</button>}
+      </div>
+    </div>
+  );
+}
+
+// One cloud-calendar provider the onboarding step can connect.
+type CalProvider = { id: string; label: string };
+const CAL_PROVIDERS: CalProvider[] = [
+  { id: "google", label: "Google Calendar" },
+  { id: "microsoft", label: "Microsoft Calendar" },
+];
+
+// Per-provider connect state. `email` is set once connected (from calendarStatus);
+// `error` holds the daemon's failure message so the UI can render, not crash.
+type CalState = {
+  status: "idle" | "connecting" | "connected" | "error";
+  email?: string;
+  error?: string;
+};
+
+// The calendar onboarding step: "Connect Google / Microsoft Calendar" buttons.
+// Connecting is optional (Skip advances) — a cloud calendar lets Bluey warm up
+// ahead of meetings, but a user with the macOS calendar connected doesn't need it.
+function CalendarStep({
+  onNext,
+  onSkip,
+}: {
+  onNext: () => void;
+  onSkip: () => void;
+}) {
+  const client = getClient();
+  const [state, setState] = useState<Record<string, CalState>>({});
+  const anyConnected = CAL_PROVIDERS.some(
+    (p) => state[p.id]?.status === "connected",
+  );
+
+  const connect = async (id: string) => {
+    setState((s) => ({ ...s, [id]: { status: "connecting" } }));
+    try {
+      await client.calendarConnect(id);
+      // Pull the connected email for the label; tolerate a status read failing.
+      let email: string | undefined;
+      try {
+        const rows = await client.calendarStatus();
+        email = rows.find((r) => r.provider === id)?.email || undefined;
+      } catch {
+        email = undefined;
+      }
+      setState((s) => ({ ...s, [id]: { status: "connected", email } }));
+    } catch (e) {
+      // Render the daemon's error (e.g. "cloud calendar not built", a timeout,
+      // or an OAuth failure) instead of throwing out of the click handler.
+      const error = e instanceof Error ? e.message : String(e);
+      setState((s) => ({ ...s, [id]: { status: "error", error } }));
+    }
+  };
+
+  return (
+    <div>
+      <Glyph>📅</Glyph>
+      <h2 style={h2}>Connect your calendar</h2>
+      <p style={p}>
+        Bluey warms up an answer ahead of each meeting from your calendar. Connect
+        a cloud calendar, or skip if your calendar is already on this Mac.
+      </p>
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 7,
+          marginTop: 16,
+        }}
+      >
+        {CAL_PROVIDERS.map((prov) => {
+          const st = state[prov.id]?.status ?? "idle";
+          const connecting = st === "connecting";
+          const connected = st === "connected";
+          return (
+            <div key={prov.id}>
+              <button
+                onClick={() => connect(prov.id)}
+                disabled={connecting || connected}
+                style={{
+                  ...pickRow,
+                  cursor: connecting || connected ? "default" : "pointer",
+                  opacity: connecting ? 0.7 : 1,
+                }}
+              >
+                <span style={{ fontSize: 13, fontWeight: 540 }}>
+                  {prov.label}
+                </span>
+                <span
+                  style={{
+                    marginLeft: "auto",
+                    fontSize: 11,
+                    color: connected ? "var(--mint-ink,#2e7d63)" : "var(--ink-3)",
+                  }}
+                >
+                  {connecting
+                    ? "Connecting…"
+                    : connected
+                      ? (state[prov.id]?.email ?? "Connected")
+                      : ""}
+                </span>
+                {!connected && (
+                  <span style={{ color: "var(--tint-ink)", fontSize: 13 }}>→</span>
+                )}
+              </button>
+              {st === "error" && (
+                <p
+                  style={{
+                    fontSize: 11.5,
+                    lineHeight: 1.5,
+                    color: "var(--danger-ink,#c0392b)",
+                    margin: "5px 2px 0",
+                  }}
+                >
+                  {state[prov.id]?.error ?? "Connection failed."}
+                </p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 9, marginTop: 20 }}>
+        <button onClick={onNext} style={primary}>
+          {anyConnected ? "Continue" : "Next"}
+        </button>
+        {!anyConnected && (
+          <button onClick={onSkip} style={ghost}>
+            Skip for now
+          </button>
+        )}
       </div>
     </div>
   );

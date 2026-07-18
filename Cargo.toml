@@ -21,6 +21,7 @@ members = [
     "crates/cue-meeting-overlay",
     "crates/cue-transcribe",
     "crates/cue-diarize",
+    "crates/cue-calendar-cloud",
 ]
 default-members = [
     "crates/cue-cli",

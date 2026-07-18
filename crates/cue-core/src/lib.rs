@@ -2,6 +2,7 @@ pub mod agent_ui;
 pub mod ai;
 pub mod app_paths;
 pub mod audio;
+pub mod calendar;
 pub mod cards;
 pub mod clock;
 pub mod cloud;
@@ -34,6 +35,7 @@ pub use audio::{
     AudioPipelineStatus, AudioSourceConfig, AudioSourceKind, AudioSourcePlan, AudioSourceState,
     AudioSourceStatus, AudioStreamFormat, SttSegmentMetadata,
 };
+pub use calendar::{CalendarConnection, CalendarSource, Participant, UpcomingEvent};
 pub use cards::{CardArtifactType, CardKind, CueCard, CueCardArtifact};
 pub use cloud::{
     ArtifactUploadMetadata, CloudAuthState, CloudDataScope, CloudDeviceId, CloudEndpointConfig,

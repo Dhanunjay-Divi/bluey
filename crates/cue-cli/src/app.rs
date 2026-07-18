@@ -17,10 +17,10 @@ use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::{
     load_account, load_settings, new_trace_id, save_account, save_settings, trace_id_from_env,
     AccountConfig, ActionItem, AgentConnectorInfo, AgentSessionSummary, AgentSummary, AiProviderId,
-    SourceCoverageInfo,
-    AiProviderKind, AiRuntimeStatus, AnswerRequest, AnswerResponse, AudioPipelineStatus, CardKind,
-    CloudSyncStatus, ContextArtifact, CueCard, CueSettings, MeetingRecap, MeetingRecord, MemoryHit,
-    OverlayPosition, ProviderRoute, ProviderSelector, Speaker, BLUEY_TRACE_ID_ENV,
+    AiProviderKind, AiRuntimeStatus, AnswerRequest, AnswerResponse, AudioPipelineStatus,
+    CalendarConnection, CardKind, CloudSyncStatus, ContextArtifact, CueCard, CueSettings,
+    MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, ProviderRoute, ProviderSelector,
+    SourceCoverageInfo, Speaker, BLUEY_TRACE_ID_ENV,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -3054,6 +3054,25 @@ fn print_source_coverage(sources: &[SourceCoverageInfo]) {
     }
 }
 
+fn print_calendar_status(connections: &[CalendarConnection]) {
+    if connections.is_empty() {
+        println!("No cloud calendar providers.");
+        return;
+    }
+    for c in connections {
+        if c.connected {
+            let account = if c.email.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", c.email)
+            };
+            println!("{}  connected{account}", c.provider);
+        } else {
+            println!("{}  not connected", c.provider);
+        }
+    }
+}
+
 fn print_agent_models(models: &[String]) {
     if models.is_empty() {
         println!("No models found.");
@@ -3093,6 +3112,7 @@ fn print_response(response: DaemonResponse) -> Result<()> {
             bail!("daemon error: {message}");
         }
         DaemonResponse::SourceCoverage { sources } => print_source_coverage(&sources),
+        DaemonResponse::CalendarStatus { connections } => print_calendar_status(&connections),
     }
     Ok(())
 }

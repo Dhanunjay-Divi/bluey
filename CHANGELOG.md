@@ -31,6 +31,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the actual cure for the daemon-spawned subprocesses.
 
 ### Added
+- **Cloud OAuth calendar ("Connect Google / Connect Microsoft").** New
+  cross-platform `cue-calendar-cloud` crate: native public-client OAuth
+  (PKCE + loopback redirect per RFC 8252, client_id only — NO client secret),
+  tokens on-device in the OS keychain (`bluey_calendar_google` /
+  `bluey_calendar_microsoft`). Google Calendar (`events.list`) + Microsoft
+  Graph (`calendarView`) clients map into the existing `CalendarSource` seam
+  as background-snapshot sources — the warmup trigger loop is untouched.
+  Gated behind the `cloud-calendar` daemon feature (cross-platform, unlike
+  the macOS-only `calendar`/EventKit feature); `default_source()` prefers a
+  connected cloud provider after the env-fake test hook, ahead of EventKit.
+  New IPC `CalendarConnectStart/Status/Disconnect` + `CalendarStatus`
+  response, overlay onboarding connect buttons, and CLI rendering. Shared
+  calendar types moved to `cue-core::calendar` (cloud crate depends on core,
+  never on the daemon). HARD PREREQUISITE: register OAuth apps (Google Cloud
+  Console Desktop client; Azure mobile-and-desktop platform) and inject
+  `BLUEY_GOOGLE_CLIENT_ID` / `BLUEY_MICROSOFT_CLIENT_ID` at build — until
+  then the flow builds and tests green but cannot authenticate live. See
+  `docs/work/IMPL-CLOUD-CALENDAR.md`.
 - **The MCP-backend pivot: Bluey becomes the memory the agent PULLS from.**
   Bluey no longer only pushes context into agent prompts — the daemon now runs
   its OWN loopback MCP server (`cue-mcp`, hand-rolled over the already-in-graph

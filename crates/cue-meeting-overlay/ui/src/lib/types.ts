@@ -37,6 +37,20 @@ export interface SourceCoverageInfo {
   connectHint: string | null;
 }
 
+/** The connection state of ONE cloud-calendar provider (the "Connect Google /
+ *  Microsoft Calendar" buttons). Mirrors the daemon's cue-core
+ *  `CalendarConnection` wire DTO. Carries only non-secret metadata — tokens live
+ *  in the OS keychain, never here. All fields are single-word so the daemon's
+ *  snake_case serde already matches this shape. */
+export interface CalendarConnection {
+  /** "google" | "microsoft" */
+  provider: string;
+  /** true when tokens for this provider are stored on-device. */
+  connected: boolean;
+  /** connected account email for the label (empty when unknown/disconnected). */
+  email: string;
+}
+
 /** One prior session, summarized for the resume picker. */
 export interface AgentSessionSummary {
   id: string;

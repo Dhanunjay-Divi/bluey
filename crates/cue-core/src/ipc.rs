@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     sanitize_observability_id, ActionItem, AgentConnectorInfo, AgentSessionSummary, AgentSummary,
     AiRuntimeStatus, AnswerRequest, AnswerResponse, AnswerStreamEvent, AudioPipelineStatus,
-    CloudSyncStatus, ContextArtifact, CueCard, DaemonState, MeetingRecap, MemoryHit,
-    OverlayPosition, SourceCoverageInfo, Speaker,
+    CalendarConnection, CloudSyncStatus, ContextArtifact, CueCard, DaemonState, MeetingRecap,
+    MemoryHit, OverlayPosition, SourceCoverageInfo, Speaker,
 };
 
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:57321";
@@ -142,6 +142,23 @@ pub enum DaemonRequest {
     SetAgentSessionHistory {
         enabled: bool,
     },
+    /// Start the interactive cloud-calendar OAuth connect flow for `provider`
+    /// (`"google"` or `"microsoft"`). Daemon-side: PKCE + loopback redirect,
+    /// opens the system browser, waits for the code, exchanges + stores tokens.
+    /// Synchronous-ish from the client's view (start → browser → wait for code →
+    /// done, with a ~2min timeout). Replies [`DaemonResponse::Ok`] on success or
+    /// [`DaemonResponse::Error`] on failure.
+    CalendarConnectStart {
+        provider: String,
+    },
+    /// Report the current cloud-calendar connection state (per provider:
+    /// connected + connected email). Replies [`DaemonResponse::CalendarStatus`].
+    CalendarConnectStatus,
+    /// Clear the stored tokens for `provider` (`"google"` or `"microsoft"`),
+    /// disconnecting that cloud calendar. Replies [`DaemonResponse::Ok`].
+    CalendarDisconnect {
+        provider: String,
+    },
 }
 
 impl DaemonRequest {
@@ -226,6 +243,11 @@ pub enum DaemonResponse {
     },
     AgentModels {
         models: Vec<String>,
+    },
+    /// Current cloud-calendar connection state, one row per provider. Answers
+    /// [`DaemonRequest::CalendarConnectStatus`].
+    CalendarStatus {
+        connections: Vec<CalendarConnection>,
     },
     Error {
         message: String,
@@ -355,5 +377,55 @@ mod tests {
                 "response variant should round-trip"
             );
         }
+    }
+
+    #[test]
+    fn calendar_request_variants_round_trip() {
+        let cases = [
+            DaemonRequest::CalendarConnectStart {
+                provider: "google".to_string(),
+            },
+            DaemonRequest::CalendarConnectStatus,
+            DaemonRequest::CalendarDisconnect {
+                provider: "microsoft".to_string(),
+            },
+        ];
+        for request in cases {
+            let json = serde_json::to_string(&request).expect("serialize request");
+            let decoded: DaemonRequest = serde_json::from_str(&json).expect("decode request");
+            assert_eq!(
+                serde_json::to_string(&decoded).expect("re-serialize"),
+                json,
+                "calendar request variant should round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn calendar_status_response_round_trips() {
+        let response = DaemonResponse::CalendarStatus {
+            connections: vec![
+                CalendarConnection {
+                    provider: "google".to_string(),
+                    connected: true,
+                    email: "person@example.com".to_string(),
+                },
+                CalendarConnection {
+                    provider: "microsoft".to_string(),
+                    connected: false,
+                    email: String::new(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&response).expect("serialize response");
+        assert!(json.contains(r#""type":"calendar_status""#));
+        assert!(json.contains(r#""provider":"google""#));
+        assert!(json.contains(r#""connected":true"#));
+        let decoded: DaemonResponse = serde_json::from_str(&json).expect("decode response");
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-serialize"),
+            json,
+            "calendar status response should round-trip"
+        );
     }
 }

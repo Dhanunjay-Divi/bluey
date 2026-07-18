@@ -1,0 +1,23 @@
+[package]
+name = "cue-calendar-cloud"
+edition = "2021"
+version.workspace = true
+license.workspace = true
+description = "Cloud OAuth (PKCE + loopback) calendar sources for Bluey — Google & Microsoft."
+
+[dependencies]
+cue-core = { path = "../cue-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+keyring.workspace = true
+# `sha2` is not declared in `[workspace.dependencies]`, but it is already a
+# direct dependency of `cue-core` at this exact version, so it adds no new
+# crate to the tree.
+sha2 = "0.10"
