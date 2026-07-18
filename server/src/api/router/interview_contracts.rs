@@ -82,7 +82,7 @@ pub(super) fn append_interview_correctness_contracts(
         ],
     ) {
         append(
-            "Independent-deploy schema contract: start exactly with `I would use an expand-contract rollout with an explicit schema version.` Then validate compatibility in a registry or deployment gate and preserve backward and forward compatibility. Add tolerant readers and new optional fields first, deploy producers and consumers independently, dual-read or dual-write and backfill when needed, monitor usage of the old version, and remove it only after every reader is migrated. Do not require lockstep deployment for a breaking change.",
+            "Independent-deploy schema contract: start exactly with `I would use an expand-contract rollout with an explicit schema version, preserving backward and forward compatibility during the overlap.` Then validate compatibility in a registry or deployment gate. Add tolerant readers and new optional fields first, deploy producers and consumers independently, dual-read or dual-write and backfill when needed, monitor usage of the old version, and remove it only after every reader is migrated. Do not require lockstep deployment for a breaking change. End after the rollout and removal criteria; do not offer another example.",
         );
     }
 
@@ -438,6 +438,17 @@ mod tests {
             assert!(instructions.contains(marker), "{question}: {instructions}");
             assert!(instructions.contains("Interview grounding"));
         }
+
+        let mut schema_rollout = String::new();
+        append_interview_correctness_contracts(
+            &mut schema_rollout,
+            "how do producers and consumers deploy independently during a breaking schema change",
+            &[],
+            &interview_plan(),
+        );
+        assert!(schema_rollout.contains(
+            "I would use an expand-contract rollout with an explicit schema version, preserving backward and forward compatibility during the overlap."
+        ));
     }
 
     #[test]
