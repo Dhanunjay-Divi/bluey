@@ -69,9 +69,9 @@ internal pricing and margin model.
 - LinkedIn and Indeed are handoff-only in background policy.
 - Local and cloud runners consume the same adapter contract.
 - Public Workday, Greenhouse, Lever, Ashby, and SmartRecruiters connectors share
-  host-pinned, retry-bounded normalization. The scheduled, server-leased beta
-  worker is enabled only for Greenhouse and Lever sources until the remaining
-  source contracts receive equivalent snapshot and closure certification.
+  host-pinned, retry-bounded normalization. The scheduled, server-leased worker
+  accepts only server-provisioned official identifiers for those five ATS
+  families; unknown sites remain review-only browser imports until certified.
 - Form planning uses confirmed facts and company/track/account answer memory;
   unknown required questions become interventions.
 - Company Answer Memory overrides Career Track memory, which overrides account

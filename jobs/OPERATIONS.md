@@ -55,19 +55,22 @@ TEMPORAL_TLS=true
 
 Run the discovery worker as a separate deployment using the workflows image
 with command `node workflows/dist/discovery-worker.js`. It leases only
-server-configured Greenhouse and Lever sources, sends complete snapshots, and
-reports bounded failure codes. Production `BLUEY_JOBS_API_ORIGIN` must use
-HTTPS; plaintext origins are accepted only for loopback development.
+server-configured, host-pinned Greenhouse, Lever, Ashby, SmartRecruiters, and
+Workday sources, sends complete snapshots, and reports bounded failure codes.
+Production `BLUEY_JOBS_API_ORIGIN` must use HTTPS; plaintext origins are
+accepted only for loopback development.
 
 ### Discovery source lifecycle
 
 Discovery is deny-by-default. A Jobs administrator must provision each source
-for an account with `POST /admin/jobs/discovery-sources/:account_id`; the only
-enabled beta providers are Greenhouse board tokens and Lever sites. New
-sources start as `waiting`, become `healthy` only after a complete verified
-snapshot, become `degraded` after a failed run, and pause after three
-consecutive failures. Paused and stale sources cannot authorize queueing or a
-runner start.
+for an account with `POST /admin/jobs/discovery-sources/:account_id`. Source
+keys are the official provider identifiers: a Greenhouse board token, Lever
+site, Ashby board name, SmartRecruiters company identifier, or a Workday
+`tenant~instance~site` tuple. The worker derives the provider host and path;
+administrators cannot supply an arbitrary URL. New sources start as `waiting`,
+become `healthy` only after a complete verified snapshot, become `degraded`
+after a failed run, and pause after three consecutive failures. Paused and
+stale sources cannot authorize queueing or a runner start.
 
 Use `PATCH /admin/jobs/discovery-sources/:account_id/:source_id` with
 `{"status":"paused"}` as the per-source kill switch. Re-enabling a source

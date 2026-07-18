@@ -2007,16 +2007,22 @@ pub fn upsert_discovery_source(
     input: &DiscoverySourceInput,
 ) -> Result<DiscoverySource> {
     let provider = input.provider.trim().to_ascii_lowercase();
-    if !matches!(provider.as_str(), "greenhouse" | "lever") {
-        anyhow::bail!("only Greenhouse and Lever discovery sources are enabled for beta")
+    if !matches!(
+        provider.as_str(),
+        "greenhouse" | "lever" | "ashby" | "smartrecruiters" | "workday"
+    ) {
+        anyhow::bail!("unsupported Jobs discovery provider")
     }
-    let source_key = input.source_key.trim();
-    if source_key.is_empty()
-        || source_key.len() > 160
-        || !source_key
+    let requested_source_key = input.source_key.trim();
+    if requested_source_key.is_empty()
+        || requested_source_key.len() > 160
+        || !requested_source_key
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'~'))
     {
+        anyhow::bail!("discovery source key contains unsupported characters")
+    }
+    if provider != "workday" && requested_source_key.contains('~') {
         anyhow::bail!("discovery source key contains unsupported characters")
     }
     let company = input.company.trim();
@@ -2034,17 +2040,56 @@ pub fn upsert_discovery_source(
     let interval = input
         .run_interval_ms
         .clamp(DISCOVERY_MIN_INTERVAL_MS, DISCOVERY_MAX_INTERVAL_MS);
-    let config = match provider.as_str() {
-        "greenhouse" => json!({
-            "kind": "greenhouse",
-            "boardToken": source_key,
-            "company": company,
-        }),
-        "lever" => json!({
-            "kind": "lever",
-            "site": source_key,
-            "company": company,
-        }),
+    let (source_key, config) = match provider.as_str() {
+        "greenhouse" => (
+            requested_source_key.to_string(),
+            json!({
+                "kind": "greenhouse",
+                "boardToken": requested_source_key,
+                "company": company,
+            }),
+        ),
+        "lever" => (
+            requested_source_key.to_string(),
+            json!({
+                "kind": "lever",
+                "site": requested_source_key,
+                "company": company,
+            }),
+        ),
+        "ashby" => (
+            requested_source_key.to_string(),
+            json!({
+                "kind": "ashby",
+                "boardName": requested_source_key,
+                "company": company,
+            }),
+        ),
+        "smartrecruiters" => (
+            requested_source_key.to_string(),
+            json!({
+                "kind": "smartrecruiters",
+                "companyIdentifier": requested_source_key,
+                "company": company,
+            }),
+        ),
+        "workday" => {
+            let identifiers = requested_source_key.split('~').collect::<Vec<_>>();
+            if identifiers.len() != 3 || identifiers.iter().any(|value| value.is_empty()) {
+                anyhow::bail!("Workday source key must use tenant~instance~site")
+            }
+            (
+                requested_source_key.to_string(),
+                json!({
+                    "kind": "workday",
+                    "tenant": identifiers[0],
+                    "instance": identifiers[1],
+                    "site": identifiers[2],
+                    "locale": "en-US",
+                    "company": company,
+                }),
+            )
+        }
         _ => unreachable!(),
     };
     let digest = hex::encode(Sha256::digest(format!(
@@ -10282,6 +10327,74 @@ mod tests {
                 .health,
             "healthy"
         );
+    }
+
+    #[test]
+    fn discovery_sources_support_only_canonical_five_ats_identifiers() {
+        let pool = test_pool();
+        let cases = [
+            ("greenhouse", "acme", "greenhouse"),
+            ("lever", "atlas", "lever"),
+            ("ashby", "orbit", "ashby"),
+            ("smartrecruiters", "northstar", "smartrecruiters"),
+            ("workday", "contoso~wd5~careers", "workday"),
+        ];
+
+        for (provider, source_key, expected_kind) in cases {
+            let source = upsert_discovery_source(
+                &pool,
+                "acct-jobs",
+                &DiscoverySourceInput {
+                    track_id: String::new(),
+                    provider: provider.to_string(),
+                    source_key: source_key.to_string(),
+                    company: "Example Company".to_string(),
+                    run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(source.provider, provider);
+            assert_eq!(source.source_key, source_key);
+            assert_eq!(source.config["kind"], expected_kind);
+            assert_eq!(source.config["company"], "Example Company");
+            if provider == "workday" {
+                assert_eq!(source.config["tenant"], "contoso");
+                assert_eq!(source.config["instance"], "wd5");
+                assert_eq!(source.config["site"], "careers");
+                assert_eq!(source.config["locale"], "en-US");
+            }
+        }
+
+        let invalid_workday = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "workday".to_string(),
+                source_key: "contoso~wd5".to_string(),
+                company: "Example Company".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap_err();
+        assert!(invalid_workday.to_string().contains("tenant~instance~site"));
+
+        let invalid_non_workday = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "greenhouse".to_string(),
+                source_key: "acme~careers".to_string(),
+                company: "Example Company".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap_err();
+        assert!(invalid_non_workday
+            .to_string()
+            .contains("unsupported characters"));
     }
 
     #[test]

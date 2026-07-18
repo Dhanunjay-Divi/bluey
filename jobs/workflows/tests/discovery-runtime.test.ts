@@ -249,6 +249,79 @@ describe("discovery worker runtime", () => {
     });
   });
 
+  it("maps every scheduled ATS source to its official provider endpoint", async () => {
+    const cases: Array<{
+      source: DiscoverySourceRecord;
+      proofUrl: string;
+      requestUrl: string;
+      method?: string;
+      payload: unknown;
+    }> = [
+      {
+        source: source({
+          id: "source-ashby-acme",
+          provider: "ashby",
+          source_key: "acme",
+          config: { kind: "ashby", boardName: "acme", company: "Acme" },
+        }),
+        proofUrl: "https://api.ashbyhq.com/posting-api/job-board/acme",
+        requestUrl: "https://api.ashbyhq.com/posting-api/job-board/acme",
+        payload: { jobs: [] },
+      },
+      {
+        source: source({
+          id: "source-smartrecruiters-acme",
+          provider: "smartrecruiters",
+          source_key: "acme",
+          config: { kind: "smartrecruiters", companyIdentifier: "acme", company: "Acme" },
+        }),
+        proofUrl: "https://api.smartrecruiters.com/v1/companies/acme/postings",
+        requestUrl: "https://api.smartrecruiters.com/v1/companies/acme/postings?limit=100&offset=0",
+        payload: { content: [], totalFound: 0 },
+      },
+      {
+        source: source({
+          id: "source-workday-acme",
+          provider: "workday",
+          source_key: "acme~wd5~careers",
+          config: {
+            kind: "workday",
+            tenant: "acme",
+            instance: "wd5",
+            site: "careers",
+            locale: "en-US",
+            company: "Acme",
+          },
+        }),
+        proofUrl: "https://acme.wd5.myworkdayjobs.com/wday/cxs/acme/careers/jobs",
+        requestUrl: "https://acme.wd5.myworkdayjobs.com/wday/cxs/acme/careers/jobs",
+        method: "POST",
+        payload: { jobPostings: [], total: 0 },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const requests: Array<{ url: string; method?: string }> = [];
+      const prepared = preparePublicAtsDiscovery(testCase.source, {
+        fetch: async (url, init) => {
+          requests.push({ url, method: init.method });
+          expect(init.redirect).toBe("error");
+          return response(testCase.payload);
+        },
+      });
+
+      expect(prepared.source.url).toBe(testCase.proofUrl);
+      await prepared.provider.discover({
+        source: prepared.source,
+        replayId: `replay-${testCase.source.provider}`,
+        scheduledFor: SCHEDULED_FOR,
+        requestedAt: SCHEDULED_FOR,
+        attempt: 1,
+      });
+      expect(requests).toEqual([{ url: testCase.requestUrl, method: testCase.method }]);
+    }
+  });
+
   it("runs a newly created source whose server health is waiting", async () => {
     const api = new FakeApi([lease({ health: "waiting" })]);
     const worker = new DiscoveryWorkerRuntime({
@@ -358,12 +431,23 @@ describe("discovery worker runtime", () => {
     expect(api.failed[0]?.input.error_code).toBe("invalid_response");
 
     try {
-      preparePublicAtsDiscovery(source({ provider: "workday" }));
+      preparePublicAtsDiscovery(source({ provider: "unknown" }));
       throw new Error("Expected unsupported provider config to fail");
     } catch (error) {
       expect(error).toBeInstanceOf(DiscoveryConfigurationError);
       expect((error as DiscoveryConfigurationError).code).toBe("unsupported_provider");
     }
+
+    expect(() => preparePublicAtsDiscovery(source({
+      provider: "workday",
+      source_key: "acme~wd5~careers",
+      config: {
+        kind: "workday",
+        tenant: "other",
+        instance: "wd5",
+        site: "careers",
+      },
+    }))).toThrow("do not match");
   });
 
   it("never includes raw errors or candidate PII in logs", async () => {

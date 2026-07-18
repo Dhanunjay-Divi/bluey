@@ -119,6 +119,67 @@ function configuredSource(source: ServerConfiguredDiscoverySource): ConfiguredSo
         proofUrl: `https://api.lever.co/v0/postings/${encodeURIComponent(identifier)}?mode=json`,
       };
     }
+    case "ashby": {
+      assertOnlyKeys(config, ["boardName", "board_name", "company", "kind"]);
+      assertMatchingKind(config.kind, "ashby");
+      const identifier = configuredIdentifier(
+        source.source_key,
+        config.board_name,
+        config.boardName,
+        "Ashby board name",
+      );
+      const company = optionalCompany(config.company);
+      return {
+        atsSource: { kind: "ashby", boardName: identifier, ...(company ? { company } : {}) },
+        proofUrl: `https://api.ashbyhq.com/posting-api/job-board/${encodeURIComponent(identifier)}`,
+      };
+    }
+    case "smartrecruiters": {
+      assertOnlyKeys(config, ["company", "companyIdentifier", "company_identifier", "kind"]);
+      assertMatchingKind(config.kind, "smartrecruiters");
+      const identifier = configuredIdentifier(
+        source.source_key,
+        config.company_identifier,
+        config.companyIdentifier,
+        "SmartRecruiters company identifier",
+      );
+      const company = optionalCompany(config.company);
+      return {
+        atsSource: {
+          kind: "smartrecruiters",
+          companyIdentifier: identifier,
+          ...(company ? { company } : {}),
+        },
+        proofUrl: `https://api.smartrecruiters.com/v1/companies/${encodeURIComponent(identifier)}/postings`,
+      };
+    }
+    case "workday": {
+      assertOnlyKeys(config, ["company", "instance", "kind", "locale", "site", "tenant"]);
+      assertMatchingKind(config.kind, "workday");
+      const tenant = requiredIdentifier(config.tenant, "Workday tenant");
+      const instance = requiredIdentifier(config.instance, "Workday instance");
+      const site = requiredIdentifier(config.site, "Workday site");
+      const expectedSourceKey = [tenant, instance, site].join("~");
+      if (source.source_key !== expectedSourceKey) {
+        throw new DiscoveryConfigurationError("invalid_config", "Workday identifiers do not match the source key");
+      }
+      const locale = config.locale === undefined
+        ? undefined
+        : requiredIdentifier(config.locale, "Workday locale");
+      const company = optionalCompany(config.company);
+      const host = `${tenant}.${instance}.myworkdayjobs.com`;
+      return {
+        atsSource: {
+          kind: "workday",
+          tenant,
+          instance,
+          site,
+          ...(company ? { company } : {}),
+          ...(locale ? { locale } : {}),
+        },
+        proofUrl: `https://${host}/wday/cxs/${encodeURIComponent(tenant)}/${encodeURIComponent(site)}/jobs`,
+      };
+    }
     default:
       throw new DiscoveryConfigurationError(
         "unsupported_provider",
@@ -206,10 +267,18 @@ function assertOnlyKeys(config: Record<string, unknown>, allowed: readonly strin
   }
 }
 
-function assertMatchingKind(value: unknown, expected: "greenhouse" | "lever"): void {
+function assertMatchingKind(value: unknown, expected: PublicAtsSource["kind"]): void {
   if (value !== undefined && value !== expected) {
     throw new DiscoveryConfigurationError("invalid_config", "Discovery provider config kind does not match");
   }
+}
+
+function requiredIdentifier(value: unknown, label: string): string {
+  const identifier = optionalIdentifier(value, label);
+  if (!identifier) {
+    throw new DiscoveryConfigurationError("invalid_config", `${label} is required`);
+  }
+  return identifier;
 }
 
 function configuredIdentifier(

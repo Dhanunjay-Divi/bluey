@@ -36,7 +36,10 @@ The highest-value reusable capabilities were:
 ## Bluey implementation outcome
 
 - Five source-configured public ATS connectors normalize to one `NormalizedJob`;
-  the scheduled server-leased runtime currently enables Greenhouse and Lever.
+  the scheduled server-leased runtime accepts canonical Greenhouse, Lever,
+  Workday, Ashby, and SmartRecruiters identifiers. Each connector remains
+  host-pinned to the provider's official public endpoint; arbitrary URLs are
+  not valid scheduled sources.
 - Discovery requests are HTTPS-only, host-pinned, redirect-free, size-bounded,
   retry-bounded, and pagination-bounded.
 - Form planning resolves confirmed profile facts and scoped answer memory in
