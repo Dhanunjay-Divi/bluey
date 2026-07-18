@@ -6604,6 +6604,12 @@ fn prompt_with_answer_plan_context(
         );
     }
 
+    if plan.interview_context {
+        instructions.push_str(
+            "\nInterview closing contract: end on the final substantive point of the ready-to-say answer. Never append an invitation or meta-offer such as `If you want`, `If helpful`, `I can also`, `I'm happy to`, `Would you like`, or `Let me know`, and never offer a shorter version, tailored version, alternate answer, another example, or extra coaching unless the user explicitly requested it.",
+        );
+    }
+
     if payment_design_or_followup {
         instructions.push_str(
             "\nIrreversible-payment safety contract: after an ambiguous provider timeout, keep the outcome `UNKNOWN` or `PENDING_RECONCILIATION`, preserve the original logical operation and its idempotency key, block a second effect, and reconcile by provider payment ID, client reference, or webhook. Never mark that outcome terminally failed or submit a new effect merely because retries ended.",

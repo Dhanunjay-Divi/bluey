@@ -1676,6 +1676,7 @@ def has_unsolicited_coaching_appendix(text: str) -> bool:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     headings = ("why this works", "why it works", "reasoning", "rationale")
     open_fence: Optional[Tuple[str, int]] = None
+    prose_lines: List[str] = []
     for line in normalized.split("\n"):
         fence = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
         if fence:
@@ -1689,11 +1690,14 @@ def has_unsolicited_coaching_appendix(text: str) -> bool:
             continue
 
         candidate = line.strip()
+        is_blockquote = bool(re.match(r"^>\s*", candidate))
         while True:
             stripped = re.sub(r"^[#*_`>\-]+\s*", "", candidate)
             if stripped == candidate:
                 break
             candidate = stripped
+        if candidate and not is_blockquote:
+            prose_lines.append(candidate)
         lower = candidate.casefold()
         for heading in headings:
             if not lower.startswith(heading):
@@ -1710,7 +1714,44 @@ def has_unsolicited_coaching_appendix(text: str) -> bool:
             line,
         ):
             return True
-    return False
+
+    if not prose_lines:
+        return False
+    closing = "\n".join(prose_lines)
+    boundary = r"(?:^|[.!?]\s+|\n)"
+    action = (
+        r"(?:turn|rewrite|shorten|expand|give|provide|show|explain|draft|adapt|"
+        r"walk|help|make|convert|tailor|sketch)"
+    )
+    direct_answer_transform = (
+        r"(?:(?:turn|rewrite|adapt|convert|tailor)\s+"
+        r"(?:this|it|the (?:answer|response))\s+(?:into|as)\b|"
+        r"shorten\s+(?:this|it|the (?:answer|response))\b|"
+        r"make\s+(?:this|it|the (?:answer|response))\s+"
+        r"(?:(?:more\s+)?(?:concise|short|shorter|long|longer|technical|behavioral)\b|"
+        r"(?:a|an)\s+[^.\n]{0,40}\b(?:answer|response|version)\b))"
+    )
+    direct_followup_deliverable = (
+        r"(?:give|provide|show|sketch)\s+(?:you\s+)?[^.\n]{0,80}"
+        r"\b(?:answer|response|version|example|diagram|checklist|implementation|"
+        r"protocol|state machine)\b"
+    )
+    meta_offer_patterns = (
+        rf"{boundary}if (?:you (?:want|would like)|you['’]d like|helpful|"
+        rf"it (?:helps|would help)),?\s+(?:i|we) (?:can|could|will)\s+"
+        rf"(?:also\s+)?{action}\b",
+        rf"{boundary}(?:i|we) (?:can|could|will)\s+(?:also\s+)?"
+        rf"(?:{direct_answer_transform}|{direct_followup_deliverable})",
+        rf"{boundary}(?:(?:i['’]?m|i am|we['’]?re|we are)\s+)?"
+        rf"happy to\s+{action}\b",
+        rf"{boundary}would you like (?:me to\s+{action}\b|"
+        r"(?:a|an|the)\s+(?:shorter|longer|tailored|alternate|alternative)\s+"
+        r"(?:version|answer|response|example)\b)",
+        rf"{boundary}(?:let me know|tell me) if "
+        rf"(?:you (?:want|would like)|you['’]d like)\s+"
+        rf"(?:me to\s+)?{action}\b",
+    )
+    return any(re.search(pattern, closing, re.I) for pattern in meta_offer_patterns)
 
 
 def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
@@ -1933,10 +1974,40 @@ def self_check_attempt_integrity_guards() -> None:
         "Answer.\r\rReasoning -\rCoaching detail.",
         "Answer.\n\nRationale — Coaching detail.",
         "Answer. **Why this works:** Coaching detail.",
+        "Answer.\n\nIf you want, I can also turn this into a 30-second interview answer.",
+        "Answer. The rollout ends after every reader migrates. If you want, I can also give a Kafka example.",
+        "Answer.\n\nI can also rewrite this as a shorter answer.",
+        "Answer.\n\nIf helpful, I can also tailor this into a cloud-heavy version.",
+        "Answer.\n\nIf you'd like, I can turn this into a concise version.",
+        "Answer.\n\nI'm happy to sketch the sequence diagram.",
+        "Answer.\n\nI can tailor this into a platform-focused response.",
+        "Answer.\n\nI can make this more concise.",
+        "Answer.\n\nI can make it a 30-second answer.",
+        "Answer.\n\nWould you like me to give another example?",
+        "Answer.\n\nWould you like a shorter version?",
+        "Answer.\n\nLet me know if you'd like me to shorten it.",
+        "Answer.\n\nLet me know if you want me to expand it.",
+        (
+            "Answer.\n\nIf you want, I can also provide:\n- a short version\n"
+            "- another example\n- a diagram\n- a checklist\n- a code sample"
+        ),
     ):
         assert has_unsolicited_coaching_appendix(appendix), appendix
     assert not has_unsolicited_coaching_appendix(
         "Answer with a literal fixture:\n```text\nReasoning:\nKeep this line.\n```"
+    )
+    assert not has_unsolicited_coaching_appendix(
+        "If you want exactly-once effects, make each warehouse write idempotent."
+    )
+    assert not has_unsolicited_coaching_appendix(
+        "I can tailor the retry budget to the downstream service-level objective."
+    )
+    assert not has_unsolicited_coaching_appendix(
+        "First, I establish the default retry budget. I can also tailor it to each "
+        "downstream service-level objective."
+    )
+    assert not has_unsolicited_coaching_appendix(
+        "Avoid this closing:\n> If you want, I can also turn this into a shorter answer."
     )
     saved_round541_q47_with_appendix = AttemptResult(
         attempt=1,

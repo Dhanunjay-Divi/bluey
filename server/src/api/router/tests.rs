@@ -1773,6 +1773,35 @@ fn answer_plan_role_interview_prompts_are_behavioral_and_humanized() {
     assert!(system.contains("Role-adaptive practitioner voice"));
     assert!(system.contains("engineering or people manager"));
     assert!(system.contains("do not fabricate experience"));
+    assert!(system.contains("Interview closing contract"));
+    assert!(system.contains("Never append an invitation or meta-offer"));
+    assert!(system.contains("If you want"));
+    assert!(system.contains("If helpful"));
+    assert!(system.contains("shorter version, tailored version, alternate answer"));
+}
+
+#[test]
+fn answer_plan_technical_interview_forbids_closing_meta_offers() {
+    let req = complete_request(
+        "Question:\nWhat does exactly-once really mean in a Kafka-to-warehouse pipeline, and where can it still break?\n\nSession context:\n[Resume]\nSenior data engineer with Kafka and warehouse experience.",
+    );
+    let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+    assert!(plan.interview_context);
+    let (system, _user) = prompt_with_answer_plan(
+        "You are Bluey.",
+        &req.user,
+        &plan,
+        &WebSearchOutcome::default(),
+    );
+
+    assert!(system.contains("Interview closing contract"));
+    assert!(system.contains("Never append an invitation or meta-offer"));
+    assert!(system.contains("If you want"));
+    assert!(system.contains("If helpful"));
+    assert!(system.contains("I can also"));
+    assert!(system.contains("I'm happy to"));
+    assert!(system.contains("Let me know"));
 }
 
 #[test]
