@@ -25,6 +25,7 @@ export interface ResumeImportPreview {
   summary: ResumeImportSummary;
   likely_different_person: boolean;
   changed_sections: string[];
+  review_warnings: string[];
 }
 
 export function prepareResumeImport(
@@ -73,7 +74,26 @@ export function prepareResumeImport(
     summary: summarizeResumeImport(replacement),
     likely_different_person: likelyDifferentPerson,
     changed_sections: changedSections,
+    review_warnings: resumeReviewWarnings(replacement),
   };
+}
+
+export function resumeReviewWarnings(profile: CareerProfile): string[] {
+  const warnings: string[] = [];
+  if (!profile.full_name) warnings.push("Candidate name was not found.");
+  if (!profile.current_location) warnings.push("Current location was not found.");
+  if (!profile.headline) warnings.push("Current or target role was not found.");
+  if (profile.employment.length === 0) {
+    warnings.push("No work history was found.");
+  } else {
+    const incomplete = profile.employment.filter((entry) => !entry.company || !entry.title).length;
+    if (incomplete) warnings.push(`${incomplete} experience ${incomplete === 1 ? "entry needs" : "entries need"} a company or title.`);
+  }
+  const incompleteEducation = profile.education.filter((entry) => !entry.school || !entry.degree).length;
+  if (incompleteEducation) {
+    warnings.push(`${incompleteEducation} education ${incompleteEducation === 1 ? "entry needs" : "entries need"} a school or degree.`);
+  }
+  return warnings;
 }
 
 export function applyResumeImport(preview: ResumeImportPreview, mode: ResumeImportMode): CareerProfile {

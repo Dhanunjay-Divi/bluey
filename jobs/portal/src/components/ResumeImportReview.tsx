@@ -33,6 +33,16 @@ export function ResumeImportReview({ preview, onApply, onClose }: Props) {
               </div>
             )}
 
+            {preview.review_warnings.length > 0 && (
+              <div className="import-person-warning import-field-warning" role="alert">
+                <AlertTriangle size={18} />
+                <div>
+                  <b>Review {preview.review_warnings.length} extracted {preview.review_warnings.length === 1 ? "field" : "fields"}</b>
+                  <ul>{preview.review_warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+                </div>
+              </div>
+            )}
+
             <section className="import-person-summary">
               <FileSearch size={20} />
               <div>

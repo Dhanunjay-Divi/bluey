@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
+use super::jobs_tailoring::tailor_resume;
 use super::DbPool;
 
 pub const PACKET_OVERAGE_CENTS: i64 = 50;
@@ -4166,37 +4167,6 @@ fn score_posting(
     (score.clamp(0, 99), reasons, missing)
 }
 
-fn structural_resume_diff(
-    profile: &CareerProfile,
-    tailored_headline: &str,
-    tailored_summary: &str,
-    tailored_skills: &[String],
-    fact_ids: &[String],
-) -> Value {
-    let mut diff = serde_json::Map::new();
-    if profile.headline.trim() != tailored_headline.trim() {
-        diff.insert(
-            "headline".to_string(),
-            json!({ "before": profile.headline, "after": tailored_headline }),
-        );
-    }
-    if profile.summary.trim() != tailored_summary.trim() {
-        diff.insert(
-            "summary".to_string(),
-            json!({ "before": profile.summary, "after": tailored_summary }),
-        );
-    }
-    if profile.skills != tailored_skills {
-        diff.insert(
-            "skills".to_string(),
-            json!({ "before": profile.skills, "after": tailored_skills }),
-        );
-    }
-    diff.insert("claims_added".to_string(), json!([]));
-    diff.insert("profile_fact_ids_used".to_string(), json!(fact_ids));
-    Value::Object(diff)
-}
-
 fn candidate_truth_fingerprint(profile: &CareerProfile) -> String {
     let mut employment: Vec<String> = profile
         .employment
@@ -4884,8 +4854,7 @@ pub fn prepare_application(
         .filter(|fact| fact.verification_status == "confirmed")
         .map(|fact| fact.id.clone())
         .collect();
-    let selected_skills = select_skills(&profile.skills, &posting.description);
-    let summary = tailored_summary(&profile, &posting, mode);
+    let tailored_resume = tailor_resume(&profile, &posting, mode);
     let truth_fingerprint = candidate_truth_fingerprint(&profile);
     let content = json!({
         "target": {
@@ -4902,12 +4871,12 @@ pub fn prepare_application(
             "linkedin_url": profile.linkedin_url,
             "portfolio_url": profile.portfolio_url,
         },
-        "headline": profile.headline,
-        "summary": summary,
-        "skills": selected_skills,
-        "employment": profile.employment,
+        "headline": tailored_resume.headline,
+        "summary": tailored_resume.summary,
+        "skills": tailored_resume.skills,
+        "employment": tailored_resume.employment,
         "education": profile.education,
-        "projects": profile.projects,
+        "projects": tailored_resume.projects,
         "certifications": profile.certifications,
         "source_resume_name": profile.source_resume_name,
         "provenance": {
@@ -4920,17 +4889,7 @@ pub fn prepare_application(
             "candidate_truth_fingerprint_version": 1,
         },
     });
-    let tailored_headline = content
-        .get("headline")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let diff = structural_resume_diff(
-        &profile,
-        tailored_headline,
-        &summary,
-        &selected_skills,
-        &approved_fact_ids,
-    );
+    let diff = tailored_resume.diff;
     let checksum_source = format!("{}|{}|{}", account_id, job_id, content);
     let checksum = hex::encode(Sha256::digest(checksum_source.as_bytes()));
     let resume = save_resume_version(
@@ -5091,45 +5050,6 @@ fn account_login_email(pool: &DbPool, account_id: &str) -> Result<String> {
             .query_one("SELECT email FROM accounts WHERE id = $1", &[&account_id])?
             .get(0)),
     })
-}
-
-fn select_skills(skills: &[String], description: &str) -> Vec<String> {
-    let lower = description.to_lowercase();
-    let mut matching: Vec<String> = skills
-        .iter()
-        .filter(|skill| lower.contains(&skill.to_lowercase()))
-        .cloned()
-        .collect();
-    let remaining_slots = 12usize.saturating_sub(matching.len());
-    let fallback: Vec<String> = skills
-        .iter()
-        .filter(|skill| {
-            !matching
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(skill))
-        })
-        .take(remaining_slots)
-        .cloned()
-        .collect();
-    matching.extend(fallback);
-    matching.truncate(12);
-    matching
-}
-
-fn tailored_summary(profile: &CareerProfile, posting: &JobPosting, mode: &str) -> String {
-    let base = profile.summary.trim();
-    if base.is_empty() {
-        String::new()
-    } else if mode == "enhance" {
-        format!(
-            "{} Focused for the {} opportunity at {}.",
-            base.trim_end_matches('.'),
-            posting.title,
-            posting.company
-        )
-    } else {
-        base.to_string()
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11088,6 +11008,91 @@ mod tests {
         assert_eq!(application_a.id, application_b.id);
         assert_eq!(resume_a.id, resume_b.id);
         assert_eq!(resume_a.job_id, posting.id);
+    }
+
+    #[test]
+    fn job_specific_packets_emphasize_different_existing_evidence() {
+        let pool = test_pool();
+        let mut profile = default_profile("jobs@example.com");
+        profile.full_name = "Taylor Rivera".to_string();
+        profile.headline = "Software Engineer".to_string();
+        profile.summary = "Builds reliable customer products.".to_string();
+        profile.skills = vec![
+            "React.js".to_string(),
+            "Amazon Web Services".to_string(),
+            "PostgreSQL".to_string(),
+        ];
+        profile.employment = vec![EmploymentEntry {
+            id: "employment-1".to_string(),
+            company: "Northstar".to_string(),
+            title: "Software Engineer".to_string(),
+            highlights: vec![
+                "Built React interfaces for customer workflows.".to_string(),
+                "Designed AWS data services backed by Postgres.".to_string(),
+            ],
+            ..EmploymentEntry::default()
+        }];
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+
+        let mut cloud_job = test_posting(
+            "https://boards.greenhouse.io/cloudco/jobs/cloud-engineer",
+            now_ms(),
+            now_ms(),
+        );
+        cloud_job.company = "Cloudco".to_string();
+        cloud_job.title = "Cloud Engineer".to_string();
+        cloud_job.description = "Build AWS services backed by PostgreSQL.".to_string();
+        let cloud_job = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &cloud_job,
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+
+        let mut frontend_job = test_posting(
+            "https://boards.greenhouse.io/webco/jobs/frontend-engineer",
+            now_ms(),
+            now_ms(),
+        );
+        frontend_job.company = "Webco".to_string();
+        frontend_job.title = "Frontend Engineer".to_string();
+        frontend_job.description = "Build customer interfaces with React.".to_string();
+        let frontend_job = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &frontend_job,
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+
+        let (cloud_application, cloud_resume) =
+            prepare_application(&pool, "acct-jobs", &cloud_job.id, "factual", "review_first")
+                .unwrap();
+        let (frontend_application, frontend_resume) = prepare_application(
+            &pool,
+            "acct-jobs",
+            &frontend_job.id,
+            "factual",
+            "review_first",
+        )
+        .unwrap();
+
+        assert_eq!(cloud_application.state, "awaiting_review");
+        assert_eq!(frontend_application.state, "awaiting_review");
+        assert_ne!(cloud_resume.id, frontend_resume.id);
+        assert!(cloud_resume.content["employment"][0]["highlights"][0]
+            .as_str()
+            .unwrap()
+            .contains("AWS"));
+        assert!(frontend_resume.content["employment"][0]["highlights"][0]
+            .as_str()
+            .unwrap()
+            .contains("React"));
+        assert_eq!(cloud_resume.diff["claims_added"], json!([]));
+        assert_eq!(frontend_resume.diff["claims_added"], json!([]));
     }
 
     #[test]

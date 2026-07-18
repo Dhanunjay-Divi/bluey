@@ -43,6 +43,7 @@ import {
 import { useLocationSuggestions } from "../data/use-location-suggestions";
 import { relativeTime } from "../lib/format";
 import { validateCareerProfile } from "../lib/profile-validation";
+import { formatResumeDiffValue, resumeDiffHasValue, resumeDiffLabel } from "../lib/resume-diff";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -323,7 +324,7 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
       </Dialog>
 
       <Dialog open={Boolean(selectedResume)} title={selectedResume?.content.target ? `${selectedResume.content.target.title} at ${selectedResume.content.target.company}` : "Tailored resume"} description={`Version ${selectedResume?.version_no || 1} · ${selectedResume?.mode || "factual"}`} onClose={() => setSelectedResume(undefined)} size="large">
-        {selectedResume && <div className="resume-version-dialog"><section className="resume-sheet compact-sheet"><BaseResume content={selectedResume.content} /></section><aside><div className="section-heading compact"><div><p>VISIBLE DIFF</p><h2>Why this version changed</h2></div><FileDiff /></div>{Object.entries(selectedResume.diff).map(([key, value]) => <div className="diff-item" key={key}><b>{key.replaceAll("_", " ")}</b><p>{Array.isArray(value) ? value.join(", ") || "None" : String(value)}</p></div>)}<div className="download-row"><button disabled={!selectedApplication} onClick={() => void exportSelected("pdf")}><Download size={15} />PDF</button><button disabled={!selectedApplication} onClick={() => void exportSelected("docx")}><Download size={15} />DOCX</button></div></aside></div>}
+        {selectedResume && <div className="resume-version-dialog"><section className="resume-sheet compact-sheet"><BaseResume content={selectedResume.content} /></section><aside><div className="section-heading compact"><div><p>VISIBLE DIFF</p><h2>Why this version changed</h2></div><FileDiff /></div>{Object.entries(selectedResume.diff).filter(([, value]) => resumeDiffHasValue(value)).map(([key, value]) => <div className="diff-item" key={key}><b>{resumeDiffLabel(key)}</b><p>{formatResumeDiffValue(value)}</p></div>)}<div className="download-row"><button disabled={!selectedApplication} onClick={() => void exportSelected("pdf")}><Download size={15} />PDF</button><button disabled={!selectedApplication} onClick={() => void exportSelected("docx")}><Download size={15} />DOCX</button></div></aside></div>}
       </Dialog>
     </div>
   );

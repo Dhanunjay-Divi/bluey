@@ -754,6 +754,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .import-person-warning div { display: grid; gap: 4px; }
 .import-person-warning b { color: var(--text); font-size: 12px; }
 .import-person-warning p { color: var(--text-soft); font-size: 10px; line-height: 1.5; }
+.import-field-warning ul { padding-left: 15px; display: grid; gap: 3px; color: var(--text-soft); font-size: 10px; line-height: 1.45; }
 .import-person-summary { padding: 14px; display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 10px; align-items: start; border-bottom: 1px solid var(--border); }
 .import-person-summary > svg { color: var(--accent); }
 .import-person-summary > div { min-width: 0; display: grid; gap: 3px; }

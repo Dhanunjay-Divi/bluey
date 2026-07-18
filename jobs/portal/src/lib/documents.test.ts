@@ -4,7 +4,9 @@ import {
   inferProfileFromResume,
   pdfTextItemsToText,
   prepareResumeImport,
+  resumeReviewWarnings,
   resumeHtmlToText,
+  mergeDocxTextSources,
   summarizeResumeImport,
   validateExtractedResumeText,
   validateResumeFileBytes,
@@ -192,6 +194,111 @@ Specialty`,
     ]);
   });
 
+  it("cleans template noise and separates a school from its trailing location", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "education-template.pdf",
+      text: `Morgan Reed
+EDUCATION
+Carnegie Mellon University (CMU) Pittsburgh, PA
+MS in Engineering & Technology Innovation Management Graduation Date: Dec 2025
+Trine University | Herndon, MA
+Master's Degree, MSIS [] 2024`,
+    });
+
+    expect(result.education[0]).toMatchObject({
+      school: "Carnegie Mellon University (CMU)",
+      degree: "MS in Engineering & Technology Innovation Management",
+      field: "Engineering & Technology Innovation Management",
+      location: "Pittsburgh, PA",
+    });
+    expect(result.education[1]).toMatchObject({
+      school: "Trine University",
+      degree: "Master's Degree, MSIS",
+      field: "MSIS",
+      location: "Herndon, MA",
+    });
+  });
+
+  it("separates comma-style school degrees and degree-line locations", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "education-rows.pdf",
+      text: `Morgan Reed
+EDUCATION
+George Mason University, M.S. Computer Science | GPA: 3.8/4.0 Aug 2023 – May 2025
+Lindsey Wilson University Dec 2025
+Master of Science, Data Science (GPA: 3.75/4.0) Columbia, KY
+Visvesvaraya Technological University Aug 2022
+Bachelor of Engineering, Computer Science India`,
+    });
+
+    expect(result.education).toEqual([
+      expect.objectContaining({
+        school: "George Mason University",
+        degree: "M.S. Computer Science",
+        field: "Computer Science",
+      }),
+      expect.objectContaining({
+        school: "Lindsey Wilson University",
+        degree: "Master of Science, Data Science",
+        field: "Data Science",
+        location: "Columbia, KY",
+      }),
+      expect.objectContaining({
+        school: "Visvesvaraya Technological University",
+        degree: "Bachelor of Engineering, Computer Science",
+        field: "Computer Science",
+        location: "India",
+      }),
+    ]);
+  });
+
+  it("drops wrapped list category labels instead of presenting them as skills", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "skills-template.pdf",
+      text: `Morgan Reed
+SKILLS
+Spring & Backend:
+Spring Boot | Spring Batch
+Cloud & DevOps:
+AWS | Kubernetes`,
+    });
+
+    expect(result.skills).toEqual(["Spring Boot", "Spring Batch", "AWS", "Kubernetes"]);
+  });
+
+  it("repairs common PDF skill wraps without joining unrelated skills", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "wrapped-skills.pdf",
+      text: `Morgan Reed
+San Francisco,CA
+SKILLS
+Data Analytics: SQL, A/B Testing, Trend
+Analysis, Data Validation
+Modern Analytics & AI: AI-Enhanced
+Reporting, Prompt Engineering
+Spring Boot, Spring
+Frameworks & Backend:
+Batch (basic exposure), MyBatis
+IDE Tools: Eclipse My Eclipse, IntelliJ`,
+    });
+
+    expect(result.current_location).toBe("San Francisco, CA");
+    expect(result.skills).toEqual([
+      "SQL",
+      "A/B Testing",
+      "Trend Analysis",
+      "Data Validation",
+      "AI-Enhanced Reporting",
+      "Prompt Engineering",
+      "Spring Boot",
+      "Spring Batch (basic exposure)",
+      "MyBatis",
+      "Eclipse",
+      "MyEclipse",
+      "IntelliJ",
+    ]);
+  });
+
   it("reconstructs PDF rows instead of flattening the full page", () => {
     const text = pdfTextItemsToText([
       { str: "Taylor Morgan", transform: [1, 0, 0, 1, 40, 720], width: 80 },
@@ -244,6 +351,17 @@ Specialty`,
       "https://linkedin.com/in/morgan",
       "Clinical Research Analyst",
       "Indianapolis, IN",
+    ].join("\n"));
+  });
+
+  it("restores identity text that Word keeps outside normal DOCX paragraphs", () => {
+    expect(mergeDocxTextSources(
+      "PROFESSIONAL SUMMARY\nData engineer building reliable systems.",
+      "ARUN EXAMPLE\nPROFESSIONAL SUMMARY\nData engineer building reliable systems.",
+    )).toBe([
+      "ARUN EXAMPLE",
+      "PROFESSIONAL SUMMARY",
+      "Data engineer building reliable systems.",
     ].join("\n"));
   });
 
@@ -439,6 +557,127 @@ Cloud/DevOps: AWS, Docker, Kubernetes`,
       "AWS",
       "Docker",
       "Kubernetes",
+    ]);
+  });
+
+  it("recognizes work and project experience headings with company-location rows", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "data-resume.docx",
+      text: `Arun Example
+PROFESSIONAL SUMMARY
+Data engineer building reliable systems.
+TECHNICAL SKILLS
+Languages: Python (Pandas, NumPy), SQL
+PROJECT EXPERIENCE
+SENIOR DATA ENGINEER June 2020 – December 2025
+Citigroup Irving, TX
+• Built regulated data pipelines.
+SOFTWARE ENGINEER October 2019 – May 2020
+Ikcon Technologies South Plainfield, NJ
+• Automated reporting workflows.
+EDUCATION
+Troy University
+Master of Science in Computer Science
+2016 - 2019`,
+    });
+
+    expect(result.employment).toEqual([
+      expect.objectContaining({
+        company: "Citigroup",
+        title: "SENIOR DATA ENGINEER",
+        location: "Irving, TX",
+      }),
+      expect.objectContaining({
+        company: "Ikcon Technologies",
+        title: "SOFTWARE ENGINEER",
+        location: "South Plainfield, NJ",
+      }),
+    ]);
+    expect(result.skills).toEqual(["Python (Pandas, NumPy)", "SQL"]);
+  });
+
+  it("keeps client assignments inside one employer and merges duplicate employer rows", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "consulting-resume.pdf",
+      text: `Taylor Example
+PROFESSIONAL EXPERIENCE
+Tata Consultancy Services, Bengaluru, India May 2021 – September 2022
+Client: Example Bank (December 2021 – September 2022)
+Software Development Engineer
+• Built loan servicing systems.
+Tata Consultancy Services, Bengaluru, India May 2021 – September 2022
+Client: Example Payments (May 2021 – December 2021)
+Software Development Engineer
+• Built payment services.`,
+    });
+
+    expect(result.employment).toHaveLength(1);
+    expect(result.employment[0]).toMatchObject({
+      company: "Tata Consultancy Services",
+      title: "Software Development Engineer",
+      location: "Bengaluru, India",
+    });
+    expect(result.employment[0].highlights).toEqual([
+      "Client: Example Bank (December 2021 – September 2022)",
+      "Built loan servicing systems.",
+      "Client: Example Payments (May 2021 – December 2021)",
+      "Built payment services.",
+    ]);
+  });
+
+  it("stops certification parsing at recognition and supports full state names", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "engineer.pdf",
+      text: `Morgan Example
+WORK EXPERIENCE
+Fannie Mae Reston, Virginia
+AWS Developer April 2024 – Present
+• Built cloud services.
+CERTIFICATIONS
+AWS Certified Developer
+SELECTED RECOGNITION
+Engineering excellence award
+SKILLS & INTERESTS
+Cloud: AWS (EKS, EC2, Lambda), Kubernetes`,
+    });
+
+    expect(result.employment[0]).toMatchObject({
+      company: "Fannie Mae",
+      title: "AWS Developer",
+      location: "Reston, Virginia",
+    });
+    expect(result.certifications).toEqual(["AWS Certified Developer"]);
+    expect(result.skills).toEqual(["AWS (EKS, EC2, Lambda)", "Kubernetes"]);
+  });
+
+  it("flags incomplete extracted facts before replacing a Career Profile", () => {
+    expect(resumeReviewWarnings({
+      ...emptyProfile(),
+      full_name: "Arun",
+      headline: "Data Engineer",
+      employment: [{
+        id: "job-1",
+        company: "",
+        title: "Data Engineer",
+        location: "Irving, TX",
+        start_date: "2020-01",
+        end_date: "2024-01",
+        current: false,
+        highlights: [],
+      }],
+      education: [{
+        id: "education-1",
+        school: "Example University",
+        degree: "",
+        field: "Computer Science",
+        start_date: "",
+        end_date: "2020",
+        location: "",
+      }],
+    })).toEqual([
+      "Current location was not found.",
+      "1 experience entry needs a company or title.",
+      "1 education entry needs a school or degree.",
     ]);
   });
 

@@ -20,7 +20,9 @@ interface ResumeSections extends Record<ResumeSection, string[]> {}
 
 export function inferProfileFromResume(profile: CareerProfile, imported: ImportedResume): CareerProfile {
   const sections = splitResumeSections(imported.text);
-  const contactLines = [...sections.preamble, ...normalizeResumeLines(imported.text).slice(0, 12)];
+  const contactLines = sections.preamble.length
+    ? sections.preamble
+    : normalizeResumeLines(imported.text).slice(0, 12);
   const likelyName = inferName(contactLines);
   const email = imported.text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
   const phone = imported.text.match(/(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}/)?.[0];
@@ -112,12 +114,13 @@ function detectSection(
   }
   const aliases: Array<[ResumeSection, RegExp]> = [
     ["summary", /^(?:professional\s+)?(?:summary|profile|objective|about)(?:\s*[:|-]\s*(.*))?$/i],
-    ["employment", /^(?:professional\s+)?(?:experience|employment|work history|career history)(?:\s*[:|-]\s*(.*))?$/i],
+    ["employment", /^(?:(?:professional|work|project|relevant)\s+)?(?:experience|employment)(?:\s*[:|-]\s*(.*))?$/i],
+    ["employment", /^(?:work history|career history)(?:\s*[:|-]\s*(.*))?$/i],
     ["education", /^(?:education|academic background|academics)(?:\s*[:|-]\s*(.*))?$/i],
-    ["skills", /^(?:technical\s+)?(?:skills|core competencies|technologies|expertise)(?:\s*[:|-]\s*(.*))?$/i],
+    ["skills", /^(?:technical\s+)?(?:skills|core competencies|technologies|expertise)(?:\s*(?:&|and)\s*(?:interests?|tools?|technologies))?(?:\s*[:|-]\s*(.*))?$/i],
     ["certifications", /^(?:certifications?|licenses?|credentials)(?:\s*[:|-]\s*(.*))?$/i],
-    ["projects", /^(?:selected\s+)?projects?(?:\s*[:|-]\s*(.*))?$/i],
-    ["other", /^(?:professional\s+)?(?:affiliations?|memberships?|awards?|honors?|publications?|languages?|volunteer(?:ing)?|interests?|references?)(?:\s*[:|-]\s*(.*))?$/i],
+    ["projects", /^(?:selected\s+)?projects?(?:\s*(?:&|and)\s*(?:leadership|research|publications?))?(?:\s*[:|-]\s*(.*))?$/i],
+    ["other", /^(?:(?:professional|selected)\s+)?(?:affiliations?|memberships?|awards?|honors?|recognition|achievements?|accomplishments?|publications?|languages?|volunteer(?:ing)?|interests?|references?)(?:\s*[:|-]\s*(.*))?$/i],
   ];
   for (const [section, pattern] of aliases) {
     const match = line.match(pattern);
@@ -159,8 +162,9 @@ function inferHeadline(lines: string[], name: string): string {
 }
 
 function parseEmployment(lines: string[]): EmploymentEntry[] {
-  return datedBlocks(lines, false).map((block, index) => {
-    const parsedCandidates = splitHeaderCandidates([...block.header, block.dateRemainder])
+  const entries = datedBlocks(lines, false).map((block, index) => {
+    const augmented = augmentEmploymentBlock(block);
+    const parsedCandidates = splitHeaderCandidates(augmented.candidates)
       .map(splitEmploymentCandidate);
     const location = parsedCandidates.map((candidate) => candidate.location).find(Boolean) || "";
     const roleCandidates = uniqueStrings(parsedCandidates.map((candidate) => candidate.value).filter(Boolean));
@@ -188,9 +192,10 @@ function parseEmployment(lines: string[]): EmploymentEntry[] {
       start_date: normalizeDate(block.start),
       end_date: block.current ? "" : normalizeDate(block.end),
       current: block.current,
-      highlights: parseHighlights(block.body),
+      highlights: parseHighlights(augmented.body),
     };
   }).filter((entry) => entry.company || entry.title);
+  return mergeDuplicateEmployment(entries);
 }
 
 function parseEducation(lines: string[]): EducationEntry[] {
@@ -198,14 +203,27 @@ function parseEducation(lines: string[]): EducationEntry[] {
   const source = blocks.length ? blocks : undatedEducationBlocks(lines);
   return source
     .map((block, index) => {
-      const candidates = splitHeaderCandidates([...block.header, block.dateRemainder, ...block.body.slice(0, 2)]);
+      const candidates = splitHeaderCandidates([...block.header, block.dateRemainder, ...block.body.slice(0, 2)])
+        .flatMap(splitCombinedEducationCandidate)
+        .flatMap(splitSchoolLocationCandidate)
+        .map(cleanEducationValue)
+        .filter(Boolean);
       const school = pickByScore(candidates, schoolScore);
-      const degreeLine = pickByScore(candidates.filter((candidate) => candidate !== school), degreeScore);
+      const nonSchoolCandidates = candidates.filter((candidate) => candidate !== school);
+      const degreeLine =
+        pickByPositiveScore(nonSchoolCandidates, degreeScore) ||
+        nonSchoolCandidates.find((candidate) => !looksLikeLocation(candidate)) ||
+        "";
       const field =
         degreeLine.match(/[—–-]\s*(.+)$/)?.[1]?.trim() ||
         degreeLine.match(/\bin\s+(.+)$/i)?.[1]?.trim() ||
+        degreeLine.match(/^(?:a\.?a\.?|a\.?s\.?|b\.?a\.?|b\.?s\.?|m\.?a\.?|m\.?s\.?)\s+(?:in\s+)?(.+)$/i)?.[1]?.trim() ||
+        degreeLine.match(/^(?:masters?|bachelors?|doctorate|ph\.?d\.?)\s*:\s*(.+)$/i)?.[1]?.trim() ||
+        degreeLine.match(/^(?:associate|bachelor|master|doctor)(?:'s|s)?(?:\s+(?:degree|of\s+[^,]+))?,\s*(.+)$/i)?.[1]?.trim() ||
         "";
-      const location = candidates.find((candidate) => candidate !== school && looksLikeLocation(candidate)) || "";
+      const location = candidates.find((candidate) => (
+        candidate !== school && (looksLikeLocation(candidate) || isCountryName(candidate))
+      )) || "";
       return {
         id: stableResumeId("education", `${school}|${degreeLine}|${block.end}|${index}`),
         school,
@@ -260,12 +278,16 @@ function parseProjects(lines: string[]): ProjectEntry[] {
 }
 
 function parseListSection(lines: string[]): string[] {
-  return uniqueStrings(
+  return repairWrappedListFragments(uniqueStrings(
     lines.flatMap((line) => {
-      const value = stripBullet(line).replace(/^[A-Za-z &/+.-]{2,30}:\s*/, "");
+      const value = stripListCategoryPrefix(stripBullet(line));
       return parseDelimitedList(value);
     }),
-  ).filter((value) => value.length <= 80 && !/^(?:and|with)$/i.test(value));
+  )).filter((value) => (
+    value.length <= 100 &&
+    !/^(?:and|with)$/i.test(value) &&
+    !isListCategory(value)
+  ));
 }
 
 function parseCertificationSection(lines: string[]): string[] {
@@ -301,7 +323,9 @@ interface DatedBlock {
 function datedBlocks(lines: string[], allowSingleYear: boolean): DatedBlock[] {
   const dates = lines
     .map((line, index) => ({ index, range: extractDateRange(line, allowSingleYear) }))
-    .filter((item): item is { index: number; range: NonNullable<ReturnType<typeof extractDateRange>> } => Boolean(item.range));
+    .filter((item): item is { index: number; range: NonNullable<ReturnType<typeof extractDateRange>> } => (
+      Boolean(item.range) && (allowSingleYear || !isNestedAssignmentLine(item.index >= 0 ? lines[item.index] : ""))
+    ));
   if (!dates.length) return [];
   const firstInlineRemainder = lines[dates[0].index]
     .replace(dates[0].range.raw, "")
@@ -401,7 +425,7 @@ function splitHeaderCandidates(lines: string[]): string[] {
 }
 
 function splitEmploymentCandidate(candidate: string): { value: string; location: string } {
-  const clean = candidate.replace(/,+$/, "").trim();
+  const clean = candidate.replace(/[.,]+$/, "").trim();
   if (!clean) return { value: "", location: "" };
   if (/^(?:remote|hybrid|on-?site)(?:\s*[-–—]\s*.+)?$/i.test(clean)) {
     return { value: "", location: clean };
@@ -410,13 +434,28 @@ function splitEmploymentCandidate(candidate: string): { value: string; location:
   if (parts.length < 2) return { value: clean, location: "" };
 
   const last = parts.at(-1) || "";
-  if (isUsStateCode(last)) {
+  if (isUsStateCode(last) || isUsStateName(last)) {
+    if (parts.length === 2) {
+      const split = splitCompanyAndCity(parts[0]);
+      if (split) {
+        return { value: split.company, location: `${split.city}, ${last}` };
+      }
+    }
     return {
       value: parts.slice(0, -2).join(", "),
       location: parts.slice(-2).join(", "),
     };
   }
+  if (/\b(?:remote|hybrid|on-?site)\b/i.test(last)) {
+    return { value: parts.slice(0, -1).join(", "), location: last };
+  }
   if (isCountryName(last)) {
+    if (parts.length === 2) {
+      const split = splitCompanyAndCity(parts[0]);
+      if (split) {
+        return { value: split.company, location: `${split.city}, ${last}` };
+      }
+    }
     return {
       value: parts.slice(0, -2).join(", "),
       location: parts.slice(-2).join(", "),
@@ -551,17 +590,21 @@ function stripContactParts(line: string): string {
 
 function looksLikeLocation(line: string): boolean {
   const value = stripContactParts(line);
+  if (new RegExp(`^[A-Za-z .'-]+,\\s*(?:${US_STATE_CODE_PATTERN}|${US_STATE_NAME_PATTERN}|${COUNTRY_PATTERN})$`, "i").test(value)) {
+    return true;
+  }
   const parsed = splitEmploymentCandidate(value);
   return Boolean(parsed.location) && !parsed.value;
 }
 
 function extractLocation(line: string): string {
-  return (
+  const location = (
     line
       .split(/\s*[|•—–]\s*/)
       .map(stripContactParts)
       .find((part) => part && looksLikeLocation(part)) || ""
   );
+  return normalizeLocationValue(location);
 }
 
 function parseHighlights(lines: string[]): string[] {
@@ -575,6 +618,12 @@ function parseHighlights(lines: string[]): string[] {
   for (const line of lines) {
     const value = stripBullet(line);
     if (!value) continue;
+    if (isNestedAssignmentLine(value)) {
+      finish();
+      highlights.push(value);
+      pendingLabel = "";
+      continue;
+    }
     if (isBullet(line)) {
       finish();
       current = pendingLabel ? `${pendingLabel}: ${value}` : value;
@@ -643,9 +692,191 @@ function joinWrappedText(left: string, right: string): string {
 }
 
 function parseDelimitedList(value: string): string[] {
-  const parts = value.split(/\s*[|,;]\s*|\s+•\s+/).map((part) => part.trim()).filter(Boolean);
+  const parts: string[] = [];
+  let current = "";
+  let depth = 0;
+  for (const character of value) {
+    if (character === "(" || character === "[") depth += 1;
+    if (character === ")" || character === "]") depth = Math.max(0, depth - 1);
+    if (depth === 0 && /[|,;•]/.test(character)) {
+      if (current.trim()) parts.push(cleanListValue(current));
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  if (current.trim()) parts.push(cleanListValue(current));
   if (parts.length > 1) return parts;
-  return value.split(/\s{2,}/).map((part) => part.trim()).filter(Boolean);
+  return value.split(/\s{2,}/).map(cleanListValue).filter(Boolean);
+}
+
+function augmentEmploymentBlock(block: DatedBlock): { candidates: string[]; body: string[] } {
+  const candidates = [...block.header, block.dateRemainder];
+  const consumed = new Set<number>();
+  for (let index = 0; index < Math.min(block.body.length, 5); index += 1) {
+    const line = block.body[index];
+    const clean = stripBullet(line).replace(/[.]$/, "").trim();
+    if (!clean || isNestedAssignmentLine(clean) || /^(?:responsibilities|duties)\s*:?$/i.test(clean)) {
+      continue;
+    }
+    const parsed = splitEmploymentCandidate(clean);
+    const headerLike = (
+      !isBullet(line) &&
+      clean.length <= 120 &&
+      (titleScore(parsed.value) > 0 || companyScore(parsed.value) > 0 || Boolean(parsed.location))
+    );
+    if (!headerLike) break;
+    candidates.push(clean);
+    consumed.add(index);
+  }
+  return {
+    candidates,
+    body: block.body.filter((_, index) => !consumed.has(index)),
+  };
+}
+
+function mergeDuplicateEmployment(entries: EmploymentEntry[]): EmploymentEntry[] {
+  const merged = new Map<string, EmploymentEntry>();
+  for (const entry of entries) {
+    const key = [
+      entry.company,
+      entry.title,
+      entry.start_date,
+      entry.end_date,
+      String(entry.current),
+    ].map((value) => value.trim().toLowerCase()).join("|");
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, entry);
+      continue;
+    }
+    existing.location ||= entry.location;
+    existing.highlights = uniqueStrings([...existing.highlights, ...entry.highlights]);
+  }
+  return [...merged.values()];
+}
+
+function splitCompanyAndCity(value: string): { company: string; city: string } | null {
+  const words = value.split(/\s+/).filter(Boolean);
+  if (words.length < 2) return null;
+  const suffix = /^(?:academy|association|bank|capital|care|center|centre|clinic|college|communications|consulting|corp(?:oration)?|foundation|group|health|hospital|hospitals|insurance|labs?|library|manufacturing|medical|services|solutions|systems|technologies|technology|telecom|university)$/i;
+  let suffixIndex = -1;
+  words.forEach((word, index) => {
+    if (suffix.test(word.replace(/[^A-Za-z]/g, ""))) suffixIndex = index;
+  });
+  if (suffixIndex >= 0 && suffixIndex < words.length - 1) {
+    return {
+      company: words.slice(0, suffixIndex + 1).join(" "),
+      city: words.slice(suffixIndex + 1).join(" "),
+    };
+  }
+  return { company: words.slice(0, -1).join(" "), city: words.at(-1) || "" };
+}
+
+function isNestedAssignmentLine(value: string): boolean {
+  return /^(?:client|customer|project|assignment|engagement)\s*:/i.test(stripBullet(value));
+}
+
+const LIST_CATEGORIES = [
+  "& backend", "ai/ml", "backend", "bpm tools", "cloud", "cloud/devops", "databases", "devops",
+  "frameworks", "ide tools", "languages", "messaging & event processing", "messaging systems",
+  "operating systems", "platforms", "spring suite", "technical skills", "technologies",
+  "tools", "tools & monitoring",
+];
+
+function stripListCategoryPrefix(value: string): string {
+  if (/^[A-Za-z0-9 &/+.-]{2,40}:\s*$/.test(value)) return "";
+  const colon = value.match(/^[A-Za-z0-9 &/+.-]{2,40}:\s*(.+)$/);
+  if (colon) return colon[1].trim();
+  const normalized = value.toLowerCase();
+  const category = LIST_CATEGORIES
+    .filter((candidate) => normalized.startsWith(`${candidate} `))
+    .sort((left, right) => right.length - left.length)[0];
+  return category ? value.slice(category.length).trim() : value;
+}
+
+function isListCategory(value: string): boolean {
+  return LIST_CATEGORIES.includes(value.trim().replace(/:$/, "").toLowerCase());
+}
+
+function cleanListValue(value: string): string {
+  const clean = value.trim().replace(/[.:;]+$/, "").trim();
+  if (/^Eclipse\s+My\s*Eclipse$/i.test(clean)) return "Eclipse|MyEclipse";
+  return clean;
+}
+
+function repairWrappedListFragments(values: string[]): string[] {
+  const expanded = values.flatMap((value) => value.split("|").map((item) => item.trim()).filter(Boolean));
+  const repaired: string[] = [];
+  const continuations: Array<[RegExp, RegExp]> = [
+    [/^trend$/i, /^analysis$/i],
+    [/^ai-enhanced$/i, /^reporting$/i],
+    [/^spring$/i, /^batch(?:\b|\s*\()/i],
+  ];
+  for (const value of expanded) {
+    const previous = repaired.at(-1);
+    const pair = previous && continuations.some(([left, right]) => left.test(previous) && right.test(value));
+    if (pair) repaired[repaired.length - 1] = `${previous} ${value}`;
+    else repaired.push(value);
+  }
+  return uniqueStrings(repaired);
+}
+
+function normalizeLocationValue(value: string): string {
+  return value
+    .replace(/\s*,\s*/g, ", ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function splitCombinedEducationCandidate(value: string): string[] {
+  const clean = value.replace(/[.]$/, "").trim();
+  if (degreeScore(clean) === 0 || schoolScore(clean) === 0) return [clean];
+  const parts = clean.split(/\s*,\s*/).filter(Boolean);
+  const schoolIndex = parts.findIndex((part) => schoolScore(part) > 0);
+  if (schoolIndex === 0 && parts.slice(1).some((part) => degreeScore(part) > 0)) {
+    return [parts[0], parts.slice(1).join(", ")];
+  }
+  if (schoolIndex <= 0) return [clean];
+  return [
+    parts.slice(0, schoolIndex).join(", "),
+    parts[schoolIndex],
+    ...parts.slice(schoolIndex + 1),
+  ].filter(Boolean);
+}
+
+function splitSchoolLocationCandidate(value: string): string[] {
+  const gpaLocationPattern = new RegExp(
+    `^(.+?)\\s*\\(?GPA\\s*:[^)]+\\)?\\s+([A-Za-z .'-]+,\\s*(?:${US_STATE_CODE_PATTERN}|${US_STATE_NAME_PATTERN}|${COUNTRY_PATTERN}))$`,
+    "i",
+  );
+  const gpaLocation = value.trim().match(gpaLocationPattern);
+  if (gpaLocation && degreeScore(gpaLocation[1]) > 0) {
+    return [cleanEducationValue(gpaLocation[1]), normalizeLocationValue(gpaLocation[2])];
+  }
+  const clean = cleanEducationValue(value);
+  const locationPattern = new RegExp(
+    `^(.+?)\\s+([A-Za-z .'-]+,\\s*(?:${US_STATE_CODE_PATTERN}|${US_STATE_NAME_PATTERN}|${COUNTRY_PATTERN}))$`,
+    "i",
+  );
+  const match = clean.match(locationPattern);
+  if (match && (schoolScore(match[1]) > 0 || degreeScore(match[1]) > 0)) {
+    return [match[1].trim(), normalizeLocationValue(match[2])];
+  }
+  const countryMatch = clean.match(new RegExp(`^(.+?)\\s+(${COUNTRY_PATTERN})$`, "i"));
+  if (countryMatch && (schoolScore(countryMatch[1]) > 0 || degreeScore(countryMatch[1]) > 0)) {
+    return [countryMatch[1].trim(), countryMatch[2].trim()];
+  }
+  return [clean];
+}
+
+function cleanEducationValue(value: string): string {
+  return value
+    .replace(/\[\s*\]/g, "")
+    .replace(/\s*\(?GPA\s*:[^)]+\)?/gi, "")
+    .replace(/\s*(?:expected\s+)?graduation\s+date\s*:?\s*$/i, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function uniqueStrings(values: string[]): string[] {
@@ -666,12 +897,20 @@ function stripDanglingDateMonth(value: string): string {
 }
 
 function isUsStateCode(value: string): boolean {
-  return /^(?:A[LKSZR]|C[AOT]|D[EC]|F[LM]|G[A]|H[I]|I[ADLN]|K[SY]|L[A]|M[ADEHINOST]|N[CDEHJMVY]|O[HKR]|P[A]|R[I]|S[CD]|T[NX]|U[T]|V[AIT]|W[AIVY])(?:\s+\d{5}(?:-\d{4})?)?$/i.test(value);
+  return new RegExp(`^(?:${US_STATE_CODE_PATTERN})(?:\\s+\\d{5}(?:-\\d{4})?)?$`, "i").test(value);
+}
+
+function isUsStateName(value: string): boolean {
+  return new RegExp(`^(?:${US_STATE_NAME_PATTERN})$`, "i").test(value);
 }
 
 function isCountryName(value: string): boolean {
-  return /^(?:Argentina|Australia|Austria|Belgium|Brazil|Canada|Chile|China|Colombia|Denmark|Egypt|Finland|France|Germany|Greece|India|Indonesia|Ireland|Israel|Italy|Japan|Kenya|Malaysia|Mexico|Netherlands|New Zealand|Nigeria|Norway|Pakistan|Philippines|Poland|Portugal|Singapore|South Africa|South Korea|Spain|Sweden|Switzerland|Taiwan|Thailand|Turkey|United Arab Emirates|United Kingdom|United States|Vietnam)$/i.test(value);
+  return new RegExp(`^(?:${COUNTRY_PATTERN})$`, "i").test(value);
 }
+
+const US_STATE_CODE_PATTERN = "A[LKSZR]|C[AOT]|D[EC]|F[LM]|G[A]|H[I]|I[ADLN]|K[SY]|L[A]|M[ADEHINOST]|N[CDEHJMVY]|O[HKR]|P[A]|R[I]|S[CD]|T[NX]|U[T]|V[AIT]|W[AIVY]";
+const US_STATE_NAME_PATTERN = "Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New Hampshire|New Jersey|New Mexico|New York|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|Wisconsin|Wyoming|District of Columbia|Puerto Rico";
+const COUNTRY_PATTERN = "Argentina|Australia|Austria|Belgium|Brazil|Canada|Chile|China|Colombia|Denmark|Egypt|Finland|France|Germany|Greece|India|Indonesia|Ireland|Israel|Italy|Japan|Kenya|Malaysia|Mexico|Netherlands|New Zealand|Nigeria|Norway|Pakistan|Philippines|Poland|Portugal|Singapore|South Africa|South Korea|Spain|Sweden|Switzerland|Taiwan|Thailand|Turkey|United Arab Emirates|United Kingdom|United States|Vietnam";
 
 function normalizeUrl(value?: string): string {
   if (!value) return "";

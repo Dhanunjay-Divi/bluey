@@ -28,6 +28,7 @@ import { Dialog } from "../components/Dialog";
 import { InterviewPrepDialog } from "../components/InterviewPrepDialog";
 import { exportResumeDocx, exportResumePdf } from "../lib/documents";
 import { applicationIssueReasons, applicationIssues, applicationOutcomes, eventActionLabel, latestApplicationOutcome } from "../lib/candidate-events";
+import { formatResumeDiffValue, resumeDiffHasValue, resumeDiffLabel } from "../lib/resume-diff";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -420,36 +421,16 @@ function PauseReasons({ application, job, intervention }: { application: JobAppl
 }
 
 function DiffList({ resume }: { resume?: ResumeVersion }) {
-  const entries = resume ? Object.entries(resume.diff).filter(([, value]) => diffHasValue(value)) : [];
+  const entries = resume ? Object.entries(resume.diff).filter(([, value]) => resumeDiffHasValue(value)) : [];
   if (!resume) return <div className="diff-empty">Loading visible diff...</div>;
   if (entries.length === 0) {
     return <div className="diff-empty">No visible resume changes were recorded for this version.</div>;
   }
   return (
     <ul className="diff-list">
-      {entries.map(([key, value]) => <li key={key}><span>{key.replaceAll("_", " ")}</span><p>{formatDiffValue(value)}</p></li>)}
+      {entries.map(([key, value]) => <li key={key}><span>{resumeDiffLabel(key)}</span><p>{formatResumeDiffValue(value)}</p></li>)}
     </ul>
   );
-}
-
-function diffHasValue(value: unknown): boolean {
-  if (Array.isArray(value)) return value.length > 0;
-  if (value && typeof value === "object") return Object.keys(value).length > 0;
-  return value !== undefined && value !== null && String(value).trim().length > 0;
-}
-
-function formatDiffValue(value: unknown): string {
-  if (Array.isArray(value)) return value.map(formatDiffValue).join(", ") || "None";
-  if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    if ("before" in record || "after" in record) {
-      return `Before: ${formatDiffValue(record.before)} · After: ${formatDiffValue(record.after)}`;
-    }
-    return Object.entries(record)
-      .map(([key, nested]) => `${key.replaceAll("_", " ")}: ${formatDiffValue(nested)}`)
-      .join(" · ");
-  }
-  return String(value ?? "None");
 }
 
 function applicationEligibility(application: JobApplication, job?: JobPosting): JobEligibilityDecision {

@@ -55,6 +55,11 @@ export function previewResume(
   const track = workspace.tracks.find((item) => item.id === job.track_id);
   const applicationIdentity = workspace.application_identities.find((item) => item.id === track?.application_identity_id)
     || workspace.application_identities.find((item) => item.is_default && item.verification_status === "verified");
+  const normalizedDescription = job.description.toLowerCase();
+  const matchedSkills = workspace.profile.skills.filter((skill) => normalizedDescription.includes(skill.toLowerCase())).slice(0, 3);
+  const summary = mode === "enhance" && workspace.profile.summary.trim() && matchedSkills.length
+    ? `${workspace.profile.summary.trim().replace(/\.$/, "")} Relevant strengths include ${matchedSkills.join(", ")}.`
+    : workspace.profile.summary;
   return {
     id,
     job_id: job.id,
@@ -68,8 +73,8 @@ export function previewResume(
         phone: workspace.profile.phone,
         location: workspace.profile.current_location,
       },
-      headline: workspace.profile.headline || job.title,
-      summary: `${workspace.profile.summary} Focused for the ${job.title} opportunity at ${job.company}.`,
+      headline: workspace.profile.headline,
+      summary,
       skills: workspace.profile.skills,
       employment: workspace.profile.employment,
       education: workspace.profile.education,
@@ -77,12 +82,9 @@ export function previewResume(
       certifications: workspace.profile.certifications,
     },
     diff: {
-      summary: {
-        before: workspace.profile.summary,
-        after: `${workspace.profile.summary} Focused for the ${job.title} opportunity at ${job.company}.`,
-      },
+      ...(summary !== workspace.profile.summary ? { summary: { before: workspace.profile.summary, after: summary } } : {}),
+      evidence_policy: "Existing profile facts only; Bluey moves the strongest evidence first.",
       claims_added: [],
-      profile_fact_ids_used: workspace.facts.filter((fact) => fact.verification_status === "confirmed").map((fact) => fact.id),
     },
     claim_ids: workspace.facts.filter((fact) => fact.verification_status === "confirmed").map((fact) => fact.id),
     checksum: `${job.id}-${id}`,

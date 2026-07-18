@@ -52,10 +52,14 @@ export async function importResume(file: File): Promise<ImportedResume> {
   }
   if (extension === "docx") {
     const { default: mammoth } = await import("mammoth");
-    const result = await mammoth.convertToHtml({ arrayBuffer: buffer });
+    const [result, raw] = await Promise.all([
+      mammoth.convertToHtml({ arrayBuffer: buffer }),
+      mammoth.extractRawText({ arrayBuffer: buffer }),
+    ]);
+    const htmlText = resumeHtmlToText(result.value);
     return {
       name: file.name,
-      text: validateExtractedResumeText(resumeHtmlToText(result.value), "DOCX"),
+      text: validateExtractedResumeText(mergeDocxTextSources(htmlText, raw.value), "DOCX"),
       file_type: "docx",
     };
   }
@@ -67,6 +71,16 @@ export async function importResume(file: File): Promise<ImportedResume> {
     };
   }
   throw new Error("Use a PDF, DOCX, or TXT resume.");
+}
+
+export function mergeDocxTextSources(htmlText: string, rawText: string): string {
+  const htmlLines = normalizedTextLines(htmlText);
+  const rawLines = normalizedTextLines(rawText);
+  const sectionIndex = rawLines.findIndex((line) => /^(?:(?:professional|work|project|relevant)\s+)?(?:summary|profile|objective|experience|employment|education|skills|projects?)\b/i.test(line));
+  const preamble = rawLines.slice(0, sectionIndex >= 0 ? sectionIndex : Math.min(rawLines.length, 12));
+  const known = new Set(htmlLines.slice(0, 16).map((line) => line.toLowerCase()));
+  const missing = preamble.filter((line) => !known.has(line.toLowerCase()));
+  return [...missing, ...htmlLines].join("\n");
 }
 
 export function validateResumeFileBytes(name: string, buffer: ArrayBuffer): void {
@@ -172,4 +186,11 @@ function decodeHtmlEntities(value: string): string {
     if (hex) return String.fromCodePoint(Number.parseInt(hex, 16));
     return named[String(name).toLowerCase()] ?? entity;
   });
+}
+
+function normalizedTextLines(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.replace(/[ \t]+/g, " ").trim())
+    .filter(Boolean);
 }

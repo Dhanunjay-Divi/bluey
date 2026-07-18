@@ -25,6 +25,7 @@ pub mod devices;
 pub mod diagnostic_logs;
 pub mod idempotency;
 pub mod jobs;
+mod jobs_tailoring;
 pub mod legal_acceptances;
 pub mod link_codes;
 pub mod metrics;
