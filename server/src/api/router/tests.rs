@@ -3799,6 +3799,27 @@ fn answer_plan_q06_general_interview_scenario_uses_short_proposed_approach_contr
 }
 
 #[test]
+fn answer_plan_q30_llm_latency_quality_uses_measured_canary_contract() {
+    let req = complete_request(
+        "Question:\nHow would you reduce p95 latency for a large language model service without silently reducing answer quality?\n\nSession context:\n[Candidate profile]\nData scientist interviewing for an AI platform role.",
+    );
+    let plan = answer_plan_for_request(&req, "balanced", &[]);
+    assert_eq!(plan.output, AnswerOutput::Compact);
+    assert!(plan.interview_context);
+
+    let (system, _) = prompt_with_answer_plan(
+        "You are Bluey.",
+        &req.user,
+        &plan,
+        &WebSearchOutcome::default(),
+    );
+    assert!(system.contains("LLM latency-quality rollout contract"));
+    assert!(system.contains("measure p95 latency and answer quality against the same baseline"));
+    assert!(system.contains("bounded canary"));
+    assert!(system.contains("roll it back if the quality gate regresses"));
+}
+
+#[test]
 fn answer_plan_q10_large_foreign_key_migration_uses_safe_engine_specific_contract() {
     let req = complete_request(
         "Question:\nA junior engineer wants to add a foreign key constraint to a 200 million row production table. What do you tell them?",

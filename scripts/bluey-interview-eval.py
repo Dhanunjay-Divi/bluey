@@ -57,6 +57,10 @@ from bluey_eval.payment_contract_checks import (  # noqa: E402
 from bluey_eval.payment_key_sharing_checks import (  # noqa: E402
     self_check_payment_key_sharing_detector,
 )
+from bluey_eval.coaching_contracts import (  # noqa: E402
+    q48_coaching_ownership_issues,
+    self_check_q48_coaching_ownership,
+)
 from bluey_eval.leadership_contracts import (  # noqa: E402
     Q47_INCIDENT_CONTAINMENT_SENTENCE,
     q47_director_alignment_issues,
@@ -306,7 +310,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q45", "behavioral", "amazon_de", "Tell me about a failure. What did you change so the same class of failure would not repeat?", "behavioral_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("fail", "mistake"), g("root cause", "learn"), g("guardrail", "test", "monitor", "process"))),
     EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
     EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("communicat", "tradeoff", "lay out", "comparison"))),
-    EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("on their own", "themselves", "let them own", "they take ownership", "their ownership", "they fix", "they make the correction"))),
+    EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("on their own", "themselves", "let them own", "they take ownership", "their ownership", "they fix", "they make the correction", "ownership with them", "they still do the work", "ask them to update the code"))),
     EvalCase("Q49", "scenario", "ds", "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?", "otter_visible_scenario", speakable=True, required_groups=(g("track", "identity"), g("calibrat", "time", "spatial"), g("dedup", "de-duplication", "fusion", "fuse", "association"))),
     EvalCase("Q50", "behavioral", "ds", "Why this role, and what would you focus on in your first ninety days?", "resume_and_jd_pdf", speakable=True, required_groups=(g("hpe", "datacenter", "telemetry"), g("first", "90", "ninety"), g("stakeholder", "baseline", "production"))),
 )
@@ -1619,6 +1623,8 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
     if case.id == "Q47":
         issues.extend(q47_director_alignment_issues(attempt.visible_answer))
         issues.extend(q47_incident_containment_issues(attempt.visible_answer))
+    if case.id == "Q48":
+        issues.extend(q48_coaching_ownership_issues(attempt.visible_answer))
     if case.id in ("Q29", "Q38") and has_drift_only_automatic_retraining(combined):
         issues.append("unsafe_drift_only_automatic_retraining")
     if case.id == "Q38":
@@ -1640,6 +1646,7 @@ def expected_outcome_is_accepted(case: EvalCase, attempt: AttemptResult) -> bool
 
 
 def self_check_attempt_integrity_guards() -> None:
+    self_check_q48_coaching_ownership()
     assert has_required_signal("def get(self, key):", "get")
     assert has_required_signal("point in time training-serving data", "point-in-time")
     q31 = next(case for case in CASES if case.id == "Q31")
@@ -1670,7 +1677,14 @@ def self_check_attempt_integrity_guards() -> None:
     )
     q48_learner_ownership_issue = (
         "missing_signal:on their own|themselves|let them own|they take ownership|"
-        "their ownership|they fix|they make the correction"
+        "their ownership|they fix|they make the correction|ownership with them|"
+        "they still do the work|ask them to update the code"
+    )
+    assert not missing_required_group_issues(
+        q48,
+        "I coach them with one concrete example and a checklist, keeping the "
+        "ownership with them. I ask them to update the code, and they still do "
+        "the work.",
     )
     for takeover_answer in (
         "I coach them with one concrete example and a checklist. Next time I take "
@@ -1945,6 +1959,29 @@ def self_check_attempt_integrity_guards() -> None:
         f"{round547_live_q47} In practice at Example Corp, I once resolved this exact "
         "conflict with a phased rollout."
     ) == ["claimed_past_example_in_hypothetical_q47"]
+    assert not q47_director_alignment_issues(
+        f"{round547_live_q47} In practice, that keeps me objective and makes the "
+        "tradeoff visible."
+    )
+    assert "claimed_past_example_in_hypothetical_q47" in q47_director_alignment_issues(
+        f"{round547_live_q47} In practice, I resolved this exact conflict last year."
+    )
+    for unsupported_past_q47 in (
+        "At Acme I did this once.",
+        "Previously, I made this call for another team.",
+        "Last year, I led this prioritization process.",
+        "I handled a similar conflict at Acme.",
+        "We handled a similar conflict at Acme.",
+        "Earlier in my career, I made this decision.",
+        "At a prior company, we did this once.",
+        "My prior team used this approach.",
+        "I had to resolve a similar conflict.",
+    ):
+        assert "claimed_past_example_in_hypothetical_q47" in (
+            q47_director_alignment_issues(
+                f"{round547_live_q47} {unsupported_past_q47}"
+            )
+        )
     round548_live_q47_rejection = (
         f"{round547_live_q47} I would not quietly pick one on my own."
     )

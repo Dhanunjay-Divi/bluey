@@ -313,6 +313,11 @@ def self_check_payment_operation_semantics() -> None:
         "account and client\nidempotency key",
     )
     assert not payment_q39_completeness_issues(line_wrapped_contract)
+    articleless_ingress = complete_payment_contract.replace(
+        Q39_INGRESS_IDEMPOTENCY_SENTENCE,
+        Q39_INGRESS_IDEMPOTENCY_SENTENCE.removeprefix("The "),
+    )
+    assert not payment_q39_completeness_issues(articleless_ingress)
     assert "unsafe_shared_idempotency_key_across_payment_operations" not in (
         payment_operation_semantic_issues(
             line_wrapped_contract,
@@ -334,6 +339,44 @@ def self_check_payment_operation_semantics() -> None:
         ),
     ):
         assert expected_issue in payment_q39_completeness_issues(hidden_sentence)
+    articleless_ingress_sentence = Q39_INGRESS_IDEMPOTENCY_SENTENCE.removeprefix("The ")
+    for hidden_articleless_ingress in (
+        f"<!-- {articleless_ingress_sentence} -->",
+        f"~~{articleless_ingress_sentence}~~",
+        f"```text\n{articleless_ingress_sentence}\n```",
+        f"> {articleless_ingress_sentence}",
+    ):
+        assert "missing_client_idempotency_intent_mapping" in (
+            payment_q39_completeness_issues(hidden_articleless_ingress)
+        )
+    for unsafe_articleless_ingress in (
+        articleless_ingress_sentence.replace(
+            "returns that stored intent on a duplicate submission",
+            "returns a new intent on a duplicate submission",
+        ),
+        articleless_ingress_sentence.replace(
+            "and returns that stored intent on a duplicate submission",
+            "",
+        ),
+        f"Do not use this rule: {articleless_ingress_sentence}",
+        f"It is false that {articleless_ingress_sentence}",
+        f"This is wrong: {articleless_ingress_sentence}",
+        f"Not {articleless_ingress_sentence}",
+        f"Never claim that {articleless_ingress_sentence}",
+        f"It isn't true that {articleless_ingress_sentence}",
+        f"It is incorrect that {articleless_ingress_sentence}",
+        f"False: {articleless_ingress_sentence}",
+        f"I deny that {articleless_ingress_sentence}",
+        f"That claim is wrong; {articleless_ingress_sentence}",
+        f"The following is false: {articleless_ingress_sentence}",
+        f"Do not believe that {articleless_ingress_sentence}",
+        f"I disagree that {articleless_ingress_sentence}",
+        f"This cannot be true: {articleless_ingress_sentence}",
+        f"It is not correct that {articleless_ingress_sentence}",
+    ):
+        assert "missing_client_idempotency_intent_mapping" in (
+            payment_q39_completeness_issues(unsafe_articleless_ingress)
+        )
     unsafe_client_key_reuse = (
         "Authorize, capture, and refund reuse the client idempotency key."
     )

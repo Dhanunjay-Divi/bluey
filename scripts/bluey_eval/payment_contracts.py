@@ -28,25 +28,31 @@ def payment_q39_completeness_issues(text: str) -> List[str]:
     """Require the exact local-effect and ingress boundaries promised for the canvas."""
     requirements = (
         (
-            Q39_INGRESS_IDEMPOTENCY_SENTENCE,
+            (
+                Q39_INGRESS_IDEMPOTENCY_SENTENCE,
+                Q39_INGRESS_IDEMPOTENCY_SENTENCE.removeprefix("The "),
+            ),
             "missing_client_idempotency_intent_mapping",
         ),
         (
-            Q39_LEDGER_IDEMPOTENCY_SENTENCE,
+            (Q39_LEDGER_IDEMPOTENCY_SENTENCE,),
             "missing_idempotent_local_ledger_posting",
         ),
         (
-            Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,
+            (Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,),
             "missing_partial_action_child_operation_boundary",
         ),
     )
     return [
         issue
-        for sentence, issue in requirements
-        if not has_visible_affirmative_contract_sentence(
-            text,
-            sentence,
-            allow_inline_code=True,
+        for alternatives, issue in requirements
+        if not any(
+            has_visible_affirmative_contract_sentence(
+                text,
+                sentence,
+                allow_inline_code=True,
+            )
+            for sentence in alternatives
         )
     ]
 

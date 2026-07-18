@@ -1046,8 +1046,41 @@ def q47_director_alignment_issues(text: str) -> List[str]:
         issues.append("missing_affirmative_director_alignment")
     if negated:
         issues.append("unsafe_negated_or_unilateral_director_alignment")
-    if re.search(
-        r"\b(?:in\s+practice(?:\s+at)?|in\s+my\s+(?:current|prior|previous|last)\s+"
+    past_action = (
+        r"(?:asked|aligned|built|challenged|chose|communicated|coordinated|"
+        r"decided|delivered|did|drove|escalated|facilitated|found|handled|"
+        r"implemented|kept|learned|led|made|managed|negotiated|picked|"
+        r"prioritized|ran|resolved|selected|took|used|went|worked|wrote|"
+        r"was\s+responsible\s+for|were\s+responsible\s+for)"
+    )
+    unsupported_personal_past = bool(
+        re.search(
+            rf"\b(?:i|we)\s+(?:(?:have|had|once|previously|personally|directly)\s+)*"
+            rf"{past_action}\b",
+            lower,
+        )
+        or re.search(
+            rf"\bmy\s+(?:prior|previous|former|last)\s+"
+            rf"(?:team|company|employer|organization|org|role)\s+{past_action}\b",
+            lower,
+        )
+        or re.search(
+            r"(?<!\bif\s)\bi\s+had\s+to\s+"
+            r"(?:resolve|handle|decide|prioritize|align|coordinate|escalate|"
+            r"choose|select|manage)\b",
+            lower,
+        )
+    )
+    if unsupported_personal_past or re.search(
+        r"\b(?:in\s+practice\s+at|in\s+practice\s*,?\s*i\s+"
+        r"(?:once|handled|led|resolved|implemented|delivered|was\s+responsible\s+for)|"
+        r"(?:previously|earlier|last\s+(?:year|quarter|month))\s*,?\s*i\s+"
+        r"(?:did|handled|led|made|resolved|implemented|delivered|decided|"
+        r"prioritized|was\s+responsible\s+for)|"
+        r"at\s+[^,.!?;]{1,60},?\s+i\s+"
+        r"(?:did|handled|led|made|resolved|implemented|delivered|decided|"
+        r"prioritized|was\s+responsible\s+for)|"
+        r"in\s+my\s+(?:current|prior|previous|last)\s+"
         r"role|at\s+my\s+(?:current|prior|previous|last)\s+(?:company|job)|"
         r"a\s+time\s+when\s+i|i\s+once)\b",
         lower,

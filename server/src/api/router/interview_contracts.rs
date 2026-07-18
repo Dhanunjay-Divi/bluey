@@ -154,6 +154,12 @@ pub(super) fn append_interview_correctness_contracts(
         );
     }
 
+    if looks_like_llm_latency_quality_question(normalized_question) {
+        append(
+            "LLM latency-quality rollout contract: name at least one serving optimization such as continuous batching, KV-cache reuse, an optimized serving runtime, or quantization validated on representative tasks. State this release rule explicitly: `I would measure p95 latency and answer quality against the same baseline and traffic slices, release each change through a bounded canary, and roll it back if the quality gate regresses.` Treat latency, quality, error rate, saturation, and cost as joint gates; never infer answer quality from latency alone or silently trade it away. Final check: the visible answer must explicitly say `measure p95 latency and answer quality against the same baseline`, `bounded canary`, and rollback on a quality-gate regression.",
+        );
+    }
+
     if looks_like_first_90_role_question(normalized_question) {
         let supplied_hpe_datacenter_role =
             target_job_description_has_all(answer_context, HPE_DATACENTER_ROLE_TERMS);
@@ -195,6 +201,28 @@ fn looks_like_first_90_role_question(normalized_question: &str) -> bool {
         normalized_question,
         &["role", "position", "job", "team", "target role"],
     )
+}
+
+fn looks_like_llm_latency_quality_question(normalized_question: &str) -> bool {
+    normalized_question.contains("p95")
+        && has_any(
+            normalized_question,
+            &[
+                "large language model",
+                "llm",
+                "language model service",
+                "model inference service",
+                "inference service",
+            ],
+        )
+        && has_any(
+            normalized_question,
+            &["answer quality", "response quality", "model quality"],
+        )
+        && has_any(
+            normalized_question,
+            &["reduce", "lower", "improve", "optimize", "speed up"],
+        )
 }
 
 fn target_job_description_has_all(contexts: &[AnswerContext], phrases: &[&str]) -> bool {
@@ -422,6 +450,10 @@ mod tests {
                 "Graph-fraud point-in-time contract",
             ),
             (
+                "How would you reduce p95 latency for a large language model service without silently reducing answer quality?",
+                "LLM latency-quality rollout contract",
+            ),
+            (
                 "What is your first 90 days plan for this target role?",
                 "First-90-days role-plan contract",
             ),
@@ -495,6 +527,58 @@ mod tests {
             &plan,
         );
         assert_eq!(compact_followup, "base");
+    }
+
+    #[test]
+    fn llm_latency_quality_contract_is_complete_and_narrow() {
+        let mut plan = interview_plan();
+        plan.output = AnswerOutput::Compact;
+        let mut instructions = String::new();
+        append_interview_correctness_contracts(
+            &mut instructions,
+            &normalize_guardrail_text(
+                "How would you reduce p95 latency for a large language model service without silently reducing answer quality?",
+            ),
+            &[],
+            &plan,
+        );
+        assert!(instructions
+            .contains("measure p95 latency and answer quality against the same baseline"));
+        assert!(instructions.contains("bounded canary"));
+        assert!(instructions.contains("roll it back if the quality gate regresses"));
+
+        for unrelated in [
+            "How would you reduce database p95 latency without reducing query correctness?",
+            "How would you improve a large language model service without discussing latency?",
+            "Summarize the p95 latency of this large language model service.",
+            "How would you reduce p99 tail latency for an LLM without reducing answer quality?",
+            "How would you reduce a latency percentile for an LLM without reducing answer quality?",
+        ] {
+            let mut unrelated_instructions = String::from("base");
+            append_interview_correctness_contracts(
+                &mut unrelated_instructions,
+                &normalize_guardrail_text(unrelated),
+                &[],
+                &plan,
+            );
+            assert_eq!(unrelated_instructions, "base", "{unrelated}");
+        }
+
+        for excluded in [
+            "Write an email about how to reduce p95 latency for a large language model service without reducing answer quality.",
+            "Rewrite this resume bullet about reducing p95 latency for a large language model service without reducing answer quality.",
+        ] {
+            let mut excluded_plan = plan.clone();
+            excluded_plan.intent = AnswerIntent::Writing;
+            let mut excluded_instructions = String::from("base");
+            append_interview_correctness_contracts(
+                &mut excluded_instructions,
+                &normalize_guardrail_text(excluded),
+                &[],
+                &excluded_plan,
+            );
+            assert_eq!(excluded_instructions, "base", "{excluded}");
+        }
     }
 
     #[test]
