@@ -155,14 +155,14 @@ pub(super) fn append_interview_correctness_contracts(
         normalized_question,
         &["role", "position", "job", "team", "target role"],
     ) {
-        let supplied_hpe_datacenter_telemetry =
-            target_job_description_has_all(answer_context, &["hpe", "datacenter", "telemetry"]);
+        let supplied_hpe_datacenter_role =
+            target_job_description_has_all(answer_context, &["hpe", "datacenter"]);
         append(
             "First-90-days role-plan contract: the opening sentence must explicitly name the supplied target employer and its role domain; do not replace them with generic `this role` language. Then tailor a 30-60-90 progression to that evidence. Start with a stakeholder map, access and domain discovery, and a baseline of current production quality, latency, reliability, and success metrics; then deliver one small validated improvement with explicit success and rollback criteria; then scale an agreed roadmap with measurable outcomes. State assumptions or questions when role context is absent, and do not invent prior-company stories, achievements, or relationships.",
         );
-        if supplied_hpe_datacenter_telemetry {
+        if supplied_hpe_datacenter_role {
             append(
-                "Supplied-role anchor: the source context names HPE and datacenter telemetry. Say `HPE` and `datacenter telemetry` explicitly in the opening sentence, while keeping every claim about the candidate grounded in the supplied resume.",
+                "Supplied-role anchor: the source context names HPE and an AI datacenter role. Say `HPE` and `datacenter` explicitly in the opening sentence, while keeping every claim about the candidate grounded in the supplied resume.",
             );
         }
     }
@@ -315,7 +315,7 @@ mod tests {
         let question = "Why this role, and what would you focus on in your first ninety days?";
         let hpe_jd = AnswerContext::new(
             AnswerContextKind::Document,
-            "HPE datacenter telemetry platform",
+            "HPE AI datacenter technology using streaming network data",
         )
         .with_role(AnswerContextRole::JobDescription);
         let mut anchored = String::new();
@@ -325,7 +325,7 @@ mod tests {
             &[hpe_jd],
             &interview_plan(),
         );
-        assert!(anchored.contains("Say `HPE` and `datacenter telemetry` explicitly"));
+        assert!(anchored.contains("Say `HPE` and `datacenter` explicitly"));
 
         let hpe_resume = AnswerContext::new(
             AnswerContextKind::Document,
