@@ -54,6 +54,9 @@ from bluey_eval.payment_contract_checks import (  # noqa: E402
     self_check_payment_operation_semantics,
     self_check_payment_platform_safety_detector,
 )
+from bluey_eval.payment_key_sharing_checks import (  # noqa: E402
+    self_check_payment_key_sharing_detector,
+)
 from bluey_eval.leadership_contracts import (  # noqa: E402
     Q47_INCIDENT_CONTAINMENT_SENTENCE,
     q47_director_alignment_issues,
@@ -2039,6 +2042,20 @@ def self_check_attempt_integrity_guards() -> None:
     )
     assert not missing_required_group_issues(q47, round544_live_q47)
     assert not q47_director_alignment_issues(round544_live_q47)
+    round546_live_q47 = (
+        "When two directors both claim top priority, I don't try to resolve it alone. "
+        "I schedule a brief joint conversation with both directors, make the tradeoff "
+        "visible, and ask them to align on one priority order. I don't unilaterally "
+        "reorder work. If they still cannot agree, I escalate the comparison to their "
+        "common accountable owner and execute the agreed decision."
+    )
+    assert not q47_director_alignment_issues(round546_live_q47)
+    assert "unsafe_negated_or_unilateral_director_alignment" in (
+        q47_director_alignment_issues(
+            "I ask both directors for input. They don't agree, so I resolve it alone "
+            "and communicate my final priority order."
+        )
+    )
     assert q47_incident_containment_issues(round544_live_q47) == [
         "missing_policy_governed_incident_containment_exception"
     ]
@@ -4042,6 +4059,7 @@ def main(argv: Sequence[str]) -> int:
     self_check_large_fk_migration_safety()
     self_check_exactly_once_processing_detector()
     self_check_payment_operation_semantics()
+    self_check_payment_key_sharing_detector()
     self_check_payment_platform_safety_detector()
     self_check_q46_story_grounding_detector()
     self_check_production_answer_contracts(

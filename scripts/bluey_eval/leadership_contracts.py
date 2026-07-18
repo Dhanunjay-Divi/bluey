@@ -142,7 +142,7 @@ def q47_director_alignment_issues(text: str) -> List[str]:
         r"(?:(?:which|what|the|a|an|this|that|either|neither|one|two|"
         r"request|requests|priority|priorities|order|sequence|winner|wins|"
         r"conflict|tradeoff|choice|ranking|decision|call|final|first|next|"
-        r"work|item|task|between|of|both|over|other|director|directors|"
+        r"work|item|task|it|between|of|both|over|other|director|directors|"
         r"competing|conflicting|their|and|or|a's|b's)\s+){0,6}"
     )
     private_decision_noun = (

@@ -3850,7 +3850,10 @@ fn answer_plan_rag_evaluation_plan_is_compact_technical_not_behavioral() {
     assert!(system.contains("no-answer or unanswerable"));
     assert!(system.contains("ACL or cross-tenant permission"));
     assert!(system.contains("PII or privacy slices"));
-    assert!(system.contains("spoken paragraph must include this exact sentence"));
+    assert!(system.contains("spoken paragraph must include both of these exact sentences"));
+    assert!(system.contains(
+        "I would compare a named baseline or champion on every slice before deciding whether to launch."
+    ));
     assert!(system.contains(
         "I would predeclare an acceptance threshold for every slice, and any critical-slice regression would block launch."
     ));

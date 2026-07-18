@@ -871,6 +871,66 @@ def self_check_payment_operation_semantics() -> None:
         require_webhook_event_dedup=True,
         require_complete_idempotency_semantics=False,
     )
+    round546_live_q39_partial_boundary = (
+        "Each logical provider-operation instance gets its own stable idempotency "
+        "key. I give each authorization, capture, and refund, including each partial "
+        "capture or refund, its own stable idempotency key; retries of that same "
+        "operation reuse the original key. A new partial capture or refund is a new "
+        "child provider-operation row under the existing payment intent. A retry of "
+        "that exact partial action reuses the original key and same child row. Duplicate "
+        "client submission, same account plus client idempotency key: return the "
+        "original stored intent. Retry "
+        "of the same provider operation: reuse the original provider-operation key. "
+        "New partial capture or refund: create a new child operation with a new key. "
+        "Retry of that same partial action: reuse the child operation key."
+    )
+    assert "unsafe_shared_idempotency_key_across_payment_operations" not in (
+        payment_operation_semantic_issues(
+            round546_live_q39_partial_boundary,
+            require_webhook_event_dedup=False,
+            require_complete_idempotency_semantics=False,
+        )
+    )
+    for unsafe_round546_partial_boundary in (
+        "A new partial capture or refund is a new child provider-operation row. "
+        "A retry of that exact partial action reuses the original key and same child row.",
+        f"{round546_live_q39_partial_boundary} Authorization, capture, and refund "
+        "share one idempotency key.",
+    ):
+        assert "unsafe_shared_idempotency_key_across_payment_operations" in (
+            payment_operation_semantic_issues(
+                unsafe_round546_partial_boundary,
+                require_webhook_event_dedup=False,
+                require_complete_idempotency_semantics=False,
+            )
+        ), unsafe_round546_partial_boundary
+    for unsafe_round546_child_key_sharing in (
+        "A partial capture shares the child operation key of a partial refund.",
+        "The child key is common between partial captures and refunds.",
+        "Every partial action uses the same original key.",
+        "A partial refund and partial capture have a common child operation key.",
+        "The child operation key for partial capture is reused by partial refund.",
+        "The original key is common to every partial action.",
+        "All partial actions retain one original idempotency key.",
+        "A partial capture and refund share their original key.",
+        "Partial capture and refund must not share a child key, but they share one "
+        "child operation key here.",
+        "Do not reuse a partial capture key for a partial refund, but the partial "
+        "refund inherits it in this recovery flow.",
+        "A partial capture does not share its child key with a refund, yet the refund "
+        "uses the capture child key after retry.",
+        "The key assigned to a partial capture is also assigned to a partial refund.",
+        "Both partial actions retain their common original key.",
+        "The original idempotency key spans every partial capture and refund.",
+    ):
+        assert "unsafe_shared_idempotency_key_across_payment_operations" in (
+            payment_operation_semantic_issues(
+                f"{round546_live_q39_partial_boundary} "
+                f"{unsafe_round546_child_key_sharing}",
+                require_webhook_event_dedup=False,
+                require_complete_idempotency_semantics=False,
+            )
+        ), unsafe_round546_child_key_sharing
     for safe_partial_retry_summary in (
         "Partial capture/refund retry: reuse the same partial-action key, and a new "
         "partial action gets a new key.",
@@ -1108,6 +1168,24 @@ def self_check_payment_operation_semantics() -> None:
         require_complete_idempotency_semantics=False,
         require_same_operation_retry_reuse=True,
     )
+    round546_live_q40 = (
+        "I would transition the payment intent from PROCESSING to UNKNOWN and stop "
+        "automatic charge retries. I would reconcile by provider payment ID or client "
+        "reference and authoritative webhooks persisted under a database uniqueness "
+        "constraint on provider event ID. If the result still stays inconclusive, "
+        "I would not create a new charge. Only if the provider contract explicitly "
+        "guarantees idempotent replay would I retry the exact same provider command "
+        "under a bounded policy with the original operation's idempotency key, not a "
+        "new key. If it remains unresolved, I keep it UNKNOWN and escalate to manual "
+        "reconciliation."
+    )
+    assert has_safe_payment_same_operation_replay_condition(round546_live_q40)
+    assert not payment_operation_semantic_issues(
+        round546_live_q40,
+        require_webhook_event_dedup=False,
+        require_complete_idempotency_semantics=False,
+        require_same_operation_retry_reuse=True,
+    )
     # Correct scope language must never mask an affirmative pairwise share.
     for unsafe_pairwise_share in (
         "Each logical provider-operation instance gets its own stable idempotency key. "
@@ -1157,6 +1235,21 @@ def self_check_payment_operation_semantics() -> None:
         assert not has_safe_payment_same_operation_replay_condition(
             replay_context.format(guarantee=status_only_guarantee, bound="at most once")
         ), status_only_guarantee
+    for explicitly_denied_money_replay in (
+        "the provider contract explicitly guarantees idempotent replay but not for charges",
+        "the provider contract explicitly guarantees idempotent replay but not for payments",
+        "the provider contract explicitly guarantees idempotent replay but not covering charges",
+        "the provider contract explicitly guarantees idempotent replay but not for the payment command",
+        "the provider contract explicitly guarantees idempotent replay but not for money movement",
+        "the provider contract explicitly guarantees idempotent replay but no charges are covered",
+        "the provider contract explicitly guarantees idempotent replay but payments are not covered",
+    ):
+        assert not has_safe_payment_same_operation_replay_condition(
+            replay_context.format(
+                guarantee=explicitly_denied_money_replay,
+                bound="at most once",
+            )
+        ), explicitly_denied_money_replay
     for money_guarantee in (
         "the provider guarantees charge replay idempotency, not status-query idempotency",
         "the provider guarantees idempotency for charge replay, not status queries",

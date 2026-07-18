@@ -6,6 +6,7 @@ import re
 from typing import List
 
 from .exact_contracts import has_visible_affirmative_contract_sentence
+from .payment_key_sharing import has_affirmative_cross_operation_key_sharing
 
 
 Q39_INGRESS_IDEMPOTENCY_SENTENCE = (
@@ -387,8 +388,6 @@ def has_explicit_no_provider_command_replay(text: str) -> bool:
     )
 
 
-_PAYMENT_OPERATION = r"(?:authoriz\w*|captur\w*|refund\w*)"
-_IDEMPOTENCY_CREDENTIAL = r"(?:idempotency\s+)?(?:key|token)"
 _MONEY_COMMAND = (
     r"(?:charge|payment|provider\s+(?:command|operation)|"
     r"(?:same|original|logical)\s+(?:provider\s+)?operation|money\s+movement)"
@@ -397,137 +396,6 @@ _MONEY_REPLAY = (
     rf"(?:retr(?:y|ies|ied|ying)|replay\w*|resubmit\w*)\b.{{0,35}}\b{_MONEY_COMMAND}\b|"
     rf"\b{_MONEY_COMMAND}\b.{{0,35}}\b(?:retr(?:y|ies|ied|ying)|replay\w*|resubmit\w*)\b"
 )
-
-
-def _has_affirmative_cross_operation_key_sharing(clause: str) -> bool:
-    """Recognize a claim that two payment operation types share one credential."""
-    if re.search(
-        rf"\b{_PAYMENT_OPERATION}\b[^.!?;]{{0,70}}"
-        r"\b(?:does\s+not|doesn't)\b[^.!?;]{0,15}"
-        r"\b(?:use|keep|retain|reuse|map)\w*\b[^.!?;]{0,25}"
-        r"\b(?:its(?:\s+own)?|a\s+(?:separate|distinct|different))\b[^.!?;]{0,25}"
-        rf"\b{_IDEMPOTENCY_CREDENTIAL}\b[^\n]{{0,45}}"
-        r"(?:[;.!?]\s*|\band\s+)"
-        r"(?:(?:instead|rather)\s*,?\s*)?(?:\bit\b[^.!?;]{0,20})?"
-        r"\b(?:share|use|reuse|borrow|inherit)\w*\b[^.!?;]{0,30}"
-        rf"\b(?:the\s+)?{_PAYMENT_OPERATION}(?:'s)?\b[^.!?;]{{0,20}}"
-        rf"\b{_IDEMPOTENCY_CREDENTIAL}\b",
-        clause,
-    ):
-        return True
-    patterns = (
-        re.compile(
-            rf"\b{_PAYMENT_OPERATION}\b\s+(?:and|or)\s+"
-            rf"\b{_PAYMENT_OPERATION}\b[^,;.!?]{{0,55}}"
-            rf"\b(?:share|use|reuse|have|map|carr(?:y|ies|ied|ying)|bear\w*)\b"
-            rf"(?:\s+(?:to|onto))?\s*.{{0,25}}"
-            rf"\b(?:one|same|identical|common|shared|the\s+same)\b.{{0,20}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
-        ),
-        re.compile(
-            rf"\b{_PAYMENT_OPERATION}\b.{{0,25}}"
-            rf"\b(?:use|reuse|inherit|map|borrow|run|key|carr(?:y|ies|ied|ying)|"
-            rf"bear|take)\w*\b"
-            rf"(?:\s+(?:to|onto|under|with))?.{{0,30}}"
-            rf"\b(?:the\s+)?{_PAYMENT_OPERATION}(?:'s)?\b.{{0,20}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
-        ),
-        re.compile(
-            rf"\b(?:the\s+)?{_PAYMENT_OPERATION}\b.{{0,20}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,25}}\baliase?s?\b.{{0,25}}"
-            rf"\b(?:the\s+)?{_PAYMENT_OPERATION}\b.{{0,20}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
-        ),
-        re.compile(
-            rf"\b(?:the\s+)?{_PAYMENT_OPERATION}(?:'s)?\b.{{0,25}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,35}}"
-            rf"\b(?:(?:is|gets?)\s+(?:also\s+)?(?:used|reused|applied)|"
-            rf"doubles?)\b.{{0,25}}\b(?:as|for|by|to)\b.{{0,20}}"
-            rf"\b{_PAYMENT_OPERATION}\b"
-        ),
-        re.compile(
-            rf"\b(?:one|same|common|shared|the\s+same)\b.{{0,20}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,45}}"
-            rf"\b(?:across|between|for)\b.{{0,30}}\b{_PAYMENT_OPERATION}\b"
-            rf".{{0,40}}\b(?:and|or)\b.{{0,25}}\b{_PAYMENT_OPERATION}\b"
-        ),
-        re.compile(
-            rf"\b{_PAYMENT_OPERATION}\b\s*,?\s*\b{_PAYMENT_OPERATION}\b\s*,?\s*"
-            rf"(?:and\s+|or\s+)?\b{_PAYMENT_OPERATION}\b\s+all\s+"
-            rf"(?:use|reuse|share|have)\w*\b.{{0,20}}"
-            rf"\b(?:one|same|common|shared|the\s+same|that|this)\b.{{0,15}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
-        ),
-        re.compile(
-            rf"\b(?:one|same|shared|the\s+same|a\s+single|that|this|the)\b.{{0,20}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,30}}"
-            rf"\b(?:is\s+)?(?:used|reused|shared|applies?|covers?|spans?)\b"
-            rf"(?:.{{0,35}}\b(?:across|for|to)\b.{{0,15}}|.{{0,20}})"
-            rf"\b(?:all(?:\s+(?:three|3))?|(?:three|3))\b.{{0,15}}\boperations\b"
-        ),
-        re.compile(
-            rf"\b(?:one|same|shared|the\s+same|a\s+single|that|this)\b.{{0,30}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,45}}"
-            r"\b(?:for|across|between|covers?|spans?)\b.{0,20}"
-            r"\b(?:both|the\s+two|two)\b.{0,20}"
-            r"\b(?:operations?|operation[- ]types?)\b"
-        ),
-        re.compile(
-            r"\b(?:both|the\s+two|two)\b.{0,20}"
-            r"\b(?:operations?|operation[- ]types?)\b.{0,45}"
-            rf"\b(?:share|use|reuse|have|map)\w*\b.{{0,25}}"
-            rf"\b(?:one|same|shared|the\s+same|a\s+single)\b.{{0,20}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
-        ),
-        re.compile(
-            rf"\b(?:one|same|shared|the\s+same|that|this)\b.{{0,30}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,50}}"
-            r"\bregardless\s+of\s+whether\b.{0,35}"
-            rf"\b{_PAYMENT_OPERATION}\b.{{0,25}}\b(?:or|and)\b.{{0,25}}"
-            rf"\b{_PAYMENT_OPERATION}\b"
-        ),
-        re.compile(
-            rf"\b(?:one|same|shared|the\s+same|that|this)\b.{{0,30}}"
-            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,45}}"
-            r"\b(?:for\s+either\s+(?:operation|one)|between\s+them)\b"
-        ),
-    )
-    contrast = re.compile(
-        r"\b(?:but|however|yet|nevertheless|although|even\s+though|except)\b"
-    )
-    local_negation = re.compile(
-        r"\b(?:do\s+not|don't|does\s+not|doesn't|must\s+not|should\s+not|"
-        r"cannot|can't|never|is\s+not|isn't|are\s+not|aren't)\b.{0,45}"
-        r"\b(?:share|use|reuse|map|have|inherit|double|alias|borrow|run|key|"
-        r"carry|carries|take|bear)\w*\b"
-    )
-    claim_clauses = [
-        item.strip()
-        for item in re.split(r"(?<=[.!?;])\s+", clause)
-        if item.strip()
-    ]
-    for claim_clause in claim_clauses:
-        # Segment first so a negated claim cannot consume an overlapping later
-        # affirmative pair: "never share A/B but A/C share one key".
-        claim_segments = [
-            segment.strip(" ,:")
-            for segment in contrast.split(claim_clause)
-            if segment.strip(" ,:")
-        ]
-        for claim_segment in claim_segments:
-            pattern_segments = [claim_segment]
-            pattern_segments.extend(
-                segment.strip()
-                for segment in re.split(r"[,:]", claim_segment)
-                if segment.strip() and segment.strip() != claim_segment
-            )
-            for pattern_segment in pattern_segments:
-                for pattern in patterns:
-                    for match in pattern.finditer(pattern_segment):
-                        local_claim = pattern_segment[: match.end()]
-                        if not local_negation.search(local_claim):
-                            return True
-    return False
 
 
 def _provider_guarantees_money_command_idempotency(text: str) -> bool:
@@ -539,7 +407,12 @@ def _provider_guarantees_money_command_idempotency(text: str) -> bool:
     ]
     provider_guarantee = (
         r"\bprovider(?:'s)?\s+(?:contract\s+)?"
+        r"(?:explicitly\s+)?"
         r"(?:guarantees?|supports?|honors?|deduplicates?|documents?)\b"
+    )
+    denied_money_command = (
+        r"(?:charges?|payments?|provider\s+(?:commands?|operations?)|"
+        r"money\s+movements?)"
     )
     for sentence in sentences:
         if not re.search(provider_guarantee, sentence) or not re.search(
@@ -554,6 +427,24 @@ def _provider_guarantees_money_command_idempotency(text: str) -> bool:
             r"\bidempoten\w*\b",
             sentence,
         ):
+            continue
+        explicit_money_denial = bool(
+            re.search(
+                rf"\b(?:but\s+)?not\s+(?:(?:for|on)\s+|covering\s+)"
+                rf"(?:the\s+)?{denied_money_command}\b|"
+                rf"\b(?:but\s+)?no\s+{denied_money_command}\b.{{0,25}}"
+                r"\b(?:is|are|gets?|remains?)?\s*"
+                r"(?:covered|supported|honored|guaranteed|deduplicated|idempotent)\b|"
+                rf"\b{denied_money_command}\b.{{0,25}}"
+                r"\b(?:is|are|remains?)\s+not\s+"
+                r"(?:covered|supported|honored|guaranteed|deduplicated|idempotent)\b|"
+                r"\bidempoten\w*\b.{0,30}"
+                r"\b(?:does\s+not|doesn't|cannot|can't)\b.{0,20}"
+                rf"\b(?:cover|apply|hold)\w*\b.{{0,20}}\b{denied_money_command}\b",
+                sentence,
+            )
+        )
+        if explicit_money_denial:
             continue
         status_only_coverage = bool(
             re.search(
@@ -1240,280 +1131,7 @@ def payment_operation_semantic_issues(
         "capture": r"\bcaptur\w*\b",
         "refund": r"\brefund\w*\b",
     }
-    # A later sentence may summarize retry behavior for several named operation
-    # types. Treat that as safe only when the full response has already made the
-    # stronger, unambiguous operation-instance ownership rule explicit. This is
-    # deliberately narrower than a generic "same key" exemption: it cannot
-    # excuse one key shared across authorize, capture, and refund.
-    explicit_per_operation_instance_key_scope = bool(
-        re.search(
-            r"\b(?:each|every)\b.{0,80}\b(?:logical\s+)?"
-            r"(?:provider[- ]?)?operation[- ]instance\b.{0,80}"
-            r"\b(?:its|their)\s+own\b.{0,35}"
-            r"\b(?:stable\s+)?idempotency\s+key\b|"
-            r"\b(?:one|a)\s+(?:stable|durable)?\s*(?:idempotency\s+)?key\b"
-            r".{0,40}\bper\s+(?:logical\s+)?(?:provider[- ]?)?"
-            r"operation[- ]instance\b|"
-            r"\b(?:idempotency\s+)?key\b.{0,60}\bscoped\s+to\b"
-            r".{0,80}\b(?:specific|logical)\s+(?:provider\s+)?"
-            r"(?:operation|action)\b.{0,60}\b(?:instance|id)\b",
-            lower,
-        )
-    )
-    safe_partial_retry_summary = bool(
-        explicit_per_operation_instance_key_scope
-        and (
-            re.search(
-                r"\b(?:partial\s+)?(?:capture|refund)"
-                r"(?:\s*/\s*(?:partial\s+)?(?:capture|refund))?\s+"
-                r"retr(?:y|ies|ied|ying)\b.{0,55}"
-                r"\breuse\w*\b.{0,30}\b(?:same|original)\b.{0,30}"
-                r"\b(?:partial[- ]action\s+)?(?:idempotency\s+)?key\b"
-                r"[\s,;.!?]*(?:(?:but|while|whereas|and)\b[\s,;.!?]*)?"
-                r"\b(?:for\s+)?(?:(?:a|any|each|every)\s+)?"
-                r"new\s+partial\s+action\b.{0,35}"
-                r"\b(?:gets?|has|uses?|receives?|mints?|creates?)\b.{0,20}"
-                r"\b(?:a\s+)?(?:new|fresh|unique|different)\b.{0,15}"
-                r"\b(?:idempotency\s+)?key\b",
-                clause_text,
-            )
-            or re.search(
-                r"\bretr(?:y|ies|ied|ying)\s+of\b.{0,30}\bexact\b.{0,25}"
-                r"\bpartial\s+(?:capture|refund)\b.{0,20}\b(?:or|and)\b"
-                r".{0,20}\b(?:partial\s+)?(?:capture|refund)\b.{0,45}"
-                r"\breuse\w*\b.{0,25}\b(?:its|the)\b.{0,15}"
-                r"\b(?:same|original)\b.{0,20}\b(?:idempotency\s+)?key\b"
-                r"[\s,;.!?]*(?:(?:but|while|whereas|and)\b[\s,;.!?]*)?"
-                r"\b(?:for\s+)?(?:(?:a|any|each|every)\s+)?"
-                r"new\s+partial\s+action\b.{0,30}"
-                r"\b(?:mint|create|assign|use|get|receive)\w*\b.{0,20}"
-                r"\b(?:a\s+)?(?:new|fresh|unique|different)\b.{0,15}"
-                r"\b(?:idempotency\s+)?key\b",
-                clause_text,
-            )
-        )
-    )
-    new_partial_action_pattern = (
-        r"\bnew\s+partial\s+(?:capture|refund)\b.{0,40}"
-        r"\b(?:partial\s+)?(?:capture|refund)\b.{0,45}"
-        r"\bnew\s+logical\s+(?:action|operation)\b.{0,30}"
-        r"\bnew\s+(?:idempotency\s+)?key\b"
-    )
-    exact_partial_retry_pattern = (
-        r"\bretr(?:y|ies|ied|ying)\s+of\b.{0,30}\bexact\b.{0,25}"
-        r"\bpartial\s+(?:action|capture|refund)\b.{0,35}"
-        r"\b(?:same|original)\s+(?:idempotency\s+)?key\b"
-    )
-    unsafe_shared_key = False
-    for clause in semantic_windows:
-        operations = {
-            operation
-            for operation, pattern in operation_pattern.items()
-            if re.search(pattern, clause)
-        }
-        if len(operations) < 2 or not re.search(r"\b(?:key|token)\b", clause):
-            continue
-        if re.search(r"\b(?:encryption|signing|hmac|webhook\s+secret)\s+key\b", clause):
-            continue
-        if _has_affirmative_cross_operation_key_sharing(clause):
-            unsafe_shared_key = True
-            break
-        safe_partial_action_pair = bool(
-            re.search(new_partial_action_pattern, clause)
-            and re.search(exact_partial_retry_pattern, clause)
-        )
-        # The exact ingress assertion owns request-to-intent deduplication; its
-        # client key is not one of the adjacent provider-operation keys. Remove
-        # only that known-safe assertion so an unsafe claim that operations share
-        # a client key remains visible to the generic detector.
-        provider_key_clause = clause.replace(
-            safe_ingress_assertion,
-            "ingress request maps to one stored payment intent",
-        )
-        if safe_partial_action_pair:
-            provider_key_clause = re.sub(
-                exact_partial_retry_pattern,
-                "retry of that exact partial action reuses its operation identifier",
-                provider_key_clause,
-                count=1,
-            )
-        shared = bool(
-            re.search(
-                r"\b(?:same|single|one|shared)\b[^.!?;]{0,35}"
-                r"\b(?:idempotency\s+)?(?:key|token)\b|"
-                r"\b(?:reuse|reused|reusing)\b[^.!?;]{0,35}"
-                r"\b(?:idempotency\s+)?(?:key|token)\b|"
-                r"\b(?:idempotency\s+)?(?:key|token)\b[^.!?;]{0,35}"
-                r"\b(?:same|single|one|shared)\b|"
-                r"\b(?:share|reuse|reuses|reused|reusing)\b[^.!?;]{0,25}"
-                r"\b(?:it|that\s+(?:key|token)|this\s+(?:key|token))\b",
-                provider_key_clause,
-            )
-        )
-        if not shared:
-            continue
-        operation_scoped = bool(
-            re.search(
-                r"\b(?:one|a|distinct|separate|derived)\b.{0,30}"
-                r"\b(?:idempotency\s+)?key\b"
-                r".{0,20}\bper\s+(?:logical\s+)?(?:provider[- ]?)?"
-                r"operation(?:[- ]instance)?\b|"
-                r"\b(?:distinct|separate|different|unique|derived)\b.{0,30}\bkeys?\b"
-                r".{0,25}\b(?:for|across)\b.{0,100}"
-                r"\b(?:authoriz\w*|captur\w*|refund\w*)\b|"
-                r"\b(?:authoriz\w*|captur\w*|refund\w*)\b.{0,140}"
-                r"\b(?:use|uses|have|has|get|gets)\b.{0,30}"
-                r"\b(?:distinct|separate|different|derived)\b.{0,50}\bkeys?\b|"
-                r"\b(?:each|every)\b.{0,100}\boperation\b.{0,100}"
-                r"\b(?:its\s+)?own\b.{0,35}\b(?:idempotency\s+)?key\b|"
-                r"\b(?:each|every)\b.{0,100}\boperation\b.{0,40}"
-                r"\b(?:gets?|has|uses?)\b.{0,20}\b(?:a\s+)?unique\b"
-                r".{0,20}\b(?:idempotency\s+)?key\b|"
-                r"\b(?:its|their)\s+own\b.{0,25}\bidempotency\s+key\b|"
-                r"\b(?:same|stable)\b.{0,25}\bkey\b.{0,60}\bonly\b.{0,60}"
-                r"\b(?:same|that)\s+operation\b",
-                clause,
-            )
-            or re.search(
-                r"\b(?:stable\s+)?idempotency\s+key\b.{0,35}\bper\b"
-                r".{0,100}\boperation[- ]type\b.{0,70}"
-                r"\boperation[- ]instance\b|"
-                r"\bidempotency\s+key\b.{0,40}\bscoped\s+to\b.{0,140}"
-                r"\boperation[- ]type\b.{0,80}\boperation[- ]instance\b",
-                clause,
-            )
-            or re.search(
-                r"\b(?:idempotency\s+)?key\b.{0,60}\bscoped\s+to\b"
-                r".{0,80}\b(?:specific|logical)\s+(?:provider\s+)?"
-                r"(?:operation|action)\b.{0,60}\b(?:instance|id)\b",
-                clause,
-            )
-            or re.search(
-                r"\b(?:same|that)\s+(?:logical\s+|provider\s+)?operation\b"
-                r".{0,45}\b(?:uses?|gets?|keeps?|reuses?)\b.{0,35}"
-                r"\b(?:the\s+)?same\b.{0,20}\bstable\b.{0,25}"
-                r"\b(?:provider\s+)?(?:idempotency\s+)?key\b",
-                clause,
-            )
-            or re.search(
-                r"\b(?:retr(?:y|ies|ied|ying)|replay\w*)\b.{0,30}"
-                r"\b(?:use|uses|using|for)\b.{0,30}"
-                r"\b(?:the\s+)?same\s+(?:logical\s+|provider\s+)?operation\b"
-                r".{0,40}\b(?:the\s+)?same\b.{0,20}\bstable\b.{0,25}"
-                r"\b(?:provider\s+)?(?:idempotency\s+)?key\b",
-                clause,
-            )
-            or (
-                len(operations) == 3
-                and re.search(
-                    r"\beach\b.{0,35}\b(?:gets?|has|uses?)\b.{0,20}"
-                    r"\b(?:a\s+)?(?:unique|distinct|separate)\b.{0,20}"
-                    r"\b(?:idempotency\s+)?key\b",
-                    clause,
-                )
-            )
-            or (
-                len(operations) == 3
-                and re.search(
-                    r"\beach\b.{0,30}\bauthoriz\w*\b.{0,50}\bcaptur\w*\b"
-                    r".{0,50}\brefund\w*\b.{0,35}\b(?:gets?|has|uses?)\b"
-                    r".{0,20}\b(?:its\s+own|a\s+(?:unique|distinct|separate))\b"
-                    r".{0,25}\b(?:stable\s+)?(?:idempotency\s+)?key\b",
-                    clause,
-                )
-            )
-            or (
-                explicit_per_operation_instance_key_scope
-                and re.search(
-                    r"\bretr(?:y|ies|ied|ying)\b.{0,35}"
-                    r"\b(?:the\s+)?same\b.{0,35}"
-                    r"\b(?:authoriz\w*|captur\w*|refund\w*)\b.{0,100}"
-                    r"\b(?:reuse|reuses|reused|use|uses)\b.{0,30}"
-                    r"\b(?:the\s+)?(?:same|original|its|their)\b.{0,30}"
-                    r"\b(?:idempotency\s+)?key\b",
-                    clause,
-                )
-            )
-            or (
-                explicit_per_operation_instance_key_scope
-                and re.search(
-                    r"\bnew\s+partial\s+(?:capture|refund)\b.{0,80}"
-                    r"\bnew\s+(?:logical\s+)?(?:action|operation)\b.{0,45}"
-                    r"\bnew\s+(?:idempotency\s+)?key\b.{0,160}"
-                    r"\b(?:retry|replay)\b.{0,70}\b(?:exact|same)\b"
-                    r".{0,55}\b(?:same|original)\b.{0,35}"
-                    r"\b(?:idempotency\s+)?key\b",
-                    clause,
-                )
-            )
-            or (
-                explicit_per_operation_instance_key_scope
-                and re.search(
-                    r"\b(?:partial\s+)?(?:capture|refund)"
-                    r"(?:\s*/\s*(?:partial\s+)?(?:capture|refund))?\s+"
-                    r"retr(?:y|ies|ied|ying)\b.{0,55}"
-                    r"\breuse\w*\b.{0,30}\b(?:same|original)\b.{0,30}"
-                    r"\b(?:partial[- ]action\s+)?(?:idempotency\s+)?key\b"
-                    r"[\s,;.!?]*(?:(?:but|while|whereas|and)\b[\s,;.!?]*)?"
-                    r"\b(?:for\s+)?(?:(?:a|any|each|every)\s+)?"
-                    r"new\s+partial\s+action\b.{0,35}"
-                    r"\b(?:gets?|has|uses?|receives?|mints?|creates?)\b.{0,20}"
-                    r"\b(?:a\s+)?(?:new|fresh|unique|different)\b.{0,15}"
-                    r"\b(?:idempotency\s+)?key\b",
-                    clause,
-                )
-            )
-            or (
-                explicit_per_operation_instance_key_scope
-                and re.search(
-                    r"\bretr(?:y|ies|ied|ying)\s+of\b.{0,30}\bexact\b.{0,25}"
-                    r"\bpartial\s+(?:capture|refund)\b.{0,20}\b(?:or|and)\b"
-                    r".{0,20}\b(?:partial\s+)?(?:capture|refund)\b.{0,45}"
-                    r"\breuse\w*\b.{0,25}\b(?:its|the)\b.{0,15}"
-                    r"\b(?:same|original)\b.{0,20}\b(?:idempotency\s+)?key\b"
-                    r".{0,55}\b(?:for\s+)?(?:(?:a|any|each|every)\s+)?"
-                    r"new\s+partial\s+action\b"
-                    r".{0,30}\b(?:mint|create|assign|use|get|receive)\w*\b"
-                    r".{0,20}\b(?:a\s+)?(?:new|fresh|unique|different)\b.{0,15}"
-                    r"\b(?:idempotency\s+)?key\b",
-                    clause,
-                )
-            )
-            or (
-                safe_partial_retry_summary
-                and re.search(
-                    r"\b(?:partial\s+)?(?:capture|refund)"
-                    r"(?:\s*/\s*(?:partial\s+)?(?:capture|refund))?\s+"
-                    r"retr(?:y|ies|ied|ying)\b.{0,55}\breuse\w*\b.{0,30}"
-                    r"\b(?:same|original)\b.{0,30}"
-                    r"\b(?:partial[- ]action\s+)?(?:idempotency\s+)?key\b|"
-                    r"\bretr(?:y|ies|ied|ying)\s+of\b.{0,30}\bexact\b.{0,25}"
-                    r"\bpartial\s+(?:capture|refund)\b.{0,20}\b(?:or|and)\b"
-                    r".{0,20}\b(?:partial\s+)?(?:capture|refund)\b.{0,45}"
-                    r"\breuse\w*\b.{0,25}\b(?:its|the)\b.{0,15}"
-                    r"\b(?:same|original)\b.{0,20}"
-                    r"\b(?:idempotency\s+)?key\b",
-                    clause,
-                )
-            )
-        )
-        safely_rejected = bool(
-            re.search(
-                r"\b(?:do not|don't|never|must not|should not|cannot|can't)\s+"
-                r"(?:use|reuse|share)?\w*\b.{0,45}\b(?:same|single|one|shared)\b"
-                r".{0,35}\b(?:idempotency\s+)?key\b",
-                clause,
-            )
-            or re.search(
-                r"\b(?:do not|don't|never|must not|should not|cannot|can't)\b"
-                r".{0,45}\b(?:share|reuse|use)\w*\b.{0,30}"
-                r"\b(?:key|it|that\s+key|this\s+key)\b",
-                clause,
-            )
-        )
-        if not operation_scoped and not safely_rejected:
-            unsafe_shared_key = True
-            break
+    unsafe_shared_key = has_affirmative_cross_operation_key_sharing(raw_lower)
     if unsafe_shared_key:
         issues.append("unsafe_shared_idempotency_key_across_payment_operations")
 
@@ -2009,7 +1627,8 @@ def payment_operation_semantic_issues(
         )
         return bool(
             re.search(
-                r"\b(?:do not|don't|never|must not|should not|cannot|can't|without|"
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't|"
+                r"would not|wouldn't|without|"
                 r"block|blocks|blocked|prevent|prevents|prevented)\s*$",
                 prefix,
             )
@@ -2019,7 +1638,8 @@ def payment_operation_semantic_issues(
                 prefix,
             )
             or re.search(
-                r"\b(?:do not|don't|never|must not|should not|cannot|can't)\b"
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't|"
+                r"would not|wouldn't)\b"
                 r"[^.!?;]{0,100}\b(?:or|and)\s*$",
                 governing_prefix,
             )
