@@ -1137,7 +1137,7 @@ pub fn default_profile(email: &str) -> CareerProfile {
 }
 
 pub fn get_profile(pool: &DbPool, account_id: &str, email: &str) -> Result<CareerProfile> {
-    crate::db::run_blocking_db(|| match pool {
+    let mut profile = crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             let raw: Option<String> = conn
@@ -1161,7 +1161,10 @@ pub fn get_profile(pool: &DbPool, account_id: &str, email: &str) -> Result<Caree
                 .transpose()
                 .map(|value| value.unwrap_or_else(|| default_profile(email)))
         }
-    })
+    })?;
+    profile.auto_submit_threshold = default_auto_submit_threshold();
+    profile.daily_limit = default_daily_limit();
+    Ok(profile)
 }
 
 pub fn save_profile(
@@ -1171,8 +1174,8 @@ pub fn save_profile(
 ) -> Result<CareerProfile> {
     let mut value = profile.clone();
     value.onboarding_step = value.onboarding_step.clamp(0, 6);
-    value.auto_submit_threshold = value.auto_submit_threshold.clamp(60, 100);
-    value.daily_limit = value.daily_limit.clamp(1, 50);
+    value.auto_submit_threshold = default_auto_submit_threshold();
+    value.daily_limit = default_daily_limit();
     value.updated_at_ms = now_ms();
     let payload = to_json(&value, "Jobs profile")?;
     crate::db::run_blocking_db(|| match pool {
@@ -1581,6 +1584,8 @@ pub fn get_preferences(pool: &DbPool, account_id: &str) -> Result<JobPreferences
     // An application email is an alias for one candidate, not a second
     // identity that can bypass employer-level submission safeguards.
     value.apply_once_per_company = true;
+    value.daily_limit = default_daily_limit();
+    value.max_posting_age_days = default_max_posting_age_days();
     Ok(value)
 }
 
@@ -1590,8 +1595,8 @@ pub fn save_preferences(
     preferences: &JobPreferences,
 ) -> Result<JobPreferences> {
     let mut value = preferences.clone();
-    value.daily_limit = value.daily_limit.clamp(1, 50);
-    value.max_posting_age_days = value.max_posting_age_days.clamp(1, 60);
+    value.daily_limit = default_daily_limit();
+    value.max_posting_age_days = default_max_posting_age_days();
     value.apply_once_per_company = true;
     value.updated_at_ms = now_ms();
     let payload = to_json(&value, "Jobs preferences")?;
@@ -3531,6 +3536,28 @@ fn build_job_eligibility(
         passed_checks.push("employment_type_allowed".to_string());
     }
 
+    if let (Some((minimum, maximum)), Some((required, inferred_from_title))) = (
+        candidate_experience_range(profile),
+        required_experience_years(posting),
+    ) {
+        if required < minimum || required > maximum {
+            let source = if inferred_from_title {
+                "Bluey inferred the level from the job title"
+            } else {
+                "The posting"
+            };
+            push_reason(
+                &mut hard_failures,
+                "experience_outside_target_range",
+                &format!(
+                    "{source} indicates about {required} years of experience; Bluey is targeting roles requesting {minimum}-{maximum} years for your profile."
+                ),
+            );
+        } else {
+            passed_checks.push("experience_aligned".to_string());
+        }
+    }
+
     if preferences.sponsorship == "required" {
         if clearly_blocks_sponsorship(posting) {
             push_reason(
@@ -3889,6 +3916,142 @@ fn clearly_blocks_sponsorship(posting: &JobPosting) -> bool {
     .any(|phrase| text.contains(phrase))
 }
 
+fn candidate_experience_range(profile: &CareerProfile) -> Option<(i64, i64)> {
+    let now = Utc::now();
+    let current_month = i64::from(now.year()) * 12 + i64::from(now.month0());
+    let mut intervals: Vec<(i64, i64)> = profile
+        .employment
+        .iter()
+        .filter_map(|entry| {
+            let start = parse_year_month(&entry.start_date)?;
+            let end = if entry.current || entry.end_date.trim().is_empty() {
+                current_month
+            } else {
+                parse_year_month(&entry.end_date)?.saturating_add(1)
+            };
+            (end > start).then_some((start, end))
+        })
+        .collect();
+    if intervals.is_empty() {
+        return None;
+    }
+    intervals.sort_unstable_by_key(|interval| interval.0);
+    let mut total_months = 0i64;
+    let mut merged = intervals[0];
+    for interval in intervals.into_iter().skip(1) {
+        if interval.0 <= merged.1 {
+            merged.1 = merged.1.max(interval.1);
+        } else {
+            total_months = total_months.saturating_add(merged.1 - merged.0);
+            merged = interval;
+        }
+    }
+    total_months = total_months.saturating_add(merged.1 - merged.0);
+    let years = (total_months + 6) / 12;
+    Some((years.saturating_sub(1), years.saturating_add(2)))
+}
+
+fn parse_year_month(value: &str) -> Option<i64> {
+    let mut parts = value.trim().split('-');
+    let year = parts.next()?.parse::<i64>().ok()?;
+    if !(1900..=2200).contains(&year) {
+        return None;
+    }
+    let month = parts
+        .next()
+        .and_then(|part| part.parse::<i64>().ok())
+        .unwrap_or(1);
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    Some(year * 12 + month - 1)
+}
+
+fn explicit_required_experience_years(posting: &JobPosting) -> Option<i64> {
+    let text = format!("{} {}", posting.title, posting.description).to_ascii_lowercase();
+    let normalized: String = text
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '+' | '-') {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| matches!(**token, "year" | "years"))
+        .filter(|(index, _)| tokens.get(index + 1).is_none_or(|token| *token != "ago"))
+        .filter_map(|(index, _)| {
+            let start = index.saturating_sub(3);
+            tokens[start..index]
+                .iter()
+                .rev()
+                .find_map(|token| parse_year_requirement(token))
+        })
+        .filter(|years| (0..=20).contains(years))
+        .max()
+}
+
+fn required_experience_years(posting: &JobPosting) -> Option<(i64, bool)> {
+    explicit_required_experience_years(posting)
+        .map(|years| (years, false))
+        .or_else(|| title_seniority_floor(&posting.title).map(|years| (years, true)))
+}
+
+fn title_seniority_floor(title: &str) -> Option<i64> {
+    let normalized: String = title
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    if words.contains(&"principal") {
+        Some(9)
+    } else if words.contains(&"director") {
+        Some(8)
+    } else if words.contains(&"staff") {
+        Some(7)
+    } else if words
+        .iter()
+        .any(|word| matches!(*word, "senior" | "sr" | "lead"))
+    {
+        Some(5)
+    } else {
+        None
+    }
+}
+
+fn parse_year_requirement(token: &str) -> Option<i64> {
+    let numeric = token
+        .trim_matches('+')
+        .split('-')
+        .next()
+        .unwrap_or_default();
+    numeric.parse::<i64>().ok().or(match numeric {
+        "one" => Some(1),
+        "two" => Some(2),
+        "three" => Some(3),
+        "four" => Some(4),
+        "five" => Some(5),
+        "six" => Some(6),
+        "seven" => Some(7),
+        "eight" => Some(8),
+        "nine" => Some(9),
+        "ten" => Some(10),
+        _ => None,
+    })
+}
+
 fn score_posting(
     posting: &JobPosting,
     profile: &CareerProfile,
@@ -3932,6 +4095,21 @@ fn score_posting(
     {
         score += 10;
         reasons.push("Location preference fits".to_string());
+    }
+
+    if let (Some((minimum, maximum)), Some((required, _))) = (
+        candidate_experience_range(profile),
+        required_experience_years(posting),
+    ) {
+        if (minimum..=maximum).contains(&required) {
+            score += 10;
+            reasons.push(format!("Experience request fits your {minimum}-{maximum} year target range"));
+        } else {
+            score -= 15;
+            missing.push(format!(
+                "Role requests {required} years; your target range is {minimum}-{maximum} years"
+            ));
+        }
     }
 
     if posting.compensation.is_empty() || preferences.minimum_compensation.is_none() {
@@ -9637,6 +9815,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn search_pace_and_auto_submit_gate_are_server_owned() {
+        let pool = test_pool();
+        let mut profile = default_profile("jobs@example.com");
+        profile.auto_submit_threshold = 99;
+        profile.daily_limit = 42;
+        let saved_profile = save_profile(&pool, "acct-jobs", &profile).unwrap();
+        assert_eq!(saved_profile.auto_submit_threshold, 80);
+        assert_eq!(saved_profile.daily_limit, 10);
+
+        let preferences = JobPreferences {
+            daily_limit: 42,
+            max_posting_age_days: 60,
+            ..JobPreferences::default()
+        };
+        let saved_preferences =
+            save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        assert_eq!(saved_preferences.daily_limit, 10);
+        assert_eq!(saved_preferences.max_posting_age_days, 14);
+    }
+
+    #[test]
+    fn experience_fit_is_derived_from_profile_dates_and_posting_requirements() {
+        let mut profile = default_profile("jobs@example.com");
+        profile.employment = vec![EmploymentEntry {
+            company: "Example Company".to_string(),
+            title: "Software Engineer".to_string(),
+            start_date: "2022-01".to_string(),
+            end_date: "2023-12".to_string(),
+            ..EmploymentEntry::default()
+        }];
+        assert_eq!(candidate_experience_range(&profile), Some((1, 4)));
+
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        let mut aligned = test_posting(
+            "https://boards.greenhouse.io/example/jobs/aligned",
+            now_ms(),
+            now_ms(),
+        );
+        aligned.description = "Requires 4+ years of software engineering experience.".to_string();
+        assert_eq!(explicit_required_experience_years(&aligned), Some(4));
+        let aligned_decision =
+            build_job_eligibility(&aligned, &profile, &preferences, &[], false, None);
+        assert!(aligned_decision
+            .passed_checks
+            .iter()
+            .any(|check| check == "experience_aligned"));
+
+        let mut too_senior = aligned;
+        too_senior.description = "Requires at least 5 years of software engineering experience.".to_string();
+        let blocked =
+            build_job_eligibility(&too_senior, &profile, &preferences, &[], false, None);
+        assert!(blocked
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "experience_outside_target_range"));
+
+        let mut title_only_senior = test_posting(
+            "https://boards.greenhouse.io/example/jobs/title-only-senior",
+            now_ms(),
+            now_ms(),
+        );
+        title_only_senior.title = "Senior Software Engineer".to_string();
+        title_only_senior.description = "Build reliable products with Rust.".to_string();
+        let blocked = build_job_eligibility(
+            &title_only_senior,
+            &profile,
+            &preferences,
+            &[],
+            false,
+            None,
+        );
+        assert!(blocked
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "experience_outside_target_range"));
+    }
+
     fn execution_lease_fixture(pool: &DbPool, suffix: &str) -> (JobApplication, String, String) {
         let profile = default_profile("jobs@example.com");
         save_profile(pool, "acct-jobs", &profile).unwrap();
@@ -11281,10 +11540,7 @@ mod tests {
         let pool = test_pool();
         let profile = default_profile("jobs@example.com");
         save_profile(&pool, "acct-jobs", &profile).unwrap();
-        let preferences = JobPreferences {
-            daily_limit: 1,
-            ..JobPreferences::default()
-        };
+        let preferences = JobPreferences::default();
         save_preferences(&pool, "acct-jobs", &preferences).unwrap();
 
         let first = upsert_posting(
@@ -11318,26 +11574,54 @@ mod tests {
                 .contains("does not create a second candidate")
         );
 
-        let mut third = test_posting(
-            "https://boards.greenhouse.io/globex/jobs/three",
+        for index in 2..=10 {
+            let mut posting = test_posting(
+                &format!("https://boards.greenhouse.io/company-{index}/jobs/{index}"),
+                now_ms(),
+                now_ms(),
+            );
+            posting.company = format!("Company {index}");
+            posting.title = format!("Platform Engineer {index}");
+            let posting =
+                upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+            let (application, _) = prepare_application(
+                &pool,
+                "acct-jobs",
+                &posting.id,
+                "factual",
+                "review_first",
+            )
+            .unwrap();
+            reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        }
+
+        let mut final_posting = test_posting(
+            "https://boards.greenhouse.io/globex/jobs/final",
             now_ms(),
             now_ms(),
         );
-        third.company = "Globex".to_string();
-        third.title = "Platform Engineer".to_string();
-        let third = upsert_posting(&pool, "acct-jobs", &third, &profile, &preferences).unwrap();
-        let (third_application, _) =
-            prepare_application(&pool, "acct-jobs", &third.id, "factual", "review_first").unwrap();
+        final_posting.company = "Globex".to_string();
+        final_posting.title = "Platform Engineer".to_string();
+        let final_posting =
+            upsert_posting(&pool, "acct-jobs", &final_posting, &profile, &preferences).unwrap();
+        let (final_application, _) = prepare_application(
+            &pool,
+            "acct-jobs",
+            &final_posting.id,
+            "factual",
+            "review_first",
+        )
+        .unwrap();
         assert!(
-            reserve_application_attempt(&pool, "acct-jobs", &third_application.id, "local")
+            reserve_application_attempt(&pool, "acct-jobs", &final_application.id, "local")
                 .unwrap_err()
                 .to_string()
                 .contains("attempt limit")
         );
 
         let reservations = list_attempt_reservations(&pool, "acct-jobs").unwrap();
-        assert_eq!(reservations.len(), 1);
-        assert_eq!(reservations[0].application_id, application.id);
+        assert_eq!(reservations.len(), 10);
+        assert!(reservations.iter().any(|reservation| reservation.application_id == application.id));
     }
 
     #[test]

@@ -135,6 +135,63 @@ Technologies: Rust, React`,
     });
   });
 
+  it("separates company-first employment headers and preserves US locations", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "software-resume.pdf",
+      text: `Taylor Example
+Arlington, VA | taylor@example.com
+EXPERIENCE
+Capital One, Software Engineer
+Richmond, VA
+January 2021 - Present
+• Built resilient payment services.
+Infosys, Software Engineer
+Indianapolis, IN
+June 2018 - December 2020
+• Delivered customer-facing systems.`,
+    });
+
+    expect(result.employment[0]).toMatchObject({
+      company: "Capital One",
+      title: "Software Engineer",
+      location: "Richmond, VA",
+      current: true,
+    });
+    expect(result.employment[1]).toMatchObject({
+      company: "Infosys",
+      title: "Software Engineer",
+      location: "Indianapolis, IN",
+    });
+  });
+
+  it("separates international locations and joins wrapped certification levels", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "clinical-resume.docx",
+      text: `Jordan Example
+Falls Church, VA | jordan@example.com
+EXPERIENCE
+Director of Clinical Operations, Hyderabad, India
+Apollo Hospitals
+January 2020 - October 2020
+• Improved clinical documentation workflows.
+CERTIFICATIONS
+AWS Certified Solutions Architect
+Professional
+AWS Certified Machine Learning
+Specialty`,
+    });
+
+    expect(result.employment[0]).toMatchObject({
+      company: "Apollo Hospitals",
+      title: "Director of Clinical Operations",
+      location: "Hyderabad, India",
+    });
+    expect(result.certifications).toEqual([
+      "AWS Certified Solutions Architect, Professional",
+      "AWS Certified Machine Learning, Specialty",
+    ]);
+  });
+
   it("reconstructs PDF rows instead of flattening the full page", () => {
     const text = pdfTextItemsToText([
       { str: "Taylor Morgan", transform: [1, 0, 0, 1, 40, 720], width: 80 },

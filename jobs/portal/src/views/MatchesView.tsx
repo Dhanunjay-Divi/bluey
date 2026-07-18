@@ -84,12 +84,23 @@ export function MatchesView({ workspace, onAddJob, onPrepare, onSaveCandidateEve
   const selectedTrack = activeTrack === "all"
     ? activeTracks[0]
     : workspace.tracks.find((track) => track.id === activeTrack);
+  const healthySourceCount = workspace.discovery_sources.filter((source) => discoverySourceState(source) === "healthy").length;
+  const discoveryReady = healthySourceCount > 0;
+  const searchState = !selectedTrack ? "paused" : discoveryReady ? "active" : "manual";
+  const searchStateLabel = !selectedTrack
+    ? "TRACK PAUSED"
+    : discoveryReady
+      ? "DISCOVERY ACTIVE"
+      : "READY FOR A JOB LINK";
   const searchTitle = activeTrack === "all" && activeTracks.length > 1
     ? `${activeTracks.length} Career Tracks configured`
     : selectedTrack?.name || "Career Track paused";
-  const searchDetail = selectedTrack
+  const trackScope = selectedTrack
     ? `${selectedTrack.role} · ${selectedTrack.locations.join(" · ") || "Location not set"}`
     : "Configure a Career Track before adding or importing matches.";
+  const searchDetail = selectedTrack && !discoveryReady
+    ? `${trackScope}. Add a job link now; automatic discovery begins only after a verified source is connected.`
+    : trackScope;
 
   const prepare = async () => {
     if (!selected) return;
@@ -141,19 +152,19 @@ export function MatchesView({ workspace, onAddJob, onPrepare, onSaveCandidateEve
       </section>
 
       <section className="metric-band">
-        <div><Target /><span><b>{filtered.length}</b><small>ready matches</small></span></div>
-        <div><Sparkles /><span><b>{averageScore || "-"}%</b><small>average fit</small></span></div>
+        <div><Target /><span><b>{filtered.length}</b><small>verified matches</small></span></div>
+        <div><Sparkles /><span><b>{averageScore ? `${averageScore}%` : "—"}</b><small>average fit</small></span></div>
         <div><BriefcaseBusiness /><span><b>{workspace.applications.filter((item) => item.state === "submitted").length}</b><small>submitted</small></span></div>
         <div className="metric-action"><span><b>{Math.max(0, workspace.entitlement.monthly_packet_limit - workspace.entitlement.used_packets)}</b><small>applications left this month</small></span><Link to={`../settings${window.location.search}#plans`}>Plan details<ChevronRight size={14} /></Link></div>
       </section>
 
-      <section className={`search-status-band ${activeTracks.length ? "active" : "paused"}`} aria-label="Active search settings">
+      <section className={`search-status-band ${searchState}`} aria-label="Active search settings">
         <span className="search-status-icon"><Radar size={20} /></span>
-        <div className="search-status-copy"><p><i />{activeTracks.length ? "TRACK READY" : "TRACK PAUSED"}</p><b>{searchTitle}</b><small>{searchDetail}</small></div>
+        <div className="search-status-copy"><p><i />{searchStateLabel}</p><b>{searchTitle}</b><small>{searchDetail}</small></div>
         <dl>
-          <div><dt>Freshness</dt><dd>{workspace.preferences.max_posting_age_days} days</dd></div>
-          <div><dt>Mode</dt><dd>{workspace.profile.default_submission_mode === "auto_submit" ? `Auto at ${workspace.profile.auto_submit_threshold}%` : "Review first"}</dd></div>
-          <div><dt>Pace</dt><dd>Up to {workspace.preferences.daily_limit}/day</dd></div>
+          <div><dt>Postings</dt><dd>Recent + open</dd></div>
+          <div><dt>Fit</dt><dd>Experience + location</dd></div>
+          <div><dt>Submission</dt><dd>Review first</dd></div>
         </dl>
         <Link className="button secondary compact" to={`../settings${window.location.search}#tracks`}>Adjust search<ChevronRight size={14} /></Link>
       </section>
@@ -185,7 +196,7 @@ export function MatchesView({ workspace, onAddJob, onPrepare, onSaveCandidateEve
             <ChevronRight size={18} />
           </button>
         ))}
-        {filtered.length === 0 && <div className="empty-state"><Search /><h3>No matches in this view</h3><p>Try another Career Track or add a job link you already found.</p><button className="button primary" onClick={() => setAddOpen(true)}>Add job link</button></div>}
+        {filtered.length === 0 && <div className="empty-state match-empty-state"><Search /><h3>{selectedTrack ? "Start with a job link" : "Create a Career Track first"}</h3><p>{selectedTrack ? "Paste a recent opening. Bluey verifies it, checks your hard filters, ranks the fit, and builds the application kit for review." : "A Career Track keeps each role, location, resume, and application stream separate."}</p><div className="empty-actions">{selectedTrack && <button className="button primary" onClick={() => setAddOpen(true)}><Link2 size={16} />Add job link</button>}<Link className="button secondary" to={`../settings${window.location.search}#tracks`}>{selectedTrack ? "Adjust Career Track" : "Create Career Track"}</Link></div><ol className="match-activation-flow"><li><b>1</b><span>Verify posting</span></li><li><b>2</b><span>Check hard filters</span></li><li><b>3</b><span>Rank the fit</span></li><li><b>4</b><span>Review application kit</span></li></ol></div>}
       </section>
 
       <Dialog open={Boolean(selected)} title={selected ? `${selected.title} at ${selected.company}` : "Job match"} description={selected?.location} onClose={() => setSelected(null)} size="large">
@@ -245,8 +256,8 @@ export function DiscoverySourceHealthList({ sources, onAddJob }: { sources: Disc
         <div className="discovery-source-empty">
           <Radar size={18} aria-hidden="true" />
           <div>
-            <strong>Discovery sources are not configured</strong>
-            <span>Paste a job link to keep discovery available.</span>
+            <strong>Automatic discovery is not connected</strong>
+            <span>Add a job link now. Bluey will verify and rank it against the selected Career Track.</span>
           </div>
           <button className="button secondary compact" onClick={onAddJob}><Link2 size={15} />Add job link</button>
         </div>

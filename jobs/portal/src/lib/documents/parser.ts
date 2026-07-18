@@ -34,7 +34,7 @@ export function inferProfileFromResume(profile: CareerProfile, imported: Importe
   const inferredEducation = parseEducation(sections.education);
   const inferredProjects = parseProjects(sections.projects);
   const inferredSkills = parseListSection(sections.skills);
-  const inferredCertifications = parseListSection(sections.certifications);
+  const inferredCertifications = parseCertificationSection(sections.certifications);
   const headline = inferHeadline(sections.preamble, likelyName);
   const summary = sections.summary.map(stripBullet).join(" ").trim();
   return {
@@ -268,6 +268,27 @@ function parseListSection(lines: string[]): string[] {
   ).filter((value) => value.length <= 80 && !/^(?:and|with)$/i.test(value));
 }
 
+function parseCertificationSection(lines: string[]): string[] {
+  const suffix = /^(?:professional|specialty|associate|expert|foundational|practitioner|level\s+(?:i|ii|iii|1|2|3))$/i;
+  return uniqueStrings(
+    lines
+      .flatMap((line) => {
+        const value = stripBullet(line).replace(/^[A-Za-z &/+.-]{2,30}:\s*/, "");
+        return parseDelimitedList(value);
+      })
+      .reduce<string[]>((certifications, value) => {
+        const clean = value.trim();
+        if (!clean) return certifications;
+        if (suffix.test(clean) && certifications.length) {
+          certifications[certifications.length - 1] = `${certifications.at(-1)}, ${clean}`;
+        } else {
+          certifications.push(clean);
+        }
+        return certifications;
+      }, []),
+  ).filter((value) => value.length <= 120);
+}
+
 interface DatedBlock {
   header: string[];
   dateRemainder: string;
@@ -396,10 +417,9 @@ function splitEmploymentCandidate(candidate: string): { value: string; location:
     };
   }
   if (isCountryName(last)) {
-    const titlePrefix = parts.length >= 3 && titleScore(parts[0]) > 0;
     return {
-      value: titlePrefix ? parts[0] : parts.slice(0, -2).join(", "),
-      location: titlePrefix ? parts.slice(1).join(", ") : parts.slice(-2).join(", "),
+      value: parts.slice(0, -2).join(", "),
+      location: parts.slice(-2).join(", "),
     };
   }
   return { value: clean, location: "" };
@@ -407,27 +427,44 @@ function splitEmploymentCandidate(candidate: string): { value: string; location:
 
 function splitCombinedTitleCompany(candidate: string): { title: string; company: string } | null {
   const parts = candidate.split(/\s*,\s*/).map((part) => part.trim()).filter(Boolean);
-  if (parts.length < 2 || titleScore(parts[0]) === 0) return null;
+  if (parts.length < 2) return null;
   const legalSuffix = /^(?:inc\.?|llc|ltd\.?|corp\.?|plc|co\.?)$/i;
   const scored = Array.from({ length: parts.length - 1 }, (_, offset) => {
     const boundary = offset + 1;
-    const title = parts.slice(0, boundary).join(", ");
-    const company = parts.slice(boundary).join(", ");
-    return {
-      title,
-      company,
+    const left = parts.slice(0, boundary).join(", ");
+    const right = parts.slice(boundary).join(", ");
+    const candidates = [
+      { title: left, company: right, titleFirst: true },
+      { title: right, company: left, titleFirst: false },
+    ];
+    return candidates.map((value) => ({
+      ...value,
       boundary,
-      titleScore: titleScore(title),
-      companyScore: companyScore(company),
-      legalOnly: legalSuffix.test(company),
-    };
+      titleScore: titleScore(value.title),
+      companyScore: companyScore(value.company),
+      companyTitleScore: titleScore(value.company),
+      companyParts: value.company.split(/\s*,\s*/).filter(Boolean).length,
+      legalOnly: legalSuffix.test(value.company),
+    }));
   })
-    .filter((value) => value.titleScore > 0 && value.company)
+    .flat()
+    .filter((value) => (
+      value.titleScore > 0 &&
+      value.company &&
+      (value.companyTitleScore === 0 || (
+        value.companyScore > 0 && value.titleScore > value.companyTitleScore
+      ))
+    ))
     .sort((left, right) => {
       if (left.legalOnly !== right.legalOnly) return left.legalOnly ? 1 : -1;
-      return right.companyScore - left.companyScore || right.boundary - left.boundary;
+      if (left.companyScore !== right.companyScore) return right.companyScore - left.companyScore;
+      if (left.companyParts !== right.companyParts) return left.companyParts - right.companyParts;
+      if (left.titleFirst !== right.titleFirst) {
+        return left.titleFirst ? right.boundary - left.boundary : left.boundary - right.boundary;
+      }
+      return right.titleScore - left.titleScore;
     });
-  const best = scored.find((value) => value.companyScore > 0) || scored[0];
+  const best = scored[0];
   return best ? { title: best.title, company: best.company } : null;
 }
 

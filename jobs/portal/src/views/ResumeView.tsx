@@ -36,11 +36,11 @@ import {
 import { ResumeImportReview } from "../components/ResumeImportReview";
 import {
   CERTIFICATION_SUGGESTIONS,
-  LOCATION_SUGGESTIONS,
   mergeCareerSuggestions,
   ROLE_SUGGESTIONS,
   SKILL_SUGGESTIONS,
 } from "../data/career-suggestions";
+import { useLocationSuggestions } from "../data/use-location-suggestions";
 import { relativeTime } from "../lib/format";
 import { validateCareerProfile } from "../lib/profile-validation";
 
@@ -69,15 +69,15 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
     () => mergeCareerSuggestions([profile.headline], profile.employment.map((entry) => entry.title), ROLE_SUGGESTIONS),
     [profile.employment, profile.headline],
   );
-  const locationSuggestions = useMemo(
+  const locationSeeds = useMemo(
     () => mergeCareerSuggestions(
       [profile.current_location],
       profile.employment.map((entry) => entry.location),
       profile.education.map((entry) => entry.location),
-      LOCATION_SUGGESTIONS,
     ),
     [profile.current_location, profile.education, profile.employment],
   );
+  const locationSuggestions = useLocationSuggestions(locationSeeds);
   const companySuggestions = useMemo(
     () => mergeCareerSuggestions(profile.employment.map((entry) => entry.company)),
     [profile.employment],
@@ -309,9 +309,9 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
 
           <section className="profile-editor-section">
             <div className="profile-editor-heading"><span>QUALIFICATIONS</span><h3>Skills, certifications, and application facts</h3></div>
-            <div className="form-grid two">
-              <CareerTagField label="Skills" values={profile.skills} onChange={(values) => setProfile({ ...profile, skills: values })} placeholder="Add a skill" suggestions={skillSuggestions} />
-              <CareerTagField label="Certifications" values={profile.certifications} onChange={(values) => setProfile({ ...profile, certifications: values })} placeholder="Add a certification" suggestions={mergeCareerSuggestions(profile.certifications, CERTIFICATION_SUGGESTIONS)} />
+            <div className="form-grid two qualification-grid">
+              <CareerTagField variant="skills" label="Skills" values={profile.skills} onChange={(values) => setProfile({ ...profile, skills: values })} placeholder="Add a skill" suggestions={skillSuggestions} />
+              <CareerTagField variant="certifications" label="Certifications" values={profile.certifications} onChange={(values) => setProfile({ ...profile, certifications: values })} placeholder="Add a certification" suggestions={mergeCareerSuggestions(profile.certifications, CERTIFICATION_SUGGESTIONS)} />
               <CareerField label="Work authorization" value={profile.work_authorization} onChange={(value) => setProfile({ ...profile, work_authorization: value })} />
               <CareerField label="Salary expectation" value={profile.salary_expectation} onChange={(value) => setProfile({ ...profile, salary_expectation: value })} />
               <CareerField label="Notice period" value={profile.notice_period} onChange={(value) => setProfile({ ...profile, notice_period: value })} />

@@ -1,5 +1,5 @@
 import { useId, useMemo, useRef, useState } from "react";
-import { BriefcaseBusiness, FolderKanban, GraduationCap, Trash2 } from "lucide-react";
+import { BriefcaseBusiness, FolderKanban, GraduationCap, Trash2, X } from "lucide-react";
 import type { EducationEntry, EmploymentEntry, ProjectEntry } from "../types";
 import { filterCareerSuggestions } from "../data/career-suggestions";
 
@@ -73,37 +73,57 @@ export function CareerField({ label, value, onChange, placeholder, autoFocus, in
   </div></div>;
 }
 
-export function CareerTagField({ label, values, onChange, placeholder, suggestions = [] }: {
+export function CareerTagField({
+  label,
+  values,
+  onChange,
+  placeholder,
+  suggestions = [],
+  variant = "chips",
+  normalizeValue = (value) => value.trim(),
+  filterSuggestions = filterCareerSuggestions,
+  customHint,
+}: {
   label: string;
   values: string[];
   onChange(values: string[]): void;
   placeholder: string;
   suggestions?: string[];
+  variant?: "chips" | "skills" | "certifications";
+  normalizeValue?(value: string): string;
+  filterSuggestions?(query: string, suggestions: string[], selected?: string[], limit?: number): string[];
+  customHint?: string;
 }) {
   const [draft, setDraft] = useState("");
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(-1);
+  const [expanded, setExpanded] = useState(false);
   const listId = useId();
   const inputId = useId();
   const options = useMemo(
-    () => filterCareerSuggestions(draft, suggestions, values),
-    [draft, suggestions, values],
+    () => filterSuggestions(draft, suggestions, values),
+    [draft, filterSuggestions, suggestions, values],
   );
   const add = () => {
-    const next = draft.trim();
+    const next = normalizeValue(draft);
     if (!next || values.some((value) => value.toLocaleLowerCase() === next.toLocaleLowerCase())) return;
     onChange([...values, next]);
     setDraft("");
   };
   const choose = (option: string) => {
-    if (!values.some((value) => value.toLocaleLowerCase() === option.toLocaleLowerCase())) onChange([...values, option]);
+    const next = normalizeValue(option);
+    if (next && !values.some((value) => value.toLocaleLowerCase() === next.toLocaleLowerCase())) onChange([...values, next]);
     setDraft("");
     setOpen(false);
     setActive(-1);
   };
+  const visibleValues = variant === "skills" && !expanded ? values.slice(0, 12) : values;
+  const hiddenCount = values.length - visibleValues.length;
 
-  return <div className="field tag-field"><label htmlFor={inputId}>{label}</label><div className="tag-input typeahead-control">
-    {values.map((value) => <button type="button" key={value} aria-label={`Remove ${value}`} onClick={() => onChange(values.filter((item) => item !== value))}>{value}<span>×</span></button>)}
+  return <div className={`field tag-field tag-field-${variant}`}><label htmlFor={inputId}>{label}<small>{values.length ? `${values.length} added` : ""}</small></label><div className={`tag-input tag-input-${variant} typeahead-control`}>
+    {visibleValues.map((value) => <button type="button" key={value} aria-label={`Remove ${value}`} onClick={() => onChange(values.filter((item) => item !== value))}><span>{value}</span><X size={12} /></button>)}
+    {hiddenCount > 0 && <button type="button" className="tag-more" onClick={() => setExpanded(true)}>+{hiddenCount} more</button>}
+    {variant === "skills" && expanded && values.length > 12 && <button type="button" className="tag-more" onClick={() => setExpanded(false)}>Show less</button>}
     <input
       value={draft}
       id={inputId}
@@ -139,7 +159,7 @@ export function CareerTagField({ label, values, onChange, placeholder, suggestio
       aria-activedescendant={open && active >= 0 ? `${listId}-${active}` : undefined}
     />
     <SuggestionList id={listId} open={open} options={options} active={active} onChoose={choose} onActive={setActive} />
-  </div></div>;
+  </div>{customHint && <p className="field-note">{customHint}</p>}</div>;
 }
 
 export function CareerEmploymentEditor({ entry, onChange, onRemove, companySuggestions, roleSuggestions, locationSuggestions }: {

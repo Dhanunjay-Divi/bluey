@@ -33,7 +33,21 @@ import type {
 } from "../types";
 import { Dialog, ConfirmDialog } from "../components/Dialog";
 import { CareerField, CareerTagField } from "../components/CareerFields";
-import { LOCATION_SUGGESTIONS, mergeCareerSuggestions, ROLE_SUGGESTIONS } from "../data/career-suggestions";
+import {
+  canonicalTargetRoles,
+  canonicalizeTargetRole,
+  mergeCareerSuggestions,
+  ROLE_SUGGESTIONS,
+  TARGET_ROLE_SUGGESTIONS,
+  targetRoleSuggestions as filterTargetRoleSuggestions,
+} from "../data/career-suggestions";
+import { useLocationSuggestions } from "../data/use-location-suggestions";
+import { SearchPolicySummary } from "../components/SearchPolicySummary";
+import {
+  BLUEY_AUTO_SUBMIT_THRESHOLD,
+  BLUEY_DAILY_APPLICATION_LIMIT,
+  BLUEY_MAX_POSTING_AGE_DAYS,
+} from "../lib/search-policy";
 import { money, titleCase } from "../lib/format";
 
 interface Props {
@@ -71,7 +85,10 @@ export function SettingsView({
   onSaveAnswerMemory,
   onDeleteAnswerMemory,
 }: Props) {
-  const [preferences, setPreferences] = useState(workspace.preferences);
+  const [preferences, setPreferences] = useState({
+    ...workspace.preferences,
+    desired_roles: canonicalTargetRoles(workspace.preferences.desired_roles),
+  });
   const [profile, setProfile] = useState(workspace.profile);
   const [trackOpen, setTrackOpen] = useState(false);
   const [editingTrack, setEditingTrack] = useState<CareerTrack | null>(null);
@@ -94,10 +111,15 @@ export function SettingsView({
     () => mergeCareerSuggestions(preferences.desired_roles, [profile.headline], profile.employment.map((entry) => entry.title), ROLE_SUGGESTIONS),
     [preferences.desired_roles, profile.employment, profile.headline],
   );
-  const locationSuggestions = useMemo(
-    () => mergeCareerSuggestions(preferences.desired_locations, [profile.current_location], profile.employment.map((entry) => entry.location), LOCATION_SUGGESTIONS),
+  const targetRoleSuggestionValues = useMemo(
+    () => mergeCareerSuggestions(canonicalTargetRoles(preferences.desired_roles), canonicalTargetRoles([profile.headline]), canonicalTargetRoles(profile.employment.map((entry) => entry.title)), TARGET_ROLE_SUGGESTIONS),
+    [preferences.desired_roles, profile.employment, profile.headline],
+  );
+  const locationSeeds = useMemo(
+    () => mergeCareerSuggestions(preferences.desired_locations, [profile.current_location], profile.employment.map((entry) => entry.location)),
     [preferences.desired_locations, profile.current_location, profile.employment],
   );
+  const locationSuggestions = useLocationSuggestions(locationSeeds);
   const companySuggestions = useMemo(
     () => mergeCareerSuggestions(profile.employment.map((entry) => entry.company)),
     [profile.employment],
@@ -105,7 +127,7 @@ export function SettingsView({
 
   useEffect(() => {
     if (searchDirty) return;
-    setPreferences(workspace.preferences);
+    setPreferences({ ...workspace.preferences, desired_roles: canonicalTargetRoles(workspace.preferences.desired_roles) });
     setProfile(workspace.profile);
   }, [searchDirty, workspace.preferences, workspace.profile]);
 
@@ -124,7 +146,19 @@ export function SettingsView({
     setLocalError("");
     setSaved("");
     try {
-      await Promise.all([onSavePreferences(preferences), onSaveProfile(profile)]);
+      await Promise.all([
+        onSavePreferences({
+          ...preferences,
+          desired_roles: canonicalTargetRoles(preferences.desired_roles),
+          daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
+          max_posting_age_days: BLUEY_MAX_POSTING_AGE_DAYS,
+        }),
+        onSaveProfile({
+          ...profile,
+          auto_submit_threshold: BLUEY_AUTO_SUBMIT_THRESHOLD,
+          daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
+        }),
+      ]);
       setSearchDirty(false);
       setSaved("Search and automation defaults saved.");
       window.setTimeout(() => setSaved(""), 2600);
@@ -198,13 +232,12 @@ export function SettingsView({
         <section className="settings-section">
           <div className="settings-section-title compact"><span><MapPin /></span><div><p>SEARCH RULES</p><h2>Where and what to apply for</h2></div></div>
           <div className="settings-form">
-            <CareerTagField label="Target roles" values={preferences.desired_roles} onChange={(values) => updatePreferences({ ...preferences, desired_roles: values })} placeholder="Add a role" suggestions={roleSuggestions} />
+            <CareerTagField label="Target roles" values={preferences.desired_roles} onChange={(values) => updatePreferences({ ...preferences, desired_roles: canonicalTargetRoles(values) })} placeholder="Software Engineer" suggestions={targetRoleSuggestionValues} normalizeValue={canonicalizeTargetRole} filterSuggestions={(query, _suggestions, selected, limit) => filterTargetRoleSuggestions(query, selected, limit)} customHint="Choose the full role name. Custom roles are saved exactly as entered for this search." />
             <CareerTagField label="Target locations" values={preferences.desired_locations} onChange={(values) => updatePreferences({ ...preferences, desired_locations: values })} placeholder="Add a city, region, or remote" suggestions={locationSuggestions} />
             <label><span>When a job uses another location</span><select value={preferences.location_policy} onChange={(event) => updatePreferences({ ...preferences, location_policy: event.target.value as JobPreferences["location_policy"] })}><option value="ask">Ask me what to say</option><option value="local">Use my current location only</option><option value="willing_to_relocate">Say I am willing to relocate</option><option value="remote_only">Skip unless remote</option></select></label>
             <CareerTagField label="Employment types" values={preferences.employment_types} onChange={(values) => updatePreferences({ ...preferences, employment_types: values })} placeholder="Full-time, contract, internship..." suggestions={["Full-time", "Part-time", "Contract", "Temporary", "Internship", "Apprenticeship"]} />
             <label><span>Sponsorship filter</span><select value={preferences.sponsorship} onChange={(event) => updatePreferences({ ...preferences, sponsorship: event.target.value })}><option value="ask">Ask when unclear</option><option value="required">Only roles offering sponsorship</option><option value="not_required">Sponsorship not required</option><option value="any">Do not filter</option></select></label>
-            <div className="form-grid two"><label><span>Daily application limit</span><input type="number" min="1" max="50" value={preferences.daily_limit} onChange={(event) => updatePreferences({ ...preferences, daily_limit: Number(event.target.value) })} /></label><label><span>Maximum job age</span><select value={preferences.max_posting_age_days} onChange={(event) => updatePreferences({ ...preferences, max_posting_age_days: Number(event.target.value) })}><option value={7}>7 days</option><option value={14}>14 days</option><option value={21}>21 days</option><option value={30}>30 days</option></select></label></div>
-            <p className="field-note">Bluey skips older listings and confirms a job is still open before applying.</p>
+            <SearchPolicySummary profile={profile} compact />
             <label><span>Minimum salary</span><input type="number" value={preferences.minimum_compensation || ""} onChange={(event) => updatePreferences({ ...preferences, minimum_compensation: Number(event.target.value) || undefined })} /></label>
             <CareerTagField label="Excluded companies" values={preferences.excluded_companies} onChange={(values) => updatePreferences({ ...preferences, excluded_companies: values })} placeholder="Add a company" suggestions={companySuggestions} />
             <CareerTagField label="Excluded titles" values={preferences.excluded_titles} onChange={(values) => updatePreferences({ ...preferences, excluded_titles: values })} placeholder="Add a title" suggestions={roleSuggestions} />
@@ -218,7 +251,7 @@ export function SettingsView({
             <label><span>Resume mode</span><div className="segmented"><button className={profile.resume_mode === "factual" ? "active" : ""} onClick={() => updateProfile({ ...profile, resume_mode: "factual" })}>Factual</button><button className={profile.resume_mode === "enhance" ? "active" : ""} onClick={() => updateProfile({ ...profile, resume_mode: "enhance" })}>Enhance</button></div></label>
             <label><span>Submission mode</span><div className="segmented"><button className={profile.default_submission_mode === "review_first" ? "active" : ""} onClick={() => updateProfile({ ...profile, default_submission_mode: "review_first" })}>Review first</button><button className={profile.default_submission_mode === "auto_submit" ? "active" : ""} onClick={() => updateProfile({ ...profile, default_submission_mode: "auto_submit" })}>Auto-submit</button></div></label>
             <label className="setting-line simple"><div><b>Review new claims</b><span>Pause before a newly proposed factual claim can enter an application.</span></div><Toggle checked={profile.review_new_claims} onChange={(checked) => updateProfile({ ...profile, review_new_claims: checked })} /></label>
-            <label><span>Auto-submit match threshold</span><div className="range-field"><input type="range" min="60" max="100" step="5" value={profile.auto_submit_threshold} onChange={(event) => updateProfile({ ...profile, auto_submit_threshold: Number(event.target.value) })} /><b>{profile.auto_submit_threshold}%</b></div></label>
+            <div className="setting-line simple"><div><b>Bluey eligibility gate</b><span>Freshness, experience, location, job status, company safety, and site capability must all pass before Auto-submit can run.</span></div><span className="status-chip success">Managed</span></div>
             <div className="challenge-rules">
               <p>CHALLENGE HANDLING</p>
               <div>
@@ -322,7 +355,7 @@ export function SettingsView({
         open={trackOpen}
         track={editingTrack}
         identities={workspace.application_identities}
-        roleSuggestions={roleSuggestions}
+        roleSuggestions={targetRoleSuggestionValues}
         locationSuggestions={locationSuggestions}
         onClose={() => setTrackOpen(false)}
         onSave={async (track) => { await onSaveTrack(track); setTrackOpen(false); }}
@@ -525,6 +558,7 @@ function TrackDialog({ open, track, identities, roleSuggestions, locationSuggest
     try {
       await onSave({
         ...current,
+        role: canonicalizeTargetRole(current.role),
         application_identity_id: current.application_identity_id || defaultIdentityId,
       });
     } catch (requestError) {
@@ -533,7 +567,7 @@ function TrackDialog({ open, track, identities, roleSuggestions, locationSuggest
       setSaving(false);
     }
   };
-  return <Dialog open={open} title={track ? "Edit Career Track" : "New Career Track"} description="Give this agent one role, location policy, and application email." onClose={onClose}><div className="dialog-form"><CareerField label="Track name" value={current.name} onChange={(value) => update({ ...current, name: value })} placeholder="Product engineering" /><CareerField label="Target role" value={current.role} onChange={(value) => update({ ...current, role: value })} placeholder="Senior Product Engineer" suggestions={roleSuggestions} /><CareerTagField label="Locations" values={current.locations} onChange={(values) => update({ ...current, locations: values })} placeholder="Add a location" suggestions={locationSuggestions} /><label><span>Workplace preference</span><select value={current.remote_preference} onChange={(event) => update({ ...current, remote_preference: event.target.value })}><option value="remote_or_hybrid">Remote or hybrid</option><option value="remote_only">Remote only</option><option value="hybrid_ok">Hybrid is fine</option><option value="onsite_ok">On-site is fine</option></select></label><label><span>Application email</span><select value={current.application_identity_id || defaultIdentityId || ""} onChange={(event) => update({ ...current, application_identity_id: event.target.value || undefined })}>{identities.filter((identity) => identity.verification_status === "verified").map((identity) => <option key={identity.id} value={identity.id}>{identity.email}{identity.is_default ? " (default)" : ""}</option>)}</select></label><label className="setting-line simple"><div><b>Agent active</b><span>Paused agents keep history but stop discovery.</span></div><Toggle checked={current.active} onChange={(checked) => update({ ...current, active: checked })} /></label>{error && <div className="inline-error" role="alert">{error}</div>}</div><div className="dialog-actions">{track && <button className="button danger subtle" onClick={() => onDelete(track)}><Trash2 size={15} />Delete</button>}<span /><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !current.name || !current.role || !(current.application_identity_id || defaultIdentityId)} onClick={() => void save()}>{saving ? "Saving..." : "Save track"}</button></div></Dialog>;
+  return <Dialog open={open} title={track ? "Edit Career Track" : "New Career Track"} description="Give this agent one role, location policy, and application email." onClose={onClose}><div className="dialog-form"><CareerField label="Track name" value={current.name} onChange={(value) => update({ ...current, name: value })} placeholder="Product engineering" /><CareerField label="Target role" value={current.role} onChange={(value) => update({ ...current, role: value })} placeholder="Software Engineer" suggestions={roleSuggestions} /><p className="field-note">Choose the full role name. Bluey maps common abbreviations such as SWE and SDE to Software Engineer.</p><CareerTagField label="Locations" values={current.locations} onChange={(values) => update({ ...current, locations: values })} placeholder="Add a location" suggestions={locationSuggestions} /><label><span>Workplace preference</span><select value={current.remote_preference} onChange={(event) => update({ ...current, remote_preference: event.target.value })}><option value="remote_or_hybrid">Remote or hybrid</option><option value="remote_only">Remote only</option><option value="hybrid_ok">Hybrid is fine</option><option value="onsite_ok">On-site is fine</option></select></label><label><span>Application email</span><select value={current.application_identity_id || defaultIdentityId || ""} onChange={(event) => update({ ...current, application_identity_id: event.target.value || undefined })}>{identities.filter((identity) => identity.verification_status === "verified").map((identity) => <option key={identity.id} value={identity.id}>{identity.email}{identity.is_default ? " (default)" : ""}</option>)}</select></label><label className="setting-line simple"><div><b>Agent active</b><span>Paused agents keep history but stop discovery.</span></div><Toggle checked={current.active} onChange={(checked) => update({ ...current, active: checked })} /></label>{error && <div className="inline-error" role="alert">{error}</div>}</div><div className="dialog-actions">{track && <button className="button danger subtle" onClick={() => onDelete(track)}><Trash2 size={15} />Delete</button>}<span /><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !current.name || !current.role || !(current.application_identity_id || defaultIdentityId)} onClick={() => void save()}>{saving ? "Saving..." : "Save track"}</button></div></Dialog>;
 }
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange(checked: boolean): void }) {

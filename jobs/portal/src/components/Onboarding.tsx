@@ -46,11 +46,21 @@ import {
 } from "./CareerFields";
 import {
   CERTIFICATION_SUGGESTIONS,
-  LOCATION_SUGGESTIONS,
+  canonicalTargetRoles,
+  canonicalizeTargetRole,
   mergeCareerSuggestions,
   ROLE_SUGGESTIONS,
   SKILL_SUGGESTIONS,
+  TARGET_ROLE_SUGGESTIONS,
+  targetRoleSuggestions as filterTargetRoleSuggestions,
 } from "../data/career-suggestions";
+import { useLocationSuggestions } from "../data/use-location-suggestions";
+import { SearchPolicySummary } from "./SearchPolicySummary";
+import {
+  BLUEY_AUTO_SUBMIT_THRESHOLD,
+  BLUEY_DAILY_APPLICATION_LIMIT,
+  BLUEY_MAX_POSTING_AGE_DAYS,
+} from "../lib/search-policy";
 import blueyIcon from "../../../../web/assets/bluey-logo.svg";
 import blueyWordmark from "../../../../web/assets/bluey-wordmark.svg";
 
@@ -73,7 +83,10 @@ const steps = [
 export function Onboarding({ workspace, error, onProgress, onComplete }: Props) {
   const [step, setStep] = useState(Math.min(workspace.profile.onboarding_step || 0, steps.length - 1));
   const [profile, setProfile] = useState<CareerProfile>(workspace.profile);
-  const [preferences, setPreferences] = useState<JobPreferences>(workspace.preferences);
+  const [preferences, setPreferences] = useState<JobPreferences>({
+    ...workspace.preferences,
+    desired_roles: canonicalTargetRoles(workspace.preferences.desired_roles),
+  });
   const [notes, setNotes] = useState("");
   const [importing, setImporting] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -110,15 +123,24 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
     ),
     [preferences.desired_roles, profile.employment, profile.headline],
   );
-  const locationSuggestions = useMemo(
+  const targetRoleSuggestionValues = useMemo(
+    () => mergeCareerSuggestions(
+      canonicalTargetRoles(preferences.desired_roles),
+      canonicalTargetRoles([profile.headline]),
+      canonicalTargetRoles(profile.employment.map((entry) => entry.title)),
+      TARGET_ROLE_SUGGESTIONS,
+    ),
+    [preferences.desired_roles, profile.employment, profile.headline],
+  );
+  const locationSeeds = useMemo(
     () => mergeCareerSuggestions(
       [profile.current_location],
       profile.employment.map((entry) => entry.location),
       preferences.desired_locations,
-      LOCATION_SUGGESTIONS,
     ),
     [preferences.desired_locations, profile.current_location, profile.employment],
   );
+  const locationSuggestions = useLocationSuggestions(locationSeeds);
   const companySuggestions = useMemo(
     () => mergeCareerSuggestions(profile.employment.map((entry) => entry.company)),
     [profile.employment],
@@ -162,7 +184,18 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
     setSaving(true);
     setValidation("");
     try {
-      await onProgress(nextProfile, preferences);
+      await onProgress(
+        {
+          ...nextProfile,
+          auto_submit_threshold: BLUEY_AUTO_SUBMIT_THRESHOLD,
+          daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
+        },
+        {
+          ...preferences,
+          daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
+          max_posting_age_days: BLUEY_MAX_POSTING_AGE_DAYS,
+        },
+      );
       setProfile(nextProfile);
       setStep(boundedStep);
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -195,11 +228,23 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
     setSaving(true);
     const finishedProfile = {
       ...profile,
+      auto_submit_threshold: BLUEY_AUTO_SUBMIT_THRESHOLD,
+      daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
       onboarding_step: steps.length,
       onboarding_complete: true,
     };
+    const finishedPreferences = {
+      ...preferences,
+      desired_roles: canonicalTargetRoles(preferences.desired_roles),
+      daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
+      max_posting_age_days: BLUEY_MAX_POSTING_AGE_DAYS,
+    };
+    const finishedTrack = {
+      ...track,
+      role: canonicalizeTargetRole(track.role),
+    };
     try {
-      await onComplete(finishedProfile, preferences, track);
+      await onComplete(finishedProfile, finishedPreferences, finishedTrack);
     } finally {
       setSaving(false);
     }
@@ -277,7 +322,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
                 </div>
                 <CareerField label="Phone" value={profile.phone} onChange={(value) => update("phone", value)} inputMode="tel" />
                 <CareerField label="Current location" value={profile.current_location} onChange={(value) => update("current_location", value)} placeholder="City, state" suggestions={locationSuggestions} />
-                <CareerField label="Professional headline" value={profile.headline} onChange={(value) => update("headline", value)} placeholder="Senior Product Engineer" suggestions={roleSuggestions} />
+                <CareerField label="Professional headline" value={profile.headline} onChange={(value) => update("headline", value)} placeholder="Software Engineer" suggestions={roleSuggestions} />
                 <CareerField label="LinkedIn" value={profile.linkedin_url} onChange={(value) => update("linkedin_url", value)} inputMode="url" placeholder="https://linkedin.com/in/..." />
                 <CareerField label="Portfolio" value={profile.portfolio_url} onChange={(value) => update("portfolio_url", value)} inputMode="url" placeholder="https://..." />
               </div>
@@ -318,9 +363,9 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
                 />
               ))}
               <button className="button secondary compact" onClick={() => update("education", [...profile.education, emptyCareerEducation()])}><Plus size={16} />Add education</button>
-              <div className="form-grid two roomy-top">
-                <CareerTagField label="Skills" values={profile.skills} onChange={(values) => update("skills", values)} placeholder="Type a skill and press Enter" suggestions={mergeCareerSuggestions(profile.skills, SKILL_SUGGESTIONS)} />
-                <CareerTagField label="Certifications" values={profile.certifications} onChange={(values) => update("certifications", values)} placeholder="Type a certification and press Enter" suggestions={mergeCareerSuggestions(profile.certifications, CERTIFICATION_SUGGESTIONS)} />
+              <div className="form-grid two roomy-top qualification-grid">
+                <CareerTagField variant="skills" label="Skills" values={profile.skills} onChange={(values) => update("skills", values)} placeholder="Add a skill" suggestions={mergeCareerSuggestions(profile.skills, SKILL_SUGGESTIONS)} />
+                <CareerTagField variant="certifications" label="Certifications" values={profile.certifications} onChange={(values) => update("certifications", values)} placeholder="Add a certification" suggestions={mergeCareerSuggestions(profile.certifications, CERTIFICATION_SUGGESTIONS)} />
               </div>
             </>
           )}
@@ -329,7 +374,16 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
             <>
               <div className="setup-heading"><p>STEP 4 OF 6</p><h2>Where should Bluey look?</h2><span>Location is a hard filter. Tell Bluey what to say instead of letting an application guess.</span></div>
               <div className="form-grid two">
-                <CareerTagField label="Target roles" values={preferences.desired_roles} onChange={(values) => updatePreferences("desired_roles", values)} placeholder="Senior Product Engineer" suggestions={roleSuggestions} />
+                <CareerTagField
+                  label="Target roles"
+                  values={preferences.desired_roles}
+                  onChange={(values) => updatePreferences("desired_roles", canonicalTargetRoles(values))}
+                  placeholder="Software Engineer"
+                  suggestions={targetRoleSuggestionValues}
+                  normalizeValue={canonicalizeTargetRole}
+                  filterSuggestions={(query, _suggestions, selected, limit) => filterTargetRoleSuggestions(query, selected, limit)}
+                  customHint="Choose the full role name. If it is not listed, enter it as a custom role; Bluey saves it for this search."
+                />
                 <CareerTagField label="Target locations" values={preferences.desired_locations} onChange={(values) => updatePreferences("desired_locations", values)} placeholder="New York, NY" suggestions={locationSuggestions} />
                 <SelectField label="Location answer" value={preferences.location_policy} onChange={(value) => updatePreferences("location_policy", value as JobPreferences["location_policy"])} options={[
                   ["ask", "Ask before using another location"],
@@ -378,10 +432,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
                 <div><b>Review new claims</b><span>Pause when Bluey proposes a factual claim not already in your profile.</span></div>
                 <Toggle checked={profile.review_new_claims} onChange={(checked) => update("review_new_claims", checked)} />
               </div>
-              <div className="form-grid two roomy-top">
-                <CareerField label="Applications per day" value={String(profile.daily_limit)} onChange={(value) => update("daily_limit", Math.max(1, Math.min(50, Number(value) || 10)))} inputMode="numeric" />
-                <CareerField label="Auto-submit threshold" value={String(profile.auto_submit_threshold)} onChange={(value) => update("auto_submit_threshold", Math.max(60, Math.min(100, Number(value) || 80)))} inputMode="numeric" suffix="%" />
-              </div>
+              <SearchPolicySummary profile={profile} />
             </>
           )}
 
@@ -393,8 +444,8 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
                 <div><p>CAREER TRACK AGENT</p><h3>{track.role || "Add a target role"}</h3><strong>{track.locations.join(" + ") || "Add a target location"}</strong></div>
                 <ul>
                   <li><Check size={15} />{profile.resume_mode === "factual" ? "Factual" : "Enhanced"} resume per job</li>
-                  <li><Check size={15} />{profile.default_submission_mode === "review_first" ? "Review before submit" : `${profile.auto_submit_threshold}% auto-submit threshold`}</li>
-                  <li><Check size={15} />Up to {profile.daily_limit} applications each day</li>
+                  <li><Check size={15} />Review before the first runner starts</li>
+                  <li><Check size={15} />Recent, experience-aligned roles only</li>
                 </ul>
               </div>
               <div className="setup-review">
