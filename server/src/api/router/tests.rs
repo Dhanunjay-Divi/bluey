@@ -740,14 +740,18 @@ fn visible_system_design_uses_spoken_section_while_canvas_keeps_detail() {
 
 #[test]
 fn visible_code_plan_preserves_the_exact_streamed_answer_for_terminal_replay() {
-    let req = complete_request("Question:\nImplement an LRU cache from first principles in Python.");
+    let req =
+        complete_request("Question:\nImplement an LRU cache from first principles in Python.");
     let plan = answer_plan_for_request(&req, "balanced", &[]);
     let answer = "Approach\nUse a map and linked list.\n\n```python\nclass LRUCache:\n    def get(self, key):\n        return -1\n    def put(self, key, value):\n        return None\n```\n\nTime Complexity: O(1)\nSpace Complexity: O(capacity)";
     let artifact = response_artifact_for_plan(answer, &plan).expect("code artifact");
 
     assert_eq!(plan.output, AnswerOutput::CodeArtifact);
     assert_eq!(artifact.artifact_type, "code");
-    assert_eq!(visible_response_text_for_plan(answer, Some(&artifact), &plan), answer);
+    assert_eq!(
+        visible_response_text_for_plan(answer, Some(&artifact), &plan),
+        answer
+    );
 }
 
 #[test]
@@ -1068,6 +1072,213 @@ fn answer_quality_guard_rejects_structural_cap_cutoff_but_allows_complete_cap_an
 }
 
 #[test]
+fn answer_quality_guard_rejects_library_cache_in_first_principles_lru_code() {
+    let req =
+        complete_request("Question:\nImplement an LRU cache from first principles in Python.");
+    let plan = answer_plan_for_request(&req, "balanced", &[]);
+    let question = normalize_guardrail_text(&extract_search_question(&req.user));
+    let valid_first_principles_lru = r#"```python
+class Node:
+    def __init__(self, key=0, value=0):
+        self.key, self.value = key, value
+        self.prev = self.next = None
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.cache = {}
+        self.head, self.tail = Node(), Node()
+        self.head.next, self.tail.prev = self.tail, self.head
+
+    def get(self, key):
+        node = self.cache.get(key)
+        return -1 if node is None else node.value
+
+    def put(self, key, value):
+        if self.cache.get(key):
+            self.cache[key].value = value
+```"#;
+
+    assert_eq!(
+        generated_answer_quality_failure(
+            "```python\nfrom collections import OrderedDict\ncache = OrderedDict()\n```",
+            20,
+            Some(1_200),
+            &plan,
+            &question,
+        ),
+        Some("upstream_code_contract_failed")
+    );
+    assert_eq!(
+        generated_answer_quality_failure(
+            &format!("Do not use collections.OrderedDict here.\n{valid_first_principles_lru}"),
+            20,
+            Some(1_200),
+            &plan,
+            &question,
+        ),
+        None
+    );
+    assert_eq!(
+        generated_answer_quality_failure(
+            valid_first_principles_lru,
+            20,
+            Some(1_200),
+            &plan,
+            &question,
+        ),
+        None
+    );
+    for library_cache in [
+        "```python\nimport collections as c\ncache = c.OrderedDict()\n```",
+        "```python\nfrom functools import lru_cache as cached\n@cached\ndef compute(key):\n    return key\n```",
+        "```python\nimport functools as tools\n@tools.lru_cache\ndef compute(key):\n    return key\n```",
+    ] {
+        assert_eq!(
+            generated_answer_quality_failure(
+                library_cache,
+                20,
+                Some(1_200),
+                &plan,
+                &question,
+            ),
+            Some("upstream_code_contract_failed"),
+            "{library_cache}"
+        );
+    }
+    assert_eq!(
+        generated_answer_quality_failure(
+            &format!(
+                "Mentioning collections.OrderedDict in prose is not an implementation.\n{valid_first_principles_lru}"
+            ),
+            20,
+            Some(1_200),
+            &plan,
+            &question,
+        ),
+        None
+    );
+    assert_eq!(
+        generated_answer_quality_failure(
+            "```python\nclass LRUCache:\n    pass\n```",
+            20,
+            Some(1_200),
+            &plan,
+            &question,
+        ),
+        Some("upstream_code_contract_failed")
+    );
+
+    let library_req =
+        complete_request("Question:\nImplement an LRU cache with collections.OrderedDict.");
+    let library_plan = answer_plan_for_request(&library_req, "balanced", &[]);
+    assert_eq!(
+        generated_answer_quality_failure(
+            "```python\nfrom collections import OrderedDict\ncache = OrderedDict()\n```",
+            20,
+            Some(1_200),
+            &library_plan,
+            &normalize_guardrail_text(&extract_search_question(&library_req.user)),
+        ),
+        None
+    );
+
+    let explicit_library_req = complete_request(
+        "Question:\nImplement an LRU cache from first principles using collections.OrderedDict.",
+    );
+    let explicit_library_plan = answer_plan_for_request(&explicit_library_req, "balanced", &[]);
+    assert_eq!(
+        generated_answer_quality_failure(
+            "```python\nimport collections as c\ncache = c.OrderedDict()\n```",
+            20,
+            Some(1_200),
+            &explicit_library_plan,
+            &normalize_guardrail_text(&extract_search_question(&explicit_library_req.user)),
+        ),
+        None
+    );
+}
+
+#[test]
+fn strict_lru_stream_gate_holds_a_fence_split_across_deltas() {
+    let mut gate = StrictLruCodeStreamGate::new(true);
+    assert_eq!(
+        gate.push("Lead-in before code.\n``"),
+        Some("Lead-in before code.\n".into())
+    );
+    assert_eq!(gate.push("`python\nclass LRUCache:\n    pass\n```"), None);
+    assert!(gate.has_delivered());
+    assert_eq!(
+        gate.release_after_quality_pass(),
+        Some("```python\nclass LRUCache:\n    pass\n```".into())
+    );
+}
+
+#[test]
+fn strict_lru_stream_gate_releases_the_same_terminal_text_after_quality_passes() {
+    let answer = "\n\tRésumé lead-in.\n```python\nclass Node:\n    def __init__(self):\n        self.prev = self.next = None\n\nclass LRUCache:\n    def __init__(self):\n        self.cache = {}\n        self.head, self.tail = Node(), Node()\n    def get(self, key):\n        return -1\n    def put(self, key, value):\n        self.cache[key] = value\n```\n \t";
+    let mut gate = StrictLruCodeStreamGate::new(true);
+    let mut streamed = String::new();
+    for delta in [
+        "\n\tR",
+        "ésumé lead-in.\n``",
+        "`python\nclass Node:\n    def __init__(self):\n        self.prev = self.next = None\n\nclass LRUCache:\n    def __init__(self):\n        self.cache = {}\n        self.head, self.tail = Node(), Node()\n    def get(self, key):\n        return -1\n    def put(self, key, value):\n        self.cache[key] = value\n```\n \t",
+    ] {
+        if let Some(visible) = gate.push(delta) {
+            streamed.push_str(&visible);
+        }
+    }
+    assert_eq!(streamed, "Résumé lead-in.\n");
+    streamed.push_str(
+        &gate
+            .release_after_quality_pass()
+            .expect("held implementation after the opening fence"),
+    );
+    assert_eq!(streamed, answer.trim());
+}
+
+#[test]
+fn strict_lru_stream_gate_withholds_forbidden_code_when_quality_fails() {
+    let mut gate = StrictLruCodeStreamGate::new(true);
+    assert_eq!(
+        gate.push("Safe lead-in.\n```python\n"),
+        Some("Safe lead-in.\n".into())
+    );
+    assert_eq!(
+        gate.push("import collections as c\ncache = c.OrderedDict()\n```"),
+        None
+    );
+    // The caller emits an error instead of calling `release_after_quality_pass`.
+    assert!(gate.has_delivered());
+    assert_eq!(gate.release_after_failure(), None);
+}
+
+#[test]
+fn strict_lru_stream_gate_releases_ambiguous_prefixes_on_failure_without_releasing_code() {
+    let mut no_fence = StrictLruCodeStreamGate::new(true);
+    assert_eq!(
+        no_fence.push("ordinary prefix``"),
+        Some("ordinary prefix".into())
+    );
+    assert_eq!(no_fence.release_after_failure(), Some("``".into()));
+
+    let mut fenced = StrictLruCodeStreamGate::new(true);
+    assert_eq!(
+        fenced.push("lead-in\n```python\n"),
+        Some("lead-in\n".into())
+    );
+    assert_eq!(fenced.push("class LRUCache:\n    pass\n"), None);
+    assert_eq!(fenced.release_after_failure(), None);
+}
+
+#[test]
+fn strict_lru_stream_gate_does_not_count_whitespace_as_delivery() {
+    let mut gate = StrictLruCodeStreamGate::new(true);
+    assert_eq!(gate.push(" \n\t"), None);
+    assert!(!gate.has_delivered());
+    assert_eq!(gate.release_after_failure(), None);
+}
+
+#[test]
 fn answer_quality_guard_rejects_near_empty_interview_answer() {
     let req = complete_request("Question:\nTell me about a difficult production incident.");
     let plan = answer_plan_for_request(&req, "balanced", &[]);
@@ -1079,6 +1290,7 @@ fn answer_quality_guard_rejects_near_empty_interview_answer() {
             20,
             Some(700),
             &plan,
+            &normalize_guardrail_text(&extract_search_question(&req.user)),
         ),
         Some("upstream_answer_too_short")
     );
@@ -1093,7 +1305,13 @@ fn answer_quality_guard_rejects_near_empty_interview_answer() {
     assert!(visible_answer.contains("HPE's AI datacenter role"));
     assert!(visible_answer.split_whitespace().count() > provider_answer.split_whitespace().count());
     assert_eq!(
-        generated_answer_quality_failure(provider_answer, 20, Some(700), &plan,),
+        generated_answer_quality_failure(
+            provider_answer,
+            20,
+            Some(700),
+            &plan,
+            &normalize_guardrail_text(&extract_search_question(&req.user)),
+        ),
         Some("upstream_answer_too_short")
     );
 }
@@ -1337,6 +1555,37 @@ fn balanced_system_design_prefers_measured_fast_quality_route() {
         disabled.first().map(|route| route.provider),
         Some("deepseek")
     );
+}
+
+#[test]
+fn balanced_code_artifact_prefers_measured_fast_quality_route_within_preferred_tier() {
+    let req =
+        complete_request("Question:\nImplement an LRU cache from first principles in Python.");
+    let plan = answer_plan_for_request(&req, "balanced", &[]);
+    assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+
+    let mut routes = priced_routes_for("balanced", 1_000, 1_000, "design-route-test");
+    let mut original_providers = routes
+        .iter()
+        .map(|route| route.provider)
+        .collect::<Vec<_>>();
+    original_providers.sort_unstable();
+    assert_eq!(routes.first().map(|route| route.provider), Some("deepseek"));
+    assert_eq!(routes.get(1).map(|route| route.provider), Some("openai"));
+    assert!(prioritize_routes_for_answer_plan(
+        &mut routes,
+        "balanced",
+        &plan,
+        &normalize_guardrail_text(&extract_search_question(&req.user)),
+        true,
+    ));
+    assert_eq!(routes.first().map(|route| route.provider), Some("openai"));
+    let mut reordered_providers = routes
+        .iter()
+        .map(|route| route.provider)
+        .collect::<Vec<_>>();
+    reordered_providers.sort_unstable();
+    assert_eq!(reordered_providers, original_providers);
 }
 
 #[test]
@@ -1969,6 +2218,26 @@ fn answer_plan_code_request_uses_deep_code_artifact() {
 }
 
 #[test]
+fn answer_plan_small_code_budget_requires_a_compact_complete_artifact() {
+    let req =
+        complete_request("Question:\nImplement an LRU cache from first principles in Python.");
+    let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+    let (system, _) = prompt_with_answer_plan_with_max_tokens(
+        "You are Bluey.",
+        &req.user,
+        &plan,
+        &WebSearchOutcome::default(),
+        1_200,
+    );
+
+    assert!(system.contains("Explicit small output-budget contract"));
+    assert!(system.contains("complete fenced implementation and its closing fence"));
+    assert!(system.contains("two to four Line notes"));
+    assert!(system.contains("Do not enumerate every line of code"));
+}
+
+#[test]
 fn answer_plan_simple_code_uses_balanced_code_artifact() {
     let req = complete_request("Question:\nWrite a tiny Python Fibonacci function.");
 
@@ -2489,11 +2758,12 @@ fn answer_plan_online_feature_store_forbids_live_offline_fallback() {
     assert!(system.contains(
         "for every training row, include a feature value only when both its event-time and availability-time are at or before that row's decision timestamp"
     ));
-    assert!(
-        system
-            .rfind("Training-row invariant")
-            .is_some_and(|index| index > system.find("Online feature-store correctness contract").unwrap())
-    );
+    assert!(system
+        .rfind("Training-row invariant")
+        .is_some_and(|index| index
+            > system
+                .find("Online feature-store correctness contract")
+                .unwrap()));
 }
 
 #[test]
@@ -2604,10 +2874,9 @@ fn answer_plan_url_shortener_uses_one_safe_mapping_write_path() {
     assert!(system.contains("excludes the alias from deletion, expiry, moderation"));
     assert!(system.contains("ordinary active-to-active target update"));
     assert!(system.contains("never applies after expiration, deletion, abuse blocking"));
-    assert!(system.contains("Deleted or expired mappings return 404 or 410"));
-    assert!(system.contains("Abuse-blocked mappings return 403 or a safe warning interstitial"));
-    assert!(system.contains("reserve 451 exclusively"));
-    assert!(system.contains("legal demand or legal restriction"));
+    assert!(system.contains(
+        "Deleted or expired mappings return 404 or 410; abuse-blocked mappings return 403 or a safe warning interstitial; legal blocks return 451."
+    ));
     assert!(system.contains("Do not acknowledge a delete, abuse-block, or legal-block transition"));
     assert!(system.contains("synchronously publish a versioned safety tombstone or deny overlay"));
     assert!(system.contains("fail closed with an authoritative state check"));
@@ -2615,11 +2884,9 @@ fn answer_plan_url_shortener_uses_one_safe_mapping_write_path() {
         "Every redirect worker checks the versioned deny overlay before serving any cached active mapping"
     ));
     assert!(system.contains("Fleet-wide redirect invariant"));
-    assert!(
-        system
-            .rfind("Fleet-wide redirect invariant")
-            .is_some_and(|index| index > system.find("URL-shortener correctness contract").unwrap())
-    );
+    assert!(system
+        .rfind("Fleet-wide redirect invariant")
+        .is_some_and(|index| index > system.find("URL-shortener correctness contract").unwrap()));
     assert!(system.contains("never redirect those states to the stored destination"));
     assert!(system.contains("Never say a cache may remain stale after delete or block"));
     assert!(system.contains("durably sink before committing the consumer offset"));
@@ -2865,9 +3132,7 @@ fn high_stakes_scenario_prompts_require_ready_to_say_safety_signals() {
 
         assert!(system.contains(marker), "{question}: {system}");
         assert!(system.contains(required_signal), "{question}: {system}");
-        assert!(should_strip_unsolicited_coaching_appendix(
-            &plan, &req.user
-        ));
+        assert!(should_strip_unsolicited_coaching_appendix(&plan, &req.user));
     }
 }
 
@@ -3169,7 +3434,6 @@ fn answer_plan_python_followup_uses_code_followup() {
     let req = complete_request("Question:\nI want the code in Python.");
 
     let plan = answer_plan_for_request(&req, "balanced", &[]);
-
     assert_eq!(plan.intent, AnswerIntent::CodingFollowUp);
     assert_eq!(plan.output, AnswerOutput::CodeArtifact);
     assert_eq!(plan.recommended_lane, "deep");
@@ -3190,6 +3454,28 @@ fn answer_plan_python_followup_uses_code_followup() {
     assert!(system.contains("include unchanged surrounding code"));
     assert!(!system.contains("Changed block"));
     assert!(!system.contains("unified diff; do not replace"));
+}
+
+#[test]
+fn answer_plan_thread_safe_lru_followup_preserves_the_first_principles_structure() {
+    let req = complete_request(
+        "Question:\nMake that same LRU implementation thread-safe without replacing it with a library cache. Return the complete updated code.",
+    );
+    let mut plan = answer_plan_for_request(&req, "balanced", &[]);
+    plan.intent = AnswerIntent::CodingFollowUp;
+    assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+
+    let (system, _) = prompt_with_answer_plan(
+        "You are Bluey.",
+        &req.user,
+        &plan,
+        &WebSearchOutcome::default(),
+    );
+
+    assert!(system.contains("Thread-safe LRU follow-up invariant"));
+    assert!(system.contains("do not substitute `collections.OrderedDict`"));
+    assert!(system.contains("one shared `threading.RLock`"));
+    assert!(system.contains("both public `get` and `put` operations"));
 }
 
 #[test]
@@ -3267,9 +3553,7 @@ fn answer_plan_live_lru_explanation_does_not_demand_code() {
     );
     assert!(system.contains("LRU ready-to-say final output invariant"));
     assert!(system.contains("Never append a `Reasoning`, `Core Intent`"));
-    assert!(should_strip_unsolicited_coaching_appendix(
-        &plan, &req.user
-    ));
+    assert!(should_strip_unsolicited_coaching_appendix(&plan, &req.user));
 
     let spoken = "An LRU cache combines a hashmap with a doubly linked list. A read moves the node to the most-recent end, and an insertion beyond capacity removes the least-recent node. Get and put are O(1), auxiliary work is O(1), and total space is O(capacity).";
     let mut output = BufferedDisclosureOutput::new(true);

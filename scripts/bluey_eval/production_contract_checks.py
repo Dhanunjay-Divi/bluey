@@ -763,6 +763,16 @@ def self_check_production_answer_contracts(
         "Abuse-blocked links use 302 to a safe warning interstitial, never stored destination.",
     ):
         assert not url_shortener_safety_issues(safe_url_wording), safe_url_wording
+    # Exact live Q41 wording: this is a fail-closed outcome, not an inactive
+    # redirect. Keep a negative control so an affirmative redirect remains caught.
+    round559_live_q41_inactive_outcome = (
+        "Deleted, expired, or blocked links return non-redirect responses."
+    )
+    assert not url_shortener_safety_issues(round559_live_q41_inactive_outcome)
+    assert "unsafe_redirect_for_inactive_or_blocked_link" in url_shortener_safety_issues(
+        "Deleted links return a non-redirect response, but expired links return "
+        "302 to the stored destination."
+    )
     unsafe_url_wording = (
         ("Blocked links get a 307 to the stored destination.", "unsafe_redirect_for_inactive_or_blocked_link"),
         ("Redirect expired mappings with 302.", "unsafe_redirect_for_inactive_or_blocked_link"),
@@ -893,6 +903,49 @@ def self_check_production_answer_contracts(
         require_same_operation_retry_reuse=True,
     )
     assert not payment_timeout_followup_completeness_issues(saved_round539_q40)
+    # Exact live round559 wording: plural webhooks are valid authoritative
+    # evidence when the answer explicitly binds the UNKNOWN transition to
+    # authoritative signals.
+    round559_live_q40 = (
+        "I would transition the payment intent from PROCESSING to UNKNOWN and stop "
+        "automatic charge retries. After that, I reconcile by provider payment ID or "
+        "client reference, plus webhooks deduplicated under a database uniqueness "
+        "constraint on provider event ID. Those authoritative signals can move UNKNOWN "
+        "to SUCCEEDED, FAILED, or CANCELED. If the result is still inconclusive, I keep "
+        "it UNKNOWN and use a manual reconciliation path, not a second charge. Only if "
+        "the provider contract explicitly guarantees idempotent replay, and the outcome "
+        "remains unresolved after reconciliation, would I retry the exact same provider "
+        "command under a bounded policy with the original operation's idempotency key. "
+        "I would never generate a new key or create a second effect."
+    )
+    assert not has_unsafe_ambiguous_payment_outcome(round559_live_q40)
+    assert not payment_timeout_followup_completeness_issues(round559_live_q40)
+    direct_authoritative_plural_webhooks = (
+        "I transition the payment intent from PROCESSING to UNKNOWN and stop automatic "
+        "charge retries. I reconcile by provider payment ID or client reference, plus "
+        "webhooks deduplicated under a database uniqueness constraint on provider event "
+        "ID. Authoritative provider webhooks transition UNKNOWN to SUCCEEDED, FAILED, "
+        "or CANCELED. If the result is still inconclusive, I keep it UNKNOWN and use a "
+        "manual reconciliation path, not a second charge. Only if the provider contract "
+        "explicitly guarantees idempotent replay, and the outcome remains unresolved "
+        "after reconciliation, would I retry the exact same provider command under a "
+        "bounded policy with the original operation's idempotency key. I would never "
+        "generate a new key or create a second effect."
+    )
+    assert not has_unsafe_ambiguous_payment_outcome(
+        direct_authoritative_plural_webhooks
+    )
+    assert not payment_timeout_followup_completeness_issues(
+        direct_authoritative_plural_webhooks
+    )
+    plural_webhooks_without_authority = (
+        "After a timeout, the provider sends webhooks. Our local timer moves UNKNOWN "
+        "to SUCCEEDED or FAILED."
+    )
+    assert has_unsafe_ambiguous_payment_outcome(plural_webhooks_without_authority)
+    assert "missing_authoritative_unknown_terminal_transitions" in (
+        payment_timeout_followup_completeness_issues(plural_webhooks_without_authority)
+    )
     for unsafe_terminal_policy in (
         "After the reconciliation deadline, treat UNKNOWN as FAILED.",
         "A timer flips UNKNOWN to FAILED after 24 hours.",

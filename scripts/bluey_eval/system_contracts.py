@@ -877,7 +877,7 @@ def payment_timeout_followup_completeness_issues(text: str) -> List[str]:
     ]
     authoritative_transition = any(
         re.search(r"\b(?:provider|processor)\b", sentence)
-        and re.search(r"\b(?:status|lookup|query|webhook|evidence|response)\b", sentence)
+        and re.search(r"\b(?:status|lookup|query|webhooks?|evidence|response)\b", sentence)
         and re.search(r"\b(?:authoritative|confirm|definitive)\w*\b", sentence)
         for sentence in transition_sentences
     )
@@ -885,7 +885,7 @@ def payment_timeout_followup_completeness_issues(text: str) -> List[str]:
         authoritative_transition
         or any(
             re.search(r"\b(?:provider|processor)\b", sentence)
-            and re.search(r"\b(?:status|lookup|query|webhook|evidence|response)\b", sentence)
+            and re.search(r"\b(?:status|lookup|query|webhooks?|evidence|response)\b", sentence)
             and re.search(
                 r"\b(?:those|these|such)\s+authoritative\s+"
                 r"(?:signals?|results?|responses?|sources?|evidence)\b",
@@ -898,7 +898,7 @@ def payment_timeout_followup_completeness_issues(text: str) -> List[str]:
         "unknown" in sentence
         and re.search(r"\b(?:move|transition|resolve|remain|stay)\w*\b", sentence)
         and re.search(r"\b(?:provider|processor)\b", sentence)
-        and re.search(r"\b(?:status|lookup|query|webhook|evidence|response)\b", sentence)
+        and re.search(r"\b(?:status|lookup|query|webhooks?|evidence|response)\b", sentence)
         and re.search(r"\b(?:authoritative|confirm|definitive)\w*\b", sentence)
         for sentence in sentences
     )
@@ -1006,7 +1006,10 @@ def url_shortener_safety_issues(
         r"(?:deleted|expired|blocked|abuse[- ]blocked|disabled|tombstoned|"
         r"revoked|suspended|quarantined|malicious)"
     )
-    redirect = r"(?:30[1278]|redirect\w*)"
+    # `non-redirect response` is explicitly a fail-closed outcome, not a
+    # redirect. Exclude both common spellings while retaining every affirmative
+    # redirect in inactive-state safety checks.
+    redirect = r"(?:30[1278]|(?<!non-)(?<!non\s)redirect\w*)"
     for clause in clauses:
         associates_state_with_redirect = bool(
             re.search(

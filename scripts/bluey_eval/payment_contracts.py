@@ -697,15 +697,15 @@ def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
     def provider_authoritatively_resolves_terminal_state(context: str) -> bool:
         provider_source = bool(
             re.search(r"\b(?:provider|processor|gateway|acquirer)\b", context)
-            and re.search(r"\b(?:status|lookup|query|webhook|evidence)\b", context)
+            and re.search(r"\b(?:status|lookup|query|webhooks?|evidence)\b", context)
         )
         authoritative_gate = bool(
             re.search(
                 r"\b(?:only\s+from|after|based\s+on|when)\b.{0,80}"
                 r"\b(?:authoritative|confirmed|definitive)\b.{0,30}"
-                r"\b(?:provider\s+)?(?:status|webhook|evidence|response)\b|"
+                r"\b(?:provider\s+)?(?:status|webhooks?|evidence|response)\b|"
                 r"\b(?:authoritative|confirmed|definitive)\b.{0,30}"
-                r"\b(?:provider\s+)?(?:status|webhook|evidence|response)\b"
+                r"\b(?:provider\s+)?(?:status|webhooks?|evidence|response)\b"
                 r".{0,80}\b(?:moves?|transitions?|resolves?|sets?)\b",
                 context,
             )

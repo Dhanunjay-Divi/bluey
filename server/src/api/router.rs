@@ -30,21 +30,10 @@ use cue_core::prompt_contracts::ROLE_ADAPTIVE_PRACTITIONER_VOICE;
 use cue_core::short_observability_ref;
 
 mod interview_contracts;
+mod sse;
 mod visible_output;
+use sse::{response_to_sse_events, router_sse, RouterSseStream};
 use visible_output::{explicitly_requests_reasoning_section, BufferedDisclosureOutput};
-
-type RouterSseStream =
-    Pin<Box<dyn futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static>>;
-
-const ROUTER_SSE_KEEP_ALIVE_SECS: u64 = 15;
-
-fn router_sse(stream: RouterSseStream) -> Sse<RouterSseStream> {
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(std::time::Duration::from_secs(ROUTER_SSE_KEEP_ALIVE_SECS))
-            .text("bluey-stream-keepalive"),
-    )
-}
 
 fn log_session_id(session_id: Option<&str>) -> &str {
     session_id
@@ -402,6 +391,132 @@ struct CanvasSpokenStream {
     stopped_at_canvas: bool,
     content_line: bool,
     delivered_chars: usize,
+}
+
+/// Holds the implementation portion of a strict first-principles LRU answer
+/// until the completed provider response passes the pre-billing contract
+/// checks. Text before the opening fence remains streaming, so this does not
+/// change normal chat latency or any non-strict code request.
+struct StrictLruCodeStreamGate {
+    enabled: bool,
+    code_fence_seen: bool,
+    pending_fence_prefix: String,
+    held_code: String,
+    delivered_meaningful_content: bool,
+}
+
+impl StrictLruCodeStreamGate {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            code_fence_seen: false,
+            pending_fence_prefix: String::new(),
+            held_code: String::new(),
+            delivered_meaningful_content: false,
+        }
+    }
+
+    /// Releases ordinary text immediately, retaining up to two trailing
+    /// backticks so a fence split across provider deltas is still recognized.
+    /// From the first opening fence onward, content remains private until the
+    /// complete response is validated.
+    fn push(&mut self, delta: &str) -> Option<String> {
+        if !self.enabled {
+            self.delivered_meaningful_content |= delta.chars().any(|ch| !ch.is_whitespace());
+            return (!delta.is_empty()).then(|| delta.to_string());
+        }
+        if self.code_fence_seen {
+            self.held_code.push_str(delta);
+            return None;
+        }
+
+        self.pending_fence_prefix.push_str(delta);
+        if let Some(fence_start) = self.pending_fence_prefix.find("```") {
+            let held = self.pending_fence_prefix.split_off(fence_start);
+            self.held_code.push_str(&held);
+            self.code_fence_seen = true;
+            return self.release_pending_prefix();
+        }
+
+        let trailing_backticks = self
+            .pending_fence_prefix
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'`')
+            .count()
+            .min(2);
+        let release_bytes = self
+            .pending_fence_prefix
+            .len()
+            .saturating_sub(trailing_backticks);
+        if release_bytes == 0 {
+            return None;
+        }
+        let released: String = self.pending_fence_prefix.drain(..release_bytes).collect();
+        self.record_delivery(&released, false)
+    }
+
+    /// Releases the held code only after the final response has passed all
+    /// contract checks. An unterminated candidate fence is ordinary text only
+    /// when no opening fence was ever recognized.
+    fn release_after_quality_pass(&mut self) -> Option<String> {
+        let mut released = std::mem::take(&mut self.pending_fence_prefix);
+        released.push_str(&std::mem::take(&mut self.held_code));
+        self.record_delivery(&released, true)
+    }
+
+    /// Error paths must not strand an ordinary prefix or one/two backticks
+    /// while a fence is still ambiguous. Once an opening fence was recognized,
+    /// however, the buffered implementation is deliberately discarded.
+    fn release_after_failure(&mut self) -> Option<String> {
+        if self.code_fence_seen {
+            self.pending_fence_prefix.clear();
+            self.held_code.clear();
+            return None;
+        }
+        let released = std::mem::take(&mut self.pending_fence_prefix);
+        self.record_delivery(&released, false)
+    }
+
+    fn has_delivered(&self) -> bool {
+        self.delivered_meaningful_content
+    }
+
+    fn release_pending_prefix(&mut self) -> Option<String> {
+        let released = std::mem::take(&mut self.pending_fence_prefix);
+        self.record_delivery(&released, false)
+    }
+
+    fn record_delivery(&mut self, released: &str, terminal_success: bool) -> Option<String> {
+        let released = if self.enabled && !self.delivered_meaningful_content {
+            released.trim_start()
+        } else {
+            released
+        };
+        let released = if self.enabled && terminal_success {
+            released.trim_end()
+        } else {
+            released
+        };
+        if released.is_empty() {
+            None
+        } else {
+            self.delivered_meaningful_content |= released.chars().any(|ch| !ch.is_whitespace());
+            Some(released.to_string())
+        }
+    }
+}
+
+fn append_visible_delta(existing: &mut Option<String>, suffix: Option<String>) {
+    let Some(suffix) = suffix else {
+        return;
+    };
+    if let Some(existing) = existing {
+        existing.push_str(&suffix);
+    } else {
+        *existing = Some(suffix);
+    }
 }
 
 impl CanvasSpokenStream {
@@ -1629,14 +1744,16 @@ fn looks_like_overlapping_sensor_deduplication(normalized_question: &str) -> boo
         && contains_any(normalized_question, &["overlap", "overlapping"])
         && contains_any(
             normalized_question,
-            &["double count", "double-count", "multiple times", "duplicate"],
+            &[
+                "double count",
+                "double-count",
+                "multiple times",
+                "duplicate",
+            ],
         )
 }
 
-fn supports_high_stakes_scenario_answer(
-    plan: &AnswerPlan,
-    normalized_question: &str,
-) -> bool {
+fn supports_high_stakes_scenario_answer(plan: &AnswerPlan, normalized_question: &str) -> bool {
     matches!(
         plan.intent,
         AnswerIntent::General
@@ -1714,10 +1831,7 @@ fn looks_like_large_foreign_key_migration_question(
         )
 }
 
-fn looks_like_high_stakes_scenario_contract(
-    plan: &AnswerPlan,
-    normalized_question: &str,
-) -> bool {
+fn looks_like_high_stakes_scenario_contract(plan: &AnswerPlan, normalized_question: &str) -> bool {
     looks_like_large_foreign_key_migration_question(normalized_question, plan)
         || (supports_high_stakes_scenario_answer(plan, normalized_question)
             && (looks_like_tail_latency_release_decision(normalized_question)
@@ -1746,8 +1860,10 @@ fn prioritize_routes_for_answer_plan(
             AnswerIntent::Quick | AnswerIntent::General | AnswerIntent::FollowUp
         )
         && !employment_document_surface;
-    let quality_sensitive_answer = plan.output == AnswerOutput::InterviewAnswer
-        || compact_live_interview_answer
+    let quality_sensitive_answer = matches!(
+        plan.output,
+        AnswerOutput::InterviewAnswer | AnswerOutput::CodeArtifact
+    ) || compact_live_interview_answer
         || (plan.intent == AnswerIntent::SystemDesign && plan.output == AnswerOutput::CanvasDetail)
         || looks_like_high_stakes_scenario_contract(plan, normalized_question);
     if !enabled || effective_lane != "balanced" || !quality_sensitive_answer {
@@ -2583,9 +2699,18 @@ fn generated_answer_quality_failure(
     output_tokens: i64,
     max_tokens: Option<u32>,
     plan: &AnswerPlan,
+    normalized_question: &str,
 ) -> Option<&'static str> {
     if likely_truncated_at_budget(text, output_tokens, max_tokens) {
         return Some("upstream_output_truncated");
+    }
+    if lru_code_uses_library_cache(text, plan, normalized_question) {
+        return Some("upstream_code_contract_failed");
+    }
+    if requires_first_principles_lru_code(plan, normalized_question)
+        && !lru_code_has_obvious_first_principles_structure(text)
+    {
+        return Some("upstream_code_contract_failed");
     }
     let substantive_words = text
         .split_whitespace()
@@ -2595,6 +2720,118 @@ fn generated_answer_quality_failure(
         return Some("upstream_answer_too_short");
     }
     None
+}
+
+fn lru_code_uses_library_cache(text: &str, plan: &AnswerPlan, normalized_question: &str) -> bool {
+    if !requires_first_principles_lru_code(plan, normalized_question) {
+        return false;
+    }
+
+    let mut inside_fence = false;
+    let lru_cache_aliases = ["lru_cache"];
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            inside_fence = !inside_fence;
+            continue;
+        }
+        if !inside_fence || trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        let code = trimmed.to_ascii_lowercase();
+        if code.starts_with("import collections") || code.starts_with("from collections import") {
+            return true;
+        }
+        if let Some(imports) = code.strip_prefix("from functools import") {
+            for imported in imports.split(',') {
+                let imported = imported.trim();
+                let mut words = imported.split_whitespace();
+                if words.next() == Some("lru_cache") {
+                    return true;
+                }
+            }
+        }
+        if code.contains("functools.lru_cache")
+            || code.contains(".lru_cache")
+            || code.strip_prefix('@').is_some_and(|decorator| {
+                let decorator = decorator
+                    .trim_start()
+                    .split(['(', ' ', '\t'])
+                    .next()
+                    .unwrap_or_default();
+                lru_cache_aliases.contains(&decorator)
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn requires_first_principles_lru_code(plan: &AnswerPlan, normalized_question: &str) -> bool {
+    plan.output == AnswerOutput::CodeArtifact
+        && contains_any(normalized_question, &["lru", "least recently used"])
+        && contains_any(
+            normalized_question,
+            &[
+                "from first principles",
+                "without a library cache",
+                "without replacing it with a library cache",
+            ],
+        )
+        && !contains_any(
+            normalized_question,
+            &[
+                "using collections ordereddict",
+                "use collections ordereddict",
+                "with collections ordereddict",
+                "using functools lru cache",
+                "use functools lru cache",
+                "with functools lru cache",
+            ],
+        )
+}
+
+/// This is deliberately an obvious-shape gate, not a proof of LRU correctness:
+/// it stops empty placeholders from reaching a streaming client before the
+/// deeper evaluator can inspect behavior and invariants.
+fn lru_code_has_obvious_first_principles_structure(text: &str) -> bool {
+    let mut inside_fence = false;
+    let mut saw_opening_fence = false;
+    let mut saw_closing_fence = false;
+    let mut code = String::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if inside_fence {
+                saw_closing_fence = true;
+            } else {
+                saw_opening_fence = true;
+            }
+            inside_fence = !inside_fence;
+            continue;
+        }
+        if inside_fence {
+            code.push_str(line);
+            code.push('\n');
+        }
+    }
+    if !saw_opening_fence || !saw_closing_fence {
+        return false;
+    }
+
+    let code = code.to_ascii_lowercase();
+    let has_sentinel_pair = (code.contains("head") && code.contains("tail"))
+        || (code.contains("left") && code.contains("right"))
+        || (code.contains("front") && code.contains("back"));
+    code.contains("class lrucache")
+        && code.contains("def get")
+        && code.contains("def put")
+        && code.contains("prev")
+        && code.contains("next")
+        && has_sentinel_pair
+        && ["hashmap", "cache", "map", "nodes"]
+            .iter()
+            .any(|signal| code.contains(signal))
 }
 
 fn flush_interrupted_role_anchor(
@@ -6367,7 +6604,18 @@ fn prompt_with_answer_plan(
     plan: &AnswerPlan,
     web_search: &WebSearchOutcome,
 ) -> (String, String) {
-    prompt_with_answer_plan_context(system, user, &[], plan, web_search)
+    prompt_with_answer_plan_context(system, user, &[], plan, web_search, None)
+}
+
+#[cfg(test)]
+fn prompt_with_answer_plan_with_max_tokens(
+    system: &str,
+    user: &str,
+    plan: &AnswerPlan,
+    web_search: &WebSearchOutcome,
+    max_tokens: u32,
+) -> (String, String) {
+    prompt_with_answer_plan_context(system, user, &[], plan, web_search, Some(max_tokens))
 }
 
 fn prompt_with_answer_plan_context(
@@ -6376,6 +6624,7 @@ fn prompt_with_answer_plan_context(
     answer_context: &[cue_core::AnswerContext],
     plan: &AnswerPlan,
     web_search: &WebSearchOutcome,
+    requested_max_tokens: Option<u32>,
 ) -> (String, String) {
     const DIRECT_TECHNICAL_PLAN_OUTPUT_CONTRACT: &str =
         "Strict output contract: write exactly one compact paragraph of 140-220 words. Do not use headings, bullets, numbered lists, a `Reasoning` section, citations, source or provenance commentary, candidate-background commentary, a preface, or closing meta-commentary. End immediately after the paragraph.";
@@ -6546,12 +6795,22 @@ fn prompt_with_answer_plan_context(
         );
     let lru_explanation = plan.output == AnswerOutput::Compact
         && contains_any(&normalized_question, &["lru", "least recently used"]);
-    let lru_ready_to_say_explanation = lru_explanation
-        && plan.interview_context
-        && !explicitly_requests_reasoning_section(user);
+    let lru_ready_to_say_explanation =
+        lru_explanation && plan.interview_context && !explicitly_requests_reasoning_section(user);
     let lru_code_implementation = plan.output == AnswerOutput::CodeArtifact
-        && matches!(plan.intent, AnswerIntent::Coding | AnswerIntent::CodingFollowUp)
+        && matches!(
+            plan.intent,
+            AnswerIntent::Coding | AnswerIntent::CodingFollowUp
+        )
         && contains_any(&normalized_question, &["lru", "least recently used"]);
+    let lru_thread_safe_followup = lru_code_implementation
+        && plan.intent == AnswerIntent::CodingFollowUp
+        && contains_any(
+            &normalized_question,
+            &["thread safe", "thread-safe", "threadsafe", "rlock", "lock"],
+        );
+    let compact_code_artifact_budget = plan.output == AnswerOutput::CodeArtifact
+        && requested_max_tokens.is_some_and(|max_tokens| max_tokens <= 1_200);
     let self_introduction_question = plan.output == AnswerOutput::InterviewAnswer
         && (looks_like_resume_intro_request(&normalized_question)
             || contains_any(
@@ -6584,8 +6843,8 @@ fn prompt_with_answer_plan_context(
     let scenario_answer = supports_high_stakes_scenario_answer(plan, &normalized_question);
     let tail_latency_release_decision =
         scenario_answer && looks_like_tail_latency_release_decision(&normalized_question);
-    let executive_model_rejection_explanation = scenario_answer
-        && looks_like_executive_model_rejection_explanation(&normalized_question);
+    let executive_model_rejection_explanation =
+        scenario_answer && looks_like_executive_model_rejection_explanation(&normalized_question);
     let overlapping_sensor_deduplication =
         scenario_answer && looks_like_overlapping_sensor_deduplication(&normalized_question);
     let two_director_conflict = contains_any(
@@ -6743,6 +7002,11 @@ fn prompt_with_answer_plan_context(
         plan.output.as_str(),
         plan.confidence
     );
+    if compact_code_artifact_budget {
+        instructions.push_str(
+            "\nExplicit small output-budget contract: finish a complete runnable answer within the requested token budget. Prioritize the complete fenced implementation and its closing fence over optional prose. Use at most one lead-in sentence, two short Approach bullets, two to four Line notes, and one concise sentence each for Explanation, Complexity, and Edge cases when needed. Do not enumerate every line of code or add a long walkthrough.",
+        );
+    }
 
     if use_default_direct_technical_shape {
         instructions.push('\n');
@@ -6856,6 +7120,11 @@ fn prompt_with_answer_plan_context(
             "\nLRU implementation structural check: use a key-to-node hashmap plus a real doubly linked recency list with two dummy boundary sentinels (`head`/`tail` or clearly equivalent names). A successful get and an existing-key put must move exactly one node to the most-recent position; insertion beyond capacity must unlink the least-recent node and remove the same key from the hashmap. Implement zero-capacity behavior in code: either reject non-positive capacity in the constructor, or make `put` return before any hashmap/list mutation when capacity is less than or equal to zero; never unlink or evict a sentinel. Close the Python fence immediately after the final executable or comment line. The headings `Line notes:`, `Explanation`, `Complexity`, and `Edge cases` and all presentation prose must be outside the fence."
         );
     }
+    if lru_thread_safe_followup {
+        instructions.push_str(
+            "\nThread-safe LRU follow-up invariant: preserve the prior first-principles hashmap, doubly linked list, and dummy sentinels; do not substitute `collections.OrderedDict`, `functools.lru_cache`, or any library cache. Add one shared `threading.RLock` initialized on the cache and hold that same lock around both public `get` and `put` operations, including every linked-list and hashmap mutation. Return the complete updated implementation, not a patch."
+        );
+    }
 
     if !web_search.sources.is_empty() {
         instructions.push_str(
@@ -6886,7 +7155,7 @@ fn prompt_with_answer_plan_context(
 
     if url_shortener_design {
         instructions.push_str(
-            "\nURL-shortener correctness contract: label every unsupplied numeric traffic, latency, retention, or availability value as an assumption. Protect ambiguous create retries with a client idempotency key that returns the already committed mapping. Create each short-code mapping through one strongly consistent canonical write path with a uniqueness constraint or conditional insert; generate a new candidate on collision rather than using check-then-act. Populate caches only from committed mappings, and keep cache propagation and click analytics asynchronous and eventually consistent. State the main tradeoff explicitly: mapping creation chooses strong consistency for uniqueness, while cache propagation and click analytics choose eventual consistency for scale. Every redirect-cache entry must carry the target, mapping state, `expires_at`, and mapping version, and every cache hit must check expiration against the current time. Use 302 or 307 for every public short link that may ever expire, be deleted, be abuse-blocked, or become legally unavailable, even when its destination is otherwise immutable. Send every revocable redirect response with `Cache-Control: no-store` and no positive browser, client, intermediary, or CDN `max-age`; internal mapping caches may remain behind the versioned deny overlay, but HTTP redirect responses must not create an unrevocable client-side freshness window. Never use 301 or 308 inside that revocable public-link trust domain because browser and intermediary caches are outside the service's invalidation control. A separately scoped non-revocable alias may use 301 or 308 only if the product explicitly accepts that client-cache risk and excludes the alias from deletion, expiry, moderation, and legal-revocation guarantees. An ordinary active-to-active target update may have explicitly bounded cache staleness with versioned invalidation; that allowance never applies after expiration, deletion, abuse blocking, or a legal block. Deleted or expired mappings return 404 or 410. Abuse-blocked mappings return 403 or a safe warning interstitial; reserve 451 exclusively for a mapping made unavailable because of a legal demand or legal restriction. Do not acknowledge a delete, abuse-block, or legal-block transition as complete while an old active redirect can still be served. Before acknowledging it, synchronously publish a versioned safety tombstone or deny overlay to the redirect path and purge or invalidate the old entry; if propagation or cache state is uncertain, fail closed with an authoritative state check or a non-redirect response. Retain the tombstone for every inactive state and never redirect those states to the stored destination. Never say a cache may remain stale after delete or block while also claiming that an inactive mapping can never redirect; explain the safety overlay, synchronous invalidation, or fail-closed check that makes both statements consistent. The canvas must include this exact sentence: `Every redirect worker checks the versioned deny overlay before serving any cached active mapping and fails closed to an authoritative state check or non-redirect response when overlay or cache state is uncertain.` Deliver click analytics at least once, deduplicate by event ID when exact counts matter, durably sink before committing the consumer offset, and replay after a pre-commit failure. Do not describe competing dual write paths for the source of truth."
+            "\nURL-shortener correctness contract: label every unsupplied numeric traffic, latency, retention, or availability value as an assumption. Protect ambiguous create retries with a client idempotency key that returns the already committed mapping. Create each short-code mapping through one strongly consistent canonical write path with a uniqueness constraint or conditional insert; generate a new candidate on collision rather than using check-then-act. Populate caches only from committed mappings, and keep cache propagation and click analytics asynchronous and eventually consistent. State the main tradeoff explicitly: mapping creation chooses strong consistency for uniqueness, while cache propagation and click analytics choose eventual consistency for scale. Every redirect-cache entry must carry the target, mapping state, `expires_at`, and mapping version, and every cache hit must check expiration against the current time. Use 302 or 307 for every public short link that may ever expire, be deleted, be abuse-blocked, or become legally unavailable, even when its destination is otherwise immutable. Send every revocable redirect response with `Cache-Control: no-store` and no positive browser, client, intermediary, or CDN `max-age`; internal mapping caches may remain behind the versioned deny overlay, but HTTP redirect responses must not create an unrevocable client-side freshness window. Never use 301 or 308 inside that revocable public-link trust domain because browser and intermediary caches are outside the service's invalidation control. A separately scoped non-revocable alias may use 301 or 308 only if the product explicitly accepts that client-cache risk and excludes the alias from deletion, expiry, moderation, and legal-revocation guarantees. An ordinary active-to-active target update may have explicitly bounded cache staleness with versioned invalidation; that allowance never applies after expiration, deletion, abuse blocking, or a legal block. The canvas must include this exact sentence: `Deleted or expired mappings return 404 or 410; abuse-blocked mappings return 403 or a safe warning interstitial; legal blocks return 451.` Do not acknowledge a delete, abuse-block, or legal-block transition as complete while an old active redirect can still be served. Before acknowledging it, synchronously publish a versioned safety tombstone or deny overlay to the redirect path and purge or invalidate the old entry; if propagation or cache state is uncertain, fail closed with an authoritative state check or a non-redirect response. Retain the tombstone for every inactive state and never redirect those states to the stored destination. Never say a cache may remain stale after delete or block while also claiming that an inactive mapping can never redirect; explain the safety overlay, synchronous invalidation, or fail-closed check that makes both statements consistent. The canvas must include this exact sentence: `Every redirect worker checks the versioned deny overlay before serving any cached active mapping and fails closed to an authoritative state check or non-redirect response when overlay or cache state is uncertain.` Deliver click analytics at least once, deduplicate by event ID when exact counts matter, durably sink before committing the consumer offset, and replay after a pre-commit failure. Do not describe competing dual write paths for the source of truth."
         );
     }
 
@@ -8313,6 +8582,7 @@ async fn complete_stream_inner(
         &req.context,
         &answer_plan,
         &web_search,
+        req.max_tokens,
     );
     let vision_text_fallback_lane = managed_vision_text_fallback_lane(&answer_plan);
     let (vision_text_fallback_system, vision_text_fallback_user) =
@@ -9055,10 +9325,13 @@ async fn complete_stream_inner(
     let stream_sources = web_sources.clone();
     // Canvas output contains a compact spoken section followed by durable
     // workbench detail. Stream the spoken section line-by-line while keeping
-    // the diagram/body out of the overlay. Code remains an intentionally
-    // streaming artifact so users see useful output without full-answer lag.
+    // the diagram/body out of the overlay. Strict first-principles LRU code
+    // is the narrow exception: its implementation stays private until the
+    // completed response has passed the contract gate.
     let split_canvas_stream = answer_plan.output == AnswerOutput::CanvasDetail
         && answer_plan.intent == AnswerIntent::SystemDesign;
+    let strict_lru_code_stream =
+        requires_first_principles_lru_code(&answer_plan, &normalized_route_question);
     let strip_interview_coaching_appendix =
         should_strip_unsolicited_coaching_appendix(&answer_plan, &req.user);
     let evidence_bound_role_reference = interview_contracts::evidence_bound_role_reference(
@@ -9076,6 +9349,7 @@ async fn complete_stream_inner(
             evidence_bound_role_reference,
         );
         let mut canvas_visible = CanvasSpokenStream::default();
+        let mut strict_lru_gate = StrictLruCodeStreamGate::new(strict_lru_code_stream);
         let mut final_tokens: Option<(i64, i64)> = None;
 
         for status_event in stream_status_events {
@@ -9095,18 +9369,22 @@ async fn complete_stream_inner(
                         let already_delivered = if split_canvas_stream {
                             canvas_visible.has_delivered()
                         } else {
-                            output.has_delivered()
+                            strict_lru_gate.has_delivered()
                         };
                         let partial =
                             flush_interrupted_role_anchor(&mut role_anchor, &mut output);
                         let partial_chars = output.char_count();
-                        let visible_partial = if split_canvas_stream {
+                        let mut visible_partial = if split_canvas_stream {
                             canvas_visible.push(&partial)
-                        } else if partial.is_empty() {
-                            None
                         } else {
-                            Some(partial)
+                            strict_lru_gate.push(&partial)
                         };
+                        if !split_canvas_stream {
+                            append_visible_delta(
+                                &mut visible_partial,
+                                strict_lru_gate.release_after_failure(),
+                            );
+                        }
                         let delivered_delta = already_delivered
                             || visible_partial
                                 .as_deref()
@@ -9192,7 +9470,7 @@ async fn complete_stream_inner(
                         let visible_delta = if split_canvas_stream {
                             canvas_visible.push(&safe_delta)
                         } else {
-                            Some(safe_delta)
+                            strict_lru_gate.push(&safe_delta)
                         };
                         if let Some(visible_delta) = visible_delta {
                             yield Ok(completion_delta_event(&visible_delta));
@@ -9207,17 +9485,21 @@ async fn complete_stream_inner(
                     let already_delivered = if split_canvas_stream {
                         canvas_visible.has_delivered()
                     } else {
-                        output.has_delivered()
+                        strict_lru_gate.has_delivered()
                     };
                     let partial = flush_interrupted_role_anchor(&mut role_anchor, &mut output);
                     let partial_chars = output.char_count();
-                    let visible_partial = if split_canvas_stream {
+                    let mut visible_partial = if split_canvas_stream {
                         canvas_visible.push(&partial)
-                    } else if partial.is_empty() {
-                        None
                     } else {
-                        Some(partial)
+                        strict_lru_gate.push(&partial)
                     };
+                    if !split_canvas_stream {
+                        append_visible_delta(
+                            &mut visible_partial,
+                            strict_lru_gate.release_after_failure(),
+                        );
+                    }
                     let delivered_delta = already_delivered
                         || visible_partial
                             .as_deref()
@@ -9304,17 +9586,21 @@ async fn complete_stream_inner(
             let already_delivered = if split_canvas_stream {
                 canvas_visible.has_delivered()
             } else {
-                output.has_delivered()
+                strict_lru_gate.has_delivered()
             };
             let partial = flush_interrupted_role_anchor(&mut role_anchor, &mut output);
             let partial_chars = output.char_count();
-            let visible_partial = if split_canvas_stream {
+            let mut visible_partial = if split_canvas_stream {
                 canvas_visible.push(&partial)
-            } else if partial.is_empty() {
-                None
             } else {
-                Some(partial)
+                strict_lru_gate.push(&partial)
             };
+            if !split_canvas_stream {
+                append_visible_delta(
+                    &mut visible_partial,
+                    strict_lru_gate.release_after_failure(),
+                );
+            }
             let delivered_delta = already_delivered
                 || visible_partial
                     .as_deref()
@@ -9388,7 +9674,7 @@ async fn complete_stream_inner(
                 let visible_delta = if split_canvas_stream {
                     canvas_visible.push(&safe_delta)
                 } else {
-                    Some(safe_delta)
+                    strict_lru_gate.push(&safe_delta)
                 };
                 if let Some(visible_delta) = visible_delta {
                     yield Ok(completion_delta_event(&visible_delta));
@@ -9399,22 +9685,27 @@ async fn complete_stream_inner(
         let already_delivered = if split_canvas_stream {
             canvas_visible.has_delivered()
         } else {
-            output.has_delivered()
+            strict_lru_gate.has_delivered()
         };
         let (text, final_delta) = output.finish();
-        let visible_final_delta = if split_canvas_stream {
+        let mut visible_final_delta = if split_canvas_stream {
             canvas_visible.push(&final_delta)
-        } else if final_delta.is_empty() {
-            None
         } else {
-            Some(final_delta)
+            strict_lru_gate.push(&final_delta)
         };
         if let Some(reason) = generated_answer_quality_failure(
             &provider_quality_text,
             output_tokens,
             Some(quality_max_tokens),
             &answer_plan,
+            &normalized_route_question,
         ) {
+            if !split_canvas_stream {
+                append_visible_delta(
+                    &mut visible_final_delta,
+                    strict_lru_gate.release_after_failure(),
+                );
+            }
             if let Some(visible_final_delta) = visible_final_delta.as_deref() {
                 yield Ok(completion_delta_event(visible_final_delta));
             }
@@ -9462,9 +9753,14 @@ async fn complete_stream_inner(
                     }),
                 },
             );
+            let error_message = if reason == "upstream_code_contract_failed" {
+                "upstream provider code violated the requested implementation contract; please retry"
+            } else {
+                "upstream provider returned an incomplete answer; please retry"
+            };
             yield Ok(Event::default().event("error").data(
                 serde_json::json!({
-                    "error": "upstream provider returned an incomplete answer; please retry",
+                    "error": error_message,
                     "reason": reason,
                 })
                 .to_string(),
@@ -9473,6 +9769,9 @@ async fn complete_stream_inner(
         }
         if let Some(visible_final_delta) = visible_final_delta {
             yield Ok(completion_delta_event(&visible_final_delta));
+        }
+        if let Some(held_code) = strict_lru_gate.release_after_quality_pass() {
+            yield Ok(completion_delta_event(&held_code));
         }
         let artifact = response_artifact_for_plan(&text, &answer_plan);
         if code_artifact_missing_for_plan(&answer_plan, artifact.as_ref()) {
@@ -10068,6 +10367,7 @@ async fn complete_inner(
         &req.context,
         &answer_plan,
         &web_search,
+        req.max_tokens,
     );
 
     // 2. Resolve lane → provider+model candidates. The reservation uses the
@@ -10602,6 +10902,7 @@ async fn complete_inner(
         comp.output_tokens,
         Some(quality_max_tokens),
         &answer_plan,
+        &normalized_route_question,
     ) {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
         release_llm_usage(&state.pool, &account.id, &req.request_id, reason);
@@ -10937,45 +11238,6 @@ use response_artifacts::{
 use response_artifacts::{
     response_artifact, response_artifact_for_output, visible_response_text_for_artifact,
 };
-
-fn response_to_sse_events(response: CompleteResponse) -> Vec<Event> {
-    let mut events = Vec::new();
-    if let Some(source_event) = sources_sse_event(&response.sources) {
-        events.push(source_event);
-    }
-    let mut text_events = response
-        .text
-        .split_inclusive(char::is_whitespace)
-        .filter(|chunk| !chunk.is_empty())
-        .map(|chunk| {
-            Event::default().data(
-                serde_json::json!({
-                    "choices": [
-                        { "delta": { "content": chunk } }
-                    ]
-                })
-                .to_string(),
-            )
-        })
-        .collect::<Vec<_>>();
-    if text_events.is_empty() {
-        text_events.push(
-            Event::default().data(
-                serde_json::json!({
-                    "choices": [
-                        { "delta": { "content": "" } }
-                    ]
-                })
-                .to_string(),
-            ),
-        );
-    }
-    events.extend(text_events);
-    let billing = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-    events.push(Event::default().event("billing").data(billing));
-    events.push(Event::default().data("[DONE]"));
-    events
-}
 
 mod embeddings;
 pub use embeddings::{
