@@ -1033,24 +1033,40 @@ fn answer_quality_guard_rejects_near_empty_interview_answer() {
         Some("upstream_answer_too_short")
     );
 
-    let prefix =
-        "I'm interested in the supplied target role because its domain fits my background.";
-    let provider_answer =
-        "I would learn the system, meet stakeholders, establish baselines, and ship one improvement.";
-    let visible_answer = format!("{prefix}\n\n{provider_answer}");
-    assert_eq!(
-        provider_origin_visible_answer(&visible_answer, Some(prefix)),
-        provider_answer
-    );
-    assert_eq!(
-        generated_answer_quality_failure(
-            provider_origin_visible_answer(&visible_answer, Some(prefix)),
-            20,
-            Some(700),
-            &plan,
+    let provider_answer = "I'm interested in this role because I would learn the system, meet stakeholders, establish baselines, and ship one improvement.";
+    let visible_answer = interview_contracts::anchor_complete_provider_answer(
+        provider_answer,
+        Some(
+            "HPE's AI datacenter role, which focuses on network data, anomaly detection, and visibility",
         ),
+    );
+    assert!(visible_answer.contains("HPE's AI datacenter role"));
+    assert!(visible_answer.split_whitespace().count() > provider_answer.split_whitespace().count());
+    assert_eq!(
+        generated_answer_quality_failure(provider_answer, 20, Some(700), &plan,),
         Some("upstream_answer_too_short")
     );
+}
+
+#[test]
+fn interrupted_role_anchor_releases_the_complete_held_opening_once() {
+    let raw_opening = format!(
+        "I'm interested in this role because {}",
+        "reliable production systems ".repeat(8)
+    );
+    assert!(raw_opening.chars().count() > 96);
+    assert!(raw_opening.chars().count() < 512);
+
+    let mut role_anchor = interview_contracts::EvidenceBoundRoleAnchor::new(Some(
+        "HPE's AI datacenter role, which focuses on network data, anomaly detection, and visibility",
+    ));
+    assert_eq!(role_anchor.push(&raw_opening), None);
+    let mut output = BufferedDisclosureOutput::default();
+    assert_eq!(
+        flush_interrupted_role_anchor(&mut role_anchor, &mut output),
+        raw_opening
+    );
+    assert_eq!(role_anchor.finish(), None);
 }
 
 #[test]

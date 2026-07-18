@@ -2450,14 +2450,16 @@ fn generated_answer_quality_failure(
     None
 }
 
-fn provider_origin_visible_answer<'a>(
-    visible_answer: &'a str,
-    evidence_bound_prefix: Option<&str>,
-) -> &'a str {
-    evidence_bound_prefix
-        .and_then(|prefix| visible_answer.strip_prefix(prefix))
-        .map(str::trim_start)
-        .unwrap_or(visible_answer)
+fn flush_interrupted_role_anchor(
+    role_anchor: &mut interview_contracts::EvidenceBoundRoleAnchor,
+    output: &mut BufferedDisclosureOutput,
+) -> String {
+    let mut safe_partial = role_anchor
+        .finish()
+        .and_then(|raw_opening| output.push(&raw_opening))
+        .unwrap_or_default();
+    safe_partial.push_str(&output.take_safe());
+    safe_partial
 }
 
 fn upstream_stream_failure_reason(error: &anyhow::Error) -> &'static str {
@@ -8799,7 +8801,7 @@ async fn complete_stream_inner(
         && answer_plan.intent == AnswerIntent::SystemDesign;
     let strip_interview_coaching_appendix =
         should_strip_unsolicited_coaching_appendix(&answer_plan, &req.user);
-    let evidence_bound_answer_prefix = interview_contracts::evidence_bound_answer_prefix(
+    let evidence_bound_role_reference = interview_contracts::evidence_bound_role_reference(
         &normalize_guardrail_text(&extract_search_question(&req.user)),
         &req.context,
         &answer_plan,
@@ -8808,6 +8810,11 @@ async fn complete_stream_inner(
         let mut events = streaming.events;
         let mut pending_first = selected_first_event;
         let mut output = BufferedDisclosureOutput::new(strip_interview_coaching_appendix);
+        let mut provider_quality_output =
+            BufferedDisclosureOutput::new(strip_interview_coaching_appendix);
+        let mut role_anchor = interview_contracts::EvidenceBoundRoleAnchor::new(
+            evidence_bound_role_reference,
+        );
         let mut canvas_visible = CanvasSpokenStream::default();
         let mut final_tokens: Option<(i64, i64)> = None;
 
@@ -8817,12 +8824,6 @@ async fn complete_stream_inner(
         if let Some(source_event) = sources_sse_event(&stream_sources) {
             yield Ok(source_event);
         }
-        if let Some(prefix) = evidence_bound_answer_prefix {
-            if let Some(safe_prefix) = output.push(&format!("{prefix}\n\n")) {
-                yield Ok(completion_delta_event(&safe_prefix));
-            }
-        }
-
         loop {
             // B2: replay the event prefetched during the first-token deadline
             // check before resuming the live stream.
@@ -8831,13 +8832,14 @@ async fn complete_stream_inner(
                 None => match tokio::time::timeout(stream_idle_deadline, events.next()).await {
                     Ok(event) => event,
                     Err(_) => {
-                        let partial_chars = output.char_count();
                         let already_delivered = if split_canvas_stream {
                             canvas_visible.has_delivered()
                         } else {
                             output.has_delivered()
                         };
-                        let partial = output.take_safe();
+                        let partial =
+                            flush_interrupted_role_anchor(&mut role_anchor, &mut output);
+                        let partial_chars = output.char_count();
                         let visible_partial = if split_canvas_stream {
                             canvas_visible.push(&partial)
                         } else if partial.is_empty() {
@@ -8922,7 +8924,11 @@ async fn complete_stream_inner(
             }
             match event {
                 Ok(routing::CompletionStreamEvent::Delta(delta)) => {
-                    if let Some(safe_delta) = output.push(&delta) {
+                    let _ = provider_quality_output.push(&delta);
+                    let Some(presentation_delta) = role_anchor.push(&delta) else {
+                        continue;
+                    };
+                    if let Some(safe_delta) = output.push(&presentation_delta) {
                         let visible_delta = if split_canvas_stream {
                             canvas_visible.push(&safe_delta)
                         } else {
@@ -8938,13 +8944,13 @@ async fn complete_stream_inner(
                     break;
                 }
                 Err(e) => {
-                    let partial_chars = output.char_count();
                     let already_delivered = if split_canvas_stream {
                         canvas_visible.has_delivered()
                     } else {
                         output.has_delivered()
                     };
-                    let partial = output.take_safe();
+                    let partial = flush_interrupted_role_anchor(&mut role_anchor, &mut output);
+                    let partial_chars = output.char_count();
                     let visible_partial = if split_canvas_stream {
                         canvas_visible.push(&partial)
                     } else if partial.is_empty() {
@@ -9035,13 +9041,13 @@ async fn complete_stream_inner(
         }
 
         let Some((input_tokens, output_tokens)) = final_tokens else {
-            let partial_chars = output.char_count();
             let already_delivered = if split_canvas_stream {
                 canvas_visible.has_delivered()
             } else {
                 output.has_delivered()
             };
-            let partial = output.take_safe();
+            let partial = flush_interrupted_role_anchor(&mut role_anchor, &mut output);
+            let partial_chars = output.char_count();
             let visible_partial = if split_canvas_stream {
                 canvas_visible.push(&partial)
             } else if partial.is_empty() {
@@ -9117,6 +9123,19 @@ async fn complete_stream_inner(
             yield Ok(Event::default().event("error").data(payload.to_string()));
             return;
         }
+        if let Some(raw_opening) = role_anchor.finish() {
+            if let Some(safe_delta) = output.push(&raw_opening) {
+                let visible_delta = if split_canvas_stream {
+                    canvas_visible.push(&safe_delta)
+                } else {
+                    Some(safe_delta)
+                };
+                if let Some(visible_delta) = visible_delta {
+                    yield Ok(completion_delta_event(&visible_delta));
+                }
+            }
+        }
+        let (provider_quality_text, _) = provider_quality_output.finish();
         let already_delivered = if split_canvas_stream {
             canvas_visible.has_delivered()
         } else {
@@ -9130,10 +9149,8 @@ async fn complete_stream_inner(
         } else {
             Some(final_delta)
         };
-        let provider_quality_text =
-            provider_origin_visible_answer(&text, evidence_bound_answer_prefix);
         if let Some(reason) = generated_answer_quality_failure(
-            provider_quality_text,
+            &provider_quality_text,
             output_tokens,
             Some(quality_max_tokens),
             &answer_plan,
@@ -10302,24 +10319,26 @@ async fn complete_inner(
         return Err(err);
     }
 
-    let mut output = BufferedDisclosureOutput::new(should_strip_unsolicited_coaching_appendix(
-        &answer_plan,
-        &req.user,
-    ));
-    let evidence_bound_answer_prefix = interview_contracts::evidence_bound_answer_prefix(
+    let strip_interview_coaching_appendix =
+        should_strip_unsolicited_coaching_appendix(&answer_plan, &req.user);
+    let evidence_bound_role_reference = interview_contracts::evidence_bound_role_reference(
         &normalize_guardrail_text(&extract_search_question(&req.user)),
         &req.context,
         &answer_plan,
     );
-    if let Some(prefix) = evidence_bound_answer_prefix {
-        let _ = output.push(&format!("{prefix}\n\n"));
-    }
-    let _ = output.push(&comp.text);
+    let mut provider_quality_output =
+        BufferedDisclosureOutput::new(strip_interview_coaching_appendix);
+    let _ = provider_quality_output.push(&comp.text);
+    let (provider_quality_text, _) = provider_quality_output.finish();
+    let presentation_text = interview_contracts::anchor_complete_provider_answer(
+        &comp.text,
+        evidence_bound_role_reference,
+    );
+    let mut output = BufferedDisclosureOutput::new(strip_interview_coaching_appendix);
+    let _ = output.push(&presentation_text);
     let (response_text, _) = output.finish();
-    let provider_quality_text =
-        provider_origin_visible_answer(&response_text, evidence_bound_answer_prefix);
     if let Some(reason) = generated_answer_quality_failure(
-        provider_quality_text,
+        &provider_quality_text,
         comp.output_tokens,
         Some(quality_max_tokens),
         &answer_plan,

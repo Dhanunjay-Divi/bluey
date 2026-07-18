@@ -9,7 +9,8 @@ use super::{
 };
 use cue_core::{AnswerContext, AnswerContextRole};
 
-const HPE_DATACENTER_ROLE_PREFIX: &str = "I'm interested in HPE's AI datacenter role because it focuses on network data, anomaly detection, and visibility.";
+const HPE_DATACENTER_ROLE_REFERENCE: &str =
+    "HPE's AI datacenter role, which focuses on network data, anomaly detection, and visibility";
 const HPE_DATACENTER_ROLE_TERMS: &[&str] = &[
     "hpe",
     "ai datacenter",
@@ -161,7 +162,7 @@ pub(super) fn append_interview_correctness_contracts(
         );
         if supplied_hpe_datacenter_role && plan.output == AnswerOutput::InterviewAnswer {
             append(&format!(
-                "Supplied-role anchor: Bluey will prepend this source-grounded opening sentence to the visible answer: `{HPE_DATACENTER_ROLE_PREFIX}` Continue with candidate-fit evidence and the 30-60-90 plan without repeating a generic why-role opening. Keep every claim about the candidate grounded in the supplied resume."
+                "Supplied-role anchor: Bluey will ground the first generic `this role` reference as `{HPE_DATACENTER_ROLE_REFERENCE}`. Write one natural opening sentence, then continue with candidate-fit evidence and the 30-60-90 plan without separately repeating the employer or role-domain introduction. Keep every claim about the candidate grounded in the supplied resume."
             ));
         }
     }
@@ -203,7 +204,7 @@ fn target_job_description_has_all(contexts: &[AnswerContext], phrases: &[&str]) 
         .any(|context| has_all(&normalize_guardrail_text(&context.content), phrases))
 }
 
-pub(super) fn evidence_bound_answer_prefix(
+pub(super) fn evidence_bound_role_reference(
     normalized_question: &str,
     answer_context: &[AnswerContext],
     plan: &AnswerPlan,
@@ -212,7 +213,156 @@ pub(super) fn evidence_bound_answer_prefix(
         && plan.output == AnswerOutput::InterviewAnswer
         && looks_like_first_90_role_question(normalized_question)
         && target_job_description_has_all(answer_context, HPE_DATACENTER_ROLE_TERMS))
-    .then_some(HPE_DATACENTER_ROLE_PREFIX)
+    .then_some(HPE_DATACENTER_ROLE_REFERENCE)
+}
+
+const ROLE_ANCHOR_MAX_BUFFER_CHARS: usize = 512;
+
+/// Holds only the provider's opening sentence until a source-grounded role
+/// reference can replace a generic `this role` phrase. Later deltas pass
+/// through immediately, so the evidence merge does not turn the whole answer
+/// into a buffered response.
+pub(super) struct EvidenceBoundRoleAnchor {
+    role_reference: Option<&'static str>,
+    pending: String,
+    resolved: bool,
+}
+
+impl EvidenceBoundRoleAnchor {
+    pub(super) fn new(role_reference: Option<&'static str>) -> Self {
+        Self {
+            role_reference,
+            pending: String::new(),
+            resolved: role_reference.is_none(),
+        }
+    }
+
+    pub(super) fn push(&mut self, delta: &str) -> Option<String> {
+        if self.resolved {
+            return (!delta.is_empty()).then(|| delta.to_string());
+        }
+        self.pending.push_str(delta);
+        if first_sentence_end_byte(&self.pending).is_some() {
+            return self.resolve_pending();
+        }
+        if self.pending.chars().count() >= ROLE_ANCHOR_MAX_BUFFER_CHARS {
+            return self.flush_raw();
+        }
+        None
+    }
+
+    pub(super) fn finish(&mut self) -> Option<String> {
+        if self.resolved || self.pending.is_empty() {
+            return None;
+        }
+        self.flush_raw()
+    }
+
+    fn resolve_pending(&mut self) -> Option<String> {
+        self.resolved = true;
+        let pending = std::mem::take(&mut self.pending);
+        let role_reference = self.role_reference?;
+        Some(anchor_provider_opening(&pending, role_reference))
+    }
+
+    fn flush_raw(&mut self) -> Option<String> {
+        self.resolved = true;
+        (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
+    }
+}
+
+pub(super) fn anchor_complete_provider_answer(
+    text: &str,
+    role_reference: Option<&'static str>,
+) -> String {
+    let mut anchor = EvidenceBoundRoleAnchor::new(role_reference);
+    let mut anchored = anchor.push(text).unwrap_or_default();
+    if let Some(tail) = anchor.finish() {
+        anchored.push_str(&tail);
+    }
+    anchored
+}
+
+fn first_sentence_end_byte(text: &str) -> Option<usize> {
+    for (index, character) in text.char_indices() {
+        if !matches!(character, '.' | '!' | '?') {
+            continue;
+        }
+        let end = index + character.len_utf8();
+        if text[end..].chars().next().is_none_or(char::is_whitespace) {
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn anchor_provider_opening(text: &str, role_reference: &str) -> String {
+    let opening_end = first_sentence_end_byte(text).unwrap_or(text.len());
+    let opening = &text[..opening_end];
+    let normalized_opening = normalize_guardrail_text(opening);
+    if normalized_opening.contains("hpe") && normalized_opening.contains("datacenter") {
+        return text.to_string();
+    }
+
+    let Some((start, end)) = generic_interested_role_range(opening) else {
+        return text.to_string();
+    };
+    let closing_comma = text[end..]
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("because");
+    if closing_comma {
+        format!("{}{role_reference},{}", &text[..start], &text[end..])
+    } else {
+        format!("{}{role_reference}{}", &text[..start], &text[end..])
+    }
+}
+
+fn generic_interested_role_range(opening: &str) -> Option<(usize, usize)> {
+    let leading = opening.len() - opening.trim_start().len();
+    let candidate = &opening[leading..];
+    let lowered = candidate.to_ascii_lowercase();
+    for interested_prefix in [
+        "i'm interested in ",
+        "i’m interested in ",
+        "i am interested in ",
+    ] {
+        let Some(remainder) = lowered.strip_prefix(interested_prefix) else {
+            continue;
+        };
+        for generic_reference in [
+            "this role",
+            "the role",
+            "this position",
+            "the position",
+            "this job",
+            "the job",
+        ] {
+            let Some(suffix) = remainder.strip_prefix(generic_reference) else {
+                continue;
+            };
+            if !safe_generic_role_suffix(suffix) {
+                continue;
+            }
+            let start = leading + interested_prefix.len();
+            return Some((start, start + generic_reference.len()));
+        }
+    }
+    None
+}
+
+fn safe_generic_role_suffix(suffix: &str) -> bool {
+    if suffix.is_empty() || suffix.starts_with(['.', '!', '?']) {
+        return true;
+    }
+    let trimmed = suffix.trim_start();
+    if trimmed.len() == suffix.len() {
+        return false;
+    }
+    trimmed
+        .to_ascii_lowercase()
+        .strip_prefix("because")
+        .is_some_and(|tail| tail.chars().next().is_none_or(char::is_whitespace))
 }
 
 #[cfg(test)]
@@ -351,14 +501,14 @@ mod tests {
             std::slice::from_ref(&hpe_jd),
             &interview_plan(),
         );
-        assert!(anchored.contains(HPE_DATACENTER_ROLE_PREFIX));
+        assert!(anchored.contains(HPE_DATACENTER_ROLE_REFERENCE));
         assert_eq!(
-            evidence_bound_answer_prefix(
+            evidence_bound_role_reference(
                 &normalize_guardrail_text(question),
                 std::slice::from_ref(&hpe_jd),
                 &interview_plan(),
             ),
-            Some(HPE_DATACENTER_ROLE_PREFIX)
+            Some(HPE_DATACENTER_ROLE_REFERENCE)
         );
 
         let mut compact_plan = interview_plan();
@@ -372,7 +522,7 @@ mod tests {
         );
         assert!(!compact_instructions.contains("Supplied-role anchor"));
         assert_eq!(
-            evidence_bound_answer_prefix(
+            evidence_bound_role_reference(
                 &normalize_guardrail_text(question),
                 std::slice::from_ref(&hpe_jd),
                 &compact_plan,
@@ -395,7 +545,7 @@ mod tests {
         assert!(generic.contains("First-90-days role-plan contract"));
         assert!(!generic.contains("Supplied-role anchor"));
         assert_eq!(
-            evidence_bound_answer_prefix(
+            evidence_bound_role_reference(
                 &normalize_guardrail_text(question),
                 std::slice::from_ref(&hpe_resume),
                 &interview_plan(),
@@ -409,12 +559,90 @@ mod tests {
         )
         .with_role(AnswerContextRole::JobDescription);
         assert_eq!(
-            evidence_bound_answer_prefix(
+            evidence_bound_role_reference(
                 &normalize_guardrail_text(question),
                 std::slice::from_ref(&incomplete_jd),
                 &interview_plan(),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn evidence_bound_role_anchor_merges_the_provider_opening_once() {
+        let mut anchor = EvidenceBoundRoleAnchor::new(Some(HPE_DATACENTER_ROLE_REFERENCE));
+        assert_eq!(anchor.push("I’m interested in this "), None);
+        let merged = anchor
+            .push("role because it matches the production AI work I want to own. Next, I would map the stakeholders.")
+            .expect("a complete opening sentence should be released");
+        assert_eq!(
+            merged,
+            "I’m interested in HPE's AI datacenter role, which focuses on network data, anomaly detection, and visibility, because it matches the production AI work I want to own. Next, I would map the stakeholders."
+        );
+        assert_eq!(
+            normalize_guardrail_text(&merged)
+                .matches("interested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            anchor_complete_provider_answer(
+                "I’m interested in this role because it matches the production AI work I want to own. Next, I would map the stakeholders.",
+                Some(HPE_DATACENTER_ROLE_REFERENCE),
+            ),
+            merged,
+            "streamed and complete delivery must produce the same answer"
+        );
+        assert_eq!(
+            anchor.push(" Then I would establish a baseline."),
+            Some(" Then I would establish a baseline.".to_string())
+        );
+        assert_eq!(anchor.finish(), None);
+
+        let already_grounded =
+            "I’m interested in HPE's AI datacenter work because it fits my background.";
+        let mut anchor = EvidenceBoundRoleAnchor::new(Some(HPE_DATACENTER_ROLE_REFERENCE));
+        assert_eq!(
+            anchor.push(already_grounded),
+            Some(already_grounded.to_string())
+        );
+
+        let mut incomplete = EvidenceBoundRoleAnchor::new(Some(HPE_DATACENTER_ROLE_REFERENCE));
+        assert_eq!(
+            incomplete.finish(),
+            None,
+            "an empty provider answer must not manufacture a visible answer"
+        );
+        let unfinished = "My first step would be stakeholder discovery";
+        assert_eq!(incomplete.push(unfinished), None);
+        assert_eq!(
+            incomplete.finish(),
+            Some(unfinished.to_string()),
+            "an incomplete or nonmatching opener must be released unchanged"
+        );
+
+        let unmatched = "My background aligns with the role's production AI scope.";
+        let mut anchor = EvidenceBoundRoleAnchor::new(Some(HPE_DATACENTER_ROLE_REFERENCE));
+        assert_eq!(anchor.push(unmatched), Some(unmatched.to_string()));
+
+        for unsafe_rewrite in [
+            "I'm interested in the role of building reliable systems.",
+            "I'm interested in this role’s impact on customers.",
+        ] {
+            let mut anchor = EvidenceBoundRoleAnchor::new(Some(HPE_DATACENTER_ROLE_REFERENCE));
+            assert_eq!(
+                anchor.push(unsafe_rewrite),
+                Some(unsafe_rewrite.to_string()),
+                "a non-generic grammatical continuation must remain untouched"
+            );
+        }
+
+        let over_cap = format!("I’m interested in this role because {}", "x".repeat(520));
+        let mut anchor = EvidenceBoundRoleAnchor::new(Some(HPE_DATACENTER_ROLE_REFERENCE));
+        assert_eq!(
+            anchor.push(&over_cap),
+            Some(over_cap),
+            "an unterminated oversized opener must flush raw instead of being rewritten"
         );
     }
 }
