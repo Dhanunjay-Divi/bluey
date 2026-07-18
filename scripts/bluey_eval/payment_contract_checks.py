@@ -189,6 +189,17 @@ def self_check_ambiguous_payment_detector() -> None:
         "that the request was declined before authorization, mark it FAILED.",
         "Keep the payment UNKNOWN until the provider confirms no charge occurred, "
         "then mark it FAILED. Do not retry the charge with a new key.",
+        "I would transition the payment intent from PROCESSING to UNKNOWN and stop "
+        "automatic charge retries. Then I would reconcile using authoritative "
+        "provider evidence, specifically a status check by payment ID or client "
+        "reference, and webhooks persisted under a database uniqueness constraint "
+        "on provider event ID. Those signals can move UNKNOWN to SUCCEEDED, FAILED, "
+        "or CANCELED only when the provider evidence is conclusive. If the result is "
+        "still inconclusive, I would keep it UNKNOWN and escalate to manual "
+        "reconciliation. Only if the provider contract explicitly guarantees "
+        "idempotent replay may I retry the exact same provider command under a "
+        "bounded policy with the original operation's idempotency key, never a new "
+        "key, and never a second charge.",
     )
     unsafe = (
         "After a timeout, mark the payment FAILED and retry the charge.",
@@ -207,6 +218,8 @@ def self_check_ambiguous_payment_detector() -> None:
         "After 24 hours, expire UNKNOWN as FAILED.",
         "UNKNOWN is considered FAILED when the reconciliation deadline expires.",
         "A scheduled job converts UNKNOWN into FAILED after one day.",
+        "Those signals move UNKNOWN to FAILED even when provider evidence remains "
+        "inconclusive.",
     )
     assert not any(has_unsafe_ambiguous_payment_outcome(text) for text in safe)
     assert all(has_unsafe_ambiguous_payment_outcome(text) for text in unsafe)

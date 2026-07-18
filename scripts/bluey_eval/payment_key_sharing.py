@@ -531,6 +531,11 @@ def has_affirmative_cross_operation_key_sharing(text: str) -> bool:
             r"\b(?:each|every)\b[^.!?;]{0,80}\b(?:logical\s+)?"
             r"(?:provider[- ]?)?operation[- ]instance\b[^.!?;]{0,80}"
             r"\b(?:its|their)\s+own\b[^.!?;]{0,35}"
+            r"\b(?:stable\s+)?idempotency\s+key\b|"
+            r"\beach\s+authoriz\w*\s*,\s*captur\w*\s*,?\s+and\s+"
+            r"refund\w*(?:\s*,\s*including\s+each\s+partial\s+captur\w*"
+            r"\s+or\s+refund\w*)?[^.!?;]{0,35}"
+            r"\b(?:its|their)\s+own\b[^.!?;]{0,20}"
             r"\b(?:stable\s+)?idempotency\s+key\b",
             normalized,
         )

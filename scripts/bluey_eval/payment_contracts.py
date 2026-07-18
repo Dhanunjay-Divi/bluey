@@ -721,6 +721,15 @@ def has_unsafe_ambiguous_payment_outcome(text: str) -> bool:
                 r"\bunknown\b.{0,80}\b(?:succeeded|failed|canceled|cancelled)\b",
                 context,
             )
+            or re.search(
+                r"\b(?:those|these|such)\s+"
+                r"(?:signals?|results?|responses?|sources?|evidence)\b.{0,100}"
+                r"\b(?:moves?|transitions?|resolves?|sets?)\b.{0,80}"
+                r"\bunknown\b.{0,80}\b(?:succeeded|failed|canceled|cancelled)\b"
+                r".{0,100}\bonly\s+when\b.{0,50}"
+                r"\bprovider\s+evidence\b.{0,30}\bconclusive\b",
+                context,
+            )
         )
         negated = bool(
             re.search(

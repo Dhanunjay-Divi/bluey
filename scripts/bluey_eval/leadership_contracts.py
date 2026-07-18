@@ -72,6 +72,11 @@ def q47_director_alignment_issues(text: str) -> List[str]:
             r"understand|confirm)\w*\b",
             lower,
         )
+        or re.search(
+            rf"\b{directors}\b.{{0,160}}\bask\w*\s+them\b.{{0,35}}"
+            r"\b(?:agree|align)\w*\b",
+            lower,
+        )
         or visible_shared_engagement
         or shared_side_by_side_engagement
     )
@@ -100,7 +105,9 @@ def q47_director_alignment_issues(text: str) -> List[str]:
             r"\bescalat\w*\b.{0,70}\b(?:common|accountable|shared)\b.{0,30}"
             r"\b(?:owner|sponsor|leader|manager|director|vp)\b|"
             r"\bescalat\w*\b.{0,35}\b(?:leadership|common\s+owner|sponsor)\b"
-            r".{0,35}\b(?:decid|resolve|priority|order)\w*\b",
+            r".{0,35}\b(?:decid|resolve|priority|order)\w*\b|"
+            r"\bask\w*\s+them\b.{0,35}\b(?:agree|align)\w*\b.{0,45}"
+            r"\b(?:which\s+(?:one|request)|priority|order|sequence)\b",
             lower,
         )
         or visible_shared_engagement
@@ -109,8 +116,13 @@ def q47_director_alignment_issues(text: str) -> List[str]:
     negated_shared_alignment = bool(
         re.search(
             r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|"
-            r"without)\b.{0,35}\b(?:ask|seek|invite)\w*\b.{0,35}"
-            r"\b(?:them|directors?)\b.{0,30}\b(?:agree|align)\w*\b",
+            r"without)\b[^.!?;]{0,35}\b(?:ask|seek|invite)\w*\b[^.!?;]{0,35}"
+            r"\b(?:them|directors?)\b[^.!?;]{0,30}\b(?:agree|align)\w*\b",
+            lower,
+        )
+        or re.search(
+            r"\bask\w*\s+(?:them|the\s+directors?)\b[^.!?;]{0,20}"
+            r"\bnot\s+to\s+(?:agree|align)\w*\b",
             lower,
         )
     )
@@ -996,4 +1008,11 @@ def q47_director_alignment_issues(text: str) -> List[str]:
         issues.append("missing_affirmative_director_alignment")
     if negated:
         issues.append("unsafe_negated_or_unilateral_director_alignment")
+    if re.search(
+        r"\b(?:in\s+practice(?:\s+at)?|in\s+my\s+(?:current|prior|previous|last)\s+"
+        r"role|at\s+my\s+(?:current|prior|previous|last)\s+(?:company|job)|"
+        r"a\s+time\s+when\s+i|i\s+once)\b",
+        lower,
+    ):
+        issues.append("claimed_past_example_in_hypothetical_q47")
     return issues

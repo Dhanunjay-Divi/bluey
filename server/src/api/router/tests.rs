@@ -3731,6 +3731,8 @@ fn answer_plan_q47_director_priority_conflict_requires_shared_decision() {
     assert!(system.contains("Until the directors agree or that accountable owner rules"));
     assert!(system.contains("do not start, continue, select, prioritize, or describe working on either conflicting request"));
     assert!(system.contains("Do not make a unilateral priority call"));
+    assert!(system.contains("This is a hypothetical scenario"));
+    assert!(system.contains("do not add a claimed past-company example or invented anecdote"));
     assert!(system.contains("minimum reversible containment"));
     assert!(system.contains("pre-agreed severity policy"));
     assert!(system.contains(

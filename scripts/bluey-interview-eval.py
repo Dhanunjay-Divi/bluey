@@ -2056,6 +2056,22 @@ def self_check_attempt_integrity_guards() -> None:
             "and communicate my final priority order."
         )
     )
+    round547_live_q47 = (
+        "When two directors both claim top priority, I don't try to make a unilateral "
+        "call. I ask them to align on which one comes first. The only exception is a "
+        "policy-governed production, security, safety, or compliance incident: I take "
+        "only the minimum reversible containment, notify both directors immediately, "
+        "and leave the resource-priority decision to their shared agreement or "
+        "accountable owner."
+    )
+    assert not q47_director_alignment_issues(round547_live_q47)
+    assert "missing_affirmative_director_alignment" in q47_director_alignment_issues(
+        "Two directors disagree. I ask them not to align on which request comes first."
+    )
+    assert q47_director_alignment_issues(
+        f"{round547_live_q47} In practice at Example Corp, I once resolved this exact "
+        "conflict with a phased rollout."
+    ) == ["claimed_past_example_in_hypothetical_q47"]
     assert q47_incident_containment_issues(round544_live_q47) == [
         "missing_policy_governed_incident_containment_exception"
     ]

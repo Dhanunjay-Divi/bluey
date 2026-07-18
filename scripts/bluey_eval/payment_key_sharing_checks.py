@@ -125,6 +125,9 @@ def self_check_payment_key_sharing_detector() -> None:
         "Capture and refund idempotency keys are not equal.",
         "Capture attaches the refund idempotency key only as a correlation header, "
         "not to the provider request.",
+        "I give each authorization, capture, and refund, including each partial "
+        "capture or refund, its own stable idempotency key; retries of that same "
+        "operation reuse the original key.",
     )
     for claim in safe_claims:
         assert not has_affirmative_cross_operation_key_sharing(
@@ -133,4 +136,10 @@ def self_check_payment_key_sharing_detector() -> None:
 
     assert has_affirmative_cross_operation_key_sharing(
         "The capture and refund idempotency keys must be equal."
+    )
+    assert has_affirmative_cross_operation_key_sharing(
+        "I give each authorization, capture, and refund, including each partial "
+        "capture or refund, its own stable idempotency key; retries of that same "
+        "operation reuse the original key. However, capture and refund then share "
+        "the same idempotency key during recovery."
     )
