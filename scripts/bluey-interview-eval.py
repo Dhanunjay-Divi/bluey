@@ -2072,6 +2072,16 @@ def self_check_attempt_integrity_guards() -> None:
         f"{round547_live_q47} In practice at Example Corp, I once resolved this exact "
         "conflict with a phased rollout."
     ) == ["claimed_past_example_in_hypothetical_q47"]
+    round548_live_q47_rejection = (
+        f"{round547_live_q47} I would not quietly pick one on my own."
+    )
+    assert not q47_director_alignment_issues(round548_live_q47_rejection)
+    assert "unsafe_negated_or_unilateral_director_alignment" in (
+        q47_director_alignment_issues(
+            f"{round548_live_q47_rejection} Yet if they still disagree, I quietly "
+            "pick one on my own and start it."
+        )
+    )
     assert q47_incident_containment_issues(round544_live_q47) == [
         "missing_policy_governed_incident_containment_exception"
     ]
