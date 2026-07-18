@@ -1558,6 +1558,73 @@ fn balanced_system_design_prefers_measured_fast_quality_route() {
 }
 
 #[test]
+fn balanced_standalone_messaging_recovery_prefers_measured_fast_quality_route() {
+    let req = complete_request(
+        "Question:\nHow would you preserve per-conversation ordering when users reconnect and servers fail?",
+    );
+    let plan = answer_plan_for_request(&req, "balanced", &[]);
+    let normalized = normalize_guardrail_text(&extract_search_question(&req.user));
+    assert!(looks_like_messaging_ordering_recovery_question(&normalized));
+
+    let mut routes = priced_routes_for("balanced", 1_000, 1_000, "design-route-test");
+    assert_eq!(routes.first().map(|route| route.provider), Some("deepseek"));
+    assert!(prioritize_routes_for_answer_plan(
+        &mut routes,
+        "balanced",
+        &plan,
+        &normalized,
+        true,
+    ));
+    assert_eq!(routes.first().map(|route| route.provider), Some("openai"));
+}
+
+#[test]
+fn messaging_recovery_contract_does_not_override_writing_or_document_edits() {
+    for question in [
+        "Write an email explaining how per-conversation ordering survives reconnects and server failover.",
+        "Rewrite this resume bullet: preserved per-conversation ordering across reconnects and server failover.",
+        "Summarize how per-conversation ordering survives reconnects and server failover.",
+    ] {
+        let req = complete_request(&format!("Question:\n{question}"));
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+        let normalized = normalize_guardrail_text(&extract_search_question(&req.user));
+        assert!(looks_like_messaging_ordering_recovery_question(&normalized));
+        assert!(!supports_messaging_ordering_recovery_answer(
+            &plan,
+            &normalized
+        ));
+
+        let (system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+        assert!(!system.contains("Messaging ordering-recovery output invariant"));
+
+        let mut routes = priced_routes_for("balanced", 1_000, 1_000, question);
+        let original = routes
+            .iter()
+            .map(|route| route.provider)
+            .collect::<Vec<_>>();
+        assert!(!prioritize_routes_for_answer_plan(
+            &mut routes,
+            "balanced",
+            &plan,
+            &normalized,
+            true,
+        ));
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route.provider)
+                .collect::<Vec<_>>(),
+            original
+        );
+    }
+}
+
+#[test]
 fn balanced_code_artifact_prefers_measured_fast_quality_route_within_preferred_tier() {
     let req =
         complete_request("Question:\nImplement an LRU cache from first principles in Python.");
@@ -2738,6 +2805,41 @@ fn answer_plan_messaging_followup_inherits_delivery_correctness_contract() {
     assert!(system.contains("stable idempotent client message IDs"));
     assert!(system.contains("deduplicate retries or replay before delivery"));
 
+    let standalone = complete_request(
+        "Question:\nHow would you preserve per-conversation ordering when users reconnect and servers fail?",
+    );
+    let standalone_plan = answer_plan_for_request(&standalone, "balanced", &[]);
+    let standalone_normalized =
+        normalize_guardrail_text(&extract_search_question(&standalone.user));
+    assert!(looks_like_messaging_ordering_recovery_question(
+        &standalone_normalized
+    ));
+    let (standalone_system, _) = prompt_with_answer_plan(
+        "You are Bluey.",
+        &standalone.user,
+        &standalone_plan,
+        &WebSearchOutcome::default(),
+    );
+    assert!(standalone_system.contains("Messaging-system correctness contract"));
+    assert!(standalone_system.contains(
+        "I would preserve ordering by making one conversation shard the single authority for sequence numbers."
+    ));
+    assert!(standalone_system.contains(
+        "I deduplicate every retry or replay by its stable client message ID before assigning another sequence number or delivering the message."
+    ));
+
+    for negative in [
+        "How would you preserve ordering during server failover?",
+        "How would you preserve per-conversation ordering when servers fail?",
+        "How would you replay jobs after workers reconnect?",
+    ] {
+        let normalized = normalize_guardrail_text(negative);
+        assert!(
+            !looks_like_messaging_ordering_recovery_question(&normalized),
+            "{negative}"
+        );
+    }
+
     let unrelated = complete_request(
         "Question:\nHow would you preserve per-conversation ordering when users reconnect and servers fail?\n\nSession context:\nPrevious system design answer:\nDesign a real-time monitoring platform for metrics and alerting.",
     );
@@ -2748,7 +2850,19 @@ fn answer_plan_messaging_followup_inherits_delivery_correctness_contract() {
         &unrelated_plan,
         &WebSearchOutcome::default(),
     );
-    assert!(!unrelated_system.contains("Messaging-system correctness contract"));
+    assert!(unrelated_system.contains("Messaging-system correctness contract"));
+
+    let generic_ordering = complete_request(
+        "Question:\nHow would you preserve event ordering when consumers reconnect and workers fail?\n\nSession context:\nPrevious system design answer:\nDesign a real-time monitoring platform for metrics and alerting.",
+    );
+    let generic_ordering_plan = answer_plan_for_request(&generic_ordering, "balanced", &[]);
+    let (generic_ordering_system, _) = prompt_with_answer_plan(
+        "You are Bluey.",
+        &generic_ordering.user,
+        &generic_ordering_plan,
+        &WebSearchOutcome::default(),
+    );
+    assert!(!generic_ordering_system.contains("Messaging-system correctness contract"));
 
     let behavioral = complete_request(
         "Question:\nTell me about a time you resolved a difficult stakeholder disagreement.\n\nSession context:\nPrevious system design answer:\nDesign a production messaging app for tens of millions of users.",

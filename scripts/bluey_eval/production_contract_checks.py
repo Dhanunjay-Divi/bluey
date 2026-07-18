@@ -10,6 +10,7 @@ from .payment_contracts import (
 )
 from .system_contracts import (
     feature_store_consistency_issues,
+    has_q35_delivery_dedup_semantics,
     payment_timeout_followup_completeness_issues,
     rag_evaluation_plan_issues,
     url_shortener_safety_issues,
@@ -19,6 +20,32 @@ from .system_contracts import (
 def self_check_production_answer_contracts(
     q38_required_group_issues: Callable[[str], List[str]],
 ) -> None:
+    for valid_q35_dedup in (
+        "The client ignores duplicates using the message ID plus sequence.",
+        "I store seen (conversation_id, message_id) and suppress a redelivery before rendering.",
+        "The consumer drops duplicate deliveries by event ID.",
+        "New messages are delivered in sequence. Then clients ignore duplicates by message ID.",
+    ):
+        assert has_q35_delivery_dedup_semantics(valid_q35_dedup), valid_q35_dedup
+    for invalid_q35_dedup in (
+        "Duplicates are acceptable; I log the message ID plus sequence.",
+        "I detect duplicates with message IDs but still deliver each replay.",
+        "Ignore duplicate messages.",
+        "Message ID plus sequence aids debugging.",
+        "Do not suppress duplicates by event ID; deliver every replay.",
+        "I ignore duplicate messages by message ID, but only after delivering them.",
+        "I filter duplicate analytics events by event ID before aggregating metrics.",
+        "I deliver duplicate messages by message ID, then ignore them.",
+        "I forward duplicate messages to the client, then ignore them by message ID.",
+        "I send duplicate messages and later suppress them using the message ID.",
+        "I emit every duplicate event, then discard it by event ID.",
+        "I render duplicates before rejecting them by message ID.",
+        "Gateways forward duplicate messages to clients. Then clients ignore duplicates by message ID.",
+        "We render duplicate messages. Then reject duplicates using message ID.",
+    ):
+        assert not has_q35_delivery_dedup_semantics(invalid_q35_dedup), (
+            invalid_q35_dedup
+        )
     shallow_rag = (
         "Use a golden dataset and score retrieval precision and faithfulness. "
         "Review the top 10% with humans. Target p95 latency under 2 seconds."

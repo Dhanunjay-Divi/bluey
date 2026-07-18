@@ -72,6 +72,7 @@ from bluey_eval.production_contract_checks import (  # noqa: E402
 from bluey_eval.system_contracts import (  # noqa: E402
     feature_store_consistency_issues,
     has_drift_only_automatic_retraining,
+    has_q35_delivery_dedup_semantics,
     has_required_signal,
     payment_timeout_followup_completeness_issues,
     rag_evaluation_plan_issues,
@@ -1281,11 +1282,19 @@ def self_check_q46_story_grounding_detector() -> None:
 
 
 def missing_required_group_issues(case: EvalCase, text: str) -> List[str]:
-    return [
-        "missing_signal:" + "|".join(group)
-        for group in case.required_groups
-        if not any(has_required_signal(text, term) for term in group)
-    ]
+    issues: List[str] = []
+    for group in case.required_groups:
+        satisfied = any(has_required_signal(text, term) for term in group)
+        if (
+            not satisfied
+            and case.id == "Q35"
+            and group == ("idempot", "dedup")
+            and has_q35_delivery_dedup_semantics(text)
+        ):
+            satisfied = True
+        if not satisfied:
+            issues.append("missing_signal:" + "|".join(group))
+    return issues
 
 
 def has_complete_code_artifact_body(body: str) -> bool:

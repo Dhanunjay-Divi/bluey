@@ -1753,6 +1753,69 @@ fn looks_like_overlapping_sensor_deduplication(normalized_question: &str) -> boo
         )
 }
 
+fn looks_like_messaging_ordering_recovery_question(normalized_question: &str) -> bool {
+    let conversation_ordering =
+        contains_any(
+            normalized_question,
+            &[
+                "per conversation",
+                "per-conversation",
+                "conversation order",
+                "conversation ordering",
+                "conversation sequence",
+                "within each conversation",
+                "within a conversation",
+            ],
+        ) && contains_any(normalized_question, &["order", "ordering", "sequence"]);
+    let reconnect_or_replay = contains_any(
+        normalized_question,
+        &[
+            "reconnect",
+            "re-connection",
+            "reconnection",
+            "replay",
+            "resume",
+        ],
+    );
+    let server_failure_or_failover = contains_any(
+        normalized_question,
+        &[
+            "server fail",
+            "servers fail",
+            "server failure",
+            "server crash",
+            "failover",
+            "leader fail",
+            "replica fail",
+        ],
+    );
+
+    conversation_ordering && reconnect_or_replay && server_failure_or_failover
+}
+
+fn supports_messaging_ordering_recovery_answer(
+    plan: &AnswerPlan,
+    normalized_question: &str,
+) -> bool {
+    let direct_answer_frame = contains_any(
+        normalized_question,
+        &[
+            "how would you",
+            "how do you",
+            "what would you",
+            "what do you",
+        ],
+    );
+    plan.output == AnswerOutput::Compact
+        && matches!(
+            plan.intent,
+            AnswerIntent::Quick | AnswerIntent::General | AnswerIntent::FollowUp
+        )
+        && !looks_like_employment_document_surface(normalized_question)
+        && direct_answer_frame
+        && looks_like_messaging_ordering_recovery_question(normalized_question)
+}
+
 fn supports_high_stakes_scenario_answer(plan: &AnswerPlan, normalized_question: &str) -> bool {
     matches!(
         plan.intent,
@@ -1865,7 +1928,8 @@ fn prioritize_routes_for_answer_plan(
         AnswerOutput::InterviewAnswer | AnswerOutput::CodeArtifact
     ) || compact_live_interview_answer
         || (plan.intent == AnswerIntent::SystemDesign && plan.output == AnswerOutput::CanvasDetail)
-        || looks_like_high_stakes_scenario_contract(plan, normalized_question);
+        || looks_like_high_stakes_scenario_contract(plan, normalized_question)
+        || supports_messaging_ordering_recovery_answer(plan, normalized_question);
     if !enabled || effective_lane != "balanced" || !quality_sensitive_answer {
         return false;
     }
@@ -6788,11 +6852,14 @@ fn prompt_with_answer_plan_context(
             && looks_like_url_shortener_domain(&normalized_previous_design))
         || (matches!(plan.intent, AnswerIntent::General | AnswerIntent::FollowUp)
             && url_shortener_safety_question);
-    let messaging_design = (plan.intent == AnswerIntent::SystemDesign
-        && contains_any(
-            &normalized_question,
-            &["messaging app", "chat system", "messaging system"],
-        ))
+    let messaging_ordering_recovery =
+        supports_messaging_ordering_recovery_answer(plan, &normalized_question);
+    let messaging_design = messaging_ordering_recovery
+        || (plan.intent == AnswerIntent::SystemDesign
+            && contains_any(
+                &normalized_question,
+                &["messaging app", "chat system", "messaging system"],
+            ))
         || (plan.intent == AnswerIntent::FollowUp
             && !normalized_previous_design.is_empty()
             && contains_any(
@@ -7156,6 +7223,11 @@ fn prompt_with_answer_plan_context(
     if messaging_design {
         instructions.push_str(
             "\nMessaging-system correctness contract: on one authoritative conversation shard, atomically allocate the per-conversation sequence and commit the message plus transactional outbox before acknowledging the sender; ordering cannot be assigned after durable acceptance. Use stable idempotent client message IDs, deduplicate retries or replay before delivery, use connection gateways for online delivery, durable offline inbox delivery, and a group-fanout strategy with its threshold tradeoff. Explain authoritative-shard failover without split-brain sequence allocation."
+        );
+    }
+    if messaging_ordering_recovery {
+        instructions.push_str(
+            "\nMessaging ordering-recovery output invariant: the visible answer must begin exactly with `I would preserve ordering by making one conversation shard the single authority for sequence numbers.` It must also include this exact sentence: `I deduplicate every retry or replay by its stable client message ID before assigning another sequence number or delivering the message.` Explain that reconnect resumes from the client's last durably applied sequence and that fenced failover resumes allocation only from the durable committed sequence. Keep the answer compact, first-person, and ready to say aloud."
         );
     }
 

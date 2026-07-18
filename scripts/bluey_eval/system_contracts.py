@@ -88,6 +88,109 @@ def has_required_signal(text: str, term: str) -> bool:
     )
 
 
+def has_q35_delivery_dedup_semantics(text: str) -> bool:
+    """Recognize explicit duplicate suppression tied to stable message identity.
+
+    Q35 is allowed to explain the behavior instead of using the literal words
+    ``dedup`` or ``idempotent``.  Keep this deliberately narrower than the
+    general required-signal matcher: merely detecting or logging duplicates is
+    not enough, and the suppression action and identity key must be local.
+    """
+    lower = re.sub(
+        r"\s+",
+        " ",
+        re.sub(
+            r"[*`~]+",
+            "",
+            text.casefold().replace("’", "'").replace("_", " "),
+        ),
+    )
+    action_pattern = re.compile(
+        r"\b(?:ignore(?:s|d|ing)?|drop(?:s|ped|ping)?|suppress(?:es|ed|ing)?|"
+        r"discard(?:s|ed|ing)?|reject(?:s|ed|ing)?)\b"
+    )
+    duplicate_pattern = re.compile(
+        r"\b(?:duplicates?|duplicate\s+(?:messages?|deliver(?:y|ies)|events?)|"
+        r"redeliver(?:y|ies|ed|ing)?|replays?)\b"
+    )
+    identity_pattern = re.compile(
+        r"\b(?:message|event|client|conversation)\s+(?:id|identifier)\b|"
+        r"\bconversation\s+(?:sequence|offset)\b|"
+        r"\b(?:sequence|offset)\s+(?:number|id)\b"
+    )
+    negated_action_prefix = re.compile(
+        r"(?:\b(?:do|does|did|will|would|should|must|can)\s+not|"
+        r"\b(?:don't|doesn't|didn't|won't|wouldn't|shouldn't|mustn't|can't|never))"
+        r"\s+(?:\w+\s+){0,2}$"
+    )
+    opposite_delivery_pattern = re.compile(
+        r"\b(?:still|continue(?:s|d)?\s+to)\s+"
+        r"(?:deliver|process|apply|render|send|forward|emit)\w*\b|"
+        r"\b(?:deliver|process|apply|render|send|forward|emit)\w*\s+"
+        r"(?:every|each|all)\s+(?:duplicate\w*|replays?)\b"
+    )
+    delivery_effect_pattern = re.compile(
+        r"\b(?:deliver|process|apply|render|send|forward|emit)\w*\b"
+    )
+    late_sequence_pattern = re.compile(
+        r"\b(?:before|(?:and\s+)?then|later|afterwards?)\b"
+    )
+
+    clauses = re.split(r"(?<=[.!?;])\s+", lower)
+    for clause_index, clause in enumerate(clauses):
+        if opposite_delivery_pattern.search(clause):
+            continue
+        actions = tuple(action_pattern.finditer(clause))
+        duplicates = tuple(duplicate_pattern.finditer(clause))
+        identities = tuple(identity_pattern.finditer(clause))
+        previous_duplicate_delivery = False
+        if clause_index:
+            previous_clause = clauses[clause_index - 1]
+            previous_effects = tuple(delivery_effect_pattern.finditer(previous_clause))
+            previous_duplicates = tuple(duplicate_pattern.finditer(previous_clause))
+            previous_duplicate_delivery = any(
+                abs(effect.start() - duplicate.start()) <= 90
+                for effect in previous_effects
+                for duplicate in previous_duplicates
+            )
+        for action in actions:
+            if previous_duplicate_delivery:
+                continue
+            action_prefix = clause[max(0, action.start() - 70) : action.start()]
+            if negated_action_prefix.search(action_prefix):
+                continue
+            action_suffix = clause[action.end() : action.end() + 180]
+            if re.search(
+                r"\b(?:only\s+)?after\s+(?:\w+\s+){0,3}"
+                r"(?:deliver|process|apply|render|send|forward|emit)\w*\b|"
+                r"\bonce\s+(?:\w+\s+){0,3}"
+                r"(?:deliver|process|apply|render|send|forward|emit)\w*\b",
+                action_suffix,
+            ):
+                continue
+            for duplicate in duplicates:
+                if abs(action.start() - duplicate.start()) > 70:
+                    continue
+                if duplicate.start() < action.start():
+                    delivery_effects = tuple(delivery_effect_pattern.finditer(clause))
+                    late_markers = tuple(late_sequence_pattern.finditer(clause))
+                    delivered_before_suppression = any(
+                        delivery.start() < marker.start() < action.start()
+                        and duplicate.end() <= marker.start()
+                        and abs(delivery.start() - duplicate.start()) <= 90
+                        and action.start() - marker.end() <= 45
+                        for delivery in delivery_effects
+                        for marker in late_markers
+                    )
+                    if delivered_before_suppression:
+                        continue
+                for identity in identities:
+                    starts = (action.start(), duplicate.start(), identity.start())
+                    if max(starts) - min(starts) <= 120:
+                        return True
+    return False
+
+
 def rag_evaluation_plan_issues(text: str) -> List[str]:
     """Require an actionable launch evaluation, not a keyword-only RAG sketch."""
     lower = re.sub(
