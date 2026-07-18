@@ -670,6 +670,7 @@ fn suffix_has_executable_code(lines: &[&str]) -> bool {
             || looks_like_recovered_comment_line(trimmed)
             || looks_like_markdown_prose_bullet(trimmed)
             || looks_like_recovered_line_note(trimmed)
+            || looks_like_presentation_sentence(trimmed)
             || is_complexity_line(trimmed)
             || is_section_separator_line(trimmed)
         {
@@ -677,9 +678,9 @@ fn suffix_has_executable_code(lines: &[&str]) -> bool {
         }
 
         // Ambiguous content stays in CODE. Recovery is intentionally limited
-        // to unmistakable headings, comments, bullets, line-note labels, and
-        // complexity lines so an unrecognized branch or expression can never
-        // be silently converted into prose.
+        // to unmistakable headings, comments, prose sentences, bullets,
+        // line-note labels, and complexity lines after a presentation heading
+        // so an unrecognized branch or expression cannot be silently moved.
         true
     })
 }
@@ -1429,11 +1430,12 @@ class LRUCache:
         node = self.cache.get(key)
         return -1 if node is None else node.value
 
-# Line notes:
-# 1: Node stores the key, value, and list links.
-# 2: The dictionary maps each key to its node.
+Line notes:
+1: Node stores the key, value, and list links.
+2: The dictionary maps each key to its node.
 
 Explanation
+The dictionary provides constant-time lookup while the list preserves recency order.
 - The dictionary provides constant-time lookup.
 - The list preserves recency order.
 
@@ -1468,6 +1470,9 @@ Edge cases
             .contains("Time Complexity: O(1) for get and put."));
         assert!(artifact.body.contains("NOTES\n-----"));
         assert!(artifact.body.contains("Explanation"));
+        assert!(artifact
+            .body
+            .contains("The dictionary provides constant-time lookup while the list preserves recency order."));
         assert!(artifact.body.contains("Edge cases"));
     }
 

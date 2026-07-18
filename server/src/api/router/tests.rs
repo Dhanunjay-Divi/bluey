@@ -1962,7 +1962,10 @@ fn answer_plan_code_request_uses_deep_code_artifact() {
     assert!(system.contains("close every code fence before `Line notes`"));
     assert!(system.contains("LRU implementation structural check"));
     assert!(system.contains("two dummy boundary sentinels"));
-    assert!(system.contains("Handle zero capacity"));
+    assert!(system.contains("make `put` return before any hashmap/list mutation"));
+    assert!(system.contains("never unlink or evict a sentinel"));
+    assert!(system.contains("Close the Python fence immediately"));
+    assert!(system.contains("all presentation prose must be outside the fence"));
 }
 
 #[test]
@@ -2210,7 +2213,10 @@ fn answer_plan_payment_system_design_requires_durable_ledger_correctness() {
     assert!(system.contains("including each partial capture or refund"));
     assert!(system.contains("its own stable idempotency key"));
     assert!(system.contains("retries of that same operation reuse the original key"));
-    assert!(system.contains("State the same operation-instance rule in the canvas"));
+    assert!(system.contains(
+        "I post confirmed holds and money movements idempotently to a durable immutable double-entry ledger only after authoritative provider evidence."
+    ));
+    assert!(system.contains("State the same operation-instance and durable-ledger rules"));
     assert!(system.contains("Never shorten this to an ambiguous claim"));
     assert!(system.contains("one key is allocated per operation type"));
     assert!(system.contains("authorization holds or encumbrances"));

@@ -1896,6 +1896,82 @@ def _capacity_guard_evicts_bound_sentinel_neighbor(
     return False
 
 
+def _has_nonpositive_capacity_exit(lru_class: ast.ClassDef) -> bool:
+    """Recognize an implemented zero-capacity return/rejection without execution."""
+
+    def is_capacity(expression: ast.AST) -> bool:
+        return (
+            isinstance(expression, ast.Name) and expression.id == "capacity"
+        ) or (
+            isinstance(expression, ast.Attribute)
+            and expression.attr == "capacity"
+            and isinstance(expression.value, ast.Name)
+            and expression.value.id == "self"
+        )
+
+    def integer(expression: ast.AST) -> Optional[int]:
+        if isinstance(expression, ast.Constant) and type(expression.value) is int:
+            return expression.value
+        return None
+
+    def tests_nonpositive(expression: ast.AST) -> bool:
+        if isinstance(expression, ast.UnaryOp) and isinstance(expression.op, ast.Not):
+            return is_capacity(expression.operand)
+        if not (
+            isinstance(expression, ast.Compare)
+            and len(expression.ops) == 1
+            and len(expression.comparators) == 1
+        ):
+            return False
+        left, operator, right = (
+            expression.left,
+            expression.ops[0],
+            expression.comparators[0],
+        )
+        right_value = integer(right)
+        if is_capacity(left) and right_value is not None:
+            return (
+                isinstance(operator, ast.Eq) and right_value == 0
+            ) or (
+                isinstance(operator, ast.LtE) and right_value == 0
+            ) or (
+                isinstance(operator, ast.Lt) and right_value == 1
+            )
+        left_value = integer(left)
+        if left_value is not None and is_capacity(right):
+            return (
+                isinstance(operator, ast.Eq) and left_value == 0
+            ) or (
+                isinstance(operator, ast.GtE) and left_value == 0
+            ) or (
+                isinstance(operator, ast.Gt) and left_value == 1
+            )
+        return False
+
+    for method_name in ("__init__", "put"):
+        method = next(
+            (
+                member
+                for member in lru_class.body
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and member.name == method_name
+            ),
+            None,
+        )
+        if method is None:
+            continue
+        for candidate in ast.walk(method):
+            if not isinstance(candidate, ast.If) or not tests_nonpositive(candidate.test):
+                continue
+            if any(
+                isinstance(statement, (ast.Return, ast.Raise))
+                for body_statement in candidate.body
+                for statement in ast.walk(body_statement)
+            ):
+                return True
+    return False
+
+
 def _used_lock_attributes(nodes: Sequence[ast.AST]) -> set[str]:
     used: set[str] = set()
     for node in nodes:
@@ -1972,6 +2048,8 @@ def lru_code_semantic_issues(case: EvalCase, body: str) -> List[str]:
     )
     if not has_linked_recency:
         issues.append("missing_lru_linked_recency_structure")
+    if not _has_nonpositive_capacity_exit(lru_class):
+        issues.append("missing_lru_zero_capacity_guard")
 
     get_scope = _reachable_class_methods(get_method, methods)
     put_scope = _reachable_class_methods(put_method, methods)
@@ -3574,6 +3652,8 @@ def self_check_attempt_integrity_guards() -> None:
         "        self._add_recent(node)\n"
         "        return node.value\n\n"
         "    def put(self, key, value):\n"
+        "        if self.capacity <= 0:\n"
+        "            return\n"
         "        if key in self.cache:\n"
         "            self._remove(self.cache[key])\n"
         "        node = Node(key, value)\n"
@@ -3626,6 +3706,23 @@ def self_check_attempt_integrity_guards() -> None:
     )
     assert not mandatory_answer_shape_issues(q08, left_right_code)
     assert answer_is_success(q08, left_right_code)
+
+    missing_zero_guard = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=code_visible,
+        streamed_answer=code_visible,
+        terminal_answer=code_visible,
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=code_body.replace(
+            "        if self.capacity <= 0:\n            return\n", "", 1
+        ),
+    )
+    assert "missing_lru_zero_capacity_guard" in mandatory_answer_shape_issues(
+        q08, missing_zero_guard
+    )
+    assert not answer_is_success(q08, missing_zero_guard)
 
     fake_unused_boundaries_body = (
         "```python\n"
@@ -3884,6 +3981,8 @@ def self_check_attempt_integrity_guards() -> None:
         "            return node.value\n\n"
         "    def put(self, key, value):\n"
         "        with self._lock:\n"
+        "            if self.capacity <= 0:\n"
+        "                return\n"
         "            if key in self.cache:\n"
         "                self._remove(self.cache[key])\n"
         "            node = Node(key, value)\n"
@@ -4017,6 +4116,14 @@ def self_check_attempt_integrity_guards() -> None:
     assert "missing_distinct_authorize_capture_refund_keys" in payment_issues
     assert "missing_same_operation_idempotency_key_reuse" in payment_issues
     assert not answer_is_success(q39, payment_attempt)
+
+    required_spoken_ledger_sentence = (
+        "I post confirmed holds and money movements idempotently to a durable "
+        "immutable double-entry ledger only after authoritative provider evidence."
+    )
+    assert "missing_durable_payment_ledger" not in payment_platform_safety_issues(
+        required_spoken_ledger_sentence
+    )
 
     complete_payment_surface = (
         "Each logical provider operation instance gets its own stable idempotency "
