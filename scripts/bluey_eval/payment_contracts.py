@@ -356,17 +356,34 @@ _MONEY_REPLAY = (
 
 def _has_affirmative_cross_operation_key_sharing(clause: str) -> bool:
     """Recognize a claim that two payment operation types share one credential."""
+    if re.search(
+        rf"\b{_PAYMENT_OPERATION}\b[^.!?;]{{0,70}}"
+        r"\b(?:does\s+not|doesn't)\b[^.!?;]{0,15}"
+        r"\b(?:use|keep|retain|reuse|map)\w*\b[^.!?;]{0,25}"
+        r"\b(?:its(?:\s+own)?|a\s+(?:separate|distinct|different))\b[^.!?;]{0,25}"
+        rf"\b{_IDEMPOTENCY_CREDENTIAL}\b[^\n]{{0,45}}"
+        r"(?:[;.!?]\s*|\band\s+)"
+        r"(?:(?:instead|rather)\s*,?\s*)?(?:\bit\b[^.!?;]{0,20})?"
+        r"\b(?:share|use|reuse|borrow|inherit)\w*\b[^.!?;]{0,30}"
+        rf"\b(?:the\s+)?{_PAYMENT_OPERATION}(?:'s)?\b[^.!?;]{{0,20}}"
+        rf"\b{_IDEMPOTENCY_CREDENTIAL}\b",
+        clause,
+    ):
+        return True
     patterns = (
         re.compile(
             rf"\b{_PAYMENT_OPERATION}\b\s+(?:and|or)\s+"
             rf"\b{_PAYMENT_OPERATION}\b[^,;.!?]{{0,55}}"
-            rf"\b(?:share|use|reuse|have|map)\w*\b(?:\s+(?:to|onto))?\s*.{{0,25}}"
-            rf"\b(?:one|same|common|shared|the\s+same)\b.{{0,20}}"
+            rf"\b(?:share|use|reuse|have|map|carr(?:y|ies|ied|ying)|bear\w*)\b"
+            rf"(?:\s+(?:to|onto))?\s*.{{0,25}}"
+            rf"\b(?:one|same|identical|common|shared|the\s+same)\b.{{0,20}}"
             rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
         ),
         re.compile(
             rf"\b{_PAYMENT_OPERATION}\b.{{0,25}}"
-            rf"\b(?:use|reuse|inherit|map)\w*\b(?:\s+(?:to|onto))?.{{0,30}}"
+            rf"\b(?:use|reuse|inherit|map|borrow|run|key|carr(?:y|ies|ied|ying)|"
+            rf"bear|take)\w*\b"
+            rf"(?:\s+(?:to|onto|under|with))?.{{0,30}}"
             rf"\b(?:the\s+)?{_PAYMENT_OPERATION}(?:'s)?\b.{{0,20}}"
             rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
         ),
@@ -403,6 +420,32 @@ def _has_affirmative_cross_operation_key_sharing(clause: str) -> bool:
             rf"(?:.{{0,35}}\b(?:across|for|to)\b.{{0,15}}|.{{0,20}})"
             rf"\b(?:all(?:\s+(?:three|3))?|(?:three|3))\b.{{0,15}}\boperations\b"
         ),
+        re.compile(
+            rf"\b(?:one|same|shared|the\s+same|a\s+single|that|this)\b.{{0,30}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,45}}"
+            r"\b(?:for|across|between|covers?|spans?)\b.{0,20}"
+            r"\b(?:both|the\s+two|two)\b.{0,20}"
+            r"\b(?:operations?|operation[- ]types?)\b"
+        ),
+        re.compile(
+            r"\b(?:both|the\s+two|two)\b.{0,20}"
+            r"\b(?:operations?|operation[- ]types?)\b.{0,45}"
+            rf"\b(?:share|use|reuse|have|map)\w*\b.{{0,25}}"
+            rf"\b(?:one|same|shared|the\s+same|a\s+single)\b.{{0,20}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b"
+        ),
+        re.compile(
+            rf"\b(?:one|same|shared|the\s+same|that|this)\b.{{0,30}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,50}}"
+            r"\bregardless\s+of\s+whether\b.{0,35}"
+            rf"\b{_PAYMENT_OPERATION}\b.{{0,25}}\b(?:or|and)\b.{{0,25}}"
+            rf"\b{_PAYMENT_OPERATION}\b"
+        ),
+        re.compile(
+            rf"\b(?:one|same|shared|the\s+same|that|this)\b.{{0,30}}"
+            rf"\b{_IDEMPOTENCY_CREDENTIAL}\b.{{0,45}}"
+            r"\b(?:for\s+either\s+(?:operation|one)|between\s+them)\b"
+        ),
     )
     contrast = re.compile(
         r"\b(?:but|however|yet|nevertheless|although|even\s+though|except)\b"
@@ -410,7 +453,8 @@ def _has_affirmative_cross_operation_key_sharing(clause: str) -> bool:
     local_negation = re.compile(
         r"\b(?:do\s+not|don't|does\s+not|doesn't|must\s+not|should\s+not|"
         r"cannot|can't|never|is\s+not|isn't|are\s+not|aren't)\b.{0,45}"
-        r"\b(?:share|use|reuse|map|have|inherit|double|alias)\w*\b"
+        r"\b(?:share|use|reuse|map|have|inherit|double|alias|borrow|run|key|"
+        r"carry|carries|take|bear)\w*\b"
     )
     claim_clauses = [
         item.strip()
@@ -898,9 +942,10 @@ def payment_operation_semantic_issues(
 
     retry_signal = r"retry|retries|retrying|replay|replays|replaying|resubmit|attempt"
     new_key_signal = (
-        r"(?:fresh|new|different|rotated|replacement|unique)\s+"
-        r"(?:operation\s+)?(?:idempotency\s+)?keys?|"
-        r"(?:rotate|change|replace)\w*\s+(?:the\s+)?idempotency\s+keys?"
+        r"(?:fresh|new|another|different|rotated|replacement|unique)\s+"
+        r"(?:operation\s+)?(?:idempotency\s+)?(?:key|token)s?|"
+        r"(?:rotate|change|replace)\w*\s+(?:the\s+)?idempotency\s+"
+        r"(?:key|token)s?"
     )
     unsafe_new_key = False
     for clause in clauses:
@@ -1158,6 +1203,39 @@ def payment_operation_semantic_issues(
             lower,
         )
     )
+    safe_partial_retry_summary = bool(
+        explicit_per_operation_instance_key_scope
+        and (
+            re.search(
+                r"\b(?:partial\s+)?(?:capture|refund)"
+                r"(?:\s*/\s*(?:partial\s+)?(?:capture|refund))?\s+"
+                r"retr(?:y|ies|ied|ying)\b.{0,55}"
+                r"\breuse\w*\b.{0,30}\b(?:same|original)\b.{0,30}"
+                r"\b(?:partial[- ]action\s+)?(?:idempotency\s+)?key\b"
+                r"[\s,;.!?]*(?:(?:but|while|whereas|and)\b[\s,;.!?]*)?"
+                r"\b(?:for\s+)?(?:(?:a|any|each|every)\s+)?"
+                r"new\s+partial\s+action\b.{0,35}"
+                r"\b(?:gets?|has|uses?|receives?|mints?|creates?)\b.{0,20}"
+                r"\b(?:a\s+)?(?:new|fresh|unique|different)\b.{0,15}"
+                r"\b(?:idempotency\s+)?key\b",
+                clause_text,
+            )
+            or re.search(
+                r"\bretr(?:y|ies|ied|ying)\s+of\b.{0,30}\bexact\b.{0,25}"
+                r"\bpartial\s+(?:capture|refund)\b.{0,20}\b(?:or|and)\b"
+                r".{0,20}\b(?:partial\s+)?(?:capture|refund)\b.{0,45}"
+                r"\breuse\w*\b.{0,25}\b(?:its|the)\b.{0,15}"
+                r"\b(?:same|original)\b.{0,20}\b(?:idempotency\s+)?key\b"
+                r"[\s,;.!?]*(?:(?:but|while|whereas|and)\b[\s,;.!?]*)?"
+                r"\b(?:for\s+)?(?:(?:a|any|each|every)\s+)?"
+                r"new\s+partial\s+action\b.{0,30}"
+                r"\b(?:mint|create|assign|use|get|receive)\w*\b.{0,20}"
+                r"\b(?:a\s+)?(?:new|fresh|unique|different)\b.{0,15}"
+                r"\b(?:idempotency\s+)?key\b",
+                clause_text,
+            )
+        )
+    )
     unsafe_shared_key = False
     for clause in semantic_windows:
         operations = {
@@ -1277,6 +1355,56 @@ def payment_operation_semantic_issues(
                     r"\bnew\s+(?:idempotency\s+)?key\b.{0,160}"
                     r"\b(?:retry|replay)\b.{0,70}\b(?:exact|same)\b"
                     r".{0,55}\b(?:same|original)\b.{0,35}"
+                    r"\b(?:idempotency\s+)?key\b",
+                    clause,
+                )
+            )
+            or (
+                explicit_per_operation_instance_key_scope
+                and re.search(
+                    r"\b(?:partial\s+)?(?:capture|refund)"
+                    r"(?:\s*/\s*(?:partial\s+)?(?:capture|refund))?\s+"
+                    r"retr(?:y|ies|ied|ying)\b.{0,55}"
+                    r"\breuse\w*\b.{0,30}\b(?:same|original)\b.{0,30}"
+                    r"\b(?:partial[- ]action\s+)?(?:idempotency\s+)?key\b"
+                    r"[\s,;.!?]*(?:(?:but|while|whereas|and)\b[\s,;.!?]*)?"
+                    r"\b(?:for\s+)?(?:(?:a|any|each|every)\s+)?"
+                    r"new\s+partial\s+action\b.{0,35}"
+                    r"\b(?:gets?|has|uses?|receives?|mints?|creates?)\b.{0,20}"
+                    r"\b(?:a\s+)?(?:new|fresh|unique|different)\b.{0,15}"
+                    r"\b(?:idempotency\s+)?key\b",
+                    clause,
+                )
+            )
+            or (
+                explicit_per_operation_instance_key_scope
+                and re.search(
+                    r"\bretr(?:y|ies|ied|ying)\s+of\b.{0,30}\bexact\b.{0,25}"
+                    r"\bpartial\s+(?:capture|refund)\b.{0,20}\b(?:or|and)\b"
+                    r".{0,20}\b(?:partial\s+)?(?:capture|refund)\b.{0,45}"
+                    r"\breuse\w*\b.{0,25}\b(?:its|the)\b.{0,15}"
+                    r"\b(?:same|original)\b.{0,20}\b(?:idempotency\s+)?key\b"
+                    r".{0,55}\b(?:for\s+)?(?:(?:a|any|each|every)\s+)?"
+                    r"new\s+partial\s+action\b"
+                    r".{0,30}\b(?:mint|create|assign|use|get|receive)\w*\b"
+                    r".{0,20}\b(?:a\s+)?(?:new|fresh|unique|different)\b.{0,15}"
+                    r"\b(?:idempotency\s+)?key\b",
+                    clause,
+                )
+            )
+            or (
+                safe_partial_retry_summary
+                and re.search(
+                    r"\b(?:partial\s+)?(?:capture|refund)"
+                    r"(?:\s*/\s*(?:partial\s+)?(?:capture|refund))?\s+"
+                    r"retr(?:y|ies|ied|ying)\b.{0,55}\breuse\w*\b.{0,30}"
+                    r"\b(?:same|original)\b.{0,30}"
+                    r"\b(?:partial[- ]action\s+)?(?:idempotency\s+)?key\b|"
+                    r"\bretr(?:y|ies|ied|ying)\s+of\b.{0,30}\bexact\b.{0,25}"
+                    r"\bpartial\s+(?:capture|refund)\b.{0,20}\b(?:or|and)\b"
+                    r".{0,20}\b(?:partial\s+)?(?:capture|refund)\b.{0,45}"
+                    r"\breuse\w*\b.{0,25}\b(?:its|the)\b.{0,15}"
+                    r"\b(?:same|original)\b.{0,20}"
                     r"\b(?:idempotency\s+)?key\b",
                     clause,
                 )
@@ -1679,6 +1807,11 @@ def payment_operation_semantic_issues(
                 context,
             )
             or re.search(
+                r"\b(?:explicitly\s+)?(?:authoriz|approv|request|initiat|confirm)\w*\b"
+                r".{0,70}\b(?:by\s+)?(?:the\s+)?(?:user|customer|cardholder)\b",
+                context,
+            )
+            or re.search(
                 r"\bexplicit\s+(?:user|customer|cardholder)\s+"
                 r"(?:authorization|approval|request|confirmation)\b",
                 context,
@@ -1733,25 +1866,87 @@ def payment_operation_semantic_issues(
         r"\s+(?:a\s+|the\s+)?(?:another|new|fresh|replacement|second)\s+"
         r"(?:charge|payment|authorization|payment\s+request|processor\s+request)"
     )
+
+    def has_affirmative_new_key(segment: str) -> bool:
+        for key_match in re.finditer(rf"\b(?:{new_key_signal})\b", segment):
+            claim_prefix = segment[max(0, key_match.start() - 100) : key_match.start()]
+            boundaries = list(
+                re.finditer(
+                    r"[,;]|\b(?:but|however|yet|nevertheless|instead)\b|"
+                    r"\band\b(?=\s+(?:(?:i|we)\s+)?(?:use|submit|send|charge|"
+                    r"generate|set|put|rotate|replace|assign|create|mint|choose|"
+                    r"derive|call)\w*\b)",
+                    claim_prefix,
+                )
+            )
+            governing_prefix = (
+                claim_prefix[boundaries[-1].end() :] if boundaries else claim_prefix
+            )
+            if re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't|avoid|"
+                r"without|rather than|instead of)\b.{0,80}$|"
+                r"\b(?:no|not(?:\s+(?:a|the|any))?)\s*$",
+                governing_prefix,
+            ):
+                continue
+            return True
+        return False
+
+    def ambiguity_governs_action(action_start: int, action_end: int) -> bool:
+        prior = lower[max(0, action_start - 480) : action_start]
+        if re.search(rf"\b(?:{ambiguous_outcome})\b", prior):
+            return True
+        following = lower[action_end : min(len(lower), action_end + 100)]
+        return bool(
+            re.search(
+                rf"\b(?:after|following)\b.{{0,35}}"
+                rf"\b(?:{ambiguous_outcome})\b",
+                following,
+            )
+        )
+
+    def action_is_negated(action_start: int) -> bool:
+        prefix = lower[max(0, action_start - 140) : action_start]
+        contrast_boundaries = list(
+            re.finditer(
+                r";|\b(?:but|however|yet|nevertheless|instead)\b|"
+                r",(?=\s*(?:i|we|the\s+(?:system|worker|client)|"
+                r"(?:system|worker|client))\b)",
+                prefix,
+            )
+        )
+        governing_prefix = (
+            prefix[contrast_boundaries[-1].end() :]
+            if contrast_boundaries
+            else prefix
+        )
+        return bool(
+            re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't|without|"
+                r"block|blocks|blocked|prevent|prevents|prevented)\s*$",
+                prefix,
+            )
+            or re.search(
+                r"\b(?:block|prevent)\w*\s+(?:(?:a|the|any)\s+)?"
+                r"(?:(?:worker|system|client)\s+)?(?:from\s+)?$",
+                prefix,
+            )
+            or re.search(
+                r"\b(?:do not|don't|never|must not|should not|cannot|can't)\b"
+                r"[^.!?;]{0,100}\b(?:or|and)\s*$",
+                governing_prefix,
+            )
+        )
+
     unsafe_new_charge = False
     for match in re.finditer(rf"\b(?:{new_charge_action})\b", lower):
-        window = lower[max(0, match.start() - 260) : match.end() + 260]
-        if not re.search(rf"\b(?:{ambiguous_outcome})\b", window):
+        if not ambiguity_governs_action(match.start(), match.end()):
             continue
         if is_distinct_user_authorized_payment_after_reconciliation(
             match.start(), match.end()
         ):
             continue
-        prefix = lower[max(0, match.start() - 100) : match.start()]
-        if re.search(
-            r"\b(?:do not|don't|never|must not|should not|cannot|can't|without|"
-            r"block|blocks|blocked|prevent|prevents|prevented)\s*$",
-            prefix,
-        ) or re.search(
-            r"\b(?:block|prevent)\w*\s+(?:(?:a|the|any)\s+)?"
-            r"(?:(?:worker|system|client)\s+)?(?:from\s+)?$",
-            prefix,
-        ):
+        if action_is_negated(match.start()):
             continue
         unsafe_new_charge = True
         break
@@ -1763,10 +1958,9 @@ def payment_operation_semantic_issues(
             lower,
         )
         for match in passive_new_charge:
-            window = lower[max(0, match.start() - 260) : match.end() + 260]
             prefix = lower[max(0, match.start() - 30) : match.start()]
             if (
-                re.search(rf"\b(?:{ambiguous_outcome})\b", window)
+                ambiguity_governs_action(match.start(), match.end())
                 and not re.search(r"\b(?:not|never)\b", match.group())
                 and not re.search(r"\b(?:no|without)\s*$", prefix)
             ):
@@ -1778,24 +1972,120 @@ def payment_operation_semantic_issues(
                 break
     if not unsafe_new_charge:
         keyed_charge = re.finditer(
-            r"\b(?:issue|send|submit|create|initiate|make|start|dispatch)\w*\s+"
-            r"(?:a\s+|the\s+)?(?:charge|payment|authorization)\b",
+            r"\b(?:(?:issue|reissue|send|submit|create|initiate|make|start|dispatch|"
+            r"queue|enqueue|perform|process|fire)\w*\s+(?:a\s+|the\s+)?"
+            r"(?:charge|payment|authorization|payment\s+request|"
+            r"(?:payment|provider|charge)\s+command)|"
+            r"kick\s+off\s+(?:a\s+|the\s+)?(?:charge|payment|authorization)|"
+            r"(?:invoke|execute|run|rerun)\w*\s+(?:a\s+|the\s+)?"
+            r"(?:payment|provider|charge)\s+command|"
+            r"(?:charge|debit)\w*\s+(?:the\s+)?(?:card|customer|account)|"
+            r"call\w*\s+(?:the\s+)?(?:provider|processor|gateway)\b.{0,25}"
+            r"\b(?:to\s+)?(?:charge|debit)\w*\s+(?:the\s+)?"
+            r"(?:card|customer|account))\b",
             lower,
         )
         for match in keyed_charge:
-            window = lower[max(0, match.start() - 260) : match.end() + 260]
-            if not re.search(rf"\b(?:{ambiguous_outcome})\b", window):
+            if not ambiguity_governs_action(match.start(), match.end()):
                 continue
-            second_effect = bool(
-                re.search(r"\b(?:again|anew)\b", window)
-                or re.search(rf"\b(?:{new_key_signal})\b", window)
+            # Bind the second-effect marker to the payment-command clause.
+            # A system-design canvas often places a normal initial request
+            # immediately after a separate rule such as "new partial action,
+            # new key" and an UNKNOWN-timeout rule.  Searching the whole
+            # proximity window lets those unrelated clauses manufacture an
+            # unsafe replay claim around "client submits payment request."
+            clause_start = max(
+                lower.rfind(delimiter, 0, match.start())
+                for delimiter in (".", "!", "?", ";")
             )
-            prefix = lower[max(0, match.start() - 100) : match.start()]
-            if second_effect and not re.search(
-                r"\b(?:do not|don't|never|must not|should not|cannot|can't|without|"
-                r"block|blocks|blocked|prevent|prevents|prevented)\s*$",
-                prefix,
-            ):
+            clause_ends = [
+                position
+                for delimiter in (".", "!", "?", ";")
+                if (position := lower.find(delimiter, match.end())) >= 0
+            ]
+            clause_end = min(clause_ends) if clause_ends else len(lower)
+            action_clause = lower[clause_start + 1 : clause_end]
+            boundary_claim = (
+                r"\b(?:distinct|separate|separately|unrelated|normal\s+initial|"
+                r"initial\s+flow|new\s+customer\s+purchase|new\s+partial\s+"
+                r"(?:capture|refund))\b"
+            )
+            key_assignment = (
+                r"\b(?:use|select|set|put|attach|apply|associate|bind|tag|stamp|assign|"
+                r"generate|create|mint|choose|derive|rotate|change|replace)\w*\b"
+                rf".{{0,50}}\b(?:{new_key_signal})\b|"
+                r"\b(?:rotate|change|replace)\w*\s+(?:the\s+)?idempotency\s+"
+                r"(?:key|token)s?\b|"
+                r"\bgive\w*\b.{0,20}\b(?:(?:that|this|same|the)\s+"
+                r"(?:command|request|charge|payment|authorization)|it)\b.{0,20}"
+                rf"\b(?:a\s+|the\s+)?(?:{new_key_signal})\b|"
+                r"\b(?:(?:that|this|same|the)\s+"
+                r"(?:command|request|charge|payment|authorization)|it)\b.{0,35}"
+                r"\b(?:gets?|uses?|receives?|has)\b.{0,25}"
+                rf"\b(?:{new_key_signal})\b"
+            )
+            previous_clauses: List[str] = []
+            cursor = clause_start
+            for _ in range(8):
+                if cursor < 0:
+                    break
+                previous_start = max(
+                    lower.rfind(delimiter, 0, cursor)
+                    for delimiter in (".", "!", "?", ";")
+                )
+                previous_clauses.append(lower[previous_start + 1 : cursor])
+                cursor = previous_start
+            prior_key_link = False
+            if not re.search(boundary_claim, action_clause):
+                for index, key_clause in enumerate(previous_clauses):
+                    if (
+                        not has_affirmative_new_key(key_clause)
+                        or not re.search(key_assignment, key_clause)
+                        or re.search(boundary_claim, key_clause)
+                    ):
+                        continue
+                    bridge = " ".join(reversed(previous_clauses[:index]))
+                    sequenced = bool(
+                        index == 0
+                        or re.search(r"^\s*(?:afterward|next|then)\b", action_clause)
+                        or re.search(
+                            r"\b(?:retry|replay|resubmit|same\s+command|"
+                            r"that\s+command)\b",
+                            f"{key_clause} {bridge}",
+                        )
+                    )
+                    if sequenced:
+                        prior_key_link = True
+                        break
+            next_clause_start = clause_end + 1
+            next_clause_ends = [
+                position
+                for delimiter in (".", "!", "?", ";")
+                if (position := lower.find(delimiter, next_clause_start)) >= 0
+            ]
+            next_clause_end = (
+                min(next_clause_ends) if next_clause_ends else len(lower)
+            )
+            next_clause = lower[next_clause_start:next_clause_end]
+            following_key_link = bool(
+                not re.search(boundary_claim, action_clause)
+                and not re.search(boundary_claim, next_clause)
+                and has_affirmative_new_key(next_clause)
+                and re.search(key_assignment, next_clause)
+            )
+            same_clause_second_effect = bool(
+                not re.search(boundary_claim, action_clause)
+                and (
+                    re.search(r"\b(?:again|anew)\b", action_clause)
+                    or has_affirmative_new_key(action_clause)
+                )
+            )
+            second_effect = bool(
+                same_clause_second_effect
+                or prior_key_link
+                or following_key_link
+            )
+            if second_effect and not action_is_negated(match.start()):
                 if is_distinct_user_authorized_payment_after_reconciliation(
                     match.start(), match.end()
                 ):

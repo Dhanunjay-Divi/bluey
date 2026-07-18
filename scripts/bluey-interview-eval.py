@@ -2007,6 +2007,138 @@ def self_check_attempt_integrity_guards() -> None:
     )
     assert not missing_required_group_issues(q47, round543_live_q47)
     assert not q47_director_alignment_issues(round543_live_q47)
+    round544_live_q47 = (
+        "I’d make it a shared priority decision, not a solo call. I’d quickly "
+        "compare the two requests on the same criteria: business impact, urgency, "
+        "effort, dependencies, and how reversible the decision is. Then I’d bring "
+        "that comparison to both directors and ask them to agree on the order, or "
+        "on what can be deferred safely. If they still disagree, I’d escalate the "
+        "decision to their common accountable owner or sponsor with that same "
+        "comparison, so the tradeoff is visible and not decided in private. I would "
+        "not start either one until the priority is resolved, unless one is a true "
+        "production, security, safety, or compliance incident covered by an agreed "
+        "severity policy, in which case I’d take only the minimum reversible "
+        "containment step and notify both directors immediately. The reason is "
+        "simple: if I choose unilaterally, I may optimize for one director and "
+        "create avoidable risk for the other. My job is to make the tradeoff "
+        "explicit, protect delivery, and keep ownership of the decision with the "
+        "right leader."
+    )
+    assert not missing_required_group_issues(q47, round544_live_q47)
+    assert not q47_director_alignment_issues(round544_live_q47)
+    for safe_conditional_private_warning in (
+        "I show both directors one comparison, ask them to agree on the order, and "
+        "escalate to their common owner if needed. If I pick alone, I could hide "
+        "the tradeoff and harm the other team.",
+        "I show both directors one comparison, ask them to agree on the order, and "
+        "escalate to their common owner if needed. If I decide privately, I might "
+        "bias the decision and undermine shared ownership.",
+        "I show both directors one comparison and ask them to align on the order. If I choose "
+        "unilaterally, I may create avoidable risk, so I avoid doing that and wait "
+        "for the owner.",
+        "I show both directors one comparison and ask them to align on the order. If I choose "
+        "unilaterally, I may create avoidable risk, so I refuse to do that and ask "
+        "the owner to decide.",
+        "I show both directors one comparison and ask them to align on the order. If I choose "
+        "unilaterally, I may create avoidable risk, and I wait for agreement.",
+        "I show both directors one comparison and ask them to align on the order. If I choose "
+        "unilaterally, I may create avoidable risk, so I choose neither request and wait.",
+        "I show both directors one comparison and ask them to align on the order. If I choose "
+        "unilaterally, I may create avoidable risk, so I decide not to act on either request.",
+        "I show both directors one comparison and ask them to align on the order. If I were "
+        "to choose unilaterally, I might create avoidable risk, so I wait for agreement.",
+        "I show both directors one comparison and ask them to align on the order. Should I "
+        "choose unilaterally, I might create avoidable risk, so I wait for agreement.",
+        "I show both directors one comparison and ask them to align on the order. If we "
+        "choose unilaterally, we may create avoidable risk, so we wait for agreement.",
+        "I show both directors one comparison and ask them to align on the order. A unilateral "
+        "decision could create avoidable risk, so I wait for agreement.",
+        "I show both directors one comparison and ask them to align on the order. If I choose "
+        "unilaterally, I might create risk. I ask the owner to decide. Once they agree, I "
+        "proceed with the chosen request.",
+        "I show both directors one comparison and ask them to align on the order. If I choose "
+        "unilaterally, I might create risk. Following the decision, I start request A.",
+        "I show both directors one comparison and ask them to align on the order. If I choose "
+        "unilaterally, I might create risk. Once the owner resolves the priority, I start "
+        "the chosen request.",
+        "I show both directors one comparison and ask them to align on the order. If I choose "
+        "unilaterally, I might create risk. I do not start request A until both directors "
+        "agree.",
+    ):
+        assert not q47_director_alignment_issues(
+            safe_conditional_private_warning
+        ), safe_conditional_private_warning
+    for unsafe_conditional_private_choice in (
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I start the higher-impact request before they decide.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk, but I proceed with my preferred "
+        "request anyway.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk; however, I proceed with my "
+        "preferred request anyway.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk. Still, I proceed with my "
+        "preferred request anyway.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk, and I proceed with my preferred "
+        "request anyway.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk, although I launch my preferred "
+        "request anyway.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk, so I assign my team to my "
+        "preferred request anyway.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk. Next I ship my preferred "
+        "request anyway.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk. I accept that risk and act on "
+        "request A.",
+        "I show both directors one comparison and ask them to align. If I decide "
+        "privately, I could create bias, while I start the request I prefer.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk. I accept the harm, then do the request.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk. I tolerate that consequence and assign "
+        "engineers to request A.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk. I accept the tradeoff and make request A "
+        "the priority.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk, but I continue work on request A anyway.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk, so I allocate engineers to request A.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk, so I direct the team to request A.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create avoidable risk, but I green-light request A.",
+        "I show both directors one comparison and ask them to align. If I chose "
+        "unilaterally, I might create avoidable risk, but I start request A.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may start request A, creating avoidable risk.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I could choose request A and create bias.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create risk, but I move forward with A.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create risk, so I put resources into request A.",
+        "I show both directors one comparison and ask them to align. I start request A. "
+        "If I choose unilaterally, I may create avoidable risk.",
+        "I show both directors one comparison and ask them to align. I put engineers on "
+        "request A. If I choose unilaterally, I may create avoidable risk.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create risk, but I put request A first.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create risk, so I expedite request A.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create risk, so I instruct the team to start request A.",
+        "I show both directors one comparison and ask them to align. If I choose "
+        "unilaterally, I may create risk, so I assign request A to the team.",
+    ):
+        assert "unsafe_negated_or_unilateral_director_alignment" in (
+            q47_director_alignment_issues(unsafe_conditional_private_choice)
+        ), unsafe_conditional_private_choice
     for safe_negated_private_choice in (
         "I make one comparison visible to both directors and ask them to agree on a "
         "shared priority. The job is not to decide on my own; it is to make the "

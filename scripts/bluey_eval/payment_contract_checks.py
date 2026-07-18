@@ -455,6 +455,155 @@ def self_check_payment_operation_semantics() -> None:
             "fresh idempotency key.",
             "unsafe_new_charge_after_ambiguous_outcome",
         ),
+        (
+            "After the timeout leaves the result UNKNOWN, use a fresh idempotency "
+            "key; then submit the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The timeout leaves the payment UNKNOWN. Submit the payment. Use a "
+            "fresh idempotency key for that command.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The timeout leaves the payment UNKNOWN. Submit the payment. It gets "
+            "a new idempotency key.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The timeout leaves the payment UNKNOWN. Submit the payment. Give it "
+            "a fresh idempotency key.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The timeout leaves the payment UNKNOWN. Give that command a fresh "
+            "idempotency key. Then submit the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The timeout leaves the payment UNKNOWN. Select a fresh key. Record the "
+            "retry reason. Then submit the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Then put a different idempotency token on the "
+            "command and submit the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Then use another idempotency key and submit "
+            "the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Then generate a fresh key and charge the card.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Generate a fresh key and call the provider to "
+            "charge the card.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Set a fresh idempotency key. Then submit the "
+            "charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Rotate the idempotency key. Then submit the "
+            "charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Do not keep the original idempotency key but "
+            "use a fresh idempotency key and submit the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Although we do not reuse the old key, we submit "
+            "the charge with a fresh key.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. We avoid the original key and submit the charge "
+            "under a replacement idempotency key.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Apply a fresh idempotency key. Then submit the "
+            "charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Attach a fresh idempotency key. Then submit the "
+            "charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Associate a fresh key with the command. Then "
+            "submit the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Bind a fresh key to the command. Then submit "
+            "the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Tag the command with a fresh key. Then submit "
+            "the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Generate a fresh key and run the charge command.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Generate a fresh key and kick off the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Generate a fresh key and invoke the payment "
+            "command.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Generate a fresh key and enqueue the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Generate a fresh key and perform the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Generate a fresh key and fire the payment request.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Stamp the command with a fresh key. Then submit "
+            "the charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Generate a fresh key and process the payment.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Generate a fresh key and reissue the payment "
+            "request.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Generate a fresh key and rerun the provider "
+            "command.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
+        (
+            "The payment is UNKNOWN. Generate a fresh key. Record one. Record two. "
+            "Record three. Record four. Record five. Record six. Then submit the "
+            "charge.",
+            "unsafe_new_charge_after_ambiguous_outcome",
+        ),
     )
     for value, expected in unsafe:
         found = payment_operation_semantic_issues(
@@ -600,6 +749,140 @@ def self_check_payment_operation_semantics() -> None:
             require_complete_idempotency_semantics=False,
         )
     )
+    round544_live_q39_rules = (
+        "Each logical provider-operation instance gets its own idempotency key, "
+        "scoped to owning account, payment, operation type, and operation instance. "
+        "A new partial capture or partial refund is a new logical action with a new "
+        "key. A retry of that exact partial action reuses the original key. Do not "
+        "create a second charge command after a timeout. Keep ambiguous outcomes as "
+        "UNKNOWN or PENDING_RECONCILIATION until reconciled. Client submits payment "
+        "request. Webhook consumer deduplicates by provider event ID. Partial "
+        "capture/refund retry: reuse the same partial-action key, but a new partial "
+        "action gets a new key."
+    )
+    assert not payment_operation_semantic_issues(
+        round544_live_q39_rules,
+        require_webhook_event_dedup=True,
+        require_complete_idempotency_semantics=False,
+    )
+    for safe_partial_retry_summary in (
+        "Partial capture/refund retry: reuse the same partial-action key, and a new "
+        "partial action gets a new key.",
+        "Partial capture/refund retry: reuse the same partial-action key; a new "
+        "partial action gets a new key.",
+        "Partial capture/refund retry: reuse the same partial-action key. A new "
+        "partial action gets a new key.",
+        "For a retry of the exact partial capture or refund, reuse its original key; "
+        "for a new partial action, mint a new key.",
+        "Partial capture/refund retry reuses the same partial-action key, but any new "
+        "partial action receives a fresh key.",
+    ):
+        assert "unsafe_shared_idempotency_key_across_payment_operations" not in (
+            payment_operation_semantic_issues(
+                "Each logical provider-operation instance gets its own idempotency "
+                "key. "
+                + safe_partial_retry_summary,
+                require_webhook_event_dedup=False,
+                require_complete_idempotency_semantics=False,
+            )
+        ), safe_partial_retry_summary
+    for safe_cross_operation_negation in (
+        "A capture retry does not carry the refund token; it keeps its own original "
+        "key.",
+        "A refund retry never borrows the capture key; it reuses its own.",
+    ):
+        assert "unsafe_shared_idempotency_key_across_payment_operations" not in (
+            payment_operation_semantic_issues(
+                "Each logical provider-operation instance gets its own idempotency "
+                "key. "
+                + safe_cross_operation_negation,
+                require_webhook_event_dedup=False,
+                require_complete_idempotency_semantics=False,
+            )
+        ), safe_cross_operation_negation
+    safe_negated_adjacent_key = (
+        "After a timeout leaves the result UNKNOWN, do not use a fresh key. "
+        "Submit a payment status query instead of a second charge."
+    )
+    assert "unsafe_new_charge_after_ambiguous_outcome" not in (
+        payment_operation_semantic_issues(
+            safe_negated_adjacent_key,
+            require_webhook_event_dedup=False,
+            require_complete_idempotency_semantics=False,
+        )
+    )
+    safe_initial_flow_before_ambiguity = (
+        "A new payment gets a new idempotency key. Client submits the payment. "
+        "If the provider later times out, mark the result UNKNOWN."
+    )
+    assert "unsafe_new_charge_after_ambiguous_outcome" not in (
+        payment_operation_semantic_issues(
+            safe_initial_flow_before_ambiguity,
+            require_webhook_event_dedup=False,
+            require_complete_idempotency_semantics=False,
+        )
+    )
+    for safe_separate_flow in (
+        "The timeout path leaves UNKNOWN and blocks a second charge. A new partial "
+        "refund is a separate action and gets a new key. In the normal initial "
+        "flow, the client submits payment to the API.",
+        "UNKNOWN outcomes stay pending reconciliation. Separately, each new partial "
+        "capture gets a new key. For an unrelated new customer purchase, the client "
+        "submits payment.",
+        "The payment is UNKNOWN. Do not attach a fresh key or submit another charge; "
+        "run a status query.",
+        "The payment is UNKNOWN. In the normal initial flow for an unrelated new "
+        "purchase, attach its new operation key and submit the payment.",
+    ):
+        assert "unsafe_new_charge_after_ambiguous_outcome" not in (
+            payment_operation_semantic_issues(
+                safe_separate_flow,
+                require_webhook_event_dedup=False,
+                require_complete_idempotency_semantics=False,
+            )
+        ), safe_separate_flow
+    for unsafe_partial_action_contrast in (
+        "Partial capture/refund retry: reuse the same partial-action key, and a new "
+        "partial action also gets the same key.",
+        "Partial capture/refund retry: reuse the same partial-action key for both "
+        "operations, but a new partial action gets a new key.",
+        "Partial capture/refund retry: reuse the same partial-action key across the "
+        "two operation types, but a new partial action gets a new key.",
+        "Partial capture/refund retries reuse the same partial-action key across the "
+        "two operation types, but a new partial action gets a new key.",
+        "Partial capture/refund retry: reuse the same partial-action key regardless "
+        "of whether it is capture or refund, but a new partial action gets a new key.",
+        "Partial capture/refund retry: reuse the same partial-action key for either "
+        "operation, but a new partial action gets a new key.",
+        "Partial capture/refund retry: reuse the same partial-action key between "
+        "them, but a new partial action gets a new key.",
+        "Partial capture and refund retries carry an identical idempotency token, "
+        "but a new partial action gets a new key.",
+        "A refund retry borrows the capture idempotency key, but a new partial "
+        "action gets a new key.",
+        "Capture does not use its own key; instead it shares the refund idempotency "
+        "key.",
+        "Capture does not use a separate key and instead it shares the refund "
+        "idempotency key.",
+        "A capture retry carries the refund idempotency token, but a new partial "
+        "action gets a new key.",
+        "A refund retry takes the capture idempotency key, but a new partial action "
+        "gets a new key.",
+        "Capture does not keep its key; it borrows the refund idempotency key.",
+        "Capture does not map to a distinct token; rather, it uses the refund "
+        "idempotency token.",
+        "A capture retry runs under the refund idempotency key.",
+        "A capture retry is keyed with the refund idempotency token.",
+        "Capture does not use a separate key and instead shares the refund key.",
+    ):
+        assert "unsafe_shared_idempotency_key_across_payment_operations" in (
+            payment_operation_semantic_issues(
+                "Each logical provider-operation instance gets its own idempotency key. "
+                + unsafe_partial_action_contrast,
+                require_webhook_event_dedup=False,
+                require_complete_idempotency_semantics=False,
+            )
+        ), unsafe_partial_action_contrast
     canary_q39_cross_operation_contradictions = (
         "Never share one key between authorization and refund, but authorization "
         "and capture share the same idempotency key.",
@@ -827,6 +1110,19 @@ def self_check_payment_operation_semantics() -> None:
         require_webhook_event_dedup=False,
         require_complete_idempotency_semantics=False,
         require_same_operation_retry_reuse=True,
+    )
+    reverse_authorization_later_payment = (
+        "A timeout leaves the original payment UNKNOWN. Provider status confirms "
+        "the original payment FAILED with no charge. For a distinct later purchase "
+        "explicitly requested by the customer, submit a new payment with a fresh "
+        "idempotency key."
+    )
+    assert "unsafe_new_charge_after_ambiguous_outcome" not in (
+        payment_operation_semantic_issues(
+            reverse_authorization_later_payment,
+            require_webhook_event_dedup=False,
+            require_complete_idempotency_semantics=False,
+        )
     )
     ambiguous_same_purchase = (
         "Authorize, capture, and refund use distinct operation-scoped idempotency "
