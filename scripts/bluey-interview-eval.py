@@ -907,17 +907,13 @@ def stream_terminal_integrity_issues(attempt: AttemptResult) -> List[str]:
     issues: List[str] = []
     if streamed and visible != streamed:
         issues.append("streamed_answer_not_preserved")
-    if (
-        attempt.billing_received
-        and streamed != terminal
-        and attempt.artifact_type != "code"
-    ):
+    if attempt.billing_received and streamed != terminal:
         issues.append("stream_terminal_answer_mismatch")
     return issues
 
 
 def stream_terminal_audit_issues(attempt: AttemptResult) -> List[str]:
-    """Retain intentional code-shape divergence as nonblocking audit evidence."""
+    """Add code-specific detail when the blocking terminal-integrity gate fires."""
     streamed = attempt.streamed_answer.replace("\r\n", "\n").replace("\r", "\n").strip()
     terminal = attempt.terminal_answer.replace("\r\n", "\n").replace("\r", "\n").strip()
     if (
@@ -1431,6 +1427,111 @@ def _initialized_lock_attributes(class_node: ast.ClassDef) -> set[str]:
     return initialized
 
 
+def _constructor_self_assignment_attributes(class_node: ast.ClassDef) -> set[str]:
+    """Find constructor assignments that read the same uninitialized attribute.
+
+    This is a static, non-executing check for a common generated-code defect such
+    as ``self.value = self.value``. It deliberately applies only inside
+    ``__init__`` and only when both sides are the identical ``self`` attribute,
+    so ordinary state updates elsewhere are unaffected.
+    """
+    # A base class or class-level descriptor/default can legitimately provide
+    # the right-hand attribute. The evaluator cannot prove those values absent,
+    # so it fails safe instead of rejecting the artifact.
+    if class_node.bases:
+        return set()
+
+    initialized: set[str] = set()
+    for member in class_node.body:
+        if isinstance(member, ast.Assign):
+            for target in member.targets:
+                if isinstance(target, ast.Name):
+                    initialized.add(target.id)
+        elif isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
+            initialized.add(member.target.id)
+        elif isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            initialized.add(member.name)
+
+    initializer = next(
+        (
+            node
+            for node in class_node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "__init__"
+        ),
+        None,
+    )
+    if initializer is None:
+        return set()
+
+    suspicious: set[str] = set()
+    assignments = sorted(
+        (
+            candidate
+            for candidate in ast.walk(initializer)
+            if isinstance(candidate, (ast.Assign, ast.AnnAssign))
+        ),
+        key=lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)),
+    )
+    for candidate in assignments:
+        if not isinstance(candidate, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = candidate.value
+        targets = candidate.targets if isinstance(candidate, ast.Assign) else [candidate.target]
+        if (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "self"
+            and value.attr not in initialized
+        ):
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                    and target.attr == value.attr
+                ):
+                    suspicious.add(target.attr)
+        for target in targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                initialized.add(target.attr)
+    return suspicious
+
+
+def _lru_implementation_classes(
+    tree: ast.AST,
+    lru_class: ast.ClassDef,
+) -> List[ast.ClassDef]:
+    """Return the LRU class plus packaged helper classes it constructs."""
+    classes = {
+        candidate.name: candidate
+        for candidate in ast.walk(tree)
+        if isinstance(candidate, ast.ClassDef)
+    }
+    relevant: List[ast.ClassDef] = []
+    pending = [lru_class]
+    visited: set[str] = set()
+    while pending:
+        class_node = pending.pop()
+        if class_node.name in visited:
+            continue
+        visited.add(class_node.name)
+        relevant.append(class_node)
+        for candidate in ast.walk(class_node):
+            if not isinstance(candidate, ast.Call) or not isinstance(
+                candidate.func, ast.Name
+            ):
+                continue
+            helper = classes.get(candidate.func.id)
+            if helper is not None and helper.name not in visited:
+                pending.append(helper)
+    return relevant
+
+
 def _used_lock_attributes(nodes: Sequence[ast.AST]) -> set[str]:
     used: set[str] = set()
     for node in nodes:
@@ -1491,6 +1592,13 @@ def lru_code_semantic_issues(case: EvalCase, body: str) -> List[str]:
         return ["missing_lru_get_or_put_implementation"]
 
     issues: List[str] = []
+    suspicious_constructor_assignments = set()
+    for candidate in _lru_implementation_classes(tree, lru_class):
+        suspicious_constructor_assignments.update(
+            _constructor_self_assignment_attributes(candidate)
+        )
+    if suspicious_constructor_assignments:
+        issues.append("suspicious_constructor_self_assignment")
     class_tokens = _attribute_tokens(tree)
     has_linked_recency = (
         {"prev", "next"}.issubset(class_tokens)
@@ -2907,14 +3015,14 @@ def self_check_attempt_integrity_guards() -> None:
         billing_received=True,
         artifact_type="code",
     )
-    assert not stream_terminal_integrity_issues(code_shape)
+    assert stream_terminal_integrity_issues(code_shape) == [
+        "stream_terminal_answer_mismatch"
+    ]
     assert stream_terminal_audit_issues(code_shape) == [
         "code_stream_terminal_shape_mismatch"
     ]
     q05 = next(case for case in CASES if case.id == "Q05")
-    assert "stream_terminal_answer_mismatch" not in blocking_answer_issues(
-        q05, code_shape
-    )
+    assert "stream_terminal_answer_mismatch" in blocking_answer_issues(q05, code_shape)
 
     canvas_shape = AttemptResult(
         attempt=1,
@@ -3096,7 +3204,7 @@ def self_check_attempt_integrity_guards() -> None:
         ok=True,
         visible_answer=code_visible,
         streamed_answer=code_visible,
-        terminal_answer="A shorter terminal code summary.",
+        terminal_answer=code_visible,
         billing_received=True,
         artifact_type="code",
         artifact_body=code_body,
@@ -3105,7 +3213,61 @@ def self_check_attempt_integrity_guards() -> None:
     assert not blocking_answer_issues(q08, valid_code)
     assert answer_is_success(q08, valid_code)
     _, _, _, _, code_quality_issues = quality_scores(q08, valid_code)
-    assert "code_stream_terminal_shape_mismatch" in code_quality_issues
+    assert "code_stream_terminal_shape_mismatch" not in code_quality_issues
+
+    constructor_self_assignment = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=code_visible,
+        streamed_answer=code_visible,
+        terminal_answer=code_visible,
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=code_body.replace(
+            "self.value = value", "self.value = self.value", 1
+        ),
+    )
+    assert "suspicious_constructor_self_assignment" in mandatory_answer_shape_issues(
+        q08, constructor_self_assignment
+    )
+    assert not answer_is_success(q08, constructor_self_assignment)
+
+    unrelated_self_assignment = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=code_visible,
+        streamed_answer=code_visible,
+        terminal_answer=code_visible,
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=code_body.replace(
+            "class Node:\n",
+            "class UnrelatedDiagnostic:\n"
+            "    def __init__(self):\n"
+            "        self.label = self.label\n\n"
+            "class Node:\n",
+            1,
+        ),
+    )
+    assert "suspicious_constructor_self_assignment" not in mandatory_answer_shape_issues(
+        q08, unrelated_self_assignment
+    )
+
+    class_default_self_assignment = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=code_visible,
+        streamed_answer=code_visible,
+        terminal_answer=code_visible,
+        billing_received=True,
+        artifact_type="code",
+        artifact_body=code_body.replace(
+            "class Node:\n", "class Node:\n    value = None\n", 1
+        ).replace("self.value = value", "self.value = self.value", 1),
+    )
+    assert "suspicious_constructor_self_assignment" not in mandatory_answer_shape_issues(
+        q08, class_default_self_assignment
+    )
 
     invalid_python_body = (
         "```python\n"

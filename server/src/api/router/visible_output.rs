@@ -71,6 +71,15 @@ impl BufferedDisclosureOutput {
         {
             return None;
         }
+        // Once an offer-shaped sentence begins, quarantine the not-yet-
+        // delivered suffix until completion. At finish we remove it only when
+        // it is truly terminal; if substantive content follows, the complete
+        // quarantined suffix is released unchanged.
+        if self.strip_interview_coaching_appendix
+            && terminal_meta_offer_needs_quarantine(&self.text)
+        {
+            return None;
+        }
 
         let release_bytes =
             disclosure_safe_release_bytes(&self.pending, DISCLOSURE_STREAM_HOLDBACK_ALNUM_CHARS);
@@ -162,9 +171,10 @@ impl BufferedDisclosureOutput {
 const INTERVIEW_COACHING_HEADINGS: [&str; 4] =
     ["why this works", "why it works", "reasoning", "rationale"];
 
-/// Returns the start of a narrow, heading-shaped coaching appendix outside a
-/// fenced code block. Ordinary prose such as "This works because..." is not a
-/// heading. Same-line detection requires explicit Markdown bold markers.
+/// Returns the start of a narrow coaching appendix or closing meta-offer
+/// outside a fenced code block. Ordinary prose such as "This works because..."
+/// and substantive technical conditions are preserved. Same-line coaching
+/// heading detection requires explicit Markdown bold markers.
 fn unsolicited_coaching_appendix_start(
     text: &str,
     allow_incomplete_terminal: bool,
@@ -217,7 +227,494 @@ fn unsolicited_coaching_appendix_start(
             line_start += 1;
         }
     }
+    if allow_incomplete_terminal {
+        return terminal_meta_offer_candidate_starts(text)
+            .into_iter()
+            .find(|start| terminal_meta_offer_suffix_is_terminal(&text[*start..]));
+    }
     None
+}
+
+fn terminal_meta_offer_candidate_starts(text: &str) -> Vec<usize> {
+    meta_offer_candidate_starts(text, terminal_meta_offer_starts)
+}
+
+fn potential_terminal_meta_offer_candidate_starts(text: &str) -> Vec<usize> {
+    meta_offer_candidate_starts(text, potential_terminal_meta_offer_starts)
+}
+
+fn meta_offer_candidate_starts(
+    text: &str,
+    starts_for_line: fn(&str) -> Vec<usize>,
+) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut line_start = 0usize;
+    let mut open_fence: Option<(u8, usize)> = None;
+    let mut starts = Vec::new();
+
+    while line_start < bytes.len() {
+        let mut line_end = line_start;
+        while line_end < bytes.len() && !matches!(bytes[line_end], b'\r' | b'\n') {
+            line_end += 1;
+        }
+        let line = &text[line_start..line_end];
+        if let Some((marker, length)) = markdown_fence_marker(line) {
+            match open_fence {
+                Some((open_marker, open_length))
+                    if marker == open_marker && length >= open_length =>
+                {
+                    open_fence = None;
+                }
+                None => open_fence = Some((marker, length)),
+                _ => {}
+            }
+        } else if open_fence.is_none() {
+            starts.extend(
+                starts_for_line(line)
+                    .into_iter()
+                    .map(|start| line_start + start),
+            );
+        }
+
+        if line_end == bytes.len() {
+            break;
+        }
+        line_start = line_end + 1;
+        if bytes[line_end] == b'\r' && line_start < bytes.len() && bytes[line_start] == b'\n' {
+            line_start += 1;
+        }
+    }
+    starts
+}
+
+fn terminal_meta_offer_needs_quarantine(text: &str) -> bool {
+    let confirmed = terminal_meta_offer_candidate_starts(text);
+    if confirmed
+        .iter()
+        .any(|start| terminal_meta_offer_suffix_is_terminal(&text[*start..]))
+    {
+        return true;
+    }
+
+    potential_terminal_meta_offer_candidate_starts(text)
+        .into_iter()
+        .filter(|start| !confirmed.contains(start))
+        .any(|start| potential_meta_offer_suffix_is_unfinished(&text[start..]))
+}
+
+fn potential_meta_offer_suffix_is_unfinished(suffix: &str) -> bool {
+    let trimmed = suffix.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .split_once(':')
+            .is_some_and(|(_, after)| !after.trim().is_empty())
+    {
+        return false;
+    }
+    !trimmed.char_indices().any(|(index, ch)| {
+        matches!(ch, '.' | '!' | '?')
+            && trimmed[index + ch.len_utf8()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+    })
+}
+
+fn terminal_meta_offer_suffix_is_terminal(suffix: &str) -> bool {
+    let trimmed = suffix.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // A colon followed by content is normally the start of the actual answer
+    // or checklist, not a disposable invitation.
+    if trimmed
+        .split_once(':')
+        .is_some_and(|(_, after)| !after.trim().is_empty())
+    {
+        return false;
+    }
+    let Some((terminal_index, terminal_char)) = trimmed
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '.' | '!' | '?'))
+    else {
+        return true;
+    };
+    trimmed[terminal_index + terminal_char.len_utf8()..]
+        .trim()
+        .trim_matches(['*', '_', '`'])
+        .trim()
+        .is_empty()
+}
+
+/// Finds an unsolicited offer that starts a line or a new terminal sentence.
+///
+/// Detection deliberately requires an explicit offer shape and, where the
+/// phrase could also describe real work, an offer action. This keeps ordinary
+/// technical prose such as "If you want exactly-once effects..." and "I can
+/// tailor the retry budget..." intact. Quoted examples and blockquotes are
+/// evidence, not answer appendices, so they are never stripped here.
+fn terminal_meta_offer_starts(line: &str) -> Vec<usize> {
+    meta_offer_starts(line, meta_offer_at_sentence_start)
+}
+
+fn potential_terminal_meta_offer_starts(line: &str) -> Vec<usize> {
+    meta_offer_starts(line, potential_meta_offer_at_sentence_start)
+}
+
+fn meta_offer_starts(
+    line: &str,
+    candidate_at_sentence_start: fn(&str, usize) -> Option<usize>,
+) -> Vec<usize> {
+    if line.trim_start().starts_with('>') {
+        return Vec::new();
+    }
+
+    let mut starts = Vec::new();
+    if let Some(start) = candidate_at_sentence_start(line, 0) {
+        starts.push(start);
+    }
+    for (byte_index, ch) in line.char_indices() {
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
+        let after_boundary = byte_index + ch.len_utf8();
+        if line[after_boundary..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+        {
+            if let Some(start) = candidate_at_sentence_start(line, after_boundary) {
+                starts.push(start);
+            }
+        }
+    }
+    starts
+}
+
+fn meta_offer_at_sentence_start(line: &str, raw_start: usize) -> Option<usize> {
+    let (removal_start, candidate) = normalized_meta_offer_at_sentence_start(line, raw_start)?;
+    is_terminal_meta_offer(&candidate).then_some(removal_start)
+}
+
+fn potential_meta_offer_at_sentence_start(line: &str, raw_start: usize) -> Option<usize> {
+    let (removal_start, candidate) = normalized_meta_offer_at_sentence_start(line, raw_start)?;
+    is_potential_terminal_meta_offer(&candidate).then_some(removal_start)
+}
+
+fn normalized_meta_offer_at_sentence_start(
+    line: &str,
+    raw_start: usize,
+) -> Option<(usize, String)> {
+    let suffix = &line[raw_start..];
+    let leading_whitespace = suffix.len() - suffix.trim_start().len();
+    let removal_start = raw_start + leading_whitespace;
+    let mut candidate = &line[removal_start..];
+
+    // Allow an offer rendered as its own Markdown bullet/heading or in bold,
+    // but retain the marker in the removed suffix so no dangling syntax leaks.
+    if raw_start == 0 {
+        if candidate
+            .as_bytes()
+            .get(0..2)
+            .is_some_and(|prefix| matches!(prefix, b"- " | b"* " | b"+ "))
+        {
+            candidate = &candidate[2..];
+        } else if candidate.starts_with('#') {
+            let marker_len = candidate.bytes().take_while(|byte| *byte == b'#').count();
+            if candidate[marker_len..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+            {
+                candidate = candidate[marker_len..].trim_start();
+            }
+        }
+    }
+    candidate = candidate.trim_start();
+    if candidate.starts_with("**") || candidate.starts_with("__") {
+        candidate = candidate[2..].trim_start();
+    }
+
+    // A quote or inline-code marker means the phrase is being discussed, not
+    // offered to the user. Fenced code is excluded by the caller.
+    if candidate.chars().next().is_some_and(|ch| {
+        matches!(
+            ch,
+            '"' | '\'' | '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}' | '`' | '>'
+        )
+    }) {
+        return None;
+    }
+
+    Some((
+        removal_start,
+        normalize_meta_offer_candidate(candidate),
+    ))
+}
+
+fn normalize_meta_offer_candidate(candidate: &str) -> String {
+    let mut normalized = String::with_capacity(candidate.len());
+    let mut pending_space = false;
+    for original in candidate.chars() {
+        if original.is_whitespace() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            normalized.push(' ');
+            pending_space = false;
+        }
+        let original = match original {
+            '\u{2018}' | '\u{2019}' => '\'',
+            other => other,
+        };
+        normalized.extend(original.to_lowercase());
+    }
+    normalized
+}
+
+fn strip_phrase<'a>(text: &'a str, phrase: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(phrase)?;
+    rest.chars()
+        .next()
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '\'')
+        .then_some(rest)
+}
+
+fn strip_offer_action(text: &str) -> Option<&str> {
+    let mut text = text.trim_start();
+    if let Some(rest) = strip_phrase(text, "also") {
+        text = rest.trim_start();
+    }
+    [
+        "turn", "rewrite", "shorten", "expand", "give", "provide", "show", "explain", "draft",
+        "adapt", "walk", "help", "make", "convert", "tailor", "sketch", "create", "share",
+        "generate", "outline", "produce", "prepare", "format", "send", "map",
+    ]
+    .iter()
+    .find_map(|action| strip_phrase(text, action))
+}
+
+fn is_terminal_meta_offer(candidate: &str) -> bool {
+    conditional_meta_offer(candidate)
+        || direct_answer_transform_offer(candidate)
+        || happy_to_offer(candidate)
+        || would_you_like_offer(candidate)
+        || let_me_know_offer(candidate)
+}
+
+fn is_potential_terminal_meta_offer(candidate: &str) -> bool {
+    if is_terminal_meta_offer(candidate) {
+        return true;
+    }
+
+    let direct_offer_action = [
+        "i can", "i could", "i will", "we can", "we could", "we will",
+    ]
+    .iter()
+    .find_map(|actor| strip_phrase(candidate, actor))
+    .map(str::trim_start)
+    .and_then(|rest| strip_phrase(rest, "also").map(str::trim_start).or(Some(rest)))
+    .and_then(strip_offer_action)
+    .is_some();
+
+    direct_offer_action
+        || [
+            "if you want",
+            "if you would like",
+            "if you'd like",
+            "if helpful",
+            "if it helps",
+            "if it would help",
+            "i'm happy to",
+            "i am happy to",
+            "we're happy to",
+            "we are happy to",
+            "happy to",
+            "would you like",
+            "let me know if",
+            "tell me if",
+        ]
+        .iter()
+        .any(|lead| strip_phrase(candidate, lead).is_some())
+}
+
+fn conditional_meta_offer(candidate: &str) -> bool {
+    for condition in [
+        "if you want",
+        "if you would like",
+        "if you'd like",
+        "if helpful",
+        "if it helps",
+        "if it would help",
+    ] {
+        let Some(mut rest) = strip_phrase(candidate, condition) else {
+            continue;
+        };
+        rest = rest.trim_start();
+        if let Some(without_comma) = rest.strip_prefix(',') {
+            rest = without_comma.trim_start();
+        }
+        for actor in [
+            "i can", "i could", "i will", "we can", "we could", "we will",
+        ] {
+            if strip_phrase(rest, actor)
+                .and_then(strip_offer_action)
+                .is_some()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn direct_answer_transform_offer(candidate: &str) -> bool {
+    let Some(mut action) = [
+        "i can", "i could", "i will", "we can", "we could", "we will",
+    ]
+    .iter()
+    .find_map(|actor| strip_phrase(candidate, actor)) else {
+        return false;
+    };
+    action = action.trim_start();
+    if let Some(rest) = strip_phrase(action, "also") {
+        action = rest.trim_start();
+    }
+
+    for verb in ["turn", "rewrite", "adapt", "convert", "tailor"] {
+        let Some(rest) = strip_phrase(action, verb) else {
+            continue;
+        };
+        if answer_object_then(rest, &["into", "as"]) {
+            return true;
+        }
+    }
+    if strip_phrase(action, "shorten")
+        .is_some_and(|rest| starts_with_answer_object(rest.trim_start()))
+    {
+        return true;
+    }
+    if let Some(rest) = strip_phrase(action, "make") {
+        if let Some(rest) = strip_answer_object(rest.trim_start()) {
+            let rest = rest.trim_start();
+            if [
+                "concise",
+                "more concise",
+                "short",
+                "shorter",
+                "long",
+                "longer",
+                "technical",
+                "behavioral",
+            ]
+            .iter()
+            .any(|shape| strip_phrase(rest, shape).is_some())
+                || (["a", "an"]
+                    .iter()
+                    .any(|article| strip_phrase(rest, article).is_some())
+                    && nearby_deliverable(rest))
+            {
+                return true;
+            }
+        }
+    }
+
+    ["give", "provide", "show", "sketch"].iter().any(|verb| {
+        strip_phrase(action, verb).is_some_and(|rest| nearby_deliverable(rest.trim_start()))
+    })
+}
+
+fn answer_object_then(text: &str, continuations: &[&str]) -> bool {
+    strip_answer_object(text.trim_start()).is_some_and(|rest| {
+        let rest = rest.trim_start();
+        continuations
+            .iter()
+            .any(|continuation| strip_phrase(rest, continuation).is_some())
+    })
+}
+
+fn starts_with_answer_object(text: &str) -> bool {
+    strip_answer_object(text).is_some()
+}
+
+fn strip_answer_object(text: &str) -> Option<&str> {
+    ["this", "it", "the answer", "the response"]
+        .iter()
+        .find_map(|object| strip_phrase(text, object))
+}
+
+fn nearby_deliverable(text: &str) -> bool {
+    let nearby = text
+        .split_ascii_whitespace()
+        .take(16)
+        .collect::<Vec<_>>()
+        .join(" ");
+    [
+        "answer",
+        "response",
+        "version",
+        "example",
+        "diagram",
+        "checklist",
+        "implementation",
+        "protocol",
+        "state machine",
+    ]
+    .iter()
+    .any(|deliverable| nearby.contains(deliverable))
+}
+
+fn happy_to_offer(candidate: &str) -> bool {
+    [
+        "i'm happy to",
+        "i am happy to",
+        "we're happy to",
+        "we are happy to",
+        "happy to",
+    ]
+    .iter()
+    .any(|lead| {
+        strip_phrase(candidate, lead)
+            .and_then(strip_offer_action)
+            .is_some()
+    })
+}
+
+fn would_you_like_offer(candidate: &str) -> bool {
+    if strip_phrase(candidate, "would you like me to")
+        .and_then(strip_offer_action)
+        .is_some()
+    {
+        return true;
+    }
+    ["a", "an", "the"].iter().any(|article| {
+        strip_phrase(candidate, "would you like")
+            .map(str::trim_start)
+            .and_then(|rest| strip_phrase(rest, article))
+            .is_some_and(|rest| nearby_deliverable(rest.trim_start()))
+    })
+}
+
+fn let_me_know_offer(candidate: &str) -> bool {
+    for lead in ["let me know if", "tell me if"] {
+        let Some(rest) = strip_phrase(candidate, lead) else {
+            continue;
+        };
+        for preference in ["you want", "you would like", "you'd like"] {
+            let Some(mut rest) = strip_phrase(rest.trim_start(), preference) else {
+                continue;
+            };
+            rest = rest.trim_start();
+            if let Some(after_me_to) = strip_phrase(rest, "me to") {
+                rest = after_me_to.trim_start();
+            }
+            if strip_offer_action(rest).is_some() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn markdown_fence_marker(line: &str) -> Option<(u8, usize)> {
@@ -472,6 +969,127 @@ mod tests {
                 assert_eq!(visible, persisted, "appendix={appendix:?}, split={split}");
             }
         }
+    }
+
+    #[test]
+    fn interview_terminal_meta_offers_are_stripped_at_every_utf8_chunk_boundary() {
+        let answer = "Résumé-aware answer: I would canary the migration, validate replicas, and keep a tested rollback path ✅. Before rollout, I would rehearse failure recovery with a production-shaped snapshot and require clean invariant checks.";
+        let offers = [
+            " If you want, I can give you a concrete PostgreSQL 17 migration runbook.",
+            "\n\nIf helpful, I can also tailor this into a cloud-heavy version.",
+            "\r\n\r\nIf you'd like, I can turn this into a concise version.",
+            "\n\nIf you’d like, I could provide a shorter answer.",
+            "\n\nI'm happy to sketch the sequence diagram.",
+            "\n\nI can also rewrite this as a shorter answer.",
+            "\n\nI can tailor this into a platform-focused response.",
+            "\n\nI can make this more concise.",
+            "\n\nWould you like me to give another example?",
+            "\n\nWould you like a shorter version?",
+            "\n\nLet me know if you'd like me to shorten it.",
+            "\n\nTell me if you want me to expand it.",
+            "\n\n- **If you want, I can provide a checklist.**",
+            " I can provide an extraordinarily detailed rigorously reviewed production hardened failure tested operationally validated carefully rehearsed rollback checklist.",
+        ];
+
+        for offer in offers {
+            let response = format!("{answer}{offer}");
+            for split in response
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(response.len()))
+            {
+                let mut output = BufferedDisclosureOutput::new(true);
+                let mut visible = output.push(&response[..split]).unwrap_or_default();
+                visible.push_str(&output.push(&response[split..]).unwrap_or_default());
+                let (persisted, remaining) = output.finish();
+                visible.push_str(&remaining);
+
+                assert_eq!(persisted, answer, "offer={offer:?}, split={split}");
+                assert_eq!(visible, persisted, "offer={offer:?}, split={split}");
+            }
+        }
+    }
+
+    #[test]
+    fn interview_terminal_meta_offer_guard_preserves_substantive_conditions_and_examples() {
+        let preserved = [
+            "If you want exactly-once effects, make each warehouse write idempotent.",
+            "If you want to reduce tail latency, hedge only idempotent reads.",
+            "I can tailor the retry budget to the downstream service-level objective.",
+            "First, I establish the default retry budget. I can also tailor it to each downstream SLO.",
+            "If helpful, I can keep the lock until the transaction commits.",
+            "I can provide a checklist: 1. Validate replicas. 2. Rehearse rollback.",
+            "I can provide a checklist. First, validate replicas before rollout.",
+            "If you want, I can provide a checklist. The first step is validating replicas.",
+            "If you want, I can provide a checklist.\n\nThe first step is validating replicas.",
+            "Avoid this closing:\n> If you want, I can also turn this into a shorter answer.",
+            "The rejected fixture is:\n```text\nIf you want, I can provide a checklist.\n```\nI assert that the fixture is rejected.",
+            "The literal closing under test is \"If you want, I can provide a checklist.\"",
+            "\"Would you like me to give another example?\" is a question the interviewer asked.",
+        ];
+
+        for answer in preserved {
+            for split in answer
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(answer.len()))
+            {
+                let mut output = BufferedDisclosureOutput::new(true);
+                let mut visible = output.push(&answer[..split]).unwrap_or_default();
+                visible.push_str(&output.push(&answer[split..]).unwrap_or_default());
+                let (persisted, remaining) = output.finish();
+                visible.push_str(&remaining);
+
+                assert_eq!(persisted, answer, "answer={answer:?}, split={split}");
+                assert_eq!(visible, answer, "answer={answer:?}, split={split}");
+            }
+        }
+    }
+
+    #[test]
+    fn interview_terminal_meta_offer_guard_checks_later_candidates() {
+        let answer = "I can provide a checklist. First validate replicas.";
+        let response =
+            format!("{answer} If you want, I can provide a production migration runbook.");
+
+        for split in response
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(response.len()))
+        {
+            let mut output = BufferedDisclosureOutput::new(true);
+            let mut visible = output.push(&response[..split]).unwrap_or_default();
+            visible.push_str(&output.push(&response[split..]).unwrap_or_default());
+            let (persisted, remaining) = output.finish();
+            visible.push_str(&remaining);
+
+            assert_eq!(persisted, answer, "split={split}");
+            assert_eq!(visible, answer, "split={split}");
+        }
+    }
+
+    #[test]
+    fn interview_substantive_offer_shape_resumes_streaming_before_finish() {
+        let answer = "I can provide a checklist: first validate every replica, then rehearse rollback from a production-shaped snapshot, verify application invariants, and canary the migration while watching latency, errors, and replication lag.";
+        let mut output = BufferedDisclosureOutput::new(true);
+        let streamed = output.push(answer).unwrap_or_default();
+
+        assert!(!streamed.is_empty());
+        let (persisted, remaining) = output.finish();
+        assert_eq!(format!("{streamed}{remaining}"), answer);
+        assert_eq!(persisted, answer);
+    }
+
+    #[test]
+    fn non_interview_output_preserves_terminal_meta_offer() {
+        let answer = "The migration is ready. If you want, I can provide the complete runbook.";
+        let mut output = BufferedDisclosureOutput::default();
+        let mut visible = output.push(answer).unwrap_or_default();
+        let (persisted, remaining) = output.finish();
+        visible.push_str(&remaining);
+
+        assert_eq!(persisted, answer);
+        assert_eq!(visible, answer);
     }
 
     #[test]

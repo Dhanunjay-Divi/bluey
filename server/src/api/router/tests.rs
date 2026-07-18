@@ -739,6 +739,18 @@ fn visible_system_design_uses_spoken_section_while_canvas_keeps_detail() {
 }
 
 #[test]
+fn visible_code_plan_preserves_the_exact_streamed_answer_for_terminal_replay() {
+    let req = complete_request("Question:\nImplement an LRU cache from first principles in Python.");
+    let plan = answer_plan_for_request(&req, "balanced", &[]);
+    let answer = "Approach\nUse a map and linked list.\n\n```python\nclass LRUCache:\n    def get(self, key):\n        return -1\n    def put(self, key, value):\n        return None\n```\n\nTime Complexity: O(1)\nSpace Complexity: O(capacity)";
+    let artifact = response_artifact_for_plan(answer, &plan).expect("code artifact");
+
+    assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+    assert_eq!(artifact.artifact_type, "code");
+    assert_eq!(visible_response_text_for_plan(answer, Some(&artifact), &plan), answer);
+}
+
+#[test]
 fn visible_canvas_diagram_uses_spoken_section_while_artifact_keeps_mermaid() {
     let req = complete_request(
         "Question:\nDesign a production messaging app and include an architecture diagram.",
@@ -1676,6 +1688,9 @@ fn answer_plan_self_intro_is_behavioral_not_system_design() {
     assert!(system.contains("do not compress the resume"));
     assert!(system.contains("full ready-to-say answer on the first response"));
     assert!(system.contains("not a teaser"));
+    assert!(system.contains("one or two of the strongest figures exactly"));
+    assert!(system.contains("Never replace all supplied figures with vague claims"));
+    assert!(system.contains("stop immediately after the last substantive answer sentence"));
 }
 
 #[test]
@@ -1876,6 +1891,8 @@ fn answer_plan_code_request_uses_deep_code_artifact() {
     assert!(system.contains("comments inside non-trivial code"));
     assert!(system.contains("above each major block"));
     assert!(system.contains("spoken lead-in"));
+    assert!(system.contains("mentally trace one normal operation and one boundary case"));
+    assert!(system.contains("close every code fence before `Line notes`"));
 }
 
 #[test]
@@ -2393,6 +2410,14 @@ fn answer_plan_online_feature_store_forbids_live_offline_fallback() {
     assert!(system.contains("Never synchronously fall back to the offline store"));
     assert!(system.contains("explicit per-feature policy"));
     assert!(system.contains("freshness and missingness telemetry"));
+    assert!(system.contains(
+        "for every training row, include a feature value only when both its event-time and availability-time are at or before that row's decision timestamp"
+    ));
+    assert!(
+        system
+            .rfind("Training-row invariant")
+            .is_some_and(|index| index > system.find("Online feature-store correctness contract").unwrap())
+    );
 }
 
 #[test]
@@ -2513,6 +2538,12 @@ fn answer_plan_url_shortener_uses_one_safe_mapping_write_path() {
     assert!(system.contains(
         "Every redirect worker checks the versioned deny overlay before serving any cached active mapping"
     ));
+    assert!(system.contains("Fleet-wide redirect invariant"));
+    assert!(
+        system
+            .rfind("Fleet-wide redirect invariant")
+            .is_some_and(|index| index > system.find("URL-shortener correctness contract").unwrap())
+    );
     assert!(system.contains("never redirect those states to the stored destination"));
     assert!(system.contains("Never say a cache may remain stale after delete or block"));
     assert!(system.contains("durably sink before committing the consumer offset"));
@@ -2752,6 +2783,24 @@ fn q40_compact_and_followup_answers_use_the_visible_coaching_guard() {
     assert!(!should_strip_unsolicited_coaching_appendix(
         &explicit_reasoning_plan,
         &explicit_reasoning.user
+    ));
+
+    let explicit_closing = complete_request(
+        "Answer this like an interview candidate, then end by asking if I want a shorter version.",
+    );
+    let explicit_closing_plan = answer_plan_for_request(&explicit_closing, "balanced", &[]);
+    assert!(!should_strip_unsolicited_coaching_appendix(
+        &explicit_closing_plan,
+        &explicit_closing.user
+    ));
+
+    let negated_closing = complete_request(
+        "Answer this like an interview candidate. Do not ask if I want another version.",
+    );
+    let negated_closing_plan = answer_plan_for_request(&negated_closing, "balanced", &[]);
+    assert!(should_strip_unsolicited_coaching_appendix(
+        &negated_closing_plan,
+        &negated_closing.user
     ));
 
     let mut technical_interview =

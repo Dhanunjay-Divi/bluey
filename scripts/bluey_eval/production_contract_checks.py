@@ -184,6 +184,24 @@ def self_check_production_answer_contracts(
         safe_issues = set(feature_store_consistency_issues(complete_store + " " + safe_suffix))
         assert "unsafe_independent_feature_transformations" not in safe_issues, safe_suffix
         assert "missing_shared_executable_feature_transformations" not in safe_issues, safe_suffix
+    live_like_as_of_only = (
+        "Use one versioned executable feature definition for streaming and batch. "
+        "Persist event_time and availability_time. The online path admits values when "
+        "both event_time and availability_time are at or before serving time. "
+        "Online cache metadata and entity lookup behavior stay isolated. Build training rows with an "
+        "as-of join at the decision timestamp. A watermark corrects late events with "
+        "idempotent replay by event ID and version, and parity checks compare online "
+        "values with offline recomputation."
+    )
+    assert "missing_point_in_time_join_mechanics" in feature_store_consistency_issues(
+        live_like_as_of_only
+    )
+    explicit_training_predicate = (
+        live_like_as_of_only
+        + " For every training row, include a feature only when both its event-time and "
+        "availability-time are at or before that row's decision timestamp."
+    )
+    assert not feature_store_consistency_issues(explicit_training_predicate)
     saved_round539_q38_mechanics = (
         "The online streaming path and offline batch path rebuild data from the same "
         "executable feature definitions. Persist event-time and availability-time. "
@@ -521,6 +539,25 @@ def self_check_production_answer_contracts(
     )
     assert not url_shortener_safety_issues(
         live_q41_per_request_boundary,
+        require_revocation_completeness=True,
+    )
+    get_path_only_boundary = (
+        "Revocable redirects use 302 or 307 with Cache-Control: no-store. GET checks "
+        "the versioned deny overlay before cache, and uncertain state fails closed. "
+        "Deleted, expired, abuse-blocked, and legally blocked mappings never redirect."
+    )
+    assert "missing_inactive_state_revocation_barrier" in url_shortener_safety_issues(
+        get_path_only_boundary,
+        require_revocation_completeness=True,
+    )
+    fleet_wide_boundary = (
+        get_path_only_boundary
+        + " Every redirect worker checks the versioned deny overlay before serving any "
+        "cached active mapping and fails closed to an authoritative state check or "
+        "non-redirect response when overlay or cache state is uncertain."
+    )
+    assert not url_shortener_safety_issues(
+        fleet_wide_boundary,
         require_revocation_completeness=True,
     )
     for unsafe_q41_overlay_boundary in (

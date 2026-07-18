@@ -76,6 +76,12 @@ pub(super) fn visible_response_text_for_plan(
     artifact: Option<&ResponseArtifact>,
     plan: &AnswerPlan,
 ) -> String {
+    // Streaming code answers are shown in full as deltas. Persist the same
+    // canonical text in the terminal/billing event so retries, audit logs, and
+    // non-streaming clients never receive a different prose-only answer shape.
+    if plan.output == AnswerOutput::CodeArtifact {
+        return text.trim().to_string();
+    }
     if plan.output == AnswerOutput::CanvasDetail
         && artifact
             .is_some_and(|candidate| matches!(candidate.artifact_type, "diagram" | "system_design"))
@@ -246,7 +252,7 @@ fn response_canvas_detail_artifact(text: &str) -> Option<ResponseArtifact> {
     }
 
     let lower = body.to_lowercase();
-    let code_blocks = extract_fenced_code_blocks(body);
+    let fenced_code = extract_fenced_code(body);
     if looks_like_diagram_artifact(body, &lower) {
         return Some(ResponseArtifact {
             artifact_type: "diagram",
@@ -264,8 +270,8 @@ fn response_canvas_detail_artifact(text: &str) -> Option<ResponseArtifact> {
             confidence: 0.88,
         });
     }
-    if !code_blocks.is_empty() {
-        let artifact_body = format_code_artifact(body, &code_blocks);
+    if !fenced_code.blocks.is_empty() {
+        let artifact_body = format_code_artifact(body, &fenced_code);
         if code_artifact_has_complete_code(&artifact_body) {
             return Some(ResponseArtifact {
                 artifact_type: "code",
@@ -318,7 +324,7 @@ pub(super) fn response_artifact(text: &str) -> Option<ResponseArtifact> {
     }
 
     let lower = body.to_lowercase();
-    let code_blocks = extract_fenced_code_blocks(body);
+    let fenced_code = extract_fenced_code(body);
     if looks_like_diagram_artifact(body, &lower) {
         return Some(ResponseArtifact {
             artifact_type: "diagram",
@@ -326,8 +332,8 @@ pub(super) fn response_artifact(text: &str) -> Option<ResponseArtifact> {
             confidence: 0.88,
         });
     }
-    if !code_blocks.is_empty() {
-        let artifact_body = format_code_artifact(body, &code_blocks);
+    if !fenced_code.blocks.is_empty() {
+        let artifact_body = format_code_artifact(body, &fenced_code);
         if !code_artifact_has_complete_code(&artifact_body) {
             return None;
         }
@@ -525,8 +531,14 @@ pub(super) fn has_code_shape(lower: &str) -> bool {
     ) >= 2
 }
 
-fn extract_fenced_code_blocks(text: &str) -> Vec<String> {
-    let mut blocks = Vec::new();
+#[derive(Default)]
+struct FencedCode {
+    blocks: Vec<String>,
+    recovered_notes: Vec<String>,
+}
+
+fn extract_fenced_code(text: &str) -> FencedCode {
+    let mut extracted = FencedCode::default();
     let mut current = Vec::new();
     let mut in_fence = false;
     for line in text.lines() {
@@ -541,10 +553,7 @@ fn extract_fenced_code_blocks(text: &str) -> Vec<String> {
                     current.push(inline_code.to_string());
                 }
                 if !closes_inline.is_empty() || after_fence.matches("```").count() > 0 {
-                    let block = current.join("\n").trim().to_string();
-                    if !block.is_empty() {
-                        blocks.push(repair_code_block_layout(&block));
-                    }
+                    push_fenced_code_block(&mut extracted, &current);
                     current.clear();
                     in_fence = false;
                     continue;
@@ -558,17 +567,157 @@ fn extract_fenced_code_blocks(text: &str) -> Vec<String> {
             if !before.trim().is_empty() {
                 current.push(before.to_string());
             }
-            let block = current.join("\n").trim().to_string();
-            if !block.is_empty() {
-                blocks.push(repair_code_block_layout(&block));
-            }
+            push_fenced_code_block(&mut extracted, &current);
             current.clear();
             in_fence = false;
         } else {
             current.push(line.to_string());
         }
     }
-    blocks
+    extracted
+}
+
+fn push_fenced_code_block(extracted: &mut FencedCode, lines: &[String]) {
+    let block = lines.join("\n");
+    let block = block.trim();
+    if block.is_empty() {
+        return;
+    }
+
+    let (code, recovered_notes) = split_misplaced_fenced_notes(block);
+    if !code.is_empty() {
+        extracted.blocks.push(repair_code_block_layout(&code));
+    }
+    if let Some(recovered_notes) = recovered_notes {
+        extracted.recovered_notes.push(recovered_notes);
+    }
+}
+
+fn split_misplaced_fenced_notes(block: &str) -> (String, Option<String>) {
+    let lines = block.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate().skip(1) {
+        if fenced_presentation_heading(line).is_none() {
+            continue;
+        }
+
+        let code = lines[..index].join("\n").trim().to_string();
+        let suffix = &lines[index..];
+        let first_heading = fenced_presentation_heading(line).expect("heading checked above");
+        let has_distinct_later_heading = suffix[1..]
+            .iter()
+            .filter_map(|line| fenced_presentation_heading(line))
+            .any(|heading| heading != first_heading);
+        if !has_distinct_later_heading
+            || !looks_like_real_code(&code)
+            || suffix_has_executable_code(suffix)
+        {
+            continue;
+        }
+
+        let recovered_notes = suffix
+            .iter()
+            .map(|line| strip_recovered_comment_prefix(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string();
+        if !recovered_notes.is_empty() {
+            return (code, Some(recovered_notes));
+        }
+    }
+
+    (block.trim().to_string(), None)
+}
+
+fn fenced_presentation_heading(line: &str) -> Option<&'static str> {
+    let heading = strip_recovered_comment_prefix(line)
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches(['*', '_', '`'])
+        .trim()
+        .trim_end_matches([':', '-', '\u{2013}', '\u{2014}'])
+        .trim()
+        .to_ascii_lowercase();
+
+    match heading.as_str() {
+        "line notes" | "line-by-line notes" | "line by line notes" | "line annotations"
+        | "visual line notes" => Some("line_notes"),
+        "explanation" | "approach" | "walkthrough" | "why this works" => Some("explanation"),
+        "complexity" | "time and space complexity" => Some("complexity"),
+        "edge case" | "edge cases" => Some("edge_cases"),
+        "notes" => Some("notes"),
+        _ => None,
+    }
+}
+
+fn strip_recovered_comment_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("//") {
+        return rest.trim_start();
+    }
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        return rest.trim_start();
+    }
+    trimmed
+}
+
+fn suffix_has_executable_code(lines: &[&str]) -> bool {
+    lines.iter().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || fenced_presentation_heading(trimmed).is_some()
+            || looks_like_recovered_comment_line(trimmed)
+            || looks_like_markdown_prose_bullet(trimmed)
+            || looks_like_recovered_line_note(trimmed)
+            || is_complexity_line(trimmed)
+            || is_section_separator_line(trimmed)
+        {
+            return false;
+        }
+
+        // Ambiguous content stays in CODE. Recovery is intentionally limited
+        // to unmistakable headings, comments, bullets, line-note labels, and
+        // complexity lines so an unrecognized branch or expression can never
+        // be silently converted into prose.
+        true
+    })
+}
+
+fn looks_like_recovered_comment_line(line: &str) -> bool {
+    if line.starts_with("//") {
+        return true;
+    }
+    let Some(rest) = line.strip_prefix('#') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    looks_like_recovered_line_note(rest) || looks_like_presentation_sentence(rest)
+}
+
+fn looks_like_markdown_prose_bullet(line: &str) -> bool {
+    ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix))
+        .is_some_and(looks_like_presentation_sentence)
+}
+
+fn looks_like_presentation_sentence(line: &str) -> bool {
+    line.chars()
+        .find(|ch| ch.is_alphabetic())
+        .is_some_and(char::is_uppercase)
+        && line.trim_end().ends_with(['.', '?', '!'])
+}
+
+fn looks_like_recovered_line_note(line: &str) -> bool {
+    let Some((label, note)) = line.split_once(':') else {
+        return false;
+    };
+    !label.trim().is_empty()
+        && !note.trim().is_empty()
+        && label
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '-' | '\u{2013}' | '\u{2014}' | ',' | ' '))
 }
 
 fn strip_fenced_code(text: &str) -> String {
@@ -751,14 +900,20 @@ fn looks_like_inline_code_after_fence(rest: &str) -> bool {
     .any(|prefix| rest.starts_with(prefix))
 }
 
-fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
-    let notes = strip_fenced_code(body).trim().to_string();
+fn format_code_artifact(body: &str, fenced_code: &FencedCode) -> String {
+    let mut note_parts = Vec::new();
+    let visible_notes = strip_fenced_code(body).trim().to_string();
+    if !visible_notes.is_empty() {
+        note_parts.push(visible_notes);
+    }
+    note_parts.extend(fenced_code.recovered_notes.iter().cloned());
+    let notes = note_parts.join("\n\n");
     let (line_notes, remaining_notes) = split_line_notes(&notes);
     let mut sections = Vec::new();
-    if !code_blocks.is_empty() {
+    if !fenced_code.blocks.is_empty() {
         sections.push(format!(
             "CODE\n----\n{}",
-            code_blocks.join("\n\n// ---\n\n")
+            fenced_code.blocks.join("\n\n// ---\n\n")
         ));
     }
     if let Some(line_notes) = line_notes {
@@ -1247,4 +1402,150 @@ fn numbered_list_prefix(line: &str) -> bool {
     saw_digit
         && matches!(chars.next(), Some('.' | ')'))
         && matches!(chars.next(), Some(ch) if ch.is_whitespace())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovers_presentation_sections_accidentally_left_inside_python_fence() {
+        let answer = r#"To implement an LRU cache, combine a hash map with a doubly linked list.
+
+```python
+class Node:
+    def __init__(self, key=0, value=0):
+        self.key = key
+        self.value = self.value  # Redundant assignment for clarity
+        self.prev = None
+        self.next = None
+
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.cache = {}
+
+    def get(self, key: int) -> int:
+        node = self.cache.get(key)
+        return -1 if node is None else node.value
+
+# Line notes:
+# 1: Node stores the key, value, and list links.
+# 2: The dictionary maps each key to its node.
+
+Explanation
+- The dictionary provides constant-time lookup.
+- The list preserves recency order.
+
+Complexity
+- Time Complexity: O(1) for get and put.
+- Space Complexity: O(capacity).
+
+Edge cases
+- A missing key returns -1.
+- Capacity zero stores nothing.
+```"#;
+
+        let artifact = response_artifact(answer).expect("code artifact");
+        assert_eq!(artifact.artifact_type, "code");
+
+        let code = extract_code_section_from_canvas(&artifact.body);
+        assert!(code.contains("self.value = self.value  # Redundant assignment for clarity"));
+        assert!(!code.contains("self.value = value"));
+        assert!(code.contains("return -1 if node is None else node.value"));
+        assert!(!code.contains("Line notes"));
+        assert!(!code.contains("Explanation"));
+        assert!(!code.contains("Time Complexity"));
+        assert!(!code.contains("Edge cases"));
+
+        assert!(artifact.body.contains("LINE NOTES\n----------"));
+        assert!(artifact
+            .body
+            .contains("1: Node stores the key, value, and list links."));
+        assert!(artifact.body.contains("COMPLEXITY\n----------"));
+        assert!(artifact
+            .body
+            .contains("Time Complexity: O(1) for get and put."));
+        assert!(artifact.body.contains("NOTES\n-----"));
+        assert!(artifact.body.contains("Explanation"));
+        assert!(artifact.body.contains("Edge cases"));
+    }
+
+    #[test]
+    fn recovers_slash_comment_presentation_headings() {
+        let answer = r#"```javascript
+function getValue(items) {
+  return items[0];
+}
+// Explanation:
+// - Return the first item.
+// Complexity:
+// - Time Complexity: O(1).
+// Edge cases:
+// - Empty input returns undefined.
+```"#;
+
+        let artifact = response_artifact(answer).expect("code artifact");
+        let code = extract_code_section_from_canvas(&artifact.body);
+        assert!(code.contains("return items[0];"));
+        assert!(!code.contains("Explanation"));
+        assert!(artifact.body.contains("COMPLEXITY\n----------"));
+        assert!(artifact.body.contains("Edge cases:"));
+    }
+
+    #[test]
+    fn preserves_heading_like_comments_when_executable_code_follows() {
+        let answer = r#"```python
+def describe(items):
+    # Explanation
+    explanation = "items are counted once"
+    # Complexity
+    complexity = len(items)
+    return explanation, complexity
+```"#;
+
+        let artifact = response_artifact(answer).expect("code artifact");
+        let code = extract_code_section_from_canvas(&artifact.body);
+        assert!(code.contains("# Explanation"));
+        assert!(code.contains("explanation = \"items are counted once\""));
+        assert!(code.contains("# Complexity"));
+        assert!(code.contains("complexity = len(items)"));
+        assert!(!artifact.body.contains("COMPLEXITY\n----------"));
+    }
+
+    #[test]
+    fn preserves_unrecognized_control_flow_after_multiple_heading_like_comments() {
+        let answer = r#"```python
+def require_value(value):
+    if value is not None:
+        return value
+    # Explanation
+    # Complexity
+    else:
+        raise ValueError("missing")
+```"#;
+
+        let artifact = response_artifact(answer).expect("code artifact");
+        let code = extract_code_section_from_canvas(&artifact.body);
+        assert!(code.contains("# Explanation"));
+        assert!(code.contains("# Complexity"));
+        assert!(code.contains("else:"));
+        assert!(code.contains("raise ValueError"));
+        assert!(!artifact.body.contains("COMPLEXITY\n----------"));
+    }
+
+    #[test]
+    fn preserves_a_single_heading_like_trailing_comment() {
+        let answer = r#"```python
+def identity(value):
+    return value
+
+# Explanation
+```"#;
+
+        let artifact = response_artifact(answer).expect("code artifact");
+        let code = extract_code_section_from_canvas(&artifact.body);
+        assert!(code.contains("# Explanation"));
+        assert!(!artifact.body.contains("NOTES\n-----"));
+    }
 }
