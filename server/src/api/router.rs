@@ -29,6 +29,7 @@ use crate::routing;
 use cue_core::prompt_contracts::ROLE_ADAPTIVE_PRACTITIONER_VOICE;
 use cue_core::short_observability_ref;
 
+mod interview_contracts;
 mod visible_output;
 use visible_output::{explicitly_requests_reasoning_section, BufferedDisclosureOutput};
 
@@ -1561,22 +1562,48 @@ fn priced_routes_for(
 
 const BALANCED_PROVIDER_MIX_PREFERRED_TIER_SIZE: usize = 3;
 
-/// Prefer the measured fast-quality route for structured design answers while
-/// keeping the operator's route policy authoritative. OpenAI is moved only
-/// when it already appears in the balanced provider-mix preferred tier; cost-
-/// optimized and static quality policies have different top tiers and are not
-/// silently overridden. Capacity and provider-health fallback remain intact.
+fn looks_like_employment_document_surface(normalized_question: &str) -> bool {
+    contains_any_token_phrase(
+        normalized_question,
+        &[
+            "resume",
+            "r sum",
+            "job description",
+            "cover letter",
+            "curriculum vitae",
+            "linkedin profile",
+            "application material",
+            "application materials",
+            "jd",
+        ],
+    )
+}
+
+/// Prefer the measured fast-quality route for structured design and live
+/// interview answers while keeping the operator's route policy authoritative.
+/// OpenAI is moved only when it already appears in the balanced provider-mix
+/// preferred tier; cost-optimized and static quality policies have different
+/// top tiers and are not silently overridden. Capacity and provider-health
+/// fallback remain intact.
 fn prioritize_routes_for_answer_plan(
     routes: &mut [PricedRoute],
     effective_lane: &str,
     plan: &AnswerPlan,
+    normalized_question: &str,
     enabled: bool,
 ) -> bool {
-    if !enabled
-        || effective_lane != "balanced"
-        || plan.intent != AnswerIntent::SystemDesign
-        || plan.output != AnswerOutput::CanvasDetail
-    {
+    let employment_document_surface = looks_like_employment_document_surface(normalized_question);
+    let compact_live_interview_answer = plan.interview_context
+        && plan.output == AnswerOutput::Compact
+        && matches!(
+            plan.intent,
+            AnswerIntent::Quick | AnswerIntent::General | AnswerIntent::FollowUp
+        )
+        && !employment_document_surface;
+    let quality_sensitive_answer = plan.output == AnswerOutput::InterviewAnswer
+        || compact_live_interview_answer
+        || (plan.intent == AnswerIntent::SystemDesign && plan.output == AnswerOutput::CanvasDetail);
+    if !enabled || effective_lane != "balanced" || !quality_sensitive_answer {
         return false;
     }
     let Some(index) = routes
@@ -2010,7 +2037,11 @@ fn answer_plan_for_request(
     let diagram_request = looks_like_diagram_request(&normalized);
     let explicit_code_generation = looks_like_explicit_code_generation_request(&normalized);
     let direct_technical_plan = looks_like_direct_technical_plan_question(&normalized);
-    let direct_behavioral = !direct_technical_plan && looks_like_behavioral_question(&normalized);
+    let direct_lived_story_followup = looks_like_lived_interview_story_followup(&normalized)
+        && ((interview_context && !context_system_design)
+            || direct_question_confirms_story_ownership(&question));
+    let direct_behavioral = !direct_technical_plan
+        && (looks_like_behavioral_question(&normalized) || direct_lived_story_followup);
     let context_behavioral = generic_live_transcript_prompt
         && has_planning_context
         && !context_system_design
@@ -3671,7 +3702,6 @@ fn looks_like_interview_story_question(normalized: &str) -> bool {
 enum BehavioralStoryGrounding {
     NotRequired,
     Complete { provider_user: String },
-    ResumeBounded { provider_user: String },
     Missing { fields: Vec<&'static str> },
 }
 
@@ -3921,6 +3951,59 @@ fn looks_like_lived_interview_story_request(normalized: &str) -> bool {
     }
 
     normalized.contains("example from your experience")
+}
+
+fn looks_like_lived_interview_story_followup(normalized: &str) -> bool {
+    let coaching_or_hypothetical_frame = contains_any(
+        normalized,
+        &[
+            "what should i say",
+            "how should i answer",
+            "how do i answer",
+            "if they ask",
+            "if an interviewer",
+            "if interviewer",
+            "interviewer asks",
+            "answer this like",
+            "if i designed",
+            "if i had designed",
+            "if i built",
+            "if i had built",
+            "suppose ",
+            "imagine ",
+            "hypothetically",
+        ],
+    );
+    if coaching_or_hypothetical_frame {
+        return false;
+    }
+
+    (contains_any(
+        normalized,
+        &["why did you choose", "tradeoff did you accept"],
+    ) && contains_any(normalized, &["architecture", "design", "tradeoff"]))
+        || (contains_any(normalized, &["how did you prove", "how did you verify"])
+            && contains_any(
+                normalized,
+                &[
+                    "data was correct",
+                    "data correctness",
+                    "trusted it",
+                    "downstream",
+                ],
+            ))
+        || (contains_any(
+            normalized,
+            &["what did you put in place", "what did you implement"],
+        ) && contains_any(
+            normalized,
+            &["that system", "rag system", "hallucinat", "project"],
+        ))
+}
+
+fn looks_like_lived_interview_story_or_followup(normalized: &str) -> bool {
+    looks_like_lived_interview_story_request(normalized)
+        || looks_like_lived_interview_story_followup(normalized)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4398,9 +4481,23 @@ fn latest_legacy_interviewer_question(planning_context: &str) -> Option<String> 
     (!latest.trim().is_empty()).then_some(latest)
 }
 
+fn request_has_prior_system_design_answer(req: &CompleteRequest) -> bool {
+    extract_previous_system_design_answer(&req.user).is_some()
+        || req.context.iter().any(|context| {
+            context.kind == cue_core::AnswerContextKind::MeetingMemory
+                && normalize_guardrail_text(&context.content).contains("previous bluey answer")
+                && looks_like_system_design_question(&normalize_guardrail_text(&context.content))
+        })
+}
+
 fn story_question_from_request(req: &CompleteRequest) -> Option<String> {
     let direct = extract_search_question(&req.user);
-    if looks_like_lived_interview_story_request(&normalize_guardrail_text(&direct)) {
+    let normalized_direct = normalize_guardrail_text(&direct);
+    let direct_story = looks_like_lived_interview_story_request(&normalized_direct);
+    let direct_followup = looks_like_lived_interview_story_followup(&normalized_direct);
+    let inherited_system_design = request_has_prior_system_design_answer(req)
+        && !direct_question_confirms_story_ownership(&direct);
+    if direct_story || (direct_followup && !inherited_system_design) {
         return Some(direct.trim().to_string());
     }
 
@@ -4410,14 +4507,17 @@ fn story_question_from_request(req: &CompleteRequest) -> Option<String> {
 
     latest_typed_transcript_turn(req)
         .filter(|turn| {
-            looks_like_lived_interview_story_request(&normalize_guardrail_text(&turn.question))
+            let normalized = normalize_guardrail_text(&turn.question);
+            looks_like_lived_interview_story_request(&normalized)
+                || (looks_like_lived_interview_story_followup(&normalized)
+                    && !inherited_system_design)
         })
         .map(|turn| turn.question)
         .or_else(|| {
             req.context.is_empty().then(|| {
                 latest_legacy_interviewer_question(&extract_planning_context(&req.user)).filter(
                     |question| {
-                        looks_like_lived_interview_story_request(&normalize_guardrail_text(
+                        looks_like_lived_interview_story_or_followup(&normalize_guardrail_text(
                             question,
                         ))
                     },
@@ -4893,7 +4993,10 @@ fn behavioral_story_grounding(
     if !uses_typed_answer_context_v1(req) {
         return BehavioralStoryGrounding::NotRequired;
     }
-    if plan.intent != AnswerIntent::Behavioral {
+    if !matches!(
+        plan.intent,
+        AnswerIntent::Behavioral | AnswerIntent::FollowUp | AnswerIntent::General
+    ) {
         return BehavioralStoryGrounding::NotRequired;
     }
     let Some(question) = story_question_from_request(req) else {
@@ -4909,7 +5012,7 @@ fn behavioral_story_grounding(
     };
     let mut sources = Vec::new();
     let direct_question = extract_search_question(&req.user);
-    if looks_like_lived_interview_story_request(&normalize_guardrail_text(&direct_question))
+    if looks_like_lived_interview_story_or_followup(&normalize_guardrail_text(&direct_question))
         && direct_question_confirms_story_ownership(&direct_question)
     {
         sources.push((direct_question, true));
@@ -4974,24 +5077,6 @@ fn behavioral_story_grounding(
         };
     }
 
-    let candidate_context = if has_structured_context {
-        structured_candidate_history_context(req)
-    } else {
-        String::new()
-    };
-    if !candidate_context.is_empty() {
-        let mut provider_user = format!(
-            "Question:\n{}\n\nSession context:\n[Resume-bounded interview draft]\nUse only the literal candidate evidence below. Do not invent a missing incident, action, metric, result, employer, or ownership claim. If a STAR detail is absent, omit it or qualify the answer instead of filling it in.\n{}",
-            question.trim(),
-            candidate_context
-        );
-        if !style_context.is_empty() {
-            provider_user.push_str("\n\n");
-            provider_user.push_str(&style_context);
-        }
-        return BehavioralStoryGrounding::ResumeBounded { provider_user };
-    }
-
     if hazardous_unowned_story {
         return BehavioralStoryGrounding::Missing {
             fields: BEHAVIORAL_STORY_FIELDS.to_vec(),
@@ -5012,8 +5097,7 @@ fn behavioral_provider_user(
         return None;
     }
     match grounding {
-        BehavioralStoryGrounding::Complete { provider_user }
-        | BehavioralStoryGrounding::ResumeBounded { provider_user } => {
+        BehavioralStoryGrounding::Complete { provider_user } => {
             return Some(provider_user.clone());
         }
         BehavioralStoryGrounding::Missing { .. } => return None,
@@ -5958,13 +6042,28 @@ fn is_post_dispatch_payment_timeout_question(
 
 /// The streamed and non-streamed paths must agree on whether a terminal
 /// coaching appendix is visible. Interview answers always use the guard; the
-/// post-dispatch payment-timeout follow-up (Q40) is also a ready-to-say,
-/// one-paragraph contract even when its router classification is Compact.
+/// compact interview follow-ups are also ready-to-say contracts even when
+/// their router classification is General or FollowUp. Q40 remains covered
+/// when it is not otherwise classified as interview context.
 fn should_strip_unsolicited_coaching_appendix(plan: &AnswerPlan, user_text: &str) -> bool {
     if explicitly_requests_reasoning_section(user_text) {
         return false;
     }
     if plan.output == AnswerOutput::InterviewAnswer {
+        return true;
+    }
+    let normalized_question = normalize_guardrail_text(&extract_search_question(user_text));
+    if plan.interview_context
+        && plan.output == AnswerOutput::Compact
+        && matches!(
+            plan.intent,
+            AnswerIntent::Quick
+                | AnswerIntent::General
+                | AnswerIntent::FollowUp
+                | AnswerIntent::Behavioral
+        )
+        && !looks_like_employment_document_surface(&normalized_question)
+    {
         return true;
     }
     if plan.output != AnswerOutput::Compact
@@ -5973,7 +6072,6 @@ fn should_strip_unsolicited_coaching_appendix(plan: &AnswerPlan, user_text: &str
         return false;
     }
 
-    let normalized_question = normalize_guardrail_text(&extract_search_question(user_text));
     let current_payment_money_effect = looks_like_payment_money_effect_domain(&normalized_question);
     let previous_payment_money_effect = extract_previous_system_design_answer(user_text)
         .map(normalize_guardrail_text)
@@ -6453,7 +6551,7 @@ fn prompt_with_answer_plan(
     if rag_evaluation_plan {
         if use_default_direct_technical_shape {
             instructions.push_str(
-                "\nRAG launch-evaluation correctness contract: use a versioned, representative golden set with blinded human labels and explicit common, rare, no-answer or unanswerable, adversarial or prompt-injection, ACL or cross-tenant permission, and PII or privacy slices. Measure retrieval recall@k plus a ranking metric such as MRR or nDCG, answer faithfulness, citation correctness, end-to-end task success, correct refusal or abstention, safety, latency, and cost. Compare a named baseline or champion on every slice. The spoken paragraph must include both of these exact sentences: `I would compare a named baseline or champion on every slice before deciding whether to launch.` `I would predeclare an acceptance threshold for every slice, and any critical-slice regression would block launch.` Do not replace them with an aggregate-only comparison, an aggregate-only gate, or a gate that covers only the critical slices. Calibrate any automated judge against blinded human labels, report inter-rater agreement, and sample human review with a stratified, risk-weighted design, never only the top-scoring subset. Exercise shadow or canary monitoring after offline gates. Do not invent numeric dataset sizes, quality thresholds, latency targets, or cost targets; if a number is useful, label it explicitly as an assumption and say it must be derived from product SLOs and baseline distributions."
+                "\nRAG launch-evaluation correctness contract: use a versioned, representative golden set with blinded human labels and explicit common, rare, no-answer or unanswerable, adversarial or prompt-injection, ACL or cross-tenant permission, and PII or privacy slices. Measure retrieval recall@k plus a ranking metric such as MRR or nDCG, answer faithfulness, citation correctness, end-to-end task success, correct refusal or abstention, safety, latency, and cost. Compare a named baseline or champion on every slice. The spoken paragraph must include all three of these exact sentences: `I would compare a named baseline or champion on every slice before deciding whether to launch.` `I would predeclare an acceptance threshold for every slice, and any critical-slice regression would block launch.` `I would calibrate the judge against blinded human labels, report inter-rater agreement, and use stratified, risk-weighted human review.` Do not replace them with an aggregate-only comparison, an aggregate-only gate, or a gate that covers only the critical slices. Never sample only the top-scoring subset. Exercise shadow or canary monitoring after offline gates. Do not invent numeric dataset sizes, quality thresholds, latency targets, or cost targets; if a number is useful, label it explicitly as an assumption and say it must be derived from product SLOs and baseline distributions."
             );
         } else {
             instructions.push_str(
@@ -6488,6 +6586,12 @@ fn prompt_with_answer_plan(
             "\nTechnical interview scenario output: answer in first person as a proposed approach, starting with `My approach would be...` or an equally direct formulation. Never claim that the candidate built, owned, operated, or achieved something unless one authoritative source directly supports that lived claim. Do not add a `Reasoning`, `Why this works`, provenance, or coaching appendix. Retry only transient operations that are idempotent, or calls protected by one stable idempotency key. Use a cache or default fallback only when it is semantically safe, and never report a critical write as successful when the source of truth did not confirm it. Treat every ambiguous external side effect as `UNKNOWN` or pending reconciliation rather than retrying it as a new effect."
         );
     }
+
+    interview_contracts::append_interview_correctness_contracts(
+        &mut instructions,
+        &normalized_question,
+        plan,
+    );
 
     if third_party_reliability_question {
         instructions.push_str(
@@ -8001,10 +8105,12 @@ async fn complete_stream_inner(
         "managed chat pre-dispatch phases completed"
     );
     let mut routes = priced_routes_for(&effective_lane, est_in, max_out, &req.request_id);
+    let normalized_route_question = normalize_guardrail_text(&extract_search_question(&req.user));
     let design_quality_route_prioritized = prioritize_routes_for_answer_plan(
         &mut routes,
         &effective_lane,
         &answer_plan,
+        &normalized_route_question,
         !env_flag_is_false("BLUEY_BALANCED_DESIGN_QUALITY_ROUTE"),
     );
     if routes.is_empty() {
@@ -9682,10 +9788,12 @@ async fn complete_inner(
         .unwrap_or_default()
         .max(server_est_in);
     let mut routes = priced_routes_for(&effective_lane, est_in, max_out, &req.request_id);
+    let normalized_route_question = normalize_guardrail_text(&extract_search_question(&req.user));
     let design_quality_route_prioritized = prioritize_routes_for_answer_plan(
         &mut routes,
         &effective_lane,
         &answer_plan,
+        &normalized_route_question,
         !env_flag_is_false("BLUEY_BALANCED_DESIGN_QUALITY_ROUTE"),
     );
     if routes.is_empty() {

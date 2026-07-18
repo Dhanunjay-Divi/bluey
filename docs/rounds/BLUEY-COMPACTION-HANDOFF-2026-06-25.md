@@ -38,6 +38,29 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
   future source-audio retention requires an explicit privacy/consent round and
   live lifecycle verification.
 
+### Codex Capacity Recovery
+
+- `Error running remote compact task: Selected model is at capacity` is a
+  Codex service-capacity failure during remote context compaction. It does not
+  revert Git commits, delete the local worktree, or invalidate completed test
+  evidence.
+- Before a long run or delegation, record the active objective, worktree,
+  branch and commit, modified files, completed verification, and exact next
+  command in this handoff or the current numbered round document.
+- Use `/status` to inspect the active model, context usage, rate limits, and
+  writable workspace. Run `/compact` proactively while the thread still has
+  room instead of waiting for automatic compaction at the limit.
+- If the selected model is at capacity, preserve the local checkpoint first,
+  then use `/model` to select an available model and resume from the recorded
+  handoff. Keep delegated tasks small and independent so one failed worker can
+  be retried without blocking the critical path.
+- Use one Codex worktree per concurrent task (`/worktree` in supported Codex
+  surfaces), and converge reviewed changes through Git. Never treat an
+  uncommitted remote-agent message as the only copy of important work.
+- At safe milestones, run focused checks and `git diff --check`, then commit
+  and push the authorized checkpoint. Before deployment, still run the full
+  required verification; a recovery checkpoint is not a release proof.
+
 ## Current State
 
 - Round 524 completed release convergence on branch
