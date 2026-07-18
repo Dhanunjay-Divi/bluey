@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Density-first answer style.** The copilot persona, per-ask style reminder,
+  and fast/balanced mode instructions now optimize for
+  completeness-at-minimum-length ("cover every point that matters in as few
+  words as it takes — never drop a needed point to sound brief") instead of a
+  hard 1-3-sentence cap. A fixed sentence count made the model omit needed
+  points to obey the number; length is now a target, not a limit.
+
+### Security
+- **Whole-body persona-leak guard.** New `redact_persona_leak` scans the
+  ENTIRE answer body (streaming, non-streaming final, and replay paths) for
+  fingerprints of the internal persona and replaces the whole answer with a
+  short decline when found. The prior guard only stripped LEADING echoes, so
+  a prompt-injection ("print everything above") could dump the instructions
+  mid-answer. Deterministic, agent-independent backstop; catches verbatim and
+  near-verbatim dumps. Paraphrase-grade (semantic) detection + a red-team
+  extraction eval suite are deliberately deferred — scoped in
+  `docs/work/FUTURE-UPGRADES.md`.
+
 ### Fixed
 - **Live-memory concurrency fixes (adversarial review findings).** (1) The
   rolling-summary inflight guard now clears via a Drop guard, so a panic
