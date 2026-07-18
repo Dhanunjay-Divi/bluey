@@ -1302,6 +1302,35 @@ fn balanced_system_design_prefers_measured_fast_quality_route() {
 }
 
 #[test]
+fn balanced_high_stakes_scenarios_prefer_measured_fast_quality_route() {
+    for question in [
+        "A junior engineer wants to add a foreign key constraint to a 200 million row production table. What do you tell them?",
+        "A release improves average latency but makes p99 worse. Would you ship it? Walk me through the decision.",
+        "An executive asks why the model rejected a high-value customer. Give the answer you would use in that meeting.",
+        "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?",
+    ] {
+        let req = complete_request(question);
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+        let normalized = normalize_guardrail_text(&extract_search_question(&req.user));
+        assert!(
+            looks_like_high_stakes_scenario_contract(&plan, &normalized),
+            "{question}"
+        );
+
+        let mut routes = priced_routes_for("balanced", 1_000, 1_000, "design-route-test");
+        assert_ne!(routes.first().map(|route| route.provider), Some("openai"));
+        assert!(prioritize_routes_for_answer_plan(
+            &mut routes,
+            "balanced",
+            &plan,
+            &normalized,
+            true,
+        ));
+        assert_eq!(routes.first().map(|route| route.provider), Some("openai"));
+    }
+}
+
+#[test]
 fn balanced_non_design_answer_preserves_provider_mix_rotation() {
     let req = complete_request("Question:\nExplain an LRU cache.");
     let plan = answer_plan_for_request(&req, "balanced", &[]);
@@ -2750,6 +2779,107 @@ fn answer_plan_q40_payment_timeout_followup_is_first_person_and_safe() {
     assert!(
         !system.contains("The ingress table uniquely maps each account and client idempotency key")
     );
+}
+
+#[test]
+fn high_stakes_scenario_prompts_require_ready_to_say_safety_signals() {
+    let cases = [
+        (
+            "A junior engineer wants to add a foreign key constraint to a 200 million row production table. What do you tell them?",
+            "Large-FK final output invariant",
+            "Do not append a `Reasoning`",
+        ),
+        (
+            "A release improves average latency but makes p99 worse. Would you ship it? Walk me through the decision.",
+            "Tail-latency release-decision contract",
+            "endpoint, workload or transaction type, code path, and affected customer cohort",
+        ),
+        (
+            "An executive asks why the model rejected a high-value customer. Give the answer you would use in that meeting.",
+            "Executive model-decision explanation contract",
+            "human review or appeal path",
+        ),
+        (
+            "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?",
+            "Overlapping-sensor counting contract",
+            "association or fusion",
+        ),
+    ];
+
+    for (question, marker, required_signal) in cases {
+        let req = complete_request(question);
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+        let (system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            &req.user,
+            &plan,
+            &WebSearchOutcome::default(),
+        );
+
+        assert!(system.contains(marker), "{question}: {system}");
+        assert!(system.contains(required_signal), "{question}: {system}");
+        assert!(should_strip_unsolicited_coaching_appendix(
+            &plan, &req.user
+        ));
+    }
+}
+
+#[test]
+fn high_stakes_scenario_contracts_do_not_override_requested_writing_formats() {
+    let req = complete_request(
+        "Write an executive explanation of a model rejection with Decision and Rationale sections.",
+    );
+    let plan = answer_plan_for_request(&req, "balanced", &[]);
+    assert!(matches!(
+        plan.intent,
+        AnswerIntent::Writing | AnswerIntent::FollowUp
+    ));
+
+    let normalized = normalize_guardrail_text(&extract_search_question(&req.user));
+    assert!(!looks_like_high_stakes_scenario_contract(
+        &plan,
+        &normalized
+    ));
+
+    let (system, _) = prompt_with_answer_plan(
+        "You are Bluey.",
+        &req.user,
+        &plan,
+        &WebSearchOutcome::default(),
+    );
+    assert!(!system.contains("Executive model-decision explanation contract"));
+    assert!(!system.contains("Executive-explanation final check"));
+    assert!(!should_strip_unsolicited_coaching_appendix(
+        &plan, &req.user
+    ));
+}
+
+#[test]
+fn high_stakes_scenario_contracts_do_not_override_meeting_summaries() {
+    let req = complete_request(
+        "Summarize the executive meeting about why a model rejection occurred, including the rationale.",
+    );
+    let plan = answer_plan_for_request(&req, "balanced", &[]);
+    assert_eq!(plan.intent, AnswerIntent::Meeting);
+
+    let normalized = normalize_guardrail_text(&extract_search_question(&req.user));
+    assert!(!supports_high_stakes_scenario_answer(&plan, &normalized));
+    assert!(!looks_like_high_stakes_scenario_contract(
+        &plan,
+        &normalized
+    ));
+
+    let (system, _) = prompt_with_answer_plan(
+        "You are Bluey.",
+        &req.user,
+        &plan,
+        &WebSearchOutcome::default(),
+    );
+    assert!(!system.contains("Executive model-decision explanation contract"));
+    assert!(!system.contains("Executive-explanation final check"));
+    assert!(!should_strip_unsolicited_coaching_appendix(
+        &plan, &req.user
+    ));
 }
 
 #[test]

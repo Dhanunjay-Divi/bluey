@@ -1579,6 +1579,124 @@ fn looks_like_employment_document_surface(normalized_question: &str) -> bool {
     )
 }
 
+fn looks_like_tail_latency_release_decision(normalized_question: &str) -> bool {
+    contains_any(normalized_question, &["p99", "tail latency"])
+        && contains_any(normalized_question, &["average latency", "mean latency"])
+        && contains_any(normalized_question, &["ship", "release", "rollout"])
+}
+
+fn looks_like_executive_model_rejection_explanation(normalized_question: &str) -> bool {
+    normalized_question.contains("executive")
+        && normalized_question.contains("model")
+        && contains_any(
+            normalized_question,
+            &["rejected", "rejection", "declined", "denied"],
+        )
+        && contains_any(normalized_question, &["why", "explain", "answer"])
+}
+
+fn looks_like_overlapping_sensor_deduplication(normalized_question: &str) -> bool {
+    contains_any(normalized_question, &["camera", "cameras"])
+        && contains_any(normalized_question, &["sensor", "sensors"])
+        && contains_any(normalized_question, &["overlap", "overlapping"])
+        && contains_any(
+            normalized_question,
+            &["double count", "double-count", "multiple times", "duplicate"],
+        )
+}
+
+fn supports_high_stakes_scenario_answer(
+    plan: &AnswerPlan,
+    normalized_question: &str,
+) -> bool {
+    matches!(
+        plan.intent,
+        AnswerIntent::General
+            | AnswerIntent::Quick
+            | AnswerIntent::FollowUp
+            | AnswerIntent::Behavioral
+    ) || (plan.intent == AnswerIntent::Meeting
+        && contains_any(
+            normalized_question,
+            &[
+                "give the answer",
+                "answer you would use",
+                "answer you would give",
+                "what would you say",
+                "how would you answer",
+                "response you would use",
+                "meeting answer",
+            ],
+        ))
+}
+
+fn looks_like_large_foreign_key_migration_question(
+    normalized_question: &str,
+    plan: &AnswerPlan,
+) -> bool {
+    let topic = contains_any(
+        normalized_question,
+        &["foreign key", "fk constraint", "referential constraint"],
+    ) && contains_any(
+        normalized_question,
+        &[
+            "production",
+            "million row",
+            "million-row",
+            "large table",
+            "online migration",
+            "without downtime",
+        ],
+    );
+    let plan_request = contains_any(
+        normalized_question,
+        &[
+            "wants to add",
+            "add a foreign key",
+            "add the foreign key",
+            "introduce a foreign key",
+            "introduce the foreign key",
+            "enforce referential integrity",
+            "migrate",
+            "migration plan",
+            "online migration",
+            "without downtime",
+            "rollout",
+            "roll out",
+        ],
+    );
+    let non_plan_request = contains_any(
+        normalized_question,
+        &[
+            "draft an email",
+            "write an email",
+            "announce",
+            "summarize",
+            "summary",
+            "postmortem",
+            "meeting notes",
+        ],
+    );
+    topic
+        && plan_request
+        && !non_plan_request
+        && matches!(
+            plan.intent,
+            AnswerIntent::General | AnswerIntent::SystemDesign | AnswerIntent::FollowUp
+        )
+}
+
+fn looks_like_high_stakes_scenario_contract(
+    plan: &AnswerPlan,
+    normalized_question: &str,
+) -> bool {
+    looks_like_large_foreign_key_migration_question(normalized_question, plan)
+        || (supports_high_stakes_scenario_answer(plan, normalized_question)
+            && (looks_like_tail_latency_release_decision(normalized_question)
+                || looks_like_executive_model_rejection_explanation(normalized_question)
+                || looks_like_overlapping_sensor_deduplication(normalized_question)))
+}
+
 /// Prefer the measured fast-quality route for structured design and live
 /// interview answers while keeping the operator's route policy authoritative.
 /// OpenAI is moved only when it already appears in the balanced provider-mix
@@ -1602,7 +1720,8 @@ fn prioritize_routes_for_answer_plan(
         && !employment_document_surface;
     let quality_sensitive_answer = plan.output == AnswerOutput::InterviewAnswer
         || compact_live_interview_answer
-        || (plan.intent == AnswerIntent::SystemDesign && plan.output == AnswerOutput::CanvasDetail);
+        || (plan.intent == AnswerIntent::SystemDesign && plan.output == AnswerOutput::CanvasDetail)
+        || looks_like_high_stakes_scenario_contract(plan, normalized_question);
     if !enabled || effective_lane != "balanced" || !quality_sensitive_answer {
         return false;
     }
@@ -6073,6 +6192,11 @@ fn should_strip_unsolicited_coaching_appendix(plan: &AnswerPlan, user_text: &str
         return true;
     }
     let normalized_question = normalize_guardrail_text(&extract_search_question(user_text));
+    if plan.output == AnswerOutput::Compact
+        && looks_like_high_stakes_scenario_contract(plan, &normalized_question)
+    {
+        return true;
+    }
     if plan.interview_context
         && plan.output == AnswerOutput::Compact
         && matches!(
@@ -6419,56 +6543,15 @@ fn prompt_with_answer_plan_context(
                 "third-party api",
             ],
         );
-    let large_foreign_key_topic = contains_any(
-        &normalized_question,
-        &["foreign key", "fk constraint", "referential constraint"],
-    ) && contains_any(
-        &normalized_question,
-        &[
-            "production",
-            "million row",
-            "million-row",
-            "large table",
-            "online migration",
-            "without downtime",
-        ],
-    );
-    let large_foreign_key_plan_request = contains_any(
-        &normalized_question,
-        &[
-            "wants to add",
-            "add a foreign key",
-            "add the foreign key",
-            "introduce a foreign key",
-            "introduce the foreign key",
-            "enforce referential integrity",
-            "migrate",
-            "migration plan",
-            "online migration",
-            "without downtime",
-            "rollout",
-            "roll out",
-        ],
-    );
-    let large_foreign_key_non_plan_request = contains_any(
-        &normalized_question,
-        &[
-            "draft an email",
-            "write an email",
-            "announce",
-            "summarize",
-            "summary",
-            "postmortem",
-            "meeting notes",
-        ],
-    );
-    let large_foreign_key_migration_question = large_foreign_key_topic
-        && large_foreign_key_plan_request
-        && !large_foreign_key_non_plan_request
-        && matches!(
-            plan.intent,
-            AnswerIntent::General | AnswerIntent::SystemDesign | AnswerIntent::FollowUp
-        );
+    let large_foreign_key_migration_question =
+        looks_like_large_foreign_key_migration_question(&normalized_question, plan);
+    let scenario_answer = supports_high_stakes_scenario_answer(plan, &normalized_question);
+    let tail_latency_release_decision =
+        scenario_answer && looks_like_tail_latency_release_decision(&normalized_question);
+    let executive_model_rejection_explanation = scenario_answer
+        && looks_like_executive_model_rejection_explanation(&normalized_question);
+    let overlapping_sensor_deduplication =
+        scenario_answer && looks_like_overlapping_sensor_deduplication(&normalized_question);
     let two_director_conflict = contains_any(
         &normalized_question,
         &[
@@ -6698,6 +6781,24 @@ fn prompt_with_answer_plan_context(
         );
     }
 
+    if tail_latency_release_decision {
+        instructions.push_str(
+            "\nTail-latency release-decision contract: answer in first person and make a decision, not a generic latency lecture. Explicitly segment the p99 regression by endpoint, workload or transaction type, code path, and affected customer cohort, and use traces to identify the tail cause. Gate on the applicable p99 SLO and user impact, compare errors, timeouts, saturation, and cost, and ship only through a bounded canary with an automatic rollback threshold after the regression is understood and acceptable. A better average never overrides an unexplained critical-path p99 regression.",
+        );
+    }
+
+    if executive_model_rejection_explanation {
+        instructions.push_str(
+            "\nExecutive model-decision explanation contract: give the ready-to-say meeting answer in first person, starting with `I would explain that...` or an equally direct formulation. Name the actual decision reason only when supplied evidence supports it; otherwise say what must be verified. Explain the top contributing factor or feature categories, the score or confidence relative to the operating threshold and policy, material uncertainty, and the human review or appeal path. Distinguish a model signal from a final policy decision, avoid unsupported claims about the customer's behavior or model internals, and state the next accountable review step.",
+        );
+    }
+
+    if overlapping_sensor_deduplication {
+        instructions.push_str(
+            "\nOverlapping-sensor counting contract: answer in first person as a proposed approach. Explicitly describe time synchronization and calibration, spatial registration, cross-sensor association or fusion, one global track identity, and deduplication before counting. Count one stable entry or virtual-line crossing per global track rather than every detection, define overlap-window and confidence behavior for ambiguous matches, and validate false merges, missed merges, and final count error against ground truth.",
+        );
+    }
+
     if director_priority_conflict_question {
         instructions.push_str(
             "\nDirector-priority conflict contract: answer in first person with one decision-ready comparison that applies the same impact, deadline urgency, effort, dependency, and reversibility criteria to both requests. Present that one comparison to both directors, seek shared agreement on the order, and make the tradeoff visible rather than negotiating two private versions. If they cannot agree, escalate the unresolved decision, with the comparison, to their common accountable owner or sponsor. Until the directors agree or that accountable owner rules, do not start, continue, select, prioritize, or describe working on either conflicting request, even when one appears stronger on the comparison. Do not make a unilateral priority call, silently reorder ordinary work, or play the directors against each other. This is a hypothetical scenario: answer the process directly and do not add a claimed past-company example or invented anecdote. The only exception is an active production, security, safety, or compliance incident governed by a pre-agreed severity policy: take only the minimum reversible containment that policy mandates, notify both directors immediately, and still leave the resource-priority decision to the shared agreement or accountable owner; do not invent that exception for an ordinary priority conflict. The ready-to-say answer must include this exact sentence: `The only exception is a policy-governed production, security, safety, or compliance incident: I take only the minimum reversible containment, notify both directors immediately, and leave the resource-priority decision to their shared agreement or accountable owner.`"
@@ -6771,6 +6872,26 @@ fn prompt_with_answer_plan_context(
     if plan.output == AnswerOutput::CodeArtifact {
         instructions.push_str(
             "\nExecutable-code final check: return a complete runnable implementation, verify constructor and state initialization against their input parameters, mentally trace one normal operation and one boundary case, and close every code fence before `Line notes`, `Explanation`, `Complexity`, or `Edge cases` prose.",
+        );
+    }
+    if large_foreign_key_migration_question {
+        instructions.push_str(
+            "\nLarge-FK final output invariant: return only the ready-to-say proposed approach and stop after its final portability sentence. Do not append a `Reasoning`, `Why this works`, rationale, provenance, or coaching section. Any mention of `ACCESS EXCLUSIVE` must explicitly say that PostgreSQL 17 `ADD FOREIGN KEY ... NOT VALID` takes `SHARE ROW EXCLUSIVE` instead, never imply that `ACCESS EXCLUSIVE` is the required or avoided installation lock.",
+        );
+    }
+    if tail_latency_release_decision {
+        instructions.push_str(
+            "\nTail-latency final check: explicitly include at least one concrete segmentation dimension such as endpoint, workload, transaction type, code path, or customer cohort, plus the canary rollback gate.",
+        );
+    }
+    if executive_model_rejection_explanation {
+        instructions.push_str(
+            "\nExecutive-explanation final check: the visible answer must be first person and explicitly include a contributing factor or feature, confidence or threshold, governing policy, and human review or appeal path without inventing the customer's facts.",
+        );
+    }
+    if overlapping_sensor_deduplication {
+        instructions.push_str(
+            "\nSensor-counting final check: explicitly use association or fusion plus deduplication to create one global track identity before a single count event; do not describe source-local counting followed by correction.",
         );
     }
     if feature_store_design {

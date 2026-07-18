@@ -302,7 +302,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q46", "behavioral", "amazon_de", "Give me an example of ownership beyond your assigned task.", "leadership_doc", speakable=True, expected_outcome="needs_user_input", required_groups=(g("ownership", "took"), g("customer", "team", "impact"), g("result", "reduced", "improved"))),
     EvalCase("Q47", "behavioral", "amazon_de", "Two urgent requests arrive from different directors and both claim top priority. What do you do?", "behavioral_doc", speakable=True, required_groups=(g("impact", "severity", "customer"), g("communicat", "tradeoff", "lay out", "comparison"))),
     EvalCase("Q48", "behavioral", "sde", "A junior engineer keeps making the same code review mistake. How do you coach them without taking over the work?", speakable=True, required_groups=(g("coach", "explain"), g("example", "pair", "checklist"), g("follow", "ownership"))),
-    EvalCase("Q49", "scenario", "ds", "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?", "otter_visible_scenario", speakable=True, required_groups=(g("track", "identity"), g("calibrat", "time", "spatial"), g("dedup", "fusion", "association"))),
+    EvalCase("Q49", "scenario", "ds", "Two cameras and two sensors overlap, so the same vehicle can be detected multiple times. How would you prevent double counting?", "otter_visible_scenario", speakable=True, required_groups=(g("track", "identity"), g("calibrat", "time", "spatial"), g("dedup", "de-duplication", "fusion", "fuse", "association"))),
     EvalCase("Q50", "behavioral", "ds", "Why this role, and what would you focus on in your first ninety days?", "resume_and_jd_pdf", speakable=True, required_groups=(g("hpe", "datacenter", "telemetry"), g("first", "90", "ninety"), g("stakeholder", "baseline", "production"))),
 )
 
@@ -1991,6 +1991,20 @@ def self_check_attempt_integrity_guards() -> None:
         q31,
         "Graph relationships expose connected fraud rings. Build the graph without "
         "leakage by using only edges and labels available at the decision timestamp.",
+    )
+    q49 = next(case for case in CASES if case.id == "Q49")
+    assert not missing_required_group_issues(
+        q49,
+        "Assign one global track identity, calibrate time and spatial overlap, then "
+        "fuse matching observations and apply de-duplication before counting once.",
+    )
+    assert (
+        "missing_signal:dedup|de-duplication|fusion|fuse|association"
+        in missing_required_group_issues(
+            q49,
+            "Assign one global track identity, calibrate time and spatial overlap, "
+            "then merge the feeds and count every local detection.",
+        )
     )
     assert not has_required_signal("We worked together on the output.", "get")
     assert not has_required_signal("The database stores rows.", "data")
