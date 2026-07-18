@@ -107,7 +107,10 @@ def q47_director_alignment_issues(text: str) -> List[str]:
             r"\bescalat\w*\b.{0,35}\b(?:leadership|common\s+owner|sponsor)\b"
             r".{0,35}\b(?:decid|resolve|priority|order)\w*\b|"
             r"\bask\w*\s+them\b.{0,35}\b(?:agree|align)\w*\b.{0,45}"
-            r"\b(?:which\s+(?:one|request)|priority|order|sequence)\b",
+            r"\b(?:which\s+(?:one|request)|priority|order|sequence)\b|"
+            r"\bask\w*\s+for\s+(?:a|one)\s+"
+            r"(?:(?:single|agreed|shared|common)\s+){1,3}"
+            r"(?:priority\s+)?order\b",
             lower,
         )
         or visible_shared_engagement
@@ -349,6 +352,31 @@ def q47_director_alignment_issues(text: str) -> List[str]:
     unsafe_scan = re.sub(
         conditional_private_choice_warning,
         strip_safe_conditional_warning,
+        unsafe_scan,
+    )
+    explanatory_private_choice_rejection = (
+        r"\b(?:because|since)\s+"
+        r"(?:taking|choosing|picking|selecting|starting|prioritizing)\b"
+        rf"[^.!?;]{{0,55}}\b{private_choice_marker}\b"
+        r"[^.!?;]{0,35}\b(?:hide|hides|create|creates|cause|causes|risk|risks|"
+        r"harm|harms|undermine|undermines)\b[^.!?;]{0,50}"
+        r"\b(?:conflict|risk|harm|trust|problem|misalignment)\b"
+    )
+
+    def strip_explanatory_private_choice_rejection(match: re.Match[str]) -> str:
+        nonlocal unsafe_conditional_followthrough
+        following = unsafe_scan[match.end() :]
+        same_sentence_tail = re.match(r"[^.!?;]{0,260}", following)
+        if same_sentence_tail and has_affirmative_conditional_followthrough(
+            same_sentence_tail.group()
+        ):
+            unsafe_conditional_followthrough = True
+            return match.group()
+        return " "
+
+    unsafe_scan = re.sub(
+        explanatory_private_choice_rejection,
+        strip_explanatory_private_choice_rejection,
         unsafe_scan,
     )
     first_person_priority_decision = bool(

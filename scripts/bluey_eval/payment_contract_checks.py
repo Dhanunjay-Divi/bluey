@@ -225,6 +225,28 @@ def self_check_ambiguous_payment_detector() -> None:
     assert all(has_unsafe_ambiguous_payment_outcome(text) for text in unsafe)
 
 def self_check_payment_operation_semantics() -> None:
+    round548_webhook_event_store = (
+        "The inbound_event table is a dedupe store for webhook event IDs. "
+        "A duplicate webhook is ignored by event ID uniqueness."
+    )
+    assert "missing_provider_event_id_webhook_dedup" not in (
+        payment_operation_semantic_issues(
+            round548_webhook_event_store,
+            require_webhook_event_dedup=True,
+            require_complete_idempotency_semantics=False,
+        )
+    )
+    for wrong_webhook_dedup_identity in (
+        "The inbound_event table is a dedupe store for payment IDs.",
+        "The inbound_event table is a dedupe store for operation idempotency keys.",
+    ):
+        assert "missing_provider_event_id_webhook_dedup" in (
+            payment_operation_semantic_issues(
+                wrong_webhook_dedup_identity,
+                require_webhook_event_dedup=True,
+                require_complete_idempotency_semantics=False,
+            )
+        ), wrong_webhook_dedup_identity
     complete_local_payment_boundaries = " ".join(
         (
             Q39_INGRESS_IDEMPOTENCY_SENTENCE,

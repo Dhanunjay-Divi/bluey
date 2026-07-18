@@ -1411,6 +1411,10 @@ def payment_operation_semantic_issues(
         r"(?:the\s+)?(?:provider|processor|gateway)"
     )
     provider_event_dedup_patterns = (
+        rf"\bdedup\w*\s+store\b[^.!?;]{{0,20}}\bfor\b"
+        rf"[^.!?;]{{0,20}}\b(?:{provider_event_id})\b",
+        r"\bdedup\w*\s+store\b[^.!?;]{0,20}\bfor\b"
+        r"[^.!?;]{0,20}\bwebhook\s+event\s+(?:ids?|identifiers?)\b",
         rf"\bdedup\w*\b[^.!?;]{{0,45}}\bwebhooks?\b[^.!?;]{{0,45}}"
         rf"\b(?:by|using|with|on|keyed\s+by)\b[^.!?;]{{0,25}}"
         rf"\b(?:{provider_event_id})\b",
