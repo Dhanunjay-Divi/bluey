@@ -5,6 +5,46 @@ from __future__ import annotations
 import re
 from typing import List
 
+from .exact_contracts import has_visible_affirmative_contract_sentence
+
+
+Q39_INGRESS_IDEMPOTENCY_SENTENCE = (
+    "The ingress table uniquely maps each account and client idempotency key to one "
+    "payment intent and returns that stored intent on a duplicate submission."
+)
+Q39_LEDGER_IDEMPOTENCY_SENTENCE = (
+    "Ledger posting has a database uniqueness constraint on provider operation ID "
+    "plus effect type, and the authoritative state transition plus ledger entry "
+    "commit in one transaction."
+)
+Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE = (
+    "A new partial capture or refund creates a child provider-operation row under "
+    "the existing payment intent, not a new payment intent."
+)
+
+
+def payment_q39_completeness_issues(text: str) -> List[str]:
+    """Require the exact local-effect and ingress boundaries promised for the canvas."""
+    requirements = (
+        (
+            Q39_INGRESS_IDEMPOTENCY_SENTENCE,
+            "missing_client_idempotency_intent_mapping",
+        ),
+        (
+            Q39_LEDGER_IDEMPOTENCY_SENTENCE,
+            "missing_idempotent_local_ledger_posting",
+        ),
+        (
+            Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,
+            "missing_partial_action_child_operation_boundary",
+        ),
+    )
+    return [
+        issue
+        for sentence, issue in requirements
+        if not has_visible_affirmative_contract_sentence(text, sentence)
+    ]
+
 def has_mysql_not_valid_portability_claim(text: str) -> bool:
     lower = re.sub(r"\s+", " ", text.casefold())
     if "mysql" not in lower or "not valid" not in lower:
@@ -917,6 +957,15 @@ def payment_operation_semantic_issues(
     raw_lower = re.sub(
         r"[*`~]+", "", text.casefold().replace("’", "'")
     ).replace("_", " ")
+    safe_ingress_assertion = Q39_INGRESS_IDEMPOTENCY_SENTENCE.casefold().rstrip(".")
+    safe_ingress_assertion_pattern = r"\s+".join(
+        re.escape(word) for word in safe_ingress_assertion.split()
+    )
+    raw_lower = re.sub(
+        safe_ingress_assertion_pattern,
+        safe_ingress_assertion,
+        raw_lower,
+    )
     # Preserve Markdown list boundaries before whitespace normalization. Without
     # this, unrelated bullets such as "same key on retry" and "capture/refund"
     # collapse into one semantic clause and can manufacture a shared-key claim.
@@ -1250,6 +1299,14 @@ def payment_operation_semantic_issues(
         if _has_affirmative_cross_operation_key_sharing(clause):
             unsafe_shared_key = True
             break
+        # The exact ingress assertion owns request-to-intent deduplication; its
+        # client key is not one of the adjacent provider-operation keys. Remove
+        # only that known-safe assertion so an unsafe claim that operations share
+        # a client key remains visible to the generic detector.
+        provider_key_clause = clause.replace(
+            safe_ingress_assertion,
+            "ingress request maps to one stored payment intent",
+        )
         shared = bool(
             re.search(
                 r"\b(?:same|single|one|shared)\b[^.!?;]{0,35}"
@@ -1260,7 +1317,7 @@ def payment_operation_semantic_issues(
                 r"\b(?:same|single|one|shared)\b|"
                 r"\b(?:share|reuse|reuses|reused|reusing)\b[^.!?;]{0,25}"
                 r"\b(?:it|that\s+(?:key|token)|this\s+(?:key|token))\b",
-                clause,
+                provider_key_clause,
             )
         )
         if not shared:

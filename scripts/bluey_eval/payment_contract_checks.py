@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from .payment_contracts import (
+    Q39_INGRESS_IDEMPOTENCY_SENTENCE,
+    Q39_LEDGER_IDEMPOTENCY_SENTENCE,
+    Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,
     has_exactly_once_processing_overclaim,
     has_safe_payment_same_operation_replay_condition,
     has_unsafe_ambiguous_payment_outcome,
     large_fk_migration_safety_issues,
     payment_operation_semantic_issues,
     payment_platform_safety_issues,
+    payment_q39_completeness_issues,
 )
 
 
@@ -208,6 +212,77 @@ def self_check_ambiguous_payment_detector() -> None:
     assert all(has_unsafe_ambiguous_payment_outcome(text) for text in unsafe)
 
 def self_check_payment_operation_semantics() -> None:
+    complete_local_payment_boundaries = " ".join(
+        (
+            Q39_INGRESS_IDEMPOTENCY_SENTENCE,
+            Q39_LEDGER_IDEMPOTENCY_SENTENCE,
+            Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,
+        )
+    )
+    assert not payment_q39_completeness_issues(complete_local_payment_boundaries)
+    complete_payment_contract = (
+        "Each logical provider operation instance gets its own stable idempotency "
+        "key. Authorize, capture, and refund use distinct keys. Retries of the same "
+        "logical operation reuse its original stable key. Deduplicate webhooks by "
+        "provider event ID. Reconcile UNKNOWN outcomes from authoritative provider "
+        f"status. {complete_local_payment_boundaries}"
+    )
+    assert not payment_operation_semantic_issues(
+        complete_payment_contract,
+        require_webhook_event_dedup=True,
+    )
+    line_wrapped_contract = complete_payment_contract.replace(
+        "account and client idempotency key",
+        "account and client\nidempotency key",
+    )
+    assert not payment_q39_completeness_issues(line_wrapped_contract)
+    assert "unsafe_shared_idempotency_key_across_payment_operations" not in (
+        payment_operation_semantic_issues(
+            line_wrapped_contract,
+            require_webhook_event_dedup=True,
+        )
+    )
+    for hidden_sentence, expected_issue in (
+        (
+            f"<!-- {Q39_INGRESS_IDEMPOTENCY_SENTENCE} -->",
+            "missing_client_idempotency_intent_mapping",
+        ),
+        (
+            f"~~{Q39_LEDGER_IDEMPOTENCY_SENTENCE}~~",
+            "missing_idempotent_local_ledger_posting",
+        ),
+        (
+            f"```text\n{Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE}\n```",
+            "missing_partial_action_child_operation_boundary",
+        ),
+    ):
+        assert expected_issue in payment_q39_completeness_issues(hidden_sentence)
+    unsafe_client_key_reuse = (
+        "Authorize, capture, and refund reuse the client idempotency key."
+    )
+    assert "unsafe_shared_idempotency_key_across_payment_operations" in (
+        payment_operation_semantic_issues(
+            unsafe_client_key_reuse,
+            require_webhook_event_dedup=False,
+        )
+    )
+    for omitted_sentence, expected_issue in (
+        (
+            Q39_INGRESS_IDEMPOTENCY_SENTENCE,
+            "missing_client_idempotency_intent_mapping",
+        ),
+        (
+            Q39_LEDGER_IDEMPOTENCY_SENTENCE,
+            "missing_idempotent_local_ledger_posting",
+        ),
+        (
+            Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,
+            "missing_partial_action_child_operation_boundary",
+        ),
+    ):
+        incomplete = complete_local_payment_boundaries.replace(omitted_sentence, "")
+        assert payment_q39_completeness_issues(incomplete) == [expected_issue]
+
     safe = (
         "Give each logical provider operation, such as authorize, capture, or refund, "
         "its own stable idempotency key, and reuse that same key only when replaying "

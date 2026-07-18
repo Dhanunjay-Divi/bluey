@@ -34,6 +34,9 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from bluey_eval.payment_contracts import (  # noqa: E402
+    Q39_INGRESS_IDEMPOTENCY_SENTENCE,
+    Q39_LEDGER_IDEMPOTENCY_SENTENCE,
+    Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,
     has_exactly_once_processing_overclaim,
     has_explicit_no_provider_command_replay,
     has_mysql_not_valid_portability_claim,
@@ -42,6 +45,7 @@ from bluey_eval.payment_contracts import (  # noqa: E402
     large_fk_migration_safety_issues,
     payment_operation_semantic_issues,
     payment_platform_safety_issues,
+    payment_q39_completeness_issues,
 )
 from bluey_eval.payment_contract_checks import (  # noqa: E402
     self_check_ambiguous_payment_detector,
@@ -50,7 +54,11 @@ from bluey_eval.payment_contract_checks import (  # noqa: E402
     self_check_payment_operation_semantics,
     self_check_payment_platform_safety_detector,
 )
-from bluey_eval.leadership_contracts import q47_director_alignment_issues  # noqa: E402
+from bluey_eval.leadership_contracts import (  # noqa: E402
+    Q47_INCIDENT_CONTAINMENT_SENTENCE,
+    q47_director_alignment_issues,
+    q47_incident_containment_issues,
+)
 from bluey_eval.production_contract_checks import (  # noqa: E402
     self_check_production_answer_contracts,
 )
@@ -1741,6 +1749,10 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
     if case.id == "Q39" and has_exactly_once_processing_overclaim(combined):
         issues.append("unsafe_exactly_once_processing_claim")
     if case.id == "Q39":
+        issues.extend(
+            f"q39_canvas_{issue}"
+            for issue in payment_q39_completeness_issues(attempt.artifact_body or "")
+        )
         issues.extend(payment_platform_safety_issues(combined))
         issues.extend(
             payment_operation_semantic_issues(
@@ -1797,7 +1809,8 @@ def blocking_answer_issues(case: EvalCase, attempt: AttemptResult) -> List[str]:
         ):
             issues.append("q46_invalid_needs_story_facts_artifact")
     if case.id == "Q47":
-        issues.extend(q47_director_alignment_issues(combined))
+        issues.extend(q47_director_alignment_issues(attempt.visible_answer))
+        issues.extend(q47_incident_containment_issues(attempt.visible_answer))
     if case.id in ("Q29", "Q38") and has_drift_only_automatic_retraining(combined):
         issues.append("unsafe_drift_only_automatic_retraining")
     if case.id == "Q38":
@@ -2026,6 +2039,65 @@ def self_check_attempt_integrity_guards() -> None:
     )
     assert not missing_required_group_issues(q47, round544_live_q47)
     assert not q47_director_alignment_issues(round544_live_q47)
+    assert q47_incident_containment_issues(round544_live_q47) == [
+        "missing_policy_governed_incident_containment_exception"
+    ]
+    assert not q47_incident_containment_issues(
+        f"{round544_live_q47} {Q47_INCIDENT_CONTAINMENT_SENTENCE}"
+    )
+    for hidden_or_rejected_contract in (
+        f"<!-- {Q47_INCIDENT_CONTAINMENT_SENTENCE} -->",
+        f"~~{Q47_INCIDENT_CONTAINMENT_SENTENCE}~~",
+        f"```text\n{Q47_INCIDENT_CONTAINMENT_SENTENCE}\n```",
+        f"> {Q47_INCIDENT_CONTAINMENT_SENTENCE}",
+        f'Do not follow this sentence: "{Q47_INCIDENT_CONTAINMENT_SENTENCE}"',
+        f"I will not follow: {Q47_INCIDENT_CONTAINMENT_SENTENCE}",
+        f"I refuse to state: {Q47_INCIDENT_CONTAINMENT_SENTENCE}",
+        f"This is an example, not advice: {Q47_INCIDENT_CONTAINMENT_SENTENCE}",
+    ):
+        assert q47_incident_containment_issues(hidden_or_rejected_contract) == [
+            "missing_policy_governed_incident_containment_exception"
+        ]
+    artifact_only_incident_contract = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=round544_live_q47,
+        streamed_answer=round544_live_q47,
+        terminal_answer=round544_live_q47,
+        billing_received=True,
+        artifact_type="answer_notes",
+        artifact_body=Q47_INCIDENT_CONTAINMENT_SENTENCE,
+    )
+    assert "missing_policy_governed_incident_containment_exception" in (
+        blocking_answer_issues(q47, artifact_only_incident_contract)
+    )
+    complete_incident_contract = (
+        f"{round544_live_q47} {Q47_INCIDENT_CONTAINMENT_SENTENCE}"
+    )
+    complete_incident_attempt = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=complete_incident_contract,
+        streamed_answer=complete_incident_contract,
+        terminal_answer=complete_incident_contract,
+        billing_received=True,
+    )
+    assert "missing_policy_governed_incident_containment_exception" not in (
+        blocking_answer_issues(q47, complete_incident_attempt)
+    )
+    artifact_only_alignment = AttemptResult(
+        attempt=1,
+        ok=True,
+        visible_answer=Q47_INCIDENT_CONTAINMENT_SENTENCE,
+        streamed_answer=Q47_INCIDENT_CONTAINMENT_SENTENCE,
+        terminal_answer=Q47_INCIDENT_CONTAINMENT_SENTENCE,
+        billing_received=True,
+        artifact_type="answer_notes",
+        artifact_body=round544_live_q47,
+    )
+    assert set(q47_director_alignment_issues(Q47_INCIDENT_CONTAINMENT_SENTENCE)) <= set(
+        blocking_answer_issues(q47, artifact_only_alignment)
+    )
     for safe_conditional_private_warning in (
         "I show both directors one comparison, ask them to agree on the order, and "
         "escalate to their common owner if needed. If I pick alone, I could hide "
@@ -3136,11 +3208,20 @@ def self_check_attempt_integrity_guards() -> None:
     assert not answer_is_success(q39, payment_attempt)
 
     complete_payment_surface = (
-        "Authorize, capture, and refund each use a distinct operation-scoped "
-        "idempotency key. Retries of the same logical operation reuse its original "
-        "stable key. Persist the payment intent and durable double-entry ledger before "
-        "calling the provider. Deduplicate webhooks by provider event ID and reconcile "
-        "UNKNOWN outcomes through authoritative provider status."
+        "Each logical provider operation instance gets its own stable idempotency "
+        "key. Authorize, capture, and refund use distinct keys. Retries of the same "
+        "logical operation reuse its original stable key. Persist the payment intent "
+        "and durable double-entry ledger before calling the provider. Deduplicate "
+        "webhooks by provider event ID and reconcile UNKNOWN outcomes through "
+        "authoritative provider status."
+    )
+    complete_payment_canvas = " ".join(
+        (
+            complete_payment_surface,
+            Q39_INGRESS_IDEMPOTENCY_SENTENCE,
+            Q39_LEDGER_IDEMPOTENCY_SENTENCE,
+            Q39_PARTIAL_ACTION_BOUNDARY_SENTENCE,
+        )
     )
     weak_payment_surface = (
         "Client requests flow through durable ledger storage to the provider, and "
@@ -3154,7 +3235,7 @@ def self_check_attempt_integrity_guards() -> None:
         terminal_answer=complete_payment_surface,
         billing_received=True,
         artifact_type="system_design",
-        artifact_body=complete_payment_surface,
+        artifact_body=complete_payment_canvas,
     )
     complete_surface_issues = set(
         blocking_answer_issues(q39, complete_both_surfaces)
@@ -3170,7 +3251,7 @@ def self_check_attempt_integrity_guards() -> None:
         terminal_answer=weak_payment_surface,
         billing_received=True,
         artifact_type="system_design",
-        artifact_body=complete_payment_surface,
+        artifact_body=complete_payment_canvas,
     )
     spoken_issues = set(blocking_answer_issues(q39, spoken_omission))
     assert "q39_spoken_missing_distinct_authorize_capture_refund_keys" in spoken_issues
@@ -3187,6 +3268,9 @@ def self_check_attempt_integrity_guards() -> None:
     )
     canvas_issues = set(blocking_answer_issues(q39, canvas_omission))
     assert "q39_canvas_missing_distinct_authorize_capture_refund_keys" in canvas_issues
+    assert "q39_canvas_missing_client_idempotency_intent_mapping" in canvas_issues
+    assert "q39_canvas_missing_idempotent_local_ledger_posting" in canvas_issues
+    assert "q39_canvas_missing_partial_action_child_operation_boundary" in canvas_issues
     assert not any(issue.startswith("q39_spoken_missing_") for issue in canvas_issues)
 
     q40 = next(case for case in CASES if case.id == "Q40")

@@ -2703,6 +2703,18 @@ fn answer_plan_payment_system_design_requires_durable_ledger_correctness() {
     assert!(system.contains("lock may only reduce duplicate work"));
     assert!(system.contains("Never write `exactly-once processing` anywhere"));
     assert!(system.contains("at-least-once delivery with idempotent exactly-once effects"));
+    assert!(
+        system.contains("The ingress table uniquely maps each account and client idempotency key")
+    );
+    assert!(system.contains(
+        "Ledger posting has a database uniqueness constraint on provider operation ID plus effect type"
+    ));
+    assert!(system.contains(
+        "the authoritative state transition plus ledger entry commit in one transaction"
+    ));
+    assert!(system.contains(
+        "creates a child provider-operation row under the existing payment intent, not a new payment intent"
+    ));
 }
 
 #[test]
@@ -3721,6 +3733,10 @@ fn answer_plan_q47_director_priority_conflict_requires_shared_decision() {
         "still leave the resource-priority decision to the shared agreement or accountable owner"
     ));
     assert!(system.contains("do not invent that exception"));
+    assert!(system.contains("The ready-to-say answer must include this exact sentence"));
+    assert!(system.contains(
+        "I take only the minimum reversible containment, notify both directors immediately"
+    ));
 
     let paraphrase = complete_request(
         "Question:\nTwo directors ask you to prioritize conflicting urgent requests. What do you do?",
