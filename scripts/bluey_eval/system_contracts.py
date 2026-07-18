@@ -1229,23 +1229,6 @@ def url_shortener_safety_issues(
 
     if require_revocation_completeness and not revocable_permanent_redirect:
         for clause in clauses:
-            positive_permanent = bool(
-                re.search(
-                    r"\b(?:return|serve|send|issue|use|respond\s+with)\w*\b"
-                    r".{0,35}\b(?:http\s+)?(?:301|308)\b|"
-                    r"\b(?:301|308)\b.{0,35}\b(?:redirect|response)\w*\b",
-                    clause,
-                )
-            )
-            safely_rejected = bool(
-                re.search(
-                    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|"
-                    r"cannot|can't)\s+(?:return|serve|send|issue|use)\w*\b"
-                    r".{0,35}\b(?:301|308)\b|"
-                    r"\bnot\s+(?:301|308)\b",
-                    clause,
-                )
-            )
             safe_exception = bool(
                 re.search(r"\bnon[- ]revocable\b", clause)
                 and re.search(r"\b(?:301|308)\b", clause)
@@ -1261,8 +1244,29 @@ def url_shortener_safety_issues(
                     clause,
                 )
             )
-            if positive_permanent and not safely_rejected and not safe_exception:
-                issues.append("unsafe_permanent_redirect_for_revocable_link")
+            for permanent_code in ("301", "308"):
+                positive_permanent = bool(
+                    re.search(
+                        rf"\b(?:return|serve|send|issue|use|respond\s+with)\w*\b"
+                        rf".{{0,35}}\b(?:http\s+)?{permanent_code}\b|"
+                        rf"\b{permanent_code}\b.{{0,35}}\b(?:redirect|response)\w*\b",
+                        clause,
+                    )
+                )
+                safely_rejected = bool(
+                    re.search(
+                        r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|"
+                        r"cannot|can't)\s+(?:return|serve|send|issue|use)\w*\b"
+                        rf".{{0,35}}\b(?:http\s+)?{permanent_code}\b|"
+                        rf"\b(?:not|never)\s+(?:http\s+)?{permanent_code}\b|"
+                        rf"\b{permanent_code}\b.{{0,30}}\b(?:is|are)\s+not\s+used\b",
+                        clause,
+                    )
+                )
+                if positive_permanent and not safely_rejected and not safe_exception:
+                    issues.append("unsafe_permanent_redirect_for_revocable_link")
+                    break
+            if "unsafe_permanent_redirect_for_revocable_link" in issues:
                 break
 
     generic_abuse_451 = False

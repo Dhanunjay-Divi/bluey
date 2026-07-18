@@ -279,7 +279,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q25", "behavioral", "ds", "Walk me through the secure RAG system you built and the decision you personally owned.", "otter_interview_style", "rag_project", speakable=True, required_groups=(g("2m", "document"), g("98%", "precision"), g("secure", "access"))),
     EvalCase("Q26", "followup", "ds", "Where could that RAG system hallucinate, and what did you put in place to catch it?", "otter_interview_style", "rag_project", speakable=True, expect_followup_context=True, required_groups=(g("retriev", "ground"), g("citation", "source"), g("eval", "threshold", "fallback"))),
     EvalCase("Q27", "technical", "ds", "Design an evaluation plan for a RAG assistant before production launch.", speakable=True, required_groups=(g("recall@k", "recall at k", "mrr", "ndcg"), g("faithful", "ground", "hallucin"), g("citation correctness", "citation precision", "citation recall"), g("no-answer", "unanswerable", "refusal", "abstain"), g("adversarial", "prompt injection"), g("acl", "permission", "tenant leakage"), g("pii", "privacy"), g("latency",), g("cost",), g("human", "golden", "dataset"), g("baseline", "champion"), g("slice", "segment"), g("regression", "launch gate"))),
-    EvalCase("Q28", "scenario", "ds", "A fraud model has 99.8 percent accuracy but misses expensive fraud. What is wrong with the evaluation?", speakable=True, required_groups=(g("class imbalance", "imbalanc"), g("precision", "recall"), g("cost", "threshold", "loss"))),
+    EvalCase("Q28", "scenario", "ds", "A fraud model has 99.8 percent accuracy but misses expensive fraud. What is wrong with the evaluation?", speakable=True, required_groups=(g("class imbalance", "imbalanc", "minority class", "majority class"), g("precision", "recall"), g("cost", "threshold", "loss"))),
     EvalCase("Q29", "scenario", "ds", "A model was strong offline but degrades two months after launch. How do you determine whether this is drift or a pipeline bug?", speakable=True, required_groups=(g("drift",), g("feature", "pipeline"), g("distribution", "monitor"), g("label", "ground truth"))),
     EvalCase("Q30", "technical", "ds", "How would you reduce p95 latency for a large language model service without silently reducing answer quality?", speakable=True, required_groups=(g("batch", "cache", "quant", "vllm"), g("p95", "latency"), g("quality", "eval"), g("canary", "measure"))),
     EvalCase("Q31", "technical", "ds", "Why can graph features help a fraud model beyond ordinary transaction aggregates?", speakable=True, required_groups=(g("relationship", "network", "graph"), g("ring", "connected"), g("leak", "time"))),
@@ -1563,7 +1563,7 @@ def code_complexity_issues(text: str) -> List[str]:
     )
     operation_bounds = all(
         re.search(
-            rf"`?\b{operation}\s*\([^\n)]*\)`?\s*:\s*O\([^\n)]+\)",
+            rf"`?\b{operation}(?:\s*\([^\n)]*\))?`?\s*:\s*O\([^\n)]+\)",
             text,
             re.I,
         )

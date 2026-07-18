@@ -430,6 +430,27 @@ def self_check_production_answer_contracts(
         safe_url_design,
         require_revocation_completeness=True,
     )
+    saved_round548_redirect_wording = (
+        "Revocable public links use 302 or 307 with Cache-Control: no-store, "
+        "never 301 or 308. Deleted links synchronously publish a deny tombstone "
+        "before acknowledgement, and every redirect worker fails closed to an "
+        "authoritative state check when overlay state is uncertain."
+    )
+    assert not url_shortener_safety_issues(
+        saved_round548_redirect_wording,
+        require_revocation_completeness=True,
+    )
+    for unsafe_permanent_wording in (
+        "Revocable public links use 301.",
+        "Immutable public links use 301 even though they may later be abuse-blocked.",
+        "Revocable public links use 301, but never 308.",
+    ):
+        assert "unsafe_permanent_redirect_for_revocable_link" in (
+            url_shortener_safety_issues(
+                unsafe_permanent_wording,
+                require_revocation_completeness=True,
+            )
+        ), unsafe_permanent_wording
     unsafe_http_cache = safe_url_design.replace(
         "Cache-Control: no-store",
         "Cache-Control: public, max-age=3600",
