@@ -4103,7 +4103,9 @@ fn score_posting(
     ) {
         if (minimum..=maximum).contains(&required) {
             score += 10;
-            reasons.push(format!("Experience request fits your {minimum}-{maximum} year target range"));
+            reasons.push(format!(
+                "Experience request fits your {minimum}-{maximum} year target range"
+            ));
         } else {
             score -= 15;
             missing.push(format!(
@@ -9830,8 +9832,7 @@ mod tests {
             max_posting_age_days: 60,
             ..JobPreferences::default()
         };
-        let saved_preferences =
-            save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let saved_preferences = save_preferences(&pool, "acct-jobs", &preferences).unwrap();
         assert_eq!(saved_preferences.daily_limit, 10);
         assert_eq!(saved_preferences.max_posting_age_days, 14);
     }
@@ -9867,9 +9868,9 @@ mod tests {
             .any(|check| check == "experience_aligned"));
 
         let mut too_senior = aligned;
-        too_senior.description = "Requires at least 5 years of software engineering experience.".to_string();
-        let blocked =
-            build_job_eligibility(&too_senior, &profile, &preferences, &[], false, None);
+        too_senior.description =
+            "Requires at least 5 years of software engineering experience.".to_string();
+        let blocked = build_job_eligibility(&too_senior, &profile, &preferences, &[], false, None);
         assert!(blocked
             .hard_failures
             .iter()
@@ -9882,14 +9883,8 @@ mod tests {
         );
         title_only_senior.title = "Senior Software Engineer".to_string();
         title_only_senior.description = "Build reliable products with Rust.".to_string();
-        let blocked = build_job_eligibility(
-            &title_only_senior,
-            &profile,
-            &preferences,
-            &[],
-            false,
-            None,
-        );
+        let blocked =
+            build_job_eligibility(&title_only_senior, &profile, &preferences, &[], false, None);
         assert!(blocked
             .hard_failures
             .iter()
@@ -11584,14 +11579,9 @@ mod tests {
             posting.title = format!("Platform Engineer {index}");
             let posting =
                 upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
-            let (application, _) = prepare_application(
-                &pool,
-                "acct-jobs",
-                &posting.id,
-                "factual",
-                "review_first",
-            )
-            .unwrap();
+            let (application, _) =
+                prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                    .unwrap();
             reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
         }
 
@@ -11621,7 +11611,9 @@ mod tests {
 
         let reservations = list_attempt_reservations(&pool, "acct-jobs").unwrap();
         assert_eq!(reservations.len(), 10);
-        assert!(reservations.iter().any(|reservation| reservation.application_id == application.id));
+        assert!(reservations
+            .iter()
+            .any(|reservation| reservation.application_id == application.id));
     }
 
     #[test]
