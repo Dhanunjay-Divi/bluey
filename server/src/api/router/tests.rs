@@ -2679,7 +2679,7 @@ fn answer_plan_payment_system_design_requires_durable_ledger_correctness() {
     assert!(system.contains("scoped to the owning account and payment, operation type"));
     assert!(system.contains("A new partial capture or partial refund is a new logical action"));
     assert!(system.contains("retransmission of that exact partial action"));
-    assert!(system.contains("Payment system-design spoken output"));
+    assert!(system.contains("Payment system-design output"));
     assert!(system.contains("I give each authorization, capture, and refund"));
     assert!(system.contains("including each partial capture or refund"));
     assert!(system.contains("its own stable idempotency key"));
@@ -2745,7 +2745,7 @@ fn payment_operation_instance_sentence_does_not_leak_into_analytics_designs() {
             "payment-processing contract leaked for {question}"
         );
         assert!(
-            !system.contains("Payment system-design spoken output"),
+            !system.contains("Payment system-design output"),
             "operation-instance sentence leaked for {question}"
         );
         assert!(
@@ -2768,7 +2768,7 @@ fn generic_money_movement_keeps_correctness_without_inventing_card_operations() 
     );
     assert!(system.contains("Payment correctness contract"));
     assert!(system.contains("Irreversible-payment safety contract"));
-    assert!(!system.contains("Payment system-design spoken output"));
+    assert!(!system.contains("Payment system-design output"));
     assert!(!system.contains("I give each authorization, capture, and refund"));
 }
 
@@ -2801,7 +2801,7 @@ fn payment_money_effect_aliases_activate_operation_contracts() {
             "{question}"
         );
         assert!(
-            system.contains("Payment system-design spoken output"),
+            system.contains("Payment system-design output"),
             "{question}"
         );
         assert!(
@@ -2827,7 +2827,7 @@ fn payment_observability_followup_does_not_repeat_operation_contract() {
     );
     assert!(system.contains("answer only the requested continuation"));
     assert!(!system.contains("Payment correctness contract"));
-    assert!(!system.contains("Payment system-design spoken output"));
+    assert!(!system.contains("Payment system-design output"));
     assert!(!system.contains("Irreversible-payment safety contract"));
 }
 
@@ -3276,6 +3276,10 @@ fn answer_plan_q40_payment_timeout_followup_is_first_person_and_safe() {
     assert!(system.contains("manual reconciliation workflow"));
     assert!(system.contains("original operation's idempotency key"));
     assert!(system.contains("operation key is not the webhook deduplication key"));
+    assert!(!system.contains("Payment system-design output"));
+    assert!(
+        !system.contains("The ingress table uniquely maps each account and client idempotency key")
+    );
 }
 
 #[test]

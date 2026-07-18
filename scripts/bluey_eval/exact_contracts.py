@@ -5,7 +5,12 @@ from __future__ import annotations
 import re
 
 
-def has_visible_affirmative_contract_sentence(text: str, expected: str) -> bool:
+def has_visible_affirmative_contract_sentence(
+    text: str,
+    expected: str,
+    *,
+    allow_inline_code: bool = False,
+) -> bool:
     """Return true only when expected appears as visible, affirmative prose."""
     prose = text.replace("\r\n", "\n").replace("\r", "\n")
     prose = re.sub(r"<!--.*?-->", " ", prose, flags=re.DOTALL)
@@ -22,7 +27,10 @@ def has_visible_affirmative_contract_sentence(text: str, expected: str) -> bool:
     )
     prose = re.sub(r"(?ms)^\s*(?:```|~~~).*\Z", " ", prose)
     prose = re.sub(r"~~.*?~~", " ", prose, flags=re.DOTALL)
-    prose = re.sub(r"`[^`\n]*`", " ", prose)
+    if allow_inline_code:
+        prose = re.sub(r"`([^`\n]*)`", r"\1", prose)
+    else:
+        prose = re.sub(r"`[^`\n]*`", " ", prose)
     prose = re.sub(r"(?m)^\s*>.*$", " ", prose)
     prose = re.sub(r"(?m)^(?: {4}|\t).*$", " ", prose)
     normalized = re.sub(

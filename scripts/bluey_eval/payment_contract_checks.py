@@ -266,6 +266,37 @@ def self_check_payment_operation_semantics() -> None:
             require_webhook_event_dedup=False,
         )
     )
+    safe_partial_action_bullets = (
+        "- New partial capture or partial refund = new logical action, new key.\n"
+        "- Retry of that exact partial action = same key."
+    )
+    assert "unsafe_shared_idempotency_key_across_payment_operations" not in (
+        payment_operation_semantic_issues(
+            safe_partial_action_bullets,
+            require_webhook_event_dedup=False,
+        )
+    )
+    contradicted_partial_action_bullets = (
+        f"{safe_partial_action_bullets}\n"
+        "- The same key is used for both operations."
+    )
+    assert "unsafe_shared_idempotency_key_across_payment_operations" in (
+        payment_operation_semantic_issues(
+            contradicted_partial_action_bullets,
+            require_webhook_event_dedup=False,
+        )
+    )
+    contradicted_partial_action_clause = (
+        "New partial capture or partial refund is a new logical action with a new "
+        "key, retry of that exact partial action reuses the same key, capture and "
+        "refund reuse an idempotency key."
+    )
+    assert "unsafe_shared_idempotency_key_across_payment_operations" in (
+        payment_operation_semantic_issues(
+            contradicted_partial_action_clause,
+            require_webhook_event_dedup=False,
+        )
+    )
     for omitted_sentence, expected_issue in (
         (
             Q39_INGRESS_IDEMPOTENCY_SENTENCE,

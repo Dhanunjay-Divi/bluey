@@ -42,8 +42,13 @@ def payment_q39_completeness_issues(text: str) -> List[str]:
     return [
         issue
         for sentence, issue in requirements
-        if not has_visible_affirmative_contract_sentence(text, sentence)
+        if not has_visible_affirmative_contract_sentence(
+            text,
+            sentence,
+            allow_inline_code=True,
+        )
     ]
+
 
 def has_mysql_not_valid_portability_claim(text: str) -> bool:
     lower = re.sub(r"\s+", " ", text.casefold())
@@ -979,7 +984,10 @@ def payment_operation_semantic_issues(
     clauses = [
         clause.strip()
         for clause in re.split(r"(?<=[.!?;])\s+", clause_text)
-        if clause.strip()
+        # Markdown list-boundary normalization can produce a standalone dot
+        # between two punctuated bullets. Do not let that empty clause prevent
+        # the two- and three-clause semantic windows from seeing contradictions.
+        if clause.strip(" .")
     ]
     semantic_windows = list(clauses)
     semantic_windows.extend(
@@ -1285,6 +1293,17 @@ def payment_operation_semantic_issues(
             )
         )
     )
+    new_partial_action_pattern = (
+        r"\bnew\s+partial\s+(?:capture|refund)\b.{0,40}"
+        r"\b(?:partial\s+)?(?:capture|refund)\b.{0,45}"
+        r"\bnew\s+logical\s+(?:action|operation)\b.{0,30}"
+        r"\bnew\s+(?:idempotency\s+)?key\b"
+    )
+    exact_partial_retry_pattern = (
+        r"\bretr(?:y|ies|ied|ying)\s+of\b.{0,30}\bexact\b.{0,25}"
+        r"\bpartial\s+(?:action|capture|refund)\b.{0,35}"
+        r"\b(?:same|original)\s+(?:idempotency\s+)?key\b"
+    )
     unsafe_shared_key = False
     for clause in semantic_windows:
         operations = {
@@ -1299,6 +1318,10 @@ def payment_operation_semantic_issues(
         if _has_affirmative_cross_operation_key_sharing(clause):
             unsafe_shared_key = True
             break
+        safe_partial_action_pair = bool(
+            re.search(new_partial_action_pattern, clause)
+            and re.search(exact_partial_retry_pattern, clause)
+        )
         # The exact ingress assertion owns request-to-intent deduplication; its
         # client key is not one of the adjacent provider-operation keys. Remove
         # only that known-safe assertion so an unsafe claim that operations share
@@ -1307,6 +1330,13 @@ def payment_operation_semantic_issues(
             safe_ingress_assertion,
             "ingress request maps to one stored payment intent",
         )
+        if safe_partial_action_pair:
+            provider_key_clause = re.sub(
+                exact_partial_retry_pattern,
+                "retry of that exact partial action reuses its operation identifier",
+                provider_key_clause,
+                count=1,
+            )
         shared = bool(
             re.search(
                 r"\b(?:same|single|one|shared)\b[^.!?;]{0,35}"
