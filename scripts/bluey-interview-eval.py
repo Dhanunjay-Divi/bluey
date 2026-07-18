@@ -282,7 +282,7 @@ CASES: Tuple[EvalCase, ...] = (
     EvalCase("Q28", "scenario", "ds", "A fraud model has 99.8 percent accuracy but misses expensive fraud. What is wrong with the evaluation?", speakable=True, required_groups=(g("class imbalance", "imbalanc", "minority class", "majority class"), g("precision", "recall"), g("cost", "threshold", "loss"))),
     EvalCase("Q29", "scenario", "ds", "A model was strong offline but degrades two months after launch. How do you determine whether this is drift or a pipeline bug?", speakable=True, required_groups=(g("drift",), g("feature", "pipeline"), g("distribution", "monitor"), g("label", "ground truth"))),
     EvalCase("Q30", "technical", "ds", "How would you reduce p95 latency for a large language model service without silently reducing answer quality?", speakable=True, required_groups=(g("batch", "cache", "quant", "vllm"), g("p95", "latency"), g("quality", "eval"), g("canary", "measure"))),
-    EvalCase("Q31", "technical", "ds", "Why can graph features help a fraud model beyond ordinary transaction aggregates?", speakable=True, required_groups=(g("relationship", "network", "graph"), g("ring", "connected"), g("leak", "time"))),
+    EvalCase("Q31", "technical", "ds", "Why can graph features help a fraud model beyond ordinary transaction aggregates?", speakable=True, required_groups=(g("relationship", "network", "graph"), g("ring", "connected"), g("leak", "leakage", "time", "timestamp"))),
     EvalCase("Q32", "scenario", "ds", "An executive asks why the model rejected a high-value customer. Give the answer you would use in that meeting.", speakable=True, required_groups=(g("factor", "feature", "reason"), g("confidence", "threshold"), g("review", "appeal", "policy"))),
     EvalCase("Q33", "behavioral", "ds", "Why does your background fit a role working on streaming datacenter telemetry, anomaly detection, and search?", "resume_and_jd_pdf", speakable=True, required_groups=(g("stream", "telemetry"), g("anomal", "search"), g("rag", "ml", "platform"))),
 
@@ -1986,6 +1986,12 @@ def expected_outcome_is_accepted(case: EvalCase, attempt: AttemptResult) -> bool
 def self_check_attempt_integrity_guards() -> None:
     assert has_required_signal("def get(self, key):", "get")
     assert has_required_signal("point in time training-serving data", "point-in-time")
+    q31 = next(case for case in CASES if case.id == "Q31")
+    assert not missing_required_group_issues(
+        q31,
+        "Graph relationships expose connected fraud rings. Build the graph without "
+        "leakage by using only edges and labels available at the decision timestamp.",
+    )
     assert not has_required_signal("We worked together on the output.", "get")
     assert not has_required_signal("The database stores rows.", "data")
     assert not has_required_signal("Identity is generated.", "id")
