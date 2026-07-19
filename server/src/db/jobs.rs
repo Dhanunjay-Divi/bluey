@@ -2239,6 +2239,52 @@ pub fn list_discovery_sources(pool: &DbPool, account_id: &str) -> Result<Vec<Dis
     })
 }
 
+/// Return the authoritative job currently bound to one verified
+/// source/external-ID pair. Workspace backfill uses this to repair sources
+/// created by the pre-membership importer without rewriting healthy matches
+/// on every read.
+pub fn verified_import_discovery_membership_job_id(
+    pool: &DbPool,
+    account_id: &str,
+    provider: &str,
+    source_key: &str,
+    external_id: &str,
+) -> Result<Option<String>> {
+    let provider = provider.trim().to_ascii_lowercase();
+    let source_key = source_key.trim();
+    let external_id = external_id.trim();
+    if provider.is_empty() || source_key.is_empty() || external_id.is_empty() {
+        return Ok(None);
+    }
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => pool
+            .get()?
+            .query_row(
+                "SELECT m.job_id
+                   FROM jobs_discovery_memberships m
+                   JOIN jobs_discovery_sources s ON s.id = m.source_id
+                  WHERE s.account_id = ?1 AND s.provider = ?2 AND s.source_key = ?3
+                    AND m.account_id = ?1 AND m.external_id = ?4",
+                params![account_id, provider, source_key, external_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("get verified-import discovery membership"),
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query_opt(
+                "SELECT m.job_id
+                   FROM jobs_discovery_memberships m
+                   JOIN jobs_discovery_sources s ON s.id = m.source_id
+                  WHERE s.account_id = $1 AND s.provider = $2 AND s.source_key = $3
+                    AND m.account_id = $1 AND m.external_id = $4",
+                &[&account_id, &provider, &source_key, &external_id],
+            )
+            .map(|row| row.map(|row| row.get(0)))
+            .context("get verified-import discovery membership"),
+    })
+}
+
 pub fn get_discovery_source(pool: &DbPool, source_id: &str) -> Result<Option<DiscoverySource>> {
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => pool
@@ -2687,6 +2733,135 @@ fn normalized_discovery_source_values(
     ))
 }
 
+fn verified_import_membership_content_hash(
+    provider: &str,
+    source_key: &str,
+    posting: &JobPosting,
+) -> String {
+    let payload = json!({
+        "provider": provider,
+        "source_key": source_key,
+        "external_id": posting.external_id.trim(),
+        "canonical_url": posting.canonical_url.trim(),
+        "company": posting.company.trim(),
+        "title": posting.title.trim(),
+        "location": posting.location.trim(),
+        "workplace": posting.workplace.trim(),
+        "description": posting.description.trim(),
+        "compensation": posting.compensation.trim(),
+        "posted_at_ms": posting.posted_at_ms,
+    });
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&payload).unwrap_or_default(),
+    ))
+}
+
+fn verified_import_membership_run_id(
+    account_id: &str,
+    source_id: &str,
+    external_id: &str,
+) -> String {
+    let digest = hex::encode(Sha256::digest(format!(
+        "{account_id}\0{source_id}\0{external_id}"
+    )));
+    format!("verified-import-{}", &digest[..32])
+}
+
+fn resolve_verified_import_identity_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    source_id: &str,
+    external_id: &str,
+    canonical_key: &str,
+) -> Result<Option<JobPosting>> {
+    let membership_job_id: Option<String> = tx
+        .query_row(
+            "SELECT job_id FROM jobs_discovery_memberships
+              WHERE source_id = ?1 AND external_id = ?2",
+            params![source_id, external_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let membership_posting = match membership_job_id {
+        Some(job_id) => tx
+            .query_row(
+                "SELECT posting_json FROM jobs_postings
+                  WHERE account_id = ?1 AND id = ?2",
+                params![account_id, job_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|raw| parse_json::<JobPosting>(raw, "job posting"))
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("discovery membership refers to a missing job"))
+            .map(Some)?,
+        None => None,
+    };
+    let canonical_posting = tx
+        .query_row(
+            "SELECT posting_json FROM jobs_postings
+              WHERE account_id = ?1 AND canonical_key = ?2",
+            params![account_id, canonical_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| parse_json::<JobPosting>(raw, "job posting"))
+        .transpose()?;
+    if membership_posting
+        .as_ref()
+        .zip(canonical_posting.as_ref())
+        .is_some_and(|(membership, canonical)| membership.id != canonical.id)
+    {
+        anyhow::bail!("discovery membership and canonical job disagree")
+    }
+    Ok(membership_posting.or(canonical_posting))
+}
+
+fn resolve_verified_import_identity_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    source_id: &str,
+    external_id: &str,
+    canonical_key: &str,
+) -> Result<Option<JobPosting>> {
+    let membership_job_id = tx
+        .query_opt(
+            "SELECT job_id FROM jobs_discovery_memberships
+              WHERE source_id = $1 AND external_id = $2 FOR UPDATE",
+            &[&source_id, &external_id],
+        )?
+        .map(|row| row.get::<_, String>(0));
+    let membership_posting = match membership_job_id {
+        Some(job_id) => tx
+            .query_opt(
+                "SELECT posting_json FROM jobs_postings
+                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                &[&account_id, &job_id],
+            )?
+            .map(|row| parse_json::<JobPosting>(row.get(0), "job posting"))
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("discovery membership refers to a missing job"))
+            .map(Some)?,
+        None => None,
+    };
+    let canonical_posting = tx
+        .query_opt(
+            "SELECT posting_json FROM jobs_postings
+              WHERE account_id = $1 AND canonical_key = $2 FOR UPDATE",
+            &[&account_id, &canonical_key],
+        )?
+        .map(|row| parse_json::<JobPosting>(row.get(0), "job posting"))
+        .transpose()?;
+    if membership_posting
+        .as_ref()
+        .zip(canonical_posting.as_ref())
+        .is_some_and(|(membership, canonical)| membership.id != canonical.id)
+    {
+        anyhow::bail!("discovery membership and canonical job disagree")
+    }
+    Ok(membership_posting.or(canonical_posting))
+}
+
 /// Atomically accept a verified public import and its required board binding.
 /// Manual and unsupported links intentionally continue through `upsert_posting`
 /// alone. For a verified import, neither a source nor a match becomes visible
@@ -2704,6 +2879,15 @@ pub fn save_verified_import_posting_with_source(
         normalized_discovery_source_values(account_id, source)?;
     if posting.track_id.trim() != track_id {
         anyhow::bail!("verified import discovery source does not match the job Career Track")
+    }
+    let external_id = posting.external_id.trim();
+    if external_id.is_empty() || external_id.chars().count() > 240 {
+        anyhow::bail!("verified import has no valid external job ID")
+    }
+    let (_, posting_source_key) =
+        canonical_public_discovery_url(&provider, &posting.canonical_url)?;
+    if posting_source_key != source_key {
+        anyhow::bail!("verified import URL does not belong to its discovery source")
     }
     let applications = list_applications(pool, account_id)?;
     let reservations = list_attempt_reservations(pool, account_id)?;
@@ -2736,18 +2920,22 @@ pub fn save_verified_import_posting_with_source(
                     updated_at_ms = excluded.updated_at_ms",
                 params![source_id, account_id, track_id, provider, source_key, source_payload, interval, now],
             )?;
-            let existing = tx
-                .query_row(
-                    "SELECT posting_json FROM jobs_postings WHERE account_id = ?1 AND canonical_key = ?2",
-                    params![account_id, canonical_job_key(posting)],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-                .map(|raw| parse_json(raw, "job posting"))
-                .transpose()?;
+            let actual_source_id: String = tx.query_row(
+                "SELECT id FROM jobs_discovery_sources
+                  WHERE account_id = ?1 AND provider = ?2 AND source_key = ?3",
+                params![account_id, provider, source_key],
+                |row| row.get(0),
+            )?;
+            let existing = resolve_verified_import_identity_sqlite(
+                &tx,
+                account_id,
+                &actual_source_id,
+                external_id,
+                &canonical_job_key(posting),
+            )?;
             let saved = prepare_snapshot_posting(
                 posting,
-                existing,
+                existing.clone(),
                 profile,
                 preferences,
                 &applications,
@@ -2755,31 +2943,74 @@ pub fn save_verified_import_posting_with_source(
                 now,
             )?;
             let payload = to_json(&saved, "job posting")?;
+            if existing.is_some() {
+                let updated = tx.execute(
+                    "UPDATE jobs_postings SET canonical_key = ?3, posting_json = ?4,
+                        source = ?5, canonical_url = ?6, company = ?7, title = ?8,
+                        location = ?9, match_score = ?10, status = ?11, updated_at_ms = ?12
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![
+                        account_id,
+                        saved.id,
+                        saved.canonical_key,
+                        payload,
+                        saved.source,
+                        saved.canonical_url,
+                        saved.company,
+                        saved.title,
+                        saved.location,
+                        saved.match_score,
+                        saved.status,
+                        saved.updated_at_ms,
+                    ],
+                )?;
+                if updated != 1 {
+                    anyhow::bail!("verified import job identity is stale")
+                }
+            } else {
+                tx.execute(
+                    "INSERT INTO jobs_postings (
+                        id, account_id, canonical_key, posting_json, source, canonical_url,
+                        company, title, location, match_score, status, created_at_ms, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        saved.id,
+                        account_id,
+                        saved.canonical_key,
+                        payload,
+                        saved.source,
+                        saved.canonical_url,
+                        saved.company,
+                        saved.title,
+                        saved.location,
+                        saved.match_score,
+                        saved.status,
+                        saved.created_at_ms,
+                        saved.updated_at_ms,
+                    ],
+                )?;
+            }
+            let content_hash =
+                verified_import_membership_content_hash(&provider, &source_key, &saved);
+            let import_run_id =
+                verified_import_membership_run_id(account_id, &actual_source_id, external_id);
             tx.execute(
-                "INSERT INTO jobs_postings (
-                    id, account_id, canonical_key, posting_json, source, canonical_url,
-                    company, title, location, match_score, status, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                 ON CONFLICT(account_id, canonical_key) DO UPDATE SET
-                    posting_json = excluded.posting_json, source = excluded.source,
-                    canonical_url = excluded.canonical_url, company = excluded.company,
-                    title = excluded.title, location = excluded.location,
-                    match_score = excluded.match_score, status = excluded.status,
-                    updated_at_ms = excluded.updated_at_ms",
+                "INSERT INTO jobs_discovery_memberships (
+                    source_id, account_id, canonical_key, external_id, job_id,
+                    content_hash, first_seen_at_ms, last_seen_at_ms,
+                    last_seen_run_id, availability_status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 'pending')
+                 ON CONFLICT(source_id, external_id) DO UPDATE SET
+                    canonical_key = excluded.canonical_key, job_id = excluded.job_id",
                 params![
-                    saved.id,
+                    actual_source_id,
                     account_id,
                     saved.canonical_key,
-                    payload,
-                    saved.source,
-                    saved.canonical_url,
-                    saved.company,
-                    saved.title,
-                    saved.location,
-                    saved.match_score,
-                    saved.status,
-                    saved.created_at_ms,
-                    saved.updated_at_ms,
+                    external_id,
+                    saved.id,
+                    content_hash,
+                    now,
+                    import_run_id,
                 ],
             )?;
             tx.commit()?;
@@ -2813,50 +3044,24 @@ pub fn save_verified_import_posting_with_source(
                     updated_at_ms = EXCLUDED.updated_at_ms",
                 &[&source_id, &account_id, &track_id, &provider, &source_key, &source_payload, &interval, &now],
             )?;
-            let candidate = prepare_snapshot_posting(
-                posting,
-                None,
-                profile,
-                preferences,
-                &applications,
-                &reservations,
-                now,
-            )?;
-            let candidate_payload = to_json(&candidate, "job posting")?;
-            tx.execute(
-                "INSERT INTO jobs_postings (
-                    id, account_id, canonical_key, posting_json, source, canonical_url,
-                    company, title, location, match_score, status, created_at_ms, updated_at_ms
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                 ON CONFLICT(account_id, canonical_key) DO NOTHING",
-                &[
-                    &candidate.id,
-                    &account_id,
-                    &candidate.canonical_key,
-                    &candidate_payload,
-                    &candidate.source,
-                    &candidate.canonical_url,
-                    &candidate.company,
-                    &candidate.title,
-                    &candidate.location,
-                    &candidate.match_score,
-                    &candidate.status,
-                    &candidate.created_at_ms,
-                    &candidate.updated_at_ms,
-                ],
-            )?;
-            let actual: JobPosting = parse_json(
-                tx.query_one(
-                    "SELECT posting_json FROM jobs_postings
-                      WHERE account_id = $1 AND canonical_key = $2 FOR UPDATE",
-                    &[&account_id, &candidate.canonical_key],
+            let actual_source_id: String = tx
+                .query_one(
+                    "SELECT id FROM jobs_discovery_sources
+                      WHERE account_id = $1 AND provider = $2 AND source_key = $3
+                      FOR UPDATE",
+                    &[&account_id, &provider, &source_key],
                 )?
-                .get(0),
-                "job posting",
+                .get(0);
+            let existing = resolve_verified_import_identity_postgres(
+                &mut tx,
+                account_id,
+                &actual_source_id,
+                external_id,
+                &canonical_job_key(posting),
             )?;
             let saved = prepare_snapshot_posting(
                 posting,
-                Some(actual),
+                existing.clone(),
                 profile,
                 preferences,
                 &applications,
@@ -2864,22 +3069,74 @@ pub fn save_verified_import_posting_with_source(
                 now,
             )?;
             let payload = to_json(&saved, "job posting")?;
+            if existing.is_some() {
+                let updated = tx.execute(
+                    "UPDATE jobs_postings SET canonical_key = $3, posting_json = $4,
+                        source = $5, canonical_url = $6, company = $7, title = $8,
+                        location = $9, match_score = $10, status = $11, updated_at_ms = $12
+                      WHERE account_id = $1 AND id = $2",
+                    &[
+                        &account_id,
+                        &saved.id,
+                        &saved.canonical_key,
+                        &payload,
+                        &saved.source,
+                        &saved.canonical_url,
+                        &saved.company,
+                        &saved.title,
+                        &saved.location,
+                        &saved.match_score,
+                        &saved.status,
+                        &saved.updated_at_ms,
+                    ],
+                )?;
+                if updated != 1 {
+                    anyhow::bail!("verified import job identity is stale")
+                }
+            } else {
+                tx.execute(
+                    "INSERT INTO jobs_postings (
+                        id, account_id, canonical_key, posting_json, source, canonical_url,
+                        company, title, location, match_score, status, created_at_ms, updated_at_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                    &[
+                        &saved.id,
+                        &account_id,
+                        &saved.canonical_key,
+                        &payload,
+                        &saved.source,
+                        &saved.canonical_url,
+                        &saved.company,
+                        &saved.title,
+                        &saved.location,
+                        &saved.match_score,
+                        &saved.status,
+                        &saved.created_at_ms,
+                        &saved.updated_at_ms,
+                    ],
+                )?;
+            }
+            let content_hash =
+                verified_import_membership_content_hash(&provider, &source_key, &saved);
+            let import_run_id =
+                verified_import_membership_run_id(account_id, &actual_source_id, external_id);
             tx.execute(
-                "UPDATE jobs_postings SET posting_json = $3, source = $4, canonical_url = $5,
-                    company = $6, title = $7, location = $8, match_score = $9, status = $10,
-                    updated_at_ms = $11 WHERE account_id = $1 AND canonical_key = $2",
+                "INSERT INTO jobs_discovery_memberships (
+                    source_id, account_id, canonical_key, external_id, job_id,
+                    content_hash, first_seen_at_ms, last_seen_at_ms,
+                    last_seen_run_id, availability_status
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, 'pending')
+                 ON CONFLICT(source_id, external_id) DO UPDATE SET
+                    canonical_key = EXCLUDED.canonical_key, job_id = EXCLUDED.job_id",
                 &[
+                    &actual_source_id,
                     &account_id,
                     &saved.canonical_key,
-                    &payload,
-                    &saved.source,
-                    &saved.canonical_url,
-                    &saved.company,
-                    &saved.title,
-                    &saved.location,
-                    &saved.match_score,
-                    &saved.status,
-                    &saved.updated_at_ms,
+                    &external_id,
+                    &saved.id,
+                    &content_hash,
+                    &now,
+                    &import_run_id,
                 ],
             )?;
             tx.commit()?;
@@ -13072,6 +13329,150 @@ mod tests {
         assert!(list_postings(&posting_failure_pool, "acct-jobs")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn verified_import_membership_preserves_job_identity_across_ats_url_aliases() {
+        let cases = [
+            (
+                "greenhouse",
+                "aliasboard",
+                "https://job-boards.greenhouse.io/aliasboard/jobs/alias-601",
+                "https://boards.greenhouse.io/aliasboard/jobs/alias-601",
+                "alias-601",
+            ),
+            (
+                "lever",
+                "aliasboard",
+                "https://jobs.eu.lever.co/aliasboard/lever-601",
+                "https://jobs.lever.co/aliasboard/lever-601",
+                "lever-601",
+            ),
+            (
+                "smartrecruiters",
+                "AliasCo",
+                "https://jobs.smartrecruiters.com/AliasCo/7440001-platform-engineer",
+                "https://jobs.smartrecruiters.com/AliasCo/7440001",
+                "7440001",
+            ),
+            (
+                "workday",
+                "aliasco~wd5~Careers",
+                "https://aliasco.wd5.myworkdayjobs.com/en-GB/Careers/job/London/Engineer_R601",
+                "https://aliasco.wd5.myworkdayjobs.com/en-US/Careers/job/London/Engineer_R601",
+                "R601",
+            ),
+        ];
+
+        for (provider, source_key, import_url, snapshot_url, external_id) in cases {
+            let pool = test_pool();
+            let profile = default_profile("jobs@example.com");
+            let preferences = JobPreferences::default();
+            let source = DiscoverySourceInput {
+                track_id: String::new(),
+                provider: provider.to_string(),
+                source_key: source_key.to_string(),
+                company: "Alias Co".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            };
+            let mut imported = test_posting(import_url, now_ms(), now_ms());
+            imported.source = format!("{provider}_import");
+            imported.company = "Alias Co".to_string();
+            imported.external_id = external_id.to_string();
+            let saved = save_verified_import_posting_with_source(
+                &pool,
+                "acct-jobs",
+                &imported,
+                &source,
+                &profile,
+                &preferences,
+            )
+            .unwrap();
+
+            let stored_source = list_discovery_sources(&pool, "acct-jobs")
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let (membership_job_id, membership_status): (String, String) = pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT job_id, availability_status FROM jobs_discovery_memberships
+                      WHERE source_id = ?1 AND external_id = ?2",
+                    params![stored_source.id, external_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(membership_job_id, saved.id, "{provider}");
+            assert_eq!(membership_status, "pending", "{provider}");
+
+            let pending_eligibility =
+                evaluate_job_eligibility(&pool, "acct-jobs", &saved, true, None).unwrap();
+            assert!(!pending_eligibility.can_queue_local, "{provider}");
+            assert!(!pending_eligibility.can_queue_cloud, "{provider}");
+            assert!(
+                pending_eligibility
+                    .review_reasons
+                    .iter()
+                    .any(|reason| reason.code == "discovery_source_unhealthy"),
+                "{provider}"
+            );
+            assert!(
+                !pending_eligibility
+                    .passed_checks
+                    .contains(&"discovery_source_healthy".to_string()),
+                "{provider}"
+            );
+
+            let lease = lease_due_discovery_source(&pool, "alias-worker")
+                .unwrap()
+                .unwrap();
+            complete_discovery_run(
+                &pool,
+                &stored_source.id,
+                &lease.lease_token,
+                &lease.replay_key,
+                lease.scheduled_for_ms,
+                &[DiscoveredJobInput {
+                    external_id: external_id.to_string(),
+                    canonical_url: snapshot_url.to_string(),
+                    title: imported.title.clone(),
+                    location: imported.location.clone(),
+                    workplace: imported.workplace.clone(),
+                    description: imported.description.clone(),
+                    compensation: imported.compensation.clone(),
+                    posted_at_ms: imported.posted_at_ms,
+                }],
+                true,
+            )
+            .unwrap();
+
+            let postings = list_postings(&pool, "acct-jobs").unwrap();
+            assert_eq!(postings.len(), 1, "{provider}");
+            assert_eq!(postings[0].id, saved.id, "{provider}");
+            assert_eq!(postings[0].canonical_url, snapshot_url, "{provider}");
+            let membership_status: String = pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT availability_status FROM jobs_discovery_memberships
+                      WHERE source_id = ?1 AND external_id = ?2",
+                    params![stored_source.id, external_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(membership_status, "active", "{provider}");
+            let refreshed = list_postings(&pool, "acct-jobs").unwrap().remove(0);
+            let active_eligibility =
+                evaluate_job_eligibility(&pool, "acct-jobs", &refreshed, true, None).unwrap();
+            assert!(
+                active_eligibility
+                    .passed_checks
+                    .contains(&"discovery_source_healthy".to_string()),
+                "{provider}"
+            );
+        }
     }
 
     #[test]

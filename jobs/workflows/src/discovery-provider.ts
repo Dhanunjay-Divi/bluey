@@ -1,5 +1,6 @@
 import {
   IncompletePublicAtsSnapshotError,
+  InvalidPublicAtsSnapshotError,
   parsePostedAt,
   PublicAtsDiscoveryProvider,
   type JobsFetch,
@@ -226,7 +227,10 @@ function scheduledJob(
 }
 
 function classifyPublicAtsError(error: unknown): DiscoveryProviderFailure {
-  if (error instanceof IncompletePublicAtsSnapshotError) {
+  if (
+    error instanceof IncompletePublicAtsSnapshotError
+    || error instanceof InvalidPublicAtsSnapshotError
+  ) {
     return { code: "provider_error", retryable: false };
   }
   if (error instanceof DiscoveryProviderError) {

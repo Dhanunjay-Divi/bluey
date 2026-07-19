@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { isRecentJob, parsePostedAt, PublicAtsDiscoveryProvider, type FetchResponse, type JobsFetch } from "../src/index.js";
+import {
+  isRecentJob,
+  parsePostedAt,
+  PublicAtsDiscoveryProvider,
+  type FetchResponse,
+  type JobsFetch,
+  type PublicAtsSource,
+} from "../src/index.js";
 
 function response(payload: unknown, status = 200): FetchResponse {
   return {
@@ -149,6 +156,47 @@ describe("public ATS discovery", () => {
       "https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/United-States/Qualified-Path_JR-2",
       "https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/Canada/Qualified-Url_JR-3",
     ]);
+  });
+
+  it("fails a scheduled snapshot when any provider-listed row is invalid", async () => {
+    const provider = new PublicAtsDiscoveryProvider({
+      fetch: async () => response({
+        total: 1,
+        jobPostings: [{
+          title: "Still listed but malformed",
+          externalPath: "https://evil.example/job/Elsewhere/Blocked_JR-BAD",
+          locationsText: "Remote",
+          bulletFields: ["JR-BAD"],
+          postedOn: "Posted Today",
+        }],
+      }),
+      sleep: async () => undefined,
+    });
+
+    await expect(provider.snapshot({
+      kind: "workday",
+      tenant: "workday",
+      instance: "wd5",
+      site: "Workday",
+    })).rejects.toThrow("invalid listed row");
+  });
+
+  it("fails closed when a scheduled provider payload omits its job list", async () => {
+    const sources: PublicAtsSource[] = [
+      { kind: "greenhouse", boardToken: "acme" },
+      { kind: "lever", site: "acme" },
+      { kind: "ashby", boardName: "acme" },
+      { kind: "smartrecruiters", companyIdentifier: "Acme" },
+      { kind: "workday", tenant: "acme", instance: "wd5", site: "Careers" },
+    ];
+
+    for (const source of sources) {
+      const provider = new PublicAtsDiscoveryProvider({
+        fetch: async () => response({}),
+        sleep: async () => undefined,
+      });
+      await expect(provider.snapshot(source)).rejects.toThrow("expected job list");
+    }
   });
 
   it("derives SmartRecruiters public URLs from the configured company and posting ID", async () => {
