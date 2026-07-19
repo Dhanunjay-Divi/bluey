@@ -688,6 +688,7 @@ fn reserve_llm_usage(
             reason,
             estimated_customer_cents,
             estimated_upstream_cents,
+            upstream_spend_guard: state.config.upstream_spend_guard,
             created_at_ms,
             expires_at_ms,
         },
@@ -739,6 +740,17 @@ fn reserve_llm_usage(
                 Json(ApiError {
                     error: "Account usage is unavailable.".into(),
                     reason: Some("account_unavailable".into()),
+                    ..Default::default()
+                }),
+            )))
+        }
+        Err(usage_reservations::UsageReservationError::UpstreamSpendLimit) => {
+            let _ = idempotency::release(&state.pool, &account.id, request_id);
+            Err(Box::new((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError {
+                    error: "Managed AI is temporarily at its upstream spend limit.".into(),
+                    reason: Some("upstream_spend_limit".into()),
                     ..Default::default()
                 }),
             )))
@@ -842,10 +854,11 @@ async fn settle_llm_usage_with_retry(
     actual_customer_cents: i64,
     elapsed_ms: i64,
     reason: &'static str,
+    events: &[usage_reservations::SettlementUsageEvent],
 ) -> Result<SettledUsage, usage_reservations::UsageReservationError> {
     let mut last_error = None;
     for attempt in 1..=LLM_SETTLEMENT_RETRY_ATTEMPTS {
-        match usage_reservations::settle(
+        match usage_reservations::settle_with_events(
             pool,
             account_id,
             request_id,
@@ -853,6 +866,7 @@ async fn settle_llm_usage_with_retry(
             elapsed_ms,
             reason,
             managed_usage_now_ms(),
+            events,
         ) {
             Ok(settled) => return Ok(settled),
             Err(error @ usage_reservations::UsageReservationError::Db(_))
@@ -1228,62 +1242,118 @@ async fn check_account_llm_or_short_wait(
     ))
 }
 
-fn release_and_upstream_spend_guard_check(
+fn prior_provider_exposure_error(
     state: &AppState,
     account_id: &str,
     request_id: &str,
-    projected_bluey_cents: i64,
-    kind: &str,
+    scope_key: &str,
 ) -> Option<(StatusCode, Json<ApiError>)> {
-    let guard = state.config.upstream_spend_guard?;
-    if projected_bluey_cents <= 0 {
-        return None;
-    }
-    let current = match usage::bluey_spend_cents_in_window(&state.pool, guard.window_hours) {
-        Ok(value) => value,
-        Err(e) => {
+    match crate::db::jobs_provider_cost_holds::has_generation_exposure(
+        &state.pool,
+        account_id,
+        scope_key,
+    ) {
+        Ok(false) => None,
+        Ok(true) | Err(_) => {
             let _ = idempotency::release(&state.pool, account_id, request_id);
-            tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
-                request_id = %request_id,
-                kind,
-                error = %e,
-                "upstream spend guard query failed"
-            );
-            return Some((
-                StatusCode::INTERNAL_SERVER_ERROR,
+            Some((
+                StatusCode::CONFLICT,
                 Json(ApiError {
-                    error: "upstream spend guard unavailable".into(),
-                    reason: Some("upstream_spend_guard_unavailable".into()),
+                    error: "prior provider exposure prevents a safe redispatch".into(),
+                    reason: Some("provider_exposure_ambiguous".into()),
                     ..Default::default()
                 }),
-            ));
+            ))
         }
-    };
-    let projected_total = current.saturating_add(projected_bluey_cents);
-    if projected_total > guard.limit_cents {
-        let _ = idempotency::release(&state.pool, account_id, request_id);
-        tracing::warn!(
-            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
-            request_id = %request_id,
-            kind,
-            current_bluey_cents = current,
-            projected_bluey_cents,
-            limit_bluey_cents = guard.limit_cents,
-            window_hours = guard.window_hours,
-            "upstream spend guard paused managed dispatch"
-        );
-        return Some((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ApiError {
-                error: "Bluey live-test budget is paused; operator action required".into(),
-                reason: Some("upstream_spend_guard".into()),
-                retry_after_secs: Some(3600),
-                ..Default::default()
-            }),
-        ));
     }
-    None
+}
+
+fn provider_accounting_pending_error(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    request_id: &str,
+) -> (StatusCode, Json<ApiError>) {
+    // Do not release the idempotency or customer reservation here. A provider
+    // response exists, while its durable exact settlement has not yet been
+    // confirmed. The provider guard's Drop retry preserves conservative spend
+    // truth and reconciliation can terminalize the customer side later.
+    let _ = idempotency::mark_failed(pool, account_id, request_id);
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError {
+            error: "provider accounting is pending reconciliation; use a new request after operator review"
+                .into(),
+            reason: Some("provider_accounting_pending".into()),
+            retry_after_secs: Some(60),
+            ..Default::default()
+        }),
+    )
+}
+
+/// Persist the provider-attempt side of accounting before any caller is
+/// allowed to settle its customer-facing root. All managed provider endpoints
+/// share this transition so a durable-settlement failure has one fail-closed
+/// result and never releases or charges the customer reservation.
+#[allow(clippy::result_large_err)]
+fn settle_provider_attempt_before_customer(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    root_request_id: &str,
+    guard: &mut provider_cost_guard::ProviderCostGuard,
+    event: UsageEvent,
+    actual_cost_cents: i64,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    guard.settle(event, actual_cost_cents).map_err(|error| {
+        tracing::error!(
+            request_id = root_request_id,
+            error = %error,
+            "provider attempt settlement pending reconciliation"
+        );
+        provider_accounting_pending_error(pool, account_id, root_request_id)
+    })
+}
+
+fn settle_selected_provider_attempt_conservative(
+    guard: &mut Option<Box<provider_cost_guard::ProviderCostGuard>>,
+) -> anyhow::Result<()> {
+    if let Some(mut guard) = guard.take() {
+        guard.settle_conservative()?;
+    }
+    Ok(())
+}
+
+fn returned_route_bluey_cost_or_cap(
+    provider: &str,
+    model: &str,
+    input_units: i64,
+    output_units: i64,
+) -> i64 {
+    pricing::lookup(provider, model)
+        .map(|price| pricing::compute_cost(price, input_units, output_units).0)
+        .unwrap_or(crate::db::usage::MAX_AUTHORITATIVE_EVENT_COST_CENTS)
+}
+
+fn prior_provider_prefix_exposure_error(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    request_id: &str,
+) -> Option<(StatusCode, Json<ApiError>)> {
+    let prefix = format!("router:{request_id}:");
+    match crate::db::jobs_provider_cost_holds::has_scope_prefix_exposure(pool, account_id, &prefix)
+    {
+        Ok(false) => None,
+        Ok(true) | Err(_) => {
+            let _ = idempotency::release(pool, account_id, request_id);
+            Some((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "prior provider exposure prevents a safe request replay".into(),
+                    reason: Some("provider_exposure_ambiguous".into()),
+                    ..Default::default()
+                }),
+            ))
+        }
+    }
 }
 
 /// First-token deadline for managed streaming. A provider that accepts the
@@ -2706,6 +2776,7 @@ struct ResolvedAnswerPlan {
     source: &'static str,
     ai_attempted: bool,
     ai_reason: &'static str,
+    provider_accounting_pending: bool,
 }
 
 impl ResolvedAnswerPlan {
@@ -2715,8 +2786,15 @@ impl ResolvedAnswerPlan {
             source: "rules",
             ai_attempted: false,
             ai_reason: reason,
+            provider_accounting_pending: false,
         }
     }
+}
+
+enum AiAnswerPlanRefinement {
+    Refined(AnswerPlan),
+    Unavailable,
+    ProviderAccountingPending,
 }
 
 fn lane_for_answer_plan(requested_lane: &str, plan: &AnswerPlan, enabled: bool) -> String {
@@ -2992,17 +3070,26 @@ async fn resolve_answer_plan_for_request(
     match refine_answer_plan_with_ai_classifier(state, account, req, requested_lane, &rule_plan)
         .await
     {
-        Some(plan) => ResolvedAnswerPlan {
+        AiAnswerPlanRefinement::Refined(plan) => ResolvedAnswerPlan {
             plan,
             source: "ai_refined",
             ai_attempted: true,
             ai_reason: reason,
+            provider_accounting_pending: false,
         },
-        None => ResolvedAnswerPlan {
+        AiAnswerPlanRefinement::Unavailable => ResolvedAnswerPlan {
             plan: rule_plan,
             source: "rules",
             ai_attempted: true,
             ai_reason: "ai_unavailable_or_invalid",
+            provider_accounting_pending: false,
+        },
+        AiAnswerPlanRefinement::ProviderAccountingPending => ResolvedAnswerPlan {
+            plan: rule_plan,
+            source: "rules",
+            ai_attempted: true,
+            ai_reason: "provider_accounting_pending",
+            provider_accounting_pending: true,
         },
     }
 }
@@ -3121,7 +3208,7 @@ async fn refine_answer_plan_with_ai_classifier(
     req: &CompleteRequest,
     requested_lane: &str,
     rule_plan: &AnswerPlan,
-) -> Option<AnswerPlan> {
+) -> AiAnswerPlanRefinement {
     let question = truncate_chars(&extract_search_question(&req.user), 1_200);
     let system = "You are Bluey's fast routing classifier. Return only one JSON object. Do not answer the user. Valid intent values: quick, coding, coding_followup, behavioral, system_design, screen, research, follow_up, missing_context, writing, meeting, general. Valid lane values: instant, balanced, deep, vision. Valid output values: compact, code_artifact, source_answer, canvas_detail, interview_answer.";
     let user = format!(
@@ -3150,10 +3237,11 @@ async fn refine_answer_plan_with_ai_classifier(
         &format!("{}:answer-plan", req.request_id),
     );
     if routes.is_empty() {
-        return None;
+        return AiAnswerPlanRefinement::Unavailable;
     }
 
     let started = Instant::now();
+    let mut dispatch_index = 0usize;
     for route in routes {
         let key_candidates = state.config.upstream.key_candidates(
             route.provider,
@@ -3184,6 +3272,26 @@ async fn refine_answer_plan_with_ai_classifier(
                 break;
             }
 
+            let hold_request_id = format!("{}:answer-plan:{dispatch_index}", req.request_id);
+            dispatch_index = dispatch_index.saturating_add(1);
+            let mut cost_guard = match provider_cost_guard::reserve(
+                &state.pool,
+                state.config.upstream_spend_guard,
+                &account.id,
+                &format!("router:{}:answer-plan", req.request_id),
+                &hold_request_id,
+                route.provider,
+                route.model,
+                route.estimated_bluey_cost_cents,
+                "answer_plan_classifier_attempt",
+                "answer_plan_classifier",
+            ) {
+                Ok(provider_cost_guard::Admission::Held(guard)) => guard,
+                Ok(provider_cost_guard::Admission::Unconfigured)
+                | Ok(provider_cost_guard::Admission::GlobalLimit)
+                | Err(_) => return AiAnswerPlanRefinement::Unavailable,
+            };
+
             let completion = tokio::time::timeout(
                 answer_plan_ai_timeout(),
                 routing::complete_with_key(
@@ -3203,13 +3311,24 @@ async fn refine_answer_plan_with_ai_classifier(
 
             match completion {
                 Ok(Ok(comp)) => {
-                    record_answer_plan_classifier_usage(
-                        &state.pool,
-                        account,
-                        req,
+                    let event = answer_plan_classifier_usage_event(
+                        &hold_request_id,
                         &comp,
                         started.elapsed().as_millis() as i64,
                     );
+                    let actual_cost = event.cost_cents_to_bluey;
+                    if settle_provider_attempt_before_customer(
+                        &state.pool,
+                        &account.id,
+                        &req.request_id,
+                        &mut cost_guard,
+                        event,
+                        actual_cost,
+                    )
+                    .is_err()
+                    {
+                        return AiAnswerPlanRefinement::ProviderAccountingPending;
+                    }
                     if let Some(plan) = parse_ai_answer_plan(&comp.text).and_then(|payload| {
                         merge_ai_answer_plan(rule_plan, payload, req, requested_lane)
                     }) {
@@ -3224,11 +3343,14 @@ async fn refine_answer_plan_with_ai_classifier(
                             answer_confidence = plan.confidence,
                             "answer plan AI classifier refined route"
                         );
-                        return Some(plan);
+                        return AiAnswerPlanRefinement::Refined(plan);
                     }
-                    return None;
+                    return AiAnswerPlanRefinement::Unavailable;
                 }
                 Ok(Err(err)) => {
+                    if cost_guard.settle_conservative().is_err() {
+                        return AiAnswerPlanRefinement::ProviderAccountingPending;
+                    }
                     if let Some(retry_after_secs) = routing::upstream_retry_after(&err) {
                         let _ = state
                             .provider_health
@@ -3243,12 +3365,17 @@ async fn refine_answer_plan_with_ai_classifier(
                     }
                     break;
                 }
-                Err(_) => break,
+                Err(_) => {
+                    if cost_guard.settle_conservative().is_err() {
+                        return AiAnswerPlanRefinement::ProviderAccountingPending;
+                    }
+                    break;
+                }
             }
         }
     }
 
-    None
+    AiAnswerPlanRefinement::Unavailable
 }
 
 fn parse_ai_answer_plan(text: &str) -> Option<AiAnswerPlanPayload> {
@@ -3428,19 +3555,17 @@ fn lane_matches_intent(intent: AnswerIntent, lane: &str) -> bool {
         )
 }
 
-fn record_answer_plan_classifier_usage(
-    pool: &crate::db::DbPool,
-    account: &Account,
-    req: &CompleteRequest,
+fn answer_plan_classifier_usage_event(
+    request_id: &str,
     comp: &routing::Completion,
     latency_ms: i64,
-) {
+) -> UsageEvent {
     let bluey_cost = pricing::lookup(&comp.provider, &comp.model)
         .map(|entry| pricing::compute_cost(entry, comp.input_tokens, comp.output_tokens).0)
         .unwrap_or(0);
-    let event = UsageEvent {
-        request_id: req.request_id.clone(),
-        kind: "answer_plan_classifier".into(),
+    UsageEvent {
+        request_id: request_id.to_string(),
+        kind: "answer_plan_classifier_attempt".into(),
         task_type: Some("answer_plan_classifier".into()),
         lane: Some("instant".into()),
         provider: Some(comp.provider.clone()),
@@ -3452,8 +3577,7 @@ fn record_answer_plan_classifier_usage(
         cost_cents_to_customer: 0,
         was_speculative: false,
         was_fallback: false,
-    };
-    let _ = usage::record(pool, &account.id, &event);
+    }
 }
 
 fn looks_like_coding_question(normalized: &str) -> bool {
@@ -7344,7 +7468,6 @@ const MAX_WEB_SEARCH_RESULTS: usize = 5;
 const MAX_WEB_SEARCHES_PER_ANSWER: i64 = 3;
 const MAX_WEB_SEARCH_QUERY_CHARS: usize = 160;
 const DEFAULT_WEB_SEARCH_CUSTOMER_COST_CENTS: i64 = 2;
-const DEFAULT_WEB_SEARCH_BLUEY_COST_CENTS: i64 = 1;
 const DEFAULT_TRIAL_WEB_SEARCHES_PER_DAY: i64 = 5;
 const DEFAULT_WEB_SEARCH_ACCOUNT_HOURLY_LIMIT: i64 = 120;
 const DEFAULT_WEB_SEARCH_BURST_LIMIT: i64 = 12;
@@ -7375,6 +7498,7 @@ struct WebSearchOutcome {
     customer_cost_cents: i64,
     bluey_cost_cents: i64,
     skipped_reason: Option<&'static str>,
+    provider_accounting_pending: bool,
 }
 
 fn web_search_config() -> Option<WebSearchConfig> {
@@ -7419,12 +7543,8 @@ fn web_search_config() -> Option<WebSearchConfig> {
         0,
         100,
     );
-    let bluey_cost_cents = web_search_env_i64(
-        "BLUEY_WEB_SEARCH_BLUEY_COST_CENTS",
-        DEFAULT_WEB_SEARCH_BLUEY_COST_CENTS,
-        0,
-        100,
-    );
+    let configured_bluey_cost = std::env::var("BLUEY_WEB_SEARCH_BLUEY_COST_CENTS").ok();
+    let bluey_cost_cents = configured_web_search_bluey_cost(configured_bluey_cost.as_deref())?;
 
     Some(WebSearchConfig {
         provider,
@@ -7435,6 +7555,14 @@ fn web_search_config() -> Option<WebSearchConfig> {
         customer_cost_cents,
         bluey_cost_cents,
     })
+}
+
+fn configured_web_search_bluey_cost(value: Option<&str>) -> Option<i64> {
+    value?
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|cost| (1..=100).contains(cost))
 }
 
 fn web_search_env_i64(key: &str, default: i64, min: i64, max: i64) -> i64 {
@@ -7471,6 +7599,7 @@ fn env_flag_is_false(key: &str) -> bool {
 
 async fn completion_web_search_budgeted(
     pool: &crate::db::DbPool,
+    upstream_spend_guard: Option<crate::config::UpstreamSpendGuard>,
     account: &Account,
     request_id: &str,
     query_text: &str,
@@ -7644,10 +7773,76 @@ async fn completion_web_search_budgeted(
     let provider = config.provider.clone();
     let budget = config.budget;
     let started = Instant::now();
+    let attempt_request_id = format!("{request_id}:web-search-attempt");
+    let mut cost_guard = match provider_cost_guard::reserve(
+        pool,
+        upstream_spend_guard,
+        &account.id,
+        &format!("router:{request_id}:web-search"),
+        &attempt_request_id,
+        &provider,
+        WEB_SEARCH_USAGE_MODEL,
+        config.bluey_cost_cents,
+        "web_search_attempt",
+        WEB_SEARCH_TASK_TYPE,
+    ) {
+        Ok(provider_cost_guard::Admission::Held(guard)) => guard,
+        Ok(provider_cost_guard::Admission::Unconfigured) => {
+            return WebSearchOutcome {
+                attempted: true,
+                provider: Some(provider),
+                skipped_reason: Some("upstream_cost_unconfigured"),
+                ..Default::default()
+            };
+        }
+        Ok(provider_cost_guard::Admission::GlobalLimit) | Err(_) => {
+            return WebSearchOutcome {
+                attempted: true,
+                provider: Some(provider),
+                skipped_reason: Some("upstream_spend_guard"),
+                ..Default::default()
+            };
+        }
+    };
     match tokio::time::timeout(budget, perform_web_search(&config, &query)).await {
         Ok(Ok(sources)) => {
             let latency_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
             let searches_used = 1_i64.min(MAX_WEB_SEARCHES_PER_ANSWER);
+            let actual_cost = config.bluey_cost_cents.saturating_mul(searches_used);
+            let event = UsageEvent {
+                request_id: attempt_request_id,
+                kind: "web_search_attempt".to_string(),
+                task_type: Some(WEB_SEARCH_TASK_TYPE.to_string()),
+                lane: Some("web_search".to_string()),
+                provider: Some(provider.clone()),
+                model: Some(WEB_SEARCH_USAGE_MODEL.to_string()),
+                input_tokens: searches_used,
+                output_tokens: sources.len().try_into().unwrap_or(i64::MAX),
+                latency_ms,
+                cost_cents_to_bluey: actual_cost,
+                cost_cents_to_customer: 0,
+                was_speculative: false,
+                was_fallback: false,
+            };
+            if settle_provider_attempt_before_customer(
+                pool,
+                &account.id,
+                request_id,
+                &mut cost_guard,
+                event,
+                actual_cost,
+            )
+            .is_err()
+            {
+                return WebSearchOutcome {
+                    attempted: true,
+                    provider: Some(provider),
+                    latency_ms,
+                    skipped_reason: Some("provider_accounting_pending"),
+                    provider_accounting_pending: true,
+                    ..Default::default()
+                };
+            }
             tracing::debug!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id,
@@ -7666,9 +7861,20 @@ async fn completion_web_search_budgeted(
                 customer_cost_cents: config.customer_cost_cents.saturating_mul(searches_used),
                 bluey_cost_cents: config.bluey_cost_cents.saturating_mul(searches_used),
                 skipped_reason: None,
+                provider_accounting_pending: false,
             }
         }
         Ok(Err(error)) => {
+            if let Err(settle_error) = cost_guard.settle_conservative() {
+                tracing::error!(request_id, error = %settle_error, "failed to terminalize web search provider error exposure");
+                return WebSearchOutcome {
+                    attempted: true,
+                    provider: Some(provider),
+                    skipped_reason: Some("provider_accounting_pending"),
+                    provider_accounting_pending: true,
+                    ..Default::default()
+                };
+            }
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id,
@@ -7685,6 +7891,16 @@ async fn completion_web_search_budgeted(
             }
         }
         Err(_) => {
+            if let Err(error) = cost_guard.settle_conservative() {
+                tracing::error!(request_id, error = %error, "failed to terminalize web search timeout exposure");
+                return WebSearchOutcome {
+                    attempted: true,
+                    provider: Some(provider),
+                    skipped_reason: Some("provider_accounting_pending"),
+                    provider_accounting_pending: true,
+                    ..Default::default()
+                };
+            }
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id,
@@ -8256,50 +8472,32 @@ fn web_search_usage_event(request_id: &str, outcome: &WebSearchOutcome) -> Optio
         input_tokens: outcome.searches_used,
         output_tokens: outcome.sources.len() as i64,
         latency_ms: outcome.latency_ms,
-        cost_cents_to_bluey: outcome.bluey_cost_cents,
+        // The pre-dispatch web-search attempt hold is the sole upstream-cost
+        // authority. This row allocates only the customer charge.
+        cost_cents_to_bluey: 0,
         cost_cents_to_customer: outcome.customer_cost_cents,
         was_speculative: false,
         was_fallback: false,
     })
 }
 
-fn record_web_search_usage(
-    pool: &crate::db::DbPool,
-    account_id: &str,
+fn managed_completion_settlement_events(
     request_id: &str,
+    primary_event: UsageEvent,
+    llm_customer_cost_cents: i64,
     outcome: &WebSearchOutcome,
-    charged_customer_cents: i64,
-    streaming: bool,
-) {
-    let Some(mut event) = web_search_usage_event(request_id, outcome) else {
-        return;
-    };
-    event.cost_cents_to_customer = charged_customer_cents.max(0);
-    match usage::record(pool, account_id, &event) {
-        Ok(true) => tracing::info!(
-            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
-            request_id,
-            provider = event.provider.as_deref().unwrap_or("unknown"),
-            searches_used = outcome.searches_used,
-            source_count = outcome.sources.len(),
-            cost_cents = event.cost_cents_to_customer,
-            streaming,
-            "managed web search usage event recorded"
-        ),
-        Ok(false) => tracing::warn!(
-            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
-            request_id,
-            streaming,
-            "managed web search usage event deduplicated"
-        ),
-        Err(e) => tracing::warn!(
-            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
-            request_id,
-            error = %e,
-            streaming,
-            "failed to record managed web search usage event"
-        ),
+) -> Vec<usage_reservations::SettlementUsageEvent> {
+    let mut events = vec![usage_reservations::SettlementUsageEvent {
+        event: primary_event,
+        customer_cost_cents: llm_customer_cost_cents,
+    }];
+    if let Some(web_event) = web_search_usage_event(request_id, outcome) {
+        events.push(usage_reservations::SettlementUsageEvent {
+            event: web_event,
+            customer_cost_cents: outcome.customer_cost_cents,
+        });
     }
+    events
 }
 
 pub async fn complete(
@@ -8500,6 +8698,12 @@ async fn complete_stream_inner(
         }
     }
 
+    if let Some(err) =
+        prior_provider_prefix_exposure_error(&state.pool, &account.id, &req.request_id)
+    {
+        return Err(err);
+    }
+
     if let Some(err) = account_not_active_error(&state.pool, &account.id) {
         let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
         tracing::warn!(
@@ -8569,6 +8773,13 @@ async fn complete_stream_inner(
         &rag_matches,
     )
     .await;
+    if resolved_answer_plan.provider_accounting_pending {
+        return Err(provider_accounting_pending_error(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+        ));
+    }
     let answer_plan_ms = answer_plan_started.elapsed().as_millis() as i64;
     let answer_plan = resolved_answer_plan.plan.clone();
     let resolved_story_grounding = behavioral_story_grounding(&req, &answer_plan);
@@ -8632,12 +8843,20 @@ async fn complete_stream_inner(
     let web_search_started = Instant::now();
     let web_search = completion_web_search_budgeted(
         &state.pool,
+        state.config.upstream_spend_guard,
         &account,
         &req.request_id,
         &req.user,
         &answer_plan,
     )
     .await;
+    if web_search.provider_accounting_pending {
+        return Err(provider_accounting_pending_error(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+        ));
+    }
     let web_search_ms = web_search_started.elapsed().as_millis() as i64;
     let web_sources = web_search.sources.clone();
     let provider_rag_matches = if resolved_story_provider_user.is_some() {
@@ -8790,32 +9009,18 @@ async fn complete_stream_inner(
         .max()
         .unwrap_or(1)
         .saturating_add(web_search.customer_cost_cents);
-    let est_bluey_cost = routes
-        .iter()
-        .chain(vision_text_fallback_routes.iter())
-        .map(|route| route.estimated_bluey_cost_cents)
-        .max()
-        .unwrap_or(1)
-        .saturating_add(web_search.bluey_cost_cents);
-    if let Some(err) = release_and_upstream_spend_guard_check(
+    if let Some(err) = prior_provider_exposure_error(
         &state,
         &account.id,
         &req.request_id,
-        est_bluey_cost,
-        "llm_stream",
+        &format!("router:{}:llm", req.request_id),
     ) {
         return Err(err);
     }
 
-    let usage_reservation = reserve_llm_usage(
-        &state,
-        &account,
-        &req.request_id,
-        est_cost,
-        est_bluey_cost,
-        "llm_stream",
-    )
-    .map_err(|error| *error)?;
+    let usage_reservation =
+        reserve_llm_usage(&state, &account, &req.request_id, est_cost, 0, "llm_stream")
+            .map_err(|error| *error)?;
     let on_trial = usage_reservation.is_trial();
     tracing::info!(
         account_id_hash = %account_id_hash,
@@ -8836,9 +9041,11 @@ async fn complete_stream_inner(
     let mut selected_route: Option<PricedRoute> = None;
     let mut selected_stream: Option<routing::StreamingCompletion> = None;
     let mut selected_first_event: Option<anyhow::Result<routing::CompletionStreamEvent>> = None;
+    let mut selected_attempt_guard: Option<Box<provider_cost_guard::ProviderCostGuard>> = None;
     let mut selected_stream_idle_deadline = stream_idle_deadline;
     let mut vision_text_fallback_active = false;
     let mut vision_media_rejection_seen = false;
+    let mut provider_dispatch_index = 0_usize;
 
     let mut capacity_sweeps_used = 0usize;
     for capacity_sweep in 0..=1 {
@@ -8851,6 +9058,7 @@ async fn complete_stream_inner(
             selected_route = None;
             selected_stream = None;
             selected_first_event = None;
+            selected_attempt_guard = None;
         }
 
         let mut route_cursor = 0usize;
@@ -8993,6 +9201,37 @@ async fn complete_stream_inner(
                     break;
                 }
 
+                let attempt_request_id = format!(
+                    "{}:llm-stream-attempt:{}",
+                    req.request_id, provider_dispatch_index
+                );
+                provider_dispatch_index = provider_dispatch_index.saturating_add(1);
+                let mut attempt_guard = match provider_cost_guard::reserve(
+                    &state.pool,
+                    state.config.upstream_spend_guard,
+                    &account.id,
+                    &format!("router:{}:llm", req.request_id),
+                    &attempt_request_id,
+                    route.provider,
+                    route.model,
+                    route.estimated_bluey_cost_cents,
+                    "llm_attempt",
+                    dispatch_lane,
+                ) {
+                    Ok(provider_cost_guard::Admission::Held(guard)) => guard,
+                    Ok(provider_cost_guard::Admission::Unconfigured) => {
+                        last_error = Some(anyhow::anyhow!(
+                            "paid streaming LLM route unexpectedly had zero projected exposure"
+                        ));
+                        break;
+                    }
+                    Ok(provider_cost_guard::Admission::GlobalLimit) | Err(_) => {
+                        last_error = Some(anyhow::anyhow!(
+                            "upstream spend guard denied streaming LLM route"
+                        ));
+                        break;
+                    }
+                };
                 let dispatch = routing::complete_stream_with_key(
                     &selected_key.secret,
                     route.provider,
@@ -9024,6 +9263,48 @@ async fn complete_stream_inner(
                         .await
                         {
                             Ok(Some(Ok(routing::CompletionStreamEvent::Delta(delta)))) => {
+                                if stream_provider != route.provider || stream_model != route.model
+                                {
+                                    let returned_cost = returned_route_bluey_cost_or_cap(
+                                        &stream_provider,
+                                        &stream_model,
+                                        est_in,
+                                        max_out,
+                                    );
+                                    let mismatch_event = UsageEvent {
+                                        request_id: attempt_request_id,
+                                        kind: "llm_attempt".into(),
+                                        task_type: Some(dispatch_lane.to_string()),
+                                        lane: Some(dispatch_lane.to_string()),
+                                        provider: Some(stream_provider),
+                                        model: Some(stream_model),
+                                        input_tokens: est_in,
+                                        output_tokens: max_out,
+                                        latency_ms: started
+                                            .elapsed()
+                                            .as_millis()
+                                            .try_into()
+                                            .unwrap_or(i64::MAX),
+                                        cost_cents_to_bluey: returned_cost,
+                                        cost_cents_to_customer: 0,
+                                        was_speculative: false,
+                                        was_fallback: route_index > 0,
+                                    };
+                                    settle_provider_attempt_before_customer(
+                                        &state.pool,
+                                        &account.id,
+                                        &req.request_id,
+                                        &mut attempt_guard,
+                                        mismatch_event,
+                                        returned_cost,
+                                    )?;
+                                    last_error = Some(anyhow::anyhow!(
+                                        "streaming provider route identity mismatch"
+                                    ));
+                                    last_failure_was_capacity = false;
+                                    break;
+                                }
+                                selected_attempt_guard = Some(attempt_guard);
                                 selected_route_idx = route_index;
                                 selected_route = Some(*route);
                                 selected_stream_idle_deadline = dispatch_stream_idle_deadline;
@@ -9096,7 +9377,46 @@ async fn complete_stream_inner(
                                 });
                                 break;
                             }
-                            Ok(Some(Ok(routing::CompletionStreamEvent::Done { .. }))) => {
+                            Ok(Some(Ok(routing::CompletionStreamEvent::Done {
+                                input_tokens,
+                                output_tokens,
+                            }))) => {
+                                // Even an empty stream can carry an exact terminal
+                                // provider usage frame. Prefer that truth over the
+                                // projected fallback before trying another route.
+                                let actual_bluey_cost = returned_route_bluey_cost_or_cap(
+                                    &stream_provider,
+                                    &stream_model,
+                                    input_tokens,
+                                    output_tokens,
+                                );
+                                let event = UsageEvent {
+                                    request_id: attempt_request_id,
+                                    kind: "llm_attempt".into(),
+                                    task_type: Some(dispatch_lane.to_string()),
+                                    lane: Some(dispatch_lane.to_string()),
+                                    provider: Some(stream_provider),
+                                    model: Some(stream_model),
+                                    input_tokens,
+                                    output_tokens,
+                                    latency_ms: started
+                                        .elapsed()
+                                        .as_millis()
+                                        .try_into()
+                                        .unwrap_or(i64::MAX),
+                                    cost_cents_to_bluey: actual_bluey_cost,
+                                    cost_cents_to_customer: 0,
+                                    was_speculative: false,
+                                    was_fallback: route_index > 0,
+                                };
+                                settle_provider_attempt_before_customer(
+                                    &state.pool,
+                                    &account.id,
+                                    &req.request_id,
+                                    &mut attempt_guard,
+                                    event,
+                                    actual_bluey_cost,
+                                )?;
                                 tracing::warn!(
                                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                                     request_id = %req.request_id,
@@ -9111,6 +9431,14 @@ async fn complete_stream_inner(
                                 break;
                             }
                             Ok(Some(Err(e))) => {
+                                if let Err(error) = attempt_guard.settle_conservative() {
+                                    tracing::error!(request_id = %req.request_id, error = %error, "pre-output stream failure settlement pending reconciliation");
+                                    return Err(provider_accounting_pending_error(
+                                        &state.pool,
+                                        &account.id,
+                                        &req.request_id,
+                                    ));
+                                }
                                 if !vision_text_fallback_active
                                     && !vision_text_fallback_routes.is_empty()
                                     && managed_vision_text_fallback_eligible(
@@ -9174,6 +9502,14 @@ async fn complete_stream_inner(
                                 break;
                             }
                             Ok(None) => {
+                                if let Err(error) = attempt_guard.settle_conservative() {
+                                    tracing::error!(request_id = %req.request_id, error = %error, "ended stream attempt settlement pending reconciliation");
+                                    return Err(provider_accounting_pending_error(
+                                        &state.pool,
+                                        &account.id,
+                                        &req.request_id,
+                                    ));
+                                }
                                 tracing::warn!(
                                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                                     request_id = %req.request_id,
@@ -9188,6 +9524,14 @@ async fn complete_stream_inner(
                                 break;
                             }
                             Err(_elapsed) => {
+                                if let Err(error) = attempt_guard.settle_conservative() {
+                                    tracing::error!(request_id = %req.request_id, error = %error, "first-token timeout settlement pending reconciliation");
+                                    return Err(provider_accounting_pending_error(
+                                        &state.pool,
+                                        &account.id,
+                                        &req.request_id,
+                                    ));
+                                }
                                 tracing::warn!(
                                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                                     request_id = %req.request_id,
@@ -9203,6 +9547,14 @@ async fn complete_stream_inner(
                         }
                     }
                     Ok(Err(e)) => {
+                        if let Err(error) = attempt_guard.settle_conservative() {
+                            tracing::error!(request_id = %req.request_id, error = %error, "stream connect failure settlement pending reconciliation");
+                            return Err(provider_accounting_pending_error(
+                                &state.pool,
+                                &account.id,
+                                &req.request_id,
+                            ));
+                        }
                         if !vision_text_fallback_active
                             && !vision_text_fallback_routes.is_empty()
                             && managed_vision_text_fallback_eligible(
@@ -9266,6 +9618,14 @@ async fn complete_stream_inner(
                         break;
                     }
                     Err(_elapsed) => {
+                        if let Err(error) = attempt_guard.settle_conservative() {
+                            tracing::error!(request_id = %req.request_id, error = %error, "stream connect-timeout settlement pending reconciliation");
+                            return Err(provider_accounting_pending_error(
+                                &state.pool,
+                                &account.id,
+                                &req.request_id,
+                            ));
+                        }
                         tracing::warn!(
                             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                             request_id = %req.request_id,
@@ -9467,6 +9827,23 @@ async fn complete_stream_inner(
                             || visible_partial
                                 .as_deref()
                                 .is_some_and(|value| !value.trim().is_empty());
+                        if let Err(error) = settle_selected_provider_attempt_conservative(
+                            &mut selected_attempt_guard,
+                        ) {
+                            tracing::error!(request_id = %req.request_id, error = %error, "stream idle exposure settlement pending reconciliation");
+                            let _ = provider_accounting_pending_error(
+                                &state.pool,
+                                &account.id,
+                                &req.request_id,
+                            );
+                            yield Ok(Event::default().event("error").data(
+                                serde_json::json!({
+                                    "error": "provider accounting is pending reconciliation",
+                                    "reason": "provider_accounting_pending",
+                                }).to_string(),
+                            ));
+                            return;
+                        }
                         fail_stream_llm_usage(
                             &state.pool,
                             &account.id,
@@ -9522,6 +9899,23 @@ async fn complete_stream_inner(
             };
             let Some(event) = event else { break };
             if let Some(payload) = live_account_error_payload(live_account_state(&state.pool, &account.id)) {
+                if let Err(error) = settle_selected_provider_attempt_conservative(
+                    &mut selected_attempt_guard,
+                ) {
+                    tracing::error!(request_id = %req.request_id, error = %error, "inactive-account stream exposure settlement pending reconciliation");
+                    let _ = provider_accounting_pending_error(
+                        &state.pool,
+                        &account.id,
+                        &req.request_id,
+                    );
+                    yield Ok(Event::default().event("error").data(
+                        serde_json::json!({
+                            "error": "provider accounting is pending reconciliation",
+                            "reason": "provider_accounting_pending",
+                        }).to_string(),
+                    ));
+                    return;
+                }
                 let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
                 release_llm_usage(
                     &state.pool,
@@ -9556,6 +9950,52 @@ async fn complete_stream_inner(
                     }
                 }
                 Ok(routing::CompletionStreamEvent::Done { input_tokens, output_tokens }) => {
+                    // A terminal provider usage frame is the first trustworthy
+                    // exact-cost boundary. Persist it immediately, before any
+                    // Bluey quality/account gate can reject the completed
+                    // answer. Streams that never reach Done retain the guard's
+                    // conservative projected settlement through Drop.
+                    let (exact_bluey_cost, _) = pricing::compute_cost(
+                        &selected_route.pricing,
+                        input_tokens,
+                        output_tokens,
+                    );
+                    if let Some(mut attempt_guard) = selected_attempt_guard.take() {
+                        let attempt_event = UsageEvent {
+                            request_id: req.request_id.clone(),
+                            kind: "llm_attempt".into(),
+                            task_type: Some(effective_lane.clone()),
+                            lane: Some(effective_lane.clone()),
+                            provider: Some(streaming.provider.clone()),
+                            model: Some(streaming.model.clone()),
+                            input_tokens,
+                            output_tokens,
+                            latency_ms: started
+                                .elapsed()
+                                .as_millis()
+                                .try_into()
+                                .unwrap_or(i64::MAX),
+                            cost_cents_to_bluey: exact_bluey_cost,
+                            cost_cents_to_customer: 0,
+                            was_speculative: false,
+                            was_fallback: selected_route_idx > 0,
+                        };
+                        if let Err((_, Json(payload))) = settle_provider_attempt_before_customer(
+                            &state.pool,
+                            &account.id,
+                            &req.request_id,
+                            &mut attempt_guard,
+                            attempt_event,
+                            exact_bluey_cost,
+                        ) {
+                            yield Ok(Event::default().event("error").data(
+                                serde_json::to_string(&payload).unwrap_or_else(|_| {
+                                    r#"{"error":"provider accounting pending","reason":"provider_accounting_pending"}"#.to_string()
+                                }),
+                            ));
+                            return;
+                        }
+                    }
                     final_tokens = Some((input_tokens, output_tokens));
                     break;
                 }
@@ -9583,6 +10023,23 @@ async fn complete_stream_inner(
                             .as_deref()
                             .is_some_and(|value| !value.trim().is_empty());
                     let failure_reason = upstream_stream_failure_reason(&e);
+                    if let Err(error) = settle_selected_provider_attempt_conservative(
+                        &mut selected_attempt_guard,
+                    ) {
+                        tracing::error!(request_id = %req.request_id, error = %error, "stream read-failure exposure settlement pending reconciliation");
+                        let _ = provider_accounting_pending_error(
+                            &state.pool,
+                            &account.id,
+                            &req.request_id,
+                        );
+                        yield Ok(Event::default().event("error").data(
+                            serde_json::json!({
+                                "error": "provider accounting is pending reconciliation",
+                                "reason": "provider_accounting_pending",
+                            }).to_string(),
+                        ));
+                        return;
+                    }
                     fail_stream_llm_usage(
                         &state.pool,
                         &account.id,
@@ -9683,6 +10140,23 @@ async fn complete_stream_inner(
                 || visible_partial
                     .as_deref()
                     .is_some_and(|value| !value.trim().is_empty());
+            if let Err(error) = settle_selected_provider_attempt_conservative(
+                &mut selected_attempt_guard,
+            ) {
+                tracing::error!(request_id = %req.request_id, error = %error, "incomplete stream exposure settlement pending reconciliation");
+                let _ = provider_accounting_pending_error(
+                    &state.pool,
+                    &account.id,
+                    &req.request_id,
+                );
+                yield Ok(Event::default().event("error").data(
+                    serde_json::json!({
+                        "error": "provider accounting is pending reconciliation",
+                        "reason": "provider_accounting_pending",
+                    }).to_string(),
+                ));
+                return;
+            }
             fail_stream_llm_usage(
                 &state.pool,
                 &account.id,
@@ -9902,6 +10376,28 @@ async fn complete_stream_inner(
         );
         let bluey_cost = llm_bluey_cost.saturating_add(web_search.bluey_cost_cents);
         let customer_cost = llm_customer_cost.saturating_add(web_search.customer_cost_cents);
+        let event = UsageEvent {
+            request_id: req.request_id.clone(),
+            kind: "llm".into(),
+            task_type: None,
+            lane: Some(effective_lane.clone()),
+            provider: Some(streaming.provider.clone()),
+            model: Some(streaming.model.clone()),
+            input_tokens,
+            output_tokens,
+            latency_ms: elapsed_ms,
+            // Per-attempt durable holds are the sole upstream-cost authority.
+            cost_cents_to_bluey: 0,
+            cost_cents_to_customer: llm_customer_cost,
+            was_speculative: false,
+            was_fallback: selected_route_idx > 0,
+        };
+        let settlement_events = managed_completion_settlement_events(
+            &req.request_id,
+            event,
+            llm_customer_cost,
+            &web_search,
+        );
 
         let settled_usage = match settle_llm_usage_with_retry(
             &state.pool,
@@ -9910,6 +10406,7 @@ async fn complete_stream_inner(
             customer_cost,
             elapsed_ms,
             "completed",
+            &settlement_events,
         )
         .await
         {
@@ -9958,66 +10455,21 @@ async fn complete_stream_inner(
             );
         }
 
-        let event = UsageEvent {
-            request_id: req.request_id.clone(),
-            kind: "llm".into(),
-            task_type: None,
-            lane: Some(effective_lane.clone()),
-            provider: Some(streaming.provider.clone()),
-            model: Some(streaming.model.clone()),
-            input_tokens,
-            output_tokens,
-            latency_ms: elapsed_ms,
-            cost_cents_to_bluey: llm_bluey_cost,
-            cost_cents_to_customer: charged_llm_customer_cost,
-            was_speculative: false,
-            was_fallback: selected_route_idx > 0,
-        };
-        match usage::record(&state.pool, &account.id, &event) {
-            Ok(true) => tracing::info!(
-                account_id_hash = %account_id_hash,
-                request_id = %req.request_id,
-                request_ref = %request_ref_log,
-                trace_id = %trace_id,
-                session_id = %session_id_log,
-                session_ref = %session_ref_log,
-                provider = %streaming.provider,
-                model = %streaming.model,
-                cost_cents = charged_llm_customer_cost,
-                balance_cents_after = balance_after,
-                latency_ms = elapsed_ms,
-                streaming = true,
-                "managed chat usage event recorded"
-            ),
-            Ok(false) => tracing::warn!(
-                account_id_hash = %account_id_hash,
-                request_id = %req.request_id,
-                trace_id = %trace_id,
-                session_id = %session_id_log,
-                provider = %streaming.provider,
-                model = %streaming.model,
-                streaming = true,
-                "managed chat usage event deduplicated"
-            ),
-            Err(e) => tracing::warn!(
-                account_id_hash = %account_id_hash,
-                request_id = %req.request_id,
-                trace_id = %trace_id,
-                session_id = %session_id_log,
-                provider = %streaming.provider,
-                model = %streaming.model,
-                error = %e,
-                streaming = true,
-                "failed to record managed chat usage event"
-            ),
-        }
-        record_web_search_usage(
-            &state.pool,
-            &account.id,
-            &req.request_id,
-            &web_search,
-            charged_web_search_customer_cost,
-            true,
+        tracing::info!(
+            account_id_hash = %account_id_hash,
+            request_id = %req.request_id,
+            request_ref = %request_ref_log,
+            trace_id = %trace_id,
+            session_id = %session_id_log,
+            session_ref = %session_ref_log,
+            provider = %streaming.provider,
+            model = %streaming.model,
+            cost_cents = charged_llm_customer_cost,
+            web_search_cost_cents = charged_web_search_customer_cost,
+            balance_cents_after = balance_after,
+            latency_ms = elapsed_ms,
+            streaming = true,
+            "managed chat usage settled with all authoritative events"
         );
 
         let artifact_type = artifact.as_ref().map(|artifact| artifact.artifact_type).unwrap_or("none");
@@ -10294,6 +10746,12 @@ async fn complete_inner(
         }
     }
 
+    if let Some(err) =
+        prior_provider_prefix_exposure_error(&state.pool, &account.id, &req.request_id)
+    {
+        return Err(err);
+    }
+
     if let Some(err) = account_not_active_error(&state.pool, &account.id) {
         let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
         tracing::warn!(
@@ -10362,6 +10820,13 @@ async fn complete_inner(
         &rag_matches,
     )
     .await;
+    if resolved_answer_plan.provider_accounting_pending {
+        return Err(provider_accounting_pending_error(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+        ));
+    }
     let answer_plan = resolved_answer_plan.plan.clone();
     let resolved_story_grounding = behavioral_story_grounding(&req, &answer_plan);
     if let BehavioralStoryGrounding::Missing { fields } = &resolved_story_grounding {
@@ -10418,12 +10883,20 @@ async fn complete_inner(
     );
     let web_search = completion_web_search_budgeted(
         &state.pool,
+        state.config.upstream_spend_guard,
         &account,
         &req.request_id,
         &req.user,
         &answer_plan,
     )
     .await;
+    if web_search.provider_accounting_pending {
+        return Err(provider_accounting_pending_error(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+        ));
+    }
     let web_sources = web_search.sources.clone();
     let provider_rag_matches = if resolved_story_provider_user.is_some() {
         &[][..]
@@ -10536,33 +11009,19 @@ async fn complete_inner(
         .max()
         .unwrap_or(1)
         .saturating_add(web_search.customer_cost_cents);
-    let est_bluey_cost = routes
-        .iter()
-        .chain(vision_text_fallback_routes.iter())
-        .map(|route| route.estimated_bluey_cost_cents)
-        .max()
-        .unwrap_or(1)
-        .saturating_add(web_search.bluey_cost_cents);
-    if let Some(err) = release_and_upstream_spend_guard_check(
+    if let Some(err) = prior_provider_exposure_error(
         &state,
         &account.id,
         &req.request_id,
-        est_bluey_cost,
-        "llm",
+        &format!("router:{}:llm", req.request_id),
     ) {
         return Err(err);
     }
 
     // 4. Atomically reserve the maximum customer charge before dispatch.
-    let usage_reservation = reserve_llm_usage(
-        &state,
-        &account,
-        &req.request_id,
-        est_cost,
-        est_bluey_cost,
-        "llm",
-    )
-    .map_err(|error| *error)?;
+    let usage_reservation =
+        reserve_llm_usage(&state, &account, &req.request_id, est_cost, 0, "llm")
+            .map_err(|error| *error)?;
     let on_trial = usage_reservation.is_trial();
     tracing::info!(
         account_id_hash = %account_id_hash,
@@ -10589,6 +11048,7 @@ async fn complete_inner(
     let mut selected_completion: Option<routing::Completion> = None;
     let mut vision_text_fallback_active = false;
     let mut vision_media_rejection_seen = false;
+    let mut provider_dispatch_index = 0_usize;
 
     let mut capacity_sweeps_used = 0usize;
     for capacity_sweep in 0..=1 {
@@ -10716,6 +11176,35 @@ async fn complete_inner(
                     break;
                 }
 
+                let attempt_request_id =
+                    format!("{}:llm-attempt:{}", req.request_id, provider_dispatch_index);
+                provider_dispatch_index = provider_dispatch_index.saturating_add(1);
+                let mut attempt_guard = match provider_cost_guard::reserve(
+                    &state.pool,
+                    state.config.upstream_spend_guard,
+                    &account.id,
+                    &format!("router:{}:llm", req.request_id),
+                    &attempt_request_id,
+                    route.provider,
+                    route.model,
+                    route.estimated_bluey_cost_cents,
+                    "llm_attempt",
+                    dispatch_lane,
+                ) {
+                    Ok(provider_cost_guard::Admission::Held(guard)) => guard,
+                    Ok(provider_cost_guard::Admission::Unconfigured) => {
+                        last_error = Some(anyhow::anyhow!(
+                            "paid LLM route unexpectedly had zero projected exposure"
+                        ));
+                        break;
+                    }
+                    Ok(provider_cost_guard::Admission::GlobalLimit) | Err(_) => {
+                        last_error = Some(anyhow::anyhow!("upstream spend guard denied LLM route"));
+                        break;
+                    }
+                };
+                let attempt_started = Instant::now();
+
                 match routing::complete_with_key(
                     &selected_key.secret,
                     route.provider,
@@ -10731,6 +11220,46 @@ async fn complete_inner(
                 .await
                 {
                     Ok(completion) => {
+                        let route_matches = completion.provider == route.provider
+                            && completion.model == route.model;
+                        let actual_bluey_cost = returned_route_bluey_cost_or_cap(
+                            &completion.provider,
+                            &completion.model,
+                            completion.input_tokens,
+                            completion.output_tokens,
+                        );
+                        let attempt_event = UsageEvent {
+                            request_id: attempt_request_id,
+                            kind: "llm_attempt".into(),
+                            task_type: Some(dispatch_lane.to_string()),
+                            lane: Some(dispatch_lane.to_string()),
+                            provider: Some(completion.provider.clone()),
+                            model: Some(completion.model.clone()),
+                            input_tokens: completion.input_tokens,
+                            output_tokens: completion.output_tokens,
+                            latency_ms: attempt_started
+                                .elapsed()
+                                .as_millis()
+                                .try_into()
+                                .unwrap_or(i64::MAX),
+                            cost_cents_to_bluey: actual_bluey_cost,
+                            cost_cents_to_customer: 0,
+                            was_speculative: false,
+                            was_fallback: route_index > 0,
+                        };
+                        settle_provider_attempt_before_customer(
+                            &state.pool,
+                            &account.id,
+                            &req.request_id,
+                            &mut attempt_guard,
+                            attempt_event,
+                            actual_bluey_cost,
+                        )?;
+                        if !route_matches {
+                            last_error = Some(anyhow::anyhow!("provider route identity mismatch"));
+                            last_failure_was_capacity = false;
+                            break;
+                        }
                         selected_route_idx = route_index;
                         selected_route = Some(route);
                         tracing::info!(
@@ -10754,6 +11283,14 @@ async fn complete_inner(
                         break;
                     }
                     Err(e) => {
+                        if let Err(error) = attempt_guard.settle_conservative() {
+                            tracing::error!(request_id = %req.request_id, error = %error, "LLM failed-attempt settlement pending reconciliation");
+                            return Err(provider_accounting_pending_error(
+                                &state.pool,
+                                &account.id,
+                                &req.request_id,
+                            ));
+                        }
                         if !vision_text_fallback_active
                             && !vision_text_fallback_routes.is_empty()
                             && managed_vision_text_fallback_eligible(
@@ -11065,6 +11602,28 @@ async fn complete_inner(
     );
     let bluey_cost = llm_bluey_cost.saturating_add(web_search.bluey_cost_cents);
     let customer_cost = llm_customer_cost.saturating_add(web_search.customer_cost_cents);
+    let event = UsageEvent {
+        request_id: req.request_id.clone(),
+        kind: "llm".into(),
+        task_type: None,
+        lane: Some(effective_lane.clone()),
+        provider: Some(comp.provider.clone()),
+        model: Some(comp.model.clone()),
+        input_tokens: comp.input_tokens,
+        output_tokens: comp.output_tokens,
+        latency_ms: elapsed_ms,
+        // Per-attempt durable holds are the sole upstream-cost authority.
+        cost_cents_to_bluey: 0,
+        cost_cents_to_customer: llm_customer_cost,
+        was_speculative: false,
+        was_fallback: selected_route_idx > 0,
+    };
+    let settlement_events = managed_completion_settlement_events(
+        &req.request_id,
+        event,
+        llm_customer_cost,
+        &web_search,
+    );
 
     // 7. Settle actual usage and atomically refund the unused ceiling.
     let settled_usage = settle_llm_usage_with_retry(
@@ -11074,6 +11633,7 @@ async fn complete_inner(
         customer_cost,
         elapsed_ms,
         "completed",
+        &settlement_events,
     )
     .await
     .map_err(|error| {
@@ -11125,68 +11685,21 @@ async fn complete_inner(
         );
     }
 
-    // 8. Record usage event. Reuse the client-supplied request_id so
-    //    Stage 7's idempotent ingest dedupes correctly across retries.
-    let event = UsageEvent {
-        request_id: req.request_id.clone(),
-        kind: "llm".into(),
-        task_type: None,
-        lane: Some(effective_lane.clone()),
-        provider: Some(comp.provider.clone()),
-        model: Some(comp.model.clone()),
-        input_tokens: comp.input_tokens,
-        output_tokens: comp.output_tokens,
-        latency_ms: elapsed_ms,
-        cost_cents_to_bluey: llm_bluey_cost,
-        cost_cents_to_customer: charged_llm_customer_cost,
-        was_speculative: false,
-        was_fallback: selected_route_idx > 0,
-    };
-    match crate::db::usage::record(&state.pool, &account.id, &event) {
-        Ok(true) => tracing::info!(
-            account_id_hash = %account_id_hash,
-            request_id = %req.request_id,
-            request_ref = %request_ref_log,
-            trace_id = %trace_id,
-            session_id = %session_id_log,
-            session_ref = %session_ref_log,
-            provider = %comp.provider,
-            model = %comp.model,
-            cost_cents = charged_llm_customer_cost,
-            balance_cents_after = balance_after,
-            latency_ms = elapsed_ms,
-            streaming = false,
-            "managed chat usage event recorded"
-        ),
-        Ok(false) => tracing::warn!(
-            account_id_hash = %account_id_hash,
-            request_id = %req.request_id,
-            trace_id = %trace_id,
-            session_id = %session_id_log,
-            provider = %comp.provider,
-            model = %comp.model,
-            streaming = false,
-            "managed chat usage event deduplicated"
-        ),
-        Err(e) => tracing::warn!(
-            account_id_hash = %account_id_hash,
-            request_id = %req.request_id,
-            trace_id = %trace_id,
-            session_id = %session_id_log,
-            provider = %comp.provider,
-            model = %comp.model,
-            error = %e,
-            streaming = false,
-            "failed to record managed chat usage event"
-        ),
-    }
-    record_web_search_usage(
-        &state.pool,
-        &account.id,
-        &req.request_id,
-        &web_search,
-        charged_web_search_customer_cost,
-        false,
+    tracing::info!(
+        account_id_hash = %account_id_hash,
+        request_id = %req.request_id,
+        request_ref = %request_ref_log,
+        trace_id = %trace_id,
+        session_id = %session_id_log,
+        session_ref = %session_ref_log,
+        provider = %comp.provider,
+        model = %comp.model,
+        cost_cents = charged_llm_customer_cost,
+        web_search_cost_cents = charged_web_search_customer_cost,
+        balance_cents_after = balance_after,
+        latency_ms = elapsed_ms,
+        streaming = false,
+        "managed chat usage settled with all authoritative events"
     );
 
     let artifact_type = artifact
@@ -11318,6 +11831,7 @@ use response_artifacts::{
 };
 
 mod embeddings;
+pub(crate) mod provider_cost_guard;
 pub use embeddings::{
     embed, embed_batch, EmbedBatchRequest, EmbedBatchResponse, EmbedRequest, EmbedResponse,
 };

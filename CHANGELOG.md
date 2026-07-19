@@ -5,6 +5,12 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept managed Jobs resume ranking extractive and default-off, with exact
+  evidence composition, bounded provider deadlines and spend, fail-closed
+  attempt accounting, and authoritative recovery of legacy application IDs.
+
 ## [0.1.103] - 2026-07-18
 
 ### Fixed

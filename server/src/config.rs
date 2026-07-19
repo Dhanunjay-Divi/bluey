@@ -151,6 +151,10 @@ pub struct UpstreamKeys {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Mandatory admission boundary for managed paid provider dispatch.
+///
+/// `None` means no positive limit was configured; it never means unlimited.
+/// Every managed paid route must fail closed before provider I/O in that state.
 pub struct UpstreamSpendGuard {
     pub limit_cents: i64,
     pub window_hours: i64,
@@ -581,6 +585,8 @@ fn log_storage_key_prefix(raw: &str) -> String {
 }
 
 fn upstream_spend_guard_from_env() -> Option<UpstreamSpendGuard> {
+    // Unset, invalid, and non-positive values deliberately produce no guard.
+    // Paid dispatchers interpret None as denied, not as an unlimited budget.
     let limit_cents = std::env::var("BLUEY_UPSTREAM_SPEND_LIMIT_CENTS")
         .ok()
         .and_then(|value| value.trim().parse::<i64>().ok())
@@ -938,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_spend_guard_reads_positive_limit_only() {
+    fn upstream_spend_guard_requires_a_positive_limit() {
         std::env::set_var("BLUEY_UPSTREAM_SPEND_LIMIT_CENTS", "1000");
         std::env::set_var("BLUEY_UPSTREAM_SPEND_WINDOW_HOURS", "12");
         let guard = upstream_spend_guard_from_env().unwrap();

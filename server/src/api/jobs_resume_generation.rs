@@ -1,11 +1,11 @@
 //! Evidence-grounded model planning for one job-specific resume version.
 //!
-//! The model may rank and rewrite verified profile evidence, but it cannot add
-//! skills, employers, dates, metrics, or other candidate facts. A strict
-//! validator rejects unsupported output and falls back to the deterministic
-//! tailoring path. Provider provenance and Bluey's upstream cost stay in the
-//! server-side generation ledger; the public packet receives only the truth
-//! policy and generation kind.
+//! The model may rank verified profile evidence, but it never authors resume
+//! prose. Headline and summary text are composed deterministically from exact
+//! evidence records selected by ID, so short credentials and metrics cannot be
+//! invented or reassigned across facts. Provider provenance and Bluey's
+//! upstream cost stay in the server-side generation ledger; the public packet
+//! receives only the truth policy and generation kind.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -18,16 +18,31 @@ use crate::{
     db::{
         jobs::{self, CareerProfile, JobPosting, ResumeVersion},
         jobs_generation::{self, ResumeGenerationReservation},
-        usage::{self, UsageEvent},
+        jobs_generation_allowance::{self, AllowanceReservation},
+        jobs_provider_cost_holds::{self, CostHoldReservation},
+        usage::UsageEvent,
     },
     pricing, routing,
 };
 
-const GENERATION_SCHEMA_VERSION: i64 = 1;
+const GENERATION_SCHEMA_VERSION: i64 = 3;
 const MAX_RESUME_SKILLS: usize = 16;
 const MAX_HEADLINE_CHARS: usize = 180;
 const MAX_SUMMARY_CHARS: usize = 700;
-const MODEL_TIMEOUT_SECS: u64 = 75;
+const MAX_MODEL_OUTPUT_TOKENS: u32 = 1_200;
+const MAX_CANDIDATE_PROMPT_BYTES: usize = 48 * 1024;
+const MAX_JOB_PROMPT_BYTES: usize = 32 * 1024;
+const MAX_USER_PROMPT_BYTES: usize = 96 * 1024;
+const MAX_PROVIDER_ATTEMPTS: usize = 3;
+const MAX_ATTEMPT_BLUEY_COST_CENTS: i64 = 10;
+const MAX_GENERATION_BLUEY_COST_CENTS: i64 = 20;
+const MODEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(22);
+const MODEL_GENERATION_DEADLINE: Duration = Duration::from_secs(75);
+
+const _: () = assert!(
+    MODEL_GENERATION_DEADLINE.as_secs() + 30 < jobs_generation::RESERVATION_TTL.as_secs(),
+    "model generation needs a settlement margin below its reservation TTL"
+);
 
 #[derive(Debug, Clone)]
 pub struct GeneratedResume {
@@ -37,9 +52,8 @@ pub struct GeneratedResume {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct ResumePlan {
-    headline: String,
-    summary: String,
     #[serde(default)]
     headline_evidence_ids: Vec<String>,
     #[serde(default)]
@@ -51,6 +65,7 @@ struct ResumePlan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct HighlightOrder {
     entry_index: usize,
     highlight_indices: Vec<usize>,
@@ -117,15 +132,60 @@ impl EvidenceCatalog {
 
     fn selected_text(&self, ids: &[String]) -> Result<String> {
         let mut selected = Vec::with_capacity(ids.len());
+        let mut seen = Vec::with_capacity(ids.len());
         for id in ids {
+            if seen.contains(id) {
+                return Err(anyhow!("duplicate evidence id: {id}"));
+            }
             let value = self
                 .values
                 .get(id)
                 .ok_or_else(|| anyhow!("unknown evidence id: {id}"))?;
             selected.push(value.as_str());
+            seen.push(id.clone());
         }
-        Ok(selected.join(" "))
+        Ok(selected.join(" • "))
     }
+
+    fn compose_headline(&self, ids: &[String]) -> Result<String> {
+        if ids.len() > 1 {
+            return Err(anyhow!(
+                "headline must select exactly one indivisible evidence record"
+            ));
+        }
+        if ids.iter().any(|id| !headline_evidence_id(id)) {
+            return Err(anyhow!("headline selected non-title evidence"));
+        }
+        let value = self.selected_text(ids)?;
+        if value.chars().count() > MAX_HEADLINE_CHARS {
+            return Err(anyhow!("selected headline evidence is too long"));
+        }
+        Ok(value)
+    }
+
+    fn compose_summary(&self, ids: &[String]) -> Result<String> {
+        if ids.iter().any(|id| !summary_evidence_id(id)) {
+            return Err(anyhow!("summary selected non-narrative evidence"));
+        }
+        let value = self.selected_text(ids)?;
+        if value.chars().count() > MAX_SUMMARY_CHARS {
+            return Err(anyhow!("selected summary evidence is too long"));
+        }
+        Ok(value)
+    }
+}
+
+fn headline_evidence_id(id: &str) -> bool {
+    id == "profile:headline"
+        || (id.starts_with("employment:") && id.ends_with(":title"))
+        || (id.starts_with("project:") && id.ends_with(":role"))
+}
+
+fn summary_evidence_id(id: &str) -> bool {
+    id == "profile:summary"
+        || id.starts_with("certification:")
+        || (id.starts_with("employment:") && id.contains(":highlight:"))
+        || (id.starts_with("project:") && id.ends_with(":summary"))
 }
 
 fn insert_evidence(values: &mut BTreeMap<String, String>, id: &str, value: &str) {
@@ -142,7 +202,9 @@ pub async fn generate(
     posting: &JobPosting,
     baseline: &ResumeVersion,
 ) -> Result<GeneratedResume> {
-    let generation_key = generation_key(account_id, profile, posting, baseline)?;
+    let managed_generation = model_generation_ready(state);
+    let generation_key =
+        generation_key(account_id, profile, posting, baseline, managed_generation)?;
     match jobs_generation::reserve(&state.pool, account_id, &posting.id, &generation_key)? {
         ResumeGenerationReservation::Ready(record) => {
             if record.provider.as_deref() == Some("bluey") {
@@ -168,12 +230,14 @@ pub async fn generate(
                 baseline,
                 &generation_key,
                 &record.reservation_token,
+                managed_generation,
             )
             .await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_reserved(
     state: &AppState,
     account_id: &str,
@@ -182,39 +246,484 @@ async fn generate_reserved(
     baseline: &ResumeVersion,
     generation_key: &str,
     reservation_token: &str,
+    managed_generation: bool,
 ) -> Result<GeneratedResume> {
+    let mut reservation = GenerationReservationGuard::new(
+        state.pool.clone(),
+        account_id,
+        &posting.id,
+        generation_key,
+        reservation_token,
+    );
     let catalog = EvidenceCatalog::from_profile(profile);
     let system = system_prompt();
-    let user = user_prompt(profile, posting, &catalog)?;
-    let estimated_input_tokens = ((system.len() + user.len()) as i64 / 4).max(1);
-    let started = std::time::Instant::now();
+    let user = match user_prompt(profile, posting, &catalog) {
+        Ok(user) => user,
+        Err(error) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                generation_ref = %generation_log_ref(generation_key),
+                error = %error,
+                "Jobs resume model prompt rejected at the size boundary"
+            );
+            return finish_deterministic_fallback(
+                state,
+                account_id,
+                baseline,
+                generation_key,
+                reservation_token,
+                &mut reservation,
+            );
+        }
+    };
+    // A hard spend boundary must not depend on the usual four-bytes-per-token
+    // heuristic. One token per UTF-8 byte is deliberately conservative across
+    // provider tokenizers and is also the fallback usage when an API omits it.
+    let estimated_input_tokens = i64::try_from(system.len().saturating_add(user.len()))
+        .unwrap_or(i64::MAX)
+        .max(1);
+    if managed_generation {
+        match jobs_generation_allowance::reserve(
+            &state.pool,
+            account_id,
+            &posting.id,
+            generation_key,
+            reservation_token,
+        )? {
+            AllowanceReservation::Reserved => reservation.arm_allowance(),
+            AllowanceReservation::AlreadyMetered
+            | AllowanceReservation::Busy
+            | AllowanceReservation::Exhausted => {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                    generation_ref = %generation_log_ref(generation_key),
+                    "Jobs resume model generation has no available packet allowance"
+                );
+                return finish_transient_deterministic_fallback(baseline, &mut reservation);
+            }
+        }
+        let generation = tokio::time::timeout(
+            MODEL_GENERATION_DEADLINE,
+            try_model_generation(
+                state,
+                account_id,
+                profile,
+                &catalog,
+                system,
+                &user,
+                generation_key,
+                reservation_token,
+                estimated_input_tokens,
+            ),
+        )
+        .await;
+        match generation {
+            Ok(Ok(Some(accounted))) => {
+                let output = serde_json::to_value(&accounted.plan)?;
+                jobs_generation::complete(
+                    &state.pool,
+                    account_id,
+                    generation_key,
+                    reservation_token,
+                    &output,
+                    &accounted.completion.provider,
+                    &accounted.completion.model,
+                    accounted.completion.input_tokens,
+                    accounted.completion.output_tokens,
+                    accounted.bluey_cost,
+                )?;
+                reservation.disarm();
+                return materialize(profile, baseline, &accounted.plan, "model");
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                reservation.fail("accounting_or_generation_failed")?;
+                return Err(error);
+            }
+            Err(_) => tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                generation_ref = %generation_log_ref(generation_key),
+                deadline_ms = MODEL_GENERATION_DEADLINE.as_millis(),
+                "Jobs resume model generation reached its overall deadline"
+            ),
+        }
+    }
 
-    if model_generation_enabled() {
-        for (provider, model) in routing::resolve_route_candidates_with_seed("deep", generation_key)
+    if managed_generation {
+        finish_transient_deterministic_fallback(baseline, &mut reservation)
+    } else {
+        finish_deterministic_fallback(
+            state,
+            account_id,
+            baseline,
+            generation_key,
+            reservation_token,
+            &mut reservation,
+        )
+    }
+}
+
+fn model_generation_enabled() -> bool {
+    model_generation_enabled_value(
+        std::env::var("BLUEY_JOBS_MODEL_GENERATION_ENABLED")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn model_generation_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+fn model_generation_ready(state: &AppState) -> bool {
+    model_generation_prerequisites_ready(
+        model_generation_enabled(),
+        state.rate_limiters.account_llm.is_some(),
+        state.config.upstream_spend_guard.is_some(),
+    )
+}
+
+fn model_generation_prerequisites_ready(
+    explicitly_enabled: bool,
+    account_limiter_configured: bool,
+    spend_guard_configured: bool,
+) -> bool {
+    explicitly_enabled && account_limiter_configured && spend_guard_configured
+}
+
+struct AccountedGeneration {
+    plan: ResumePlan,
+    completion: routing::Completion,
+    bluey_cost: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptOutcome {
+    Accepted,
+    RejectedTruth,
+    RejectedCost,
+    RejectedDeadline,
+    RejectedProviderBoundary,
+    RejectedProviderError,
+    RejectedTimeout,
+    RejectedCancelled,
+}
+
+impl AttemptOutcome {
+    fn task_type(self) -> &'static str {
+        match self {
+            Self::Accepted => "jobs_resume_tailoring_accepted",
+            Self::RejectedTruth => "jobs_resume_tailoring_rejected_truth",
+            Self::RejectedCost => "jobs_resume_tailoring_rejected_cost",
+            Self::RejectedDeadline => "jobs_resume_tailoring_rejected_deadline",
+            Self::RejectedProviderBoundary => "jobs_resume_tailoring_rejected_provider_boundary",
+            Self::RejectedProviderError => "jobs_resume_tailoring_rejected_provider_error",
+            Self::RejectedTimeout => "jobs_resume_tailoring_rejected_timeout",
+            Self::RejectedCancelled => "jobs_resume_tailoring_rejected_cancelled",
+        }
+    }
+}
+
+struct GenerationReservationGuard {
+    pool: crate::db::DbPool,
+    account_id: String,
+    job_id: String,
+    generation_key: String,
+    reservation_token: String,
+    allowance_armed: bool,
+    armed: bool,
+}
+
+impl GenerationReservationGuard {
+    fn new(
+        pool: crate::db::DbPool,
+        account_id: &str,
+        job_id: &str,
+        generation_key: &str,
+        reservation_token: &str,
+    ) -> Self {
+        Self {
+            pool,
+            account_id: account_id.to_string(),
+            job_id: job_id.to_string(),
+            generation_key: generation_key.to_string(),
+            reservation_token: reservation_token.to_string(),
+            allowance_armed: false,
+            armed: true,
+        }
+    }
+
+    fn arm_allowance(&mut self) {
+        self.allowance_armed = true;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.allowance_armed = false;
+    }
+
+    fn fail(&mut self, code: &str) -> Result<()> {
+        let generation_result = if self.armed {
+            jobs_generation::fail(
+                &self.pool,
+                &self.account_id,
+                &self.generation_key,
+                &self.reservation_token,
+                code,
+            )
+        } else {
+            Ok(())
+        };
+        if generation_result.is_ok() {
+            self.armed = false;
+        }
+        let allowance_result = if self.allowance_armed {
+            jobs_generation_allowance::release(
+                &self.pool,
+                &self.account_id,
+                &self.job_id,
+                &self.generation_key,
+                &self.reservation_token,
+            )
+            .map(|_| ())
+        } else {
+            Ok(())
+        };
+        if allowance_result.is_ok() {
+            self.allowance_armed = false;
+        }
+        generation_result.and(allowance_result)
+    }
+}
+
+impl Drop for GenerationReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed && !self.allowance_armed {
+            return;
+        }
+        if self.armed {
+            if let Err(error) = jobs_generation::fail(
+                &self.pool,
+                &self.account_id,
+                &self.generation_key,
+                &self.reservation_token,
+                "cancelled",
+            ) {
+                tracing::error!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
+                    generation_ref = %generation_log_ref(&self.generation_key),
+                    error = %error,
+                    "failed to close a cancelled Jobs resume generation reservation"
+                );
+            }
+        }
+        if self.allowance_armed {
+            if let Err(error) = jobs_generation_allowance::release(
+                &self.pool,
+                &self.account_id,
+                &self.job_id,
+                &self.generation_key,
+                &self.reservation_token,
+            ) {
+                tracing::error!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
+                    job_id_hash = %generation_log_ref(&self.job_id),
+                    error = %error,
+                    "failed to release a cancelled Jobs generation allowance"
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_model_generation(
+    state: &AppState,
+    account_id: &str,
+    profile: &CareerProfile,
+    catalog: &EvidenceCatalog,
+    system: &str,
+    user: &str,
+    generation_key: &str,
+    reservation_token: &str,
+    estimated_input_tokens: i64,
+) -> Result<Option<AccountedGeneration>> {
+    if jobs_provider_cost_holds::has_generation_exposure(&state.pool, account_id, generation_key)? {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            generation_ref = %generation_log_ref(generation_key),
+            "Jobs resume generation has prior ambiguous provider exposure; refusing redispatch"
+        );
+        return Ok(None);
+    }
+    if let Err(denied) = state.rate_limiters.check_account_llm(account_id).await {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            generation_ref = %generation_log_ref(generation_key),
+            reason = denied.reason,
+            retry_after_secs = denied.retry_after_secs,
+            "Jobs resume generation stopped by the account LLM limiter"
+        );
+        return Ok(None);
+    }
+
+    let spend_guard = state
+        .config
+        .upstream_spend_guard
+        .ok_or_else(|| anyhow!("Jobs managed generation requires an upstream spend guard"))?;
+    let generation_started = tokio::time::Instant::now();
+    let mut dispatched_attempts = 0_usize;
+    'routes: for (provider, model) in
+        routing::resolve_route_candidates_with_seed("deep", generation_key)
+    {
+        if dispatched_attempts >= MAX_PROVIDER_ATTEMPTS
+            || generation_started.elapsed() >= MODEL_GENERATION_DEADLINE
         {
-            if state
-                .config
-                .upstream
-                .key_candidates(provider, generation_key)
-                .is_empty()
+            break;
+        }
+        let key_candidates = state.config.upstream.key_candidates(
+            provider,
+            &format!("jobs:{generation_key}:{provider}:{model}"),
+        );
+        if key_candidates.is_empty() {
+            continue;
+        }
+        let Some(estimated_bluey_cost) = estimated_route_bluey_cost(
+            provider,
+            model,
+            estimated_input_tokens,
+            i64::from(MAX_MODEL_OUTPUT_TOKENS),
+        ) else {
+            tracing::warn!(provider, model, "Jobs resume route has no pricing entry");
+            continue;
+        };
+        if estimated_bluey_cost > MAX_ATTEMPT_BLUEY_COST_CENTS {
+            tracing::warn!(
+                provider,
+                model,
+                estimated_bluey_cost,
+                "Jobs resume route exceeded the hard upstream-cost ceiling"
+            );
+            continue;
+        }
+        loop {
+            if dispatched_attempts >= MAX_PROVIDER_ATTEMPTS
+                || generation_started.elapsed() >= MODEL_GENERATION_DEADLINE
             {
-                continue;
+                break 'routes;
             }
-            if provider_capacity(state, provider, generation_key)
+            let selected_key = match state
+                .provider_health
+                .choose_key(provider, model, &key_candidates)
                 .await
-                .is_err()
             {
-                continue;
+                Ok(selected) => selected,
+                Err(denied) => {
+                    tracing::warn!(
+                        provider,
+                        model,
+                        reason = denied.reason,
+                        retry_after_secs = denied.retry_after_secs,
+                        "Jobs resume route has no healthy provider key"
+                    );
+                    break;
+                }
+            };
+            if let Err(denied) = state
+                .rate_limiters
+                .check_provider_llm(provider, model)
+                .await
+            {
+                tracing::warn!(
+                    provider,
+                    model,
+                    reason = denied.reason,
+                    retry_after_secs = denied.retry_after_secs,
+                    "Jobs resume route skipped by the provider/model limiter"
+                );
+                break;
             }
+            let attempt_index = dispatched_attempts;
+            let request_id = attempt_request_id(
+                generation_key,
+                reservation_token,
+                attempt_index,
+                provider,
+                model,
+            );
+            let hold_reservation_token = match jobs_provider_cost_holds::reserve(
+                &state.pool,
+                account_id,
+                generation_key,
+                reservation_token,
+                &request_id,
+                provider,
+                model,
+                estimated_bluey_cost,
+                MAX_GENERATION_BLUEY_COST_CENTS,
+                spend_guard,
+            )? {
+                CostHoldReservation::Held { reservation_token } => reservation_token,
+                CostHoldReservation::RecoveredAmbiguous { reservation_token } => {
+                    dispatched_attempts += 1;
+                    drop(ProviderAttemptGuard::new(
+                        state.pool.clone(),
+                        account_id,
+                        request_id,
+                        &reservation_token,
+                        provider,
+                        model,
+                        attempt_index,
+                        estimated_input_tokens,
+                        estimated_bluey_cost,
+                    ));
+                    continue;
+                }
+                CostHoldReservation::GenerationLimit => break 'routes,
+                CostHoldReservation::GlobalLimit => break 'routes,
+            };
+            dispatched_attempts += 1;
+            let remaining = MODEL_GENERATION_DEADLINE.saturating_sub(generation_started.elapsed());
+            if remaining.is_zero() {
+                let hold = ProviderAttemptGuard::new(
+                    state.pool.clone(),
+                    account_id,
+                    request_id,
+                    &hold_reservation_token,
+                    provider,
+                    model,
+                    attempt_index,
+                    estimated_input_tokens,
+                    estimated_bluey_cost,
+                );
+                drop(hold);
+                break 'routes;
+            }
+            let mut hold = ProviderAttemptGuard::new(
+                state.pool.clone(),
+                account_id,
+                request_id,
+                &hold_reservation_token,
+                provider,
+                model,
+                attempt_index,
+                estimated_input_tokens,
+                estimated_bluey_cost,
+            );
             let attempt = tokio::time::timeout(
-                Duration::from_secs(MODEL_TIMEOUT_SECS),
-                routing::complete(
-                    &state.config.upstream,
+                MODEL_ATTEMPT_TIMEOUT.min(remaining),
+                routing::complete_with_key(
+                    &selected_key.secret,
                     provider,
                     model,
                     system,
-                    &user,
-                    Some(1_800),
+                    user,
+                    Some(MAX_MODEL_OUTPUT_TOKENS),
                     Some(0.1),
                     routing::ThinkingBudget::off(),
                     Some(estimated_input_tokens),
@@ -222,68 +731,279 @@ async fn generate_reserved(
                 ),
             )
             .await;
-            let completion = match attempt {
+            let mut completion = match attempt {
                 Ok(Ok(completion)) => completion,
                 Ok(Err(error)) => {
+                    hold.settle_uncertain(AttemptOutcome::RejectedProviderError)?;
                     tracing::warn!(provider, model, error = %error, "Jobs resume generation route failed");
-                    continue;
+                    if let Some(retry_after_secs) = routing::upstream_retry_after(&error) {
+                        state
+                            .provider_health
+                            .record_cooldown(
+                                provider,
+                                model,
+                                &selected_key.fingerprint,
+                                retry_after_secs,
+                            )
+                            .await;
+                        continue;
+                    }
+                    break;
                 }
                 Err(_) => {
+                    hold.settle_uncertain(AttemptOutcome::RejectedTimeout)?;
                     tracing::warn!(provider, model, "Jobs resume generation route timed out");
-                    continue;
+                    break;
                 }
             };
-            let plan = match parse_plan(&completion.text)
-                .and_then(|plan| validate_plan(profile, &catalog, plan))
-            {
+            normalize_missing_completion_usage(&mut completion, estimated_input_tokens);
+            let computed_bluey_cost = pricing::lookup(&completion.provider, &completion.model)
+                .map(|price| completed_bluey_cost(price, &completion))
+                .unwrap_or(estimated_bluey_cost);
+            // Never release any portion of the immutable pre-dispatch hold.
+            // Returned route metadata may be crossed or cheaper, and provider
+            // usage can be incomplete; neither is evidence that exposure fell.
+            let settled_bluey_cost = estimated_bluey_cost.max(computed_bluey_cost);
+            let provider_boundary_rejected =
+                completion.provider != provider || completion.model != model;
+            let cost_rejected = settled_bluey_cost > MAX_ATTEMPT_BLUEY_COST_CENTS;
+            let deadline_rejected = generation_started.elapsed() >= MODEL_GENERATION_DEADLINE;
+            let plan =
+                parse_plan(&completion.text).and_then(|plan| validate_plan(profile, catalog, plan));
+            let outcome = if provider_boundary_rejected {
+                AttemptOutcome::RejectedProviderBoundary
+            } else if cost_rejected {
+                AttemptOutcome::RejectedCost
+            } else if deadline_rejected {
+                AttemptOutcome::RejectedDeadline
+            } else if plan.is_ok() {
+                AttemptOutcome::Accepted
+            } else {
+                AttemptOutcome::RejectedTruth
+            };
+            hold.settle(&completion, settled_bluey_cost, outcome)?;
+            if provider_boundary_rejected {
+                tracing::error!(
+                    requested_provider = provider,
+                    requested_model = model,
+                    completed_provider = %completion.provider,
+                    completed_model = %completion.model,
+                    "Jobs resume completion crossed its routed provider/model boundary"
+                );
+                break 'routes;
+            }
+            if cost_rejected || deadline_rejected {
+                break 'routes;
+            }
+            let plan = match plan {
                 Ok(plan) => plan,
                 Err(error) => {
-                    tracing::warn!(provider, model, error = %error, "Jobs resume generation output rejected");
-                    continue;
+                    tracing::warn!(
+                        provider = %completion.provider,
+                        model = %completion.model,
+                        error = %error,
+                        "Jobs resume generation output rejected"
+                    );
+                    break;
                 }
             };
-            let bluey_cost = pricing::lookup(&completion.provider, &completion.model)
-                .map(|price| {
-                    pricing::compute_cost(price, completion.input_tokens, completion.output_tokens)
-                        .0
-                })
-                .unwrap_or(0);
-            let output = serde_json::to_value(&plan)?;
-            jobs_generation::complete(
-                &state.pool,
-                account_id,
-                generation_key,
-                reservation_token,
-                &output,
-                &completion.provider,
-                &completion.model,
-                completion.input_tokens,
-                completion.output_tokens,
-                bluey_cost,
-            )?;
-            let _ = usage::record(
-                &state.pool,
-                account_id,
-                &UsageEvent {
-                    request_id: format!("jobs-resume-{generation_key}"),
-                    kind: "jobs_resume_generation".to_string(),
-                    task_type: Some("resume_tailoring".to_string()),
-                    lane: Some("deep".to_string()),
-                    provider: Some(completion.provider),
-                    model: Some(completion.model),
-                    input_tokens: completion.input_tokens,
-                    output_tokens: completion.output_tokens,
-                    latency_ms: started.elapsed().as_millis().try_into().unwrap_or(i64::MAX),
-                    cost_cents_to_bluey: bluey_cost,
-                    cost_cents_to_customer: 0,
-                    was_speculative: false,
-                    was_fallback: false,
-                },
-            );
-            return materialize(profile, baseline, &plan, "model");
+            return Ok(Some(AccountedGeneration {
+                plan,
+                completion,
+                bluey_cost: settled_bluey_cost,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn estimated_route_bluey_cost(
+    provider: &str,
+    model: &str,
+    estimated_input_tokens: i64,
+    max_output_tokens: i64,
+) -> Option<i64> {
+    pricing::lookup(provider, model).map(|price| {
+        pricing::estimate_bluey_cost_ceiling(
+            price,
+            estimated_input_tokens.max(0),
+            max_output_tokens.max(0),
+        )
+    })
+}
+
+fn completed_bluey_cost(price: &pricing::ModelPricing, completion: &routing::Completion) -> i64 {
+    // Provider usage is untrusted JSON. Calculate in i128 so a malformed token
+    // count cannot overflow the accounting path and accidentally become cheap.
+    const MICROCENTS_PER_CENT: i128 = 10_000;
+    const TOKENS_PER_MILLION: i128 = 1_000_000;
+    let input_tokens = i128::from(completion.input_tokens.max(0));
+    let output_tokens = i128::from(completion.output_tokens.max(0));
+    let input_microcents = i128::from(price.upstream_in_microcents_per_1m)
+        .saturating_mul(input_tokens)
+        / TOKENS_PER_MILLION;
+    let output_microcents = i128::from(price.upstream_out_microcents_per_1m)
+        .saturating_mul(output_tokens)
+        / TOKENS_PER_MILLION;
+    let microcents = input_microcents.saturating_add(output_microcents).max(0);
+    let cents = microcents.saturating_add(MICROCENTS_PER_CENT - 1) / MICROCENTS_PER_CENT;
+    cents.min(i128::from(i64::MAX)) as i64
+}
+
+fn normalize_missing_completion_usage(
+    completion: &mut routing::Completion,
+    estimated_input_tokens: i64,
+) {
+    if completion.input_tokens <= 0 {
+        completion.input_tokens = estimated_input_tokens.max(1);
+    }
+    if completion.output_tokens <= 0 && !completion.text.is_empty() {
+        // One token per UTF-8 byte is a conservative tokenizer-independent
+        // ceiling. Providers occasionally omit output usage; recording zero
+        // would let rejected attempts bypass the generation spend boundary.
+        completion.output_tokens = i64::try_from(completion.text.len()).unwrap_or(i64::MAX);
+    }
+}
+
+struct ProviderAttemptGuard {
+    pool: crate::db::DbPool,
+    account_id: String,
+    request_id: String,
+    reservation_token: String,
+    requested_provider: String,
+    requested_model: String,
+    attempt_index: usize,
+    estimated_input_tokens: i64,
+    estimated_output_tokens: i64,
+    projected_bluey_cost: i64,
+    pending_outcome: AttemptOutcome,
+    started: std::time::Instant,
+    armed: bool,
+}
+
+impl ProviderAttemptGuard {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        pool: crate::db::DbPool,
+        account_id: &str,
+        request_id: String,
+        reservation_token: &str,
+        requested_provider: &str,
+        requested_model: &str,
+        attempt_index: usize,
+        estimated_input_tokens: i64,
+        projected_bluey_cost: i64,
+    ) -> Self {
+        Self {
+            pool,
+            account_id: account_id.to_string(),
+            request_id,
+            reservation_token: reservation_token.to_string(),
+            requested_provider: requested_provider.to_string(),
+            requested_model: requested_model.to_string(),
+            attempt_index,
+            estimated_input_tokens,
+            estimated_output_tokens: i64::from(MAX_MODEL_OUTPUT_TOKENS),
+            projected_bluey_cost,
+            pending_outcome: AttemptOutcome::RejectedCancelled,
+            started: std::time::Instant::now(),
+            armed: true,
         }
     }
 
+    fn settle(
+        &mut self,
+        completion: &routing::Completion,
+        bluey_cost: i64,
+        outcome: AttemptOutcome,
+    ) -> Result<()> {
+        // If persistence fails after a known completion, Drop must retry with
+        // at least the known cost and usage rather than the smaller entry hold.
+        self.projected_bluey_cost = self.projected_bluey_cost.max(bluey_cost);
+        self.estimated_input_tokens = completion.input_tokens.max(0);
+        self.estimated_output_tokens = completion.output_tokens.max(0);
+        self.pending_outcome = outcome;
+        let event = UsageEvent {
+            request_id: self.request_id.clone(),
+            kind: "jobs_resume_generation_attempt".to_string(),
+            task_type: Some(outcome.task_type().to_string()),
+            lane: Some("deep".to_string()),
+            // Durable accounting stays bound to the immutable requested route
+            // even when a provider returns crossed identity metadata.
+            provider: Some(self.requested_provider.clone()),
+            model: Some(self.requested_model.clone()),
+            input_tokens: completion.input_tokens.max(0),
+            output_tokens: completion.output_tokens.max(0),
+            latency_ms: self
+                .started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(i64::MAX),
+            cost_cents_to_bluey: self.projected_bluey_cost,
+            cost_cents_to_customer: 0,
+            was_speculative: false,
+            was_fallback: self.attempt_index > 0,
+        };
+        jobs_provider_cost_holds::settle_with_usage(
+            &self.pool,
+            &self.account_id,
+            &self.request_id,
+            &self.reservation_token,
+            self.projected_bluey_cost,
+            &event,
+        )?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn settle_uncertain(&mut self, outcome: AttemptOutcome) -> Result<()> {
+        let completion = routing::Completion {
+            text: String::new(),
+            provider: self.requested_provider.clone(),
+            model: self.requested_model.clone(),
+            input_tokens: self.estimated_input_tokens.max(1),
+            output_tokens: self.estimated_output_tokens.max(0),
+        };
+        self.settle(&completion, self.projected_bluey_cost, outcome)
+    }
+}
+
+impl Drop for ProviderAttemptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.settle_uncertain(self.pending_outcome) {
+            tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
+                request_id = %self.request_id,
+                error = %error,
+                "failed to conservatively settle a cancelled Jobs provider attempt"
+            );
+        }
+    }
+}
+
+fn attempt_request_id(
+    generation_key: &str,
+    reservation_token: &str,
+    attempt_index: usize,
+    provider: &str,
+    model: &str,
+) -> String {
+    let input = format!("{generation_key}|{reservation_token}|{attempt_index}|{provider}|{model}");
+    format!("jobs-resume-attempt-{}", hex::encode(Sha256::digest(input)))
+}
+
+fn finish_deterministic_fallback(
+    state: &AppState,
+    account_id: &str,
+    baseline: &ResumeVersion,
+    generation_key: &str,
+    reservation_token: &str,
+    reservation: &mut GenerationReservationGuard,
+) -> Result<GeneratedResume> {
     let output = json!({"fallback": "deterministic_baseline"});
     jobs_generation::complete(
         &state.pool,
@@ -292,39 +1012,31 @@ async fn generate_reserved(
         reservation_token,
         &output,
         "bluey",
-        "deterministic-fallback-v1",
+        "deterministic-fallback-v2",
         0,
         0,
         0,
     )?;
+    reservation.disarm();
     deterministic_fallback(baseline)
 }
 
-async fn provider_capacity(
-    state: &AppState,
-    provider: &str,
-    generation_key: &str,
-) -> std::result::Result<(), u64> {
-    let limiter = match provider {
-        "openai" => &state.rate_limiters.provider_openai_llm,
-        "anthropic" => &state.rate_limiters.provider_anthropic_llm,
-        "gemini" => &state.rate_limiters.provider_gemini_llm,
-        "deepseek" => &state.rate_limiters.provider_deepseek_llm,
-        "zai" => &state.rate_limiters.provider_zai_llm,
-        _ => return Err(60),
-    };
-    limiter.check(generation_key).await
+fn finish_transient_deterministic_fallback(
+    baseline: &ResumeVersion,
+    reservation: &mut GenerationReservationGuard,
+) -> Result<GeneratedResume> {
+    // Managed routing was explicitly enabled, so limiter pressure, provider
+    // outages, and spend-guard denials must remain retryable. The caller still
+    // receives the deterministic review-first resume for this request.
+    reservation.fail("managed_generation_unavailable")?;
+    deterministic_fallback(baseline)
 }
 
-fn model_generation_enabled() -> bool {
-    std::env::var("BLUEY_JOBS_MODEL_GENERATION_ENABLED")
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off"
-            )
-        })
-        .unwrap_or(true)
+fn generation_log_ref(generation_key: &str) -> String {
+    hex::encode(Sha256::digest(generation_key.as_bytes()))
+        .chars()
+        .take(12)
+        .collect()
 }
 
 fn generation_key(
@@ -332,9 +1044,11 @@ fn generation_key(
     profile: &CareerProfile,
     posting: &JobPosting,
     baseline: &ResumeVersion,
+    managed_generation: bool,
 ) -> Result<String> {
     let input = json!({
         "schema_version": GENERATION_SCHEMA_VERSION,
+        "generation_mode": if managed_generation { "managed" } else { "deterministic" },
         "account_id": account_id,
         "profile": profile,
         "posting": posting,
@@ -345,13 +1059,11 @@ fn generation_key(
 }
 
 fn system_prompt() -> &'static str {
-    r#"You create one job-specific resume plan from verified candidate evidence.
-Return JSON only. Never invent or infer a skill, employer, title, degree, date, metric, certification, authorization fact, or location. Never copy candidate requirements from the job description into the candidate's history. Use exact skill strings and exact evidence IDs from the input.
+    r#"You rank verified candidate evidence for one job-specific resume.
+Return JSON only. Do not write or rewrite the headline, summary, skills, employers, titles, degrees, dates, metrics, certifications, authorization facts, or locations. Select only exact skill strings, exact evidence IDs, and existing array indexes from the input. Never copy candidate requirements from the job description into candidate evidence.
 
 The output schema is:
 {
-  "headline": "concise evidence-grounded headline",
-  "summary": "concise evidence-grounded summary",
   "headline_evidence_ids": ["evidence:id"],
   "summary_evidence_ids": ["evidence:id"],
   "skill_order": ["exact candidate skill"],
@@ -360,7 +1072,7 @@ The output schema is:
   "project_order": [0]
 }
 
-Include every employment and project index exactly once. Include every highlight index exactly once for every employment entry. Choose at most 16 skills. The headline and summary may rewrite selected evidence for clarity, but every meaningful word and every number must come from the selected evidence. Prefer the evidence that best answers the job description."#
+Select zero or one headline evidence ID and any non-duplicated summary evidence IDs whose exact text fits the resume. Bluey composes those exact records deterministically; do not return headline or summary text. An empty headline or summary selection preserves Bluey's deterministic baseline instead of deleting it. Include every employment and project index exactly once. Include every highlight index exactly once for every employment entry. Choose at most 16 skills. Prefer the evidence that best answers the job description."#
 }
 
 fn user_prompt(
@@ -368,23 +1080,43 @@ fn user_prompt(
     posting: &JobPosting,
     catalog: &EvidenceCatalog,
 ) -> Result<String> {
+    let job = json!({
+        "company": posting.company,
+        "title": posting.title,
+        "location": posting.location,
+        "description": posting.description,
+        "employment_type": posting.employment_type,
+    });
+    let candidate = json!({
+        "skills": profile.skills,
+        "employment": profile.employment,
+        "projects": profile.projects,
+        "certifications": profile.certifications,
+    });
+    ensure_json_size(&candidate, MAX_CANDIDATE_PROMPT_BYTES, "candidate profile")?;
+    ensure_json_size(&job, MAX_JOB_PROMPT_BYTES, "job posting")?;
     let input = json!({
-        "job": {
-            "company": posting.company,
-            "title": posting.title,
-            "location": posting.location,
-            "description": posting.description,
-            "employment_type": posting.employment_type,
-        },
-        "candidate": {
-            "skills": profile.skills,
-            "employment": profile.employment,
-            "projects": profile.projects,
-            "certifications": profile.certifications,
-        },
+        "job": job,
+        "candidate": candidate,
         "evidence_catalog": catalog.values,
     });
-    serde_json::to_string(&input).context("encode resume generation prompt")
+    let prompt = serde_json::to_string(&input).context("encode resume generation prompt")?;
+    if prompt.len() > MAX_USER_PROMPT_BYTES {
+        return Err(anyhow!(
+            "resume generation prompt exceeds {MAX_USER_PROMPT_BYTES} bytes"
+        ));
+    }
+    Ok(prompt)
+}
+
+fn ensure_json_size(value: &Value, max_bytes: usize, label: &str) -> Result<()> {
+    let size = serde_json::to_vec(value)
+        .with_context(|| format!("measure {label} for resume generation"))?
+        .len();
+    if size > max_bytes {
+        return Err(anyhow!("{label} exceeds {max_bytes} bytes"));
+    }
+    Ok(())
 }
 
 fn parse_plan(raw: &str) -> Result<ResumePlan> {
@@ -410,12 +1142,8 @@ fn validate_plan(
     catalog: &EvidenceCatalog,
     plan: ResumePlan,
 ) -> Result<ResumePlan> {
-    if plan.headline.chars().count() > MAX_HEADLINE_CHARS {
-        return Err(anyhow!("headline is too long"));
-    }
-    if plan.summary.chars().count() > MAX_SUMMARY_CHARS {
-        return Err(anyhow!("summary is too long"));
-    }
+    catalog.compose_headline(&plan.headline_evidence_ids)?;
+    catalog.compose_summary(&plan.summary_evidence_ids)?;
     validate_permutation(
         &plan.employment_order,
         profile.employment.len(),
@@ -455,16 +1183,6 @@ fn validate_plan(
         }
         seen_skills.push(skill);
     }
-    validate_narrative(
-        &plan.headline,
-        &catalog.selected_text(&plan.headline_evidence_ids)?,
-        "headline",
-    )?;
-    validate_narrative(
-        &plan.summary,
-        &catalog.selected_text(&plan.summary_evidence_ids)?,
-        "summary",
-    )?;
     Ok(plan)
 }
 
@@ -480,99 +1198,6 @@ fn validate_permutation(values: &[usize], expected_len: usize, label: &str) -> R
         ));
     }
     Ok(())
-}
-
-fn validate_narrative(value: &str, evidence: &str, label: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        return Ok(());
-    }
-    if evidence.trim().is_empty() {
-        return Err(anyhow!("{label} has no selected evidence"));
-    }
-    let evidence_tokens = normalized_tokens(evidence);
-    for token in normalized_tokens(value) {
-        if is_stop_word(&token) || token.len() <= 3 {
-            continue;
-        }
-        if !evidence_tokens
-            .iter()
-            .any(|candidate| token_matches(&token, candidate))
-        {
-            return Err(anyhow!("{label} contains unsupported word: {token}"));
-        }
-    }
-    let evidence_numbers: Vec<String> = evidence_tokens
-        .iter()
-        .filter(|token| token.chars().any(|character| character.is_ascii_digit()))
-        .cloned()
-        .collect();
-    for token in normalized_tokens(value)
-        .into_iter()
-        .filter(|token| token.chars().any(|character| character.is_ascii_digit()))
-    {
-        if !evidence_numbers.contains(&token) {
-            return Err(anyhow!("{label} contains an unsupported number"));
-        }
-    }
-    Ok(())
-}
-
-fn normalized_tokens(value: &str) -> Vec<String> {
-    let mut normalized = String::with_capacity(value.len());
-    for character in value.chars().flat_map(char::to_lowercase) {
-        if character.is_ascii_alphanumeric() {
-            normalized.push(character);
-        } else {
-            normalized.push(' ');
-        }
-    }
-    normalized.split_whitespace().map(str::to_string).collect()
-}
-
-fn token_matches(left: &str, right: &str) -> bool {
-    left == right || stem(left) == stem(right)
-}
-
-fn stem(value: &str) -> &str {
-    for suffix in ["ing", "ed", "es", "s"] {
-        if value.len() > suffix.len() + 4 && value.ends_with(suffix) {
-            return &value[..value.len() - suffix.len()];
-        }
-    }
-    value
-}
-
-fn is_stop_word(value: &str) -> bool {
-    matches!(
-        value,
-        "a" | "an"
-            | "and"
-            | "as"
-            | "at"
-            | "by"
-            | "for"
-            | "from"
-            | "in"
-            | "into"
-            | "of"
-            | "on"
-            | "or"
-            | "the"
-            | "to"
-            | "with"
-            | "across"
-            | "using"
-            | "through"
-            | "who"
-            | "that"
-            | "this"
-            | "their"
-            | "its"
-            | "is"
-            | "are"
-            | "was"
-            | "were"
-    )
 }
 
 fn deterministic_fallback(baseline: &ResumeVersion) -> Result<GeneratedResume> {
@@ -608,16 +1233,33 @@ fn materialize(
     plan: &ResumePlan,
     kind: &str,
 ) -> Result<GeneratedResume> {
+    let catalog = EvidenceCatalog::from_profile(profile);
     if kind == "model" {
-        validate_plan(
-            profile,
-            &EvidenceCatalog::from_profile(profile),
-            plan.clone(),
-        )?;
+        validate_plan(profile, &catalog, plan.clone())?;
     }
+    let headline = if plan.headline_evidence_ids.is_empty() {
+        baseline
+            .content
+            .get("headline")
+            .and_then(Value::as_str)
+            .unwrap_or(&profile.headline)
+            .to_string()
+    } else {
+        catalog.compose_headline(&plan.headline_evidence_ids)?
+    };
+    let summary = if plan.summary_evidence_ids.is_empty() {
+        baseline
+            .content
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or(&profile.summary)
+            .to_string()
+    } else {
+        catalog.compose_summary(&plan.summary_evidence_ids)?
+    };
     let mut content = baseline.content.clone();
-    content["headline"] = json!(plan.headline);
-    content["summary"] = json!(plan.summary);
+    content["headline"] = json!(headline);
+    content["summary"] = json!(summary);
     content["skills"] = json!(plan.skill_order);
 
     let highlight_orders: BTreeMap<usize, &HighlightOrder> = plan
@@ -653,7 +1295,15 @@ fn materialize(
         "claims_added": 0,
     });
     content["provenance"]["resume_generation"] = public_provenance.clone();
-    let diff = build_diff(profile, plan, &employment, &projects, kind);
+    let diff = build_diff(
+        profile,
+        plan,
+        &headline,
+        &summary,
+        &employment,
+        &projects,
+        kind,
+    );
     Ok(GeneratedResume {
         content,
         diff,
@@ -664,21 +1314,23 @@ fn materialize(
 fn build_diff(
     profile: &CareerProfile,
     plan: &ResumePlan,
+    headline: &str,
+    summary: &str,
     employment: &[jobs::EmploymentEntry],
     projects: &[jobs::ProjectEntry],
     kind: &str,
 ) -> Value {
     let mut diff = serde_json::Map::new();
-    if profile.headline.trim() != plan.headline.trim() {
+    if profile.headline.trim() != headline.trim() {
         diff.insert(
             "headline".to_string(),
-            json!({"before": profile.headline, "after": plan.headline}),
+            json!({"before": profile.headline, "after": headline}),
         );
     }
-    if profile.summary.trim() != plan.summary.trim() {
+    if profile.summary.trim() != summary.trim() {
         diff.insert(
             "summary".to_string(),
-            json!({"before": profile.summary, "after": plan.summary}),
+            json!({"before": profile.summary, "after": summary}),
         );
     }
     if profile.skills != plan.skill_order {
@@ -725,7 +1377,7 @@ fn build_diff(
     diff.insert(
         "evidence_policy".to_string(),
         json!(if kind == "model" {
-            "A managed model ranked and rewrote verified profile evidence. No new factual claims were added."
+            "A managed model ranked verified profile evidence. Bluey composed exact evidence records without model-authored facts."
         } else {
             "Verified profile facts only; Bluey used deterministic relevance ranking because model generation was unavailable."
         }),
@@ -737,7 +1389,10 @@ fn build_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::jobs::{EmploymentEntry, ProjectEntry};
+    use crate::db::{
+        self,
+        jobs::{EmploymentEntry, ProjectEntry},
+    };
 
     fn profile() -> CareerProfile {
         CareerProfile {
@@ -766,8 +1421,6 @@ mod tests {
 
     fn valid_plan() -> ResumePlan {
         ResumePlan {
-            headline: "Software Engineer".into(),
-            summary: "Built reliable distributed systems for healthcare teams.".into(),
             headline_evidence_ids: vec!["profile:headline".into()],
             summary_evidence_ids: vec!["profile:summary".into()],
             skill_order: vec!["Rust".into(), "PostgreSQL".into()],
@@ -780,6 +1433,47 @@ mod tests {
         }
     }
 
+    fn posting() -> JobPosting {
+        serde_json::from_value(json!({
+            "company": "Example",
+            "title": "Engineer",
+            "description": "Build reliable systems"
+        }))
+        .unwrap()
+    }
+
+    fn generation_pool_with_job() -> (crate::db::DbPool, String, String) {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-resume-generation-boundary-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = db::open_pool(&path).unwrap();
+        db::run_migrations(&pool).unwrap();
+        let account_id = uuid::Uuid::new_v4().to_string();
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp_millis();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining) \
+                 VALUES (?1, 'generation-boundary@bluey.test', 'hash', 0)",
+                rusqlite::params![account_id],
+            )
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_postings (id, account_id, canonical_key, posting_json, source, \
+                 canonical_url, company, title, location, match_score, status, created_at_ms, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, '{}', 'test', NULL, 'Example', 'Engineer', NULL, 0, \
+                 'matched', ?4, ?4)",
+                rusqlite::params![job_id, account_id, format!("test:{job_id}"), now],
+            )
+            .unwrap();
+        (pool, account_id, job_id)
+    }
+
     #[test]
     fn parses_fenced_json() {
         let raw = format!(
@@ -790,16 +1484,79 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_skill_and_new_number() {
+    fn rejects_unknown_skill_and_duplicate_evidence() {
         let profile = profile();
         let catalog = EvidenceCatalog::from_profile(&profile);
         let mut unknown_skill = valid_plan();
         unknown_skill.skill_order.push("Kubernetes".into());
         assert!(validate_plan(&profile, &catalog, unknown_skill).is_err());
 
-        let mut invented_metric = valid_plan();
-        invented_metric.summary = "Built reliable systems with 99 percent uptime.".into();
-        assert!(validate_plan(&profile, &catalog, invented_metric).is_err());
+        let mut duplicate_evidence = valid_plan();
+        duplicate_evidence
+            .summary_evidence_ids
+            .push("profile:summary".into());
+        assert!(validate_plan(&profile, &catalog, duplicate_evidence).is_err());
+
+        let mut company_as_title = valid_plan();
+        company_as_title.headline_evidence_ids = vec!["employment:0:company".into()];
+        assert!(validate_plan(&profile, &catalog, company_as_title).is_err());
+    }
+
+    #[test]
+    fn rejects_model_authored_short_credentials_titles_and_metrics() {
+        let mut attempted = serde_json::to_value(valid_plan()).unwrap();
+        attempted["headline"] = json!("CEO, PhD, AWS");
+        attempted["summary"] = json!("Increased revenue by 30 percent using AI and ML.");
+        assert!(parse_plan(&attempted.to_string()).is_err());
+    }
+
+    #[test]
+    fn exact_composition_cannot_reassign_a_metric_between_evidence_records() {
+        let mut profile = profile();
+        profile.summary = "Increased revenue for the platform.".into();
+        profile.employment[0].highlights[0] = "Reduced latency by 30 percent.".into();
+        let mut plan = valid_plan();
+        plan.summary_evidence_ids =
+            vec!["profile:summary".into(), "employment:0:highlight:0".into()];
+        let baseline = ResumeVersion {
+            id: "resume-1".into(),
+            job_id: "job-1".into(),
+            version_no: 1,
+            mode: "factual".into(),
+            content: json!({"provenance": {}}),
+            diff: json!({}),
+            claim_ids: Vec::new(),
+            checksum: "checksum".into(),
+            created_at_ms: 1,
+        };
+        let generated = materialize(&profile, &baseline, &plan, "model").unwrap();
+        assert_eq!(
+            generated.content["summary"],
+            "Increased revenue for the platform. • Reduced latency by 30 percent."
+        );
+        assert_ne!(
+            generated.content["summary"],
+            "Increased revenue by 30 percent for the platform."
+        );
+    }
+
+    #[test]
+    fn preserves_legitimate_short_credentials_only_when_the_evidence_contains_them() {
+        let mut profile = profile();
+        profile.headline = "VP".into();
+        profile.summary = "AWS and GCP certified engineer.".into();
+        let catalog = EvidenceCatalog::from_profile(&profile);
+        let plan = valid_plan();
+        assert_eq!(
+            catalog
+                .compose_headline(&plan.headline_evidence_ids)
+                .unwrap(),
+            "VP"
+        );
+        assert_eq!(
+            catalog.compose_summary(&plan.summary_evidence_ids).unwrap(),
+            "AWS and GCP certified engineer."
+        );
     }
 
     #[test]
@@ -835,6 +1592,363 @@ mod tests {
             "model"
         );
         assert_eq!(generated.diff["claims_added"], json!([]));
+    }
+
+    #[test]
+    fn prompt_caps_reject_oversized_profile_and_job_text() {
+        let mut oversized_profile = profile();
+        oversized_profile.employment[0].highlights = vec!["x".repeat(MAX_CANDIDATE_PROMPT_BYTES)];
+        let posting = posting();
+        let catalog = EvidenceCatalog::from_profile(&oversized_profile);
+        assert!(user_prompt(&oversized_profile, &posting, &catalog).is_err());
+
+        let profile = profile();
+        let mut oversized_posting = posting;
+        oversized_posting.description = "x".repeat(MAX_JOB_PROMPT_BYTES);
+        let catalog = EvidenceCatalog::from_profile(&profile);
+        assert!(user_prompt(&profile, &oversized_posting, &catalog).is_err());
+    }
+
+    #[test]
+    fn model_generation_is_default_off_and_requires_an_explicit_true_value() {
+        assert!(!model_generation_enabled_value(None));
+        assert!(!model_generation_enabled_value(Some("")));
+        assert!(!model_generation_enabled_value(Some("false")));
+        assert!(!model_generation_enabled_value(Some("surprise")));
+        assert!(model_generation_enabled_value(Some("1")));
+        assert!(model_generation_enabled_value(Some("YES")));
+    }
+
+    #[test]
+    fn cost_and_attempt_boundaries_are_deterministic() {
+        let known = estimated_route_bluey_cost("openai", "gpt-5.4-mini", 1_000, 500);
+        assert!(known.is_some_and(|cost| cost > 0));
+        assert!(estimated_route_bluey_cost("openai", "missing", 1_000, 500).is_none());
+        let price = pricing::lookup("openai", "gpt-5.4-mini").unwrap();
+        let completion = routing::Completion {
+            text: String::new(),
+            provider: "openai".into(),
+            model: "gpt-5.4-mini".into(),
+            input_tokens: 1_000,
+            output_tokens: 500,
+        };
+        assert_eq!(
+            completed_bluey_cost(price, &completion),
+            pricing::compute_cost(price, 1_000, 500).0
+        );
+        assert!(
+            completed_bluey_cost(
+                price,
+                &routing::Completion {
+                    input_tokens: i64::MAX,
+                    output_tokens: i64::MAX,
+                    ..completion
+                }
+            ) > MAX_ATTEMPT_BLUEY_COST_CENTS
+        );
+        assert_ne!(
+            attempt_request_id("generation", "lease-a", 0, "openai", "model"),
+            attempt_request_id("generation", "lease-b", 0, "openai", "model")
+        );
+        assert!(MODEL_GENERATION_DEADLINE < jobs_generation::RESERVATION_TTL);
+    }
+
+    #[test]
+    fn provider_deadlines_leave_a_settlement_margin_before_the_lease_ttl() {
+        assert!(
+            MODEL_ATTEMPT_TIMEOUT * u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap()
+                <= MODEL_GENERATION_DEADLINE
+        );
+        assert!(
+            MODEL_GENERATION_DEADLINE + Duration::from_secs(30) < jobs_generation::RESERVATION_TTL
+        );
+    }
+
+    #[test]
+    fn cancellation_guard_marks_the_generation_failed_and_immediately_restartable() {
+        let (pool, account_id, job_id) = generation_pool_with_job();
+        let ResumeGenerationReservation::Start(first) =
+            jobs_generation::reserve(&pool, &account_id, &job_id, "cancelled-generation").unwrap()
+        else {
+            panic!("first worker should own the generation")
+        };
+        {
+            let _guard = GenerationReservationGuard::new(
+                pool.clone(),
+                &account_id,
+                &job_id,
+                "cancelled-generation",
+                &first.reservation_token,
+            );
+        }
+        let (status, failure_code): (String, Option<String>) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT status, failure_code FROM jobs_resume_generations \
+                 WHERE account_id = ?1 AND generation_key = ?2",
+                rusqlite::params![account_id, "cancelled-generation"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(failure_code.as_deref(), Some("cancelled"));
+        let ResumeGenerationReservation::Start(second) =
+            jobs_generation::reserve(&pool, &account_id, &job_id, "cancelled-generation").unwrap()
+        else {
+            panic!("cancelled generation should be immediately restartable")
+        };
+        assert_ne!(first.reservation_token, second.reservation_token);
+    }
+
+    #[test]
+    fn provider_spend_keeps_the_jobs_packet_slot_consumed_after_generation_failure() {
+        let (pool, account_id, job_id) = generation_pool_with_job();
+        let ResumeGenerationReservation::Start(generation) =
+            jobs_generation::reserve(&pool, &account_id, &job_id, "spent-generation").unwrap()
+        else {
+            panic!("generation reservation must start")
+        };
+        assert_eq!(
+            jobs_generation_allowance::reserve(
+                &pool,
+                &account_id,
+                &job_id,
+                "spent-generation",
+                &generation.reservation_token,
+            )
+            .unwrap(),
+            AllowanceReservation::Reserved
+        );
+        let attempt_request_id = "spent-generation:attempt:0";
+        let hold_token = match jobs_provider_cost_holds::reserve(
+            &pool,
+            &account_id,
+            "spent-generation",
+            &generation.reservation_token,
+            attempt_request_id,
+            "openai",
+            "gpt-5.4-mini",
+            2,
+            MAX_GENERATION_BLUEY_COST_CENTS,
+            crate::config::UpstreamSpendGuard {
+                limit_cents: 100,
+                window_hours: 24,
+            },
+        )
+        .unwrap()
+        {
+            CostHoldReservation::Held { reservation_token } => reservation_token,
+            other => panic!("expected provider hold, got {other:?}"),
+        };
+        jobs_provider_cost_holds::settle_with_usage(
+            &pool,
+            &account_id,
+            attempt_request_id,
+            &hold_token,
+            2,
+            &UsageEvent {
+                request_id: attempt_request_id.into(),
+                kind: "jobs_resume_generation_attempt".into(),
+                task_type: Some("jobs_resume_tailoring_rejected_provider_error".into()),
+                lane: Some("deep".into()),
+                provider: Some("openai".into()),
+                model: Some("gpt-5.4-mini".into()),
+                input_tokens: 10,
+                output_tokens: 0,
+                latency_ms: 1,
+                cost_cents_to_bluey: 2,
+                cost_cents_to_customer: 0,
+                was_speculative: false,
+                was_fallback: false,
+            },
+        )
+        .unwrap();
+        jobs_generation::fail(
+            &pool,
+            &account_id,
+            "spent-generation",
+            &generation.reservation_token,
+            "provider_failed",
+        )
+        .unwrap();
+
+        assert!(
+            !jobs_generation_allowance::release(
+                &pool,
+                &account_id,
+                &job_id,
+                "spent-generation",
+                &generation.reservation_token,
+            )
+            .unwrap(),
+            "a provider-billed generation must not refund its included packet slot"
+        );
+        let (used_packets, allowance_status): (i64, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT e.used_packets, r.status
+                   FROM jobs_entitlements e
+                   JOIN jobs_generation_allowance_reservations r
+                     ON r.account_id = e.account_id
+                  WHERE e.account_id = ?1 AND r.job_id = ?2",
+                rusqlite::params![account_id, job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(used_packets, 1);
+        assert_eq!(allowance_status, "reserved");
+    }
+
+    #[test]
+    fn crossing_the_lease_ttl_cannot_commit_late_model_output() {
+        let (pool, account_id, job_id) = generation_pool_with_job();
+        let ResumeGenerationReservation::Start(first) =
+            jobs_generation::reserve(&pool, &account_id, &job_id, "expired-generation").unwrap()
+        else {
+            panic!("first worker should own the generation")
+        };
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_resume_generations SET updated_at_ms = 0 \
+                 WHERE account_id = ?1 AND generation_key = ?2",
+                rusqlite::params![account_id, "expired-generation"],
+            )
+            .unwrap();
+        assert!(jobs_generation::complete(
+            &pool,
+            &account_id,
+            "expired-generation",
+            &first.reservation_token,
+            &json!({"late": true}),
+            "openai",
+            "gpt-5.4-mini",
+            10,
+            10,
+            1,
+        )
+        .is_err());
+        let ResumeGenerationReservation::Start(second) =
+            jobs_generation::reserve(&pool, &account_id, &job_id, "expired-generation").unwrap()
+        else {
+            panic!("expired generation should be reclaimable")
+        };
+        assert_ne!(first.reservation_token, second.reservation_token);
+    }
+
+    #[test]
+    fn rejected_provider_output_is_durably_settled_before_retry() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-resume-attempt-accounting-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = db::open_pool(&path).unwrap();
+        db::run_migrations(&pool).unwrap();
+        let account = db::accounts::Account::create(&pool, "attempt@bluey.test", "hash").unwrap();
+        let completion = routing::Completion {
+            text: "rejected".into(),
+            provider: "openai".into(),
+            model: "gpt-5.4-mini".into(),
+            input_tokens: 100,
+            output_tokens: 50,
+        };
+        let request_id = attempt_request_id(
+            "generation",
+            "reservation",
+            0,
+            &completion.provider,
+            &completion.model,
+        );
+        assert!(matches!(
+            jobs_provider_cost_holds::reserve(
+                &pool,
+                &account.id,
+                "generation",
+                "reservation",
+                &request_id,
+                &completion.provider,
+                &completion.model,
+                3,
+                MAX_GENERATION_BLUEY_COST_CENTS,
+                crate::config::UpstreamSpendGuard {
+                    limit_cents: 4,
+                    window_hours: 24,
+                },
+            )
+            .unwrap(),
+            CostHoldReservation::Held { .. }
+        ));
+        let mut attempt = ProviderAttemptGuard::new(
+            pool.clone(),
+            &account.id,
+            request_id.clone(),
+            "reservation",
+            &completion.provider,
+            &completion.model,
+            0,
+            100,
+            3,
+        );
+        attempt
+            .settle(&completion, 3, AttemptOutcome::RejectedTruth)
+            .unwrap();
+        let (task_type, provider, model, cost): (String, String, String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT task_type, provider, model, cost_cents_to_bluey FROM usage_events \
+                 WHERE account_id = ?1 AND kind = 'jobs_resume_generation_attempt'",
+                rusqlite::params![account.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(task_type, AttemptOutcome::RejectedTruth.task_type());
+        assert_eq!(provider, "openai");
+        assert_eq!(model, "gpt-5.4-mini");
+        assert_eq!(cost, 3);
+        assert!(matches!(
+            jobs_provider_cost_holds::reserve(
+                &pool,
+                &account.id,
+                "generation-2",
+                "reservation-2",
+                "second-attempt",
+                "openai",
+                "gpt-5.4-mini",
+                1,
+                MAX_GENERATION_BLUEY_COST_CENTS,
+                crate::config::UpstreamSpendGuard {
+                    limit_cents: 4,
+                    window_hours: 24,
+                },
+            )
+            .unwrap(),
+            CostHoldReservation::Held { .. }
+        ));
+        // The provider attempt event and durable hold are one exposure, not
+        // two. The exact boundary admits cost 3 + 1, then denies another cent.
+        assert_eq!(
+            jobs_provider_cost_holds::reserve(
+                &pool,
+                &account.id,
+                "generation-3",
+                "reservation-3",
+                "third-attempt",
+                "openai",
+                "gpt-5.4-mini",
+                1,
+                MAX_GENERATION_BLUEY_COST_CENTS,
+                crate::config::UpstreamSpendGuard {
+                    limit_cents: 4,
+                    window_hours: 24,
+                },
+            )
+            .unwrap(),
+            CostHoldReservation::GlobalLimit
+        );
     }
 
     #[test]

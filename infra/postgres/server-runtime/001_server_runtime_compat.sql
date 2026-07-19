@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
   account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   request_id TEXT NOT NULL,
   ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  origin TEXT NOT NULL DEFAULT 'legacy_unverified',
   kind TEXT NOT NULL,
   task_type TEXT,
   lane TEXT,
@@ -149,7 +150,8 @@ CREATE TABLE IF NOT EXISTS usage_events (
   cost_cents_to_bluey BIGINT NOT NULL DEFAULT 0,
   cost_cents_to_customer BIGINT NOT NULL DEFAULT 0,
   was_speculative INTEGER NOT NULL DEFAULT 0,
-  was_fallback INTEGER NOT NULL DEFAULT 0
+  was_fallback INTEGER NOT NULL DEFAULT 0,
+  CHECK (origin IN ('server', 'client', 'legacy_unverified'))
 );
 CREATE INDEX IF NOT EXISTS idx_usage_events_account_ts
   ON usage_events(account_id, ts);

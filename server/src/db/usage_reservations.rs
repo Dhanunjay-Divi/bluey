@@ -9,7 +9,15 @@
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
-use crate::db::{balance, DbPool};
+use crate::config::UpstreamSpendGuard;
+use crate::db::{
+    balance,
+    usage::{
+        UsageEvent, CUTOVER_SPEND_BASELINE_GRACE_MS, MAX_AUTHORITATIVE_EVENT_COST_CENTS,
+        MAX_AUTHORITATIVE_EVENT_LATENCY_MS, MAX_AUTHORITATIVE_EVENT_TOKENS,
+    },
+    DbPool,
+};
 
 const STATUS_RESERVED: &str = "reserved";
 const STATUS_SETTLED: &str = "settled";
@@ -23,6 +31,7 @@ pub(crate) struct ReserveUsageInput<'a> {
     pub reason: &'a str,
     pub estimated_customer_cents: i64,
     pub estimated_upstream_cents: i64,
+    pub upstream_spend_guard: Option<UpstreamSpendGuard>,
     pub created_at_ms: i64,
     pub expires_at_ms: i64,
 }
@@ -55,6 +64,14 @@ pub(crate) struct SettledUsage {
     pub trial_seconds_remaining: i64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SettlementUsageEvent {
+    pub event: UsageEvent,
+    /// Desired customer charge for this component before reservation/trial
+    /// settlement. Components are funded in slice order.
+    pub customer_cost_cents: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReleasedUsage {
     pub attempt: i64,
@@ -80,6 +97,8 @@ pub(crate) enum UsageReservationError {
     AlreadyReleased,
     #[error("managed usage reservation was not found")]
     NotFound,
+    #[error("global upstream spend limit would be exceeded")]
+    UpstreamSpendLimit,
     #[error(transparent)]
     Db(#[from] anyhow::Error),
 }
@@ -137,6 +156,8 @@ fn validate_reserve_input(input: ReserveUsageInput<'_>) -> Result<(), UsageReser
         || input.reason.trim().is_empty()
         || input.estimated_customer_cents < 0
         || input.estimated_upstream_cents < 0
+        || input.estimated_customer_cents > MAX_AUTHORITATIVE_EVENT_COST_CENTS
+        || input.estimated_upstream_cents > MAX_AUTHORITATIVE_EVENT_COST_CENTS
         || input.expires_at_ms <= input.created_at_ms
     {
         return Err(UsageReservationError::InvalidReservation);
@@ -185,6 +206,79 @@ fn reserve_sqlite(
         .optional()
         .map_err(|error| UsageReservationError::Db(error.into()))?;
     let attempt = next_attempt(existing.as_ref())?;
+    if let Some(guard) = input.upstream_spend_guard {
+        let baseline_retention_ms = guard
+            .window_hours
+            .max(0)
+            .saturating_mul(3_600_000)
+            .saturating_add(CUTOVER_SPEND_BASELINE_GRACE_MS);
+        tx.execute(
+            "DELETE FROM usage_cutover_spend_baseline
+              WHERE occurred_at < datetime('now', ?1)",
+            params![format!("-{} seconds", baseline_retention_ms / 1_000)],
+        )
+        .map_err(|error| UsageReservationError::Db(error.into()))?;
+        let usage_without_jobs_holds = super::usage::sqlite_saturated_cost_sum(
+            &tx,
+            "SELECT u.cost_cents_to_bluey
+                   FROM usage_events u
+                  WHERE u.origin = 'server' AND u.ts >= datetime('now', ?1)
+                    AND substr(u.kind, -8) != '_attempt'",
+            params![format!("-{} hours", guard.window_hours)],
+        )
+        .map_err(UsageReservationError::Db)?;
+        let window_start = input
+            .created_at_ms
+            .saturating_sub(guard.window_hours.saturating_mul(3_600_000));
+        let jobs_exposure = super::usage::sqlite_saturated_cost_sum(
+            &tx,
+            "SELECT CASE WHEN status = 'held'
+                             THEN projected_cost_cents ELSE settled_cost_cents END
+                   FROM jobs_provider_cost_holds
+                  WHERE status IN ('held', 'settled') AND updated_at_ms >= ?1",
+            params![window_start],
+        )
+        .map_err(UsageReservationError::Db)?;
+        let cutover_baseline_exposure = super::usage::sqlite_saturated_cost_sum(
+            &tx,
+            "SELECT cost_cents FROM usage_cutover_spend_baseline
+              WHERE occurred_at >= datetime('now', ?1)",
+            params![format!("-{} hours", guard.window_hours)],
+        )
+        .map_err(UsageReservationError::Db)?;
+        let ordinary_exposure = super::usage::sqlite_saturated_cost_sum(
+            &tx,
+            "SELECT estimated_upstream_cents
+                   FROM usage_reservations r
+                  WHERE NOT (r.account_id = ?1 AND r.request_id = ?2)
+                    AND ((r.status = 'reserved' AND r.expires_at_ms > ?3)
+                      OR (r.status = 'settled'
+                        AND r.settled_at_ms >= ?4
+                        AND NOT EXISTS (
+                            SELECT 1 FROM usage_events u
+                             WHERE u.account_id = r.account_id
+                               AND u.request_id = r.request_id
+                               AND u.origin = 'server'
+                               AND u.kind = r.kind
+                        )))",
+            params![
+                input.account_id,
+                input.request_id,
+                input.created_at_ms,
+                window_start
+            ],
+        )
+        .map_err(UsageReservationError::Db)?;
+        if usage_without_jobs_holds
+            .saturating_add(jobs_exposure)
+            .saturating_add(cutover_baseline_exposure)
+            .saturating_add(ordinary_exposure)
+            .saturating_add(input.estimated_upstream_cents)
+            > guard.limit_cents
+        {
+            return Err(UsageReservationError::UpstreamSpendLimit);
+        }
+    }
     let active_trial_reservation: bool = tx
         .query_row(
             "SELECT EXISTS(
@@ -318,6 +412,11 @@ fn reserve_postgres(
     let mut tx = conn
         .transaction()
         .map_err(|error| UsageReservationError::Db(error.into()))?;
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended('jobs-provider-cost-global', 0))",
+        &[],
+    )
+    .map_err(|error| UsageReservationError::Db(error.into()))?;
 
     let row = tx
         .query_opt(
@@ -361,6 +460,90 @@ fn reserve_postgres(
         })
         .transpose()?;
     let attempt = next_attempt(existing.as_ref())?;
+    if let Some(guard) = input.upstream_spend_guard {
+        let baseline_retention_ms = guard
+            .window_hours
+            .max(0)
+            .saturating_mul(3_600_000)
+            .saturating_add(CUTOVER_SPEND_BASELINE_GRACE_MS);
+        tx.execute(
+            "DELETE FROM usage_cutover_spend_baseline
+              WHERE occurred_at < now() - ($1::bigint * interval '1 millisecond')",
+            &[&baseline_retention_ms],
+        )
+        .map_err(|error| UsageReservationError::Db(error.into()))?;
+        let usage_without_jobs_holds: i64 = tx
+            .query_one(
+                "SELECT LEAST(COALESCE(SUM(LEAST(GREATEST(u.cost_cents_to_bluey, 0), 100000000)::numeric), 0),
+                                  9223372036854775807)::bigint
+                   FROM usage_events u
+                  WHERE u.origin = 'server'
+                    AND u.ts >= now() - ($1::bigint * interval '1 hour')
+                    AND right(u.kind, 8) != '_attempt'",
+                &[&guard.window_hours],
+            )
+            .map_err(|error| UsageReservationError::Db(error.into()))?
+            .get(0);
+        let window_start = input
+            .created_at_ms
+            .saturating_sub(guard.window_hours.saturating_mul(3_600_000));
+        let jobs_exposure: i64 = tx
+            .query_one(
+                "SELECT LEAST(COALESCE(SUM(LEAST(GREATEST(CASE WHEN status = 'held'
+                                         THEN projected_cost_cents
+                                         ELSE settled_cost_cents END, 0), 100000000)::numeric), 0),
+                                  9223372036854775807)::bigint
+                   FROM jobs_provider_cost_holds
+                  WHERE status IN ('held', 'settled') AND updated_at_ms >= $1",
+                &[&window_start],
+            )
+            .map_err(|error| UsageReservationError::Db(error.into()))?
+            .get(0);
+        let cutover_baseline_exposure: i64 = tx
+            .query_one(
+                "SELECT LEAST(COALESCE(SUM(LEAST(GREATEST(cost_cents, 0), 100000000)::numeric), 0),
+                                  9223372036854775807)::bigint
+                   FROM usage_cutover_spend_baseline
+                  WHERE occurred_at >= now() - ($1::bigint * interval '1 hour')",
+                &[&guard.window_hours],
+            )
+            .map_err(|error| UsageReservationError::Db(error.into()))?
+            .get(0);
+        let ordinary_exposure: i64 = tx
+            .query_one(
+                "SELECT LEAST(COALESCE(SUM(LEAST(GREATEST(estimated_upstream_cents, 0), 100000000)::numeric), 0),
+                                  9223372036854775807)::bigint
+                   FROM usage_reservations r
+                  WHERE NOT (r.account_id = $1 AND r.request_id = $2)
+                    AND ((r.status = 'reserved' AND r.expires_at_ms > $3)
+                      OR (r.status = 'settled'
+                        AND r.settled_at_ms >= $4
+                        AND NOT EXISTS (
+                            SELECT 1 FROM usage_events u
+                             WHERE u.account_id = r.account_id
+                               AND u.request_id = r.request_id
+                               AND u.origin = 'server'
+                               AND u.kind = r.kind
+                        )))",
+                &[
+                    &input.account_id,
+                    &input.request_id,
+                    &input.created_at_ms,
+                    &window_start,
+                ],
+            )
+            .map_err(|error| UsageReservationError::Db(error.into()))?
+            .get(0);
+        if usage_without_jobs_holds
+            .saturating_add(jobs_exposure)
+            .saturating_add(cutover_baseline_exposure)
+            .saturating_add(ordinary_exposure)
+            .saturating_add(input.estimated_upstream_cents)
+            > guard.limit_cents
+        {
+            return Err(UsageReservationError::UpstreamSpendLimit);
+        }
+    }
     let active_trial_reservation: bool = tx
         .query_one(
             "SELECT EXISTS(
@@ -581,6 +764,7 @@ fn record_reserve_ledger_postgres(
     .map_err(UsageReservationError::Db)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn settle(
     pool: &DbPool,
     account_id: &str,
@@ -590,11 +774,44 @@ pub(crate) fn settle(
     reason: &str,
     settled_at_ms: i64,
 ) -> Result<SettledUsage, UsageReservationError> {
+    settle_with_events(
+        pool,
+        account_id,
+        request_id,
+        actual_customer_cents,
+        elapsed_ms,
+        reason,
+        settled_at_ms,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn settle_with_events(
+    pool: &DbPool,
+    account_id: &str,
+    request_id: &str,
+    actual_customer_cents: i64,
+    elapsed_ms: i64,
+    reason: &str,
+    settled_at_ms: i64,
+    components: &[SettlementUsageEvent],
+) -> Result<SettledUsage, UsageReservationError> {
     if account_id.trim().is_empty()
         || request_id.trim().is_empty()
         || reason.trim().is_empty()
         || actual_customer_cents < 0
         || elapsed_ms < 0
+        || components.iter().any(|component| {
+            component.customer_cost_cents < 0
+                || component.customer_cost_cents > MAX_AUTHORITATIVE_EVENT_COST_CENTS
+                || component.event.request_id.trim().is_empty()
+                || component.event.kind.trim().is_empty()
+        })
+        || (!components.is_empty()
+            && components.iter().fold(0i64, |sum, component| {
+                sum.saturating_add(component.customer_cost_cents)
+            }) != actual_customer_cents)
     {
         return Err(UsageReservationError::InvalidReservation);
     }
@@ -607,6 +824,7 @@ pub(crate) fn settle(
             elapsed_ms,
             reason,
             settled_at_ms,
+            components,
         ),
         DbPool::Postgres(_) => settle_postgres(
             pool,
@@ -616,10 +834,12 @@ pub(crate) fn settle(
             elapsed_ms,
             reason,
             settled_at_ms,
+            components,
         ),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settle_sqlite(
     pool: &DbPool,
     account_id: &str,
@@ -628,6 +848,7 @@ fn settle_sqlite(
     elapsed_ms: i64,
     reason: &str,
     settled_at_ms: i64,
+    components: &[SettlementUsageEvent],
 ) -> Result<SettledUsage, UsageReservationError> {
     let mut conn = pool.get().map_err(UsageReservationError::Db)?;
     let tx = conn
@@ -636,7 +857,22 @@ fn settle_sqlite(
     let account = account_snapshot_sqlite(&tx, account_id)?;
     let reservation = load_reservation_sqlite(&tx, account_id, request_id)?;
     if reservation.status == STATUS_SETTLED {
-        return settled_from_row(&reservation);
+        if reservation.actual_customer_cents != actual_customer_cents {
+            return Err(UsageReservationError::InvalidReservation);
+        }
+        let settled = settled_from_row(&reservation)?;
+        persist_settlement_events_sqlite(
+            &tx,
+            account_id,
+            request_id,
+            &reservation.kind,
+            components,
+            settled.charged_customer_cents,
+            true,
+        )?;
+        tx.commit()
+            .map_err(|error| UsageReservationError::Db(error.into()))?;
+        return Ok(settled);
     }
     if reservation.status == STATUS_RELEASED {
         return Err(UsageReservationError::AlreadyReleased);
@@ -730,6 +966,15 @@ fn settle_sqlite(
         actual_customer_cents,
         charged_customer_cents,
     )?;
+    persist_settlement_events_sqlite(
+        &tx,
+        account_id,
+        request_id,
+        &reservation.kind,
+        components,
+        charged_customer_cents,
+        false,
+    )?;
     tx.commit()
         .map_err(|error| UsageReservationError::Db(error.into()))?;
 
@@ -745,6 +990,7 @@ fn settle_sqlite(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settle_postgres(
     pool: &DbPool,
     account_id: &str,
@@ -753,15 +999,36 @@ fn settle_postgres(
     elapsed_ms: i64,
     reason: &str,
     settled_at_ms: i64,
+    components: &[SettlementUsageEvent],
 ) -> Result<SettledUsage, UsageReservationError> {
     let mut conn = pool.get_pg().map_err(UsageReservationError::Db)?;
     let mut tx = conn
         .transaction()
         .map_err(|error| UsageReservationError::Db(error.into()))?;
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended('jobs-provider-cost-global', 0))",
+        &[],
+    )
+    .map_err(|error| UsageReservationError::Db(error.into()))?;
     let account = account_snapshot_postgres(&mut tx, account_id)?;
     let reservation = load_reservation_postgres(&mut tx, account_id, request_id)?;
     if reservation.status == STATUS_SETTLED {
-        return settled_from_row(&reservation);
+        if reservation.actual_customer_cents != actual_customer_cents {
+            return Err(UsageReservationError::InvalidReservation);
+        }
+        let settled = settled_from_row(&reservation)?;
+        persist_settlement_events_postgres(
+            &mut tx,
+            account_id,
+            request_id,
+            &reservation.kind,
+            components,
+            settled.charged_customer_cents,
+            true,
+        )?;
+        tx.commit()
+            .map_err(|error| UsageReservationError::Db(error.into()))?;
+        return Ok(settled);
     }
     if reservation.status == STATUS_RELEASED {
         return Err(UsageReservationError::AlreadyReleased);
@@ -855,6 +1122,15 @@ fn settle_postgres(
         actual_customer_cents,
         charged_customer_cents,
     )?;
+    persist_settlement_events_postgres(
+        &mut tx,
+        account_id,
+        request_id,
+        &reservation.kind,
+        components,
+        charged_customer_cents,
+        false,
+    )?;
     tx.commit()
         .map_err(|error| UsageReservationError::Db(error.into()))?;
 
@@ -868,6 +1144,240 @@ fn settle_postgres(
         balance_cents_after: balance_after,
         trial_seconds_remaining: trial_after,
     })
+}
+
+fn allocated_settlement_events(
+    request_id: &str,
+    reservation_kind: &str,
+    components: &[SettlementUsageEvent],
+    charged_customer_cents: i64,
+) -> Result<Vec<UsageEvent>, UsageReservationError> {
+    if components.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !components.iter().any(|component| {
+        component.event.request_id == request_id && component.event.kind == reservation_kind
+    }) {
+        return Err(UsageReservationError::InvalidReservation);
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    let mut remaining = charged_customer_cents.max(0);
+    let mut events = Vec::with_capacity(components.len());
+    for component in components {
+        if !identities.insert((
+            component.event.request_id.as_str(),
+            component.event.kind.as_str(),
+        )) {
+            return Err(UsageReservationError::InvalidReservation);
+        }
+        let mut event = component.event.clone();
+        event.input_tokens = event.input_tokens.clamp(0, MAX_AUTHORITATIVE_EVENT_TOKENS);
+        event.output_tokens = event.output_tokens.clamp(0, MAX_AUTHORITATIVE_EVENT_TOKENS);
+        event.latency_ms = event
+            .latency_ms
+            .clamp(0, MAX_AUTHORITATIVE_EVENT_LATENCY_MS);
+        event.cost_cents_to_bluey = event
+            .cost_cents_to_bluey
+            .clamp(0, MAX_AUTHORITATIVE_EVENT_COST_CENTS);
+        let charged = component.customer_cost_cents.min(remaining);
+        event.cost_cents_to_customer = charged;
+        remaining = remaining.saturating_sub(charged);
+        events.push(event);
+    }
+    if remaining != 0 {
+        return Err(UsageReservationError::InvalidReservation);
+    }
+    Ok(events)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_usage_event_exists_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    event: &UsageEvent,
+) -> Result<bool, UsageReservationError> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM usage_events
+          WHERE account_id = ?1 AND request_id = ?2 AND kind = ?3
+            AND origin = 'server'
+            AND task_type IS ?4 AND lane IS ?5
+            AND provider IS ?6 AND model IS ?7
+            AND input_tokens = ?8 AND output_tokens = ?9
+            AND latency_ms = ?10 AND cost_cents_to_bluey = ?11
+            AND cost_cents_to_customer = ?12
+            AND was_speculative = ?13 AND was_fallback = ?14)",
+        params![
+            account_id,
+            event.request_id,
+            event.kind,
+            event.task_type,
+            event.lane,
+            event.provider,
+            event.model,
+            event.input_tokens,
+            event.output_tokens,
+            event.latency_ms,
+            event.cost_cents_to_bluey,
+            event.cost_cents_to_customer,
+            i64::from(event.was_speculative),
+            i64::from(event.was_fallback),
+        ],
+        |row| row.get(0),
+    )
+    .map_err(|error| UsageReservationError::Db(error.into()))
+}
+
+fn persist_settlement_events_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    request_id: &str,
+    reservation_kind: &str,
+    components: &[SettlementUsageEvent],
+    charged_customer_cents: i64,
+    replay: bool,
+) -> Result<(), UsageReservationError> {
+    for event in allocated_settlement_events(
+        request_id,
+        reservation_kind,
+        components,
+        charged_customer_cents,
+    )? {
+        let inserted = if replay {
+            0
+        } else {
+            tx.execute(
+                "INSERT OR IGNORE INTO usage_events
+                    (id, account_id, request_id, origin, kind, task_type, lane,
+                     provider, model, input_tokens, output_tokens, latency_ms,
+                     cost_cents_to_bluey, cost_cents_to_customer,
+                     was_speculative, was_fallback)
+                 VALUES (?1, ?2, ?3, 'server', ?4, ?5, ?6, ?7, ?8, ?9,
+                         ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    account_id,
+                    event.request_id,
+                    event.kind,
+                    event.task_type,
+                    event.lane,
+                    event.provider,
+                    event.model,
+                    event.input_tokens,
+                    event.output_tokens,
+                    event.latency_ms,
+                    event.cost_cents_to_bluey,
+                    event.cost_cents_to_customer,
+                    i64::from(event.was_speculative),
+                    i64::from(event.was_fallback),
+                ],
+            )
+            .map_err(|error| UsageReservationError::Db(error.into()))?
+        };
+        if inserted != 1 && !exact_usage_event_exists_sqlite(tx, account_id, &event)? {
+            return Err(UsageReservationError::Db(anyhow::anyhow!(
+                "authoritative usage event replay mismatch"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn exact_usage_event_exists_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    event: &UsageEvent,
+) -> Result<bool, UsageReservationError> {
+    let was_speculative = i32::from(event.was_speculative);
+    let was_fallback = i32::from(event.was_fallback);
+    tx.query_one(
+        "SELECT EXISTS(SELECT 1 FROM usage_events
+          WHERE account_id = $1 AND request_id = $2 AND kind = $3
+            AND origin = 'server'
+            AND task_type IS NOT DISTINCT FROM $4
+            AND lane IS NOT DISTINCT FROM $5
+            AND provider IS NOT DISTINCT FROM $6
+            AND model IS NOT DISTINCT FROM $7
+            AND input_tokens = $8 AND output_tokens = $9
+            AND latency_ms = $10 AND cost_cents_to_bluey = $11
+            AND cost_cents_to_customer = $12
+            AND was_speculative = $13 AND was_fallback = $14)",
+        &[
+            &account_id,
+            &event.request_id,
+            &event.kind,
+            &event.task_type,
+            &event.lane,
+            &event.provider,
+            &event.model,
+            &event.input_tokens,
+            &event.output_tokens,
+            &event.latency_ms,
+            &event.cost_cents_to_bluey,
+            &event.cost_cents_to_customer,
+            &was_speculative,
+            &was_fallback,
+        ],
+    )
+    .map(|row| row.get(0))
+    .map_err(|error| UsageReservationError::Db(error.into()))
+}
+
+fn persist_settlement_events_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    request_id: &str,
+    reservation_kind: &str,
+    components: &[SettlementUsageEvent],
+    charged_customer_cents: i64,
+    replay: bool,
+) -> Result<(), UsageReservationError> {
+    for event in allocated_settlement_events(
+        request_id,
+        reservation_kind,
+        components,
+        charged_customer_cents,
+    )? {
+        let was_speculative = i32::from(event.was_speculative);
+        let was_fallback = i32::from(event.was_fallback);
+        let inserted = if replay {
+            0
+        } else {
+            tx.execute(
+                "INSERT INTO usage_events
+                    (id, account_id, request_id, origin, kind, task_type, lane,
+                     provider, model, input_tokens, output_tokens, latency_ms,
+                     cost_cents_to_bluey, cost_cents_to_customer,
+                     was_speculative, was_fallback)
+                 VALUES ($1, $2, $3, 'server', $4, $5, $6, $7, $8, $9,
+                         $10, $11, $12, $13, $14, $15)
+                 ON CONFLICT (account_id, request_id, kind) DO NOTHING",
+                &[
+                    &uuid::Uuid::new_v4().to_string(),
+                    &account_id,
+                    &event.request_id,
+                    &event.kind,
+                    &event.task_type,
+                    &event.lane,
+                    &event.provider,
+                    &event.model,
+                    &event.input_tokens,
+                    &event.output_tokens,
+                    &event.latency_ms,
+                    &event.cost_cents_to_bluey,
+                    &event.cost_cents_to_customer,
+                    &was_speculative,
+                    &was_fallback,
+                ],
+            )
+            .map_err(|error| UsageReservationError::Db(error.into()))?
+        };
+        if inserted != 1 && !exact_usage_event_exists_postgres(tx, account_id, &event)? {
+            return Err(UsageReservationError::Db(anyhow::anyhow!(
+                "authoritative usage event replay mismatch"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn release(
@@ -999,6 +1509,11 @@ fn release_postgres(
     let mut tx = conn
         .transaction()
         .map_err(|error| UsageReservationError::Db(error.into()))?;
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended('jobs-provider-cost-global', 0))",
+        &[],
+    )
+    .map_err(|error| UsageReservationError::Db(error.into()))?;
     let account = account_snapshot_postgres(&mut tx, account_id)?;
     let reservation = load_reservation_postgres(&mut tx, account_id, request_id)?;
     if reservation.status == STATUS_SETTLED {
@@ -1503,6 +2018,7 @@ mod tests {
             reason: "llm_test",
             estimated_customer_cents,
             estimated_upstream_cents: estimated_customer_cents / 2,
+            upstream_spend_guard: None,
             created_at_ms,
             expires_at_ms,
         }
@@ -1550,6 +2066,74 @@ mod tests {
             1
         );
         assert_eq!(account_money(&pool, &account_id), (25, 75));
+    }
+
+    #[test]
+    fn anonymous_cutover_baseline_blocks_generic_reservation_until_window_and_grace_expire() {
+        let pool = temp_pool();
+        let account_id = create_paid_account(&pool, "usage-cutover@example.com", 100);
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO usage_cutover_spend_baseline(occurred_at, cost_cents)
+                 VALUES (datetime('now'), 7)",
+                [],
+            )
+            .unwrap();
+
+        let now = crate::db::jobs::now_ms();
+        let guard = UpstreamSpendGuard {
+            limit_cents: 10,
+            window_hours: 24,
+        };
+        let mut blocked = input(
+            &account_id,
+            "cutover-baseline-blocked",
+            8,
+            now,
+            now.saturating_add(60_000),
+        );
+        blocked.estimated_upstream_cents = 4;
+        blocked.upstream_spend_guard = Some(guard);
+        assert!(matches!(
+            reserve(&pool, blocked),
+            Err(UsageReservationError::UpstreamSpendLimit)
+        ));
+        assert_eq!(account_money(&pool, &account_id), (100, 0));
+
+        // Twenty-four-hour window plus the one-day cleanup grace has elapsed.
+        // The baseline no longer contributes to admission and is physically
+        // removed by the next guarded transaction.
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE usage_cutover_spend_baseline
+                    SET occurred_at = datetime('now', '-3 days')",
+                [],
+            )
+            .unwrap();
+        let mut admitted = input(
+            &account_id,
+            "cutover-baseline-expired",
+            8,
+            now.saturating_add(1),
+            now.saturating_add(60_001),
+        );
+        admitted.estimated_upstream_cents = 4;
+        admitted.upstream_spend_guard = Some(guard);
+        reserve(&pool, admitted).unwrap();
+        assert_eq!(account_money(&pool, &account_id), (92, 8));
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM usage_cutover_spend_baseline",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

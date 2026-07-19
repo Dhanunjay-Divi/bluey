@@ -543,6 +543,12 @@ pub struct JobApplication {
 pub struct PreparedApplicationDraft {
     pub application: JobApplication,
     pub baseline_resume: ResumeVersion,
+    /// Exact candidate snapshot used to build `baseline_resume` and its truth
+    /// fingerprint. Callers must use this snapshot for any async generation.
+    pub profile: CareerProfile,
+    /// Exact posting snapshot used for tailoring, generation, and the frozen
+    /// application receipt. Finalization rejects a concurrent posting refresh.
+    pub posting: JobPosting,
     expected_application: Option<ExpectedApplicationRevision>,
 }
 
@@ -1064,6 +1070,18 @@ fn parse_json<T: DeserializeOwned>(raw: String, label: &str) -> Result<T> {
     serde_json::from_str(&plain).with_context(|| format!("parse {label}"))
 }
 
+fn parse_application_json(
+    raw: String,
+    authoritative_id: &str,
+    authoritative_job_id: &str,
+    label: &str,
+) -> Result<JobApplication> {
+    let mut application: JobApplication = parse_json(raw, label)?;
+    application.id = authoritative_id.to_string();
+    application.job_id = authoritative_job_id.to_string();
+    Ok(application)
+}
+
 fn to_json<T: Serialize>(value: &T, label: &str) -> Result<String> {
     let plain = serde_json::to_string(value).with_context(|| format!("serialize {label}"))?;
     encrypt_payload(&plain).with_context(|| format!("encrypt {label}"))
@@ -1578,7 +1596,7 @@ pub fn delete_fact(pool: &DbPool, account_id: &str, fact_id: &str) -> Result<boo
 }
 
 pub fn get_preferences(pool: &DbPool, account_id: &str) -> Result<JobPreferences> {
-    let mut value = crate::db::run_blocking_db(|| match pool {
+    let value = crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             let raw: Option<String> = conn
@@ -1603,12 +1621,16 @@ pub fn get_preferences(pool: &DbPool, account_id: &str) -> Result<JobPreferences
                 .map(|value| value.unwrap_or_default())
         }
     })?;
+    Ok(enforce_job_preference_safety(value))
+}
+
+fn enforce_job_preference_safety(mut value: JobPreferences) -> JobPreferences {
     // An application email is an alias for one candidate, not a second
     // identity that can bypass employer-level submission safeguards.
     value.apply_once_per_company = true;
     value.daily_limit = default_daily_limit();
     value.max_posting_age_days = default_max_posting_age_days();
-    Ok(value)
+    value
 }
 
 pub fn save_preferences(
@@ -3417,8 +3439,16 @@ fn apply_discovery_authority(
     decision: &mut JobEligibilityDecision,
 ) -> Result<()> {
     let authorities = get_job_discovery_authority(pool, account_id, &posting.id)?;
+    apply_discovery_authorities(&authorities, decision);
+    Ok(())
+}
+
+fn apply_discovery_authorities(
+    authorities: &[JobDiscoveryAuthority],
+    decision: &mut JobEligibilityDecision,
+) {
     if authorities.is_empty() {
-        return Ok(());
+        return;
     }
     let now = now_ms();
     let runnable = authorities.iter().any(|authority| {
@@ -3431,7 +3461,7 @@ fn apply_discovery_authority(
         decision
             .passed_checks
             .push("discovery_source_healthy".to_string());
-        return Ok(());
+        return;
     }
 
     decision.can_auto_submit = false;
@@ -3455,6 +3485,31 @@ fn apply_discovery_authority(
         "discovery_source_unhealthy",
         message,
     );
+}
+
+fn enforce_application_finalization_eligibility(
+    application: &JobApplication,
+    posting: &JobPosting,
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+    reservations: &[AttemptReservation],
+    authorities: &[JobDiscoveryAuthority],
+) -> Result<()> {
+    let mut decision = build_job_eligibility(
+        posting,
+        profile,
+        preferences,
+        reservations,
+        false,
+        Some(application.id.as_str()),
+    );
+    apply_discovery_authorities(authorities, &mut decision);
+    if !decision.can_prepare {
+        anyhow::bail!("job eligibility changed while the application packet was generated")
+    }
+    if application.state == "queued" && !decision.can_auto_submit {
+        anyhow::bail!("auto-submit eligibility changed while the application packet was generated")
+    }
     Ok(())
 }
 
@@ -4258,85 +4313,44 @@ fn score_posting(
 }
 
 fn candidate_truth_fingerprint(profile: &CareerProfile) -> String {
-    let mut employment: Vec<String> = profile
-        .employment
-        .iter()
-        .map(|entry| {
-            [
-                entry.company.as_str(),
-                entry.title.as_str(),
-                entry.start_date.as_str(),
-                entry.end_date.as_str(),
-                if entry.current { "current" } else { "past" },
-            ]
-            .map(normalize_truth_text)
-            .join("|")
-        })
-        .collect();
-    employment.sort();
-
-    let mut education: Vec<String> = profile
-        .education
-        .iter()
-        .map(|entry| {
-            [
-                entry.school.as_str(),
-                entry.degree.as_str(),
-                entry.field.as_str(),
-                entry.start_date.as_str(),
-                entry.end_date.as_str(),
-            ]
-            .map(normalize_truth_text)
-            .join("|")
-        })
-        .collect();
-    education.sort();
-
-    let mut projects: Vec<String> = profile
-        .projects
-        .iter()
-        .map(|entry| {
-            [entry.name.as_str(), entry.role.as_str()]
-                .map(normalize_truth_text)
-                .join("|")
-        })
-        .collect();
-    projects.sort();
-
-    let mut certifications: Vec<String> = profile
-        .certifications
-        .iter()
-        .map(|value| normalize_truth_text(value))
-        .filter(|value| !value.is_empty())
-        .collect();
-    certifications.sort();
-
-    let payload = json!({
-        "full_name": normalize_truth_text(&profile.full_name),
-        "linkedin_url": normalize_truth_text(&profile.linkedin_url),
-        "employment": employment,
-        "education": education,
-        "projects": projects,
-        "certifications": certifications,
-    });
-    hex::encode(Sha256::digest(payload.to_string().as_bytes()))
+    // Fingerprint the exact candidate snapshot used to build the packet. The
+    // login/application email is intentionally excluded because the verified
+    // application identity is fenced separately, and `updated_at_ms` is not a
+    // candidate fact. Everything else can affect resume prose, form answers,
+    // eligibility, or user-visible contact data and must invalidate stale work.
+    let mut snapshot = profile.clone();
+    snapshot.email.clear();
+    snapshot.updated_at_ms = 0;
+    let encoded = serde_json::to_vec(&snapshot)
+        .expect("CareerProfile contains no serialization-fallible values");
+    hex::encode(Sha256::digest(encoded))
 }
 
-fn normalize_truth_text(value: &str) -> String {
-    let mut normalized = String::new();
-    let mut pending_separator = false;
-    for character in value.chars().flat_map(char::to_lowercase) {
-        if character.is_alphanumeric() {
-            if pending_separator && !normalized.is_empty() {
-                normalized.push(' ');
-            }
-            normalized.push(character);
-            pending_separator = false;
-        } else {
-            pending_separator = true;
-        }
-    }
-    normalized
+fn confirmed_facts_fingerprint(facts: &[CareerFact]) -> String {
+    let mut confirmed = facts
+        .iter()
+        .filter(|fact| fact.verification_status == "confirmed")
+        .cloned()
+        .collect::<Vec<_>>();
+    confirmed.sort_by(|left, right| left.id.cmp(&right.id));
+    let encoded = serde_json::to_vec(&confirmed)
+        .expect("CareerFact contains no serialization-fallible values");
+    hex::encode(Sha256::digest(encoded))
+}
+
+fn selected_application_identity<'a>(
+    track_identity_id: Option<&str>,
+    identities: &'a [ApplicationIdentity],
+) -> Option<&'a ApplicationIdentity> {
+    track_identity_id
+        .and_then(|identity_id| identities.iter().find(|item| item.id == identity_id))
+        .or_else(|| identities.iter().find(|item| item.is_default))
+        .filter(|item| item.verification_status == "verified")
+}
+
+fn posting_snapshot_fingerprint(posting: &JobPosting) -> Result<String> {
+    let encoded = serde_json::to_vec(posting).context("encode Jobs posting snapshot")?;
+    Ok(hex::encode(Sha256::digest(encoded)))
 }
 
 pub fn list_attempt_reservations(
@@ -4752,25 +4766,35 @@ pub fn list_applications(pool: &DbPool, account_id: &str) -> Result<Vec<JobAppli
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             let mut stmt = conn.prepare(
-                "SELECT application_json FROM jobs_applications
+                "SELECT id, job_id, application_json FROM jobs_applications
                   WHERE account_id = ?1 ORDER BY updated_at_ms DESC",
             )?;
             let raws = stmt
-                .query_map(params![account_id], |row| row.get::<_, String>(0))?
+                .query_map(params![account_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             raws.into_iter()
-                .map(|raw| parse_json(raw, "job application"))
+                .map(|(id, job_id, raw)| {
+                    parse_application_json(raw, &id, &job_id, "job application")
+                })
                 .collect()
         }
         DbPool::Postgres(_) => pool
             .get_pg()?
             .query(
-                "SELECT application_json FROM jobs_applications
+                "SELECT id, job_id, application_json FROM jobs_applications
                   WHERE account_id = $1 ORDER BY updated_at_ms DESC",
                 &[&account_id],
             )?
             .into_iter()
-            .map(|row| parse_json(row.get(0), "job application"))
+            .map(|row| {
+                parse_application_json(row.get(2), row.get(0), row.get(1), "job application")
+            })
             .collect(),
     })
 }
@@ -4780,27 +4804,33 @@ pub fn get_application(
     account_id: &str,
     application_id: &str,
 ) -> Result<Option<JobApplication>> {
-    crate::db::run_blocking_db(|| match pool {
+    crate::db::run_blocking_db(|| {
+        match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
-            let raw: Option<String> = conn
+            let raw: Option<(String, String, String)> = conn
                 .query_row(
-                    "SELECT application_json FROM jobs_applications WHERE account_id = ?1 AND id = ?2",
+                    "SELECT id, job_id, application_json FROM jobs_applications WHERE account_id = ?1 AND id = ?2",
                     params![account_id, application_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            raw.map(|value| parse_json(value, "job application"))
+            raw.map(|(id, job_id, value)| {
+                parse_application_json(value, &id, &job_id, "job application")
+            })
                 .transpose()
         }
         DbPool::Postgres(_) => pool
             .get_pg()?
             .query_opt(
-                "SELECT application_json FROM jobs_applications WHERE account_id = $1 AND id = $2",
+                "SELECT id, job_id, application_json FROM jobs_applications WHERE account_id = $1 AND id = $2",
                 &[&account_id, &application_id],
             )?
-            .map(|row| parse_json(row.get(0), "job application"))
+            .map(|row| {
+                parse_application_json(row.get(2), row.get(0), row.get(1), "job application")
+            })
             .transpose(),
+    }
     })
 }
 
@@ -4905,7 +4935,7 @@ pub fn prepare_application(
     mode: &str,
     submission_mode: &str,
 ) -> Result<(JobApplication, ResumeVersion)> {
-    let (application, resume, _) =
+    let (application, resume, _, _, _) =
         prepare_application_inner(pool, account_id, job_id, mode, submission_mode, true)?;
     Ok((application, resume))
 }
@@ -4917,11 +4947,13 @@ pub fn prepare_application_draft(
     mode: &str,
     submission_mode: &str,
 ) -> Result<PreparedApplicationDraft> {
-    let (application, baseline_resume, expected_application) =
+    let (application, baseline_resume, expected_application, profile, posting) =
         prepare_application_inner(pool, account_id, job_id, mode, submission_mode, false)?;
     Ok(PreparedApplicationDraft {
         application,
         baseline_resume,
+        profile,
+        posting,
         expected_application,
     })
 }
@@ -4937,10 +4969,13 @@ fn prepare_application_inner(
     JobApplication,
     ResumeVersion,
     Option<ExpectedApplicationRevision>,
+    CareerProfile,
+    JobPosting,
 )> {
     let profile = get_profile(pool, account_id, "")?;
     let posting =
         get_posting(pool, account_id, job_id)?.ok_or_else(|| anyhow::anyhow!("job not found"))?;
+    let posting_fingerprint = posting_snapshot_fingerprint(&posting)?;
     let existing = find_application_for_job_with_revision(pool, account_id, job_id)?;
     let existing_application = existing
         .as_ref()
@@ -4967,20 +5002,17 @@ fn prepare_application_inner(
         .into_iter()
         .find(|track| track.id == posting.track_id)
         .and_then(|track| track.application_identity_id);
-    let application_identity = track_identity_id
-        .as_deref()
-        .and_then(|identity_id| identities.iter().find(|item| item.id == identity_id))
-        .or_else(|| identities.iter().find(|item| item.is_default))
-        .filter(|item| item.verification_status == "verified")
-        .ok_or_else(|| {
-            anyhow::anyhow!("verify an application email before preparing this packet")
-        })?;
+    let application_identity =
+        selected_application_identity(track_identity_id.as_deref(), &identities).ok_or_else(
+            || anyhow::anyhow!("verify an application email before preparing this packet"),
+        )?;
     let facts = list_facts(pool, account_id)?;
     let approved_fact_ids: Vec<String> = facts
         .iter()
         .filter(|fact| fact.verification_status == "confirmed")
         .map(|fact| fact.id.clone())
         .collect();
+    let confirmed_facts_fingerprint = confirmed_facts_fingerprint(&facts);
     let tailored_resume = tailor_resume(&profile, &posting, mode);
     let truth_fingerprint = candidate_truth_fingerprint(&profile);
     let content = json!({
@@ -5014,6 +5046,9 @@ fn prepare_application_inner(
             "career_track_id": posting.track_id,
             "candidate_truth_fingerprint": truth_fingerprint,
             "candidate_truth_fingerprint_version": 1,
+            "confirmed_facts_fingerprint": confirmed_facts_fingerprint,
+            "confirmed_facts_fingerprint_version": 1,
+            "job_snapshot_fingerprint": posting_fingerprint,
         },
     });
     let diff = tailored_resume.diff;
@@ -5095,6 +5130,9 @@ fn prepare_application_inner(
         "career_track_id": posting.track_id,
         "candidate_truth_fingerprint": truth_fingerprint,
         "candidate_truth_fingerprint_version": 1,
+        "confirmed_facts_fingerprint": confirmed_facts_fingerprint,
+        "confirmed_facts_fingerprint_version": 1,
+        "job_snapshot_fingerprint": posting_fingerprint,
         "application_identity": {
             "id": application_identity.id,
             "email": application_identity.email,
@@ -5117,7 +5155,7 @@ fn prepare_application_inner(
     if finalize_immediately {
         save_application(pool, account_id, &application)?;
     }
-    Ok((application, resume, expected_application))
+    Ok((application, resume, expected_application, profile, posting))
 }
 
 pub fn finalize_prepared_application(
@@ -5135,6 +5173,22 @@ pub fn finalize_prepared_application(
     }
     let posting = get_posting(pool, account_id, &application.job_id)?
         .ok_or_else(|| anyhow::anyhow!("job not found"))?;
+    let expected_posting_fingerprint = posting_snapshot_fingerprint(&prepared.posting)?;
+    if posting_snapshot_fingerprint(&posting)? != expected_posting_fingerprint {
+        anyhow::bail!("job posting changed while the application packet was generated")
+    }
+    if application
+        .receipt
+        .get("job_snapshot_fingerprint")
+        .and_then(Value::as_str)
+        != Some(expected_posting_fingerprint.as_str())
+        || content
+            .pointer("/provenance/job_snapshot_fingerprint")
+            .and_then(Value::as_str)
+            != Some(expected_posting_fingerprint.as_str())
+    {
+        anyhow::bail!("generated resume does not match the job posting snapshot")
+    }
     if baseline.job_id != posting.id {
         anyhow::bail!("application baseline targets a different job")
     }
@@ -5145,23 +5199,53 @@ pub fn finalize_prepared_application(
         .receipt
         .get("candidate_truth_fingerprint")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("application draft has no truth fingerprint"))?;
+        .ok_or_else(|| anyhow::anyhow!("application draft has no truth fingerprint"))?
+        .to_string();
     if content
         .pointer("/provenance/candidate_truth_fingerprint")
         .and_then(Value::as_str)
-        != Some(expected_truth_fingerprint)
+        != Some(expected_truth_fingerprint.as_str())
     {
         anyhow::bail!("generated resume does not match the candidate truth snapshot")
+    }
+    if candidate_truth_fingerprint(&prepared.profile) != expected_truth_fingerprint {
+        anyhow::bail!("application draft does not match the candidate truth snapshot")
+    }
+    let current_profile = get_profile(pool, account_id, "")?;
+    if candidate_truth_fingerprint(&current_profile) != expected_truth_fingerprint {
+        anyhow::bail!("candidate profile changed while the application packet was generated")
+    }
+    let expected_facts_fingerprint = application
+        .receipt
+        .get("confirmed_facts_fingerprint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("application draft has no confirmed-facts fingerprint"))?
+        .to_string();
+    if content
+        .pointer("/provenance/confirmed_facts_fingerprint")
+        .and_then(Value::as_str)
+        != Some(expected_facts_fingerprint.as_str())
+    {
+        anyhow::bail!("generated resume does not match the confirmed candidate facts")
     }
     let expected_identity_id = application
         .receipt
         .pointer("/application_identity/id")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("application draft has no verified identity"))?;
+        .ok_or_else(|| anyhow::anyhow!("application draft has no verified identity"))?
+        .to_string();
+    let expected_identity_email = application
+        .receipt
+        .pointer("/application_identity/email")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("application draft has no verified identity email"))?
+        .to_string();
     if content
         .pointer("/provenance/application_identity_id")
         .and_then(Value::as_str)
-        != Some(expected_identity_id)
+        != Some(expected_identity_id.as_str())
+        || content.pointer("/contact/email").and_then(Value::as_str)
+            != Some(expected_identity_email.as_str())
     {
         anyhow::bail!("generated resume does not match the verified application identity")
     }
@@ -5212,6 +5296,11 @@ pub fn finalize_prepared_application(
         content,
         diff,
         checksum,
+        &expected_truth_fingerprint,
+        &expected_posting_fingerprint,
+        &expected_identity_id,
+        &expected_identity_email,
+        &expected_facts_fingerprint,
     )
 }
 
@@ -5225,6 +5314,11 @@ fn commit_prepared_application(
     content: Value,
     diff: Value,
     checksum: String,
+    expected_truth_fingerprint: &str,
+    expected_posting_fingerprint: &str,
+    expected_identity_id: &str,
+    expected_identity_email: &str,
+    expected_facts_fingerprint: &str,
 ) -> Result<(JobApplication, ResumeVersion)> {
     validate_application_state(&application.state)?;
     let content_json = to_json(&content, "resume content")?;
@@ -5237,6 +5331,158 @@ fn commit_prepared_application(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current_profile: CareerProfile = tx
+                .query_row(
+                    "SELECT profile_json FROM jobs_profiles WHERE account_id = ?1",
+                    params![account_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|raw| parse_json(raw, "Jobs profile during application finalization"))
+                .transpose()?
+                .unwrap_or_else(|| default_profile(""));
+            if candidate_truth_fingerprint(&current_profile) != expected_truth_fingerprint {
+                anyhow::bail!(
+                    "candidate profile changed while the application packet was generated"
+                )
+            }
+            let current_posting: JobPosting = tx
+                .query_row(
+                    "SELECT posting_json FROM jobs_postings
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, application.job_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|raw| parse_json(raw, "Jobs posting during application finalization"))
+                .transpose()?
+                .ok_or_else(|| anyhow::anyhow!("job not found during application finalization"))?;
+            if posting_snapshot_fingerprint(&current_posting)? != expected_posting_fingerprint {
+                anyhow::bail!("job posting changed while the application packet was generated")
+            }
+            let current_track: Option<CareerTrack> = tx
+                .query_row(
+                    "SELECT track_json FROM jobs_tracks
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, current_posting.track_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|raw| parse_json(raw, "career track during application finalization"))
+                .transpose()?;
+            let track_identity_id = current_track.and_then(|track| track.application_identity_id);
+            let mut identity_stmt = tx.prepare(
+                "SELECT identity_json, verification_status, is_default
+                   FROM jobs_application_identities WHERE account_id = ?1",
+            )?;
+            let identity_rows = identity_stmt
+                .query_map(params![account_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let identities = identity_rows
+                .into_iter()
+                .map(|(raw, status, is_default)| {
+                    parse_application_identity_row(raw, status, is_default)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let current_identity =
+                selected_application_identity(track_identity_id.as_deref(), &identities);
+            if current_identity.is_none_or(|identity| {
+                identity.id != expected_identity_id || identity.email != expected_identity_email
+            }) {
+                anyhow::bail!("verified application identity changed during generation")
+            }
+            let mut fact_stmt = tx.prepare(
+                "SELECT id, category, label, value_json, source, verification_status,
+                        confirmed_at_ms, confirmed_by, schema_version,
+                        created_at_ms, updated_at_ms
+                   FROM jobs_facts
+                  WHERE account_id = ?1 AND verification_status = 'confirmed'",
+            )?;
+            let current_facts = fact_stmt
+                .query_map(params![account_id], fact_from_sqlite_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut current_fact_ids = current_facts
+                .iter()
+                .map(|fact| fact.id.as_str())
+                .collect::<Vec<_>>();
+            current_fact_ids.sort_unstable();
+            let mut expected_fact_ids = claim_ids.iter().map(String::as_str).collect::<Vec<_>>();
+            expected_fact_ids.sort_unstable();
+            if current_fact_ids != expected_fact_ids
+                || confirmed_facts_fingerprint(&current_facts) != expected_facts_fingerprint
+            {
+                anyhow::bail!("confirmed candidate facts changed during resume generation")
+            }
+            let preferences = tx
+                .query_row(
+                    "SELECT preferences_json FROM jobs_preferences WHERE account_id = ?1",
+                    params![account_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|raw| {
+                    parse_json::<JobPreferences>(raw, "Jobs preferences during finalization")
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let preferences = enforce_job_preference_safety(preferences);
+            let mut reservation_stmt = tx.prepare(
+                "SELECT id, application_id, company_key, period_key, runner, status,
+                        reserved_at_ms, updated_at_ms
+                   FROM jobs_attempt_reservations WHERE account_id = ?1",
+            )?;
+            let reservations = reservation_stmt
+                .query_map(params![account_id], |row| {
+                    Ok(AttemptReservation {
+                        id: row.get(0)?,
+                        application_id: row.get(1)?,
+                        company_key: row.get(2)?,
+                        period_key: row.get(3)?,
+                        runner: row.get(4)?,
+                        status: row.get(5)?,
+                        reserved_at_ms: row.get(6)?,
+                        updated_at_ms: row.get(7)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut authority_stmt = tx.prepare(
+                "SELECT s.id, s.provider, s.status, s.health,
+                        m.availability_status, m.last_seen_at_ms, m.last_seen_run_id
+                   FROM jobs_discovery_memberships m
+                   JOIN jobs_discovery_sources s ON s.id = m.source_id
+                  WHERE m.account_id = ?1 AND m.job_id = ?2",
+            )?;
+            let authorities = authority_stmt
+                .query_map(params![account_id, application.job_id], |row| {
+                    Ok(JobDiscoveryAuthority {
+                        source_id: row.get(0)?,
+                        provider: row.get(1)?,
+                        source_status: row.get(2)?,
+                        source_health: row.get(3)?,
+                        membership_status: row.get(4)?,
+                        last_seen_at_ms: row.get(5)?,
+                        last_seen_run_id: row.get(6)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            enforce_application_finalization_eligibility(
+                application,
+                &current_posting,
+                &current_profile,
+                &preferences,
+                &reservations,
+                &authorities,
+            )?;
+            drop(identity_stmt);
+            drop(fact_stmt);
+            drop(reservation_stmt);
+            drop(authority_stmt);
             let resume = if let Some(existing) = tx
                 .query_row(
                     "SELECT id, job_id, version_no, mode, content_json, diff_json,
@@ -5342,7 +5588,171 @@ fn commit_prepared_application(
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            let mut tx = conn.transaction()?;
+            let mut tx = conn
+                .build_transaction()
+                .isolation_level(postgres::IsolationLevel::Serializable)
+                .start()?;
+            let current_profile: CareerProfile = tx
+                .query_opt(
+                    "SELECT profile_json FROM jobs_profiles WHERE account_id = $1 FOR SHARE",
+                    &[&account_id],
+                )?
+                .map(|row| {
+                    parse_json(
+                        row.get::<_, String>(0),
+                        "Jobs profile during application finalization",
+                    )
+                })
+                .transpose()?
+                .unwrap_or_else(|| default_profile(""));
+            if candidate_truth_fingerprint(&current_profile) != expected_truth_fingerprint {
+                anyhow::bail!(
+                    "candidate profile changed while the application packet was generated"
+                )
+            }
+            let current_posting: JobPosting = tx
+                .query_opt(
+                    "SELECT posting_json FROM jobs_postings
+                      WHERE account_id = $1 AND id = $2 FOR SHARE",
+                    &[&account_id, &application.job_id],
+                )?
+                .map(|row| {
+                    parse_json(
+                        row.get::<_, String>(0),
+                        "Jobs posting during application finalization",
+                    )
+                })
+                .transpose()?
+                .ok_or_else(|| anyhow::anyhow!("job not found during application finalization"))?;
+            if posting_snapshot_fingerprint(&current_posting)? != expected_posting_fingerprint {
+                anyhow::bail!("job posting changed while the application packet was generated")
+            }
+            let current_track: Option<CareerTrack> = tx
+                .query_opt(
+                    "SELECT track_json FROM jobs_tracks
+                      WHERE account_id = $1 AND id = $2 FOR SHARE",
+                    &[&account_id, &current_posting.track_id],
+                )?
+                .map(|row| {
+                    parse_json(
+                        row.get::<_, String>(0),
+                        "career track during application finalization",
+                    )
+                })
+                .transpose()?;
+            let track_identity_id = current_track.and_then(|track| track.application_identity_id);
+            let identities = tx
+                .query(
+                    "SELECT identity_json, verification_status, is_default
+                       FROM jobs_application_identities
+                      WHERE account_id = $1 FOR SHARE",
+                    &[&account_id],
+                )?
+                .into_iter()
+                .map(|row| {
+                    parse_application_identity_row(
+                        row.get(0),
+                        row.get(1),
+                        row.get::<_, i32>(2) != 0,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let current_identity =
+                selected_application_identity(track_identity_id.as_deref(), &identities);
+            if current_identity.is_none_or(|identity| {
+                identity.id != expected_identity_id || identity.email != expected_identity_email
+            }) {
+                anyhow::bail!("verified application identity changed during generation")
+            }
+            let current_facts = tx
+                .query(
+                    "SELECT id, category, label, value_json, source, verification_status,
+                            confirmed_at_ms, confirmed_by, schema_version,
+                            created_at_ms, updated_at_ms
+                       FROM jobs_facts
+                      WHERE account_id = $1 AND verification_status = 'confirmed'
+                      FOR SHARE",
+                    &[&account_id],
+                )?
+                .into_iter()
+                .map(fact_from_pg_row)
+                .collect::<Result<Vec<_>>>()?;
+            let mut current_fact_ids = current_facts
+                .iter()
+                .map(|fact| fact.id.as_str())
+                .collect::<Vec<_>>();
+            current_fact_ids.sort_unstable();
+            let mut expected_fact_ids = claim_ids.iter().map(String::as_str).collect::<Vec<_>>();
+            expected_fact_ids.sort_unstable();
+            if current_fact_ids != expected_fact_ids
+                || confirmed_facts_fingerprint(&current_facts) != expected_facts_fingerprint
+            {
+                anyhow::bail!("confirmed candidate facts changed during resume generation")
+            }
+            let preferences = tx
+                .query_opt(
+                    "SELECT preferences_json FROM jobs_preferences
+                      WHERE account_id = $1 FOR SHARE",
+                    &[&account_id],
+                )?
+                .map(|row| {
+                    parse_json::<JobPreferences>(
+                        row.get::<_, String>(0),
+                        "Jobs preferences during finalization",
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let preferences = enforce_job_preference_safety(preferences);
+            let reservations = tx
+                .query(
+                    "SELECT id, application_id, company_key, period_key, runner, status,
+                            reserved_at_ms, updated_at_ms
+                       FROM jobs_attempt_reservations
+                      WHERE account_id = $1 FOR SHARE",
+                    &[&account_id],
+                )?
+                .into_iter()
+                .map(|row| AttemptReservation {
+                    id: row.get(0),
+                    application_id: row.get(1),
+                    company_key: row.get(2),
+                    period_key: row.get(3),
+                    runner: row.get(4),
+                    status: row.get(5),
+                    reserved_at_ms: row.get(6),
+                    updated_at_ms: row.get(7),
+                })
+                .collect::<Vec<_>>();
+            let authorities = tx
+                .query(
+                    "SELECT s.id, s.provider, s.status, s.health,
+                            m.availability_status, m.last_seen_at_ms, m.last_seen_run_id
+                       FROM jobs_discovery_memberships m
+                       JOIN jobs_discovery_sources s ON s.id = m.source_id
+                      WHERE m.account_id = $1 AND m.job_id = $2
+                      FOR SHARE OF m, s",
+                    &[&account_id, &application.job_id],
+                )?
+                .into_iter()
+                .map(|row| JobDiscoveryAuthority {
+                    source_id: row.get(0),
+                    provider: row.get(1),
+                    source_status: row.get(2),
+                    source_health: row.get(3),
+                    membership_status: row.get(4),
+                    last_seen_at_ms: row.get(5),
+                    last_seen_run_id: row.get(6),
+                })
+                .collect::<Vec<_>>();
+            enforce_application_finalization_eligibility(
+                application,
+                &current_posting,
+                &current_profile,
+                &preferences,
+                &reservations,
+                &authorities,
+            )?;
             let resume = if let Some(row) = tx.query_opt(
                 "SELECT id, job_id, version_no, mode, content_json, diff_json,
                         claim_ids_json, checksum, created_at_ms
@@ -5664,7 +6074,8 @@ fn find_application_for_job_with_revision(
                 )
                 .optional()?;
             raw.map(|(id, state, updated_at_ms, value)| {
-                let application = parse_json(value.clone(), "job application")?;
+                let application =
+                    parse_application_json(value.clone(), &id, job_id, "job application")?;
                 Ok((
                     application,
                     ExpectedApplicationRevision {
@@ -5686,11 +6097,13 @@ fn find_application_for_job_with_revision(
             )?
             .map(|row| {
                 let value: String = row.get(3);
-                let application = parse_json(value.clone(), "job application")?;
+                let id: String = row.get(0);
+                let application =
+                    parse_application_json(value.clone(), &id, job_id, "job application")?;
                 Ok((
                     application,
                     ExpectedApplicationRevision {
-                        id: row.get(0),
+                        id,
                         state: row.get(1),
                         updated_at_ms: row.get(2),
                         payload: value,
@@ -6080,7 +6493,20 @@ pub fn commit_packet(
                 params![account_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            let included = used < limit;
+            let allowance: Option<String> = tx
+                .query_row(
+                    "SELECT status
+                       FROM jobs_generation_allowance_reservations
+                      WHERE account_id = ?1 AND job_id = ?2",
+                    params![account_id, application.job_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if allowance.as_deref() == Some("committed") {
+                anyhow::bail!("committed Jobs allowance has no packet metering row")
+            }
+            let pre_reserved = allowance.as_deref() == Some("reserved");
+            let included = pre_reserved || used < limit;
             let amount_cents = if included { 0 } else { PACKET_OVERAGE_CENTS };
             if amount_cents > 0 {
                 let balance_before: i64 = tx.query_row(
@@ -6132,15 +6558,23 @@ pub fn commit_packet(
             )?;
             tx.execute(
                 "UPDATE jobs_entitlements SET used_packets = used_packets + 1,
-                    updated_at_ms = ?2 WHERE account_id = ?1",
-                params![account_id, now],
+                    updated_at_ms = ?2 WHERE account_id = ?1 AND ?3 = 0",
+                params![account_id, now, i64::from(pre_reserved)],
             )?;
+            if allowance.as_deref() == Some("reserved") {
+                tx.execute(
+                    "UPDATE jobs_generation_allowance_reservations
+                        SET status = 'committed', application_id = ?3, updated_at_ms = ?4
+                      WHERE account_id = ?1 AND job_id = ?2 AND status = 'reserved'",
+                    params![account_id, application.job_id, application.id, now],
+                )?;
+            }
             tx.commit()?;
             Ok(PacketCommitResult {
                 newly_metered: true,
                 included,
                 amount_cents,
-                used_packets: used + 1,
+                used_packets: used + i64::from(!pre_reserved),
                 monthly_packet_limit: limit,
             })
         }
@@ -6149,17 +6583,21 @@ pub fn commit_packet(
             let mut tx = conn.transaction()?;
             tx.query_one(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                &[&metering_key],
+                &[&format!(
+                    "jobs-allowance:{account_id}:{}",
+                    application.job_id
+                )],
+            )?;
+            let entitlement = tx.query_one(
+                "SELECT used_packets, monthly_packet_limit FROM jobs_entitlements
+                  WHERE account_id = $1 FOR UPDATE",
+                &[&account_id],
             )?;
             if let Some(row) = tx.query_opt(
                 "SELECT included, amount_cents FROM jobs_packet_metering
                   WHERE account_id = $1 AND job_id = $2",
                 &[&account_id, &application.job_id],
             )? {
-                let entitlement = tx.query_one(
-                    "SELECT used_packets, monthly_packet_limit FROM jobs_entitlements WHERE account_id = $1",
-                    &[&account_id],
-                )?;
                 return Ok(PacketCommitResult {
                     newly_metered: false,
                     included: row.get::<_, i32>(0) != 0,
@@ -6168,14 +6606,24 @@ pub fn commit_packet(
                     monthly_packet_limit: entitlement.get(1),
                 });
             }
-            let entitlement = tx.query_one(
-                "SELECT used_packets, monthly_packet_limit FROM jobs_entitlements
-                  WHERE account_id = $1 FOR UPDATE",
-                &[&account_id],
-            )?;
             let used: i64 = entitlement.get(0);
             let limit: i64 = entitlement.get(1);
-            let included = used < limit;
+            let allowance = tx.query_opt(
+                "SELECT status
+                   FROM jobs_generation_allowance_reservations
+                  WHERE account_id = $1 AND job_id = $2 FOR UPDATE",
+                &[&account_id, &application.job_id],
+            )?;
+            if allowance
+                .as_ref()
+                .is_some_and(|row| row.get::<_, String>(0) == "committed")
+            {
+                anyhow::bail!("committed Jobs allowance has no packet metering row")
+            }
+            let pre_reserved = allowance
+                .as_ref()
+                .is_some_and(|row| row.get::<_, String>(0) == "reserved");
+            let included = pre_reserved || used < limit;
             let included_db = i32::from(included);
             let amount_cents = if included { 0 } else { PACKET_OVERAGE_CENTS };
             if amount_cents > 0 {
@@ -6233,15 +6681,26 @@ pub fn commit_packet(
             )?;
             tx.execute(
                 "UPDATE jobs_entitlements SET used_packets = used_packets + 1,
-                    updated_at_ms = $2 WHERE account_id = $1",
-                &[&account_id, &now],
+                    updated_at_ms = $2 WHERE account_id = $1 AND $3 = 0",
+                &[&account_id, &now, &i32::from(pre_reserved)],
             )?;
+            if allowance
+                .as_ref()
+                .is_some_and(|row| row.get::<_, String>(0) == "reserved")
+            {
+                tx.execute(
+                    "UPDATE jobs_generation_allowance_reservations
+                        SET status = 'committed', application_id = $3, updated_at_ms = $4
+                      WHERE account_id = $1 AND job_id = $2 AND status = 'reserved'",
+                    &[&account_id, &application.job_id, &application.id, &now],
+                )?;
+            }
             tx.commit()?;
             Ok(PacketCommitResult {
                 newly_metered: true,
                 included,
                 amount_cents,
-                used_packets: used + 1,
+                used_packets: used + i64::from(!pre_reserved),
                 monthly_packet_limit: limit,
             })
         }
@@ -7169,18 +7628,19 @@ pub fn finalize_submission(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let raw: Option<String> = tx
+            let raw: Option<(String, String)> = tx
                 .query_row(
-                    "SELECT application_json FROM jobs_applications
+                    "SELECT job_id, application_json FROM jobs_applications
                       WHERE account_id = ?1 AND id = ?2",
                     params![account_id, application_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            let Some(raw) = raw else {
+            let Some((job_id, raw)) = raw else {
                 anyhow::bail!("application not found")
             };
-            let mut application: JobApplication = parse_json(raw, "Jobs application")?;
+            let mut application =
+                parse_application_json(raw, application_id, &job_id, "Jobs application")?;
             if application.state == "submitted" {
                 if application
                     .receipt
@@ -7297,14 +7757,16 @@ pub fn finalize_submission(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             let row = tx.query_opt(
-                "SELECT application_json FROM jobs_applications
+                "SELECT job_id, application_json FROM jobs_applications
                   WHERE account_id = $1 AND id = $2 FOR UPDATE",
                 &[&account_id, &application_id],
             )?;
             let Some(row) = row else {
                 anyhow::bail!("application not found")
             };
-            let mut application: JobApplication = parse_json(row.get(0), "Jobs application")?;
+            let job_id: String = row.get(0);
+            let mut application =
+                parse_application_json(row.get(1), application_id, &job_id, "Jobs application")?;
             if application.state == "submitted" {
                 if application
                     .receipt
@@ -8647,18 +9109,19 @@ pub fn finalize_local_side_effect_unknown(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let raw: Option<String> = tx
+            let raw: Option<(String, String)> = tx
                 .query_row(
-                    "SELECT application_json FROM jobs_applications
+                    "SELECT job_id, application_json FROM jobs_applications
                       WHERE account_id = ?1 AND id = ?2",
                     params![account_id, application_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            let Some(raw) = raw else {
+            let Some((job_id, raw)) = raw else {
                 anyhow::bail!("application not found")
             };
-            let mut application: JobApplication = parse_json(raw, "Jobs application")?;
+            let mut application =
+                parse_application_json(raw, application_id, &job_id, "Jobs application")?;
             if application.run_id.as_deref() != Some(run_id) {
                 anyhow::bail!("local run ticket does not match this application")
             }
@@ -8742,14 +9205,16 @@ pub fn finalize_local_side_effect_unknown(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             let row = tx.query_opt(
-                "SELECT application_json FROM jobs_applications
+                "SELECT job_id, application_json FROM jobs_applications
                   WHERE account_id = $1 AND id = $2 FOR UPDATE",
                 &[&account_id, &application_id],
             )?;
             let Some(row) = row else {
                 anyhow::bail!("application not found")
             };
-            let mut application: JobApplication = parse_json(row.get(0), "Jobs application")?;
+            let job_id: String = row.get(0);
+            let mut application =
+                parse_application_json(row.get(1), application_id, &job_id, "Jobs application")?;
             if application.run_id.as_deref() != Some(run_id) {
                 anyhow::bail!("local run ticket does not match this application")
             }
@@ -9340,6 +9805,7 @@ fn execution_lease_from_pg_row(row: postgres::Row) -> StoredExecutionLease {
 #[allow(clippy::too_many_arguments)]
 fn validate_execution_target_payloads(
     application_raw: String,
+    application_job_id: &str,
     application_state: &str,
     session_raw: String,
     session_runner: &str,
@@ -9348,11 +9814,13 @@ fn validate_execution_target_payloads(
     application_id: &str,
     run_id: &str,
 ) -> ExecutionLeaseResult<()> {
-    let application: JobApplication = parse_json(application_raw, "job application")?;
-    if application.id != application_id
-        || application.run_id.as_deref() != Some(run_id)
-        || application.state != application_state
-    {
+    let application = parse_application_json(
+        application_raw,
+        application_id,
+        application_job_id,
+        "job application",
+    )?;
+    if application.run_id.as_deref() != Some(run_id) || application.state != application_state {
         return Err(ExecutionLeaseError::NotFound);
     }
     if !matches!(application_state, "queued" | "running" | "needs_input") {
@@ -9401,16 +9869,21 @@ fn sqlite_execution_target(
     application_id: &str,
     run_id: &str,
 ) -> ExecutionLeaseResult<String> {
-    let (application_raw, application_state): (String, String) = tx
+    let (application_job_id, application_raw, application_state): (String, String, String) = tx
         .query_row(
-            "SELECT application_json, state FROM jobs_applications
+            "SELECT job_id, application_json, state FROM jobs_applications
               WHERE account_id = ?1 AND id = ?2",
             params![account_id, application_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?
         .ok_or(ExecutionLeaseError::NotFound)?;
-    let application: JobApplication = parse_json(application_raw.clone(), "job application")?;
+    let application = parse_application_json(
+        application_raw.clone(),
+        application_id,
+        &application_job_id,
+        "job application",
+    )?;
     let identity_id = application
         .receipt
         .pointer("/application_identity/id")
@@ -9437,6 +9910,7 @@ fn sqlite_execution_target(
         .ok_or(ExecutionLeaseError::Conflict)?;
     validate_execution_target_payloads(
         application_raw,
+        &application_job_id,
         &application_state,
         session_raw,
         &session_runner,
@@ -9456,14 +9930,20 @@ fn postgres_execution_target(
 ) -> ExecutionLeaseResult<String> {
     let row = tx
         .query_opt(
-            "SELECT application_json, state FROM jobs_applications
+            "SELECT job_id, application_json, state FROM jobs_applications
               WHERE account_id = $1 AND id = $2 FOR UPDATE",
             &[&account_id, &application_id],
         )?
         .ok_or(ExecutionLeaseError::NotFound)?;
-    let application_raw: String = row.get(0);
-    let application_state: String = row.get(1);
-    let application: JobApplication = parse_json(application_raw.clone(), "job application")?;
+    let application_job_id: String = row.get(0);
+    let application_raw: String = row.get(1);
+    let application_state: String = row.get(2);
+    let application = parse_application_json(
+        application_raw.clone(),
+        application_id,
+        &application_job_id,
+        "job application",
+    )?;
     let identity_id = application
         .receipt
         .pointer("/application_identity/id")
@@ -9491,6 +9971,7 @@ fn postgres_execution_target(
     let identity_status: String = row.get(1);
     validate_execution_target_payloads(
         application_raw,
+        &application_job_id,
         &application_state,
         session_raw,
         &session_runner,
@@ -11819,20 +12300,32 @@ mod tests {
     }
 
     #[test]
-    fn candidate_truth_fingerprint_ignores_application_email_but_not_work_history() {
+    fn candidate_truth_fingerprint_ignores_only_non_fact_profile_fields() {
         let mut profile = default_profile("jobs@example.com");
         profile.full_name = "Taylor Rivera".to_string();
+        profile.summary = "Builds reliable distributed systems.".to_string();
+        profile.skills = vec!["Rust".to_string()];
         profile.employment = vec![EmploymentEntry {
             company: "Northstar".to_string(),
             title: "Software Engineer".to_string(),
             start_date: "2022-01".to_string(),
             current: true,
+            highlights: vec!["Reduced p99 latency by 30%.".to_string()],
             ..EmploymentEntry::default()
         }];
         let baseline = candidate_truth_fingerprint(&profile);
 
         profile.email = "another-alias@example.com".to_string();
+        profile.updated_at_ms += 1;
         assert_eq!(candidate_truth_fingerprint(&profile), baseline);
+
+        profile.summary = "Builds reliable payment systems.".to_string();
+        assert_ne!(candidate_truth_fingerprint(&profile), baseline);
+        profile.summary = "Builds reliable distributed systems.".to_string();
+
+        profile.employment[0].highlights[0] = "Reduced p99 latency by 50%.".to_string();
+        assert_ne!(candidate_truth_fingerprint(&profile), baseline);
+        profile.employment[0].highlights[0] = "Reduced p99 latency by 30%.".to_string();
 
         profile.employment[0].title = "Data Engineer".to_string();
         assert_ne!(candidate_truth_fingerprint(&profile), baseline);
@@ -12073,6 +12566,252 @@ mod tests {
     }
 
     #[test]
+    fn resume_generation_finalization_rejects_a_concurrent_profile_edit() {
+        let pool = test_pool();
+        let mut profile = default_profile("jobs@example.com");
+        profile.summary = "Builds reliable distributed systems.".to_string();
+        profile.skills = vec!["Rust".to_string(), "PostgreSQL".to_string()];
+        profile.employment = vec![EmploymentEntry {
+            company: "Northstar".to_string(),
+            title: "Software Engineer".to_string(),
+            highlights: vec!["Reduced p99 latency by 30%.".to_string()],
+            ..EmploymentEntry::default()
+        }];
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/stale-profile-resume",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let prepared =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+
+        profile.summary = "Builds high-throughput payment systems.".to_string();
+        profile.skills.push("Kafka".to_string());
+        profile.employment[0].highlights[0] = "Reduced p99 latency by 50%.".to_string();
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+
+        let error = finalize_prepared_application(
+            &pool,
+            "acct-jobs",
+            &prepared,
+            prepared.baseline_resume.content.clone(),
+            prepared.baseline_resume.diff.clone(),
+            json!({"kind": "model"}),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("candidate profile changed while the application packet was generated"));
+        assert!(
+            get_application(&pool, "acct-jobs", &prepared.application.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(list_resume_versions(&pool, "acct-jobs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_generation_finalization_rejects_a_changed_confirmed_fact() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let mut fact = upsert_fact(
+            &pool,
+            "acct-jobs",
+            &CareerFact {
+                id: String::new(),
+                category: "achievement".to_string(),
+                label: "Latency reduction".to_string(),
+                value: json!({"metric": "30%", "system": "checkout"}),
+                source: "user_entry".to_string(),
+                verification_status: "confirmed".to_string(),
+                confirmed_at_ms: None,
+                confirmed_by: None,
+                schema_version: 1,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/stale-fact-resume",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let prepared =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+
+        fact.value = json!({"metric": "50%", "system": "checkout"});
+        upsert_fact(&pool, "acct-jobs", &fact).unwrap();
+
+        let error = finalize_prepared_application(
+            &pool,
+            "acct-jobs",
+            &prepared,
+            prepared.baseline_resume.content.clone(),
+            prepared.baseline_resume.diff.clone(),
+            json!({"kind": "model"}),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("confirmed candidate facts changed during resume generation"));
+        assert!(list_applications(&pool, "acct-jobs").unwrap().is_empty());
+        assert!(list_resume_versions(&pool, "acct-jobs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_generation_finalization_rejects_a_new_confirmed_fact() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/new-fact-resume",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let prepared =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+
+        upsert_fact(
+            &pool,
+            "acct-jobs",
+            &CareerFact {
+                id: String::new(),
+                category: "achievement".to_string(),
+                label: "Newly confirmed reliability result".to_string(),
+                value: json!({"metric": "99.99%", "system": "payments"}),
+                source: "user_entry".to_string(),
+                verification_status: "confirmed".to_string(),
+                confirmed_at_ms: None,
+                confirmed_by: None,
+                schema_version: 1,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+
+        let error = finalize_prepared_application(
+            &pool,
+            "acct-jobs",
+            &prepared,
+            prepared.baseline_resume.content.clone(),
+            prepared.baseline_resume.diff.clone(),
+            json!({"kind": "model"}),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("confirmed candidate facts changed during resume generation"));
+        assert!(list_applications(&pool, "acct-jobs").unwrap().is_empty());
+        assert!(list_resume_versions(&pool, "acct-jobs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_generation_finalization_rejects_a_changed_track_identity() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let primary =
+            ensure_primary_application_identity(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        let alternate = save_application_identity(
+            &pool,
+            "acct-jobs",
+            &ApplicationIdentity {
+                id: String::new(),
+                email: "applications@example.com".to_string(),
+                label: "Applications".to_string(),
+                verification_status: "pending".to_string(),
+                is_default: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        save_identity_verification(&pool, "acct-jobs", &alternate.id, "602314", 60_000).unwrap();
+        let alternate =
+            verify_application_identity(&pool, "acct-jobs", &alternate.id, "602314").unwrap();
+        let mut track = upsert_track(
+            &pool,
+            "acct-jobs",
+            &CareerTrack {
+                id: String::new(),
+                name: "Engineering".to_string(),
+                role: "Software Engineer".to_string(),
+                locations: Vec::new(),
+                remote_preference: "hybrid_ok".to_string(),
+                application_identity_id: Some(primary.id),
+                active: true,
+                match_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/stale-track-identity",
+            now_ms(),
+            now_ms(),
+        );
+        posting.track_id = track.id.clone();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &posting,
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let prepared =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+
+        track.application_identity_id = Some(alternate.id);
+        upsert_track(&pool, "acct-jobs", &track).unwrap();
+
+        let error = finalize_prepared_application(
+            &pool,
+            "acct-jobs",
+            &prepared,
+            prepared.baseline_resume.content.clone(),
+            prepared.baseline_resume.diff.clone(),
+            json!({"kind": "model"}),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("verified application identity changed during generation"));
+        assert!(list_applications(&pool, "acct-jobs").unwrap().is_empty());
+        assert!(list_resume_versions(&pool, "acct-jobs").unwrap().is_empty());
+    }
+
+    #[test]
     fn cancelled_generation_preserves_the_prior_review_packet() {
         let pool = test_pool();
         let profile = default_profile("jobs@example.com");
@@ -12112,6 +12851,73 @@ mod tests {
         assert_eq!(current.resume_version_id, Some(prior_resume.id));
         assert_eq!(current.receipt, prior.receipt);
         assert_eq!(list_resume_versions(&pool, "acct-jobs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_embedded_application_identity_is_normalized_to_authoritative_columns() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/legacy-embedded-identity",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (prior, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let mut legacy_payload = prior.clone();
+        legacy_payload.id = "payload-only-id".into();
+        legacy_payload.job_id = "payload-only-job".into();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_applications SET application_json = ?3 \
+                 WHERE account_id = ?1 AND id = ?2",
+                params![
+                    "acct-jobs",
+                    prior.id,
+                    serde_json::to_string(&legacy_payload).unwrap()
+                ],
+            )
+            .unwrap();
+
+        let prepared =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        assert_eq!(prepared.application.id, prior.id);
+        assert_eq!(prepared.application.job_id, posting.id);
+
+        let mut content = prepared.baseline_resume.content.clone();
+        content["provenance"]["resume_generation"] = json!({
+            "kind": "deterministic_fallback",
+            "schema_version": 2,
+            "truth_guard": "deterministic",
+            "claims_added": 0,
+        });
+        let generation = content["provenance"]["resume_generation"].clone();
+        let (application, resume) = finalize_prepared_application(
+            &pool,
+            "acct-jobs",
+            &prepared,
+            content,
+            prepared.baseline_resume.diff.clone(),
+            generation,
+        )
+        .unwrap();
+        assert_eq!(application.id, prior.id);
+        assert_eq!(application.job_id, posting.id);
+        assert_eq!(resume.job_id, posting.id);
+        assert!(get_application(&pool, "acct-jobs", "payload-only-id")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

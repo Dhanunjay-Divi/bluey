@@ -672,8 +672,9 @@ pub async fn prepare_application(
     if !matches!(req.submission_mode.as_str(), "review_first" | "auto_submit") {
         return bad_request("Choose Review first or Auto-submit.");
     }
-    let profile = jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?;
-    if !profile.onboarding_complete {
+    let onboarding_profile =
+        jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?;
+    if !onboarding_profile.onboarding_complete {
         return Err((
             StatusCode::CONFLICT,
             "Finish your Career Profile before preparing applications.".to_string(),
@@ -687,14 +688,18 @@ pub async fn prepare_application(
         &req.submission_mode,
     )
     .map_err(internal)?;
-    let posting = jobs::get_posting(&state.pool, &account.id, &req.job_id)
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
+    if !prepared.profile.onboarding_complete {
+        return Err((
+            StatusCode::CONFLICT,
+            "Your Career Profile changed while Bluey prepared this application. Try again."
+                .to_string(),
+        ));
+    }
     let generated = jobs_resume_generation::generate(
         &state,
         &account.id,
-        &profile,
-        &posting,
+        &prepared.profile,
+        &prepared.posting,
         &prepared.baseline_resume,
     )
     .await
@@ -711,13 +716,18 @@ pub async fn prepare_application(
             internal(error)
         }
     })?;
+    let jobs_resume_generation::GeneratedResume {
+        content,
+        diff,
+        public_provenance,
+    } = generated;
     let (mut application, resume_version) = jobs::finalize_prepared_application(
         &state.pool,
         &account.id,
         &prepared,
-        generated.content,
-        generated.diff,
-        generated.public_provenance,
+        content,
+        diff,
+        public_provenance,
     )
     .map_err(internal)?;
     let mut metering = None;
@@ -727,7 +737,7 @@ pub async fn prepare_application(
             &account.id,
             &account.email,
             &application,
-            &posting,
+            &prepared.posting,
             &resume_version,
         )?;
         if let Err(error) = jobs::reserve_application_attempt(
