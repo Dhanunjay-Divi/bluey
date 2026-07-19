@@ -2894,33 +2894,77 @@ fn validate_discovered_job(source: &DiscoverySource, input: &DiscoveredJobInput)
 }
 
 fn canonicalize_discovered_url(source: &DiscoverySource, raw: &str) -> Result<String> {
+    let (canonical_url, source_key) = canonical_public_discovery_url(&source.provider, raw)?;
+    if source_key != source.source_key {
+        anyhow::bail!("discovery job URL does not belong to the configured source")
+    }
+    Ok(canonical_url)
+}
+
+/// Derive a scheduled public-ATS source only from a job that the server's
+/// allowlisted importer has already verified. Unknown or manual imports never
+/// become scheduled sources.
+pub fn discovery_source_input_from_verified_import(
+    imported_source: &str,
+    canonical_url: &str,
+    company: &str,
+    track_id: &str,
+) -> Result<Option<DiscoverySourceInput>> {
+    let provider = match imported_source {
+        "greenhouse_import" => "greenhouse",
+        "lever_import" => "lever",
+        "ashby_import" => "ashby",
+        "smartrecruiters_import" => "smartrecruiters",
+        "workday_import" => "workday",
+        _ => return Ok(None),
+    };
+    let (_, source_key) = canonical_public_discovery_url(provider, canonical_url)?;
+    let company = company.trim();
+    if company.is_empty() || company.chars().count() > 200 {
+        anyhow::bail!("verified job import has no valid company")
+    }
+
+    Ok(Some(DiscoverySourceInput {
+        track_id: track_id.to_string(),
+        provider: provider.to_string(),
+        source_key,
+        company: company.to_string(),
+        run_interval_ms: default_discovery_interval_ms(),
+    }))
+}
+
+fn canonical_public_discovery_url(provider: &str, raw: &str) -> Result<(String, String)> {
     let mut url = reqwest::Url::parse(raw.trim()).context("parse discovered job URL")?;
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         anyhow::bail!("discovery job URL must be public HTTPS without credentials")
     }
-    let host = url
-        .host_str()
-        .unwrap_or_default()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    let allowed = match source.provider.as_str() {
-        "greenhouse" => matches!(
-            host.as_str(),
-            "boards.greenhouse.io" | "job-boards.greenhouse.io"
-        ),
-        "lever" => matches!(host.as_str(), "jobs.lever.co" | "jobs.eu.lever.co"),
-        _ => false,
-    };
-    if !allowed {
-        anyhow::bail!("discovery job URL does not belong to the configured provider")
+    if url.port().is_some() {
+        anyhow::bail!("discovery job URL must use the default HTTPS port")
     }
-    let source_key = url
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let segments = url
         .path_segments()
-        .and_then(|mut segments| segments.next())
+        .map(|segments| segments.collect::<Vec<_>>())
         .unwrap_or_default();
-    if source_key != source.source_key {
-        anyhow::bail!("discovery job URL does not belong to the configured source")
-    }
+    let source_key = match provider {
+        "greenhouse"
+            if matches!(
+                host.as_str(),
+                "boards.greenhouse.io" | "job-boards.greenhouse.io"
+            ) =>
+        {
+            source_key_before_job_segment(&segments, "jobs", "Greenhouse")?
+        }
+        "lever" if matches!(host.as_str(), "jobs.lever.co" | "jobs.eu.lever.co") => {
+            direct_board_source_key(&segments, "Lever")?
+        }
+        "ashby" if host == "jobs.ashbyhq.com" => direct_board_source_key(&segments, "Ashby")?,
+        "smartrecruiters" if host == "jobs.smartrecruiters.com" => {
+            direct_board_source_key(&segments, "SmartRecruiters")?
+        }
+        "workday" => workday_source_key(&host, &segments)?,
+        _ => anyhow::bail!("discovery job URL does not belong to the configured provider"),
+    };
     let retained_query = url
         .query_pairs()
         .filter(|(key, _)| {
@@ -2937,7 +2981,85 @@ fn canonicalize_discovered_url(source: &DiscoverySource, raw: &str) -> Result<St
         }
     }
     url.set_fragment(None);
-    Ok(url.to_string().trim_end_matches('/').to_string())
+    Ok((
+        url.to_string().trim_end_matches('/').to_string(),
+        source_key,
+    ))
+}
+
+fn direct_board_source_key(segments: &[&str], provider: &str) -> Result<String> {
+    let Some((source_key, job_id)) = segments.first().zip(segments.get(1)) else {
+        anyhow::bail!("discovery {provider} URL must include a board and job ID")
+    };
+    checked_discovery_identifier(source_key, "board identifier")?;
+    checked_discovery_identifier(job_id, "job identifier")?;
+    Ok((*source_key).to_string())
+}
+
+fn source_key_before_job_segment(
+    segments: &[&str],
+    job_segment: &str,
+    provider: &str,
+) -> Result<String> {
+    let mut matches = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, segment)| **segment == job_segment);
+    let Some((job_index, _)) = matches.next() else {
+        anyhow::bail!("discovery {provider} URL must include a job ID")
+    };
+    if matches.next().is_some() || job_index == 0 || segments.get(job_index + 1).is_none() {
+        anyhow::bail!("discovery {provider} URL is ambiguous")
+    }
+    let source_key = segments[job_index - 1];
+    checked_discovery_identifier(source_key, "board identifier")?;
+    checked_discovery_identifier(segments[job_index + 1], "job identifier")?;
+    Ok(source_key.to_string())
+}
+
+fn workday_source_key(host: &str, segments: &[&str]) -> Result<String> {
+    let host_parts = host.split('.').collect::<Vec<_>>();
+    if host_parts.len() != 4 || host_parts[2] != "myworkdayjobs" || host_parts[3] != "com" {
+        anyhow::bail!("discovery job URL does not belong to the configured provider")
+    }
+    let tenant = host_parts[0];
+    let instance = host_parts[1];
+    checked_discovery_identifier(tenant, "Workday tenant")?;
+    checked_discovery_identifier(instance, "Workday instance")?;
+    if !instance.starts_with("wd") {
+        anyhow::bail!("discovery Workday URL has an invalid instance")
+    }
+    let mut matches = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, segment)| **segment == "job");
+    let Some((job_index, _)) = matches.next() else {
+        anyhow::bail!("discovery Workday URL must include a job requisition")
+    };
+    if matches.next().is_some() || job_index == 0 || segments.len() <= job_index + 1 {
+        anyhow::bail!("discovery Workday URL is ambiguous")
+    }
+    let site = segments[job_index - 1];
+    checked_discovery_identifier(site, "Workday site")?;
+    if segments[job_index + 1..]
+        .iter()
+        .any(|segment| checked_discovery_identifier(segment, "Workday job path").is_err())
+    {
+        anyhow::bail!("discovery Workday URL has an invalid job path")
+    }
+    Ok(format!("{tenant}~{instance}~{site}"))
+}
+
+fn checked_discovery_identifier(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 160
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        anyhow::bail!("discovery {label} contains unsupported characters")
+    }
+    Ok(())
 }
 
 fn discovered_job_content_hash(
@@ -11354,6 +11476,180 @@ mod tests {
         assert!(invalid_non_workday
             .to_string()
             .contains("unsupported characters"));
+    }
+
+    #[test]
+    fn verified_imports_resolve_to_their_original_public_ats_board() {
+        let cases = [
+            (
+                "greenhouse_import",
+                "https://boards.greenhouse.io/acme/jobs/123?gh_src=feed",
+                "greenhouse",
+                "acme",
+            ),
+            (
+                "lever_import",
+                "https://jobs.lever.co/atlas/job-123?lever-source=feed",
+                "lever",
+                "atlas",
+            ),
+            (
+                "ashby_import",
+                "https://jobs.ashbyhq.com/orbit/job-123?utm_source=feed",
+                "ashby",
+                "orbit",
+            ),
+            (
+                "smartrecruiters_import",
+                "https://jobs.smartrecruiters.com/northstar/744000123456789-platform-engineer",
+                "smartrecruiters",
+                "northstar",
+            ),
+            (
+                "workday_import",
+                "https://contoso.wd5.myworkdayjobs.com/en-US/Careers/job/Austin/Software-Engineer_R12345",
+                "workday",
+                "contoso~wd5~Careers",
+            ),
+        ];
+
+        for (imported_source, url, provider, source_key) in cases {
+            let input = discovery_source_input_from_verified_import(
+                imported_source,
+                url,
+                "Example Company",
+                "track-engineering",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(input.provider, provider);
+            assert_eq!(input.source_key, source_key);
+            assert_eq!(input.track_id, "track-engineering");
+            assert_eq!(input.company, "Example Company");
+        }
+    }
+
+    #[test]
+    fn discovery_url_canonicalization_rejects_cross_source_and_hostile_targets() {
+        let pool = test_pool();
+        let ashby = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "ashby".to_string(),
+                source_key: "acme".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap();
+        let smartrecruiters = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "smartrecruiters".to_string(),
+                source_key: "acme".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap();
+        let workday = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "workday".to_string(),
+                source_key: "acme~wd5~Careers".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            canonicalize_discovered_url(
+                &ashby,
+                "https://jobs.ashbyhq.com/acme/job-123?utm_source=feed#details",
+            )
+            .unwrap(),
+            "https://jobs.ashbyhq.com/acme/job-123"
+        );
+        assert_eq!(
+            canonicalize_discovered_url(
+                &smartrecruiters,
+                "https://jobs.smartrecruiters.com/acme/744000123456789-platform-engineer",
+            )
+            .unwrap(),
+            "https://jobs.smartrecruiters.com/acme/744000123456789-platform-engineer"
+        );
+        assert_eq!(
+            canonicalize_discovered_url(
+                &workday,
+                "https://acme.wd5.myworkdayjobs.com/en-US/Careers/job/Austin/Software-Engineer_R12345",
+            )
+            .unwrap(),
+            "https://acme.wd5.myworkdayjobs.com/en-US/Careers/job/Austin/Software-Engineer_R12345"
+        );
+
+        for raw in [
+            "https://jobs.ashbyhq.com/other/job-123",
+            "https://jobs.smartrecruiters.com/acme/744000123456789-platform-engineer",
+            "https://jobs.ashbyhq.com@127.0.0.1/acme/job-123",
+            "https://jobs.ashbyhq.com.evil.example/acme/job-123",
+            "https://jobs.ashbyhq.com:444/acme/job-123",
+            "https://127.0.0.1/acme/job-123",
+        ] {
+            assert!(canonicalize_discovered_url(&ashby, raw).is_err(), "{raw}");
+        }
+        for raw in [
+            "https://jobs.smartrecruiters.com/other/744000123456789-platform-engineer",
+            "https://sub.jobs.smartrecruiters.com/acme/744000123456789-platform-engineer",
+            "https://jobs.smartrecruiters.com@169.254.169.254/acme/job-123",
+        ] {
+            assert!(
+                canonicalize_discovered_url(&smartrecruiters, raw).is_err(),
+                "{raw}"
+            );
+        }
+        for raw in [
+            "https://other.wd5.myworkdayjobs.com/en-US/Careers/job/Austin/Software-Engineer_R12345",
+            "https://acme.wd5.myworkdayjobs.com.evil.example/en-US/Careers/job/Austin/Software-Engineer_R12345",
+            "https://acme.wd5.myworkdayjobs.com/en-US/Other/job/Austin/Software-Engineer_R12345",
+            "https://acme.wd6.myworkdayjobs.com/en-US/Careers/job/Austin/Software-Engineer_R12345",
+        ] {
+            assert!(canonicalize_discovered_url(&workday, raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn non_public_or_unknown_imports_never_resolve_to_discovery_sources() {
+        for (source, url) in [
+            ("linkedin_import", "https://www.linkedin.com/jobs/view/123"),
+            ("indeed_import", "https://www.indeed.com/viewjob?jk=123"),
+            (
+                "ziprecruiter_import",
+                "https://www.ziprecruiter.com/jobs/123",
+            ),
+            ("dice_import", "https://www.dice.com/job-detail/123"),
+            ("pasted_link", "https://jobs.ashbyhq.com/acme/job-123"),
+            ("unknown", "https://127.0.0.1/private"),
+        ] {
+            assert!(
+                discovery_source_input_from_verified_import(source, url, "Acme", "track")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(discovery_source_input_from_verified_import(
+            "ashby_import",
+            "https://jobs.ashbyhq.com@127.0.0.1/acme/job-123",
+            "Acme",
+            "track",
+        )
+        .is_err());
     }
 
     #[test]

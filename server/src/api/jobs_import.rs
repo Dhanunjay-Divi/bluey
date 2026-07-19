@@ -43,6 +43,11 @@ pub(super) async fn import_supported_job(
             "Use a public https employer job link.".to_string(),
         ));
     }
+    if url.port().is_some() {
+        return Err(JobImportError::Invalid(
+            "Use the default HTTPS port for an employer job link.".to_string(),
+        ));
+    }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     match host.as_str() {
         "jobs.lever.co" | "jobs.eu.lever.co" => import_lever(&url).await.map(Some),
@@ -415,7 +420,7 @@ fn smartrecruiters_job_from_payload(
 async fn import_workday(url: &Url) -> Result<ImportedJob, JobImportError> {
     let host = url.host_str().unwrap_or_default();
     let host_parts = host.split('.').collect::<Vec<_>>();
-    if host_parts.len() < 4 || host_parts[host_parts.len() - 2..] != ["myworkdayjobs", "com"] {
+    if host_parts.len() != 4 || host_parts[2..] != ["myworkdayjobs", "com"] {
         return Err(JobImportError::Invalid(
             "Use a direct Workday employer job link.".to_string(),
         ));
@@ -979,6 +984,23 @@ mod tests {
         assert!(matches!(
             runtime.block_on(import_supported_job(
                 "https://acme.wd5.myworkdayjobs.com/en-US/Careers"
+            )),
+            Err(JobImportError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn import_rejects_non_default_ports_and_ambiguous_workday_hosts_before_fetching() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(matches!(
+            runtime.block_on(import_supported_job(
+                "https://jobs.ashbyhq.com:444/acme/job-123"
+            )),
+            Err(JobImportError::Invalid(_))
+        ));
+        assert!(matches!(
+            runtime.block_on(import_supported_job(
+                "https://acme.wd5.extra.myworkdayjobs.com/en-US/Careers/job/Austin/Software-Engineer_R12345"
             )),
             Err(JobImportError::Invalid(_))
         ));

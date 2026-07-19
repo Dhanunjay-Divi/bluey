@@ -541,13 +541,58 @@ pub async fn save_match(
             "Bluey cannot import this job site automatically yet. Add the company and role to continue in Review mode.",
         );
     }
+    let verified_import = imported.is_some();
     let posting = posting_from_user_input(input, imported);
     validate_posting(&posting)?;
     let profile = jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?;
     let preferences = jobs::get_preferences(&state.pool, &account.id).map_err(internal)?;
-    jobs::upsert_posting(&state.pool, &account.id, &posting, &profile, &preferences)
-        .map(Json)
-        .map_err(internal)
+    let saved = jobs::upsert_posting(&state.pool, &account.id, &posting, &profile, &preferences)
+        .map_err(internal)?;
+    if verified_import {
+        try_enroll_verified_import_discovery_source(&state.pool, &account.id, &saved);
+    }
+    Ok(Json(saved))
+}
+
+// Discovery enrollment is a retryable convenience after the verified match is
+// durable. A discovery DB outage must not turn a successfully saved import into
+// a false API failure; replaying the same import retries the idempotent upsert.
+fn try_enroll_verified_import_discovery_source(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+) -> bool {
+    match enroll_verified_import_discovery_source(pool, account_id, posting) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                account_id,
+                source = %posting.source,
+                canonical_url = %posting.canonical_url,
+                error = %error,
+                "verified Jobs import was saved without scheduled discovery enrollment"
+            );
+            false
+        }
+    }
+}
+
+fn enroll_verified_import_discovery_source(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+) -> anyhow::Result<()> {
+    let Some(source) = jobs::discovery_source_input_from_verified_import(
+        &posting.source,
+        &posting.canonical_url,
+        &posting.company,
+        &posting.track_id,
+    )?
+    else {
+        return Ok(());
+    };
+    jobs::upsert_discovery_source(pool, account_id, &source)?;
+    Ok(())
 }
 
 fn posting_from_user_input(
@@ -4537,6 +4582,54 @@ mod tests {
         }
     }
 
+    fn discovery_enrollment_test_pool() -> crate::db::DbPool {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-discovery-enrollment-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::open_pool(&path).unwrap();
+        crate::db::run_migrations(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-one', 'one@example.com', 'hash', 0);
+             INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-two', 'two@example.com', 'hash', 0);",
+        )
+        .unwrap();
+        drop(conn);
+        pool
+    }
+
+    fn imported_discovery_posting(source: &str, canonical_url: &str, track_id: &str) -> JobPosting {
+        JobPosting {
+            id: String::new(),
+            canonical_key: String::new(),
+            source: source.to_string(),
+            external_id: "job-123".to_string(),
+            company: "Acme".to_string(),
+            title: "Platform Engineer".to_string(),
+            location: "Austin, TX".to_string(),
+            workplace: "Hybrid".to_string(),
+            canonical_url: canonical_url.to_string(),
+            description: "Build reliable services.".to_string(),
+            compensation: String::new(),
+            employment_type: "full_time".to_string(),
+            track_id: track_id.to_string(),
+            match_score: 0,
+            matched_reasons: Vec::new(),
+            missing_requirements: Vec::new(),
+            posted_at_ms: None,
+            last_verified_at_ms: Some(1),
+            availability_status: "active".to_string(),
+            status: "matched".to_string(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            eligibility: None,
+        }
+    }
+
     #[test]
     fn client_supplied_track_id_cannot_bypass_plan_limit() {
         let current = vec![test_track("existing-track")];
@@ -4555,6 +4648,80 @@ mod tests {
             &test_entitlement(1),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn verified_import_enrollment_is_idempotent_bound_and_retries_after_failure() {
+        let pool = discovery_enrollment_test_pool();
+        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        jobs::upsert_track(&pool, "acct-one", &test_track("track-two")).unwrap();
+
+        let first = imported_discovery_posting(
+            "ashby_import",
+            "https://jobs.ashbyhq.com/acme/job-123",
+            "track-one",
+        );
+        enroll_verified_import_discovery_source(&pool, "acct-one", &first).unwrap();
+        enroll_verified_import_discovery_source(&pool, "acct-one", &first).unwrap();
+        let account_one_sources = jobs::list_discovery_sources(&pool, "acct-one").unwrap();
+        assert_eq!(account_one_sources.len(), 1);
+        assert_eq!(account_one_sources[0].provider, "ashby");
+        assert_eq!(account_one_sources[0].source_key, "acme");
+        assert_eq!(account_one_sources[0].track_id, "track-one");
+
+        let second_track = imported_discovery_posting(
+            "ashby_import",
+            "https://jobs.ashbyhq.com/acme/job-123",
+            "track-two",
+        );
+        enroll_verified_import_discovery_source(&pool, "acct-one", &second_track).unwrap();
+        assert_eq!(
+            jobs::list_discovery_sources(&pool, "acct-one")
+                .unwrap()
+                .len(),
+            2
+        );
+
+        assert!(!try_enroll_verified_import_discovery_source(
+            &pool, "acct-two", &first
+        ));
+        assert!(jobs::list_discovery_sources(&pool, "acct-two")
+            .unwrap()
+            .is_empty());
+
+        jobs::upsert_track(&pool, "acct-two", &test_track("track-two-account-two")).unwrap();
+        let second_account = imported_discovery_posting(
+            "ashby_import",
+            "https://jobs.ashbyhq.com/acme/job-123",
+            "track-two-account-two",
+        );
+        assert!(try_enroll_verified_import_discovery_source(
+            &pool,
+            "acct-two",
+            &second_account
+        ));
+        assert!(try_enroll_verified_import_discovery_source(
+            &pool,
+            "acct-two",
+            &second_account
+        ));
+        let account_two_sources = jobs::list_discovery_sources(&pool, "acct-two").unwrap();
+        assert_eq!(account_two_sources.len(), 1);
+        assert_eq!(account_two_sources[0].account_id, "acct-two");
+        assert_eq!(account_two_sources[0].track_id, "track-two-account-two");
+
+        let manual = imported_discovery_posting(
+            "pasted_link",
+            "https://jobs.ashbyhq.com/acme/job-123",
+            "track-one",
+        );
+        enroll_verified_import_discovery_source(&pool, "acct-one", &manual).unwrap();
+        assert_eq!(
+            jobs::list_discovery_sources(&pool, "acct-one")
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     fn strict_receipt_fixture() -> (

@@ -37,9 +37,11 @@ The highest-value reusable capabilities were:
 
 - Five source-configured public ATS connectors normalize to one `NormalizedJob`;
   the scheduled server-leased runtime accepts canonical Greenhouse, Lever,
-  Workday, Ashby, and SmartRecruiters identifiers. Each connector remains
-  host-pinned to the provider's official public endpoint; arbitrary URLs are
-  not valid scheduled sources.
+  Workday, Ashby, and SmartRecruiters identifiers. Sources can be configured
+  by an administrator or derived only from a verified direct import of that
+  same public ATS board and Career Track. Each connector remains host-pinned
+  to the provider's official public endpoint; arbitrary URLs are not valid
+  scheduled sources.
 - Discovery requests are HTTPS-only, host-pinned, redirect-free, size-bounded,
   retry-bounded, and pagination-bounded.
 - Form planning resolves confirmed profile facts and scoped answer memory in

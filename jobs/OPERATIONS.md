@@ -70,15 +70,25 @@ accepted only for loopback development.
 
 ### Discovery source lifecycle
 
-Discovery is deny-by-default. A Jobs administrator must provision each source
-for an account with `POST /admin/jobs/discovery-sources/:account_id`. Source
-keys are the official provider identifiers: a Greenhouse board token, Lever
-site, Ashby board name, SmartRecruiters company identifier, or a Workday
+Discovery is deny-by-default. A Jobs administrator can provision a source for
+an account with `POST /admin/jobs/discovery-sources/:account_id`. In addition,
+a verified direct import from the account's own public Greenhouse, Lever,
+Ashby, SmartRecruiters, or Workday job page can enroll that exact provider
+board for the imported Career Track. Manual links and LinkedIn, Indeed,
+ZipRecruiter, Dice, unknown, and private targets never enroll discovery.
+Source keys are the official provider identifiers: a Greenhouse board token,
+Lever site, Ashby board name, SmartRecruiters company identifier, or a Workday
 `tenant~instance~site` tuple. The worker derives the provider host and path;
-administrators cannot supply an arbitrary URL. New sources start as `waiting`,
-become `healthy` only after a complete verified snapshot, become `degraded`
-after a failed run, and pause after three consecutive failures. Paused and
-stale sources cannot authorize queueing or a runner start.
+neither administrators nor imports can supply an arbitrary scheduled URL. New
+sources start as `waiting`, become `healthy` only after a complete verified
+snapshot, become `degraded` after a failed run, and pause after three
+consecutive failures. Paused and stale sources cannot authorize queueing or a
+runner start.
+
+If the optional enrollment write is temporarily unavailable, the verified job
+import remains saved and a replay of that same import retries the idempotent
+source enrollment. Operators should alert on the structured enrollment warning
+rather than asking a customer to re-enter a job manually.
 
 Use `PATCH /admin/jobs/discovery-sources/:account_id/:source_id` with
 `{"status":"paused"}` as the per-source kill switch. Re-enabling a source
