@@ -679,7 +679,7 @@ pub async fn prepare_application(
             "Finish your Career Profile before preparing applications.".to_string(),
         ));
     }
-    let (draft, baseline_resume) = jobs::prepare_application_draft(
+    let prepared = jobs::prepare_application_draft(
         &state.pool,
         &account.id,
         &req.job_id,
@@ -690,28 +690,31 @@ pub async fn prepare_application(
     let posting = jobs::get_posting(&state.pool, &account.id, &req.job_id)
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
-    let generated =
-        jobs_resume_generation::generate(&state, &account.id, &profile, &posting, &baseline_resume)
-            .await
-            .map_err(|error| {
-                if error
-                    .to_string()
-                    .contains("resume generation is already in progress")
-                {
-                    (
-                        StatusCode::CONFLICT,
-                        "Bluey is already preparing this resume. Try again in a moment."
-                            .to_string(),
-                    )
-                } else {
-                    internal(error)
-                }
-            })?;
+    let generated = jobs_resume_generation::generate(
+        &state,
+        &account.id,
+        &profile,
+        &posting,
+        &prepared.baseline_resume,
+    )
+    .await
+    .map_err(|error| {
+        if error
+            .to_string()
+            .contains("resume generation is already in progress")
+        {
+            (
+                StatusCode::CONFLICT,
+                "Bluey is already preparing this resume. Try again in a moment.".to_string(),
+            )
+        } else {
+            internal(error)
+        }
+    })?;
     let (mut application, resume_version) = jobs::finalize_prepared_application(
         &state.pool,
         &account.id,
-        &draft.id,
-        &baseline_resume,
+        &prepared,
         generated.content,
         generated.diff,
         generated.public_provenance,

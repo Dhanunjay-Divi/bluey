@@ -5,10 +5,17 @@ use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 
 use super::DbPool;
 
-const RESERVATION_STALE_MS: i64 = 2 * 60 * 1_000;
+/// Reservations are short-lived fences, not ownership locks. Managed work
+/// must finish before this deadline or renew with the same token.
+pub(crate) const RESERVATION_TTL: Duration = Duration::from_secs(2 * 60);
+
+fn reservation_ttl_ms() -> i64 {
+    RESERVATION_TTL.as_millis().try_into().unwrap_or(i64::MAX)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResumeGenerationRecord {
@@ -105,8 +112,17 @@ pub fn reserve(
     job_id: &str,
     generation_key: &str,
 ) -> Result<ResumeGenerationReservation> {
-    let now = now_ms();
-    let stale_before = now - RESERVATION_STALE_MS;
+    reserve_at(pool, account_id, job_id, generation_key, now_ms())
+}
+
+fn reserve_at(
+    pool: &DbPool,
+    account_id: &str,
+    job_id: &str,
+    generation_key: &str,
+    now: i64,
+) -> Result<ResumeGenerationReservation> {
+    let stale_before = now.saturating_sub(reservation_ttl_ms());
     let reservation_token = uuid::Uuid::new_v4().to_string();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -247,6 +263,60 @@ pub fn reserve(
     })
 }
 
+/// Extend a still-valid reservation without changing its fencing token.
+/// Returning `false` means the caller has lost ownership and must stop before
+/// dispatching or finalizing any more work.
+pub fn renew(
+    pool: &DbPool,
+    account_id: &str,
+    generation_key: &str,
+    reservation_token: &str,
+) -> Result<bool> {
+    renew_at(
+        pool,
+        account_id,
+        generation_key,
+        reservation_token,
+        now_ms(),
+    )
+}
+
+fn renew_at(
+    pool: &DbPool,
+    account_id: &str,
+    generation_key: &str,
+    reservation_token: &str,
+    now: i64,
+) -> Result<bool> {
+    let stale_before = now.saturating_sub(reservation_ttl_ms());
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
+            "UPDATE jobs_resume_generations SET updated_at_ms = MAX(updated_at_ms, ?5)
+              WHERE account_id = ?1 AND generation_key = ?2 AND reservation_token = ?3
+                AND status = 'reserved' AND updated_at_ms >= ?4",
+            params![
+                account_id,
+                generation_key,
+                reservation_token,
+                stale_before,
+                now
+            ],
+        )? == 1),
+        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
+            "UPDATE jobs_resume_generations SET updated_at_ms = GREATEST(updated_at_ms, $5)
+              WHERE account_id = $1 AND generation_key = $2 AND reservation_token = $3
+                AND status = 'reserved' AND updated_at_ms >= $4",
+            &[
+                &account_id,
+                &generation_key,
+                &reservation_token,
+                &stale_before,
+                &now,
+            ],
+        )? == 1),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn complete(
     pool: &DbPool,
@@ -260,7 +330,36 @@ pub fn complete(
     output_tokens: i64,
     cost_cents_to_bluey: i64,
 ) -> Result<ResumeGenerationRecord> {
-    let now = now_ms();
+    complete_at(
+        pool,
+        account_id,
+        generation_key,
+        reservation_token,
+        output,
+        provider,
+        model,
+        input_tokens,
+        output_tokens,
+        cost_cents_to_bluey,
+        now_ms(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_at(
+    pool: &DbPool,
+    account_id: &str,
+    generation_key: &str,
+    reservation_token: &str,
+    output: &Value,
+    provider: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cost_cents_to_bluey: i64,
+    now: i64,
+) -> Result<ResumeGenerationRecord> {
+    let stale_before = now.saturating_sub(reservation_ttl_ms());
     let output_json = serde_json::to_string(output).context("encode resume generation output")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -270,7 +369,7 @@ pub fn complete(
                  provider = ?5, model = ?6, input_tokens = ?7, output_tokens = ?8, \
                  cost_cents_to_bluey = ?9, failure_code = NULL, updated_at_ms = ?10 \
                  WHERE account_id = ?1 AND generation_key = ?2 AND reservation_token = ?3 \
-                 AND status = 'reserved'",
+                 AND status = 'reserved' AND updated_at_ms >= ?11",
                 params![
                     account_id,
                     generation_key,
@@ -281,7 +380,8 @@ pub fn complete(
                     input_tokens,
                     output_tokens,
                     cost_cents_to_bluey,
-                    now
+                    now,
+                    stale_before,
                 ],
             )?;
             if updated != 1 {
@@ -302,7 +402,7 @@ pub fn complete(
                  provider = $5, model = $6, input_tokens = $7, output_tokens = $8, \
                  cost_cents_to_bluey = $9, failure_code = NULL, updated_at_ms = $10 \
                  WHERE account_id = $1 AND generation_key = $2 AND reservation_token = $3 \
-                 AND status = 'reserved' \
+                 AND status = 'reserved' AND updated_at_ms >= $11 \
                  RETURNING {SELECT_COLUMNS}"
                 ),
                     &[
@@ -316,6 +416,7 @@ pub fn complete(
                         &output_tokens,
                         &cost_cents_to_bluey,
                         &now,
+                        &stale_before,
                     ],
                 )?
                 .ok_or_else(|| {
@@ -492,5 +593,147 @@ mod tests {
             1,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn fenced_renewal_keeps_valid_work_owned_past_the_original_deadline() {
+        let (pool, account_id, job_id) = pool_with_job();
+        let started_at = 1_000_000;
+        let ResumeGenerationReservation::Start(reservation) =
+            reserve_at(&pool, &account_id, &job_id, "key-renewed", started_at).unwrap()
+        else {
+            panic!("first worker should own the generation")
+        };
+        let renewed_at = started_at + reservation_ttl_ms() - 1;
+        assert!(renew_at(
+            &pool,
+            &account_id,
+            "key-renewed",
+            &reservation.reservation_token,
+            renewed_at,
+        )
+        .unwrap());
+
+        let after_original_deadline = started_at + reservation_ttl_ms() + 1;
+        assert_eq!(
+            reserve_at(
+                &pool,
+                &account_id,
+                &job_id,
+                "key-renewed",
+                after_original_deadline,
+            )
+            .unwrap(),
+            ResumeGenerationReservation::Pending
+        );
+        complete_at(
+            &pool,
+            &account_id,
+            "key-renewed",
+            &reservation.reservation_token,
+            &serde_json::json!({"headline":"renewed"}),
+            "openai",
+            "model",
+            20,
+            10,
+            1,
+            after_original_deadline,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn expired_or_replaced_tokens_cannot_renew_finalize_or_fail() {
+        let (pool, account_id, job_id) = pool_with_job();
+        let started_at = 2_000_000;
+        let ResumeGenerationReservation::Start(first) =
+            reserve_at(&pool, &account_id, &job_id, "key-fenced", started_at).unwrap()
+        else {
+            panic!("first worker should own the generation")
+        };
+        let expired_at = started_at + reservation_ttl_ms() + 1;
+        assert!(!renew_at(
+            &pool,
+            &account_id,
+            "key-fenced",
+            &first.reservation_token,
+            expired_at,
+        )
+        .unwrap());
+        assert!(complete_at(
+            &pool,
+            &account_id,
+            "key-fenced",
+            &first.reservation_token,
+            &serde_json::json!({"headline":"late"}),
+            "openai",
+            "model",
+            20,
+            10,
+            1,
+            expired_at,
+        )
+        .is_err());
+
+        let ResumeGenerationReservation::Start(second) =
+            reserve_at(&pool, &account_id, &job_id, "key-fenced", expired_at).unwrap()
+        else {
+            panic!("second worker should reclaim expired work")
+        };
+        assert_ne!(first.reservation_token, second.reservation_token);
+        assert!(!renew_at(
+            &pool,
+            &account_id,
+            "key-fenced",
+            &first.reservation_token,
+            expired_at + 1,
+        )
+        .unwrap());
+        assert!(fail(
+            &pool,
+            &account_id,
+            "key-fenced",
+            &first.reservation_token,
+            "cancelled",
+        )
+        .is_err());
+        complete_at(
+            &pool,
+            &account_id,
+            "key-fenced",
+            &second.reservation_token,
+            &serde_json::json!({"headline":"current"}),
+            "openai",
+            "model",
+            20,
+            10,
+            1,
+            expired_at + 1,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn failed_generation_can_restart_without_reusing_its_token() {
+        let (pool, account_id, job_id) = pool_with_job();
+        let ResumeGenerationReservation::Start(first) =
+            reserve(&pool, &account_id, &job_id, "key-restart").unwrap()
+        else {
+            panic!("first worker should own the generation")
+        };
+        fail(
+            &pool,
+            &account_id,
+            "key-restart",
+            &first.reservation_token,
+            "cancelled",
+        )
+        .unwrap();
+        let ResumeGenerationReservation::Start(second) =
+            reserve(&pool, &account_id, &job_id, "key-restart").unwrap()
+        else {
+            panic!("failed generation should be restartable")
+        };
+        assert_ne!(first.reservation_token, second.reservation_token);
     }
 }

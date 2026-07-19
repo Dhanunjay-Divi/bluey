@@ -535,6 +535,25 @@ pub struct JobApplication {
     pub submitted_at_ms: Option<i64>,
 }
 
+/// An application packet assembled in memory while its resume generation is
+/// pending. The candidate is deliberately not persisted: callers continue to
+/// see the last committed packet until `finalize_prepared_application` commits
+/// both the resume version and this application with an optimistic fence.
+#[derive(Debug, Clone)]
+pub struct PreparedApplicationDraft {
+    pub application: JobApplication,
+    pub baseline_resume: ResumeVersion,
+    expected_application: Option<ExpectedApplicationRevision>,
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedApplicationRevision {
+    id: String,
+    state: String,
+    updated_at_ms: i64,
+    payload: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserSession {
     #[serde(default)]
@@ -4886,7 +4905,9 @@ pub fn prepare_application(
     mode: &str,
     submission_mode: &str,
 ) -> Result<(JobApplication, ResumeVersion)> {
-    prepare_application_inner(pool, account_id, job_id, mode, submission_mode, true)
+    let (application, resume, _) =
+        prepare_application_inner(pool, account_id, job_id, mode, submission_mode, true)?;
+    Ok((application, resume))
 }
 
 pub fn prepare_application_draft(
@@ -4895,8 +4916,14 @@ pub fn prepare_application_draft(
     job_id: &str,
     mode: &str,
     submission_mode: &str,
-) -> Result<(JobApplication, ResumeVersion)> {
-    prepare_application_inner(pool, account_id, job_id, mode, submission_mode, false)
+) -> Result<PreparedApplicationDraft> {
+    let (application, baseline_resume, expected_application) =
+        prepare_application_inner(pool, account_id, job_id, mode, submission_mode, false)?;
+    Ok(PreparedApplicationDraft {
+        application,
+        baseline_resume,
+        expected_application,
+    })
 }
 
 fn prepare_application_inner(
@@ -4906,11 +4933,19 @@ fn prepare_application_inner(
     mode: &str,
     submission_mode: &str,
     finalize_immediately: bool,
-) -> Result<(JobApplication, ResumeVersion)> {
+) -> Result<(
+    JobApplication,
+    ResumeVersion,
+    Option<ExpectedApplicationRevision>,
+)> {
     let profile = get_profile(pool, account_id, "")?;
     let posting =
         get_posting(pool, account_id, job_id)?.ok_or_else(|| anyhow::anyhow!("job not found"))?;
-    let existing_application = find_application_for_job(pool, account_id, job_id)?;
+    let existing = find_application_for_job_with_revision(pool, account_id, job_id)?;
+    let existing_application = existing
+        .as_ref()
+        .map(|(application, _)| application.clone());
+    let expected_application = existing.as_ref().map(|(_, revision)| revision.clone());
     let eligibility = evaluate_job_eligibility(
         pool,
         account_id,
@@ -5079,22 +5114,22 @@ fn prepare_application_inner(
         },
         "confirmation": Value::Null,
     });
-    save_application(pool, account_id, &application)?;
-    Ok((application, resume))
+    if finalize_immediately {
+        save_application(pool, account_id, &application)?;
+    }
+    Ok((application, resume, expected_application))
 }
 
 pub fn finalize_prepared_application(
     pool: &DbPool,
     account_id: &str,
-    application_id: &str,
-    baseline: &ResumeVersion,
+    prepared: &PreparedApplicationDraft,
     content: Value,
     diff: Value,
     generation: Value,
 ) -> Result<(JobApplication, ResumeVersion)> {
-    let Some(mut application) = get_application(pool, account_id, application_id)? else {
-        anyhow::bail!("application not found")
-    };
+    let mut application = prepared.application.clone();
+    let baseline = &prepared.baseline_resume;
     if application.state != "preparing" {
         anyhow::bail!("application is not waiting for resume generation")
     }
@@ -5133,16 +5168,6 @@ pub fn finalize_prepared_application(
 
     let checksum_source = format!("{}|{}|{}", account_id, posting.id, content);
     let checksum = hex::encode(Sha256::digest(checksum_source.as_bytes()));
-    let resume = save_resume_version(
-        pool,
-        account_id,
-        &posting.id,
-        &baseline.mode,
-        content,
-        diff,
-        baseline.claim_ids.clone(),
-        checksum,
-    )?;
     let eligibility = evaluate_job_eligibility(
         pool,
         account_id,
@@ -5152,7 +5177,6 @@ pub fn finalize_prepared_application(
     )?;
     let auto_submit_eligible =
         application.submission_mode == "auto_submit" && eligibility.can_auto_submit;
-    application.resume_version_id = Some(resume.id.clone());
     application.state = if auto_submit_eligible {
         "queued".to_string()
     } else {
@@ -5163,7 +5187,6 @@ pub fn finalize_prepared_application(
         .receipt
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("application receipt must be an object"))?;
-    receipt.insert("resume_version_id".to_string(), json!(resume.id));
     receipt.insert(
         "eligibility".to_string(),
         serde_json::to_value(eligibility)?,
@@ -5180,7 +5203,249 @@ pub fn finalize_prepared_application(
             "canonical_job_key": posting.canonical_key,
         }),
     );
-    save_application(pool, account_id, &application).map(|application| (application, resume))
+    commit_prepared_application(
+        pool,
+        account_id,
+        &mut application,
+        &prepared.expected_application,
+        baseline,
+        content,
+        diff,
+        checksum,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_prepared_application(
+    pool: &DbPool,
+    account_id: &str,
+    application: &mut JobApplication,
+    expected: &Option<ExpectedApplicationRevision>,
+    baseline: &ResumeVersion,
+    content: Value,
+    diff: Value,
+    checksum: String,
+) -> Result<(JobApplication, ResumeVersion)> {
+    validate_application_state(&application.state)?;
+    let content_json = to_json(&content, "resume content")?;
+    let diff_json = to_json(&diff, "resume diff")?;
+    let claim_ids = baseline.claim_ids.clone();
+    let claim_ids_json = to_json(&claim_ids, "resume claims")?;
+    let resume_created_at_ms = now_ms();
+
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let resume = if let Some(existing) = tx
+                .query_row(
+                    "SELECT id, job_id, version_no, mode, content_json, diff_json,
+                            claim_ids_json, checksum, created_at_ms
+                       FROM jobs_resume_versions
+                      WHERE account_id = ?1 AND job_id = ?2 AND checksum = ?3",
+                    params![account_id, application.job_id, checksum],
+                    resume_from_sqlite_row,
+                )
+                .optional()?
+            {
+                existing
+            } else {
+                let version_no: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(version_no), 0) + 1 FROM jobs_resume_versions
+                      WHERE account_id = ?1 AND job_id = ?2",
+                    params![account_id, application.job_id],
+                    |row| row.get(0),
+                )?;
+                let id = uuid::Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO jobs_resume_versions (
+                        id, account_id, job_id, version_no, mode, content_json,
+                        diff_json, claim_ids_json, checksum, created_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        id,
+                        account_id,
+                        application.job_id,
+                        version_no,
+                        baseline.mode,
+                        content_json,
+                        diff_json,
+                        claim_ids_json,
+                        checksum,
+                        resume_created_at_ms,
+                    ],
+                )?;
+                ResumeVersion {
+                    id,
+                    job_id: application.job_id.clone(),
+                    version_no,
+                    mode: baseline.mode.clone(),
+                    content: content.clone(),
+                    diff: diff.clone(),
+                    claim_ids: claim_ids.clone(),
+                    checksum: checksum.clone(),
+                    created_at_ms: resume_created_at_ms,
+                }
+            };
+
+            application.resume_version_id = Some(resume.id.clone());
+            application
+                .receipt
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("application receipt must be an object"))?
+                .insert("resume_version_id".to_string(), json!(resume.id));
+            let payload = to_json(application, "job application")?;
+            let changed = match expected {
+                Some(expected) => tx.execute(
+                    "UPDATE jobs_applications SET resume_version_id = ?5, state = ?6,
+                            application_json = ?7, updated_at_ms = ?8, submitted_at_ms = ?9
+                      WHERE account_id = ?1 AND job_id = ?2 AND id = ?3
+                        AND state = ?4 AND updated_at_ms = ?10 AND application_json = ?11",
+                    params![
+                        account_id,
+                        application.job_id,
+                        expected.id,
+                        expected.state,
+                        application.resume_version_id,
+                        application.state,
+                        payload,
+                        application.updated_at_ms,
+                        application.submitted_at_ms,
+                        expected.updated_at_ms,
+                        expected.payload,
+                    ],
+                )?,
+                None => tx.execute(
+                    "INSERT INTO jobs_applications (
+                        id, account_id, job_id, resume_version_id, state,
+                        application_json, created_at_ms, updated_at_ms, submitted_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(account_id, job_id) DO NOTHING",
+                    params![
+                        application.id,
+                        account_id,
+                        application.job_id,
+                        application.resume_version_id,
+                        application.state,
+                        payload,
+                        application.created_at_ms,
+                        application.updated_at_ms,
+                        application.submitted_at_ms,
+                    ],
+                )?,
+            };
+            if changed != 1 {
+                anyhow::bail!("application changed while resume generation was in progress");
+            }
+            tx.commit()?;
+            Ok((application.clone(), resume))
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let resume = if let Some(row) = tx.query_opt(
+                "SELECT id, job_id, version_no, mode, content_json, diff_json,
+                        claim_ids_json, checksum, created_at_ms
+                   FROM jobs_resume_versions
+                  WHERE account_id = $1 AND job_id = $2 AND checksum = $3",
+                &[&account_id, &application.job_id, &checksum],
+            )? {
+                resume_from_pg_row(row)?
+            } else {
+                let version_no: i64 = tx
+                    .query_one(
+                        "SELECT COALESCE(MAX(version_no), 0) + 1 FROM jobs_resume_versions
+                          WHERE account_id = $1 AND job_id = $2",
+                        &[&account_id, &application.job_id],
+                    )?
+                    .get(0);
+                let id = uuid::Uuid::new_v4().to_string();
+                let inserted = tx.query_opt(
+                    "INSERT INTO jobs_resume_versions (
+                        id, account_id, job_id, version_no, mode, content_json,
+                        diff_json, claim_ids_json, checksum, created_at_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     ON CONFLICT (account_id, job_id, checksum) DO NOTHING
+                     RETURNING id, job_id, version_no, mode, content_json, diff_json,
+                               claim_ids_json, checksum, created_at_ms",
+                    &[
+                        &id,
+                        &account_id,
+                        &application.job_id,
+                        &version_no,
+                        &baseline.mode,
+                        &content_json,
+                        &diff_json,
+                        &claim_ids_json,
+                        &checksum,
+                        &resume_created_at_ms,
+                    ],
+                )?;
+                match inserted {
+                    Some(row) => resume_from_pg_row(row)?,
+                    None => resume_from_pg_row(tx.query_one(
+                        "SELECT id, job_id, version_no, mode, content_json, diff_json,
+                                claim_ids_json, checksum, created_at_ms
+                           FROM jobs_resume_versions
+                          WHERE account_id = $1 AND job_id = $2 AND checksum = $3",
+                        &[&account_id, &application.job_id, &checksum],
+                    )?)?,
+                }
+            };
+
+            application.resume_version_id = Some(resume.id.clone());
+            application
+                .receipt
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("application receipt must be an object"))?
+                .insert("resume_version_id".to_string(), json!(resume.id));
+            let payload = to_json(application, "job application")?;
+            let changed = match expected {
+                Some(expected) => tx.execute(
+                    "UPDATE jobs_applications SET resume_version_id = $5, state = $6,
+                            application_json = $7, updated_at_ms = $8, submitted_at_ms = $9
+                      WHERE account_id = $1 AND job_id = $2 AND id = $3
+                        AND state = $4 AND updated_at_ms = $10 AND application_json = $11",
+                    &[
+                        &account_id,
+                        &application.job_id,
+                        &expected.id,
+                        &expected.state,
+                        &application.resume_version_id,
+                        &application.state,
+                        &payload,
+                        &application.updated_at_ms,
+                        &application.submitted_at_ms,
+                        &expected.updated_at_ms,
+                        &expected.payload,
+                    ],
+                )?,
+                None => tx.execute(
+                    "INSERT INTO jobs_applications (
+                        id, account_id, job_id, resume_version_id, state,
+                        application_json, created_at_ms, updated_at_ms, submitted_at_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     ON CONFLICT(account_id, job_id) DO NOTHING",
+                    &[
+                        &application.id,
+                        &account_id,
+                        &application.job_id,
+                        &application.resume_version_id,
+                        &application.state,
+                        &payload,
+                        &application.created_at_ms,
+                        &application.updated_at_ms,
+                        &application.submitted_at_ms,
+                    ],
+                )?,
+            };
+            if changed != 1 {
+                anyhow::bail!("application changed while resume generation was in progress");
+            }
+            tx.commit()?;
+            Ok((application.clone(), resume))
+        }
+    })
 }
 
 fn answers_for_posting(
@@ -5382,34 +5647,57 @@ fn save_resume_version(
     })
 }
 
-fn find_application_for_job(
+fn find_application_for_job_with_revision(
     pool: &DbPool,
     account_id: &str,
     job_id: &str,
-) -> Result<Option<JobApplication>> {
-    crate::db::run_blocking_db(|| {
-        match pool {
+) -> Result<Option<(JobApplication, ExpectedApplicationRevision)>> {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
-            let raw: Option<String> = conn
+            let raw: Option<(String, String, i64, String)> = conn
                 .query_row(
-                    "SELECT application_json FROM jobs_applications WHERE account_id = ?1 AND job_id = ?2",
+                    "SELECT id, state, updated_at_ms, application_json
+                       FROM jobs_applications WHERE account_id = ?1 AND job_id = ?2",
                     params![account_id, job_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()?;
-            raw.map(|value| parse_json(value, "job application"))
-                .transpose()
+            raw.map(|(id, state, updated_at_ms, value)| {
+                let application = parse_json(value.clone(), "job application")?;
+                Ok((
+                    application,
+                    ExpectedApplicationRevision {
+                        id,
+                        state,
+                        updated_at_ms,
+                        payload: value,
+                    },
+                ))
+            })
+            .transpose()
         }
         DbPool::Postgres(_) => pool
             .get_pg()?
             .query_opt(
-                "SELECT application_json FROM jobs_applications WHERE account_id = $1 AND job_id = $2",
+                "SELECT id, state, updated_at_ms, application_json
+                   FROM jobs_applications WHERE account_id = $1 AND job_id = $2",
                 &[&account_id, &job_id],
             )?
-            .map(|row| parse_json(row.get(0), "job application"))
+            .map(|row| {
+                let value: String = row.get(3);
+                let application = parse_json(value.clone(), "job application")?;
+                Ok((
+                    application,
+                    ExpectedApplicationRevision {
+                        id: row.get(0),
+                        state: row.get(1),
+                        updated_at_ms: row.get(2),
+                        payload: value,
+                    },
+                ))
+            })
             .transpose(),
-    }
     })
 }
 
@@ -11696,12 +11984,15 @@ mod tests {
             &JobPreferences::default(),
         )
         .unwrap();
-        let (draft, baseline) =
+        let prepared =
             prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "auto_submit")
                 .unwrap();
+        let draft = &prepared.application;
+        let baseline = &prepared.baseline_resume;
         assert_eq!(draft.state, "preparing");
         assert!(draft.resume_version_id.is_none());
         assert!(baseline.id.is_empty());
+        assert!(list_applications(&pool, "acct-jobs").unwrap().is_empty());
         assert!(list_resume_versions(&pool, "acct-jobs").unwrap().is_empty());
         assert_eq!(
             draft.receipt.pointer("/metering/status"),
@@ -11719,8 +12010,7 @@ mod tests {
         let (application, resume) = finalize_prepared_application(
             &pool,
             "acct-jobs",
-            &draft.id,
-            &baseline,
+            &prepared,
             content.clone(),
             baseline.diff.clone(),
             generation,
@@ -11757,16 +12047,17 @@ mod tests {
             &JobPreferences::default(),
         )
         .unwrap();
-        let (draft, baseline) =
+        let prepared =
             prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "review_first")
                 .unwrap();
+        let draft = &prepared.application;
+        let baseline = &prepared.baseline_resume;
         let mut content = baseline.content.clone();
         content["provenance"]["candidate_truth_fingerprint"] = json!("tampered");
         let error = finalize_prepared_application(
             &pool,
             "acct-jobs",
-            &draft.id,
-            &baseline,
+            &prepared,
             content,
             baseline.diff.clone(),
             json!({"kind": "model"}),
@@ -11775,14 +12066,179 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not match the candidate truth snapshot"));
-        assert_eq!(
-            get_application(&pool, "acct-jobs", &draft.id)
-                .unwrap()
-                .unwrap()
-                .state,
-            "preparing"
-        );
+        assert!(get_application(&pool, "acct-jobs", &draft.id)
+            .unwrap()
+            .is_none());
         assert!(list_resume_versions(&pool, "acct-jobs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelled_generation_preserves_the_prior_review_packet() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/preserved-packet",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (prior, prior_resume) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        assert_eq!(prior.state, "awaiting_review");
+
+        let pending =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "enhance", "review_first")
+                .unwrap();
+        assert_eq!(pending.application.state, "preparing");
+        drop(pending); // Request cancellation/restart before generation finishes.
+
+        let current = get_application(&pool, "acct-jobs", &prior.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&current).unwrap(),
+            serde_json::to_value(&prior).unwrap(),
+            "cancellation must not mutate any part of the committed packet"
+        );
+        assert_eq!(current.state, "awaiting_review");
+        assert_eq!(current.resume_version_id, Some(prior_resume.id));
+        assert_eq!(current.receipt, prior.receipt);
+        assert_eq!(list_resume_versions(&pool, "acct-jobs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_prepare_finalization_is_cas_fenced_and_atomic() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/concurrent-generation",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (prior, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let first =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let second =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+
+        let mut first_content = first.baseline_resume.content.clone();
+        first_content["provenance"]["resume_generation"] = json!({"kind":"model","attempt":1});
+        let (winner, winner_resume) = finalize_prepared_application(
+            &pool,
+            "acct-jobs",
+            &first,
+            first_content,
+            first.baseline_resume.diff.clone(),
+            json!({"kind":"model","attempt":1}),
+        )
+        .unwrap();
+        let resume_count_after_winner = list_resume_versions(&pool, "acct-jobs").unwrap().len();
+
+        let mut stale_content = second.baseline_resume.content.clone();
+        stale_content["provenance"]["resume_generation"] = json!({"kind":"model","attempt":2});
+        let error = finalize_prepared_application(
+            &pool,
+            "acct-jobs",
+            &second,
+            stale_content,
+            second.baseline_resume.diff.clone(),
+            json!({"kind":"model","attempt":2}),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("application changed while resume generation was in progress"));
+        assert_eq!(
+            list_resume_versions(&pool, "acct-jobs").unwrap().len(),
+            resume_count_after_winner,
+            "the losing CAS must roll back its resume insert"
+        );
+        let current = get_application(&pool, "acct-jobs", &prior.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.id, winner.id);
+        assert_eq!(current.resume_version_id, Some(winner_resume.id));
+        assert_eq!(
+            current.receipt.pointer("/resume_generation/attempt"),
+            Some(&json!(1))
+        );
+    }
+
+    #[test]
+    fn duplicate_first_prepare_creates_only_one_visible_packet() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/first-packet-race",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let first =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let second =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        assert!(list_applications(&pool, "acct-jobs").unwrap().is_empty());
+
+        let (winner, _) = finalize_prepared_application(
+            &pool,
+            "acct-jobs",
+            &first,
+            first.baseline_resume.content.clone(),
+            first.baseline_resume.diff.clone(),
+            json!({"kind":"deterministic"}),
+        )
+        .unwrap();
+        let error = finalize_prepared_application(
+            &pool,
+            "acct-jobs",
+            &second,
+            second.baseline_resume.content.clone(),
+            second.baseline_resume.diff.clone(),
+            json!({"kind":"deterministic"}),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("application changed while resume generation was in progress"));
+        assert_eq!(list_applications(&pool, "acct-jobs").unwrap().len(), 1);
+        assert_eq!(list_resume_versions(&pool, "acct-jobs").unwrap().len(), 1);
+        assert_eq!(
+            get_application(&pool, "acct-jobs", &winner.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            winner.id
+        );
     }
 
     #[test]
