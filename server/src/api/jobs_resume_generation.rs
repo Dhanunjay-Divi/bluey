@@ -23,7 +23,7 @@ use crate::{
     pricing, routing,
 };
 
-const GENERATION_SCHEMA_VERSION: i64 = 1;
+const GENERATION_SCHEMA_VERSION: i64 = 2;
 const MAX_RESUME_SKILLS: usize = 16;
 const MAX_HEADLINE_CHARS: usize = 180;
 const MAX_SUMMARY_CHARS: usize = 700;
@@ -44,9 +44,13 @@ struct ResumePlan {
     headline_evidence_ids: Vec<String>,
     #[serde(default)]
     summary_evidence_ids: Vec<String>,
+    #[serde(default)]
     skill_order: Vec<String>,
+    #[serde(default)]
     employment_order: Vec<usize>,
+    #[serde(default)]
     employment_highlight_order: Vec<HighlightOrder>,
+    #[serde(default)]
     project_order: Vec<usize>,
 }
 
@@ -234,6 +238,7 @@ async fn generate_reserved(
                 }
             };
             let plan = match parse_plan(&completion.text)
+                .map(|plan| normalize_plan(profile, &catalog, plan))
                 .and_then(|plan| validate_plan(profile, &catalog, plan))
             {
                 Ok(plan) => plan,
@@ -455,17 +460,132 @@ fn validate_plan(
         }
         seen_skills.push(skill);
     }
-    validate_narrative(
-        &plan.headline,
-        &catalog.selected_text(&plan.headline_evidence_ids)?,
-        "headline",
-    )?;
-    validate_narrative(
-        &plan.summary,
-        &catalog.selected_text(&plan.summary_evidence_ids)?,
-        "summary",
-    )?;
+    catalog.selected_text(&plan.headline_evidence_ids)?;
+    catalog.selected_text(&plan.summary_evidence_ids)?;
+    let all_verified_evidence = catalog
+        .values
+        .values()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    validate_narrative(&plan.headline, &all_verified_evidence, "headline")?;
+    validate_narrative(&plan.summary, &all_verified_evidence, "summary")?;
     Ok(plan)
+}
+
+fn normalize_plan(
+    profile: &CareerProfile,
+    catalog: &EvidenceCatalog,
+    mut plan: ResumePlan,
+) -> ResumePlan {
+    plan.headline_evidence_ids = normalize_evidence_ids(catalog, plan.headline_evidence_ids);
+    plan.summary_evidence_ids = normalize_evidence_ids(catalog, plan.summary_evidence_ids);
+    plan.skill_order = normalize_skills(profile, plan.skill_order);
+    plan.employment_order = normalize_permutation(plan.employment_order, profile.employment.len());
+    plan.project_order = normalize_permutation(plan.project_order, profile.projects.len());
+
+    let mut highlight_orders = BTreeMap::new();
+    for order in plan.employment_highlight_order {
+        if order.entry_index < profile.employment.len() {
+            highlight_orders
+                .entry(order.entry_index)
+                .or_insert(order.highlight_indices);
+        }
+    }
+    plan.employment_highlight_order = (0..profile.employment.len())
+        .map(|entry_index| HighlightOrder {
+            entry_index,
+            highlight_indices: normalize_permutation(
+                highlight_orders.remove(&entry_index).unwrap_or_default(),
+                profile.employment[entry_index].highlights.len(),
+            ),
+        })
+        .collect();
+
+    plan.headline = normalize_narrative(
+        &plan.headline,
+        &profile.headline,
+        catalog,
+        MAX_HEADLINE_CHARS,
+    );
+    plan.summary = normalize_narrative(&plan.summary, &profile.summary, catalog, MAX_SUMMARY_CHARS);
+    plan
+}
+
+fn normalize_evidence_ids(catalog: &EvidenceCatalog, ids: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for id in ids {
+        if catalog.values.contains_key(&id) && !normalized.contains(&id) {
+            normalized.push(id);
+        }
+    }
+    normalized
+}
+
+fn normalize_skills(profile: &CareerProfile, skills: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for skill in skills {
+        if profile.skills.iter().any(|candidate| candidate == &skill)
+            && !normalized.contains(&skill)
+            && normalized.len() < MAX_RESUME_SKILLS
+        {
+            normalized.push(skill);
+        }
+    }
+    if normalized.is_empty() {
+        normalized.extend(profile.skills.iter().take(MAX_RESUME_SKILLS).cloned());
+    }
+    normalized
+}
+
+fn normalize_permutation(values: Vec<usize>, expected_len: usize) -> Vec<usize> {
+    let mut normalized = Vec::with_capacity(expected_len);
+    for value in values {
+        if value < expected_len && !normalized.contains(&value) {
+            normalized.push(value);
+        }
+    }
+    for value in 0..expected_len {
+        if !normalized.contains(&value) {
+            normalized.push(value);
+        }
+    }
+    normalized
+}
+
+fn normalize_narrative(
+    proposed: &str,
+    fallback: &str,
+    catalog: &EvidenceCatalog,
+    max_chars: usize,
+) -> String {
+    let all_verified_evidence = catalog
+        .values
+        .values()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let proposed = truncate_at_boundary(proposed.trim(), max_chars);
+    if validate_narrative(&proposed, &all_verified_evidence, "narrative").is_ok() {
+        return proposed;
+    }
+    truncate_at_boundary(fallback.trim(), max_chars)
+}
+
+fn truncate_at_boundary(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let prefix = value.chars().take(max_chars).collect::<String>();
+    let boundary = prefix
+        .char_indices()
+        .filter(|(_, character)| character.is_whitespace() || matches!(character, '.' | ',' | ';'))
+        .map(|(index, _)| index)
+        .next_back()
+        .unwrap_or(prefix.len());
+    prefix[..boundary]
+        .trim_end_matches(|character: char| character.is_whitespace() || character == ',')
+        .to_string()
 }
 
 fn validate_permutation(values: &[usize], expected_len: usize, label: &str) -> Result<()> {
@@ -790,6 +910,18 @@ mod tests {
     }
 
     #[test]
+    fn missing_rank_arrays_normalize_to_verified_profile_order() {
+        let profile = profile();
+        let catalog = EvidenceCatalog::from_profile(&profile);
+        let raw = r#"{"headline":"Software Engineer","summary":"Built reliable distributed systems for healthcare teams."}"#;
+        let normalized = normalize_plan(&profile, &catalog, parse_plan(raw).unwrap());
+        assert_eq!(normalized.employment_order, vec![0]);
+        assert_eq!(normalized.project_order, vec![0]);
+        assert_eq!(normalized.skill_order, profile.skills);
+        validate_plan(&profile, &catalog, normalized).unwrap();
+    }
+
+    #[test]
     fn rejects_unknown_skill_and_new_number() {
         let profile = profile();
         let catalog = EvidenceCatalog::from_profile(&profile);
@@ -809,6 +941,49 @@ mod tests {
         let mut invalid = valid_plan();
         invalid.employment_highlight_order[0].highlight_indices = vec![0, 0];
         assert!(validate_plan(&profile, &catalog, invalid).is_err());
+    }
+
+    #[test]
+    fn normalizes_model_shape_without_adding_candidate_claims() {
+        let mut profile = profile();
+        profile.skills.push("REST APIs".into());
+        let catalog = EvidenceCatalog::from_profile(&profile);
+        let mut plan = valid_plan();
+        plan.headline = "Senior API Engineer".into();
+        plan.summary = "Invented leadership claim for an unrelated industry.".into();
+        plan.headline_evidence_ids = vec!["missing:evidence".into()];
+        plan.skill_order = vec![
+            "REST APIs".into(),
+            "Rust".into(),
+            "Rust".into(),
+            "Unknown".into(),
+        ];
+        plan.employment_order.clear();
+        plan.employment_highlight_order.clear();
+        plan.project_order.clear();
+
+        let normalized = normalize_plan(&profile, &catalog, plan);
+        assert_eq!(normalized.headline, profile.headline);
+        assert_eq!(normalized.summary, profile.summary);
+        assert_eq!(normalized.skill_order, vec!["REST APIs", "Rust"]);
+        assert_eq!(normalized.employment_order, vec![0]);
+        assert_eq!(
+            normalized.employment_highlight_order[0].highlight_indices,
+            vec![0, 1]
+        );
+        assert_eq!(normalized.project_order, vec![0]);
+        validate_plan(&profile, &catalog, normalized).unwrap();
+    }
+
+    #[test]
+    fn verified_profile_evidence_can_support_narrative_without_selected_id_echo() {
+        let mut profile = profile();
+        profile.skills.push("REST APIs".into());
+        let catalog = EvidenceCatalog::from_profile(&profile);
+        let mut plan = valid_plan();
+        plan.summary = "Built reliable REST APIs for healthcare teams.".into();
+        plan.summary_evidence_ids = vec!["profile:summary".into()];
+        validate_plan(&profile, &catalog, plan).unwrap();
     }
 
     #[test]
