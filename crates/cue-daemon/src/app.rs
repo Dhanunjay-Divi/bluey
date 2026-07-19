@@ -83,6 +83,9 @@ use crate::doc_conversion::{
     build_markdown_preview, classify_context_path, convert_context_file_to_markdown,
     is_supported_context_file, supported_context_formats_message, write_markdown_artifact,
 };
+use crate::overlay_hydration::{
+    OverlayHydrationDecision, OverlayHydrationFeedback, OverlayHydrationState,
+};
 use crate::overlay_state::{
     enter_overlay_ui_state, new_shared_overlay_ui_state, reset_overlay_ui_state_on_scope_exit,
     SharedOverlayUiState,
@@ -109,7 +112,9 @@ const MEETING_EVIDENCE_MAX_AGE_MS: i64 = 10_000;
 const MEETING_EVIDENCE_MAX_FUTURE_SKEW_MS: i64 = 2_000;
 const PCM16_DBFS_FLOOR: f64 = -120.0;
 const OVERLAY_EVENT_QUEUE_CAPACITY: usize = 256;
+const OVERLAY_PRIORITY_EVENT_QUEUE_CAPACITY: usize = 8;
 const OVERLAY_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const OVERLAY_HYDRATION_TIMEOUT: Duration = Duration::from_secs(12);
 const OVERLAY_MAX_RESTART_ATTEMPTS: u32 = 5;
 const OVERLAY_RESTART_BASE_DELAY_MS: u64 = 250;
 const OVERLAY_RESTART_MAX_DELAY_MS: u64 = 5_000;
@@ -1766,9 +1771,16 @@ struct Daemon {
     overlay: Mutex<Option<OverlayProcess>>,
     overlay_enabled: bool,
     overlay_bin: Option<PathBuf>,
-    overlay_events_tx: mpsc::Sender<OverlayProcessEvent>,
+    overlay_events: OverlayEventSenders,
     overlay_generation: Arc<AtomicU64>,
-    overlay_restart: Mutex<OverlayRestartState>,
+    /// Ordinary commands wait until the exact helper generation has received
+    /// its complete persisted-state snapshot.
+    overlay_hydration: watch::Sender<OverlayHydrationState>,
+    /// Expected appearance acknowledgements emitted by that snapshot.
+    overlay_hydration_feedback: parking_lot::Mutex<OverlayHydrationFeedback>,
+    /// Serializes persisted overlay appearance and visibility intent.
+    overlay_state_transitions: Mutex<()>,
+    overlay_restart: parking_lot::Mutex<OverlayRestartState>,
     overlay_shutdown_requested: AtomicBool,
     capture: Mutex<CaptureRuntime>,
     meeting_watch: MeetingWatch,
@@ -1900,9 +1912,16 @@ struct OverlayProcessEvent {
     event: OverlayEvent,
 }
 
+#[derive(Clone)]
+struct OverlayEventSenders {
+    ordinary: mpsc::Sender<OverlayProcessEvent>,
+    priority: mpsc::Sender<OverlayProcessEvent>,
+}
+
 #[derive(Debug, Default)]
 struct OverlayRestartState {
     in_progress: bool,
+    requested: bool,
     consecutive_failures: u32,
 }
 
@@ -2062,6 +2081,8 @@ pub async fn run() -> Result<()> {
     let initial_state = state_from_active_meeting(active_meeting.as_ref());
     let cloud_status = cloud_status_from_env(&paths);
     let (overlay_events_tx, overlay_events_rx) = mpsc::channel(OVERLAY_EVENT_QUEUE_CAPACITY);
+    let (overlay_priority_events_tx, overlay_priority_events_rx) =
+        mpsc::channel(OVERLAY_PRIORITY_EVENT_QUEUE_CAPACITY);
     let overlay_bin = args.overlay_bin.clone();
     let rag_indexer = RagIndexCoordinator::from_paths(&paths, store.clone())?;
     let balance_watch = crate::cloud::balance::BalanceWatch::default();
@@ -2083,9 +2104,15 @@ pub async fn run() -> Result<()> {
         overlay: Mutex::new(None),
         overlay_enabled: !args.no_overlay,
         overlay_bin: overlay_bin.clone(),
-        overlay_events_tx: overlay_events_tx.clone(),
+        overlay_events: OverlayEventSenders {
+            ordinary: overlay_events_tx,
+            priority: overlay_priority_events_tx,
+        },
         overlay_generation: Arc::new(AtomicU64::new(0)),
-        overlay_restart: Mutex::new(OverlayRestartState::default()),
+        overlay_hydration: watch::channel(OverlayHydrationState::default()).0,
+        overlay_hydration_feedback: parking_lot::Mutex::new(OverlayHydrationFeedback::default()),
+        overlay_state_transitions: Mutex::new(()),
+        overlay_restart: parking_lot::Mutex::new(OverlayRestartState::default()),
         overlay_shutdown_requested: AtomicBool::new(false),
         capture: Mutex::new(CaptureRuntime {
             stop: None,
@@ -2140,7 +2167,11 @@ pub async fn run() -> Result<()> {
             }
         }
     }
-    spawn_overlay_event_handler(daemon.clone(), overlay_events_rx);
+    spawn_overlay_event_handler(
+        daemon.clone(),
+        overlay_events_rx,
+        overlay_priority_events_rx,
+    );
     spawn_overlay_balance_bridge(daemon.clone());
     spawn_meeting_watch_tick(daemon.clone());
 
@@ -2478,23 +2509,27 @@ async fn handle_request_inner(
         }),
         DaemonRequest::Shutdown => Ok(DaemonResponse::Ok),
         DaemonRequest::OverlayShow => {
-            send_overlay(daemon, OverlayCommand::Show).await?;
+            let _transition = daemon.overlay_state_transitions.lock().await;
             daemon.state.lock().await.overlay_visible = true;
             write_state(daemon).await?;
+            send_overlay(daemon, OverlayCommand::Show).await?;
             Ok(DaemonResponse::Ok)
         }
         DaemonRequest::OverlayHide => {
-            send_overlay(daemon, OverlayCommand::Hide).await?;
+            let _transition = daemon.overlay_state_transitions.lock().await;
             daemon.state.lock().await.overlay_visible = false;
             write_state(daemon).await?;
+            send_overlay(daemon, OverlayCommand::Hide).await?;
             Ok(DaemonResponse::Ok)
         }
         DaemonRequest::OverlayToggle => {
+            let _transition = daemon.overlay_state_transitions.lock().await;
             let visible = {
                 let mut state = daemon.state.lock().await;
                 state.overlay_visible = !state.overlay_visible;
                 state.overlay_visible
             };
+            write_state(daemon).await?;
             send_overlay(
                 daemon,
                 if visible {
@@ -2504,7 +2539,6 @@ async fn handle_request_inner(
                 },
             )
             .await?;
-            write_state(daemon).await?;
             Ok(DaemonResponse::Ok)
         }
         DaemonRequest::OverlayClear => {
@@ -2512,22 +2546,25 @@ async fn handle_request_inner(
             Ok(DaemonResponse::Ok)
         }
         DaemonRequest::OverlayBoot { title, lines } => {
-            send_overlay(daemon, OverlayCommand::Boot { title, lines }).await?;
+            let _transition = daemon.overlay_state_transitions.lock().await;
             daemon.state.lock().await.overlay_visible = true;
             write_state(daemon).await?;
+            send_overlay(daemon, OverlayCommand::Boot { title, lines }).await?;
             Ok(DaemonResponse::Ok)
         }
         DaemonRequest::OverlaySetOpacity { opacity } => {
+            let _transition = daemon.overlay_state_transitions.lock().await;
             let opacity = opacity.clamp(0.05, 1.0);
-            send_overlay(daemon, OverlayCommand::SetOpacity { opacity }).await?;
             daemon.state.lock().await.overlay_opacity = opacity;
             write_state(daemon).await?;
+            send_overlay(daemon, OverlayCommand::SetOpacity { opacity }).await?;
             Ok(DaemonResponse::Ok)
         }
         DaemonRequest::OverlaySetPosition { position } => {
-            send_overlay(daemon, OverlayCommand::SetPosition { position }).await?;
+            let _transition = daemon.overlay_state_transitions.lock().await;
             daemon.state.lock().await.overlay_position = position;
             write_state(daemon).await?;
+            send_overlay(daemon, OverlayCommand::SetPosition { position }).await?;
             Ok(DaemonResponse::Ok)
         }
         DaemonRequest::PushCard { card } => {
@@ -3123,35 +3160,141 @@ async fn handle_request_inner(
 }
 
 async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<()> {
-    let mut overlay_guard = daemon.overlay.lock().await;
-    if let Err(error) = ensure_overlay_ready(daemon, &mut overlay_guard).await {
-        drop(overlay_guard);
-        schedule_overlay_restart(daemon);
-        return Err(error);
-    }
-
-    if let Some(overlay) = overlay_guard.as_mut() {
-        if let Err(first_error) = overlay.send(&command) {
-            warn!("overlay command failed; restarting overlay: {first_error:#}");
-            dispose_overlay_process(overlay_guard.take());
-            if let Err(restart_error) = ensure_overlay_ready(daemon, &mut overlay_guard).await {
+    let mut last_error = None;
+    for _attempt in 1..=3 {
+        let generation = {
+            let mut overlay_guard = daemon.overlay.lock().await;
+            if let Err(error) = ensure_overlay_ready(daemon, &mut overlay_guard).await {
                 drop(overlay_guard);
                 schedule_overlay_restart(daemon);
-                return Err(restart_error).with_context(|| {
-                    format!("overlay pipe failed ({first_error:#}) and restart failed")
-                });
+                return Err(error);
             }
-            let Some(overlay) = overlay_guard.as_mut() else {
-                return Err(anyhow!("overlay process is not running after restart"));
+            let Some(process) = overlay_guard.as_ref() else {
+                return Err(anyhow!("overlay process is not running"));
             };
-            overlay.send(&command).with_context(|| {
-                format!("overlay pipe failed ({first_error:#}) and retry failed")
-            })?;
+            process.generation
+        };
+
+        match wait_for_overlay_hydration(daemon, generation).await {
+            Ok(OverlayHydrationDecision::Ready) => {}
+            Ok(OverlayHydrationDecision::Replaced) => continue,
+            Ok(OverlayHydrationDecision::Failed) => {
+                invalidate_overlay_generation(daemon, generation).await;
+                last_error = Some(anyhow!(
+                    "overlay generation {generation} failed state hydration"
+                ));
+                continue;
+            }
+            Ok(OverlayHydrationDecision::Pending) => unreachable!("pending wait cannot finish"),
+            Err(error) => {
+                invalidate_overlay_generation(daemon, generation).await;
+                last_error = Some(error);
+                continue;
+            }
         }
-        return Ok(());
+
+        let send_result = {
+            let mut overlay_guard = daemon.overlay.lock().await;
+            let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
+            let Some(process) = overlay_guard.as_mut() else {
+                continue;
+            };
+            if current_generation != generation || process.generation != generation {
+                continue;
+            }
+            match process.child.try_wait() {
+                Ok(Some(status)) => Err(anyhow!(
+                    "overlay generation {generation} exited before command: {status}"
+                )),
+                Ok(None) => process.send(&command),
+                Err(error) => Err(error).context("failed to poll overlay before command"),
+            }
+        };
+
+        match send_result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                warn!(generation, error = %error, "overlay command failed; replacing helper");
+                invalidate_overlay_generation(daemon, generation).await;
+                last_error = Some(error);
+            }
+        }
     }
 
-    return Err(anyhow!("overlay process is not running"));
+    schedule_overlay_restart(daemon);
+    Err(last_error.unwrap_or_else(|| anyhow!("overlay command retry budget exhausted")))
+}
+
+async fn wait_for_overlay_hydration(
+    daemon: &Arc<Daemon>,
+    generation: u64,
+) -> Result<OverlayHydrationDecision> {
+    let mut hydration = daemon.overlay_hydration.subscribe();
+    timeout(OVERLAY_HYDRATION_TIMEOUT, async {
+        loop {
+            let decision = hydration.borrow().decision(generation);
+            if decision != OverlayHydrationDecision::Pending {
+                return Ok(decision);
+            }
+            hydration
+                .changed()
+                .await
+                .map_err(|_| anyhow!("overlay hydration barrier closed"))?;
+        }
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "overlay generation {generation} did not finish state hydration within {} ms",
+            OVERLAY_HYDRATION_TIMEOUT.as_millis()
+        )
+    })?
+}
+
+async fn send_overlay_for_generation(
+    daemon: &Arc<Daemon>,
+    generation: u64,
+    command: OverlayCommand,
+) -> Result<()> {
+    let mut overlay_guard = daemon.overlay.lock().await;
+    let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
+    let process = overlay_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("overlay process is absent during hydration"))?;
+    if current_generation != generation || process.generation != generation {
+        return Err(anyhow!(
+            "overlay generation changed during hydration: expected {generation}, current {current_generation}"
+        ));
+    }
+    if let Some(status) = process.child.try_wait()? {
+        return Err(anyhow!(
+            "overlay generation {generation} exited during hydration: {status}"
+        ));
+    }
+    process.send(&command)?;
+    let mut feedback = daemon.overlay_hydration_feedback.lock();
+    match command {
+        OverlayCommand::Show => feedback.expect_visibility(generation, true),
+        OverlayCommand::Hide => feedback.expect_visibility(generation, false),
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn invalidate_overlay_generation(daemon: &Arc<Daemon>, generation: u64) {
+    {
+        let mut overlay_guard = daemon.overlay.lock().await;
+        if overlay_guard
+            .as_ref()
+            .map(|process| process.generation == generation)
+            .unwrap_or(false)
+        {
+            dispose_overlay_process(overlay_guard.take());
+        }
+    }
+    daemon
+        .overlay_hydration
+        .send_if_modified(|state| state.fail(generation));
 }
 
 async fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
@@ -3478,21 +3621,21 @@ async fn ensure_overlay_ready(
             );
             dispose_overlay_process(overlay.take());
         } else if let Some(status) = process.child.try_wait()? {
-            warn!("overlay process exited before command: {status}");
+            let generation = process.generation;
+            warn!(
+                generation,
+                "overlay process exited before command: {status}"
+            );
+            daemon
+                .overlay_hydration
+                .send_if_modified(|state| state.fail(generation));
             *overlay = None;
         }
     }
 
     if overlay.is_none() {
-        let mut process =
-            spawn_overlay_for_daemon(daemon).context("failed to start native overlay")?;
-        if let Err(error) = process.send(&OverlayCommand::SetMeetingDetectionEnabled {
-            enabled: meeting_detection_enabled(&daemon.paths),
-        }) {
-            dispose_overlay_process(Some(process));
-            return Err(error).context("failed to initialize native overlay state");
-        }
-        *overlay = Some(process);
+        *overlay =
+            Some(spawn_overlay_for_daemon(daemon).context("failed to start native overlay")?);
         let mut state = daemon.state.lock().await;
         state.overlay_capture_excluded = Some(default_overlay_capture_excluded_state());
     }
@@ -3508,13 +3651,23 @@ fn spawn_overlay_for_daemon(daemon: &Arc<Daemon>) -> Result<OverlayProcess> {
         .overlay_generation
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
-    spawn_overlay(
+    daemon
+        .overlay_hydration
+        .send_if_modified(|state| state.begin(generation));
+    daemon.overlay_hydration_feedback.lock().begin(generation);
+    let result = spawn_overlay(
         daemon.overlay_bin.as_deref(),
-        daemon.overlay_events_tx.clone(),
+        daemon.overlay_events.clone(),
         daemon.overlay_session_token.clone(),
         daemon.overlay_ui_state.clone(),
         generation,
-    )
+    );
+    if result.is_err() {
+        daemon
+            .overlay_hydration
+            .send_if_modified(|state| state.fail(generation));
+    }
+    result
 }
 
 fn default_overlay_capture_excluded_state() -> bool {
@@ -3544,25 +3697,64 @@ fn overlay_restart_delay(attempt: u32) -> Duration {
     )
 }
 
+async fn restart_overlay_once(daemon: &Arc<Daemon>) -> Result<u64> {
+    let generation = {
+        let mut overlay = daemon.overlay.lock().await;
+        if let Some(process) = overlay.as_mut() {
+            let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
+            let is_current_and_alive = process.generation == current_generation
+                && matches!(process.child.try_wait(), Ok(None));
+            if !is_current_and_alive {
+                dispose_overlay_process(overlay.take());
+            }
+        }
+        ensure_overlay_ready(daemon, &mut overlay).await?;
+        overlay
+            .as_ref()
+            .map(|process| process.generation)
+            .ok_or_else(|| anyhow!("overlay process is absent after restart"))?
+    };
+
+    match wait_for_overlay_hydration(daemon, generation).await {
+        Ok(OverlayHydrationDecision::Ready) => Ok(generation),
+        Ok(OverlayHydrationDecision::Replaced) => Err(anyhow!(
+            "overlay generation {generation} was replaced before hydration"
+        )),
+        Ok(OverlayHydrationDecision::Failed) => {
+            invalidate_overlay_generation(daemon, generation).await;
+            Err(anyhow!(
+                "overlay generation {generation} failed state hydration"
+            ))
+        }
+        Ok(OverlayHydrationDecision::Pending) => unreachable!("pending wait cannot finish"),
+        Err(error) => {
+            invalidate_overlay_generation(daemon, generation).await;
+            Err(error)
+        }
+    }
+}
+
 fn schedule_overlay_restart(daemon: &Arc<Daemon>) {
     if daemon.overlay_shutdown_requested.load(Ordering::Acquire) || !daemon.overlay_enabled {
         return;
     }
+    {
+        let mut restart = daemon.overlay_restart.lock();
+        if restart.in_progress {
+            restart.requested = true;
+            return;
+        }
+        restart.in_progress = true;
+        restart.requested = false;
+        restart.consecutive_failures = 0;
+    }
     let daemon = Arc::clone(daemon);
     tokio::spawn(async move {
-        {
-            let mut restart = daemon.overlay_restart.lock().await;
-            if restart.in_progress {
-                return;
-            }
-            restart.in_progress = true;
-            restart.consecutive_failures = 0;
-        }
-
         for attempt in 1..=OVERLAY_MAX_RESTART_ATTEMPTS {
             if daemon.overlay_shutdown_requested.load(Ordering::Acquire) {
-                let mut restart = daemon.overlay_restart.lock().await;
+                let mut restart = daemon.overlay_restart.lock();
                 restart.in_progress = false;
+                restart.requested = false;
                 return;
             }
             let delay = overlay_restart_delay(attempt);
@@ -3574,38 +3766,41 @@ fn schedule_overlay_restart(daemon: &Arc<Daemon>) {
             sleep(delay).await;
 
             if daemon.overlay_shutdown_requested.load(Ordering::Acquire) {
-                let mut restart = daemon.overlay_restart.lock().await;
+                let mut restart = daemon.overlay_restart.lock();
                 restart.in_progress = false;
+                restart.requested = false;
                 return;
             }
 
-            let restart_result = {
-                let mut overlay = daemon.overlay.lock().await;
-                if let Some(process) = overlay.as_mut() {
-                    let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
-                    if process.generation == current_generation
-                        && matches!(process.child.try_wait(), Ok(None))
-                    {
-                        Ok(())
-                    } else {
-                        dispose_overlay_process(overlay.take());
-                        ensure_overlay_ready(&daemon, &mut overlay).await
-                    }
-                } else {
-                    ensure_overlay_ready(&daemon, &mut overlay).await
-                }
-            };
+            // This attempt covers every restart request observed before it.
+            // A request arriving during the attempt must prevent a premature
+            // success transition and force revalidation on the next attempt.
+            daemon.overlay_restart.lock().requested = false;
+
+            let restart_result = restart_overlay_once(&daemon).await;
 
             match restart_result {
-                Ok(()) => {
-                    let mut restart = daemon.overlay_restart.lock().await;
+                Ok(generation) => {
+                    let mut restart = daemon.overlay_restart.lock();
+                    if restart.requested {
+                        restart.consecutive_failures = attempt;
+                        warn!(
+                            attempt,
+                            generation,
+                            "overlay restart requested during successful hydration; revalidating"
+                        );
+                        continue;
+                    }
                     restart.in_progress = false;
                     restart.consecutive_failures = 0;
-                    info!(attempt, "overlay restarted after exact ready handshake");
+                    info!(
+                        attempt,
+                        generation, "overlay restarted after exact state hydration"
+                    );
                     return;
                 }
                 Err(error) => {
-                    let mut restart = daemon.overlay_restart.lock().await;
+                    let mut restart = daemon.overlay_restart.lock();
                     restart.consecutive_failures = attempt;
                     warn!(attempt, error = %error, "overlay restart attempt failed");
                 }
@@ -3613,13 +3808,10 @@ fn schedule_overlay_restart(daemon: &Arc<Daemon>) {
         }
 
         {
-            let mut restart = daemon.overlay_restart.lock().await;
+            let mut restart = daemon.overlay_restart.lock();
             restart.in_progress = false;
+            restart.requested = false;
             restart.consecutive_failures = OVERLAY_MAX_RESTART_ATTEMPTS;
-        }
-        daemon.state.lock().await.overlay_visible = false;
-        if let Err(error) = write_state(&daemon).await {
-            warn!(error = %error, "failed to persist overlay restart exhaustion state");
         }
         error!(
             attempts = OVERLAY_MAX_RESTART_ATTEMPTS,
@@ -3631,9 +3823,21 @@ fn schedule_overlay_restart(daemon: &Arc<Daemon>) {
 fn spawn_overlay_event_handler(
     daemon: Arc<Daemon>,
     mut events: mpsc::Receiver<OverlayProcessEvent>,
+    mut priority_events: mpsc::Receiver<OverlayProcessEvent>,
 ) {
+    // Ordinary events remain on their original bounded, backpressured channel
+    // and preserve wire order. Ready has a separate bounded path so hydration
+    // cannot be blocked by an ordinary event. No lifecycle, exit, or
+    // user-control event is dropped or allowed to overtake an earlier event.
+    let ordinary_daemon = Arc::clone(&daemon);
     tokio::spawn(async move {
         while let Some(process_event) = events.recv().await {
+            handle_current_overlay_ordinary_process_event(&ordinary_daemon, process_event).await;
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Some(process_event) = priority_events.recv().await {
             let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
             if process_event.generation != current_generation {
                 debug!(
@@ -3644,13 +3848,69 @@ fn spawn_overlay_event_handler(
                 );
                 continue;
             }
-            let event = process_event.event;
-            let event_kind = overlay_event_label(&event);
-            if let Err(error) = handle_overlay_event(&daemon, event).await {
-                warn!(event_kind, "failed to handle overlay event: {error:#}");
-            }
+            let ready_daemon = Arc::clone(&daemon);
+            tokio::spawn(async move {
+                handle_current_overlay_process_event(&ready_daemon, process_event).await;
+            });
         }
     });
+}
+
+async fn handle_current_overlay_ordinary_process_event(
+    daemon: &Arc<Daemon>,
+    process_event: OverlayProcessEvent,
+) {
+    if matches!(&process_event.event, OverlayEvent::Exited) {
+        handle_current_overlay_process_event(daemon, process_event).await;
+        return;
+    }
+    let generation = process_event.generation;
+    match wait_for_overlay_hydration(daemon, generation).await {
+        Ok(OverlayHydrationDecision::Ready) => {}
+        Ok(OverlayHydrationDecision::Replaced | OverlayHydrationDecision::Failed) => {
+            debug!(
+                generation,
+                event_kind = overlay_event_label(&process_event.event),
+                "discarded overlay event from generation that never completed hydration"
+            );
+            return;
+        }
+        Ok(OverlayHydrationDecision::Pending) => unreachable!("pending wait cannot finish"),
+        Err(error) => {
+            warn!(
+                generation,
+                event_kind = overlay_event_label(&process_event.event),
+                error = %error,
+                "discarded overlay event after hydration wait failed"
+            );
+            invalidate_overlay_generation(daemon, generation).await;
+            schedule_overlay_restart(daemon);
+            return;
+        }
+    }
+    handle_current_overlay_process_event(daemon, process_event).await;
+}
+
+async fn handle_current_overlay_process_event(
+    daemon: &Arc<Daemon>,
+    process_event: OverlayProcessEvent,
+) {
+    let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
+    if process_event.generation != current_generation {
+        debug!(
+            event_generation = process_event.generation,
+            current_generation,
+            event_kind = overlay_event_label(&process_event.event),
+            "ignored queued stale overlay generation event"
+        );
+        return;
+    }
+    let event_kind = overlay_event_label(&process_event.event);
+    if let Err(error) =
+        handle_overlay_event(daemon, process_event.generation, process_event.event).await
+    {
+        warn!(event_kind, "failed to handle overlay event: {error:#}");
+    }
 }
 
 fn spawn_meeting_watch_tick(daemon: Arc<Daemon>) {
@@ -3811,131 +4071,185 @@ async fn finish_overlay_answer(daemon: &Arc<Daemon>) {
     *daemon.overlay_answer_active.lock().await = false;
 }
 
-async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Result<()> {
+async fn hydrate_overlay_generation(
+    daemon: &Arc<Daemon>,
+    generation: u64,
+    capture_excluded: bool,
+) -> Result<()> {
+    let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
+    if generation != current_generation {
+        return Err(anyhow!(
+            "overlay generation changed before hydration: expected {generation}, current {current_generation}"
+        ));
+    }
+
+    // Snapshot every source independently before writing to the helper. No
+    // daemon data mutex is held across process I/O.
+    let meeting = daemon.meeting.lock().await.clone();
+    let listening_state = {
+        let audio = daemon.audio.lock().await;
+        match audio.capture.state {
+            cue_core::AudioCaptureState::Starting | cue_core::AudioCaptureState::Planning => {
+                ListeningState::Connecting
+            }
+            cue_core::AudioCaptureState::Capturing => ListeningState::Listening,
+            cue_core::AudioCaptureState::Failed => ListeningState::Failed,
+            cue_core::AudioCaptureState::Paused
+            | cue_core::AudioCaptureState::Stopping
+            | cue_core::AudioCaptureState::Stopped => ListeningState::Paused,
+            cue_core::AudioCaptureState::Idle => ListeningState::Idle,
+        }
+    };
+    let signed_in = build_cloud_client(&daemon.paths, None)
+        .ok()
+        .and_then(|client| client.current_tokens())
+        .is_some();
+    let balance_label = daemon
+        .balance_watch
+        .current()
+        .map(|snapshot| format_balance_snapshot_label(&snapshot))
+        .or_else(|| (!signed_in).then(|| "Sign in".to_string()));
+    let active = *daemon.active_answer_card.lock().await;
+    let active_snapshot = daemon.active_answer_snapshot.lock().await.clone();
+    let (overlay_visible, overlay_opacity, overlay_position) = {
+        let mut state = daemon.state.lock().await;
+        state.overlay_capture_excluded = Some(capture_excluded);
+        (
+            state.overlay_visible,
+            state.overlay_opacity,
+            state.overlay_position,
+        )
+    };
+    write_state(daemon).await?;
+
+    send_overlay_for_generation(
+        daemon,
+        generation,
+        OverlayCommand::SetOpacity {
+            opacity: overlay_opacity,
+        },
+    )
+    .await?;
+    send_overlay_for_generation(
+        daemon,
+        generation,
+        OverlayCommand::SetPosition {
+            position: overlay_position,
+        },
+    )
+    .await?;
+    send_overlay_for_generation(
+        daemon,
+        generation,
+        if overlay_visible {
+            OverlayCommand::Show
+        } else {
+            OverlayCommand::Hide
+        },
+    )
+    .await?;
+    send_overlay_for_generation(
+        daemon,
+        generation,
+        OverlayCommand::SetMeetingDetectionEnabled {
+            enabled: meeting_detection_enabled(&daemon.paths),
+        },
+    )
+    .await?;
+    send_overlay_for_generation(
+        daemon,
+        generation,
+        OverlayCommand::ListeningStateChanged {
+            state: listening_state,
+        },
+    )
+    .await?;
+    send_overlay_for_generation(
+        daemon,
+        generation,
+        OverlayCommand::SetAccountState { signed_in },
+    )
+    .await?;
+    if let Some(label) = balance_label {
+        send_overlay_for_generation(daemon, generation, OverlayCommand::SetBalance { label })
+            .await?;
+    }
+
+    if let Some(meeting) = meeting {
+        if meeting_has_overlay_history(&meeting) {
+            hydrate_overlay_meeting_history_during_ready(daemon, generation, &meeting).await?;
+        } else {
+            send_overlay_for_generation(daemon, generation, OverlayCommand::Clear).await?;
+        }
+        send_overlay_for_generation(
+            daemon,
+            generation,
+            OverlayCommand::SetContextItems {
+                items: overlay_context_items(&meeting),
+            },
+        )
+        .await?;
+    } else {
+        send_overlay_for_generation(daemon, generation, OverlayCommand::Clear).await?;
+        send_overlay_for_generation(
+            daemon,
+            generation,
+            OverlayCommand::SetContextItems { items: vec![] },
+        )
+        .await?;
+    }
+
+    if let (Some((generation_id, card_id)), Some(snapshot)) = (active, active_snapshot) {
+        if generation_id == snapshot.generation_id
+            && card_id == snapshot.card_id
+            && is_answer_generation_current(daemon, generation_id)
+        {
+            send_overlay_for_generation(
+                daemon,
+                generation,
+                OverlayCommand::UpdateCard {
+                    id: snapshot.card_id,
+                    body: snapshot.body,
+                    done: snapshot.done,
+                    sequence: snapshot.sequence,
+                    snapshot: true,
+                    cost_label: snapshot.cost_label,
+                    artifact: snapshot.artifact,
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_overlay_event(
+    daemon: &Arc<Daemon>,
+    generation: u64,
+    event: OverlayEvent,
+) -> Result<()> {
     match event {
         OverlayEvent::Ready {
             capture_excluded, ..
         } => {
+            if let Err(error) =
+                hydrate_overlay_generation(daemon, generation, capture_excluded).await
             {
-                let mut restart = daemon.overlay_restart.lock().await;
-                restart.consecutive_failures = 0;
+                invalidate_overlay_generation(daemon, generation).await;
+                schedule_overlay_restart(daemon);
+                return Err(error);
             }
-            let (overlay_visible, overlay_opacity, overlay_position) = {
-                let mut state = daemon.state.lock().await;
-                state.overlay_capture_excluded = Some(capture_excluded);
-                (
-                    state.overlay_visible,
-                    state.overlay_opacity,
-                    state.overlay_position,
-                )
-            };
-            write_state(daemon).await?;
-            let _ = send_overlay(
-                daemon,
-                OverlayCommand::SetOpacity {
-                    opacity: overlay_opacity,
-                },
-            )
-            .await;
-            let _ = send_overlay(
-                daemon,
-                OverlayCommand::SetPosition {
-                    position: overlay_position,
-                },
-            )
-            .await;
-            let _ = send_overlay(
-                daemon,
-                if overlay_visible {
-                    OverlayCommand::Show
-                } else {
-                    OverlayCommand::Hide
-                },
-            )
-            .await;
-            let _ = send_overlay(
-                daemon,
-                OverlayCommand::SetMeetingDetectionEnabled {
-                    enabled: meeting_detection_enabled(&daemon.paths),
-                },
-            )
-            .await;
-            let listening_state = {
-                let audio = daemon.audio.lock().await;
-                match audio.capture.state {
-                    cue_core::AudioCaptureState::Starting
-                    | cue_core::AudioCaptureState::Planning => ListeningState::Connecting,
-                    cue_core::AudioCaptureState::Capturing => ListeningState::Listening,
-                    cue_core::AudioCaptureState::Failed => ListeningState::Failed,
-                    cue_core::AudioCaptureState::Paused
-                    | cue_core::AudioCaptureState::Stopping
-                    | cue_core::AudioCaptureState::Stopped => ListeningState::Paused,
-                    cue_core::AudioCaptureState::Idle => ListeningState::Idle,
-                }
-            };
-            let _ = send_overlay(
-                daemon,
-                OverlayCommand::ListeningStateChanged {
-                    state: listening_state,
-                },
-            )
-            .await;
-            let signed_in = build_cloud_client(&daemon.paths, None)
-                .ok()
-                .and_then(|client| client.current_tokens())
-                .is_some();
-            let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in }).await;
-            if let Some(snapshot) = daemon.balance_watch.current() {
-                let _ = send_overlay(
-                    daemon,
-                    OverlayCommand::SetBalance {
-                        label: format_balance_snapshot_label(&snapshot),
-                    },
-                )
-                .await;
-            } else if !signed_in {
-                let _ = send_overlay(
-                    daemon,
-                    OverlayCommand::SetBalance {
-                        label: "Sign in".to_string(),
-                    },
-                )
-                .await;
+            let completed = daemon
+                .overlay_hydration
+                .send_if_modified(|state| state.complete(generation));
+            if !completed {
+                debug!(
+                    generation,
+                    "discarded hydration completion for replaced overlay"
+                );
+                return Ok(());
             }
-            if let Some(meeting) = daemon.meeting.lock().await.clone() {
-                if meeting_has_overlay_history(&meeting) {
-                    hydrate_overlay_meeting_history(daemon, &meeting).await;
-                } else {
-                    let _ = send_overlay(daemon, OverlayCommand::Clear).await;
-                }
-                refresh_overlay_context_items(daemon, &meeting).await;
-            } else {
-                let _ = send_overlay(daemon, OverlayCommand::Clear).await;
-                let _ =
-                    send_overlay(daemon, OverlayCommand::SetContextItems { items: vec![] }).await;
-            }
-            let active = *daemon.active_answer_card.lock().await;
-            let snapshot = daemon.active_answer_snapshot.lock().await.clone();
-            if let (Some((generation_id, card_id)), Some(snapshot)) = (active, snapshot) {
-                if generation_id == snapshot.generation_id
-                    && card_id == snapshot.card_id
-                    && is_answer_generation_current(daemon, generation_id)
-                {
-                    let _ = send_overlay(
-                        daemon,
-                        OverlayCommand::UpdateCard {
-                            id: snapshot.card_id,
-                            body: snapshot.body,
-                            done: snapshot.done,
-                            sequence: snapshot.sequence,
-                            snapshot: true,
-                            cost_label: snapshot.cost_label,
-                            artifact: snapshot.artifact,
-                        },
-                    )
-                    .await;
-                }
-            }
+            daemon.overlay_restart.lock().consecutive_failures = 0;
             refresh_overlay_sessions(daemon).await;
             let daemon_balance = Arc::clone(daemon);
             tokio::spawn(async move {
@@ -3946,17 +4260,57 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             }
         }
         OverlayEvent::Shown => {
-            daemon.state.lock().await.overlay_visible = true;
-            write_state(daemon).await?;
+            let _transition = daemon.overlay_state_transitions.lock().await;
+            if daemon
+                .overlay_hydration_feedback
+                .lock()
+                .consume_visibility(generation, true)
+            {
+                debug!(generation, "consumed hydrated visibility acknowledgement");
+                return Ok(());
+            }
+            let changed = {
+                let mut state = daemon.state.lock().await;
+                let changed = !state.overlay_visible;
+                state.overlay_visible = true;
+                changed
+            };
+            if changed {
+                write_state(daemon).await?;
+            }
         }
         OverlayEvent::Hidden => {
-            daemon.state.lock().await.overlay_visible = false;
-            write_state(daemon).await?;
+            let _transition = daemon.overlay_state_transitions.lock().await;
+            if daemon
+                .overlay_hydration_feedback
+                .lock()
+                .consume_visibility(generation, false)
+            {
+                debug!(generation, "consumed hydrated visibility acknowledgement");
+                return Ok(());
+            }
+            let changed = {
+                let mut state = daemon.state.lock().await;
+                let changed = state.overlay_visible;
+                state.overlay_visible = false;
+                changed
+            };
+            if changed {
+                write_state(daemon).await?;
+            }
         }
         OverlayEvent::OpacityUpdated { opacity } => {
+            let _transition = daemon.overlay_state_transitions.lock().await;
             let opacity = opacity.clamp(0.05, 1.0);
-            daemon.state.lock().await.overlay_opacity = opacity;
-            write_state(daemon).await?;
+            let changed = {
+                let mut state = daemon.state.lock().await;
+                let changed = (state.overlay_opacity - opacity).abs() > f32::EPSILON;
+                state.overlay_opacity = opacity;
+                changed
+            };
+            if changed {
+                write_state(daemon).await?;
+            }
         }
         OverlayEvent::AskRequested {
             question,
@@ -4288,8 +4642,18 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::Exited => {
             let _ = stop_screen_capture(daemon, "overlay exited").await;
-            dispose_overlay_process(daemon.overlay.lock().await.take());
-            if !daemon.overlay_shutdown_requested.load(Ordering::Acquire) {
+            let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
+            if current_generation == generation {
+                invalidate_overlay_generation(daemon, generation).await;
+            } else {
+                debug!(
+                    exited_generation = generation,
+                    current_generation, "kept replacement overlay after stale process exit cleanup"
+                );
+            }
+            if current_generation == generation
+                && !daemon.overlay_shutdown_requested.load(Ordering::Acquire)
+            {
                 schedule_overlay_restart(daemon);
             }
         }
@@ -8183,6 +8547,45 @@ fn history_question_card_attachments(
 
 fn meeting_has_overlay_history(meeting: &MeetingRecord) -> bool {
     !meeting.conversation.is_empty() || !meeting.transcript.is_empty()
+}
+
+/// Replay a coherent history before the generation barrier is opened. Every
+/// send is pinned to the same helper, so a replacement aborts the snapshot.
+async fn hydrate_overlay_meeting_history_during_ready(
+    daemon: &Arc<Daemon>,
+    generation: u64,
+    meeting: &MeetingRecord,
+) -> Result<()> {
+    send_overlay_for_generation(daemon, generation, OverlayCommand::Clear).await?;
+    let cards = overlay_history_cards_for_meeting(meeting);
+    let card_count = cards.len();
+    info!(
+        meeting_id = %meeting.id,
+        card_count,
+        conversation_turns = meeting.conversation.len(),
+        transcript_segments = meeting.transcript.len(),
+        context_items = meeting.context.len(),
+        "overlay meeting history ready hydration started"
+    );
+    let mut pushed_cards = 0_usize;
+    for card in cards {
+        send_overlay_for_generation(daemon, generation, OverlayCommand::PushCard { card })
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to hydrate overlay history for meeting {}",
+                    meeting.id
+                )
+            })?;
+        pushed_cards += 1;
+    }
+    info!(
+        meeting_id = %meeting.id,
+        card_count,
+        pushed_cards,
+        "overlay meeting history ready hydration finished"
+    );
+    Ok(())
 }
 
 async fn hydrate_overlay_meeting_history(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
@@ -19657,7 +20060,7 @@ async fn shutdown_daemon(daemon: &Arc<Daemon>) {
 /// - UI state-machine: AttachFilesRequested allowed from drag/drop idle or AttachOpen, etc.
 fn spawn_overlay(
     explicit: Option<&Path>,
-    events: mpsc::Sender<OverlayProcessEvent>,
+    events: OverlayEventSenders,
     expected_token: String,
     ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
     generation: u64,
@@ -19711,7 +20114,7 @@ fn spawn_overlay(
 
 fn spawn_stdio_overlay(
     resolved: PathBuf,
-    events: mpsc::Sender<OverlayProcessEvent>,
+    events: OverlayEventSenders,
     expected_token: String,
     ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
     generation: u64,
@@ -19857,7 +20260,7 @@ fn should_use_macos_socket_overlay(path: &Path) -> bool {
 #[cfg(target_os = "macos")]
 fn spawn_macos_socket_overlay(
     resolved: PathBuf,
-    events: mpsc::Sender<OverlayProcessEvent>,
+    events: OverlayEventSenders,
     expected_token: String,
     ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
     generation: u64,
@@ -20068,7 +20471,7 @@ fn macos_overlay_capture_visible_allowed(
 
 fn spawn_overlay_reader<R>(
     reader: R,
-    events: mpsc::Sender<OverlayProcessEvent>,
+    events: OverlayEventSenders,
     expected_token: String,
     ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
     cleanup_path: Option<PathBuf>,
@@ -20098,19 +20501,12 @@ fn spawn_overlay_reader<R>(
                     }
                     let completing_ready_handshake =
                         !ready_seen && matches!(&event, OverlayEvent::Ready { .. });
-                    if !ready_seen {
-                        if completing_ready_handshake {
-                            ready_seen = true;
-                            if let Some(signal) = ready_signal.take() {
-                                let _ = signal.send(Ok(()));
-                            }
-                        } else {
-                            warn!(
-                                event_kind = overlay_event_label(&event),
-                                "overlay event rejected before ready handshake"
-                            );
-                            continue;
-                        }
+                    if !ready_seen && !completing_ready_handshake {
+                        warn!(
+                            event_kind = overlay_event_label(&event),
+                            "overlay event rejected before ready handshake"
+                        );
+                        continue;
                     }
                     if !completing_ready_handshake && matches!(&event, OverlayEvent::Ready { .. }) {
                         warn!(generation, "duplicate overlay ready handshake rejected");
@@ -20120,11 +20516,22 @@ fn spawn_overlay_reader<R>(
                         event_kind = overlay_event_label(&event),
                         generation, "overlay event received"
                     );
-                    if events
+                    let sender = if completing_ready_handshake {
+                        &events.priority
+                    } else {
+                        &events.ordinary
+                    };
+                    if sender
                         .blocking_send(OverlayProcessEvent { generation, event })
                         .is_err()
                     {
                         break;
+                    }
+                    if completing_ready_handshake {
+                        ready_seen = true;
+                        if let Some(signal) = ready_signal.take() {
+                            let _ = signal.send(Ok(()));
+                        }
                     }
                 }
                 Err(OverlayLineReject::NotJson) => {
@@ -20163,7 +20570,7 @@ fn spawn_overlay_reader<R>(
         if let Some(path) = cleanup_path {
             let _ = std::fs::remove_file(path);
         }
-        let _ = events.blocking_send(OverlayProcessEvent {
+        let _ = events.ordinary.blocking_send(OverlayProcessEvent {
             generation,
             event: OverlayEvent::Exited,
         });
@@ -21287,6 +21694,27 @@ mod tests {
         (base, paths)
     }
 
+    fn recv_overlay_event_with_timeout(
+        receiver: &mut mpsc::Receiver<OverlayProcessEvent>,
+        label: &str,
+    ) -> OverlayProcessEvent {
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => return event,
+                Err(mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    panic!("timed out waiting for {label}")
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("channel disconnected while waiting for {label}")
+                }
+            }
+        }
+    }
+
     #[test]
     fn auto_cloud_sync_env_is_disable_only_and_cannot_bypass_persisted_consent() {
         let _lock = AUTO_CLOUD_SYNC_ENV_LOCK.lock().unwrap();
@@ -21346,6 +21774,7 @@ mod tests {
         let rag_indexer =
             RagIndexCoordinator::from_paths(paths, store.clone()).expect("RAG index coordinator");
         let (overlay_events_tx, _overlay_events_rx) = mpsc::channel(4);
+        let (overlay_priority_events_tx, _overlay_priority_events_rx) = mpsc::channel(1);
         Arc::new(Daemon {
             paths: paths.clone(),
             store,
@@ -21355,9 +21784,15 @@ mod tests {
             overlay: Mutex::new(None),
             overlay_enabled: false,
             overlay_bin: None,
-            overlay_events_tx,
+            overlay_events: OverlayEventSenders {
+                ordinary: overlay_events_tx,
+                priority: overlay_priority_events_tx,
+            },
             overlay_generation: Arc::new(AtomicU64::new(0)),
-            overlay_restart: Mutex::new(OverlayRestartState::default()),
+            overlay_hydration: watch::channel(OverlayHydrationState::default()).0,
+            overlay_hydration_feedback: parking_lot::Mutex::new(OverlayHydrationFeedback::default()),
+            overlay_state_transitions: Mutex::new(()),
+            overlay_restart: parking_lot::Mutex::new(OverlayRestartState::default()),
             overlay_shutdown_requested: AtomicBool::new(false),
             capture: Mutex::new(CaptureRuntime {
                 stop: None,
@@ -21392,6 +21827,391 @@ mod tests {
             overlay_session_token: "test-token".to_string(),
             overlay_ui_state: new_shared_overlay_ui_state(),
         })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_surface_command_waits_for_exact_generation_hydration() {
+        let (base, paths) = isolated_test_paths("overlay-hydration-order");
+        let mut daemon = test_daemon(&paths);
+        Arc::get_mut(&mut daemon)
+            .expect("unshared test daemon")
+            .overlay_enabled = true;
+
+        let output_path = base.join("overlay-commands.ndjson");
+        let output_file = std::fs::File::create(&output_path).expect("overlay test output");
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(output_file))
+            .spawn()
+            .expect("spawn deterministic overlay pipe");
+        let stdin = child.stdin.take().expect("overlay test stdin");
+        let generation = 7;
+        daemon
+            .overlay_generation
+            .store(generation, Ordering::Release);
+        daemon
+            .overlay_hydration
+            .send_if_modified(|state| state.begin(generation));
+        *daemon.overlay.lock().await = Some(OverlayProcess {
+            child,
+            transport: OverlayTransport::Stdio(stdin),
+            generation,
+        });
+
+        let command_daemon = Arc::clone(&daemon);
+        let command = tokio::spawn(async move {
+            send_overlay(
+                &command_daemon,
+                OverlayCommand::PushCard {
+                    card: CueCard::new(CardKind::System, "Newest", "After hydration"),
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !command.is_finished(),
+            "ordinary command crossed a pending hydration barrier"
+        );
+
+        send_overlay_for_generation(&daemon, generation, OverlayCommand::Clear)
+            .await
+            .expect("ready hydration clear");
+        assert!(
+            daemon
+                .overlay_hydration
+                .send_if_modified(|state| state.complete(generation)),
+            "complete exact generation"
+        );
+        command
+            .await
+            .expect("surface command task")
+            .expect("surface command send");
+
+        let mut process = daemon
+            .overlay
+            .lock()
+            .await
+            .take()
+            .expect("test overlay process");
+        drop(process.transport);
+        process.child.wait().expect("drain overlay test pipe");
+        daemon
+            .overlay_hydration
+            .send_if_modified(|state| state.fail(generation));
+        let output = std::fs::read_to_string(output_path).expect("read overlay command log");
+        let mut lines = output.lines();
+        let first: serde_json::Value =
+            serde_json::from_str(lines.next().expect("hydration command line"))
+                .expect("parse hydration command");
+        let second: serde_json::Value =
+            serde_json::from_str(lines.next().expect("ordinary command line"))
+                .expect("parse ordinary command");
+        assert_eq!(
+            first.get("type").and_then(|value| value.as_str()),
+            Some("clear")
+        );
+        assert_eq!(
+            second.get("type").and_then(|value| value.as_str()),
+            Some("push_card")
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn ordinary_overlay_event_waits_for_exact_generation_hydration() {
+        let (base, paths) = isolated_test_paths("overlay-event-hydration-order");
+        let daemon = test_daemon(&paths);
+        let generation = 23;
+        daemon
+            .overlay_generation
+            .store(generation, Ordering::Release);
+        daemon
+            .overlay_hydration
+            .send_if_modified(|state| state.begin(generation));
+        daemon.state.lock().await.overlay_visible = false;
+
+        let event_daemon = Arc::clone(&daemon);
+        let event_task = tokio::spawn(async move {
+            handle_current_overlay_ordinary_process_event(
+                &event_daemon,
+                OverlayProcessEvent {
+                    generation,
+                    event: OverlayEvent::Shown,
+                },
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !event_task.is_finished(),
+            "ordinary event crossed a pending hydration barrier"
+        );
+        assert!(!daemon.state.lock().await.overlay_visible);
+
+        assert!(
+            daemon
+                .overlay_hydration
+                .send_if_modified(|state| state.complete(generation)),
+            "complete exact generation"
+        );
+        timeout(Duration::from_secs(1), event_task)
+            .await
+            .expect("ordinary event deadline")
+            .expect("ordinary event task");
+        assert!(daemon.state.lock().await.overlay_visible);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn hydrated_feedback_cannot_rollback_newer_visibility_intent() {
+        let (base, paths) = isolated_test_paths("overlay-feedback-order");
+        let daemon = test_daemon(&paths);
+        let generation = 29;
+        daemon
+            .overlay_generation
+            .store(generation, Ordering::Release);
+        daemon
+            .overlay_hydration
+            .send_if_modified(|state| state.begin(generation));
+        daemon
+            .overlay_hydration
+            .send_if_modified(|state| state.complete(generation));
+        {
+            let mut feedback = daemon.overlay_hydration_feedback.lock();
+            feedback.begin(generation);
+            feedback.expect_visibility(generation, false);
+        }
+
+        let release_request = Arc::new(Notify::new());
+        let request_release = Arc::clone(&release_request);
+        let request_daemon = Arc::clone(&daemon);
+        let (intent_persisted_tx, intent_persisted_rx) = oneshot::channel();
+        let request_task = tokio::spawn(async move {
+            let _transition = request_daemon.overlay_state_transitions.lock().await;
+            request_daemon.state.lock().await.overlay_visible = true;
+            intent_persisted_tx
+                .send(())
+                .expect("signal newer visibility intent");
+            request_release.notified().await;
+        });
+        intent_persisted_rx
+            .await
+            .expect("newer visibility intent persisted");
+
+        let event_daemon = Arc::clone(&daemon);
+        let stale_feedback = tokio::spawn(async move {
+            handle_current_overlay_ordinary_process_event(
+                &event_daemon,
+                OverlayProcessEvent {
+                    generation,
+                    event: OverlayEvent::Hidden,
+                },
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !stale_feedback.is_finished(),
+            "helper feedback bypassed appearance transition serialization"
+        );
+        assert!(daemon.state.lock().await.overlay_visible);
+
+        release_request.notify_one();
+        request_task.await.expect("visibility request task");
+        timeout(Duration::from_secs(1), stale_feedback)
+            .await
+            .expect("stale feedback deadline")
+            .expect("stale feedback task");
+        assert!(
+            daemon.state.lock().await.overlay_visible,
+            "hydration acknowledgement rolled back newer visibility intent"
+        );
+
+        handle_current_overlay_ordinary_process_event(
+            &daemon,
+            OverlayProcessEvent {
+                generation,
+                event: OverlayEvent::Hidden,
+            },
+        )
+        .await;
+        assert!(
+            !daemon.state.lock().await.overlay_visible,
+            "a later user-driven visibility event was incorrectly suppressed"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_attempt_requires_exact_generation_hydration_success() {
+        let (base, paths) = isolated_test_paths("overlay-restart-hydration");
+        let mut daemon = test_daemon(&paths);
+        Arc::get_mut(&mut daemon)
+            .expect("unshared test daemon")
+            .overlay_enabled = true;
+
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn deterministic overlay pipe");
+        let stdin = child.stdin.take().expect("overlay test stdin");
+        let generation = 31;
+        daemon
+            .overlay_generation
+            .store(generation, Ordering::Release);
+        daemon
+            .overlay_hydration
+            .send_if_modified(|state| state.begin(generation));
+        *daemon.overlay.lock().await = Some(OverlayProcess {
+            child,
+            transport: OverlayTransport::Stdio(stdin),
+            generation,
+        });
+
+        let restart_daemon = Arc::clone(&daemon);
+        let restart = tokio::spawn(async move { restart_overlay_once(&restart_daemon).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !restart.is_finished(),
+            "transport readiness was incorrectly credited as restart success"
+        );
+
+        assert!(
+            daemon
+                .overlay_hydration
+                .send_if_modified(|state| state.fail(generation)),
+            "fail exact generation hydration"
+        );
+        let error = timeout(Duration::from_secs(1), restart)
+            .await
+            .expect("restart attempt deadline")
+            .expect("restart attempt task")
+            .expect_err("failed hydration must fail the restart attempt");
+        assert!(format!("{error:#}").contains("failed state hydration"));
+        assert!(daemon.overlay.lock().await.is_none());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn restart_request_during_active_cycle_is_coalesced_synchronously() {
+        let (base, paths) = isolated_test_paths("overlay-restart-coalesce");
+        let mut daemon = test_daemon(&paths);
+        Arc::get_mut(&mut daemon)
+            .expect("unshared test daemon")
+            .overlay_enabled = true;
+        daemon.overlay_restart.lock().in_progress = true;
+
+        schedule_overlay_restart(&daemon);
+
+        let restart = daemon.overlay_restart.lock();
+        assert!(restart.in_progress);
+        assert!(restart.requested);
+        drop(restart);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacement_ready_hydrates_while_exited_event_waits_for_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (base, paths) = isolated_test_paths("overlay-ready-reentrant");
+        let helper_dir = env::current_dir()
+            .expect("test current directory")
+            .join("target")
+            .join(format!("overlay-ready-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&helper_dir).expect("create overlay helper directory");
+        let helper = helper_dir.join("overlay-ready-test.sh");
+        std::fs::write(
+            &helper,
+            br#"#!/bin/sh
+printf '{"type":"ready","token":"%s","platform":"test","capture_excluded":true}\n' "$BLUEY_OVERLAY_SESSION_TOKEN"
+cat
+"#,
+        )
+        .expect("write overlay helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+            .expect("make overlay helper executable");
+
+        let (events_tx, events_rx) = mpsc::channel(OVERLAY_EVENT_QUEUE_CAPACITY);
+        let (priority_events_tx, priority_events_rx) =
+            mpsc::channel(OVERLAY_PRIORITY_EVENT_QUEUE_CAPACITY);
+        let mut daemon = test_daemon(&paths);
+        {
+            let daemon_mut = Arc::get_mut(&mut daemon).expect("unshared test daemon");
+            daemon_mut.overlay_enabled = true;
+            daemon_mut.overlay_bin = Some(helper);
+            daemon_mut.overlay_events = OverlayEventSenders {
+                ordinary: events_tx,
+                priority: priority_events_tx,
+            };
+        }
+        spawn_overlay_event_handler(Arc::clone(&daemon), events_rx, priority_events_rx);
+
+        let first = spawn_overlay_for_daemon(&daemon).expect("spawn first overlay generation");
+        let first_generation = first.generation;
+        *daemon.overlay.lock().await = Some(first);
+        assert_eq!(
+            timeout(
+                Duration::from_secs(3),
+                wait_for_overlay_hydration(&daemon, first_generation)
+            )
+            .await
+            .expect("first hydration deadline")
+            .expect("first hydration result"),
+            OverlayHydrationDecision::Ready
+        );
+
+        let (capture_stop, _capture_stopped) = oneshot::channel();
+        daemon.capture.lock().await.stop = Some(capture_stop);
+        let first = daemon.overlay.lock().await.take();
+        dispose_overlay_process(first);
+
+        let mut hydration = daemon.overlay_hydration.subscribe();
+        let replacement_generation = timeout(Duration::from_secs(5), async {
+            loop {
+                let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
+                if current_generation > first_generation
+                    && hydration.borrow().decision(current_generation)
+                        == OverlayHydrationDecision::Ready
+                {
+                    return current_generation;
+                }
+                hydration
+                    .changed()
+                    .await
+                    .expect("hydration sender remains live");
+            }
+        })
+        .await
+        .expect("replacement Ready was not blocked by the Exited handler");
+        assert_eq!(replacement_generation, first_generation + 1);
+        assert_eq!(
+            daemon
+                .overlay
+                .lock()
+                .await
+                .as_ref()
+                .map(|process| process.generation),
+            Some(replacement_generation),
+            "Exited cleanup must retain the already-hydrated replacement"
+        );
+        assert!(daemon.capture.lock().await.stop.is_none());
+
+        daemon
+            .overlay_shutdown_requested
+            .store(true, Ordering::Release);
+        dispose_overlay_process(daemon.overlay.lock().await.take());
+        let _ = std::fs::remove_dir_all(helper_dir);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
@@ -25255,10 +26075,14 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             .to_vec(),
         );
         let (events_tx, mut events_rx) = mpsc::channel(4);
+        let (priority_events_tx, mut priority_events_rx) = mpsc::channel(1);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         spawn_overlay_reader(
             input,
-            events_tx,
+            OverlayEventSenders {
+                ordinary: events_tx,
+                priority: priority_events_tx,
+            },
             "tok".to_string(),
             new_shared_overlay_ui_state(),
             None,
@@ -25270,15 +26094,107 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             ready_rx.recv_timeout(std::time::Duration::from_secs(1)),
             Ok(Ok(()))
         ));
-        let ready = events_rx.blocking_recv().expect("ready event");
+        let ready = recv_overlay_event_with_timeout(&mut priority_events_rx, "ready event");
         assert_eq!(ready.generation, 7);
         assert!(matches!(ready.event, OverlayEvent::Ready { .. }));
-        let shown = events_rx.blocking_recv().expect("shown event");
+        let shown = recv_overlay_event_with_timeout(&mut events_rx, "shown event");
         assert_eq!(shown.generation, 7);
         assert!(matches!(shown.event, OverlayEvent::Shown));
-        let exited = events_rx.blocking_recv().expect("exit event");
+        let exited = recv_overlay_event_with_timeout(&mut events_rx, "exit event");
         assert_eq!(exited.generation, 7);
         assert!(matches!(exited.event, OverlayEvent::Exited));
+    }
+
+    #[test]
+    fn overlay_reader_reports_ready_only_after_priority_enqueue() {
+        let input = std::io::Cursor::new(
+            "{\"type\":\"ready\",\"token\":\"tok\",\"platform\":\"test\",\"capture_excluded\":true}\n"
+                .as_bytes()
+                .to_vec(),
+        );
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (priority_events_tx, priority_events_rx) = mpsc::channel(1);
+        drop(priority_events_rx);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+
+        spawn_overlay_reader(
+            input,
+            OverlayEventSenders {
+                ordinary: events_tx,
+                priority: priority_events_tx,
+            },
+            "tok".to_string(),
+            new_shared_overlay_ui_state(),
+            None,
+            Some(ready_tx),
+            9,
+        );
+
+        assert!(matches!(
+            ready_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(Err(_))
+        ));
+    }
+
+    #[test]
+    fn overlay_reader_preserves_critical_events_when_ordinary_queue_is_saturated() {
+        let input = std::io::Cursor::new(
+            concat!(
+                "{\"type\":\"ready\",\"token\":\"tok\",\"platform\":\"test\",\"capture_excluded\":true}\n",
+                "{\"type\":\"lifecycle\",\"token\":\"tok\",\"stage\":\"started\",\"status\":\"ok\"}\n",
+                "{\"type\":\"close_requested\",\"token\":\"tok\"}\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        events_tx
+            .blocking_send(OverlayProcessEvent {
+                generation: 11,
+                event: OverlayEvent::Pong,
+            })
+            .expect("pre-fill ordinary queue");
+        let (priority_events_tx, mut priority_events_rx) = mpsc::channel(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+
+        spawn_overlay_reader(
+            input,
+            OverlayEventSenders {
+                ordinary: events_tx,
+                priority: priority_events_tx,
+            },
+            "tok".to_string(),
+            new_shared_overlay_ui_state(),
+            None,
+            Some(ready_tx),
+            11,
+        );
+
+        assert!(matches!(
+            ready_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(Ok(()))
+        ));
+        let ready =
+            recv_overlay_event_with_timeout(&mut priority_events_rx, "priority ready event");
+        assert_eq!(ready.generation, 11);
+        assert!(matches!(ready.event, OverlayEvent::Ready { .. }));
+
+        assert!(matches!(
+            recv_overlay_event_with_timeout(&mut events_rx, "pre-filled event").event,
+            OverlayEvent::Pong
+        ));
+        assert!(matches!(
+            recv_overlay_event_with_timeout(&mut events_rx, "lifecycle event").event,
+            OverlayEvent::Lifecycle { .. }
+        ));
+        assert!(matches!(
+            recv_overlay_event_with_timeout(&mut events_rx, "user control event").event,
+            OverlayEvent::CloseRequested
+        ));
+        assert!(matches!(
+            recv_overlay_event_with_timeout(&mut events_rx, "exit event").event,
+            OverlayEvent::Exited
+        ));
     }
 
     #[test]
@@ -25460,6 +26376,7 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
         let rag_indexer =
             RagIndexCoordinator::from_paths(&paths, store.clone()).expect("RAG index coordinator");
         let (overlay_events_tx, _overlay_events_rx) = mpsc::channel(1);
+        let (overlay_priority_events_tx, _overlay_priority_events_rx) = mpsc::channel(1);
         let daemon = Arc::new(Daemon {
             paths: paths.clone(),
             store,
@@ -25478,9 +26395,15 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             overlay: Mutex::new(None),
             overlay_enabled: false,
             overlay_bin: None,
-            overlay_events_tx,
+            overlay_events: OverlayEventSenders {
+                ordinary: overlay_events_tx,
+                priority: overlay_priority_events_tx,
+            },
             overlay_generation: Arc::new(AtomicU64::new(0)),
-            overlay_restart: Mutex::new(OverlayRestartState::default()),
+            overlay_hydration: watch::channel(OverlayHydrationState::default()).0,
+            overlay_hydration_feedback: parking_lot::Mutex::new(OverlayHydrationFeedback::default()),
+            overlay_state_transitions: Mutex::new(()),
+            overlay_restart: parking_lot::Mutex::new(OverlayRestartState::default()),
             overlay_shutdown_requested: AtomicBool::new(false),
             capture: Mutex::new(CaptureRuntime {
                 stop: None,

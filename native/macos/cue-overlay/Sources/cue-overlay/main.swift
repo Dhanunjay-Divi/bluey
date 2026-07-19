@@ -6756,7 +6756,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateTranscriptClearButtonVisibility()
         setContextItems([])
         setTranscriptState("READY", active: false)
-        applyOpacity(opacitySlider.doubleValue)
+        applyOpacity(opacitySlider.doubleValue, emitEvent: false)
         refreshKeyboardFocusRingStyle()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -9925,7 +9925,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         applyOpacity(opacitySlider.doubleValue)
     }
 
-    func applyOpacity(_ opacity: Double) {
+    func applyOpacity(_ opacity: Double, emitEvent: Bool = true) {
         let value = min(max(opacity, Double(minimumOverlayBackgroundOpacity)), 1.0)
         backgroundOpacity = CGFloat(value)
         if abs(opacitySlider.doubleValue - value) > 0.001 {
@@ -9935,7 +9935,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         opacityValueLabel.stringValue = "\(Int((value * 100.0).rounded()))"
         refreshBackgroundChrome()
         onOpacityChanged?(value)
-        emitOpacityUpdated(value)
+        if emitEvent {
+            emitOpacityUpdated(value)
+        }
     }
 
     private func setComposerTextHeight(_ rawHeight: CGFloat) {
@@ -16561,7 +16563,7 @@ private final class OverlayApp {
         expandedWindow = window
         expandedView = view
         view.setListeningState(currentRunState)
-        view.applyOpacity(overlayOpacity)
+        view.applyOpacity(overlayOpacity, emitEvent: false)
         switch accountUIState {
         case .signedIn:
             view.showSignedInChromeReady()
@@ -16693,7 +16695,7 @@ private final class OverlayApp {
             let value = min(max(o, Double(minimumOverlayBackgroundOpacity)), 1.0)
             overlayOpacity = value
             pillView?.applyBackgroundOpacity(value)
-            expandedView?.applyOpacity(value)
+            expandedView?.applyOpacity(value, emitEvent: false)
         case .setPosition(let pos):
             applyPosition(pos)
         case .setBalance(let label):
