@@ -8,11 +8,12 @@
   "main": "dist/main.js",
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "build": "npm run clean && tsc -p tsconfig.json",
+    "build": "npm run clean && tsc -p tsconfig.json && node scripts/copy-renderer-assets.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "start": "electron dist/main.js",
     "prepare:chromium": "node scripts/install-chromium.mjs",
+    "prepare:icons": "python3 scripts/generate-icons.py",
     "package": "npm run build && npm run prepare:chromium && electron-builder --config electron-builder.yml"
   },
   "dependencies": {

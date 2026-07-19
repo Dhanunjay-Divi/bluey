@@ -5,6 +5,7 @@ directories:
   output: release
 files:
   - dist/**
+  - assets/**
   - package.json
   - "!node_modules/@bluey/jobs-automation/src{,/**}"
   - "!node_modules/@bluey/jobs-automation/tests{,/**}"
@@ -23,7 +24,7 @@ protocols:
     schemes:
       - bluey-jobs
 mac:
-  icon: ../../crates/cue-dashboard/icons/icon.icns
+  icon: assets/icon.icns
   category: public.app-category.productivity
   target:
     - dmg
@@ -31,13 +32,14 @@ mac:
   hardenedRuntime: true
   gatekeeperAssess: false
 win:
-  icon: ../../crates/cue-dashboard/icons/icon.ico
+  icon: assets/icon.ico
   target:
     - nsis
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
 linux:
+  icon: assets/icon-512-linux.png
   category: Office
   target:
     - AppImage

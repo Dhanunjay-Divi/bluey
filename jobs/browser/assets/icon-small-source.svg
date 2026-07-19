@@ -1,0 +1,19 @@
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bluey Browser compact icon">
+  <defs>
+    <linearGradient id="bg" x1="112" y1="94" x2="916" y2="928" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#071722"/>
+      <stop offset="1" stop-color="#0a4054"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="150" y1="130" x2="850" y2="880" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8cf6ff"/>
+      <stop offset="1" stop-color="#35c9ea"/>
+    </linearGradient>
+  </defs>
+  <rect x="88" y="78" width="848" height="848" rx="244" fill="url(#bg)" stroke="url(#edge)" stroke-width="50"/>
+  <rect x="218" y="270" width="588" height="492" rx="112" fill="#061722" stroke="#58ddf5" stroke-width="44"/>
+  <path d="M238 392h548" stroke="#58ddf5" stroke-width="38"/>
+  <circle cx="690" cy="332" r="25" fill="#58ddf5"/>
+  <circle cx="754" cy="332" r="25" fill="#66f0a5"/>
+  <path d="m354 488 102 102-102 102" fill="none" stroke="#f4fbff" stroke-width="66" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M546 690h132" stroke="#66f0a5" stroke-width="54" stroke-linecap="round"/>
+</svg>

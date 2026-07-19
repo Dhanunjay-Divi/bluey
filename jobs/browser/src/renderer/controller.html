@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    >
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bluey Browser</title>
+    <link rel="stylesheet" href="./controller.css">
+  </head>
+  <body>
+    <main class="shell" id="app">
+      <header class="app-header">
+        <div class="brand-lockup">
+          <img src="../../assets/icon-128.png" width="46" height="46" alt="">
+          <div>
+            <strong>Bluey Browser</strong>
+            <span id="identity">Separate application identity</span>
+          </div>
+        </div>
+        <span class="mode-chip" id="mode">Local</span>
+      </header>
+
+      <section class="offline-banner" id="offline" role="status" hidden>
+        Offline — no new application will start.
+      </section>
+
+      <section class="status-card" id="status-card" data-status="ready">
+        <div class="status-kicker"><span class="status-dot"></span><span id="status-label">Ready</span></div>
+        <h1 id="title">Ready when you are</h1>
+        <p id="detail">Start a reviewed application from Bluey Jobs.</p>
+        <div class="job-context" id="job-context" hidden>
+          <span id="company"></span>
+          <strong id="role"></strong>
+        </div>
+      </section>
+
+      <section class="progress-card" aria-labelledby="progress-title">
+        <div class="section-heading">
+          <h2 id="progress-title">Application progress</h2>
+          <span id="run-count">No open application</span>
+        </div>
+        <ol class="progress" id="progress">
+          <li data-step="0"><span>1</span><b>Prepare</b></li>
+          <li data-step="1"><span>2</span><b>Fill</b></li>
+          <li data-step="2"><span>3</span><b>Review</b></li>
+          <li data-step="3"><span>4</span><b>Result</b></li>
+        </ol>
+      </section>
+
+      <section class="actions" aria-label="Application controls">
+        <button class="primary" id="primary" type="button">Open Bluey Jobs</button>
+        <div class="secondary-actions">
+          <button id="open-browser" type="button">Open browser</button>
+          <button id="pause" type="button">Pause</button>
+          <button id="stop" class="danger" type="button">Stop</button>
+        </div>
+      </section>
+
+      <section class="background-card">
+        <label class="toggle-row" for="background-enabled">
+          <span>
+            <strong id="background-title">Keep available in the background</strong>
+            <small id="background-detail">Closing this window then hides it to the tray. It runs only while this computer is awake.</small>
+          </span>
+          <input id="background-enabled" type="checkbox" role="switch">
+        </label>
+      </section>
+
+      <details class="activity-card">
+        <summary>Technical activity</summary>
+        <ul id="activity"></ul>
+      </details>
+
+      <footer>
+        <p id="footnote">Runs quietly while this computer is awake.</p>
+        <button class="link-button" id="open-jobs" type="button">Open Bluey Jobs</button>
+      </footer>
+      <div class="sr-only" id="announcer" aria-live="polite" aria-atomic="true"></div>
+    </main>
+    <script type="module" src="./controller.js"></script>
+  </body>
+</html>

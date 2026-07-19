@@ -1,0 +1,50 @@
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bluey Browser">
+  <defs>
+    <linearGradient id="shell" x1="132" y1="92" x2="904" y2="926" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#081620"/>
+      <stop offset=".58" stop-color="#082638"/>
+      <stop offset="1" stop-color="#0b4357"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="164" y1="150" x2="840" y2="862" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8bf5ff"/>
+      <stop offset=".5" stop-color="#35ccec"/>
+      <stop offset="1" stop-color="#4e86ff"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="616" y1="190" x2="800" y2="392" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#77f6bd"/>
+      <stop offset="1" stop-color="#4edc8d"/>
+    </linearGradient>
+    <linearGradient id="browser" x1="520" y1="560" x2="914" y2="884" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#092a3b"/>
+      <stop offset="1" stop-color="#061722"/>
+    </linearGradient>
+    <filter id="outerGlow" x="-25%" y="-25%" width="150%" height="150%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="0" stdDeviation="30" flood-color="#5adcf3" flood-opacity=".52"/>
+      <feDropShadow dx="0" dy="28" stdDeviation="32" flood-color="#02080e" flood-opacity=".55"/>
+    </filter>
+    <filter id="badgeShadow" x="-25%" y="-25%" width="160%" height="170%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="20" stdDeviation="22" flood-color="#01080d" flood-opacity=".72"/>
+    </filter>
+  </defs>
+
+  <rect x="90" y="80" width="844" height="844" rx="252" fill="url(#shell)" stroke="url(#edge)" stroke-width="30" filter="url(#outerGlow)"/>
+  <rect x="116" y="106" width="792" height="792" rx="226" fill="none" stroke="#9bf5ff" stroke-opacity=".18" stroke-width="8"/>
+
+  <rect x="264" y="300" width="470" height="378" rx="112" fill="#06131d" stroke="url(#edge)" stroke-width="28"/>
+  <path d="M372 418 450 496 372 574" fill="none" stroke="#f4fbff" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M520 584h126" fill="none" stroke="#bdefff" stroke-width="46" stroke-linecap="round"/>
+
+  <path d="m716 188 28 94 92 30-92 30-28 98-28-98-92-30 92-30Z" fill="url(#signal)"/>
+  <circle cx="814" cy="238" r="25" fill="#77f6bd"/>
+
+  <g filter="url(#badgeShadow)">
+    <rect x="510" y="558" width="410" height="324" rx="72" fill="url(#browser)" stroke="#58ddf5" stroke-width="20"/>
+    <path d="M522 658h386" stroke="#58ddf5" stroke-width="18"/>
+    <path d="M586 650v-28c0-24 20-44 44-44h108c24 0 44 20 44 44v28" fill="#0b4053" stroke="#58ddf5" stroke-width="14"/>
+    <circle cx="816" cy="620" r="11" fill="#58ddf5"/>
+    <circle cx="854" cy="620" r="11" fill="#66f0a5"/>
+    <circle cx="892" cy="620" r="11" fill="#4b96ff"/>
+    <path d="m638 728 54 54-54 54" fill="none" stroke="#f1fbff" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M764 830h62" stroke="#66f0a5" stroke-width="24" stroke-linecap="round"/>
+  </g>
+</svg>
