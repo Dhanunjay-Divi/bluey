@@ -4,15 +4,23 @@ Release candidate: 2026-07-19
 
 Audience: controlled production beta
 
-Status: verification in progress; not yet published
+Status: deployed to the controlled production beta; publication-ready but not
+yet publicly released
 
 ## Sealed Source
 
-The release source commit is not sealed yet. The final commit must contain this
-version bump and release record, have a clean worktree, and be identical to the
-source archive used by every macOS, Windows, Linux-server, and deployment gate.
-The exact commit and source-archive SHA-256 will be recorded here before
-publication.
+The code and artifact seal is commit
+`53c258cf843599f595a1e250d1872d191638d57a`, tree
+`65dabc483bea3ea3694a28fc168d5b1e9dd247d0`, with build epoch
+`1784475153`. The source archive is 35,634,329 bytes with SHA-256
+`63e6846bdda0191cb105b61a856e28f424e8d1950a0fd46351073f37aabeaeeb`.
+Exact macOS, physical Windows, Linux-server, Jobs, PostgreSQL, and independent
+diff/security/release gates all used this seal.
+
+This release record and the two round documents are updated after deployment
+as evidence-only documentation. Their later documentation commit is not the
+code/artifact seal and must not be substituted for the commit embedded in the
+archives or deployed binaries.
 
 ## Summary
 
@@ -108,59 +116,84 @@ their own canaries and operator approvals pass.
 
 | Platform | Status | Bytes | SHA-256 |
 | --- | --- | ---: | --- |
-| macOS arm64 | Exact-candidate build pending | — | — |
-| macOS x86_64 | Exact-candidate build pending | — | — |
-| macOS universal | Exact-candidate build pending | — | — |
-| Windows x86_64 | Exact-candidate build pending | — | — |
+| macOS arm64 | Exact sealed artifact; installed-runtime gate passed | 22,022,647 | `dfddcc30b78cd2819777ca8c8551a43443fc513bafdd630b14cbecb476892b95` |
+| macOS x86_64 | Exact sealed artifact; Rosetta gate passed | 23,391,529 | `bd28eb0fe683b90c070776f50e70c563cd5fa9c5cca241004d81b80de390caa4` |
+| macOS universal | Exact sealed artifact; native and Rosetta gates passed | 45,418,523 | `b842b6e31a52a749ce3011bf1717a4a0e5f321a0dd7c531bc94167ca8e6cc12c` |
+| Windows x86_64 | Exact sealed artifact; physical Windows 11 gate passed | 22,617,970 | `3887013440ed1cd5c55a6656fae6ef36b6bb1dc42a0625c752e21268b4670a23` |
 | Linux desktop | Not published | — | — |
 
-An artifact row is replaced with exact bytes and SHA-256 only after its
-packaged install and runtime smoke passes. Bluey Browser package hashes are
-test evidence only and do not enter the public terminal manifest.
+Bluey Browser package hashes are test evidence only and do not enter the public
+terminal manifest. The immutable terminal artifacts and signed manifest have
+not yet been uploaded, so these rows are sealed inputs rather than a claim that
+`0.1.104` is publicly available.
+
+The local publication packet is also sealed and its Ed25519 signature verifies:
+
+| Publication input | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `latest.json` | 1,376 | `b97a6090d93d69c14455d63c9ff354de997f7a2abb99c8417cc81a3cf4f4f716` |
+| `latest.json.sig` | 88 | `9b70ccbf7894979d818e53fb20087682d234ef83b2a895929d8dc7dcc9f1c3b9` |
+| `install.sh` | 24,466 | `ced25c22f7d8cf58439bcd08e0563cb6f81d83a6ec93a3b443fdecaff1b74e57` |
+| `install.ps1` | 20,778 | `74de690c5eebf6a03cac6aafb2e00ab96b410fab9db919ecfc55ef1e111481b3` |
+
+These are pre-publication identities, not a claim that the files are live.
+
+Reproducibility is stated narrowly. Repackaging the same final built outputs
+reproduced each immutable archive byte-for-byte, and the Rust CLI/daemon plus
+picker `Info.plist` were identical across clean builds. Independent clean Swift
+helper relinks changed Apple `LC_UUID`/ad-hoc `CDHash` metadata, so this release
+does not claim byte-identical archives across independent clean Swift relinks.
+The hash-pinned artifacts above are authoritative; deterministic Swift linker
+metadata (including evaluation of `-no_uuid`) remains a P1 packaging follow-up.
 
 ## Installed-Runtime And Linux-Server Verification
 
-Exact-candidate installed-runtime results are pending. macOS must cover the
-arm64, x86_64/Rosetta, and universal archives; Windows must run in an
-interactive Windows 11 desktop. Each lane must prove version and executable
-identity, secure-store opt-out, overlay/controller visibility, capture/privacy
-state, clean lifecycle, and zero residual processes.
+Exact sealed installed-runtime gates passed for macOS arm64, macOS
+x86_64/Rosetta, macOS universal in native and Rosetta modes, and an interactive
+physical Windows 11 desktop. Each lane proved version and executable identity,
+secure-store opt-out, overlay/controller visibility, capture/privacy state,
+clean lifecycle, and zero residual processes. Windows also passed automation
+139/139, Browser 95/95, and runner 50/50; the exact macOS lane passed runner
+50/50.
 
-Linux verification covers the main API, Jobs API, worker packages, and Jobs
-portal against the sealed source. It does not authorize or advertise a Linux
-desktop package.
+Linux verification passed the main API, Jobs API, worker packages, and Jobs
+portal against the sealed source, including the server's 788-test full gate and
+the runner's 50/50 suite. It does not authorize or advertise a Linux desktop
+package. The sealed Linux deployment inputs were:
+
+| Input | Bytes | SHA-256 |
+| --- | ---: | --- |
+| Main API | 27,327,944 | `7704fb8d279d1d64af15646f19d14a657ed36d5144fcf89d98ac0e8bad593888` |
+| Jobs API | 21,364,968 | `687fc4834a08a53465bde64cb55336f931ae26acf3819139e221edb30a07bb2e` |
+| Jobs portal archive | 1,279,010 | `488b0f08f15f479b291f517901f99cd3a25562634051475ad8b67274263fbf3f` |
 
 ## PostgreSQL Recovery Proof
 
-Pre-seal drills passed on PostgreSQL 18.4 with pgvector 0.8.3 for fresh and
-restored databases, operator migration discovery, embedded replay, migration
-009 uniqueness, and local submit authority. The exact sealed source must rerun
-the focused migration and authority gates before deployment. The local backup
-identity is recorded in Round 550; no customer rows are copied into evidence.
+PostgreSQL 18.4 with pgvector 0.8.3 passed fresh and restored databases,
+operator migration discovery, embedded replay, migration 009 uniqueness, local
+submit authority, and the 12 targeted runtime tests on the exact seal.
+Immediately before production mutation, backup
+`bluey-postgres-20260719T163508Z.pgdump` was verified remotely and again after
+transfer to macOS: 24,845,155 bytes, SHA-256
+`6cd7272a947a88e377cdf477ba182b29ddadde277b92f77c7a92840106b7022a`.
+No customer rows are copied into this evidence.
 
 ## Release Boundary
 
-Publication remains blocked until all of these exact-candidate gates pass:
+The exact local and physical platform gates, artifact checksum/source checks,
+PostgreSQL recovery drills, independent audit, atomic production rollout, and
+live health verification are green. GitHub Actions did not execute a job step:
+every zero-step job reported, "The job was not started because an Actions
+budget is preventing further use." This is an explicit infrastructure waiver,
+not a green check and not a product-test failure; equivalent or stronger exact
+macOS, physical Windows, Linux, Jobs, server, and PostgreSQL gates supplied the
+required evidence.
 
-- Rust formatting, all-target tests, clippy with warnings denied, and release
-  builds for the root workspace and server;
-- Jobs automation, Browser, runner, workflows, and portal tests, typechecks,
-  and production builds;
-- PostgreSQL 18 fresh, restored, operator migration, replay, uniqueness,
-  retention, and local-submit authority drills;
-- packaged macOS install/start/update/stop and packaged Bluey Browser
-  controller/tray verification;
-- physical Windows terminal package/install/runtime and Bluey Browser
-  package/controller/tray verification;
-- Linux server/API/Jobs/workers/portal verification without claiming a Linux
-  desktop package; and
-- artifact checksum, source-commit, signed-manifest, rollback, and live health
-  verification.
-
-Exact commit, artifact sizes, hashes, and publication evidence will be added
-only after those gates pass. Until then, `0.1.103` remains the public release.
-The `0.1.104` website fallback must not be deployed before its immutable
-artifacts and signed manifest are live.
+Public release remains pending only on publishing the immutable desktop
+artifacts and signed manifest, verifying the public installers/updater against
+that manifest, and then updating the website terminal fallback. Until those
+steps complete, `0.1.103` remains the public release and `0.1.104` must not be
+advertised as downloadable.
 
 ## Security And Privacy
 
@@ -186,16 +219,38 @@ artifacts and signed manifest are live.
 
 ## Deployment, Publication, And Rollback
 
-Deployment identity, service stability, signed-manifest hash, signature hash,
-installer hashes, updater smoke, and live artifact checks are pending. Rollout
-must disable and drain paid dispatch, apply migrations 008 and 010, atomically
-replace the main API and Jobs API, verify the new build with the three Jobs
-flags still `0`, and only then restore independently approved paid routes.
+Production deployed the exact code/artifact seal during a full ingress outage.
+Paid dispatch was held closed and all measured work aggregates were `0` before
+the matching main API, Jobs API, and portal moved together across migrations
+008, 009, and 010. The four replay-safe data markers were present afterward.
+Current verified identity is:
 
-Rollback is symmetric: disable and drain paid dispatch first, roll back both
-server binaries together, and never run an older paid dispatcher against the
-authority cutover merely because it boots. The previous `0.1.103` terminal
-artifacts and previous approved Jobs binary remain immutable rollback inputs.
+- main API PID `2217136`, SHA-256
+  `7704fb8d279d1d64af15646f19d14a657ed36d5144fcf89d98ac0e8bad593888`;
+- Jobs API PID `2217137`, SHA-256
+  `687fc4834a08a53465bde64cb55336f931ae26acf3819139e221edb30a07bb2e`;
+- Caddy PID `2217438` and Jobs portal `index.html` SHA-256
+  `309c555e40ed568a84c79e681e93756758392d3cf0762e9fc10e32fc1cb08ca3`;
+- both services at `NRestarts=0`, public health reporting the exact seal,
+  upstream cap 1,000 cents per 24 hours, and all three Jobs flags at `0`.
+
+The locally staged signed-manifest, detached-signature, and installer hashes are
+recorded above and verify. Public upload, live installer/updater smokes, and
+website publication remain pending. The website terminal fallback has not been
+updated.
+
+Rollback is symmetric and outage-bound: stop ingress and both APIs, then never
+run an older paid dispatcher against the migrated authority schema merely
+because it boots. A true old-version rollback requires restoring the verified
+pre-cutover PostgreSQL dump and both saved binaries/configurations together
+before restoring the original positive cap. Now that ingress has reopened, a
+database restore could discard post-cutover writes, so normal recovery is
+fix-forward. The previous `0.1.103` terminal artifacts remain immutable desktop
+rollback inputs.
+
+The R2/offsite credential still returns `AccessDenied`. The verified remote and
+macOS copies of the pre-cutover PostgreSQL backup are the current recovery
+evidence; R2 repair remains an operational follow-up.
 
 ## Related Evidence
 

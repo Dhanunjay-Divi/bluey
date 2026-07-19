@@ -1,6 +1,6 @@
 # Round 550 — Integrated Jobs, Browser, discovery, spend, and cross-platform release
 
-Status: release candidate verification in progress; not deployed or published.
+Status: exact seal deployed; publication-ready but not yet publicly released.
 
 Date: 2026-07-19
 
@@ -8,9 +8,10 @@ Date: 2026-07-19
 
 This round converges the previously reviewed Bluey desktop, Jobs, Browser,
 public-ATS discovery, provider-spend, PostgreSQL migration, and maintainability
-work onto one release branch. Production remains unchanged while the exact
-candidate is tested on macOS, a physical Windows 11 machine, PostgreSQL 18, and
-a Linux server environment.
+work onto one sealed source. Exact macOS, physical Windows 11, PostgreSQL 18,
+Linux-server, Jobs, and independent audit gates passed, and that seal is now
+running in the controlled production beta. Public desktop publication remains
+separate and has not happened yet.
 
 The release does not silently activate new automation. Production must retain:
 
@@ -20,19 +21,26 @@ BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0
 BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0
 ```
 
-The current public terminal release is `0.1.103`; this source targets
-`0.1.104`. Linux is a server verification target only, not a public terminal or
-Bluey Browser artifact.
+The current public terminal release remains `0.1.103`; the sealed source and
+production servers target `0.1.104`. Linux is a server verification target
+only, not a public terminal or Bluey Browser artifact. Bluey Browser packages
+are test evidence only and are not part of the public terminal release.
 
 ## Scope and sealed-source provenance
 
-The integration history is preserved as reviewable commits above the last
-observed `origin/main` commit `3c08c5f55e62db7d9dd00fdcf6a8347fed08be31`.
-The release source commit is not sealed yet; the exact final commit must include
-the `0.1.104` version metadata and this evidence scaffold with a clean
-worktree. All final platform bundles, database drills, the source archive, and
-deployment binaries must trace to that one commit. A stale branch, rebuilt
-post-test artifact, or undocumented worktree delta is not a release input.
+The integration history is preserved as reviewable commits above the former
+`origin/main` commit `3c08c5f55e62db7d9dd00fdcf6a8347fed08be31`. The code
+and artifact seal is commit
+`53c258cf843599f595a1e250d1872d191638d57a`, tree
+`65dabc483bea3ea3694a28fc168d5b1e9dd247d0`, with build epoch
+`1784475153`. The sealed source archive is 35,634,329 bytes with SHA-256
+`63e6846bdda0191cb105b61a856e28f424e8d1950a0fd46351073f37aabeaeeb`.
+Every final platform bundle, database drill, deployment binary, portal archive,
+and independent audit traces to this identity.
+
+The later commit that records deployment and publication evidence in this
+document is documentation-only. It must not be confused with or substituted
+for the code/artifact seal embedded in binaries and archives.
 
 ## Evidence-backed findings
 
@@ -190,12 +198,15 @@ transactional current-policy recheck at claim and immediately before Submit.
 
 ### P0 — release and truth gates
 
-1. Finish the exact macOS, physical Windows, Linux server, Jobs/portal,
-   PostgreSQL, artifact, installer, updater, and rollback verification listed
-   in `docs/release/RELEASE-v0.1.104.md`.
-2. Preserve the three Jobs execution/generation flags at `0` during deploy.
-3. Prove main API and Jobs API use the same migration/accounting source and
-   move atomically across migrations 008 and 010.
+1. Exact macOS, physical Windows, Linux-server, Jobs/portal, PostgreSQL,
+   artifact, and rollback gates passed. Public signed-manifest,
+   installer/updater, and website publication verification remains pending as
+   the final release step.
+2. Preserve the three Jobs execution/generation flags at `0` after deploy and
+   through public publication.
+3. Main API and Jobs API moved atomically from the same sealed source across
+   migrations 008, 009, and 010 under a full-ingress outage and paid-dispatch
+   hold.
 4. Implement the audited Career Track/experience/tailoring gaps. Do not enable
    automatic submission while profile eligibility and tailored packet coverage
    are conflated or current eligibility is not rechecked before Submit.
@@ -244,27 +255,40 @@ license/usage boundary even when a repository's code license is permissive.
 - Employer-facing side effects require current server authority, and uncertain
   final-submit state cannot enter an automatic retry loop.
 
-## Unknowns requiring runtime validation
+## Remaining unknowns and product residuals
 
-- Exact `0.1.104` Windows terminal package and updater behavior on the physical
-  Windows 11 machine.
-- Exact frozen-candidate Browser close-to-tray, relaunch, and explicit-Quit
-  lifecycle on macOS and Windows.
-- Linux build/runtime behavior for the server, Jobs API, workers, and portal;
-  this does not create a Linux desktop release.
-- Production backup replication to R2/S3; the last observed R2 credential
-  returned `AccessDenied`, while local and off-host PostgreSQL backups existed.
-- Live provider answer quality and cost under owner-controlled canary prompts.
+- Production backup replication to R2/S3 remains unresolved: the current R2
+  credential returns `AccessDenied`. The exact pre-cutover backup was instead
+  verified both remotely and after transfer to macOS.
+- The owner-approved Career Track policy remains P0: role-family-scoped relevant
+  months, required/preferred separation, seniority/title guards, Track-bound
+  resumes/evidence, hard engagement/authorization dimensions, immutable
+  evidence revisions, dual scores, per-claim evidence IDs, and transactional
+  eligibility/fact checks at claim and immediately before Submit.
+- Broad discovery remains P1. External feeds may supply candidate leads only
+  after schema/hash/provenance checks and canonical ATS reverification; they do
+  not become application truth. Anti-bot, stealth, proxy-bypass, and visual-only
+  Submit behavior remain out of scope.
+- Bluey Browser passed exact macOS and physical Windows controller/tray/package
+  tests, but distribution and all employer-facing execution remain disabled.
+  Public distribution needs its own product approval after the P0 truth gates.
+- Live provider answer quality and cost still require owner-controlled canary
+  prompts before managed generation can be enabled.
 - Mailbox/calendar OAuth and ATS-specific execution outside the currently
-  certified provider paths.
+  certified provider paths require provider-specific validation.
+- GitHub Actions supplied no runtime signal because an account budget prevented
+  every job from starting. This was explicitly waived using the equivalent or
+  stronger exact local and physical platform gates; it is not recorded as a
+  green GitHub check.
 
 ## PostgreSQL backup, restore, and replay evidence
 
-The pre-seal PostgreSQL drill used PostgreSQL 18.4 and pgvector 0.8.3. It
+The exact-seal PostgreSQL drill used PostgreSQL 18.4 and pgvector 0.8.3. It
 validated fresh migration, restored migration, embedded server replay,
-operator replay, and the exact migration 009 unique index. A duplicate board
-owner was rejected. The local-submit authority drill produced one claim winner
-and denied deleted identity, revoked entitlement, and invalid binding paths.
+operator replay, migrations 008, 009, and 010, the migration 009 unique index,
+and 12 targeted runtime tests. A duplicate board owner was rejected. The
+local-submit authority drill produced one claim winner and denied deleted
+identity, revoked entitlement, and invalid binding paths.
 
 The local backup is:
 
@@ -274,40 +298,97 @@ The local backup is:
 SHA-256 64508a1e615aca00983a0f78fac6b614b0704f583e39eead5a26f3821659f5a4
 ```
 
-This path is local evidence, not a deploy input. The final gate must prove the
-backup can restore and keep database contents out of documentation. R2
-replication remains unresolved because the last credential check returned
-`AccessDenied`.
+This path is an earlier isolated-drill input, not the production deploy backup.
+Immediately before mutation, production created:
+
+```text
+bluey-postgres-20260719T163508Z.pgdump
+24,845,155 bytes
+SHA-256 6cd7272a947a88e377cdf477ba182b29ddadde277b92f77c7a92840106b7022a
+```
+
+The production backup was validated remotely and again after transfer to
+macOS. Database contents remain outside this documentation. R2 replication
+remains unresolved because the current credential returns `AccessDenied`.
 
 ## macOS, Windows, and Linux-server verification
 
-- macOS pre-seal Browser package and controller checks passed, but the final
-  terminal and Browser packages must be rebuilt from the sealed commit.
-- Physical Windows 11 passed the pre-seal Rust suites and the Browser's 24
-  files / 90 tests, package, sandbox/CSP/Node isolation, 125%/200% layout, and
-  current-user key ACL. Final terminal and Browser packages remain required.
-- Linux must build and run the main API, Jobs API, workers, and portal from the
-  sealed source. No result in that lane creates a Linux desktop claim.
+- Exact macOS arm64, x86_64/Rosetta, and universal native/Rosetta terminal
+  artifacts passed installed-runtime, updater, lifecycle, secure-store-off,
+  and zero-residual checks. The exact Browser controller/tray/package lifecycle
+  also passed; Browser remains test-only.
+- Physical Windows 11 passed the exact terminal install/runtime/updater lane,
+  automation 139/139, Browser 95/95, runner 50/50, sandbox/CSP/Node isolation,
+  125%/200% layout, current-user key ACL, close-to-tray, relaunch, and clean
+  explicit Quit.
+- Exact Linux passed the main API, Jobs API, workers, Jobs portal, server
+  788-test full gate, and runner 50/50. No result in this lane creates a Linux
+  desktop claim.
+- The independent exact diff/security/release audit found no blocker.
+- GitHub Actions ran zero job steps because its account budget prevented every
+  job from starting. The explicit infrastructure waiver relies on the
+  equivalent or stronger exact gates above; the zero-step jobs are neither
+  green checks nor product-test failures.
 
 ## Artifact, source, and binary hashes
 
-Pending candidate seal and exact-platform verification. This section will
-record the source archive, four terminal artifacts, deployed main API binary,
-deployed Jobs API binary, signed manifest, detached signature, and installer
-hashes. Browser package hashes remain non-public test evidence.
+| Input | Bytes | SHA-256 |
+| --- | ---: | --- |
+| Source archive | 35,634,329 | `63e6846bdda0191cb105b61a856e28f424e8d1950a0fd46351073f37aabeaeeb` |
+| macOS arm64 terminal | 22,022,647 | `dfddcc30b78cd2819777ca8c8551a43443fc513bafdd630b14cbecb476892b95` |
+| macOS x86_64 terminal | 23,391,529 | `bd28eb0fe683b90c070776f50e70c563cd5fa9c5cca241004d81b80de390caa4` |
+| macOS universal terminal | 45,418,523 | `b842b6e31a52a749ce3011bf1717a4a0e5f321a0dd7c531bc94167ca8e6cc12c` |
+| Windows x86_64 terminal | 22,617,970 | `3887013440ed1cd5c55a6656fae6ef36b6bb1dc42a0625c752e21268b4670a23` |
+| Linux main API | 27,327,944 | `7704fb8d279d1d64af15646f19d14a657ed36d5144fcf89d98ac0e8bad593888` |
+| Linux Jobs API | 21,364,968 | `687fc4834a08a53465bde64cb55336f931ae26acf3819139e221edb30a07bb2e` |
+| Jobs portal archive | 1,279,010 | `488b0f08f15f479b291f517901f99cd3a25562634051475ad8b67274263fbf3f` |
+
+All rows above are exact seal inputs. The local signed publication packet also
+verifies before upload:
+
+| Publication input | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `latest.json` | 1,376 | `b97a6090d93d69c14455d63c9ff354de997f7a2abb99c8417cc81a3cf4f4f716` |
+| `latest.json.sig` | 88 | `9b70ccbf7894979d818e53fb20087682d234ef83b2a895929d8dc7dcc9f1c3b9` |
+| `install.sh` | 24,466 | `ced25c22f7d8cf58439bcd08e0563cb6f81d83a6ec93a3b443fdecaff1b74e57` |
+| `install.ps1` | 20,778 | `74de690c5eebf6a03cac6aafb2e00ab96b410fab9db919ecfc55ef1e111481b3` |
+
+The Ed25519 signature verifies locally. These are pre-publication identities,
+not a claim that the packet is live. Browser package hashes remain non-public
+test evidence and do not enter the terminal manifest.
+
+Archive reproduction has a precise boundary: rerunning packaging from the same
+final built outputs produced byte-identical archives, while independent clean
+Swift helper relinks changed Apple `LC_UUID`/ad-hoc `CDHash` metadata. The Rust
+CLI/daemon and picker `Info.plist` remained byte-identical. Therefore the
+hash-pinned artifacts above are authoritative, but this round does not claim
+fully byte-identical clean Swift relinks. Deterministic Swift linker metadata,
+including evaluation of `-no_uuid`, remains a P1 packaging follow-up.
 
 ## Deployment and publication evidence
 
-No deployment, restart, feature-flag change, release upload, manifest change,
-or public website update has occurred in this round. The last read-only
-production observation showed the approved Jobs commit
-`f3a0a04360febb36363c27f869e954f2d61f32e0`, binary SHA-256
-`07e12cb5d5668c4c8cd24129a9fbccc3f512e873d2400867b0fde55be288ac96`,
-active with zero restarts and all three Jobs generation/distribution flags at
-`0`. These values must be reverified immediately before rollout.
+Production deployed exact seal `53c258cf843599f595a1e250d1872d191638d57a`
+during a full public-ingress outage. A verified remote and macOS backup was
+taken first, paid dispatch was held closed, all measured aggregates were `0`,
+migrations 008, 009, and 010 plus all four data markers were verified, and the
+main API, Jobs API, and Jobs portal moved as one maintenance unit.
 
-The website contains a `0.1.104` fallback and therefore must not be deployed
-before the immutable `0.1.104` artifacts and signed manifest are live.
+Post-rollout identity:
+
+| Surface | Live evidence |
+| --- | --- |
+| Main API | PID `2217136`; binary SHA-256 `7704fb8d279d1d64af15646f19d14a657ed36d5144fcf89d98ac0e8bad593888` |
+| Jobs API | PID `2217137`; binary SHA-256 `687fc4834a08a53465bde64cb55336f931ae26acf3819139e221edb30a07bb2e` |
+| Ingress / portal | Caddy PID `2217438`; `index.html` SHA-256 `309c555e40ed568a84c79e681e93756758392d3cf0762e9fc10e32fc1cb08ca3` |
+| Service stability | Main and Jobs `NRestarts=0`; public health reports exact seal |
+| Spend / execution | 1,000 cents per 24 hours; model/local/cloud Jobs flags all `0`; all measured aggregates `0` |
+
+No immutable desktop artifact, signed manifest, detached signature, or public
+installer has been uploaded yet. The website terminal fallback has not been
+updated. Publication must upload and verify the artifacts and signed manifest
+first, smoke the public installers/updater, and only then update the website.
+Consequently `0.1.103` remains the public terminal release even though the
+controlled production services run the `0.1.104` seal.
 
 ## Feature flags and explicit non-claims
 
@@ -321,38 +402,49 @@ before the immutable `0.1.104` artifacts and signed manifest are live.
 
 ## Rollback procedure
 
-1. Disable every managed paid dispatcher and drain in-flight provider work.
-2. Keep the three Jobs generation/distribution flags at `0`.
-3. Restore the previous approved main API and Jobs API binaries together; do
-   not mix an older paid dispatcher with the authority-cutover schema.
-4. Verify database migrations remain additive and the prior binaries do not
-   dispatch paid work before they are re-enabled.
-5. Restore the previous signed desktop manifest only by its immutable release
+1. Stop Caddy and both APIs, verify every in-flight aggregate is `0`, and keep
+   the three Jobs generation/distribution flags at `0`.
+2. Before migration 008 commits, restore both saved binaries/configurations
+   together and retain the original positive spend cap.
+3. After migration 008 commits, never boot the old binaries against the
+   migrated authority schema. A true old-version rollback requires restoring
+   the verified pre-cutover PostgreSQL dump with `pg_restore --clean
+   --if-exists --single-transaction`, then restoring both saved binaries and
+   configurations while ingress remains stopped.
+4. Verify the migration ledger is back at 001-007, both old binary hashes are
+   exact, temporary zero-cap holds are absent, and the original positive cap is
+   effective before restarting Caddy.
+5. Once public ingress has reopened, treat the database rollback window as
+   closed because a restore would discard post-cutover writes; fix forward.
+6. Restore the prior Jobs portal entrypoint only from the paired rollback
+   packet and retain immutable hashed assets.
+7. Restore a previous signed desktop manifest only from immutable release
    inputs; never overwrite versioned artifacts.
-6. Verify health, binary hashes, source identity, and service restart counts.
 
 ## Final acceptance checklist
 
-- [ ] Candidate commit sealed and worktree clean.
-- [ ] Root and server fmt, clippy, all-target tests, and release builds pass.
-- [ ] All Jobs packages pass tests, typechecks, and production builds.
-- [ ] PostgreSQL fresh/restore/operator/replay/authority gates pass on the
+- [x] Code/artifact commit sealed and its build worktree clean.
+- [x] Root and server fmt, clippy, all-target tests, and release builds pass.
+- [x] All Jobs packages pass tests, typechecks, and production builds.
+- [x] PostgreSQL fresh/restore/operator/replay/authority gates pass on the
       sealed commit and the backup hash is recorded in full.
-- [ ] macOS arm64, x86_64, and universal terminal artifacts pass installed
+- [x] macOS arm64, x86_64, and universal terminal artifacts pass installed
       runtime and updater checks with secure stores disabled.
-- [ ] macOS Bluey Browser package passes controller, tray, close, relaunch,
+- [x] macOS Bluey Browser package passes controller, tray, close, relaunch,
       intervention, and explicit-Quit checks.
-- [ ] Physical Windows 11 terminal and Browser packages pass equivalent gates.
-- [ ] Linux server/API/Jobs/workers/portal gate passes with no desktop claim.
-- [ ] Source and artifact reproducibility/hashes are recorded.
-- [ ] Independent diff/security/release audit has no blocker.
-- [ ] Origin main has not advanced incompatibly; integrated work reaches main.
-- [ ] Production backup and rollback inputs are verified.
-- [ ] Main API and Jobs API deploy atomically with all Jobs flags at `0`.
+- [x] Physical Windows 11 terminal and Browser packages pass equivalent gates.
+- [x] Linux server/API/Jobs/workers/portal gate passes with no desktop claim.
+- [x] Source and artifact identities plus bounded archive-repack evidence and
+      the independent-clean-Swift-relink limitation are recorded.
+- [x] Independent diff/security/release audit has no blocker.
+- [x] Exact integrated seal reaches `origin/main`.
+- [x] Production backup and rollback inputs are verified.
+- [x] Main API and Jobs API deploy atomically with all Jobs flags at `0`.
 - [ ] Immutable desktop artifacts and signed manifest publish before the
       `0.1.104` website fallback.
-- [ ] Live health, versions, hashes, flags, and `NRestarts` are verified.
-- [ ] Round 549 and this round are updated with exact rollout evidence.
+- [x] Live health, versions, hashes, flags, and `NRestarts` are verified.
+- [x] Round 549 and this round are updated with exact pre-publication rollout
+      evidence.
 - [ ] The continuation Codex receives the final main/deploy handoff.
 
 ## Concrete implementation handoff
@@ -369,29 +461,29 @@ before any execution flag changes.
 
 ## Verification ledger
 
-Completed before candidate seal:
+Completed on the exact code/artifact seal:
 
-- Jobs workspace: 371 tests across automation, Browser, runner, workflows, and
-  portal, plus typecheck/build gates.
-- Browser after Windows secure-store, package-pruning, and close-copy fixes: 25
-  files / 95 tests on macOS and physical Windows.
-- Server library: 706 tests in serial, with the spend-retention boundary made
-  robust against SQLite timestamp rounding and repeated ten times.
-- PostgreSQL 18.4 + pgvector 0.8.3: fresh and restored migration drills,
-  operator replay, migration 009 uniqueness, and local submit authority.
-- Physical Windows Browser package smoke from the pre-version-bump tree,
-  including sandbox/CSP/Node isolation, 125% and 200% layout, current-user key
-  ACL, zero secure-store calls, real WM_CLOSE hide/show when background is on,
-  and clean Quit when it is off.
+- root and server formatting, all-target tests, clippy with warnings denied,
+  and release builds; server full gate 788 tests, including 706 library tests;
+- all Jobs package suites, typechecks, and builds; physical Windows automation
+  139/139, Browser 95/95, and runner 50/50; exact macOS and Linux runner 50/50;
+- exact macOS terminal and Browser installed-runtime/package lifecycle gates;
+- exact physical Windows 11 terminal and Browser installed-runtime/package
+  lifecycle gates;
+- exact Linux main API, Jobs API, workers, and portal build/runtime gates;
+- PostgreSQL 18.4 + pgvector 0.8.3 fresh and restored migration drills,
+  operator and embedded replay, migration 009 uniqueness, local-submit
+  authority, and 12 targeted runtime tests;
+- artifact/source identity checks, independent diff/security/release audit,
+  pre-mutation backup verification, atomic production rollout, and post-rollout
+  health/hash/flag/restart verification.
 
-Still required on the sealed source commit:
+GitHub Actions is covered only by the documented infrastructure waiver: every
+job had zero steps because the account Actions budget prevented it from
+starting. No GitHub job is represented as green.
 
-- final full parallel Rust/server and Jobs suites;
-- final macOS terminal and Browser packages and runtime smokes;
-- final physical Windows terminal and Browser packages and runtime smokes;
-- final Linux server/API/Jobs/workers/portal gate;
-- exact artifact hashes, reproducibility checks, signed manifest, rollout,
-  rollback readiness, and live health/NRestarts verification.
-
-No deployment or publication is authorized until every required item above is
-green and this document is updated with the exact source and artifact hashes.
+Still required for public release: sign and publish the immutable desktop
+manifest and artifacts, verify the public installers and updater, update the
+website terminal fallback afterward, record the resulting hashes/evidence, and
+send the continuation handoff. Until then, deployment is live but `0.1.104`
+remains unpublished.
