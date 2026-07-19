@@ -17,7 +17,8 @@ GET  /account/me                       license + plan + balance
 GET  /account/usage                    rolling-7-day mix + tier projection
 POST /router/complete                  managed LLM dispatch
 POST /router/embed                     managed embedding dispatch
-POST /router/transcribe                managed STT dispatch
+POST /router/transcribe                managed RIFF/WAV PCM STT (32 MiB, 15 min)
+GET  /stt/live                         managed binary PCM16/16-kHz/mono WebSocket (20 min)
 POST /usage/event                      per-call metering ingestion
 POST /billing/checkout                 Stripe checkout session
 POST /billing/webhook                  Stripe webhook handler

@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use super::{
     billing_restricted_error, capacity_error, missing_provider_key_error,
     priced_transcribe_routes_for, prior_provider_exposure_error, provider_accounting_pending_error,
-    provider_cost_guard, release_and_capacity_error, settle_provider_attempt_before_customer,
-    ApiError, AppState, PricedTranscribeRoute,
+    provider_cost_guard, release_and_capacity_error, release_and_upstream_spend_guard_error,
+    settle_provider_attempt_before_customer, spawn_usage_expiry_reconciler, ApiError, AppState,
+    PricedTranscribeRoute,
 };
 use crate::auth::AuthedAccount;
 use crate::db::{
@@ -14,6 +15,162 @@ use crate::db::{
     usage_reservations::{self, ReserveUsageInput, SettlementUsageEvent},
 };
 use crate::{pricing, routing};
+
+/// The managed REST transcription path accepts only duration-verifiable PCM.
+/// Compressed audio must use the live STT session path, whose reservation is
+/// bounded by the server-issued session maximum before any provider I/O.
+const MAX_REST_TRANSCRIBE_DURATION_SECONDS: i64 = 15 * 60;
+
+#[derive(Debug, PartialEq, Eq)]
+enum WavValidationError {
+    UnsupportedMediaType,
+    Malformed(&'static str),
+    TooLong,
+}
+
+fn little_u16(bytes: &[u8]) -> Option<u16> {
+    Some(u16::from_le_bytes(bytes.get(..2)?.try_into().ok()?))
+}
+
+fn little_u32(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?))
+}
+
+/// Validate an uncompressed RIFF/WAVE PCM container and derive duration from
+/// the declared PCM byte rate plus the complete data chunk. No compressed-byte
+/// heuristic or client-supplied duration is trusted for provider admission.
+fn validated_wav_duration_seconds(
+    body: &[u8],
+    content_type: &str,
+) -> Result<i64, WavValidationError> {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(
+        media_type.as_str(),
+        "audio/wav" | "audio/x-wav" | "audio/wave"
+    ) {
+        return Err(WavValidationError::UnsupportedMediaType);
+    }
+    if body.len() < 44 || body.get(..4) != Some(b"RIFF") || body.get(8..12) != Some(b"WAVE") {
+        return Err(WavValidationError::Malformed("invalid RIFF/WAVE header"));
+    }
+    let riff_payload = usize::try_from(
+        little_u32(&body[4..8]).ok_or(WavValidationError::Malformed("missing RIFF size"))?,
+    )
+    .map_err(|_| WavValidationError::Malformed("invalid RIFF size"))?;
+    let riff_end = riff_payload
+        .checked_add(8)
+        .ok_or(WavValidationError::Malformed("RIFF size overflow"))?;
+    if riff_end != body.len() {
+        return Err(WavValidationError::Malformed(
+            "RIFF size does not match body",
+        ));
+    }
+
+    let mut offset = 12_usize;
+    let mut byte_rate = None;
+    let mut block_align = None;
+    let mut data_bytes = None;
+    while offset < riff_end {
+        let header_end = offset
+            .checked_add(8)
+            .ok_or(WavValidationError::Malformed("chunk offset overflow"))?;
+        if header_end > riff_end {
+            return Err(WavValidationError::Malformed("truncated chunk header"));
+        }
+        let chunk_id = &body[offset..offset + 4];
+        let chunk_len = usize::try_from(
+            little_u32(&body[offset + 4..header_end])
+                .ok_or(WavValidationError::Malformed("missing chunk size"))?,
+        )
+        .map_err(|_| WavValidationError::Malformed("invalid chunk size"))?;
+        let chunk_start = header_end;
+        let chunk_end = chunk_start
+            .checked_add(chunk_len)
+            .ok_or(WavValidationError::Malformed("chunk size overflow"))?;
+        if chunk_end > riff_end {
+            return Err(WavValidationError::Malformed("truncated chunk"));
+        }
+
+        if chunk_id == b"fmt " {
+            if byte_rate.is_some() || chunk_len < 16 {
+                return Err(WavValidationError::Malformed("invalid fmt chunk"));
+            }
+            let fmt = &body[chunk_start..chunk_end];
+            let audio_format =
+                little_u16(fmt).ok_or(WavValidationError::Malformed("missing PCM format"))?;
+            let channels = little_u16(&fmt[2..])
+                .ok_or(WavValidationError::Malformed("missing channel count"))?;
+            let sample_rate = little_u32(&fmt[4..])
+                .ok_or(WavValidationError::Malformed("missing sample rate"))?;
+            let declared_byte_rate =
+                little_u32(&fmt[8..]).ok_or(WavValidationError::Malformed("missing byte rate"))?;
+            let declared_block_align = little_u16(&fmt[12..])
+                .ok_or(WavValidationError::Malformed("missing block alignment"))?;
+            let bits_per_sample = little_u16(&fmt[14..])
+                .ok_or(WavValidationError::Malformed("missing sample width"))?;
+            if audio_format != 1
+                || channels == 0
+                || sample_rate == 0
+                || bits_per_sample == 0
+                || bits_per_sample % 8 != 0
+            {
+                return Err(WavValidationError::Malformed(
+                    "only integer PCM is supported",
+                ));
+            }
+            let expected_block_align = u32::from(channels)
+                .checked_mul(u32::from(bits_per_sample / 8))
+                .ok_or(WavValidationError::Malformed("block alignment overflow"))?;
+            let expected_byte_rate = sample_rate
+                .checked_mul(expected_block_align)
+                .ok_or(WavValidationError::Malformed("byte rate overflow"))?;
+            if expected_block_align != u32::from(declared_block_align)
+                || expected_byte_rate != declared_byte_rate
+                || declared_byte_rate == 0
+            {
+                return Err(WavValidationError::Malformed("inconsistent PCM format"));
+            }
+            byte_rate = Some(u64::from(declared_byte_rate));
+            block_align = Some(u64::from(declared_block_align));
+        } else if chunk_id == b"data"
+            && (data_bytes.replace(chunk_len as u64).is_some() || chunk_len == 0)
+        {
+            return Err(WavValidationError::Malformed("invalid data chunk"));
+        }
+
+        offset = chunk_end
+            .checked_add(chunk_len & 1)
+            .ok_or(WavValidationError::Malformed("chunk padding overflow"))?;
+        if offset > riff_end {
+            return Err(WavValidationError::Malformed("truncated chunk padding"));
+        }
+    }
+
+    let byte_rate = byte_rate.ok_or(WavValidationError::Malformed("missing fmt chunk"))?;
+    let block_align = block_align.ok_or(WavValidationError::Malformed("missing fmt chunk"))?;
+    let data_bytes = data_bytes.ok_or(WavValidationError::Malformed("missing data chunk"))?;
+    if data_bytes % block_align != 0 {
+        return Err(WavValidationError::Malformed("partial PCM sample frame"));
+    }
+    let duration_seconds = data_bytes
+        .checked_add(byte_rate - 1)
+        .ok_or(WavValidationError::Malformed("duration overflow"))?
+        / byte_rate;
+    let duration_seconds = i64::try_from(duration_seconds)
+        .map_err(|_| WavValidationError::Malformed("duration overflow"))?;
+    if duration_seconds <= 0 {
+        return Err(WavValidationError::Malformed("empty PCM duration"));
+    }
+    if duration_seconds > MAX_REST_TRANSCRIBE_DURATION_SECONDS {
+        return Err(WavValidationError::TooLong);
+    }
+    Ok(duration_seconds)
+}
 
 #[derive(Deserialize)]
 pub struct TranscribeQuery {
@@ -73,6 +230,35 @@ pub async fn transcribe(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("audio/wav")
         .to_string();
+    let verified_duration_seconds =
+        validated_wav_duration_seconds(&body, &content_type).map_err(|error| match error {
+            WavValidationError::UnsupportedMediaType => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                Json(ApiError {
+                    error: "REST transcription accepts validated WAV/PCM audio only".into(),
+                    reason: Some("unsupported_audio_media_type".into()),
+                    ..Default::default()
+                }),
+            ),
+            WavValidationError::Malformed(detail) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ApiError {
+                    error: format!("invalid WAV/PCM audio: {detail}"),
+                    reason: Some("invalid_pcm_audio".into()),
+                    ..Default::default()
+                }),
+            ),
+            WavValidationError::TooLong => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ApiError {
+                    error: format!(
+                        "WAV/PCM audio exceeds the {MAX_REST_TRANSCRIBE_DURATION_SECONDS}-second REST limit"
+                    ),
+                    reason: Some("audio_duration_limit".into()),
+                    ..Default::default()
+                }),
+            ),
+        })?;
 
     match idempotency::reserve(&state.pool, &account.id, &q.request_id).map_err(|e| {
         (
@@ -127,9 +313,7 @@ pub async fn transcribe(
             denied.retry_after_secs,
         ));
     }
-    // Estimate ~1s per ~16KB of audio (rough). Real cost from upstream metadata.
-    let est_seconds = (body.len() as i64 / 16_000).max(1);
-    let routes = priced_transcribe_routes_for(q.model.as_deref(), est_seconds);
+    let routes = priced_transcribe_routes_for(q.model.as_deref(), verified_duration_seconds);
     if routes.is_empty() {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
         return Err((
@@ -192,6 +376,13 @@ pub async fn transcribe(
             ),
         }
     })?;
+    spawn_usage_expiry_reconciler(
+        state.pool.clone(),
+        account.id.clone(),
+        q.request_id.clone(),
+        usage_reservation.attempt,
+        usage_reservation.expires_at_ms,
+    );
     let on_trial = usage_reservation.is_trial();
 
     let mut last_error: Option<anyhow::Error> = None;
@@ -275,8 +466,26 @@ pub async fn transcribe(
                     ));
                     break;
                 }
-                Ok(provider_cost_guard::Admission::GlobalLimit) | Err(_) => {
-                    last_error = Some(anyhow::anyhow!("upstream spend guard denied STT route"));
+                Ok(provider_cost_guard::Admission::GlobalLimit) => {
+                    let _ = usage_reservations::release(
+                        &state.pool,
+                        &account.id,
+                        &q.request_id,
+                        "upstream_spend_guard",
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                    return Err(release_and_upstream_spend_guard_error(
+                        &state.pool,
+                        &account.id,
+                        &q.request_id,
+                    ));
+                }
+                Err(error) => {
+                    last_error =
+                        Some(error.context(
+                            "durable upstream spend admission failed for REST transcription",
+                        ));
+                    last_failure_was_capacity = false;
                     break;
                 }
             };
@@ -287,6 +496,7 @@ pub async fn transcribe(
                 &route.model,
                 &body,
                 &content_type,
+                verified_duration_seconds,
             )
             .await
             {
@@ -317,6 +527,7 @@ pub async fn transcribe(
                         &mut attempt_guard,
                         attempt_event,
                         actual_bluey_cost,
+                        c.usage_provenance,
                     )?;
                     if !route_matches {
                         last_error = Some(anyhow::anyhow!("STT provider route identity mismatch"));
@@ -500,4 +711,75 @@ pub async fn transcribe(
     }
 
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pcm_wav(sample_rate: u32, channels: u16, bits_per_sample: u16, data_len: usize) -> Vec<u8> {
+        let block_align = channels * (bits_per_sample / 8);
+        let byte_rate = sample_rate * u32::from(block_align);
+        let riff_size = 36_u32 + u32::try_from(data_len).expect("test data fits WAV");
+        let mut wav = Vec::with_capacity(44 + data_len);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_size.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(
+            &u32::try_from(data_len)
+                .expect("test data fits WAV")
+                .to_le_bytes(),
+        );
+        wav.resize(44 + data_len, 0);
+        wav
+    }
+
+    #[test]
+    fn wav_duration_is_derived_from_validated_pcm_frames() {
+        let wav = pcm_wav(16_000, 2, 16, 32_002);
+        assert_eq!(
+            validated_wav_duration_seconds(&wav, "audio/wav; charset=binary"),
+            Err(WavValidationError::Malformed("partial PCM sample frame"))
+        );
+        let wav = pcm_wav(16_000, 1, 16, 64_000);
+        assert_eq!(validated_wav_duration_seconds(&wav, "audio/wav"), Ok(2));
+    }
+
+    #[test]
+    fn compressed_or_low_bitrate_payload_cannot_claim_pcm_duration() {
+        let compressed = vec![0_u8; 1_024];
+        assert_eq!(
+            validated_wav_duration_seconds(&compressed, "audio/mpeg"),
+            Err(WavValidationError::UnsupportedMediaType)
+        );
+        let mut forged = pcm_wav(48_000, 2, 16, 960);
+        forged[28..32].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(
+            validated_wav_duration_seconds(&forged, "audio/wav"),
+            Err(WavValidationError::Malformed("inconsistent PCM format"))
+        );
+    }
+
+    #[test]
+    fn wav_duration_limit_is_enforced_before_dispatch() {
+        let bytes_per_second = 8_000_usize * 2;
+        let wav = pcm_wav(
+            8_000,
+            1,
+            16,
+            bytes_per_second * (MAX_REST_TRANSCRIBE_DURATION_SECONDS as usize + 1),
+        );
+        assert_eq!(
+            validated_wav_duration_seconds(&wav, "audio/x-wav"),
+            Err(WavValidationError::TooLong)
+        );
+    }
 }

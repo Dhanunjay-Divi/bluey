@@ -5,6 +5,98 @@ mod story_grounding;
 
 static FIRST_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn png_data_url(width: u32, height: u32) -> String {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend_from_slice(&13_u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&0_u32.to_be_bytes());
+    bytes.extend_from_slice(b"IEND");
+    bytes.extend_from_slice(&[0; 4]);
+    format!("data:image/png;base64,{}", BASE64_STANDARD.encode(bytes))
+}
+
+fn padded_png_data_url(width: u32, height: u32, padding_bytes: usize) -> String {
+    let mut bytes = BASE64_STANDARD
+        .decode(
+            png_data_url(width, height)
+                .strip_prefix("data:image/png;base64,")
+                .unwrap(),
+        )
+        .unwrap();
+    let iend_offset = bytes.len() - 12;
+    let mut chunk = u32::try_from(padding_bytes).unwrap().to_be_bytes().to_vec();
+    chunk.extend_from_slice(b"IDAT");
+    chunk.resize(8 + padding_bytes, 0);
+    chunk.extend_from_slice(&[0; 4]);
+    bytes.splice(iend_offset..iend_offset, chunk);
+    format!("data:image/png;base64,{}", BASE64_STANDARD.encode(bytes))
+}
+
+fn jpeg_data_url(width: u16, height: u16) -> String {
+    let mut bytes = b"\xff\xd8\xff\xc0\x00\x0b\x08".to_vec();
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&[1, 1, 0x11, 0]);
+    bytes.extend_from_slice(b"\xff\xd9");
+    format!("data:image/jpeg;base64,{}", BASE64_STANDARD.encode(bytes))
+}
+
+fn webp_data_url_parts(
+    canvas_width: u32,
+    canvas_height: u32,
+    payload_dimensions: Option<(u16, u16)>,
+) -> String {
+    let mut bytes = b"RIFF".to_vec();
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(b"WEBPVP8X");
+    bytes.extend_from_slice(&10_u32.to_le_bytes());
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    let width = canvas_width - 1;
+    let height = canvas_height - 1;
+    bytes.extend_from_slice(&width.to_le_bytes()[..3]);
+    bytes.extend_from_slice(&height.to_le_bytes()[..3]);
+    if let Some((payload_width, payload_height)) = payload_dimensions {
+        bytes.extend_from_slice(b"VP8 ");
+        bytes.extend_from_slice(&10_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.extend_from_slice(b"\x9d\x01\x2a");
+        bytes.extend_from_slice(&payload_width.to_le_bytes());
+        bytes.extend_from_slice(&payload_height.to_le_bytes());
+    }
+    let riff_payload_size = u32::try_from(bytes.len() - 8).unwrap();
+    bytes[4..8].copy_from_slice(&riff_payload_size.to_le_bytes());
+    format!("data:image/webp;base64,{}", BASE64_STANDARD.encode(bytes))
+}
+
+fn webp_data_url(width: u32, height: u32) -> String {
+    webp_data_url_parts(
+        width,
+        height,
+        Some((
+            u16::try_from(width).unwrap(),
+            u16::try_from(height).unwrap(),
+        )),
+    )
+}
+
+fn gif_data_url(width: u16, height: u16) -> String {
+    let mut bytes = b"GIF89a".to_vec();
+    bytes.extend_from_slice(&width.to_le_bytes());
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.push(0x2c);
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&width.to_le_bytes());
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&[2, 2, 0x44, 0x01, 0, 0x3b]);
+    format!("data:image/gif;base64,{}", BASE64_STANDARD.encode(bytes))
+}
+
 fn temp_pool() -> crate::db::DbPool {
     let path = std::env::temp_dir().join(format!("bluey-router-{}.db", uuid::Uuid::new_v4()));
     let pool = crate::db::open_pool(&path).unwrap();
@@ -39,8 +131,7 @@ fn complete_request(user: &str) -> CompleteRequest {
 fn vision_complete_request(user: &str) -> CompleteRequest {
     let mut req = complete_request(user);
     req.lane = "vision".into();
-    req.image_data_urls
-        .push("data:image/png;base64,aGVsbG8=".to_string());
+    req.image_data_urls.push(png_data_url(1, 1));
     req
 }
 
@@ -368,6 +459,7 @@ fn crossed_unknown_routes_settle_to_cap_in_stream_and_nonstream_modes() {
                     was_fallback: false,
                 },
                 returned_cost,
+                pricing::UsageProvenance::Exact,
             )
             .unwrap();
     }
@@ -401,6 +493,12 @@ fn provider_settlement_failure_leaves_customer_roots_unsettled_for_all_endpoints
         ("llm-nonstream", "llm", "llm_attempt", true),
         ("embed", "embed", "embed_attempt", true),
         ("transcribe", "transcribe", "stt_attempt", true),
+        (
+            "answer-plan",
+            "answer_plan",
+            "answer_plan_classifier_attempt",
+            false,
+        ),
         ("web", "web_search", "web_search_attempt", false),
     ];
     for (mode, root_kind, attempt_kind, has_customer_reservation) in endpoint_cases {
@@ -417,7 +515,7 @@ fn provider_settlement_failure_leaves_customer_roots_unsettled_for_all_endpoints
                     estimated_upstream_cents: 0,
                     upstream_spend_guard: None,
                     created_at_ms: 1_000,
-                    expires_at_ms: i64::MAX,
+                    expires_at_ms: 61_000,
                 },
             )
             .unwrap();
@@ -465,6 +563,7 @@ fn provider_settlement_failure_leaves_customer_roots_unsettled_for_all_endpoints
                 was_fallback: false,
             },
             1,
+            pricing::UsageProvenance::Exact,
         )
         .expect_err("shared endpoint transition must fail closed when A is unavailable");
         assert_eq!(
@@ -496,6 +595,195 @@ fn provider_settlement_failure_leaves_customer_roots_unsettled_for_all_endpoints
             assert_eq!(status, "reserved", "{mode} must leave B for reconciliation");
         }
     }
+}
+
+#[test]
+fn every_managed_route_family_preserves_uncertain_projection_and_next_admission_cap() {
+    let attempt_kinds = [
+        "llm_attempt",
+        "answer_plan_classifier_attempt",
+        "embed_attempt",
+        "stt_attempt",
+        "stt_live_attempt",
+        "web_search_attempt",
+    ];
+    let cases = [
+        (
+            "exact-lower",
+            pricing::UsageProvenance::Exact,
+            "openai",
+            2,
+            2,
+            5,
+            3,
+            true,
+            pricing::UsageProvenance::Exact,
+        ),
+        (
+            "estimated-lower",
+            pricing::UsageProvenance::Estimated,
+            "openai",
+            2,
+            5,
+            5,
+            1,
+            false,
+            pricing::UsageProvenance::Estimated,
+        ),
+        (
+            "missing-zero",
+            pricing::UsageProvenance::Missing,
+            "openai",
+            0,
+            5,
+            5,
+            1,
+            false,
+            pricing::UsageProvenance::Missing,
+        ),
+        (
+            "route-mismatch",
+            pricing::UsageProvenance::Exact,
+            "crossed-provider",
+            2,
+            5,
+            5,
+            1,
+            false,
+            pricing::UsageProvenance::Missing,
+        ),
+        (
+            "exact-overrun",
+            pricing::UsageProvenance::Exact,
+            "openai",
+            7,
+            7,
+            7,
+            1,
+            false,
+            pricing::UsageProvenance::Exact,
+        ),
+    ];
+
+    for attempt_kind in attempt_kinds {
+        for (
+            case,
+            provenance,
+            returned_provider,
+            reported_cost,
+            expected_settled,
+            next_limit,
+            next_cost,
+            expect_next_held,
+            expected_provenance,
+        ) in cases
+        {
+            let pool = temp_pool();
+            let account_id = make_account(
+                &pool,
+                &format!("{attempt_kind}-{case}-{}@bluey.test", uuid::Uuid::new_v4()),
+            );
+            let request_id = format!("{attempt_kind}:{case}:attempt:0");
+            let mut guard = match provider_cost_guard::reserve(
+                &pool,
+                Some(crate::config::UpstreamSpendGuard {
+                    limit_cents: 100,
+                    window_hours: 24,
+                }),
+                &account_id,
+                &format!("router:{attempt_kind}:{case}"),
+                &request_id,
+                "openai",
+                "gpt-5.4-mini",
+                5,
+                attempt_kind,
+                case,
+            )
+            .unwrap()
+            {
+                provider_cost_guard::Admission::Held(guard) => guard,
+                _ => panic!("expected provider hold for {attempt_kind}/{case}"),
+            };
+            let result = guard.settle(
+                UsageEvent {
+                    request_id: request_id.clone(),
+                    kind: attempt_kind.into(),
+                    task_type: Some(case.into()),
+                    lane: Some(case.into()),
+                    provider: Some(returned_provider.into()),
+                    model: Some("gpt-5.4-mini".into()),
+                    input_tokens: if provenance == pricing::UsageProvenance::Missing {
+                        0
+                    } else {
+                        10
+                    },
+                    output_tokens: if provenance == pricing::UsageProvenance::Missing {
+                        0
+                    } else {
+                        5
+                    },
+                    latency_ms: 1,
+                    cost_cents_to_bluey: reported_cost,
+                    cost_cents_to_customer: 0,
+                    was_speculative: false,
+                    was_fallback: false,
+                },
+                reported_cost,
+                provenance,
+            );
+            assert_eq!(
+                result.is_err(),
+                case == "exact-overrun",
+                "{attempt_kind}/{case}"
+            );
+
+            let (settled_cost, stored_provenance): (i64, String) = pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT settled_cost_cents, usage_provenance
+                       FROM jobs_provider_cost_holds",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(settled_cost, expected_settled, "{attempt_kind}/{case}");
+            assert_eq!(
+                stored_provenance,
+                expected_provenance.as_str(),
+                "{attempt_kind}/{case}"
+            );
+
+            let next = provider_cost_guard::reserve(
+                &pool,
+                Some(crate::config::UpstreamSpendGuard {
+                    limit_cents: next_limit,
+                    window_hours: 24,
+                }),
+                &account_id,
+                &format!("router:{attempt_kind}:{case}:next"),
+                &format!("{attempt_kind}:{case}:attempt:1"),
+                "openai",
+                "gpt-5.4-mini",
+                next_cost,
+                attempt_kind,
+                case,
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(next, provider_cost_guard::Admission::Held(_)),
+                expect_next_held,
+                "{attempt_kind}/{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn streaming_terminal_paths_require_an_armed_selected_provider_guard() {
+    let mut missing: Option<Box<provider_cost_guard::ProviderCostGuard>> = None;
+    assert!(take_selected_provider_attempt_guard(&mut missing).is_err());
+    assert!(settle_selected_provider_attempt_conservative(&mut missing).is_err());
 }
 
 #[tokio::test]
@@ -2050,12 +2338,64 @@ fn balanced_resume_intro_still_prefers_the_interview_quality_route() {
 #[test]
 fn complete_image_validation_accepts_supported_data_urls() {
     let images = vec![
-        "data:image/png;base64,aGVsbG8=".to_string(),
-        "data:image/jpeg;base64,aGVsbG8=".to_string(),
-        "data:image/webp;base64,aGVsbG8=".to_string(),
+        png_data_url(1, 1),
+        jpeg_data_url(1, 1),
+        webp_data_url(1, 1),
+        gif_data_url(1, 1),
     ];
     assert!(validate_complete_images(&images).is_ok());
-    assert_eq!(image_token_estimate(images.len()), 4_500);
+    assert_eq!(
+        complete_image_token_upper_bound(images.len()),
+        4 * MAX_VISION_TOKENS_PER_IMAGE
+    );
+}
+
+#[test]
+fn complete_image_validation_rejects_webp_canvas_without_image_payload() {
+    let images = vec![webp_data_url_parts(1, 1, None)];
+    let error = validate_complete_images(&images).unwrap_err();
+    assert_eq!(error.reason.as_deref(), Some("invalid_image_data"));
+}
+
+#[test]
+fn complete_image_validation_rejects_webp_canvas_payload_dimension_mismatch() {
+    let images = vec![webp_data_url_parts(1, 1, Some((4_096, 4_096)))];
+    let error = validate_complete_images(&images).unwrap_err();
+    assert_eq!(error.reason.as_deref(), Some("invalid_image_data"));
+}
+
+#[test]
+fn complete_image_validation_rejects_tiny_compressed_large_dimensions() {
+    let images = vec![png_data_url(MAX_COMPLETE_IMAGE_DIMENSION + 1, 1)];
+    let error = validate_complete_images(&images).unwrap_err();
+    assert_eq!(error.reason.as_deref(), Some("image_dimensions_too_large"));
+}
+
+#[test]
+fn complete_image_validation_rejects_mime_magic_mismatch() {
+    let encoded = png_data_url(1, 1)
+        .strip_prefix("data:image/png;base64,")
+        .unwrap()
+        .to_string();
+    let images = vec![format!("data:image/jpeg;base64,{encoded}")];
+    let error = validate_complete_images(&images).unwrap_err();
+    assert_eq!(error.reason.as_deref(), Some("image_mime_mismatch"));
+}
+
+#[test]
+fn image_projection_uses_validated_ceiling_not_base64_text_length() {
+    let tiny = png_data_url(1, 1);
+    let near_limit = padded_png_data_url(1, 1, 2_900_000);
+    assert!(near_limit.len() < MAX_COMPLETE_IMAGE_DATA_URL_BYTES);
+    assert!(validate_complete_images(std::slice::from_ref(&near_limit)).is_ok());
+    assert_eq!(
+        complete_input_token_upper_bound("system", "user", 1),
+        pricing::utf8_input_token_upper_bound(["system", "user"]) + MAX_VISION_TOKENS_PER_IMAGE
+    );
+    assert_eq!(
+        complete_input_token_upper_bound("system", "user", 1),
+        complete_input_token_upper_bound("system", "user", usize::from(!tiny.is_empty()))
+    );
 }
 
 #[test]
@@ -2067,7 +2407,7 @@ fn complete_image_validation_rejects_unsupported_payload() {
 
 #[test]
 fn complete_image_validation_rejects_too_many_images() {
-    let images = vec!["data:image/png;base64,aGVsbG8=".to_string(); 5];
+    let images = vec![png_data_url(1, 1); 5];
     let error = validate_complete_images(&images).unwrap_err();
     assert_eq!(error.reason.as_deref(), Some("too_many_images"));
 }
@@ -2084,13 +2424,9 @@ fn complete_image_validation_rejects_single_oversized_image() {
 
 #[test]
 fn complete_image_validation_rejects_oversized_total_payload() {
-    let image_payload = "a".repeat((MAX_COMPLETE_IMAGE_DATA_URL_TOTAL_BYTES / 4) + 1);
-    let images = vec![
-        format!("data:image/png;base64,{image_payload}"),
-        format!("data:image/png;base64,{image_payload}"),
-        format!("data:image/png;base64,{image_payload}"),
-        format!("data:image/png;base64,{image_payload}"),
-    ];
+    let image = padded_png_data_url(1, 1, 2_400_000);
+    assert!(image.len() < MAX_COMPLETE_IMAGE_DATA_URL_BYTES);
+    let images = vec![image; 4];
     let error = validate_complete_images(&images).unwrap_err();
     assert_eq!(error.reason.as_deref(), Some("image_payload_too_large"));
 }
@@ -4596,8 +4932,7 @@ fn answer_plan_uses_screen_context_code_signals() {
     let mut req = complete_request(
         "Question:\nAnswer using the attached screen capture, documents, and current session context.\n\nSession context:\n[Screen context from screenshot]\nCODE\nimport math\n\ndef build_map(robot_pose, measurements):\n    robot_x, robot_y, robot_theta = robot_pose\n    obj_map = {}\n    for dist, bearing, obj_id in measurements:\n        global_angle = robot_theta + bearing\n        obj_x = robot_x + dist * math.cos(global_angle)\n        obj_y = robot_y + dist * math.sin(global_angle)\n        obj_map[obj_id] = (obj_x, obj_y)\n    return obj_map",
     );
-    req.image_data_urls
-        .push("data:image/png;base64,aGVsbG8=".to_string());
+    req.image_data_urls.push(png_data_url(1, 1));
 
     let plan = answer_plan_for_request(&req, "vision", &[]);
 
@@ -4635,8 +4970,7 @@ fn generic_screen_template_with_image_is_not_missing_context() {
     let mut req = complete_request(
         "Question:\nAnswer using the attached screen capture, documents, and current session context.",
     );
-    req.image_data_urls
-        .push("data:image/png;base64,aGVsbG8=".to_string());
+    req.image_data_urls.push(png_data_url(1, 1));
 
     let plan = answer_plan_for_request(&req, "vision", &[]);
 
@@ -4787,8 +5121,7 @@ fn answer_plan_routing_is_default_on_with_env_rollback() {
 #[test]
 fn answer_plan_routing_preserves_vision_requests() {
     let mut req = complete_request("Question:\nWhat is on this screen?");
-    req.image_data_urls
-        .push("data:image/png;base64,aGVsbG8=".to_string());
+    req.image_data_urls.push(png_data_url(1, 1));
     let plan = answer_plan_for_request(&req, "vision", &[]);
 
     assert_eq!(plan.intent, AnswerIntent::Screen);

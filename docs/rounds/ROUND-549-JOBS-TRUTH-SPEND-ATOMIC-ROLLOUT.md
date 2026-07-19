@@ -43,8 +43,64 @@ snapshot and relabel. A completed replay does not retake that table lock.
 Both ordinary usage reservations and durable provider-attempt holds include the
 active baseline in the same global admission cap. The baseline is deliberately
 conservative, survives account deletion, is never used for customer billing or
-product analytics, stops contributing after the rolling window, and is deleted
-after the window plus a 24-hour cleanup grace.
+product analytics, and stops contributing after the configured rolling window
+(clamped to 1 through 720 hours). Physical deletion is independent of the
+current configured window: baseline rows are retained for a fixed 31 days, the
+maximum 720-hour window plus a 24-hour cleanup grace. Shortening the configured
+window therefore cannot destroy evidence needed if operators later restore a
+longer window.
+
+Databases that crossed the authority marker with an earlier build but lack the
+baseline marker receive a conservative compatibility repair: every positive
+historical cost is snapshotted. This may temporarily double count exposure, but
+it cannot reset the cap or silently undercount provider spend.
+
+## Usage trust and projections
+
+Every durable provider hold records one of three usage provenances:
+
+- `exact`: a complete, trusted provider usage report for the route that was
+  actually selected;
+- `estimated`: a partial or explicitly estimated provider report; or
+- `missing`: omitted usage, a zero-only report, an ambiguous live-audio send,
+  or a provider/model route mismatch.
+
+Only `exact` usage may shrink a durable hold below its immutable pre-dispatch
+projection. `estimated` and `missing` settlements retain the greater of the
+projection and any reported cost. An exact report above the projection is first
+persisted as the actual exposure, then the request fails closed so the
+under-projection cannot be hidden.
+
+Projections are deliberately upper bounds rather than average-token guesses:
+text uses UTF-8 byte length plus protocol and per-part envelopes, output uses
+the route's effective maximum, vision uses a fixed decoded-image token ceiling,
+web search uses a fixed maximum, and STT uses verified audio duration. These
+same rules apply to main LLM streaming/non-streaming, answer planning,
+embeddings, upload transcription, live STT, web search, and managed Jobs resume
+generation.
+
+## Ingress and recovery boundaries
+
+Upload transcription accepts only structurally valid RIFF/WAV PCM, validates
+declared sizes, byte rate, block alignment, and complete frames, then projects
+from the verified duration before any provider call. The request body is capped
+at 32 MiB and verified audio at 15 minutes. Live STT accepts only binary
+16-kHz, mono, PCM16 frames, rejects odd-length PCM and client text/control
+frames, caps confirmed audio at 32,000 bytes per second for at most 20 minutes,
+and treats a cancelled or ambiguous upstream send as `missing` usage.
+
+Vision validates decoded PNG, JPEG, WebP, or GIF containers rather than trusting
+the data-URL label. Animated images, MIME/container mismatches, malformed
+containers, duplicate or missing WebP payloads, and WebP canvas/payload
+dimension mismatches are rejected. Per-image and aggregate byte, dimension,
+pixel, and image-count ceilings are enforced before provider dispatch; base64
+transport text is not double-counted as prompt text.
+
+Reservation and hold expiry decisions use database transaction time. Startup
+and periodic bounded janitors run in both server processes. Expired-reservation
+release is fenced by account, request id, attempt number, and exact expiry in
+the same refund transaction, so a stale janitor or delayed task cannot refund a
+replacement attempt that reused the request id.
 
 ## Required rollout
 
@@ -52,8 +108,9 @@ after the window plus a 24-hour cleanup grace.
    planning, web search, embeddings, upload transcription, live STT, and managed
    Jobs resume generation), or remove its provider credentials, and verify no
    provider dispatch remains in flight.
-2. Apply the schema migration and deploy the matching main API and Jobs binaries
-   in the same maintenance boundary.
+2. Apply migrations 008 and 010 (migration 009 remains reserved for the Jobs
+   discovery board-owner boundary) and deploy the matching main API and Jobs
+   binaries in the same maintenance boundary.
 3. Verify server-origin attempt rows, opaque provider holds, global-cap denial,
    account-deletion retention, and customer-root settlement before re-enabling
    paid routes.
@@ -68,10 +125,19 @@ against the cutover schema merely because it passes a boot check.
 - All-target Rust build, clippy, and full tests must pass.
 - SQLite tests must prove the anonymous baseline blocks both global admission
   paths, clamps hostile values, survives account deletion, expires and cleans
-  up after window plus grace, and is not duplicated on migration replay.
+  up only after the fixed 31-day retention, and is not duplicated on migration
+  replay.
 - SQL-shape tests must preserve the marker-guarded PostgreSQL snapshot and its
   conditional cutover lock; exact PostgreSQL runtime behavior is a separate
   frozen-commit drill.
+- Route-family tests must prove that route mismatch persists as `missing` and
+  cannot shrink a hold, while an exact over-projection report persists actual
+  exposure before returning an error. They must cover all managed main API
+  route families and the Jobs dispatcher.
+- Ingress tests must reject malformed/compressed/oversized audio and malformed,
+  animated, MIME-mismatched, or canvas-mismatched images before provider I/O.
+- Deterministic janitor tests must prove a stale expiry candidate cannot refund
+  a replacement attempt with the same request id.
 - PostgreSQL migration/replay and account-deletion spend-retention drills must
   pass against the exact frozen commit.
 - Windows and macOS packaging checks remain separate release gates; this server

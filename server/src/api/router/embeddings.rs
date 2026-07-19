@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     billing_restricted_error, prior_provider_exposure_error, provider_accounting_pending_error,
     provider_cost_guard, release_and_capacity_error, settle_provider_attempt_before_customer,
-    ApiError, AppState,
+    spawn_usage_expiry_reconciler, ApiError, AppState,
 };
 use crate::auth::AuthedAccount;
 use crate::db::{
@@ -219,11 +219,7 @@ async fn embed_batch_inner(
     }
     // Entry estimate. Customer funds/trial are atomically reserved below,
     // after provider configuration is verified and before network dispatch.
-    let est_in = req
-        .inputs
-        .iter()
-        .map(|input| (input.len() as i64) / 4)
-        .sum();
+    let est_in = pricing::utf8_input_token_upper_bound(req.inputs.iter().map(String::as_str));
     let est_cost = pricing::estimate_cost_ceiling(pricing_entry, est_in, 0);
     let est_bluey_cost = pricing::estimate_bluey_cost_ceiling(pricing_entry, est_in, 0);
     if let Some(err) = prior_provider_exposure_error(
@@ -289,6 +285,13 @@ async fn embed_batch_inner(
             ),
         }
     })?;
+    spawn_usage_expiry_reconciler(
+        state.pool.clone(),
+        account.id.clone(),
+        req.request_id.clone(),
+        usage_reservation.attempt,
+        usage_reservation.expires_at_ms,
+    );
     let on_trial = usage_reservation.is_trial();
 
     let mut dispatch_index = 0_usize;
@@ -421,6 +424,7 @@ async fn embed_batch_inner(
                     &mut attempt_guard,
                     attempt_event,
                     actual_bluey_cost,
+                    c.usage_provenance,
                 )?;
                 if !route_matches {
                     let _ = usage_reservations::release(

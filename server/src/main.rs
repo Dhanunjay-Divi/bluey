@@ -44,6 +44,23 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     db::run_migrations(&pool).context("run migrations")?;
+    let expired_usage_released =
+        db::usage_reservations::reconcile_expired_usage_reservations(&pool)
+            .context("reconcile expired managed usage reservations at startup")?;
+    tracing::info!(
+        expired_usage_released,
+        "startup managed usage reservation reconciliation completed"
+    );
+    let usage_reservation_janitor =
+        db::usage_reservations::spawn_expired_usage_reservation_janitor(pool.clone());
+    let startup_spend_cleanup = db::jobs_provider_cost_holds::prune_expired_spend_truth(&pool)
+        .context("prune expired upstream spend truth at startup")?;
+    tracing::info!(
+        provider_holds_deleted = startup_spend_cleanup.provider_holds_deleted,
+        cutover_baseline_rows_deleted = startup_spend_cleanup.cutover_baseline_rows_deleted,
+        "startup upstream spend truth cleanup completed"
+    );
+    let spend_truth_janitor = db::jobs_provider_cost_holds::spawn_spend_truth_janitor(pool.clone());
 
     let cleanup_worker = object_storage::spawn_cleanup_worker(
         pool.clone(),
@@ -81,6 +98,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(worker) = cleanup_worker {
         worker.abort();
     }
+    spend_truth_janitor.abort();
+    usage_reservation_janitor.abort();
     serve_result?;
 
     tracing::info!("bluey-server exited cleanly");

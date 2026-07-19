@@ -126,7 +126,8 @@ In priority order:
 | `BLUEY_MAX_OUTPUT_TOKENS` | non-thinking output ceiling (TPM/cost) | 2048 |
 | `BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS` | stall → fallback deadline (B2) | 6000 |
 | `BLUEY_RAG_RETRIEVAL_BUDGET_MS` | RAG retrieval budget (B1) | 300 |
-| `BLUEY_UPSTREAM_SPEND_LIMIT_CENTS` / `_WINDOW_HOURS` | global spend circuit breaker | off |
+| `BLUEY_UPSTREAM_SPEND_LIMIT_CENTS` | mandatory global paid-dispatch spend boundary; unset, invalid, or zero fails closed | no valid guard |
+| `BLUEY_UPSTREAM_SPEND_WINDOW_HOURS` | authoritative rolling-spend window, clamped to 1-720 hours once a positive limit exists | 24 |
 
 Redis (if configured) makes cooldowns + capacity limits fleet-wide; without
 it they are per-instance (local fallback).

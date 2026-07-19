@@ -15,6 +15,55 @@
 //! cents without floats. The cost function rounds final customer-cents
 //! UP to the nearest cent so we never undercharge by sub-cent fractions.
 
+use serde::{Deserialize, Serialize};
+
+/// Trust level attached to provider usage returned by a dispatcher.
+///
+/// Only `Exact` usage may reduce a durable pre-dispatch cost hold. Estimated
+/// or absent usage remains useful for diagnostics, but cannot prove that the
+/// provider exposure was below the conservative projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageProvenance {
+    Exact,
+    Estimated,
+    Missing,
+}
+
+impl UsageProvenance {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Estimated => "estimated",
+            Self::Missing => "missing",
+        }
+    }
+
+    pub const fn is_exact(self) -> bool {
+        matches!(self, Self::Exact)
+    }
+}
+
+/// Conservative provider-message overhead applied in addition to validated
+/// UTF-8 bytes. Provider tokenizers can be denser than the old chars/4
+/// heuristic; one token per byte plus envelope overhead is the admission
+/// boundary used by every managed text and embedding dispatcher.
+pub const PROVIDER_PROTOCOL_OVERHEAD_TOKENS: i64 = 1_024;
+pub const PROVIDER_PART_OVERHEAD_TOKENS: i64 = 64;
+
+pub fn utf8_input_token_upper_bound<'a>(parts: impl IntoIterator<Item = &'a str>) -> i64 {
+    let mut bytes = 0_i64;
+    let mut count = 0_i64;
+    for part in parts {
+        bytes = bytes.saturating_add(i64::try_from(part.len()).unwrap_or(i64::MAX));
+        count = count.saturating_add(1);
+    }
+    bytes
+        .saturating_add(PROVIDER_PROTOCOL_OVERHEAD_TOKENS)
+        .saturating_add(count.saturating_mul(PROVIDER_PART_OVERHEAD_TOKENS))
+        .max(1)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
     pub provider: &'static str,
@@ -448,5 +497,17 @@ mod tests {
             i64::MAX
         );
         assert_eq!(compute_cost(&hostile, -1, i64::MIN), (0, 0));
+    }
+
+    #[test]
+    fn utf8_projection_covers_dense_unicode_and_protocol_envelope() {
+        let dense = "😀界é";
+        let bound = utf8_input_token_upper_bound([dense, "x"]);
+        let validated_bytes = i64::try_from(dense.len() + 1).unwrap();
+        assert!(bound >= validated_bytes + PROVIDER_PROTOCOL_OVERHEAD_TOKENS);
+        assert_eq!(
+            bound,
+            validated_bytes + PROVIDER_PROTOCOL_OVERHEAD_TOKENS + 2 * PROVIDER_PART_OVERHEAD_TOKENS
+        );
     }
 }

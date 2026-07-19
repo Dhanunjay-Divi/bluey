@@ -79,6 +79,32 @@ fn signed_worker_request(input: SignedWorkerRequest<'_>) -> Request<Body> {
         .unwrap()
 }
 
+fn pcm16_mono_wav(seconds: u32) -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 16_000;
+    const CHANNELS: u16 = 1;
+    const BITS_PER_SAMPLE: u16 = 16;
+    const BLOCK_ALIGN: u16 = CHANNELS * (BITS_PER_SAMPLE / 8);
+    const BYTE_RATE: u32 = SAMPLE_RATE * BLOCK_ALIGN as u32;
+
+    let data_len = BYTE_RATE.checked_mul(seconds).unwrap();
+    let riff_len = 36_u32.checked_add(data_len).unwrap();
+    let mut wav = Vec::with_capacity((riff_len + 8) as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_len.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&CHANNELS.to_le_bytes());
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&BYTE_RATE.to_le_bytes());
+    wav.extend_from_slice(&BLOCK_ALIGN.to_le_bytes());
+    wav.extend_from_slice(&BITS_PER_SAMPLE.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.resize((riff_len + 8) as usize, 0);
+    wav
+}
+
 #[tokio::test]
 #[serial]
 async fn jobs_worker_signatures_reject_replay_expiry_and_body_tampering() {
@@ -2278,7 +2304,15 @@ async fn boot_harness_with_upstream_and_admin_emails(
     upstream: UpstreamKeys,
     admin_emails: Vec<String>,
 ) -> Harness {
-    boot_harness_with_options(upstream, admin_emails, None).await
+    boot_harness_with_options(
+        upstream,
+        admin_emails,
+        Some(UpstreamSpendGuard {
+            limit_cents: 100_000_000,
+            window_hours: 24,
+        }),
+    )
+    .await
 }
 
 async fn boot_harness_with_options(
@@ -3066,7 +3100,7 @@ async fn router_embed_consumes_trial_seconds_and_records_bluey_cost() {
     assert_eq!(embed["input_tokens"], 1500);
 
     let conn = h.pool.get().unwrap();
-    let (trial_remaining, bluey_cost, customer_cost): (i64, i64, i64) = conn
+    let (trial_remaining, root_bluey_cost, customer_cost): (i64, i64, i64) = conn
         .query_row(
             "SELECT a.trial_seconds_remaining,
                     u.cost_cents_to_bluey,
@@ -3079,8 +3113,31 @@ async fn router_embed_consumes_trial_seconds_and_records_bluey_cost() {
         )
         .unwrap();
     assert_eq!(trial_remaining, 898);
-    assert!(bluey_cost > 0);
+    assert_eq!(root_bluey_cost, 0);
     assert_eq!(customer_cost, 0);
+    let attempt_bluey_cost: i64 = conn
+        .query_row(
+            "SELECT cost_cents_to_bluey FROM usage_events
+              WHERE account_id = (SELECT id FROM accounts WHERE email = ?1)
+                AND request_id = 'trial-embed-1:embed-attempt:0'
+                AND kind = 'embed_attempt'",
+            rusqlite::params!["trial-embed@example.com"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let attempt_provenance: String = conn
+        .query_row(
+            "SELECT usage_provenance FROM jobs_provider_cost_holds",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let expected_attempt_bluey_cost =
+        bluey_server::pricing::lookup("openai", "text-embedding-3-small")
+            .map(|pricing| bluey_server::pricing::compute_cost(pricing, 1_500, 0).0)
+            .unwrap();
+    assert_eq!(attempt_bluey_cost, expected_attempt_bluey_cost);
+    assert_eq!(attempt_provenance, "exact");
 }
 
 #[tokio::test]
@@ -3164,26 +3221,32 @@ async fn router_complete_upstream_spend_guard_blocks_before_provider_hit() {
         .mount(&h.openai)
         .await;
 
-    let req = Request::post("/router/complete")
-        .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {access}"))
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "request_id": "budget-guard",
-                "system": "you are helpful",
-                "user": "hello",
-                "lane": "instant"
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = h.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["reason"], "upstream_spend_guard");
+    for (path, request_id) in [
+        ("/router/complete", "budget-guard"),
+        ("/router/complete/stream", "budget-guard-stream"),
+    ] {
+        let req = Request::post(path)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {access}"))
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "request_id": request_id,
+                    "system": "you are helpful",
+                    "user": "hello",
+                    "lane": "instant"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = h.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["reason"], "upstream_spend_guard", "{path}");
+        assert_eq!(v["retry_after_secs"], 60, "{path}");
+    }
 }
 
 #[tokio::test]
@@ -5035,7 +5098,7 @@ async fn router_transcribe_happy_path_with_mocked_deepgram() {
     let req = Request::post("/router/transcribe?request_id=test-stt-1")
         .header("authorization", format!("Bearer {access}"))
         .header("content-type", "audio/wav")
-        .body(Body::from(vec![1u8; 32_000]))
+        .body(Body::from(pcm16_mono_wav(1)))
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -5075,7 +5138,7 @@ async fn router_transcribe_falls_back_to_openai_when_deepgram_fails() {
     let req = Request::post("/router/transcribe?request_id=test-stt-fallback-1")
         .header("authorization", format!("Bearer {access}"))
         .header("content-type", "audio/wav")
-        .body(Body::from(vec![1u8; 32_000]))
+        .body(Body::from(pcm16_mono_wav(1)))
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -5087,7 +5150,81 @@ async fn router_transcribe_falls_back_to_openai_when_deepgram_fails() {
     assert_eq!(v["text"], "hello from openai fallback");
     assert_eq!(v["provider"], "openai");
     assert_eq!(v["model"], "gpt-4o-mini-transcribe");
-    assert_eq!(v["duration_seconds"], 2);
+    assert_eq!(v["duration_seconds"], 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn router_transcribe_spend_guard_returns_typed_503_before_provider_hit() {
+    let h = boot_harness_with_options(
+        UpstreamKeys {
+            openai_api_key: Some("sk-test-openai".to_string()),
+            anthropic_api_key: Some("sk-test-anthropic".to_string()),
+            gemini_api_key: None,
+            deepseek_api_key: None,
+            zai_api_key: None,
+            deepgram_api_key: Some("dg-test".to_string()),
+            ollama_base_url: None,
+        },
+        vec![],
+        Some(UpstreamSpendGuard {
+            limit_cents: 10,
+            window_hours: 24,
+        }),
+    )
+    .await;
+    let access = signup_and_login(&h, "stt-budget@example.com", "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, "stt-budget@example.com")
+        .unwrap()
+        .unwrap();
+    usage::record(&h.pool, &account.id, &sample_usage("stt-budget-spent", 10)).unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/listen"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&h.deepgram)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/transcribe?request_id=stt-budget-guard")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "audio/wav")
+        .body(Body::from(pcm16_mono_wav(1)))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["reason"], "upstream_spend_guard");
+    assert_eq!(v["retry_after_secs"], 60);
+
+    let (trial_seconds, reservation_status): (i64, String) = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT a.trial_seconds_remaining, r.status
+               FROM accounts a
+               JOIN usage_reservations r ON r.account_id = a.id
+              WHERE a.id = ?1 AND r.request_id = 'stt-budget-guard'",
+            rusqlite::params![account.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(trial_seconds, 900);
+    assert_eq!(reservation_status, "released");
+    assert!(matches!(
+        idempotency::reserve(&h.pool, &account.id, "stt-budget-guard").unwrap(),
+        idempotency::ReserveOutcome::FreshReservation
+    ));
 }
 
 #[tokio::test]

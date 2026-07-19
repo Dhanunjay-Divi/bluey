@@ -280,12 +280,7 @@ async fn generate_reserved(
             );
         }
     };
-    // A hard spend boundary must not depend on the usual four-bytes-per-token
-    // heuristic. One token per UTF-8 byte is deliberately conservative across
-    // provider tokenizers and is also the fallback usage when an API omits it.
-    let estimated_input_tokens = i64::try_from(system.len().saturating_add(user.len()))
-        .unwrap_or(i64::MAX)
-        .max(1);
+    let estimated_input_tokens = pricing::utf8_input_token_upper_bound([system, user.as_str()]);
     if managed_generation {
         match jobs_generation_allowance::reserve(
             &state.pool,
@@ -764,10 +759,11 @@ async fn try_model_generation(
             let computed_bluey_cost = pricing::lookup(&completion.provider, &completion.model)
                 .map(|price| completed_bluey_cost(price, &completion))
                 .unwrap_or(estimated_bluey_cost);
-            // Never release any portion of the immutable pre-dispatch hold.
-            // Returned route metadata may be crossed or cheaper, and provider
-            // usage can be incomplete; neither is evidence that exposure fell.
-            let settled_bluey_cost = estimated_bluey_cost.max(computed_bluey_cost);
+            let settled_bluey_cost = if completion.usage_provenance.is_exact() {
+                computed_bluey_cost
+            } else {
+                estimated_bluey_cost.max(computed_bluey_cost)
+            };
             let provider_boundary_rejected =
                 completion.provider != provider || completion.model != model;
             let cost_rejected = settled_bluey_cost > MAX_ATTEMPT_BLUEY_COST_CENTS;
@@ -785,7 +781,7 @@ async fn try_model_generation(
             } else {
                 AttemptOutcome::RejectedTruth
             };
-            hold.settle(&completion, settled_bluey_cost, outcome)?;
+            hold.settle(&completion, computed_bluey_cost, outcome)?;
             if provider_boundary_rejected {
                 tracing::error!(
                     requested_provider = provider,
@@ -858,14 +854,20 @@ fn normalize_missing_completion_usage(
     completion: &mut routing::Completion,
     estimated_input_tokens: i64,
 ) {
+    let mut repaired = false;
     if completion.input_tokens <= 0 {
         completion.input_tokens = estimated_input_tokens.max(1);
+        repaired = true;
     }
     if completion.output_tokens <= 0 && !completion.text.is_empty() {
         // One token per UTF-8 byte is a conservative tokenizer-independent
         // ceiling. Providers occasionally omit output usage; recording zero
         // would let rejected attempts bypass the generation spend boundary.
         completion.output_tokens = i64::try_from(completion.text.len()).unwrap_or(i64::MAX);
+        repaired = true;
+    }
+    if repaired && completion.usage_provenance.is_exact() {
+        completion.usage_provenance = pricing::UsageProvenance::Estimated;
     }
 }
 
@@ -880,6 +882,7 @@ struct ProviderAttemptGuard {
     estimated_input_tokens: i64,
     estimated_output_tokens: i64,
     projected_bluey_cost: i64,
+    fallback_bluey_cost: i64,
     pending_outcome: AttemptOutcome,
     started: std::time::Instant,
     armed: bool,
@@ -909,6 +912,7 @@ impl ProviderAttemptGuard {
             estimated_input_tokens,
             estimated_output_tokens: i64::from(MAX_MODEL_OUTPUT_TOKENS),
             projected_bluey_cost,
+            fallback_bluey_cost: projected_bluey_cost,
             pending_outcome: AttemptOutcome::RejectedCancelled,
             started: std::time::Instant::now(),
             armed: true,
@@ -921,9 +925,27 @@ impl ProviderAttemptGuard {
         bluey_cost: i64,
         outcome: AttemptOutcome,
     ) -> Result<()> {
-        // If persistence fails after a known completion, Drop must retry with
-        // at least the known cost and usage rather than the smaller entry hold.
-        self.projected_bluey_cost = self.projected_bluey_cost.max(bluey_cost);
+        let route_matches = completion.provider == self.requested_provider
+            && completion.model == self.requested_model;
+        let usage_provenance = if route_matches {
+            completion.usage_provenance
+        } else {
+            pricing::UsageProvenance::Missing
+        };
+        let reported_bluey_cost =
+            bluey_cost.clamp(0, crate::db::usage::MAX_AUTHORITATIVE_EVENT_COST_CENTS);
+        let settled_bluey_cost = if usage_provenance.is_exact() {
+            reported_bluey_cost
+        } else {
+            self.projected_bluey_cost.max(reported_bluey_cost)
+        };
+        // If persistence fails after a known completion, Drop retries with a
+        // conservative Missing-provenance value. Keep it separate from the
+        // immutable projection so trusted Exact usage can still settle lower.
+        self.fallback_bluey_cost = self
+            .fallback_bluey_cost
+            .max(self.projected_bluey_cost)
+            .max(reported_bluey_cost);
         self.estimated_input_tokens = completion.input_tokens.max(0);
         self.estimated_output_tokens = completion.output_tokens.max(0);
         self.pending_outcome = outcome;
@@ -944,7 +966,7 @@ impl ProviderAttemptGuard {
                 .as_millis()
                 .try_into()
                 .unwrap_or(i64::MAX),
-            cost_cents_to_bluey: self.projected_bluey_cost,
+            cost_cents_to_bluey: settled_bluey_cost,
             cost_cents_to_customer: 0,
             was_speculative: false,
             was_fallback: self.attempt_index > 0,
@@ -954,10 +976,23 @@ impl ProviderAttemptGuard {
             &self.account_id,
             &self.request_id,
             &self.reservation_token,
-            self.projected_bluey_cost,
+            reported_bluey_cost,
+            usage_provenance,
             &event,
         )?;
         self.armed = false;
+        if usage_provenance.is_exact() && reported_bluey_cost > self.projected_bluey_cost {
+            tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
+                request_id = %self.request_id,
+                provider = %self.requested_provider,
+                model = %self.requested_model,
+                projected_cost_cents = self.projected_bluey_cost,
+                exact_cost_cents = reported_bluey_cost,
+                "Jobs exact provider cost exceeded its pre-dispatch upper bound"
+            );
+            anyhow::bail!("Jobs exact provider cost exceeded pre-dispatch upper bound")
+        }
         Ok(())
     }
 
@@ -968,8 +1003,9 @@ impl ProviderAttemptGuard {
             model: self.requested_model.clone(),
             input_tokens: self.estimated_input_tokens.max(1),
             output_tokens: self.estimated_output_tokens.max(0),
+            usage_provenance: pricing::UsageProvenance::Missing,
         };
-        self.settle(&completion, self.projected_bluey_cost, outcome)
+        self.settle(&completion, self.fallback_bluey_cost, outcome)
     }
 }
 
@@ -1793,6 +1829,7 @@ mod tests {
             model: "gpt-5.4-mini".into(),
             input_tokens: 1_000,
             output_tokens: 500,
+            usage_provenance: pricing::UsageProvenance::Exact,
         };
         assert_eq!(
             completed_bluey_cost(price, &completion),
@@ -1909,6 +1946,7 @@ mod tests {
             attempt_request_id,
             &hold_token,
             2,
+            pricing::UsageProvenance::Exact,
             &UsageEvent {
                 request_id: attempt_request_id.into(),
                 kind: "jobs_resume_generation_attempt".into(),
@@ -2016,6 +2054,7 @@ mod tests {
             model: "gpt-5.4-mini".into(),
             input_tokens: 100,
             output_tokens: 50,
+            usage_provenance: pricing::UsageProvenance::Exact,
         };
         let request_id = attempt_request_id(
             "generation",
@@ -2111,6 +2150,263 @@ mod tests {
             .unwrap(),
             CostHoldReservation::GlobalLimit
         );
+    }
+
+    #[test]
+    fn jobs_provider_settlement_failure_stops_before_customer_root_and_reconciles_conservatively() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-resume-settlement-failure-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = db::open_pool(&path).unwrap();
+        db::run_migrations(&pool).unwrap();
+        let account =
+            db::accounts::Account::create(&pool, "settlement-failure@bluey.test", "hash").unwrap();
+        let request_id = "settlement-failure:attempt:0";
+        let reservation_token = "settlement-failure-token";
+        assert!(matches!(
+            jobs_provider_cost_holds::reserve(
+                &pool,
+                &account.id,
+                "settlement-failure-generation",
+                reservation_token,
+                request_id,
+                "openai",
+                "gpt-5.4-mini",
+                5,
+                MAX_GENERATION_BLUEY_COST_CENTS,
+                crate::config::UpstreamSpendGuard {
+                    limit_cents: 100,
+                    window_hours: 24,
+                },
+            )
+            .unwrap(),
+            CostHoldReservation::Held { .. }
+        ));
+        let completion = routing::Completion {
+            text: "valid provider result".into(),
+            provider: "openai".into(),
+            model: "gpt-5.4-mini".into(),
+            input_tokens: 10,
+            output_tokens: 5,
+            usage_provenance: pricing::UsageProvenance::Exact,
+        };
+        let mut attempt = ProviderAttemptGuard::new(
+            pool.clone(),
+            &account.id,
+            request_id.into(),
+            reservation_token,
+            "openai",
+            "gpt-5.4-mini",
+            0,
+            10,
+            5,
+        );
+        jobs_provider_cost_holds::fail_next_settlement_for_test();
+        assert!(attempt
+            .settle(&completion, 2, AttemptOutcome::Accepted)
+            .is_err());
+
+        let (status_before_drop, root_events_before_drop): (String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT h.status,
+                        (SELECT COUNT(*) FROM usage_events e
+                          WHERE e.account_id = ?1 AND e.kind = 'jobs_resume_generation')
+                   FROM jobs_provider_cost_holds h",
+                rusqlite::params![account.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status_before_drop, "held");
+        assert_eq!(root_events_before_drop, 0);
+
+        drop(attempt);
+        let (status, settled_cost, provenance, root_events): (String, i64, String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT h.status, h.settled_cost_cents, h.usage_provenance,
+                        (SELECT COUNT(*) FROM usage_events e
+                          WHERE e.account_id = ?1 AND e.kind = 'jobs_resume_generation')
+                   FROM jobs_provider_cost_holds h",
+                rusqlite::params![account.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "settled");
+        assert_eq!(settled_cost, 5);
+        assert_eq!(provenance, pricing::UsageProvenance::Missing.as_str());
+        assert_eq!(root_events, 0);
+    }
+
+    #[test]
+    fn jobs_usage_provenance_controls_hold_shrink_overrun_and_next_admission() {
+        let cases = [
+            (
+                "exact-lower",
+                pricing::UsageProvenance::Exact,
+                "openai",
+                2,
+                2,
+                5,
+                3,
+                true,
+                pricing::UsageProvenance::Exact,
+            ),
+            (
+                "estimated-lower",
+                pricing::UsageProvenance::Estimated,
+                "openai",
+                2,
+                5,
+                5,
+                1,
+                false,
+                pricing::UsageProvenance::Estimated,
+            ),
+            (
+                "missing-zero",
+                pricing::UsageProvenance::Missing,
+                "openai",
+                0,
+                5,
+                5,
+                1,
+                false,
+                pricing::UsageProvenance::Missing,
+            ),
+            (
+                "route-mismatch",
+                pricing::UsageProvenance::Exact,
+                "crossed-provider",
+                2,
+                5,
+                5,
+                1,
+                false,
+                pricing::UsageProvenance::Missing,
+            ),
+            (
+                "exact-overrun",
+                pricing::UsageProvenance::Exact,
+                "openai",
+                7,
+                7,
+                7,
+                1,
+                false,
+                pricing::UsageProvenance::Exact,
+            ),
+        ];
+        for (
+            case,
+            provenance,
+            returned_provider,
+            reported_cost,
+            expected_settled,
+            next_limit,
+            next_cost,
+            expect_next_held,
+            expected_provenance,
+        ) in cases
+        {
+            let path = std::env::temp_dir().join(format!(
+                "bluey-jobs-provenance-{case}-{}.sqlite3",
+                uuid::Uuid::new_v4()
+            ));
+            let pool = db::open_pool(&path).unwrap();
+            db::run_migrations(&pool).unwrap();
+            let account =
+                db::accounts::Account::create(&pool, &format!("{case}@bluey.test"), "hash")
+                    .unwrap();
+            let request_id = format!("{case}:attempt:0");
+            let reservation_token = format!("{case}-token");
+            assert!(matches!(
+                jobs_provider_cost_holds::reserve(
+                    &pool,
+                    &account.id,
+                    case,
+                    &reservation_token,
+                    &request_id,
+                    "openai",
+                    "gpt-5.4-mini",
+                    5,
+                    MAX_GENERATION_BLUEY_COST_CENTS,
+                    crate::config::UpstreamSpendGuard {
+                        limit_cents: 100,
+                        window_hours: 24,
+                    },
+                )
+                .unwrap(),
+                CostHoldReservation::Held { .. }
+            ));
+            let completion = routing::Completion {
+                text: "result".into(),
+                provider: returned_provider.into(),
+                model: "gpt-5.4-mini".into(),
+                input_tokens: if provenance == pricing::UsageProvenance::Missing {
+                    0
+                } else {
+                    10
+                },
+                output_tokens: if provenance == pricing::UsageProvenance::Missing {
+                    0
+                } else {
+                    5
+                },
+                usage_provenance: provenance,
+            };
+            let mut attempt = ProviderAttemptGuard::new(
+                pool.clone(),
+                &account.id,
+                request_id,
+                &reservation_token,
+                "openai",
+                "gpt-5.4-mini",
+                0,
+                10,
+                5,
+            );
+            let result = attempt.settle(&completion, reported_cost, AttemptOutcome::RejectedTruth);
+            assert_eq!(result.is_err(), case == "exact-overrun", "{case}");
+
+            let (settled_cost, stored_provenance): (i64, String) = pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT settled_cost_cents, usage_provenance
+                       FROM jobs_provider_cost_holds",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(settled_cost, expected_settled, "{case}");
+            assert_eq!(stored_provenance, expected_provenance.as_str(), "{case}");
+
+            let next = jobs_provider_cost_holds::reserve(
+                &pool,
+                &account.id,
+                &format!("{case}-next"),
+                &format!("{case}-next-token"),
+                &format!("{case}:attempt:1"),
+                "openai",
+                "gpt-5.4-mini",
+                next_cost,
+                MAX_GENERATION_BLUEY_COST_CENTS,
+                crate::config::UpstreamSpendGuard {
+                    limit_cents: next_limit,
+                    window_hours: 24,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(next, CostHoldReservation::Held { .. }),
+                expect_next_held,
+                "{case}"
+            );
+        }
     }
 
     #[test]

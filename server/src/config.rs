@@ -160,6 +160,14 @@ pub struct UpstreamSpendGuard {
     pub window_hours: i64,
 }
 
+/// Largest rolling provider-spend window accepted from configuration. Spend
+/// truth is physically retained for this full interval plus cleanup grace so
+/// shrinking and later enlarging the configured window cannot reopen the cap.
+pub const MAX_UPSTREAM_SPEND_WINDOW_HOURS: i64 = 30 * 24;
+pub const UPSTREAM_SPEND_RETENTION_GRACE_HOURS: i64 = 24;
+pub const UPSTREAM_SPEND_TRUTH_RETENTION_MS: i64 =
+    (MAX_UPSTREAM_SPEND_WINDOW_HOURS + UPSTREAM_SPEND_RETENTION_GRACE_HOURS) * 3_600_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrialAbuseConfig {
     pub max_trials_per_email: i64,
@@ -595,7 +603,8 @@ fn upstream_spend_guard_from_env() -> Option<UpstreamSpendGuard> {
         .ok()
         .and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(24);
+        .unwrap_or(24)
+        .min(MAX_UPSTREAM_SPEND_WINDOW_HOURS);
     Some(UpstreamSpendGuard {
         limit_cents,
         window_hours,
@@ -950,6 +959,11 @@ mod tests {
         let guard = upstream_spend_guard_from_env().unwrap();
         assert_eq!(guard.limit_cents, 1000);
         assert_eq!(guard.window_hours, 12);
+
+        std::env::set_var("BLUEY_UPSTREAM_SPEND_WINDOW_HOURS", "999999");
+        let guard = upstream_spend_guard_from_env().unwrap();
+        assert_eq!(guard.window_hours, MAX_UPSTREAM_SPEND_WINDOW_HOURS);
+        assert_eq!(UPSTREAM_SPEND_TRUTH_RETENTION_MS, 31 * 24 * 3_600_000);
 
         std::env::set_var("BLUEY_UPSTREAM_SPEND_LIMIT_CENTS", "0");
         assert!(upstream_spend_guard_from_env().is_none());

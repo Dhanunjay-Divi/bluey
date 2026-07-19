@@ -9,13 +9,15 @@ use anyhow::Result;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-use crate::config::UpstreamSpendGuard;
+use crate::{
+    config::{UpstreamSpendGuard, UPSTREAM_SPEND_TRUTH_RETENTION_MS},
+    pricing::UsageProvenance,
+};
 
 use super::{
-    jobs,
     usage::{
-        UsageEvent, CUTOVER_SPEND_BASELINE_GRACE_MS, MAX_AUTHORITATIVE_EVENT_COST_CENTS,
-        MAX_AUTHORITATIVE_EVENT_LATENCY_MS, MAX_AUTHORITATIVE_EVENT_TOKENS,
+        UsageEvent, MAX_AUTHORITATIVE_EVENT_COST_CENTS, MAX_AUTHORITATIVE_EVENT_LATENCY_MS,
+        MAX_AUTHORITATIVE_EVENT_TOKENS,
     },
     DbPool,
 };
@@ -38,7 +40,108 @@ pub(crate) fn fail_next_settlement_for_test() {
     FAIL_NEXT_SETTLEMENT_FOR_TEST.with(|flag| flag.set(true));
 }
 
-const COST_HOLD_RETENTION_GRACE_MS: i64 = 86_400_000;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpendTruthCleanup {
+    pub provider_holds_deleted: u64,
+    pub cutover_baseline_rows_deleted: u64,
+}
+
+pub(super) fn sqlite_transaction_now_ms(tx: &rusqlite::Transaction<'_>) -> Result<i64> {
+    Ok(tx.query_row(
+        "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+pub(super) fn postgres_transaction_now_ms(tx: &mut postgres::Transaction<'_>) -> Result<i64> {
+    Ok(tx
+        .query_one(
+            "SELECT (EXTRACT(EPOCH FROM transaction_timestamp()) * 1000)::bigint",
+            &[],
+        )?
+        .get(0))
+}
+
+/// Delete anonymous cutover evidence and pseudonymous provider holds only
+/// after the fixed maximum configurable spend window plus grace. This is an
+/// independent transaction so admission denial or a lack of paid traffic can
+/// never postpone privacy cleanup indefinitely.
+pub fn prune_expired_spend_truth(pool: &DbPool) -> Result<SpendTruthCleanup> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = sqlite_transaction_now_ms(&tx)?;
+            let retention_cutoff = now.saturating_sub(UPSTREAM_SPEND_TRUTH_RETENTION_MS);
+            let provider_holds_deleted = tx.execute(
+                "DELETE FROM jobs_provider_cost_holds WHERE updated_at_ms < ?1",
+                params![retention_cutoff],
+            )?;
+            let cutover_baseline_rows_deleted = tx.execute(
+                "DELETE FROM usage_cutover_spend_baseline
+                  WHERE occurred_at < datetime(?1 / 1000, 'unixepoch')",
+                params![retention_cutoff],
+            )?;
+            tx.commit()?;
+            Ok(SpendTruthCleanup {
+                provider_holds_deleted: provider_holds_deleted as u64,
+                cutover_baseline_rows_deleted: cutover_baseline_rows_deleted as u64,
+            })
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended('jobs-provider-cost-global', 0))",
+                &[],
+            )?;
+            let now = postgres_transaction_now_ms(&mut tx)?;
+            let retention_cutoff = now.saturating_sub(UPSTREAM_SPEND_TRUTH_RETENTION_MS);
+            let provider_holds_deleted = tx.execute(
+                "DELETE FROM jobs_provider_cost_holds WHERE updated_at_ms < $1",
+                &[&retention_cutoff],
+            )?;
+            let cutover_baseline_rows_deleted = tx.execute(
+                "DELETE FROM usage_cutover_spend_baseline
+                  WHERE occurred_at < to_timestamp(($1::bigint)::double precision / 1000.0)",
+                &[&retention_cutoff],
+            )?;
+            tx.commit()?;
+            Ok(SpendTruthCleanup {
+                provider_holds_deleted,
+                cutover_baseline_rows_deleted,
+            })
+        }
+    })
+}
+
+pub fn spawn_spend_truth_janitor(pool: DbPool) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(60 * 60);
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match prune_expired_spend_truth(&pool) {
+                Ok(cleanup)
+                    if cleanup.provider_holds_deleted > 0
+                        || cleanup.cutover_baseline_rows_deleted > 0 =>
+                {
+                    tracing::info!(
+                        provider_holds_deleted = cleanup.provider_holds_deleted,
+                        cutover_baseline_rows_deleted = cleanup.cutover_baseline_rows_deleted,
+                        "expired upstream spend truth pruned"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(error = %error, "upstream spend truth janitor failed")
+                }
+            }
+        }
+    })
+}
 
 fn opaque_scope_hash(domain: &str, parts: &[&str]) -> String {
     let mut digest = Sha256::new();
@@ -101,8 +204,13 @@ pub fn has_generation_exposure(
             Ok(conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM jobs_provider_cost_holds
                   WHERE account_scope_hash = ?1 AND generation_scope_hash = ?2
-                    AND status IN ('held', 'settled'))",
-                params![account_scope_hash, generation_scope_hash],
+                    AND status IN ('held', 'settled')
+                    AND updated_at_ms >= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - ?3)",
+                params![
+                    account_scope_hash,
+                    generation_scope_hash,
+                    UPSTREAM_SPEND_TRUTH_RETENTION_MS
+                ],
                 |row| row.get(0),
             )?)
         }
@@ -112,8 +220,13 @@ pub fn has_generation_exposure(
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM jobs_provider_cost_holds
                       WHERE account_scope_hash = $1 AND generation_scope_hash = $2
-                        AND status IN ('held', 'settled'))",
-                    &[&account_scope_hash, &generation_scope_hash],
+                        AND status IN ('held', 'settled')
+                        AND updated_at_ms >= (EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::bigint - $3)",
+                    &[
+                        &account_scope_hash,
+                        &generation_scope_hash,
+                        &UPSTREAM_SPEND_TRUTH_RETENTION_MS,
+                    ],
                 )?
                 .get(0))
         }
@@ -133,8 +246,13 @@ pub fn has_scope_prefix_exposure(
             Ok(conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM jobs_provider_cost_holds
                   WHERE account_scope_hash = ?1 AND root_scope_hash = ?2
-                    AND status IN ('held', 'settled'))",
-                params![account_scope_hash, root_scope_hash],
+                    AND status IN ('held', 'settled')
+                    AND updated_at_ms >= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - ?3)",
+                params![
+                    account_scope_hash,
+                    root_scope_hash,
+                    UPSTREAM_SPEND_TRUTH_RETENTION_MS
+                ],
                 |row| row.get(0),
             )?)
         }
@@ -144,8 +262,13 @@ pub fn has_scope_prefix_exposure(
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM jobs_provider_cost_holds
                       WHERE account_scope_hash = $1 AND root_scope_hash = $2
-                        AND status IN ('held', 'settled'))",
-                    &[&account_scope_hash, &root_scope_hash],
+                        AND status IN ('held', 'settled')
+                        AND updated_at_ms >= (EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::bigint - $3)",
+                    &[
+                        &account_scope_hash,
+                        &root_scope_hash,
+                        &UPSTREAM_SPEND_TRUTH_RETENTION_MS,
+                    ],
                 )?
                 .get(0))
         }
@@ -171,14 +294,6 @@ pub fn reserve(
     {
         anyhow::bail!("Jobs provider cost hold must be positive")
     }
-    let now = jobs::now_ms();
-    let window_start = now.saturating_sub(guard.window_hours.saturating_mul(3_600_000));
-    let retention_cutoff = window_start.saturating_sub(COST_HOLD_RETENTION_GRACE_MS);
-    let baseline_retention_ms = guard
-        .window_hours
-        .max(0)
-        .saturating_mul(3_600_000)
-        .saturating_add(CUTOVER_SPEND_BASELINE_GRACE_MS);
     let account_scope_hash = account_scope_hash(account_id);
     let generation_scope_hash = generation_scope_hash(account_id, generation_key);
     let request_scope_hash = request_scope_hash(account_id, request_id);
@@ -187,14 +302,17 @@ pub fn reserve(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = sqlite_transaction_now_ms(&tx)?;
+            let window_start = now.saturating_sub(guard.window_hours.saturating_mul(3_600_000));
+            let retention_cutoff = now.saturating_sub(UPSTREAM_SPEND_TRUTH_RETENTION_MS);
             tx.execute(
                 "DELETE FROM jobs_provider_cost_holds WHERE updated_at_ms < ?1",
                 params![retention_cutoff],
             )?;
             tx.execute(
                 "DELETE FROM usage_cutover_spend_baseline
-                  WHERE occurred_at < datetime('now', ?1)",
-                params![format!("-{} seconds", baseline_retention_ms / 1_000)],
+                  WHERE occurred_at < datetime(?1 / 1000, 'unixepoch')",
+                params![retention_cutoff],
             )?;
             let jobs_fence: Option<(String, String)> = tx
                 .query_row(
@@ -277,9 +395,9 @@ pub fn reserve(
                 &tx,
                 "SELECT u.cost_cents_to_bluey
                    FROM usage_events u
-                  WHERE u.origin = 'server' AND u.ts >= datetime('now', ?1)
+                  WHERE u.origin = 'server' AND u.ts >= datetime(?1 / 1000, 'unixepoch')
                     AND substr(u.kind, -8) != '_attempt'",
-                params![format!("-{} hours", guard.window_hours)],
+                params![window_start],
             )?;
             let held_exposure = super::usage::sqlite_saturated_cost_sum(
                 &tx,
@@ -292,8 +410,8 @@ pub fn reserve(
             let cutover_baseline_exposure = super::usage::sqlite_saturated_cost_sum(
                 &tx,
                 "SELECT cost_cents FROM usage_cutover_spend_baseline
-                  WHERE occurred_at >= datetime('now', ?1)",
-                params![format!("-{} hours", guard.window_hours)],
+                  WHERE occurred_at >= datetime(?1 / 1000, 'unixepoch')",
+                params![window_start],
             )?;
             let ordinary_managed_exposure = super::usage::sqlite_saturated_cost_sum(
                 &tx,
@@ -348,6 +466,9 @@ pub fn reserve(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            let now = postgres_transaction_now_ms(&mut tx)?;
+            let window_start = now.saturating_sub(guard.window_hours.saturating_mul(3_600_000));
+            let retention_cutoff = now.saturating_sub(UPSTREAM_SPEND_TRUTH_RETENTION_MS);
             let jobs_fence = tx.query_opt(
                 "SELECT reservation_token, status FROM jobs_resume_generations
                   WHERE account_id = $1 AND generation_key = $2 FOR UPDATE",
@@ -376,8 +497,8 @@ pub fn reserve(
             )?;
             tx.execute(
                 "DELETE FROM usage_cutover_spend_baseline
-                  WHERE occurred_at < now() - ($1::bigint * interval '1 millisecond')",
-                &[&baseline_retention_ms],
+                  WHERE occurred_at < to_timestamp(($1::bigint)::double precision / 1000.0)",
+                &[&retention_cutoff],
             )?;
             let existing = tx.query_opt(
                 "SELECT account_scope_hash, generation_scope_hash, provider, model,
@@ -431,9 +552,9 @@ pub fn reserve(
                                       9223372036854775807)::bigint
                       FROM usage_events u
                      WHERE u.origin = 'server'
-                        AND u.ts >= now() - ($1::bigint * interval '1 hour')
+                        AND u.ts >= to_timestamp(($1::bigint)::double precision / 1000.0)
                         AND right(u.kind, 8) != '_attempt'",
-                    &[&guard.window_hours],
+                    &[&window_start],
                 )?
                 .get(0);
             let held_exposure: i64 = tx
@@ -452,8 +573,8 @@ pub fn reserve(
                     "SELECT LEAST(COALESCE(SUM(LEAST(GREATEST(cost_cents, 0), 100000000)::numeric), 0),
                                       9223372036854775807)::bigint
                        FROM usage_cutover_spend_baseline
-                      WHERE occurred_at >= now() - ($1::bigint * interval '1 hour')",
-                    &[&guard.window_hours],
+                      WHERE occurred_at >= to_timestamp(($1::bigint)::double precision / 1000.0)",
+                    &[&window_start],
                 )?
                 .get(0);
             let ordinary_managed_exposure: i64 = tx
@@ -517,9 +638,9 @@ pub fn settle_with_usage(
     request_id: &str,
     reservation_token: &str,
     actual_or_conservative_cost_cents: i64,
+    usage_provenance: UsageProvenance,
     event: &UsageEvent,
 ) -> Result<()> {
-    let now = jobs::now_ms();
     if event.request_id != request_id || event.kind.trim().is_empty() {
         anyhow::bail!("Jobs provider usage event does not match its hold")
     }
@@ -527,7 +648,7 @@ pub fn settle_with_usage(
     if FAIL_NEXT_SETTLEMENT_FOR_TEST.with(|flag| flag.replace(false)) {
         anyhow::bail!("injected provider hold settlement failure")
     }
-    let settled_cost =
+    let reported_cost =
         actual_or_conservative_cost_cents.clamp(0, MAX_AUTHORITATIVE_EVENT_COST_CENTS);
     let mut event = event.clone();
     event.input_tokens = event.input_tokens.clamp(0, MAX_AUTHORITATIVE_EVENT_TOKENS);
@@ -535,7 +656,6 @@ pub fn settle_with_usage(
     event.latency_ms = event
         .latency_ms
         .clamp(0, MAX_AUTHORITATIVE_EVENT_LATENCY_MS);
-    event.cost_cents_to_bluey = settled_cost;
     event.cost_cents_to_customer = event
         .cost_cents_to_customer
         .clamp(0, MAX_AUTHORITATIVE_EVENT_COST_CENTS);
@@ -545,30 +665,58 @@ pub fn settle_with_usage(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = sqlite_transaction_now_ms(&tx)?;
             let account_exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
                 params![account_id],
                 |row| row.get(0),
             )?;
-            let existing: Option<(String, i64, String, String)> = tx
+            let existing: Option<(String, i64, i64, String, String, String)> = tx
                 .query_row(
-                    "SELECT status, settled_cost_cents, provider, model
+                    "SELECT status, settled_cost_cents, projected_cost_cents,
+                            provider, model, usage_provenance
                        FROM jobs_provider_cost_holds
                       WHERE request_scope_hash = ?1 AND account_scope_hash = ?2
                         AND reservation_token = ?3",
                     params![request_scope_hash, account_scope_hash, reservation_token],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            if existing.as_ref().is_some_and(|(_, _, provider, model)| {
-                event.provider.as_deref() != Some(provider.as_str())
-                    || event.model.as_deref() != Some(model.as_str())
-            }) {
-                anyhow::bail!("Jobs provider usage event route does not match its hold")
-            }
             if existing
                 .as_ref()
-                .is_some_and(|(status, cost, _, _)| status == "settled" && *cost == settled_cost)
+                .is_some_and(|(_, _, _, provider, model, _)| {
+                    event.provider.as_deref() != Some(provider.as_str())
+                        || event.model.as_deref() != Some(model.as_str())
+                })
+            {
+                anyhow::bail!("Jobs provider usage event route does not match its hold")
+            }
+            let projected_cost = existing
+                .as_ref()
+                .map(|(_, _, projected, _, _, _)| *projected)
+                .ok_or_else(|| anyhow::anyhow!("Jobs provider cost hold is missing"))?;
+            let settled_cost = if usage_provenance.is_exact() {
+                reported_cost
+            } else {
+                reported_cost.max(projected_cost)
+            };
+            event.cost_cents_to_bluey = settled_cost;
+            if existing
+                .as_ref()
+                .is_some_and(|(status, cost, _, _, _, provenance)| {
+                    status == "settled"
+                        && *cost == settled_cost
+                        && provenance == usage_provenance.as_str()
+                })
             {
                 if !account_exists {
                     tx.commit()?;
@@ -610,13 +758,15 @@ pub fn settle_with_usage(
             }
             let updated = tx.execute(
                 "UPDATE jobs_provider_cost_holds
-                    SET status = 'settled', settled_cost_cents = ?3, updated_at_ms = ?4
+                    SET status = 'settled', settled_cost_cents = ?3,
+                        usage_provenance = ?4, updated_at_ms = ?5
                   WHERE request_scope_hash = ?1 AND reservation_token = ?2 AND status = 'held'
-                    AND account_scope_hash = ?5",
+                    AND account_scope_hash = ?6",
                 params![
                     request_scope_hash,
                     reservation_token,
                     settled_cost,
+                    usage_provenance.as_str(),
                     now,
                     account_scope_hash
                 ],
@@ -664,6 +814,7 @@ pub fn settle_with_usage(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            let now = postgres_transaction_now_ms(&mut tx)?;
             tx.query_one(
                 "SELECT pg_advisory_xact_lock(hashtextextended('jobs-provider-cost-global', 0))",
                 &[],
@@ -675,7 +826,8 @@ pub fn settle_with_usage(
                 )?
                 .is_some();
             let existing = tx.query_opt(
-                "SELECT status, settled_cost_cents, provider, model
+                "SELECT status, settled_cost_cents, projected_cost_cents,
+                        provider, model, usage_provenance
                    FROM jobs_provider_cost_holds
                   WHERE request_scope_hash = $1 AND account_scope_hash = $2
                     AND reservation_token = $3
@@ -683,13 +835,25 @@ pub fn settle_with_usage(
                 &[&request_scope_hash, &account_scope_hash, &reservation_token],
             )?;
             if existing.as_ref().is_some_and(|row| {
-                event.provider.as_deref() != Some(row.get::<_, String>(2).as_str())
-                    || event.model.as_deref() != Some(row.get::<_, String>(3).as_str())
+                event.provider.as_deref() != Some(row.get::<_, String>(3).as_str())
+                    || event.model.as_deref() != Some(row.get::<_, String>(4).as_str())
             }) {
                 anyhow::bail!("Jobs provider usage event route does not match its hold")
             }
+            let projected_cost = existing
+                .as_ref()
+                .map(|row| row.get::<_, i64>(2))
+                .ok_or_else(|| anyhow::anyhow!("Jobs provider cost hold is missing"))?;
+            let settled_cost = if usage_provenance.is_exact() {
+                reported_cost
+            } else {
+                reported_cost.max(projected_cost)
+            };
+            event.cost_cents_to_bluey = settled_cost;
             if existing.as_ref().is_some_and(|row| {
-                row.get::<_, String>(0) == "settled" && row.get::<_, i64>(1) == settled_cost
+                row.get::<_, String>(0) == "settled"
+                    && row.get::<_, i64>(1) == settled_cost
+                    && row.get::<_, String>(5) == usage_provenance.as_str()
             }) {
                 if !account_exists {
                     tx.commit()?;
@@ -734,13 +898,15 @@ pub fn settle_with_usage(
             }
             let updated = tx.execute(
                 "UPDATE jobs_provider_cost_holds
-                    SET status = 'settled', settled_cost_cents = $3, updated_at_ms = $4
+                    SET status = 'settled', settled_cost_cents = $3,
+                        usage_provenance = $4, updated_at_ms = $5
                   WHERE request_scope_hash = $1 AND reservation_token = $2 AND status = 'held'
-                    AND account_scope_hash = $5",
+                    AND account_scope_hash = $6",
                 &[
                     &request_scope_hash,
                     &reservation_token,
                     &settled_cost,
+                    &usage_provenance.as_str(),
                     &now,
                     &account_scope_hash,
                 ],
@@ -807,6 +973,148 @@ mod tests {
         crate::db::accounts::Account::create(pool, "holds@bluey.test", "hash")
             .unwrap()
             .id
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_runtime_reserve_and_exact_settlement_preserve_every_usage_field() {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = crate::db::open_postgres_pool(&database_url).expect("open Postgres test pool");
+        crate::db::run_migrations(&pool).expect("apply Postgres runtime migrations");
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct_provider_truth_{suffix}");
+        let email = format!("provider-truth-{suffix}@example.test");
+        let generation_key = format!("router:pg18-{suffix}:llm");
+        let request_id = format!("pg18-{suffix}:attempt:0");
+        let reservation_token = format!("pg18-token-{suffix}");
+        {
+            let mut conn = pool.get_pg().expect("Postgres setup connection");
+            conn.execute(
+                "INSERT INTO accounts (id, email, password_hash) VALUES ($1, $2, 'hash')",
+                &[&account_id, &email],
+            )
+            .expect("insert Postgres test account");
+        }
+
+        let admission = reserve(
+            &pool,
+            &account_id,
+            &generation_key,
+            &reservation_token,
+            &request_id,
+            "openai",
+            "gpt-5.4-mini",
+            17,
+            100,
+            UpstreamSpendGuard {
+                limit_cents: 100_000_000,
+                window_hours: 24,
+            },
+        )
+        .expect("reserve Postgres provider hold");
+        assert_eq!(
+            admission,
+            CostHoldReservation::Held {
+                reservation_token: reservation_token.clone()
+            }
+        );
+
+        let event = UsageEvent {
+            request_id: request_id.clone(),
+            kind: "llm_attempt".into(),
+            task_type: Some("pg18_settlement".into()),
+            lane: Some("balanced".into()),
+            provider: Some("openai".into()),
+            model: Some("gpt-5.4-mini".into()),
+            input_tokens: 123,
+            output_tokens: 45,
+            latency_ms: 67,
+            cost_cents_to_bluey: 5,
+            cost_cents_to_customer: 3,
+            was_speculative: true,
+            was_fallback: true,
+        };
+        settle_with_usage(
+            &pool,
+            &account_id,
+            &request_id,
+            &reservation_token,
+            5,
+            UsageProvenance::Exact,
+            &event,
+        )
+        .expect("settle exact Postgres provider usage");
+        settle_with_usage(
+            &pool,
+            &account_id,
+            &request_id,
+            &reservation_token,
+            5,
+            UsageProvenance::Exact,
+            &event,
+        )
+        .expect("repeat exact Postgres settlement idempotently");
+
+        let request_hash = request_scope_hash(&account_id, &request_id);
+        let mut conn = pool.get_pg().expect("Postgres assertion connection");
+        let row = conn
+            .query_one(
+                "SELECT h.projected_cost_cents, h.settled_cost_cents,
+                        h.usage_provenance, h.status,
+                        e.kind, e.task_type, e.lane, e.provider, e.model,
+                        e.input_tokens, e.output_tokens, e.latency_ms,
+                        e.cost_cents_to_bluey, e.cost_cents_to_customer,
+                        e.was_speculative, e.was_fallback
+                   FROM jobs_provider_cost_holds h
+                   JOIN usage_events e
+                     ON e.account_id = $2 AND e.request_id = $3
+                    AND e.kind = 'llm_attempt'
+                  WHERE h.request_scope_hash = $1",
+                &[&request_hash, &account_id, &request_id],
+            )
+            .expect("read exact Postgres settlement");
+        assert_eq!(row.get::<_, i64>(0), 17);
+        assert_eq!(row.get::<_, i64>(1), 5);
+        assert_eq!(row.get::<_, String>(2), "exact");
+        assert_eq!(row.get::<_, String>(3), "settled");
+        assert_eq!(row.get::<_, String>(4), "llm_attempt");
+        assert_eq!(
+            row.get::<_, Option<String>>(5).as_deref(),
+            Some("pg18_settlement")
+        );
+        assert_eq!(row.get::<_, Option<String>>(6).as_deref(), Some("balanced"));
+        assert_eq!(row.get::<_, Option<String>>(7).as_deref(), Some("openai"));
+        assert_eq!(
+            row.get::<_, Option<String>>(8).as_deref(),
+            Some("gpt-5.4-mini")
+        );
+        assert_eq!(row.get::<_, i64>(9), 123);
+        assert_eq!(row.get::<_, i64>(10), 45);
+        assert_eq!(row.get::<_, i64>(11), 67);
+        assert_eq!(row.get::<_, i64>(12), 5);
+        assert_eq!(row.get::<_, i64>(13), 3);
+        assert_eq!(row.get::<_, i32>(14), 1);
+        assert_eq!(row.get::<_, i32>(15), 1);
+        let event_count: i64 = conn
+            .query_one(
+                "SELECT COUNT(*) FROM usage_events
+                  WHERE account_id = $1 AND request_id = $2 AND kind = 'llm_attempt'",
+                &[&account_id, &request_id],
+            )
+            .expect("count idempotent Postgres event")
+            .get(0);
+        assert_eq!(event_count, 1);
+
+        conn.execute(
+            "DELETE FROM jobs_provider_cost_holds WHERE request_scope_hash = $1",
+            &[&request_hash],
+        )
+        .expect("delete Postgres test hold");
+        conn.execute("DELETE FROM accounts WHERE id = $1", &[&account_id])
+            .expect("delete Postgres test account");
     }
 
     #[test]
@@ -891,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_cutover_baseline_blocks_provider_hold_until_expired_and_cleaned() {
+    fn anonymous_cutover_baseline_uses_window_but_fixed_retention() {
         let pool = temp_pool();
         let account_id = account(&pool);
         pool.get()
@@ -950,6 +1258,9 @@ mod tests {
             .unwrap(),
             CostHoldReservation::Held { .. }
         ));
+        // Shrinking the active cap window must not shrink physical retention.
+        // The maximum configurable window plus grace is a fixed privacy and
+        // accounting contract, independent of the current guard setting.
         assert_eq!(
             pool.get()
                 .unwrap()
@@ -959,8 +1270,18 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            0
+            1
         );
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE usage_cutover_spend_baseline
+                    SET occurred_at = datetime('now', '-32 days')",
+                [],
+            )
+            .unwrap();
+        let cleanup = prune_expired_spend_truth(&pool).unwrap();
+        assert_eq!(cleanup.cutover_baseline_rows_deleted, 1);
     }
 
     #[test]
@@ -1080,6 +1401,7 @@ mod tests {
             "private-request:llm-attempt:0",
             "deleted-token",
             7,
+            UsageProvenance::Exact,
             &event,
         )
         .unwrap();
@@ -1144,9 +1466,13 @@ mod tests {
             .unwrap()
             .execute(
                 "UPDATE jobs_provider_cost_holds SET updated_at_ms = ?1",
-                params![jobs::now_ms().saturating_sub(172_800_001)],
+                params![crate::db::jobs::now_ms()
+                    .saturating_sub(UPSTREAM_SPEND_TRUTH_RETENTION_MS)
+                    .saturating_sub(1)],
             )
             .unwrap();
+        let cleanup = prune_expired_spend_truth(&pool).unwrap();
+        assert_eq!(cleanup.provider_holds_deleted, 1);
         assert!(matches!(
             reserve(
                 &pool,
