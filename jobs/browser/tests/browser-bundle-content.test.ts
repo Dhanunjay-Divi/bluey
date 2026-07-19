@@ -23,9 +23,10 @@ describe("packaged browser bundle", () => {
       "chromium-1228",
       ".links",
       "chromium_headless_shell-1228",
+      "winldd-1007",
     ])).toEqual({
       headedChromium: ["chromium-1228"],
-      removable: [".links", "chromium_headless_shell-1228", "ffmpeg-1011"],
+      removable: [".links", "chromium_headless_shell-1228", "ffmpeg-1011", "winldd-1007"],
       unexpected: [],
     });
   });
@@ -36,6 +37,7 @@ describe("packaged browser bundle", () => {
       "chromium-1228",
       "chromium_headless_shell-1228",
       "ffmpeg-1011",
+      "winldd-1007",
       ".links",
     ]) await mkdir(join(root, name));
 

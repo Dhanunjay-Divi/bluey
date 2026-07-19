@@ -2,7 +2,10 @@ import { mkdir, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 const HEADED_CHROMIUM = /^chromium-\d+$/;
-const OPTIONAL_PLAYWRIGHT_PAYLOAD = /^(?:chromium_headless_shell|ffmpeg)-\d+$/;
+// Playwright downloads ffmpeg and the Windows winldd dependency scanner with
+// headed Chromium. Bluey launches the packaged chrome executable directly;
+// neither install/diagnostic helper belongs in the shipped runtime.
+const OPTIONAL_PLAYWRIGHT_PAYLOAD = /^(?:chromium_headless_shell|ffmpeg|winldd)-\d+$/;
 const INSTALL_METADATA = new Set([".links", ".DS_Store"]);
 
 export function classifyBrowserBundleEntries(names) {
