@@ -17,7 +17,10 @@ import {
   finalSubmitMarkerExists,
   recordReconciledSubmitConfirmation,
 } from "./irreversible-submit.js";
-import { authorizedFinalSubmitHooks } from "./authorized-final-submit.js";
+import {
+  authorizedFinalSubmitHooks,
+  type FinalSubmitAuthorizer,
+} from "./authorized-final-submit.js";
 import {
   classifyLocalFailure,
   LocalBrowserError,
@@ -71,9 +74,14 @@ let browserShell: BrowserShell | undefined;
 let runView: RunControllerView | undefined;
 const admission = new LocalRunAdmission();
 const executionFlights = new ExecutionSingleFlight();
+let finalSubmitAuthorizer: FinalSubmitAuthorizer | undefined;
 
-export async function initializeLocalRunController(shell: BrowserShell): Promise<void> {
+export async function initializeLocalRunController(
+  shell: BrowserShell,
+  options: { authorizeFinalSubmit?: FinalSubmitAuthorizer } = {},
+): Promise<void> {
   browserShell = shell;
+  finalSubmitAuthorizer = options.authorizeFinalSubmit;
   runView = new RunControllerView(shell, () => [...activeLocalRuns.values()].map(displayForRun));
   browserContexts = new BrowserContextRegistry(
     app.getPath("userData"),
@@ -199,7 +207,12 @@ async function executeLocalRequestSingleFlight(
   );
   await checkpointActiveLocalRun(request.runId, "prepared", "prepared");
   const browserPage = new PlaywrightBrowserPage(page);
-  const durableHooks = authorizedFinalSubmitHooks(runDirectory, delivery);
+  const durableHooks = authorizedFinalSubmitHooks(
+    runDirectory,
+    request,
+    delivery,
+    finalSubmitAuthorizer,
+  );
   const finalSubmitHooks = {
     async beforeFinalSubmit() {
       // The exclusive marker is written first. A crash before the encrypted
@@ -731,6 +744,7 @@ export function setLocalPowerAvailable(available: boolean): void {
 export async function shutdownLocalRunController(): Promise<void> {
   await closeAllContexts();
   activeLocalRuns.clear();
+  finalSubmitAuthorizer = undefined;
   runView = undefined;
   browserShell = undefined;
 }

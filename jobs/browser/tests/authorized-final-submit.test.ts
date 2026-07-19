@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { authorizedFinalSubmitHooks } from "../src/authorized-final-submit.js";
 import { finalSubmitMarkerExists } from "../src/irreversible-submit.js";
 import type { LocalRunDelivery } from "../src/local-run-contracts.js";
@@ -18,22 +18,70 @@ afterEach(async () => {
 describe("authorized final submit", () => {
   it("fails before marker acquisition when claimed run authority has expired", async () => {
     const runDirectory = await temporaryRunDirectory();
-    const hooks = authorizedFinalSubmitHooks(runDirectory, delivery(Date.now() - 1));
+    const authorize = vi.fn(async () => undefined);
+    const hooks = authorizedFinalSubmitHooks(
+      runDirectory,
+      requestBindings(),
+      delivery(Date.now() - 1),
+      authorize,
+    );
 
     await expect(hooks.beforeFinalSubmit()).rejects.toMatchObject({
       code: "launch_expired",
     });
+    expect(authorize).not.toHaveBeenCalled();
+    await expect(finalSubmitMarkerExists(runDirectory)).resolves.toBe(false);
+  });
+
+  it("fails before marker acquisition when live authority denies or is unavailable", async () => {
+    const runDirectory = await temporaryRunDirectory();
+    const denial = new Error("live authority denied");
+    const authorize = vi.fn(async () => {
+      throw denial;
+    });
+    const expiresAtMs = Date.now() + 60_000;
+    const hooks = authorizedFinalSubmitHooks(
+      runDirectory,
+      requestBindings(),
+      delivery(expiresAtMs),
+      authorize,
+    );
+
+    await expect(hooks.beforeFinalSubmit()).rejects.toBe(denial);
+    expect(authorize).toHaveBeenCalledOnce();
+    expect(authorize).toHaveBeenCalledWith(Object.freeze({
+      ...requestBindings(),
+      apiOrigin: "https://bluey.sh",
+      capability: capability("result", expiresAtMs),
+      expiresAtMs,
+    }));
     await expect(finalSubmitMarkerExists(runDirectory)).resolves.toBe(false);
   });
 
   it("acquires durable authority while the claimed run is still valid", async () => {
     const runDirectory = await temporaryRunDirectory();
-    const hooks = authorizedFinalSubmitHooks(runDirectory, delivery(Date.now() + 60_000));
+    const authorize = vi.fn(async () => undefined);
+    const hooks = authorizedFinalSubmitHooks(
+      runDirectory,
+      requestBindings(),
+      delivery(Date.now() + 60_000),
+      authorize,
+    );
 
     await hooks.beforeFinalSubmit();
+    expect(authorize).toHaveBeenCalledOnce();
     await expect(finalSubmitMarkerExists(runDirectory)).resolves.toBe(true);
   });
 });
+
+function requestBindings() {
+  return {
+    accountId: "account-123",
+    applicationId: "application-123",
+    applicationIdentityId: "identity-123",
+    runId: "run-123",
+  };
+}
 
 function delivery(expiresAtMs: number): LocalRunDelivery {
   return {
