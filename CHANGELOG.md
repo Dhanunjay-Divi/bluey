@@ -5,6 +5,16 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+## [0.1.103] - 2026-07-18
+
+### Fixed
+
+- Made the `0.1.96` to `0.1.102` ownership upgrade recover legacy unscoped
+  session projections without losing turns, saved answers, or active-session
+  state.
+- Kept account isolation fail-closed: startup only adopts an exact same-ID
+  `NULL`-owner row and still rejects every non-null cross-account mismatch.
+
 ## [0.1.102] - 2026-07-16
 
 ### Added

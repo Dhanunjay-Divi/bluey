@@ -7617,6 +7617,15 @@ fn project_meeting_session_in_db(
     active: bool,
 ) -> Result<()> {
     let owner_account_id = meeting.owner_account_id.as_deref();
+    // Session ownership was added after MeetingStore records already carried an
+    // account owner. Upgrade only the matching legacy, unowned projection before
+    // applying owner-scoped mutations. `reassign_session_owner` remains the
+    // account-isolation boundary: a row owned by any other account is rejected.
+    if let Some(owner_account_id) = owner_account_id {
+        if db.get_session(meeting.id)?.is_some() {
+            db.reassign_session_owner(meeting.id, None, Some(owner_account_id))?;
+        }
+    }
     db.ensure_session_record_for_owner(
         owner_account_id,
         meeting.id,
@@ -25575,6 +25584,209 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
         let archived = store.load_by_id(foreign.id).unwrap().unwrap();
         assert_eq!(archived.owner_account_id.as_deref(), Some("account-a"));
         assert!(archived.ended_at.is_some());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn startup_claims_legacy_unowned_projection_for_owned_meeting() {
+        let (base, paths) = isolated_test_paths("startup-legacy-owner-claim-test");
+        let store = MeetingStore::new(&paths).unwrap();
+        let mut meeting = MeetingRecord::new(Some("Legacy projection".to_string()));
+        meeting.owner_account_id = Some("account-a".to_string());
+        store.save_archived(&meeting).unwrap();
+
+        let db = crate::db::Database::open(
+            paths
+                .data_dir
+                .join("sessions.db")
+                .to_str()
+                .expect("sessions db path"),
+        )
+        .unwrap();
+        db.ensure_session_record(
+            meeting.id,
+            &meeting.title,
+            parse_epoch_ms_i64(&meeting.started_at),
+            meeting_projection_updated_at(&meeting),
+        )
+        .unwrap();
+        db.append_turn(
+            meeting.id,
+            cue_core::session::NewTurn {
+                user_message: "preserved question".to_string(),
+                model_response: "preserved answer".to_string(),
+                lane: cue_core::session::Lane::Solve,
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                created_at: 100,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cost_cents: None,
+            },
+        )
+        .unwrap();
+        let session_id = meeting.id.to_string();
+        db.insert_cue_response(crate::db::NewCueResponse {
+            id: "legacy-owner-response",
+            session_id: &session_id,
+            kind: "answer",
+            text: "preserved answer",
+            source_text: Some("preserved question"),
+            ts_ms: 100,
+            cost_cents: None,
+            balance_cents_after: None,
+            provider: Some("test"),
+            model: Some("test"),
+            input_tokens: None,
+            output_tokens: None,
+            cost_label: None,
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
+        })
+        .unwrap();
+
+        reconcile_session_projection(&db, &store, None, &paths).unwrap();
+
+        assert!(db.get_session(meeting.id).unwrap().is_none());
+        let projected = db
+            .get_session_for_owner(Some("account-a"), meeting.id)
+            .unwrap()
+            .expect("owned session projection");
+        assert_eq!(projected.status, SessionStatus::Archived);
+        assert_eq!(
+            db.list_turns_for_owner(Some("account-a"), meeting.id, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .list_turns_for_owner(Some("account-b"), meeting.id, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.list_cue_responses(&session_id, 10).unwrap().len(), 1);
+        reconcile_session_projection(&db, &store, None, &paths).unwrap();
+        assert_eq!(
+            db.list_turns_for_owner(Some("account-a"), meeting.id, None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn startup_moves_legacy_active_pointer_to_meeting_owner() {
+        let (base, paths) = isolated_test_paths("startup-legacy-active-owner-test");
+        let store = MeetingStore::new(&paths).unwrap();
+        let mut meeting = MeetingRecord::new(Some("Legacy active projection".to_string()));
+        meeting.owner_account_id = Some("account-a".to_string());
+        store.save_active(&meeting).unwrap();
+
+        let db = crate::db::Database::open(
+            paths
+                .data_dir
+                .join("sessions.db")
+                .to_str()
+                .expect("sessions db path"),
+        )
+        .unwrap();
+        db.ensure_session_record(
+            meeting.id,
+            &meeting.title,
+            parse_epoch_ms_i64(&meeting.started_at),
+            meeting_projection_updated_at(&meeting),
+        )
+        .unwrap();
+        db.save_active_session(Some(meeting.id)).unwrap();
+
+        reconcile_session_projection(&db, &store, Some(&meeting), &paths).unwrap();
+
+        assert_eq!(db.load_active_session().unwrap(), None);
+        assert_eq!(
+            db.load_active_session_for_owner(Some("account-a")).unwrap(),
+            Some(meeting.id)
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn startup_never_reassigns_projection_between_owned_accounts() {
+        let (base, paths) = isolated_test_paths("startup-owner-conflict-test");
+        let store = MeetingStore::new(&paths).unwrap();
+        let mut meeting = MeetingRecord::new(Some("Conflicting projection".to_string()));
+        meeting.owner_account_id = Some("account-a".to_string());
+        store.save_archived(&meeting).unwrap();
+
+        let db = crate::db::Database::open(
+            paths
+                .data_dir
+                .join("sessions.db")
+                .to_str()
+                .expect("sessions db path"),
+        )
+        .unwrap();
+        db.ensure_session_record_for_owner(
+            Some("account-b"),
+            meeting.id,
+            &meeting.title,
+            parse_epoch_ms_i64(&meeting.started_at),
+            meeting_projection_updated_at(&meeting),
+        )
+        .unwrap();
+
+        let error = reconcile_session_projection(&db, &store, None, &paths)
+            .expect_err("cross-account projection must fail closed");
+
+        assert!(error.to_string().contains("requested owner scope"));
+        assert!(db
+            .get_session_for_owner(Some("account-a"), meeting.id)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_session_for_owner(Some("account-b"), meeting.id)
+            .unwrap()
+            .is_some());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn startup_never_downgrades_owned_projection_to_local_scope() {
+        let (base, paths) = isolated_test_paths("startup-owned-to-local-conflict-test");
+        let store = MeetingStore::new(&paths).unwrap();
+        let meeting = MeetingRecord::new(Some("Local projection conflict".to_string()));
+        store.save_archived(&meeting).unwrap();
+
+        let db = crate::db::Database::open(
+            paths
+                .data_dir
+                .join("sessions.db")
+                .to_str()
+                .expect("sessions db path"),
+        )
+        .unwrap();
+        db.ensure_session_record_for_owner(
+            Some("account-a"),
+            meeting.id,
+            &meeting.title,
+            parse_epoch_ms_i64(&meeting.started_at),
+            meeting_projection_updated_at(&meeting),
+        )
+        .unwrap();
+
+        reconcile_session_projection(&db, &store, None, &paths)
+            .expect_err("owned projection must never be exposed locally");
+
+        assert!(db.get_session(meeting.id).unwrap().is_none());
+        assert!(db
+            .get_session_for_owner(Some("account-a"), meeting.id)
+            .unwrap()
+            .is_some());
 
         let _ = std::fs::remove_dir_all(base);
     }
