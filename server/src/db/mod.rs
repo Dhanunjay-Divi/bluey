@@ -25,6 +25,7 @@ pub mod devices;
 pub mod diagnostic_logs;
 pub mod idempotency;
 pub mod jobs;
+pub mod jobs_generation;
 mod jobs_tailoring;
 pub mod legal_acceptances;
 pub mod link_codes;
@@ -1368,6 +1369,36 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_candidate_events_application
         ON jobs_candidate_events(account_id, application_id, created_at_ms DESC);
     "#,
+    // 0031 - idempotent, Jobs-owned model generation cache.
+    //
+    // Packet generation is included in the Jobs allowance, so these rows
+    // retain provider provenance and Bluey's upstream cost without charging
+    // the general chat balance. The generation key is a hash of the tenant,
+    // job snapshot, profile truth, mode, and schema version.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_resume_generations (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        job_id                TEXT NOT NULL,
+        generation_key        TEXT NOT NULL,
+        reservation_token     TEXT NOT NULL,
+        status                TEXT NOT NULL DEFAULT 'reserved',
+        output_json           TEXT,
+        provider              TEXT,
+        model                 TEXT,
+        input_tokens          INTEGER NOT NULL DEFAULT 0,
+        output_tokens         INTEGER NOT NULL DEFAULT 0,
+        cost_cents_to_bluey   INTEGER NOT NULL DEFAULT 0,
+        failure_code          TEXT,
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL,
+        UNIQUE(account_id, generation_key),
+        FOREIGN KEY (job_id) REFERENCES jobs_postings(id) ON DELETE CASCADE,
+        CHECK (status IN ('reserved', 'completed', 'failed'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_resume_generations_job
+        ON jobs_resume_generations(account_id, job_id, updated_at_ms DESC);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1422,6 +1453,17 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         "signup_otps",
         "account_id",
         "TEXT REFERENCES accounts(id) ON DELETE CASCADE",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_resume_generations",
+        "reservation_token",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    conn.execute(
+        "UPDATE jobs_resume_generations SET reservation_token = id \
+         WHERE reservation_token = ''",
+        [],
     )?;
     ensure_column(
         &conn,
@@ -1535,6 +1577,8 @@ const POSTGRES_JOBS_CANDIDATE_EVENTS: &str =
     include_str!("../../../infra/postgres/server-runtime/005_jobs_candidate_events.sql");
 const POSTGRES_CONTEXT_ARTIFACT_REVISIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/006_context_artifact_revisions.sql");
+const POSTGRES_JOBS_RESUME_GENERATIONS: &str =
+    include_str!("../../../infra/postgres/server-runtime/007_jobs_resume_generations.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -1543,13 +1587,19 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
         POSTGRES_OBJECT_UPLOAD_CONTROLS,
     ),
     ("004_stripe_auto_reload.sql", POSTGRES_STRIPE_AUTO_RELOAD),
+];
+const POSTGRES_JOBS_SCHEMA: &str =
+    include_str!("../../../infra/postgres/server-runtime/002_jobs.sql");
+const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "005_jobs_candidate_events.sql",
         POSTGRES_JOBS_CANDIDATE_EVENTS,
     ),
+    (
+        "007_jobs_resume_generations.sql",
+        POSTGRES_JOBS_RESUME_GENERATIONS,
+    ),
 ];
-const POSTGRES_JOBS_SCHEMA: &str =
-    include_str!("../../../infra/postgres/server-runtime/002_jobs.sql");
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
     run_blocking_db(|| run_postgres_migrations_inner(pool))
@@ -1597,6 +1647,16 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
         &[&"002_jobs.sql"],
     )
     .context("record postgres Jobs migration")?;
+    for (version, sql) in POSTGRES_POST_JOBS_MIGRATIONS {
+        conn.batch_execute(sql)
+            .with_context(|| format!("apply post-Jobs postgres migration {version}"))?;
+        conn.execute(
+            "INSERT INTO bluey_schema_migrations(version) VALUES ($1)
+             ON CONFLICT (version) DO NOTHING",
+            &[version],
+        )
+        .with_context(|| format!("record post-Jobs postgres migration {version}"))?;
+    }
     conn.batch_execute(POSTGRES_CONTEXT_ARTIFACT_REVISIONS)
         .context("apply postgres context artifact revision migration")?;
     conn.execute(
@@ -1630,7 +1690,7 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
 
     tracing::info!(
         backend = pool.backend_name(),
-        migrations = POSTGRES_MIGRATIONS.len(),
+        migrations = POSTGRES_MIGRATIONS.len() + POSTGRES_POST_JOBS_MIGRATIONS.len(),
         "migrations applied"
     );
     Ok(())
@@ -1676,15 +1736,28 @@ mod blocking_boundary_tests {
 
 #[cfg(test)]
 mod postgres_migration_tests {
-    use super::POSTGRES_MIGRATIONS;
+    use super::POSTGRES_POST_JOBS_MIGRATIONS;
 
     #[test]
     fn candidate_events_are_part_of_runtime_postgres_migrations() {
-        let (_, sql) = POSTGRES_MIGRATIONS
+        let (_, sql) = POSTGRES_POST_JOBS_MIGRATIONS
             .iter()
             .find(|(version, _)| *version == "005_jobs_candidate_events.sql")
             .expect("candidate event migration must run before Jobs routes are served");
 
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS jobs_candidate_events"));
+    }
+
+    #[test]
+    fn resume_generations_are_part_of_runtime_postgres_migrations() {
+        let (_, sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == "007_jobs_resume_generations.sql")
+            .expect("resume generation migration must run before Jobs routes are served");
+
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS jobs_resume_generations"));
+        assert!(sql.contains("UNIQUE(account_id, generation_key)"));
+        assert!(sql.contains("reservation_token TEXT NOT NULL"));
+        assert!(sql.contains("created_at_ms BIGINT"));
     }
 }

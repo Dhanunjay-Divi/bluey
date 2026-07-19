@@ -224,12 +224,14 @@ async fn free_pro_cloud_runner_entitlement_matrix_is_enforced() {
         "BLUEY_JOBS_BETA_ENABLED",
         "BLUEY_JOBS_DATA_KEY",
         "BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED",
+        "BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED",
         "BLUEY_JOBS_WORKFLOW_ORIGIN",
         "BLUEY_JOBS_WORKFLOW_TOKEN",
     ]);
     std::env::set_var("BLUEY_JOBS_BETA_ENABLED", "1");
     std::env::set_var("BLUEY_JOBS_DATA_KEY", JOBS_DATA_KEY);
     std::env::set_var("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED", "1");
+    std::env::set_var("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED", "1");
     std::env::remove_var("BLUEY_JOBS_WORKFLOW_ORIGIN");
     std::env::remove_var("BLUEY_JOBS_WORKFLOW_TOKEN");
 
