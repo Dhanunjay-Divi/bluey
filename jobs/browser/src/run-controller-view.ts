@@ -78,6 +78,23 @@ export class RunControllerView {
 
   showCompleted(run: RunDisplay, submitted: boolean, paused: boolean): void {
     this.clearFocus(run.runId);
+    const remainingRuns = this.activeRuns();
+    const nextRun = remainingRuns.find((candidate) => candidate.interventionKind)
+      ?? remainingRuns[0];
+    if (nextRun) {
+      if (nextRun.interventionKind) {
+        this.showNeedsYou(nextRun, remainingRuns.length);
+      } else {
+        this.showRunning(
+          nextRun,
+          remainingRuns.length,
+          1,
+          paused,
+          "Another reviewed application is still in progress.",
+        );
+      }
+      return;
+    }
     this.show(completedControllerState({
       submitted,
       backgroundEnabled: this.shell.backgroundEnabled,

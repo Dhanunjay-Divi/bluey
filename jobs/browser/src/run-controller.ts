@@ -14,10 +14,10 @@ import {
   type ExecutionResult,
 } from "@bluey/jobs-automation";
 import {
-  durableFinalSubmitHooks,
   finalSubmitMarkerExists,
   recordReconciledSubmitConfirmation,
 } from "./irreversible-submit.js";
+import { authorizedFinalSubmitHooks } from "./authorized-final-submit.js";
 import {
   classifyLocalFailure,
   LocalBrowserError,
@@ -199,7 +199,7 @@ async function executeLocalRequestSingleFlight(
   );
   await checkpointActiveLocalRun(request.runId, "prepared", "prepared");
   const browserPage = new PlaywrightBrowserPage(page);
-  const durableHooks = durableFinalSubmitHooks(runDirectory);
+  const durableHooks = authorizedFinalSubmitHooks(runDirectory, delivery);
   const finalSubmitHooks = {
     async beforeFinalSubmit() {
       // The exclusive marker is written first. A crash before the encrypted
