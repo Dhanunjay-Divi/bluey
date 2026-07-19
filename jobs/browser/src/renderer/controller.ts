@@ -1,4 +1,5 @@
 import type { ControllerViewState } from "../controller-contract.js";
+import { backgroundAvailabilityDetail } from "./background-copy.js";
 
 const elements = {
   statusCard: required<HTMLElement>("status-card"),
@@ -83,9 +84,7 @@ function render(state: ControllerViewState): void {
   elements.backgroundTitle.textContent = state.loginItemSupported
     ? "Start at sign-in and keep available"
     : "Keep available in the background";
-  elements.backgroundDetail.textContent = state.loginItemSupported
-    ? "Closing this window hides it to the tray. It starts quietly at sign-in and runs only while this computer is awake."
-    : "Closing this window hides it to the tray. Start-at-sign-in is not managed on this system.";
+  elements.backgroundDetail.textContent = backgroundAvailabilityDetail(state);
 
   const announcement = `${statusLabel(state.status)}. ${state.title}`;
   if (announcement !== lastAnnouncement) {
