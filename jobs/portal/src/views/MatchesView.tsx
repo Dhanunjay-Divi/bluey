@@ -345,15 +345,15 @@ function capabilityDescription(capability: ReturnType<typeof jobEligibility>["ca
 
 const DAY_MS = 86_400_000;
 
-function isRecentPosting(job: JobPosting, maximumAgeDays: number): boolean {
-  const timestamp = job.posted_at_ms || job.created_at_ms;
-  if (!timestamp) return false;
+export function isRecentPosting(job: JobPosting, maximumAgeDays: number): boolean {
+  const timestamp = job.posted_at_ms;
+  if (!timestamp) return job.availability_status !== "expired";
   return Date.now() - timestamp <= Math.max(1, maximumAgeDays) * DAY_MS;
 }
 
-function postingAgeLabel(job: JobPosting): string {
-  const timestamp = job.posted_at_ms || job.created_at_ms;
-  if (!timestamp) return "Recently found";
+export function postingAgeLabel(job: JobPosting): string {
+  const timestamp = job.posted_at_ms;
+  if (!timestamp) return "Posting date not listed";
   const ageDays = Math.max(0, Math.floor((Date.now() - timestamp) / DAY_MS));
   if (ageDays === 0) return "Posted today";
   if (ageDays === 1) return "Posted yesterday";

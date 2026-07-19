@@ -198,7 +198,9 @@ export default function App() {
       setWorkspace((current) =>
         current ? { ...current, matches: [saved, ...current.matches.filter((item) => item.id !== saved.id)] } : current,
       );
-      setToast("Job added. Bluey scored it against your profile.");
+      setToast(isPreview
+        ? "Preview mode cannot verify live job facts. Sign in to import and check this listing."
+        : "Job added. Bluey scored it against your profile.");
       return saved;
     },
     [],

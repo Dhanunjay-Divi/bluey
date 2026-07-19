@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import type { DiscoverySource, DiscoverySourceHealth } from "../types";
+import type { DiscoverySource, DiscoverySourceHealth, JobPosting } from "../types";
 import {
   DiscoverySourceHealthList,
   JOB_IMPORT_ACTION_LABEL,
@@ -8,6 +8,8 @@ import {
   JOB_IMPORT_FALLBACK_LABEL,
   discoverySourceAction,
   discoverySourceState,
+  isRecentPosting,
+  postingAgeLabel,
 } from "./MatchesView";
 
 function source(status: DiscoverySource["status"], health: DiscoverySourceHealth): DiscoverySource {
@@ -50,5 +52,16 @@ describe("job-link import", () => {
     expect(JOB_IMPORT_DESCRIPTION).toContain("checks freshness");
     expect(JOB_IMPORT_FALLBACK_LABEL).toBe("Can't import this link? Enter details manually");
     expect(JOB_IMPORT_ACTION_LABEL).toBe("Import & score");
+  });
+
+  it("does not present Bluey's import time as the employer posting date", () => {
+    const job = {
+      availability_status: "unknown",
+      created_at_ms: Date.now(),
+      posted_at_ms: null,
+    } as unknown as JobPosting;
+
+    expect(postingAgeLabel(job)).toBe("Posting date not listed");
+    expect(isRecentPosting(job, 14)).toBe(true);
   });
 });

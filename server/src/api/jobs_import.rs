@@ -114,7 +114,16 @@ fn lever_job_from_payload(
             }
         }
     }
-    push_text(&mut sections, payload.get("additionalPlain"));
+    if let Some(additional) = payload
+        .get("additionalPlain")
+        .or_else(|| payload.get("additional"))
+        .and_then(Value::as_str)
+    {
+        let plain = strip_html(additional);
+        if !plain.is_empty() {
+            sections.push(plain);
+        }
+    }
 
     Ok(ImportedJob {
         source: "lever_import".to_string(),
@@ -818,6 +827,7 @@ mod tests {
             "categories": { "location": "Sunnyvale, CA", "commitment": "Full-time" },
             "descriptionPlain": "Build Java services on AWS.",
             "lists": [{ "text": "What you bring", "content": "<li>Java</li><li>AWS</li>" }],
+            "additional": "<div>Visa Sponsorship</div><div>This position is eligible for visa sponsorship.</div>",
             "salaryRange": { "min": 150000, "max": 220000, "currency": "USD", "interval": "year" }
         });
         let imported =
@@ -831,6 +841,9 @@ mod tests {
         assert_eq!(imported.employment_type, "full_time");
         assert!(imported.description.contains("Build Java services on AWS."));
         assert!(imported.description.contains("What you bring"));
+        assert!(imported
+            .description
+            .contains("This position is eligible for visa sponsorship."));
     }
 
     #[test]

@@ -30,7 +30,10 @@ describe("public ATS discovery", () => {
         hostedUrl: "https://boards.greenhouse.io/acme/jobs/10",
         categories: { location: "New York, NY", department: "Engineering" },
         descriptionPlain: "Duplicate feed entry",
+        lists: [{ text: "Experience", content: "<li>Build reliable systems</li>" }],
+        additional: "<div>Visa Sponsorship</div><div>This position is eligible for visa sponsorship.</div>",
         createdAt: Date.now(),
+        salaryRange: { min: 150000, max: 450000, currency: "USD", interval: "per-year-salary" },
       }]);
     });
     const provider = new PublicAtsDiscoveryProvider({ fetch: fetcher, sleep: async () => undefined });
@@ -53,6 +56,10 @@ describe("public ATS discovery", () => {
       department: "Engineering",
     });
     expect(page.jobs[0]?.canonicalUrl).not.toContain("gh_src");
+    expect(page.jobs.find((job) => job.source === "lever")?.compensation)
+      .toBe("USD 150000-450000 per-year-salary");
+    expect(page.jobs.find((job) => job.source === "lever")?.description)
+      .toContain("This position is eligible for visa sponsorship.");
   });
 
   it("uses bounded Workday pagination and a pinned POST target", async () => {

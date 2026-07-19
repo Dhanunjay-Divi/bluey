@@ -3614,6 +3614,8 @@ fn build_job_eligibility(
                 "sponsorship_unavailable",
                 "This job appears to reject sponsorship.",
             );
+        } else if clearly_offers_sponsorship(posting) {
+            passed_checks.push("sponsorship_available".to_string());
         } else {
             push_reason(
                 &mut review_reasons,
@@ -3622,11 +3624,15 @@ fn build_job_eligibility(
             );
         }
     } else if preferences.sponsorship == "ask" {
-        push_reason(
-            &mut review_reasons,
-            "sponsorship_answer_required",
-            "Confirm the sponsorship answer before Auto-submit.",
-        );
+        if clearly_offers_sponsorship(posting) {
+            passed_checks.push("sponsorship_available".to_string());
+        } else {
+            push_reason(
+                &mut review_reasons,
+                "sponsorship_answer_required",
+                "Confirm the sponsorship answer before Auto-submit.",
+            );
+        }
     } else {
         passed_checks.push("sponsorship_policy_passed".to_string());
     }
@@ -3987,6 +3993,24 @@ fn clearly_blocks_sponsorship(posting: &JobPosting) -> bool {
         "must be a us citizen",
         "must be u.s. citizen",
         "must be us citizen",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+fn clearly_offers_sponsorship(posting: &JobPosting) -> bool {
+    let text = format!("{} {}", posting.title, posting.description).to_lowercase();
+    [
+        "eligible for visa sponsorship",
+        "eligible for sponsorship",
+        "visa sponsorship is available",
+        "visa sponsorship available",
+        "sponsorship is available",
+        "sponsorship available",
+        "we provide visa sponsorship",
+        "we offer visa sponsorship",
+        "will sponsor visas",
+        "can sponsor visas",
     ]
     .iter()
     .any(|phrase| text.contains(phrase))
@@ -11613,6 +11637,39 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("sponsorship"));
+
+        let mut sponsorship_available = test_posting(
+            "https://jobs.lever.co/ifm-us/1454349c-eb2b-480b-9a57-edfbb2aeeffe",
+            now_ms(),
+            now_ms(),
+        );
+        sponsorship_available.source = "lever_import".to_string();
+        sponsorship_available.description =
+            "Visa Sponsorship\nThis position is eligible for visa sponsorship.".to_string();
+        sponsorship_available.compensation = "USD 150000-450000 per-year-salary".to_string();
+        let sponsorship_available = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &sponsorship_available,
+            &profile,
+            &preferences,
+        )
+        .unwrap();
+        let eligibility = evaluate_job_eligibility(
+            &pool,
+            "acct-jobs",
+            &sponsorship_available,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(eligibility
+            .passed_checks
+            .contains(&"sponsorship_available".to_string()));
+        assert!(!eligibility
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code.starts_with("sponsorship_")));
     }
 
     #[test]

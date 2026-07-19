@@ -173,8 +173,9 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
         title: asString(item.text),
         location: asString(categories.location || item.location),
         workplace: asString(item.workplaceType),
-        description: asString(item.descriptionPlain || item.description),
+        description: leverDescription(item),
         postedAt: asOptionalString(item.createdAt),
+        compensation: leverCompensation(item.salaryRange),
         department: asString(categories.department || categories.team),
       });
     });
@@ -388,6 +389,29 @@ function normalizeJob(source: AtsKind, raw: RawJob): NormalizedJob {
     compensation: raw.compensation,
     department: raw.department || undefined,
   };
+}
+
+function leverCompensation(value: unknown): string | undefined {
+  const range = asRecord(value);
+  const minimum = Number(range.min);
+  const maximum = Number(range.max);
+  if (!Number.isFinite(minimum) && !Number.isFinite(maximum)) return undefined;
+  const currency = asString(range.currency) || "USD";
+  const interval = asString(range.interval);
+  const bounds = Number.isFinite(minimum) && Number.isFinite(maximum)
+    ? `${Math.round(minimum)}-${Math.round(maximum)}`
+    : String(Math.round(Number.isFinite(minimum) ? minimum : maximum));
+  return `${currency} ${bounds}${interval ? ` ${interval}` : ""}`;
+}
+
+function leverDescription(item: Record<string, unknown>): string {
+  const sections = [asString(item.descriptionPlain || item.description)];
+  for (const value of asArray(item.lists)) {
+    const section = asRecord(value);
+    sections.push(asString(section.text), asString(section.content));
+  }
+  sections.push(asString(item.additionalPlain || item.additional));
+  return sections.filter(Boolean).join("\n\n");
 }
 
 function matchesQuery(job: NormalizedJob, query: DiscoveryQuery): boolean {
