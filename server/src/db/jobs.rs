@@ -3981,11 +3981,25 @@ fn clearly_blocks_sponsorship(posting: &JobPosting) -> bool {
         "not sponsor",
         "does not sponsor",
         "do not sponsor",
+        "don't sponsor",
+        "not able to sponsor",
         "without sponsorship",
         "must be authorized to work",
         "will not sponsor",
         "cannot sponsor",
         "unable to sponsor",
+        "not eligible for visa sponsorship",
+        "not eligible for sponsorship",
+        "ineligible for visa sponsorship",
+        "ineligible for sponsorship",
+        "no visa sponsorship available",
+        "no visa sponsorship is available",
+        "no sponsorship available",
+        "no sponsorship is available",
+        "visa sponsorship is not available",
+        "visa sponsorship not available",
+        "sponsorship is not available",
+        "sponsorship not available",
         "sponsorship unavailable",
         "u.s. citizenship required",
         "us citizenship required",
@@ -3999,6 +4013,9 @@ fn clearly_blocks_sponsorship(posting: &JobPosting) -> bool {
 }
 
 fn clearly_offers_sponsorship(posting: &JobPosting) -> bool {
+    if clearly_blocks_sponsorship(posting) {
+        return false;
+    }
     let text = format!("{} {}", posting.title, posting.description).to_lowercase();
     [
         "eligible for visa sponsorship",
@@ -9838,6 +9855,65 @@ mod tests {
     }
 
     #[test]
+    fn sponsorship_detection_never_treats_explicit_rejections_as_offers() {
+        let mut posting = test_posting("https://jobs.example.com/role", now_ms(), now_ms());
+        for rejection in [
+            "This position is not eligible for visa sponsorship.",
+            "No visa sponsorship available for this role.",
+            "No visa sponsorship is available for this role.",
+            "This position is ineligible for sponsorship.",
+            "Visa sponsorship is not available.",
+        ] {
+            posting.description = rejection.to_string();
+            assert!(clearly_blocks_sponsorship(&posting), "{rejection}");
+            assert!(!clearly_offers_sponsorship(&posting), "{rejection}");
+        }
+
+        posting.description = "This position is eligible for visa sponsorship.".to_string();
+        assert!(!clearly_blocks_sponsorship(&posting));
+        assert!(clearly_offers_sponsorship(&posting));
+    }
+
+    #[test]
+    fn sponsorship_rejections_remain_fail_closed_for_required_and_ask_policies() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let mut preferences = JobPreferences {
+            sponsorship: "required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+
+        let mut posting = test_posting(
+            "https://jobs.example.com/sponsorship-policy",
+            now_ms(),
+            now_ms(),
+        );
+        posting.description = "No visa sponsorship is available for this role.".to_string();
+        let posting = upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+        let required = evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
+        assert!(required
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "sponsorship_unavailable"));
+        assert!(!required
+            .passed_checks
+            .contains(&"sponsorship_available".to_string()));
+
+        preferences.sponsorship = "ask".to_string();
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let ask = evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
+        assert!(ask
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "sponsorship_answer_required"));
+        assert!(!ask
+            .passed_checks
+            .contains(&"sponsorship_available".to_string()));
+    }
+
+    #[test]
     fn search_pace_and_auto_submit_gate_are_server_owned() {
         let pool = test_pool();
         let mut profile = default_profile("jobs@example.com");
@@ -11655,14 +11731,9 @@ mod tests {
             &preferences,
         )
         .unwrap();
-        let eligibility = evaluate_job_eligibility(
-            &pool,
-            "acct-jobs",
-            &sponsorship_available,
-            true,
-            None,
-        )
-        .unwrap();
+        let eligibility =
+            evaluate_job_eligibility(&pool, "acct-jobs", &sponsorship_available, true, None)
+                .unwrap();
         assert!(eligibility
             .passed_checks
             .contains(&"sponsorship_available".to_string()));

@@ -114,14 +114,14 @@ fn lever_job_from_payload(
             }
         }
     }
-    if let Some(additional) = payload
-        .get("additionalPlain")
-        .or_else(|| payload.get("additional"))
-        .and_then(Value::as_str)
-    {
+    for field in ["additionalPlain", "additional"] {
+        let Some(additional) = payload.get(field).and_then(Value::as_str) else {
+            continue;
+        };
         let plain = strip_html(additional);
         if !plain.is_empty() {
             sections.push(plain);
+            break;
         }
     }
 
@@ -844,6 +844,38 @@ mod tests {
         assert!(imported
             .description
             .contains("This position is eligible for visa sponsorship."));
+    }
+
+    #[test]
+    fn lever_payload_falls_back_when_additional_plain_has_no_text() {
+        let url = Url::parse("https://jobs.lever.co/acme/job-123").unwrap();
+        for additional_plain in [
+            Value::Null,
+            Value::String(String::new()),
+            Value::String("<div></div>".to_string()),
+        ] {
+            let mut payload = serde_json::json!({
+                "text": "Platform Engineer",
+                "additional": "<div>Fallback sponsorship details.</div>"
+            });
+            payload["additionalPlain"] = additional_plain;
+
+            let imported =
+                lever_job_from_payload(&url, "job-123", "Acme".to_string(), &payload).unwrap();
+            assert!(imported
+                .description
+                .contains("Fallback sponsorship details."));
+        }
+
+        let payload = serde_json::json!({
+            "text": "Platform Engineer",
+            "additionalPlain": "Preferred plain details.",
+            "additional": "<div>Fallback details that must not be duplicated.</div>"
+        });
+        let imported =
+            lever_job_from_payload(&url, "job-123", "Acme".to_string(), &payload).unwrap();
+        assert!(imported.description.contains("Preferred plain details."));
+        assert!(!imported.description.contains("Fallback details"));
     }
 
     #[test]
