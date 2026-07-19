@@ -20057,7 +20057,7 @@ fn macos_overlay_capture_visible_for_debug() -> bool {
     }
 }
 
-#[cfg(all(target_os = "macos", debug_assertions))]
+#[cfg(all(target_os = "macos", any(debug_assertions, test)))]
 fn macos_overlay_capture_visible_allowed(
     dev_gate: bool,
     capture_requested: bool,

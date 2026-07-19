@@ -21,7 +21,11 @@ pub fn load_api_key(provider: &str) -> Result<Option<String>> {
 
 pub fn delete_api_key(provider: &str) -> Result<()> {
     let entry = keyring::Entry::new(SERVICE, &format!("stt_{provider}"))?;
-    match entry.delete_password() {
+    normalize_delete_result(entry.delete_password())
+}
+
+fn normalize_delete_result(result: keyring::Result<()>) -> Result<()> {
+    match result {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.into()),
@@ -51,10 +55,7 @@ mod tests {
 
     fn delete_test(provider: &str) -> Result<()> {
         let entry = keyring::Entry::new(TEST_SERVICE, &format!("stt_{provider}"))?;
-        match entry.delete_password() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        normalize_delete_result(entry.delete_password())
     }
 
     #[test]
@@ -69,12 +70,13 @@ mod tests {
         assert_eq!(load_test(provider).unwrap(), None);
     }
 
-    #[cfg_attr(
-        not(any(target_os = "macos", target_os = "windows")),
-        ignore = "requires a desktop keyring backend"
-    )]
     #[test]
-    fn delete_nonexistent_is_ok() {
-        assert!(delete_test("nonexistent_provider_xyz").is_ok());
+    fn delete_missing_result_is_ok_without_platform_access() {
+        assert!(normalize_delete_result(Err(keyring::Error::NoEntry)).is_ok());
+        assert!(normalize_delete_result(Err(keyring::Error::Invalid(
+            "account".to_string(),
+            "test failure".to_string(),
+        )))
+        .is_err());
     }
 }
