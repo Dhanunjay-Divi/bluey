@@ -58,8 +58,8 @@ inline bool parse_int32(const wchar_t* value, int* result) {
   wchar_t* end = nullptr;
   const long long parsed = std::wcstoll(value, &end, 10);
   if (errno == ERANGE || end == value || end == nullptr || *end != L'\0' ||
-      parsed < std::numeric_limits<int>::min() ||
-      parsed > std::numeric_limits<int>::max()) {
+      parsed < (std::numeric_limits<int>::min)() ||
+      parsed > (std::numeric_limits<int>::max)()) {
     return false;
   }
   *result = static_cast<int>(parsed);

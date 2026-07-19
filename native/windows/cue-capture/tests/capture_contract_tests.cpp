@@ -1,7 +1,13 @@
-#include "../capture_contract.h"
-
 #include <cstdio>
 #include <limits>
+
+// Match the function-like macros exposed by windows.h unless NOMINMAX is set.
+// The capture contract must remain safe regardless of its caller's include order.
+#define min(left, right) bluey_test_min_macro_must_not_expand
+#define max(left, right) bluey_test_max_macro_must_not_expand
+#include "../capture_contract.h"
+#undef max
+#undef min
 
 namespace {
 
