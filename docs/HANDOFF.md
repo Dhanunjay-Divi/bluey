@@ -1,8 +1,8 @@
 # Bluey Handoff
 
-> Current implementation handoff for `0.1.102`. Release acceptance and runtime
+> Current implementation handoff for `0.1.103`. Release acceptance and runtime
 > boundaries are recorded in
-> `docs/rounds/ROUND-527-CONTEXT-RECOVERY-UX-AND-ATOMIC-RELEASE.md`.
+> `docs/rounds/ROUND-548-BLUEY-STARTUP-OWNERSHIP-RECOVERY-AND-CROSS-PLATFORM-RELEASE.md`.
 
 This document is the quick-start map for the next agent or engineer picking up Bluey.
 
@@ -17,6 +17,10 @@ This document is the quick-start map for the next agent or engineer picking up B
 ## Current Working Path
 
 - `bluey on` starts a detached daemon and native overlay.
+- Startup repairs only exact same-session legacy `NULL`-owner projections;
+  every cross-account ownership mismatch remains fail-closed.
+- Overlay replacement is generation-fenced and becomes ready only after the
+  exact replacement process has received its complete ordered state.
 - Hidden/collapsed overlay stays hidden while passive cards arrive; the small Bluey pill restores it.
 - Questions entered in the bottom composer create a question card, route to the answer runtime, then create an answer card.
 - The overlay feed is chronological: `SYSTEM` and `MIC` transcript rows stream in as compact source-labeled cards, a submitted question appears as `YOU`, and the generated response appears next as `BLUEY`.

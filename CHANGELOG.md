@@ -5,7 +5,7 @@ under `docs/release/`.
 
 ## [Unreleased]
 
-## [0.1.103] - 2026-07-18
+## [0.1.103] - 2026-07-19
 
 ### Fixed
 
@@ -14,6 +14,12 @@ under `docs/release/`.
   state.
 - Kept account isolation fail-closed: startup only adopts an exact same-ID
   `NULL`-owner row and still rejects every non-null cross-account mismatch.
+- Made overlay restart readiness generation-scoped and dependent on complete,
+  ordered state hydration instead of process launch alone.
+- Kept programmatic overlay restoration from feeding back as a user preference
+  change, and fixed the Windows capture build under platform `min`/`max` macros.
+
+See `docs/release/RELEASE-v0.1.103.md` for release detail.
 
 ## [0.1.102] - 2026-07-16
 
