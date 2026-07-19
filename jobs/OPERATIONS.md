@@ -42,7 +42,11 @@ and browser pool share `BLUEY_JOBS_RUNNER_TOKEN`. Use independently generated
 BLUEY_JOBS_BETA_ENABLED=1
 BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0
 BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0
-BLUEY_JOBS_MODEL_GENERATION_ENABLED=1
+# Keep managed model generation disabled until provider credentials, the
+# global spend guard, and usage-ledger monitoring are verified in production.
+BLUEY_JOBS_MODEL_GENERATION_ENABLED=0
+BLUEY_UPSTREAM_SPEND_LIMIT_CENTS=1000
+BLUEY_UPSTREAM_SPEND_WINDOW_HOURS=24
 BLUEY_JOBS_WORKFLOW_ORIGIN=https://jobs-workflows.internal
 BLUEY_JOBS_WORKFLOW_TOKEN=<random secret>
 BLUEY_JOBS_WORKER_TOKEN=<random secret>
