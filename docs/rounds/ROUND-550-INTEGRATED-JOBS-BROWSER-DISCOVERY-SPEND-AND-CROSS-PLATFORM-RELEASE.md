@@ -1,6 +1,6 @@
 # Round 550 — Integrated Jobs, Browser, discovery, spend, and cross-platform release
 
-Status: exact seal deployed; publication-ready but not yet publicly released.
+Status: exact seal deployed and public terminal release complete.
 
 Date: 2026-07-19
 
@@ -9,9 +9,9 @@ Date: 2026-07-19
 This round converges the previously reviewed Bluey desktop, Jobs, Browser,
 public-ATS discovery, provider-spend, PostgreSQL migration, and maintainability
 work onto one sealed source. Exact macOS, physical Windows 11, PostgreSQL 18,
-Linux-server, Jobs, and independent audit gates passed, and that seal is now
-running in the controlled production beta. Public desktop publication remains
-separate and has not happened yet.
+Linux-server, Jobs, and independent audit gates passed; that seal is running in
+the controlled production beta; and the signed `0.1.104` terminal release is
+public.
 
 The release does not silently activate new automation. Production must retain:
 
@@ -21,10 +21,10 @@ BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0
 BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0
 ```
 
-The current public terminal release remains `0.1.103`; the sealed source and
-production servers target `0.1.104`. Linux is a server verification target
-only, not a public terminal or Bluey Browser artifact. Bluey Browser packages
-are test evidence only and are not part of the public terminal release.
+The current public terminal release is `0.1.104`, matching the sealed source and
+production servers. Linux is a server verification target only, not a public
+terminal or Bluey Browser artifact. Bluey Browser packages are test evidence
+only and are not part of the public terminal release.
 
 ## Scope and sealed-source provenance
 
@@ -199,9 +199,8 @@ transactional current-policy recheck at claim and immediately before Submit.
 ### P0 — release and truth gates
 
 1. Exact macOS, physical Windows, Linux-server, Jobs/portal, PostgreSQL,
-   artifact, and rollback gates passed. Public signed-manifest,
-   installer/updater, and website publication verification remains pending as
-   the final release step.
+   artifact, rollback, public signed-manifest, installer/updater, and website
+   publication gates passed.
 2. Preserve the three Jobs execution/generation flags at `0` after deploy and
    through public publication.
 3. Main API and Jobs API moved atomically from the same sealed source across
@@ -343,8 +342,8 @@ remains unresolved because the current credential returns `AccessDenied`.
 | Linux Jobs API | 21,364,968 | `687fc4834a08a53465bde64cb55336f931ae26acf3819139e221edb30a07bb2e` |
 | Jobs portal archive | 1,279,010 | `488b0f08f15f479b291f517901f99cd3a25562634051475ad8b67274263fbf3f` |
 
-All rows above are exact seal inputs. The local signed publication packet also
-verifies before upload:
+All rows above are exact seal inputs. The live signed publication packet also
+verifies:
 
 | Publication input | Bytes | SHA-256 |
 | --- | ---: | --- |
@@ -352,10 +351,21 @@ verifies before upload:
 | `latest.json.sig` | 88 | `9b70ccbf7894979d818e53fb20087682d234ef83b2a895929d8dc7dcc9f1c3b9` |
 | `install.sh` | 24,466 | `ced25c22f7d8cf58439bcd08e0563cb6f81d83a6ec93a3b443fdecaff1b74e57` |
 | `install.ps1` | 20,778 | `74de690c5eebf6a03cac6aafb2e00ab96b410fab9db919ecfc55ef1e111481b3` |
+| `SHA256SUMS.txt` | 559 | `a4afea050b33bf6cc7563d09bb2b930d89f58d2cad6d857b7e048ed3450f45a0` |
 
-The Ed25519 signature verifies locally. These are pre-publication identities,
-not a claim that the packet is live. Browser package hashes remain non-public
-test evidence and do not enter the terminal manifest.
+The Ed25519 signature verifies live, and the top-level public files are
+byte-identical to these inputs. Both installers and all four terminal artifacts
+were downloaded byte-identically from the immutable release directory. Browser
+package hashes remain non-public test evidence and do not enter the terminal
+manifest.
+
+The immutable release directory retains its sealed pre-publication
+`RELEASE.md`, 13,682 bytes with SHA-256
+`76e25d76075cbeae26fdc450deebffb43a61a66f54cff78dd6955e7f7d43006a`.
+Its stale status language is preserved as part of that audit packet rather than
+rewritten after signing. The signed manifest's `release_notes_url` still links
+to that note, so the public link retains stale status language; this round
+records the post-publication state without altering the link.
 
 Archive reproduction has a precise boundary: rerunning packaging from the same
 final built outputs produced byte-identical archives, while independent clean
@@ -383,12 +393,29 @@ Post-rollout identity:
 | Service stability | Main and Jobs `NRestarts=0`; public health reports exact seal |
 | Spend / execution | 1,000 cents per 24 hours; model/local/cloud Jobs flags all `0`; all measured aggregates `0` |
 
-No immutable desktop artifact, signed manifest, detached signature, or public
-installer has been uploaded yet. The website terminal fallback has not been
-updated. Publication must upload and verify the artifacts and signed manifest
-first, smoke the public installers/updater, and only then update the website.
-Consequently `0.1.103` remains the public terminal release even though the
-controlled production services run the `0.1.104` seal.
+Public publication followed the required order. The immutable desktop
+artifacts, installers, signed manifest, and detached signature were uploaded
+and verified before the website terminal fallback moved to `0.1.104`. Live
+verification passed for all four artifact hashes and both installers. An
+isolated no-sudo macOS smoke with optional local tools skipped installed
+`0.1.104`, followed by an equivalently isolated signed updater run from
+immutable `0.1.103` to public `0.1.104`; secure stores remained disabled and
+neither smoke left a residual process. Full helper/runtime coverage remains the
+earlier exact-artifact gate. The PowerShell installer was hash/content-type
+verified, while its execution evidence remains the earlier physical Windows 11
+exact-artifact gate. The website origin `index.html` is
+byte-identical to the repository file with SHA-256
+`80c2d1136960bfd341806a1179a25bd325da6a15d63295a391faeaa60134bf70`.
+At final verification, the proxied response differed from the origin file only
+by Cloudflare email-protection/challenge markup and retained the visible
+`0.1.104` copy.
+
+The final 2026-07-19 post-site stability snapshot kept the PIDs and binary
+hashes in the table above, reported `NRestarts=0`, retained the
+1,000-cent/24-hour cap and all
+three Jobs flags at `0`, and found six measured active-work aggregates at `0`
+with 2,681 usage events. Public and loopback health reported the exact seal;
+protected account and Jobs routes returned `401`.
 
 ## Feature flags and explicit non-claims
 
@@ -440,20 +467,21 @@ controlled production services run the `0.1.104` seal.
 - [x] Exact integrated seal reaches `origin/main`.
 - [x] Production backup and rollback inputs are verified.
 - [x] Main API and Jobs API deploy atomically with all Jobs flags at `0`.
-- [ ] Immutable desktop artifacts and signed manifest publish before the
+- [x] Immutable desktop artifacts and signed manifest publish before the
       `0.1.104` website fallback.
 - [x] Live health, versions, hashes, flags, and `NRestarts` are verified.
-- [x] Round 549 and this round are updated with exact pre-publication rollout
-      evidence.
+- [x] Round 549 and this round are updated with exact final rollout and public
+      release evidence.
 - [ ] The continuation Codex receives the final main/deploy handoff.
 
 ## Concrete implementation handoff
 
-The next agent must start from the final main commit recorded here after
-publication, verify a clean worktree and live flags, and must not resurrect a
-stale branch. Its first Jobs work item is the owner-approved Career Track and
-tailoring policy: non-overlapping relevant months, a default -1/+2-year window,
-required-versus-preferred experience, seniority and role-family guards, hard
+The next agent must start from the then-current `origin/main` named in the
+continuation message, verify a clean worktree and live flags, and must not
+resurrect a stale branch. Its first Jobs work item is the owner-approved Career
+Track and tailoring policy: non-overlapping relevant months, a default
+`-1/+2-year` window, required-versus-preferred experience, seniority and
+role-family guards, hard
 employment/authorization filters, immutable evidence provenance, separate
 profile-fit and tailored-packet-coverage scores, and server-owned auto-submit
 eligibility. That work needs schema, API, scoring, portal, and acceptance tests
@@ -482,8 +510,6 @@ GitHub Actions is covered only by the documented infrastructure waiver: every
 job had zero steps because the account Actions budget prevented it from
 starting. No GitHub job is represented as green.
 
-Still required for public release: sign and publish the immutable desktop
-manifest and artifacts, verify the public installers and updater, update the
-website terminal fallback afterward, record the resulting hashes/evidence, and
-send the continuation handoff. Until then, deployment is live but `0.1.104`
-remains unpublished.
+Public release is complete. The remaining coordination step is to send the
+continuation task the exact final `origin/main`, deployed seal, live hashes,
+disabled flags, infrastructure waiver, recovery residuals, and P0 roadmap.

@@ -1,11 +1,11 @@
 # Bluey Release v0.1.104
 
-Release candidate: 2026-07-19
+Released: 2026-07-19
 
-Audience: controlled production beta
+Audience: public desktop terminal release and controlled production server beta
 
-Status: deployed to the controlled production beta; publication-ready but not
-yet publicly released
+Status: publicly released; exact server seal deployed with Jobs generation and
+Browser distribution disabled
 
 ## Sealed Source
 
@@ -116,18 +116,17 @@ their own canaries and operator approvals pass.
 
 | Platform | Status | Bytes | SHA-256 |
 | --- | --- | ---: | --- |
-| macOS arm64 | Exact sealed artifact; installed-runtime gate passed | 22,022,647 | `dfddcc30b78cd2819777ca8c8551a43443fc513bafdd630b14cbecb476892b95` |
-| macOS x86_64 | Exact sealed artifact; Rosetta gate passed | 23,391,529 | `bd28eb0fe683b90c070776f50e70c563cd5fa9c5cca241004d81b80de390caa4` |
-| macOS universal | Exact sealed artifact; native and Rosetta gates passed | 45,418,523 | `b842b6e31a52a749ce3011bf1717a4a0e5f321a0dd7c531bc94167ca8e6cc12c` |
-| Windows x86_64 | Exact sealed artifact; physical Windows 11 gate passed | 22,617,970 | `3887013440ed1cd5c55a6656fae6ef36b6bb1dc42a0625c752e21268b4670a23` |
+| macOS arm64 | Public; exact sealed artifact; installed-runtime gate passed | 22,022,647 | `dfddcc30b78cd2819777ca8c8551a43443fc513bafdd630b14cbecb476892b95` |
+| macOS x86_64 | Public; exact sealed artifact; Rosetta gate passed | 23,391,529 | `bd28eb0fe683b90c070776f50e70c563cd5fa9c5cca241004d81b80de390caa4` |
+| macOS universal | Public; exact sealed artifact; native and Rosetta gates passed | 45,418,523 | `b842b6e31a52a749ce3011bf1717a4a0e5f321a0dd7c531bc94167ca8e6cc12c` |
+| Windows x86_64 | Public; exact sealed artifact; physical Windows 11 gate passed | 22,617,970 | `3887013440ed1cd5c55a6656fae6ef36b6bb1dc42a0625c752e21268b4670a23` |
 | Linux desktop | Not published | — | — |
 
 Bluey Browser package hashes are test evidence only and do not enter the public
-terminal manifest. The immutable terminal artifacts and signed manifest have
-not yet been uploaded, so these rows are sealed inputs rather than a claim that
-`0.1.104` is publicly available.
+terminal manifest. The four terminal artifacts above are live and downloaded
+byte-identically from the public immutable release directory.
 
-The local publication packet is also sealed and its Ed25519 signature verifies:
+The live publication packet is sealed and its Ed25519 signature verifies:
 
 | Publication input | Bytes | SHA-256 |
 | --- | ---: | --- |
@@ -135,8 +134,28 @@ The local publication packet is also sealed and its Ed25519 signature verifies:
 | `latest.json.sig` | 88 | `9b70ccbf7894979d818e53fb20087682d234ef83b2a895929d8dc7dcc9f1c3b9` |
 | `install.sh` | 24,466 | `ced25c22f7d8cf58439bcd08e0563cb6f81d83a6ec93a3b443fdecaff1b74e57` |
 | `install.ps1` | 20,778 | `74de690c5eebf6a03cac6aafb2e00ab96b410fab9db919ecfc55ef1e111481b3` |
+| `SHA256SUMS.txt` | 559 | `a4afea050b33bf6cc7563d09bb2b930d89f58d2cad6d857b7e048ed3450f45a0` |
 
-These are pre-publication identities, not a claim that the files are live.
+The top-level public manifest, signature, and installers are byte-identical to
+these inputs. `scripts/bluey-release-live-verify.sh 0.1.104` passed against the
+live site, including immutable installer identity and the unpacked arm64 binary
+version. An isolated no-sudo macOS smoke with optional local tools skipped
+installed `0.1.104`, and an equivalently isolated `0.1.103` installation updated
+through the signed public manifest to `0.1.104`. Full installed-runtime/helper
+coverage comes from the earlier exact-artifact gate. The public PowerShell
+installer and Windows artifact were verified byte-identically after the earlier
+physical Windows 11 exact-artifact gate; this record does not claim that the
+public PowerShell script itself was executed.
+
+The immutable release directory retains the publication packet's sealed
+pre-publication `RELEASE.md` (13,682 bytes, SHA-256
+`76e25d76075cbeae26fdc450deebffb43a61a66f54cff78dd6955e7f7d43006a`).
+Its old status language was not rewritten after publication because doing so
+would mutate that audit packet. The signed manifest's `release_notes_url` still
+links to that immutable note, so the public link retains stale status language.
+This repository document records the post-publication state without altering
+that link; a future publisher should generate the public status note at the
+publication boundary.
 
 Reproducibility is stated narrowly. Repackaging the same final built outputs
 reproduced each immutable archive byte-for-byte, and the Rust CLI/daemon plus
@@ -189,11 +208,15 @@ not a green check and not a product-test failure; equivalent or stronger exact
 macOS, physical Windows, Linux, Jobs, server, and PostgreSQL gates supplied the
 required evidence.
 
-Public release remains pending only on publishing the immutable desktop
-artifacts and signed manifest, verifying the public installers/updater against
-that manifest, and then updating the website terminal fallback. Until those
-steps complete, `0.1.103` remains the public release and `0.1.104` must not be
-advertised as downloadable.
+Public release is complete. The signed manifest advertises `0.1.104`; both
+installers and all four public platform artifacts match the sealed identities;
+the fresh public macOS install and signed `0.1.103` to `0.1.104` updater path
+passed; and the website terminal fallback was published only afterward. The
+origin `index.html` is byte-identical to the repository file with SHA-256
+`80c2d1136960bfd341806a1179a25bd325da6a15d63295a391faeaa60134bf70`.
+At final verification, the proxied response differed from the origin file only
+by Cloudflare email-protection/challenge markup and retained the visible
+`0.1.104` release copy.
 
 ## Security And Privacy
 
@@ -223,7 +246,7 @@ Production deployed the exact code/artifact seal during a full ingress outage.
 Paid dispatch was held closed and all measured work aggregates were `0` before
 the matching main API, Jobs API, and portal moved together across migrations
 008, 009, and 010. The four replay-safe data markers were present afterward.
-Current verified identity is:
+The final 2026-07-19 post-publication snapshot recorded:
 
 - main API PID `2217136`, SHA-256
   `7704fb8d279d1d64af15646f19d14a657ed36d5144fcf89d98ac0e8bad593888`;
@@ -231,13 +254,18 @@ Current verified identity is:
   `687fc4834a08a53465bde64cb55336f931ae26acf3819139e221edb30a07bb2e`;
 - Caddy PID `2217438` and Jobs portal `index.html` SHA-256
   `309c555e40ed568a84c79e681e93756758392d3cf0762e9fc10e32fc1cb08ca3`;
-- both services at `NRestarts=0`, public health reporting the exact seal,
+- both APIs at `NRestarts=0`, public health reporting the exact seal,
   upstream cap 1,000 cents per 24 hours, and all three Jobs flags at `0`.
 
-The locally staged signed-manifest, detached-signature, and installer hashes are
-recorded above and verify. Public upload, live installer/updater smokes, and
-website publication remain pending. The website terminal fallback has not been
-updated.
+The public signed manifest, detached signature, installers, and four terminal
+artifacts match the hashes above. Live signature verification, an isolated
+no-sudo macOS install with optional local tools skipped, an equivalently
+isolated signed `0.1.103` to `0.1.104` updater run, and the subsequent website
+publication all passed. Full helper/runtime coverage remains the earlier
+exact-artifact gate. A final stability check found both APIs and
+Caddy still at the PIDs above with `NRestarts=0`, the six measured active-work
+aggregates at `0`, 2,681 usage events, the 1,000-cent/24-hour cap effective, and
+all three Jobs flags at `0`.
 
 Rollback is symmetric and outage-bound: stop ingress and both APIs, then never
 run an older paid dispatcher against the migrated authority schema merely

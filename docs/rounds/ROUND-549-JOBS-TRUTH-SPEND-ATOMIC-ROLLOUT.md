@@ -1,6 +1,6 @@
 # Round 549 — Jobs truth/spend atomic rollout
 
-Status: exact code/artifact seal deployed; desktop publication pending.
+Status: exact code/artifact seal deployed and public desktop release complete.
 
 Code/artifact seal: commit
 `53c258cf843599f595a1e250d1872d191638d57a`, tree
@@ -196,11 +196,11 @@ After the full-ingress maintenance window:
   24 hours, all three Jobs flags are `0`, and all measured aggregates remain
   `0`.
 
-Deployment is complete. Public `0.1.104` desktop artifacts, signed manifest,
-installer/updater verification, and the website terminal fallback remain
-pending, so `0.1.104` is not yet a public release.
+Deployment and public desktop publication are complete. The signed manifest
+advertises `0.1.104`, all four public platform artifacts match the seal, and the
+website terminal fallback was updated only after installer and updater checks.
 
-The signed publication packet is locally sealed before upload: `latest.json`
+The signed publication packet is live: `latest.json`
 SHA-256 `b97a6090d93d69c14455d63c9ff354de997f7a2abb99c8417cc81a3cf4f4f716`,
 detached signature SHA-256
 `9b70ccbf7894979d818e53fb20087682d234ef83b2a895929d8dc7dcc9f1c3b9`,
@@ -208,5 +208,20 @@ installer SHA-256
 `ced25c22f7d8cf58439bcd08e0563cb6f81d83a6ec93a3b443fdecaff1b74e57`,
 and Windows installer SHA-256
 `74de690c5eebf6a03cac6aafb2e00ab96b410fab9db919ecfc55ef1e111481b3`.
-The Ed25519 signature verifies locally; none of these identities is represented
-as public until live verification completes.
+The Ed25519 signature verifies live. Both installers and all four public
+artifacts downloaded byte-identically. An isolated no-sudo macOS smoke with
+optional local tools skipped installed `0.1.104`, and an equivalently isolated
+`0.1.103` installation updated through the signed public manifest to `0.1.104`;
+full helper/runtime coverage remains the earlier exact-artifact gate. The
+PowerShell installer was hash/content-type verified, while Windows execution
+evidence remains the earlier exact-artifact physical Windows 11 gate. The
+subsequently published website origin `index.html` has SHA-256
+`80c2d1136960bfd341806a1179a25bd325da6a15d63295a391faeaa60134bf70` and
+contains the `0.1.104` fallback.
+
+The immutable release directory deliberately retains its sealed pre-publication
+`RELEASE.md` with SHA-256
+`76e25d76075cbeae26fdc450deebffb43a61a66f54cff78dd6955e7f7d43006a`.
+The signed manifest still links to that note, so the public link retains stale
+status language. This post-publication round records the final state without
+mutating the published audit packet or altering the link.
