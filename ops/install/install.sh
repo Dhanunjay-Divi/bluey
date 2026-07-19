@@ -108,6 +108,42 @@ run_install_command() {
     fi
 }
 
+symlink_points_to() {
+    local link="$1"
+    local expected="$2"
+    local target link_dir target_dir target_name
+
+    [ -L "$link" ] || return 1
+    target="$(readlink "$link" 2>/dev/null || true)"
+    [ -n "$target" ] || return 1
+    case "$target" in
+        /*) ;;
+        *)
+            link_dir="$(cd "$(dirname "$link")" 2>/dev/null && pwd -P)" || return 1
+            target_dir="$(cd "$link_dir/$(dirname "$target")" 2>/dev/null && pwd -P)" || return 1
+            target_name="$(basename "$target")"
+            target="$target_dir/$target_name"
+            ;;
+    esac
+    [ "$target" = "$expected" ]
+}
+
+cli_links_current() {
+    local dir="$1"
+    local helper
+
+    symlink_points_to "$dir/bluey" "$CLI_SOURCE" || return 1
+    if [ -x "$DAEMON_SOURCE" ]; then
+        symlink_points_to "$dir/bluey-daemon" "$DAEMON_SOURCE" || return 1
+    fi
+    for helper in "${PUBLIC_HELPER_NAMES[@]}"; do
+        if [ -x "$INSTALL_ROOT/bin/$helper" ]; then
+            symlink_points_to "$dir/$helper" "$INSTALL_ROOT/bin/$helper" || return 1
+        fi
+    done
+    return 0
+}
+
 remove_bluey_legacy_terminal_link() {
     local dir="$1"
     local sudo_prefix="${2:-}"
@@ -316,8 +352,11 @@ run_with_bluey_uv_env() {
 try_sudo_cli_link() {
     local dir="$1"
 
-    [ "${BLUEY_INSTALL_NO_SUDO:-0}" != "1" ] || return 1
     [ "$dir" = "/usr/local/bin" ] || return 1
+    if cli_links_current "$dir"; then
+        return 0
+    fi
+    [ "${BLUEY_INSTALL_NO_SUDO:-0}" != "1" ] || return 1
     command -v sudo >/dev/null 2>&1 || return 1
     [ -r /dev/tty ] || return 1
 

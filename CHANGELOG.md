@@ -5,6 +5,11 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Skip the macOS installer sudo prompt during an update when every public
+  command symlink already points at the fixed Bluey install directory.
+
 ## [0.1.103] - 2026-07-19
 
 ### Fixed
