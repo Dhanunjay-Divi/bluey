@@ -1399,6 +1399,13 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_resume_generations_job
         ON jobs_resume_generations(account_id, job_id, updated_at_ms DESC);
     "#,
+    // 0032 - a provider board has one authoritative Career Track binding per
+    // account. The application preflight is advisory; this uniqueness is the
+    // last-line concurrency authority.
+    r#"
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_discovery_sources_board_owner
+        ON jobs_discovery_sources(account_id, provider, source_key);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1579,6 +1586,10 @@ const POSTGRES_CONTEXT_ARTIFACT_REVISIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/006_context_artifact_revisions.sql");
 const POSTGRES_JOBS_RESUME_GENERATIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/007_jobs_resume_generations.sql");
+const POSTGRES_JOBS_DISCOVERY_BOARD_OWNER: &str = r#"
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_discovery_sources_board_owner
+        ON jobs_discovery_sources(account_id, provider, source_key);
+"#;
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -1598,6 +1609,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "007_jobs_resume_generations.sql",
         POSTGRES_JOBS_RESUME_GENERATIONS,
+    ),
+    (
+        "009_jobs_discovery_board_owner.sql",
+        POSTGRES_JOBS_DISCOVERY_BOARD_OWNER,
     ),
 ];
 

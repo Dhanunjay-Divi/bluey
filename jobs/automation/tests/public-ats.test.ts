@@ -91,6 +91,150 @@ describe("public ATS discovery", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
+  it("builds canonical public Workday URLs from native CXS job paths only", async () => {
+    const fetcher: JobsFetch = vi.fn(async (url) => {
+      expect(url).toBe("https://workday.wd5.myworkdayjobs.com/wday/cxs/workday/Workday/jobs");
+      return response({
+        total: 4,
+        jobPostings: [
+          {
+            title: "Senior Software Engineer",
+            externalPath: "/job/Ireland-Dublin/Senior-Software-Engineer_JR-0107796",
+            locationsText: "Dublin, Ireland",
+            bulletFields: ["JR-0107796"],
+            postedOn: "Posted Today",
+          },
+          {
+            title: "Qualified same-host path",
+            externalPath: "/en-US/Workday/job/United-States/Qualified-Path_JR-2",
+            locationsText: "Remote - US",
+            bulletFields: ["JR-2"],
+            postedOn: "Posted Today",
+          },
+          {
+            title: "Qualified same-host absolute URL",
+            externalPath: "https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/Canada/Qualified-Url_JR-3",
+            locationsText: "Toronto, Canada",
+            bulletFields: ["JR-3"],
+            postedOn: "Posted Today",
+          },
+          {
+            title: "Cross-host URL is not a public Workday job",
+            externalPath: "https://evil.example/job/Elsewhere/Blocked_JR-4",
+            locationsText: "Nowhere",
+            bulletFields: ["JR-4"],
+            postedOn: "Posted Today",
+          },
+        ],
+      });
+    });
+    const provider = new PublicAtsDiscoveryProvider({ fetch: fetcher, sleep: async () => undefined });
+    const page = await provider.search({
+      roles: [],
+      locations: [],
+      remotePreference: "any",
+      excludedCompanies: [],
+      sources: [{
+        kind: "workday",
+        tenant: "workday",
+        instance: "wd5",
+        site: "Workday",
+        locale: "en-US",
+        company: "Workday",
+      }],
+    });
+
+    expect(page.jobs.map((job) => job.canonicalUrl)).toEqual([
+      "https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/Ireland-Dublin/Senior-Software-Engineer_JR-0107796",
+      "https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/United-States/Qualified-Path_JR-2",
+      "https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/Canada/Qualified-Url_JR-3",
+    ]);
+  });
+
+  it("derives SmartRecruiters public URLs from the configured company and posting ID", async () => {
+    const fetcher: JobsFetch = vi.fn(async (url) => {
+      expect(url).toBe("https://api.smartrecruiters.com/v1/companies/Experian/postings?limit=100&offset=0");
+      return response({
+        totalFound: 2,
+        content: [
+          {
+            id: "744000138411689",
+            name: "Senior Software Engineer",
+            ref: "https://api.smartrecruiters.com/v1/companies/Experian/postings/744000138411689",
+            postingUrl: "https://evil.example/jobs/744000138411689",
+            location: { city: "Dublin", country: "Ireland" },
+            company: { name: "Experian" },
+            releasedDate: new Date().toISOString(),
+          },
+          {
+            id: "unsafe/id",
+            name: "Malformed provider ID",
+            ref: "https://evil.example/jobs/unsafe-id",
+            location: { city: "Nowhere" },
+            releasedDate: new Date().toISOString(),
+          },
+        ],
+      });
+    });
+    const provider = new PublicAtsDiscoveryProvider({ fetch: fetcher, sleep: async () => undefined });
+    const page = await provider.search({
+      roles: [],
+      locations: [],
+      remotePreference: "any",
+      excludedCompanies: [],
+      sources: [{ kind: "smartrecruiters", companyIdentifier: "Experian", company: "Experian" }],
+    });
+
+    expect(page.jobs).toHaveLength(1);
+    expect(page.jobs[0]?.canonicalUrl)
+      .toBe("https://jobs.smartrecruiters.com/Experian/744000138411689");
+  });
+
+  it("refuses a capped SmartRecruiters or Workday feed as an incomplete snapshot", async () => {
+    const smartFetch: JobsFetch = vi.fn(async (url) => {
+      const offset = Number(new URL(url).searchParams.get("offset"));
+      return response({
+        totalFound: 501,
+        content: Array.from({ length: 100 }, (_, index) => ({
+          id: `${offset + index}`,
+          name: `Job ${offset + index}`,
+          location: { city: "Dublin" },
+          releasedDate: new Date().toISOString(),
+        })),
+      });
+    });
+    const smart = new PublicAtsDiscoveryProvider({
+      fetch: smartFetch,
+      maxPages: 5,
+      sleep: async () => undefined,
+    });
+    await expect(smart.snapshot({ kind: "smartrecruiters", companyIdentifier: "Experian" }))
+      .rejects.toThrow("pagination cap");
+    expect(smartFetch).toHaveBeenCalledTimes(5);
+
+    const workdayFetch: JobsFetch = vi.fn(async () => response({
+      total: 101,
+      jobPostings: Array.from({ length: 20 }, (_, index) => ({
+        title: `Job ${index}`,
+        externalPath: `/job/Dublin/Engineer_JR-${index}`,
+        bulletFields: [`JR-${index}`],
+        postedOn: "Posted Today",
+      })),
+    }));
+    const workday = new PublicAtsDiscoveryProvider({
+      fetch: workdayFetch,
+      maxPages: 5,
+      sleep: async () => undefined,
+    });
+    await expect(workday.snapshot({
+      kind: "workday",
+      tenant: "workday",
+      instance: "wd5",
+      site: "Workday",
+    })).rejects.toThrow("pagination cap");
+    expect(workdayFetch).toHaveBeenCalledTimes(5);
+  });
+
   it("retries transient ATS errors without following redirects", async () => {
     let calls = 0;
     const fetcher: JobsFetch = vi.fn(async () => {

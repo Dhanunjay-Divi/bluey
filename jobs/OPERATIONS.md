@@ -80,15 +80,28 @@ Source keys are the official provider identifiers: a Greenhouse board token,
 Lever site, Ashby board name, SmartRecruiters company identifier, or a Workday
 `tenant~instance~site` tuple. The worker derives the provider host and path;
 neither administrators nor imports can supply an arbitrary scheduled URL. New
-sources start as `waiting`, become `healthy` only after a complete verified
-snapshot, become `degraded` after a failed run, and pause after three
-consecutive failures. Paused and stale sources cannot authorize queueing or a
-runner start.
+sources start as `waiting`, run once immediately, then use a four-hour
+baseline interval with stable per-source jitter and failure backoff. Discovery
+is capped at 8 sources per Career Track and 24 per account. A provider board
+is bound to exactly one Career Track in an account; reject a conflicting
+import/source instead of allowing two tracks to overwrite the same job. A
+future multi-track product must use an explicit association table. Sources
+become `healthy` only after a complete verified snapshot, become `degraded`
+after a failed run, and pause after three consecutive failures. Paused and
+stale sources cannot authorize queueing or a runner start.
 
-If the optional enrollment write is temporarily unavailable, the verified job
-import remains saved and a replay of that same import retries the idempotent
-source enrollment. Operators should alert on the structured enrollment warning
-rather than asking a customer to re-enter a job manually.
+Verified public imports validate their board and Career Track enrollment before
+the match is accepted. A quota or conflicting board binding is returned to the
+caller; it is never silently converted into an unscheduled import. Workspace
+repair remains for legacy rows only, not as a client-side replay mechanism.
+
+Each authenticated workspace load also performs a bounded, idempotent repair
+for existing verified public-ATS imports. It considers only allowlisted import
+sources with a verified timestamp and a valid account Career Track; manual,
+restricted, unknown, forged, and unverified postings remain ineligible.
+The repair scans up to 250 eligible imports in deterministic workspace order,
+skips bindings already known or over quota, and never treats a client replay
+as the repair mechanism.
 
 Use `PATCH /admin/jobs/discovery-sources/:account_id/:source_id` with
 `{"status":"paused"}` as the per-source kill switch. Re-enabling a source

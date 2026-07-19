@@ -4,6 +4,7 @@
 //! never fetched by the API; unsupported links remain manual Review-only jobs.
 
 use chrono::DateTime;
+use futures_util::StreamExt;
 use reqwest::{redirect::Policy, StatusCode, Url};
 use serde_json::Value;
 use std::time::Duration;
@@ -36,28 +37,51 @@ pub(super) enum JobImportError {
 pub(super) async fn import_supported_job(
     raw_url: &str,
 ) -> Result<Option<ImportedJob>, JobImportError> {
-    let url = Url::parse(raw_url)
+    let parsed_url = Url::parse(raw_url)
         .map_err(|_| JobImportError::Invalid("Use a complete https job link.".to_string()))?;
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+    if parsed_url.scheme() != "https"
+        || !parsed_url.username().is_empty()
+        || parsed_url.password().is_some()
+    {
         return Err(JobImportError::Invalid(
             "Use a public https employer job link.".to_string(),
         ));
     }
-    if url.port().is_some() {
+    if parsed_url.port().is_some() {
         return Err(JobImportError::Invalid(
             "Use the default HTTPS port for an employer job link.".to_string(),
         ));
     }
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    match host.as_str() {
-        "jobs.lever.co" | "jobs.eu.lever.co" => import_lever(&url).await.map(Some),
-        "boards.greenhouse.io" | "job-boards.greenhouse.io" => {
-            import_greenhouse(&url).await.map(Some)
-        }
-        "jobs.ashbyhq.com" => import_ashby(&url).await.map(Some),
-        "jobs.smartrecruiters.com" => import_smartrecruiters(&url).await.map(Some),
-        _ if host.ends_with(".myworkdayjobs.com") => import_workday(&url).await.map(Some),
-        _ => Ok(None),
+    let host = parsed_url
+        .host_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let provider = match host.as_str() {
+        "jobs.lever.co" | "jobs.eu.lever.co" => "lever",
+        "boards.greenhouse.io" | "job-boards.greenhouse.io" => "greenhouse",
+        "jobs.ashbyhq.com" => "ashby",
+        "jobs.smartrecruiters.com" => "smartrecruiters",
+        _ if host.ends_with(".myworkdayjobs.com") => "workday",
+        _ => return Ok(None),
+    };
+    // The scheduler resolves precisely the same public URL grammar. Normalize
+    // it before any fetch so a verified import cannot later be rejected during
+    // discovery enrollment (for example, repeated `jobs` or `job` segments).
+    let canonical_url =
+        crate::db::jobs::canonical_public_discovery_url(provider, parsed_url.as_str())
+            .map_err(|_| {
+                JobImportError::Invalid("Use a direct public employer job link.".to_string())
+            })?
+            .0;
+    let url = Url::parse(&canonical_url)
+        .map_err(|_| JobImportError::Invalid("Use a complete https job link.".to_string()))?;
+    match provider {
+        "lever" => import_lever(&url).await.map(Some),
+        "greenhouse" => import_greenhouse(&url).await.map(Some),
+        "ashby" => import_ashby(&url).await.map(Some),
+        "smartrecruiters" => import_smartrecruiters(&url).await.map(Some),
+        "workday" => import_workday(&url).await.map(Some),
+        _ => unreachable!(),
     }
 }
 
@@ -575,16 +599,22 @@ async fn checked_body(response: reqwest::Response) -> Result<bytes::Bytes, JobIm
             "That job listing is too large to import safely.".to_string(),
         ));
     }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|_| JobImportError::Temporary("The job listing was interrupted.".to_string()))?;
-    if body.len() as u64 > MAX_JOB_RESPONSE_BYTES {
-        return Err(JobImportError::Invalid(
-            "That job listing is too large to import safely.".to_string(),
-        ));
+    let mut stream = response.bytes_stream();
+    let mut body = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| {
+            JobImportError::Temporary("The job listing was interrupted.".to_string())
+        })?;
+        if body.len().saturating_add(chunk.len()) as u64 > MAX_JOB_RESPONSE_BYTES {
+            // Dropping the stream cancels an oversized chunked response before
+            // it can be buffered in full.
+            return Err(JobImportError::Invalid(
+                "That job listing is too large to import safely.".to_string(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(body.freeze())
 }
 
 fn path_segments(url: &Url) -> Result<Vec<String>, JobImportError> {
@@ -774,6 +804,10 @@ fn decode_entities(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     #[test]
     fn unknown_hosts_are_not_imported() {
@@ -1004,5 +1038,53 @@ mod tests {
             )),
             Err(JobImportError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn importer_and_discovery_share_the_strict_ats_url_grammar() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(matches!(
+            runtime.block_on(import_supported_job(
+                "https://boards.greenhouse.io/acme/jobs/jobs/123"
+            )),
+            Err(JobImportError::Invalid(_))
+        ));
+        assert!(matches!(
+            runtime.block_on(import_supported_job(
+                "https://acme.wd5.myworkdayjobs.com/en-US/Careers/job/Austin/job/R12345"
+            )),
+            Err(JobImportError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn checked_body_stops_an_oversized_chunked_response_without_buffering_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await;
+            for chunk in [vec![b'a'; 700_000], vec![b'b'; 700_000]] {
+                let _ = stream
+                    .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
+                    .await;
+                let _ = stream.write_all(&chunk).await;
+                let _ = stream.write_all(b"\r\n").await;
+            }
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/oversized"))
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            checked_body(response).await,
+            Err(JobImportError::Invalid(_))
+        ));
+        server.await.unwrap();
     }
 }

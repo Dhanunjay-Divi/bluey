@@ -74,7 +74,13 @@ internal pricing and margin model.
   receive a source from an administrator or from one of its own verified public
   ATS imports; enrollment preserves the original Career Track and never turns
   manual, LinkedIn, Indeed, ZipRecruiter, Dice, unknown, or private links into
-  scheduled discovery.
+  scheduled discovery. Workspace loads idempotently repair eligible legacy
+  verified imports so existing customers do not need to re-import a job. A
+  board is deliberately bound to one Career Track per account; multi-track
+  discovery needs a future explicit association model rather than duplicating
+  or overwriting a job. Sources are capped per track and per account, start
+  once immediately, then use a four-hour baseline interval with stable jitter
+  to keep provider load bounded.
 - Form planning uses confirmed facts and company/track/account answer memory;
   unknown required questions become interventions.
 - Company Answer Memory overrides Career Track memory, which overrides account

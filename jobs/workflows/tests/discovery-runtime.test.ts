@@ -363,6 +363,37 @@ describe("discovery worker runtime", () => {
     }]);
   });
 
+  it("fails a capped SmartRecruiters snapshot instead of committing it as complete", async () => {
+    const api = new FakeApi([lease({
+      provider: "smartrecruiters",
+      source_key: "Experian",
+      config: { kind: "smartrecruiters", companyIdentifier: "Experian", company: "Experian" },
+    })]);
+    const atsFetch: JobsFetch = vi.fn(async (url) => {
+      const offset = Number(new URL(url).searchParams.get("offset"));
+      return response({
+        totalFound: 501,
+        content: Array.from({ length: 100 }, (_, index) => ({
+          id: `${offset + index}`,
+          name: `Job ${offset + index}`,
+          location: { city: "Dublin" },
+          releasedDate: SCHEDULED_FOR,
+        })),
+      });
+    });
+    const worker = new DiscoveryWorkerRuntime({
+      api,
+      atsFetch,
+      loopClock: new ImmediateClock(),
+      logger: new RecordingLogger(),
+    });
+
+    await expect(worker.pollOnce()).resolves.toBe("failed");
+    expect(atsFetch).toHaveBeenCalledTimes(5);
+    expect(api.completed).toEqual([]);
+    expect(api.failed[0]?.input.error_code).toBe("provider_error");
+  });
+
   it("replays a duplicate lease without polling the provider again", async () => {
     const duplicate = lease();
     const api = new FakeApi([duplicate, duplicate]);

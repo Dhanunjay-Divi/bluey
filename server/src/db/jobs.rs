@@ -29,14 +29,45 @@ pub const ADDITIONAL_INBOX_CENTS: i64 = 400;
 const ENCRYPTED_PAYLOAD_PREFIX: &str = "bluey-jobs:v1:";
 const DISCOVERY_MIN_INTERVAL_MS: i64 = 5 * 60 * 1_000;
 const DISCOVERY_MAX_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
+/// A guardrail against a single account repeatedly enrolling near-identical
+/// public boards. Boards are intentionally one-to-one with a Career Track.
+pub const DISCOVERY_MAX_SOURCES_PER_TRACK: usize = 8;
+pub const DISCOVERY_MAX_SOURCES_PER_ACCOUNT: usize = 24;
 const DISCOVERY_LEASE_MS: i64 = 2 * 60 * 1_000;
-const DISCOVERY_COMMIT_LEASE_MS: i64 = 5 * 60 * 1_000;
 const EXECUTION_LEASE_TTL_MS: i64 = 60 * 1_000;
 const LOCAL_RESUME_ACTION_TTL_MS: i64 = 15 * 60 * 1_000;
 type HmacSha256 = Hmac<Sha256>;
 
 fn default_discovery_interval_ms() -> i64 {
-    15 * 60 * 1_000
+    4 * 60 * 60 * 1_000
+}
+
+fn discovery_next_run_at(source: &DiscoverySource, completed_at_ms: i64, failures: i64) -> i64 {
+    // Stable per-source jitter avoids a synchronized account-wide polling
+    // burst. Failures back off (up to 8x) before the same deterministic jitter
+    // is applied; a new source still starts immediately on first enrollment.
+    let multiplier = 1_i64 << failures.saturating_sub(1).clamp(0, 3) as u32;
+    let interval = source
+        .run_interval_ms
+        .saturating_mul(multiplier)
+        .min(DISCOVERY_MAX_INTERVAL_MS);
+    let digest = Sha256::digest(source.id.as_bytes());
+    let jitter_seed = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"));
+    let jitter = (jitter_seed % (interval.max(1) / 10) as u64) as i64;
+    completed_at_ms
+        .saturating_add(interval)
+        .saturating_add(jitter)
+}
+
+const DISCOVERY_ACCOUNT_LOCK_SQL: &str =
+    "SELECT pg_advisory_xact_lock(hashtextextended('jobs-discovery-account:' || $1, 0))";
+
+fn lock_discovery_account_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> Result<()> {
+    tx.query_one(DISCOVERY_ACCOUNT_LOCK_SQL, &[&account_id])?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1123,13 +1154,42 @@ pub fn canonical_job_key(posting: &JobPosting) -> String {
         posting.company.trim().to_lowercase(),
         posting.title.trim().to_lowercase(),
         posting.location.trim().to_lowercase(),
-        posting
-            .canonical_url
-            .trim()
-            .trim_end_matches('/')
-            .to_lowercase()
+        canonical_url_for_job_key(&posting.canonical_url)
     );
     hex::encode(Sha256::digest(normalized.as_bytes()))
+}
+
+/// Keep public-job identity stable when an ATS link differs only by common
+/// attribution parameters. Preserve other query parameters because some ATSs
+/// use them to select a genuine job variant.
+fn canonical_url_for_job_key(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw.trim()) else {
+        return raw.trim().trim_end_matches('/').to_lowercase();
+    };
+    let mut retained_query = url
+        .query_pairs()
+        .filter(|(key, _)| !is_tracking_query_key(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    retained_query.sort();
+    url.set_query(None);
+    if !retained_query.is_empty() {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in retained_query {
+            query.append_pair(&key, &value);
+        }
+    }
+    url.set_fragment(None);
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    url.to_string().trim_end_matches('/').to_lowercase()
+}
+
+fn is_tracking_query_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "gh_src" | "lever-source" | "source" | "ref" | "referrer"
+    ) || key.to_ascii_lowercase().starts_with("utm_")
 }
 
 pub fn default_profile(email: &str) -> CareerProfile {
@@ -1722,14 +1782,81 @@ pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Res
 
 pub fn delete_track(pool: &DbPool, account_id: &str, track_id: &str) -> Result<bool> {
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
-            "DELETE FROM jobs_tracks WHERE account_id = ?1 AND id = ?2",
-            params![account_id, track_id],
-        )? > 0),
-        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
-            "DELETE FROM jobs_tracks WHERE account_id = $1 AND id = $2",
-            &[&account_id, &track_id],
-        )? > 0),
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM jobs_tracks WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, track_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                let source_count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM jobs_discovery_sources WHERE account_id = ?1 AND track_id = ?2",
+                    params![account_id, track_id],
+                    |row| row.get(0),
+                )?;
+                let mut stmt =
+                    tx.prepare("SELECT posting_json FROM jobs_postings WHERE account_id = ?1")?;
+                let bound_posting = stmt
+                    .query_map(params![account_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|raw| parse_json::<JobPosting>(raw, "job posting"))
+                    .collect::<Result<Vec<_>>>()?
+                    .iter()
+                    .any(|posting| posting.track_id == track_id);
+                drop(stmt);
+                if source_count > 0 || bound_posting {
+                    anyhow::bail!("Career Track still has Jobs matches or discovery sources")
+                }
+                tx.execute(
+                    "DELETE FROM jobs_tracks WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, track_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(exists)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            let exists = tx
+                .query_opt(
+                    "SELECT 1 FROM jobs_tracks WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                    &[&account_id, &track_id],
+                )?
+                .is_some();
+            if exists {
+                let source_count: i64 = tx.query_one(
+                    "SELECT COUNT(*) FROM jobs_discovery_sources WHERE account_id = $1 AND track_id = $2",
+                    &[&account_id, &track_id],
+                )?.get(0);
+                let bound_posting = tx
+                    .query(
+                        "SELECT posting_json FROM jobs_postings WHERE account_id = $1",
+                        &[&account_id],
+                    )?
+                    .into_iter()
+                    .map(|row| parse_json::<JobPosting>(row.get(0), "job posting"))
+                    .collect::<Result<Vec<_>>>()?
+                    .iter()
+                    .any(|posting| posting.track_id == track_id);
+                if source_count > 0 || bound_posting {
+                    anyhow::bail!("Career Track still has Jobs matches or discovery sources")
+                }
+                tx.execute(
+                    "DELETE FROM jobs_tracks WHERE account_id = $1 AND id = $2",
+                    &[&account_id, &track_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(exists)
+        }
     })
 }
 
@@ -1822,16 +1949,6 @@ pub fn upsert_posting(
         anyhow::bail!("invalid job availability status")
     }
     value.canonical_key = canonical_job_key(&value);
-    if let Some(existing) = list_postings(pool, account_id)?
-        .into_iter()
-        .find(|item| item.canonical_key == value.canonical_key)
-    {
-        value.id = existing.id;
-        value.created_at_ms = existing.created_at_ms;
-        if value.posted_at_ms.is_none() {
-            value.posted_at_ms = existing.posted_at_ms;
-        }
-    }
     if value.match_score == 0 {
         let (score, reasons, missing) = score_posting(&value, profile, preferences);
         value.match_score = score;
@@ -1860,85 +1977,233 @@ pub fn upsert_posting(
         true,
         existing_application_id,
     ));
-    let payload = to_json(&value, "job posting")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let candidate = prepare_snapshot_posting(
+                &value,
+                None,
+                profile,
+                preferences,
+                &applications,
+                &reservations,
+                now,
+            )?;
+            let candidate_payload = to_json(&candidate, "job posting")?;
+            tx.execute(
                 "INSERT INTO jobs_postings (
                     id, account_id, canonical_key, posting_json, source, canonical_url,
                     company, title, location, match_score, status, created_at_ms, updated_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                 ON CONFLICT(account_id, canonical_key) DO UPDATE SET
-                    posting_json = excluded.posting_json,
-                    source = excluded.source,
-                    canonical_url = excluded.canonical_url,
-                    company = excluded.company,
-                    title = excluded.title,
-                    location = excluded.location,
-                    match_score = excluded.match_score,
-                    status = excluded.status,
-                    updated_at_ms = excluded.updated_at_ms",
+                 ON CONFLICT(account_id, canonical_key) DO NOTHING",
                 params![
-                    value.id,
+                    candidate.id,
                     account_id,
-                    value.canonical_key,
-                    payload,
-                    value.source,
-                    value.canonical_url,
-                    value.company,
-                    value.title,
-                    value.location,
-                    value.match_score,
-                    value.status,
-                    value.created_at_ms,
-                    value.updated_at_ms,
+                    candidate.canonical_key,
+                    candidate_payload,
+                    candidate.source,
+                    candidate.canonical_url,
+                    candidate.company,
+                    candidate.title,
+                    candidate.location,
+                    candidate.match_score,
+                    candidate.status,
+                    candidate.created_at_ms,
+                    candidate.updated_at_ms,
                 ],
             )?;
-            let raw: String = conn.query_row(
+            let raw: String = tx.query_row(
                 "SELECT posting_json FROM jobs_postings WHERE account_id = ?1 AND canonical_key = ?2",
-                params![account_id, value.canonical_key],
+                params![account_id, candidate.canonical_key],
                 |row| row.get(0),
             )?;
-            parse_json(raw, "job posting")
+            let actual: JobPosting = parse_json(raw, "job posting")?;
+            let saved = prepare_snapshot_posting(
+                &value,
+                Some(actual),
+                profile,
+                preferences,
+                &applications,
+                &reservations,
+                now,
+            )?;
+            let payload = to_json(&saved, "job posting")?;
+            tx.execute(
+                "UPDATE jobs_postings SET posting_json = ?3, source = ?4, canonical_url = ?5,
+                    company = ?6, title = ?7, location = ?8, match_score = ?9, status = ?10,
+                    updated_at_ms = ?11 WHERE account_id = ?1 AND canonical_key = ?2",
+                params![
+                    account_id,
+                    saved.canonical_key,
+                    payload,
+                    saved.source,
+                    saved.canonical_url,
+                    saved.company,
+                    saved.title,
+                    saved.location,
+                    saved.match_score,
+                    saved.status,
+                    saved.updated_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(saved)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            let row = conn.query_one(
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            let candidate = prepare_snapshot_posting(
+                &value,
+                None,
+                profile,
+                preferences,
+                &applications,
+                &reservations,
+                now,
+            )?;
+            let candidate_payload = to_json(&candidate, "job posting")?;
+            tx.execute(
                 "INSERT INTO jobs_postings (
                     id, account_id, canonical_key, posting_json, source, canonical_url,
                     company, title, location, match_score, status, created_at_ms, updated_at_ms
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                 ON CONFLICT(account_id, canonical_key) DO UPDATE SET
-                    posting_json = EXCLUDED.posting_json,
-                    source = EXCLUDED.source,
-                    canonical_url = EXCLUDED.canonical_url,
-                    company = EXCLUDED.company,
-                    title = EXCLUDED.title,
-                    location = EXCLUDED.location,
-                    match_score = EXCLUDED.match_score,
-                    status = EXCLUDED.status,
-                    updated_at_ms = EXCLUDED.updated_at_ms
-                 RETURNING posting_json",
+                 ON CONFLICT(account_id, canonical_key) DO NOTHING",
                 &[
-                    &value.id,
+                    &candidate.id,
                     &account_id,
-                    &value.canonical_key,
-                    &payload,
-                    &value.source,
-                    &value.canonical_url,
-                    &value.company,
-                    &value.title,
-                    &value.location,
-                    &value.match_score,
-                    &value.status,
-                    &value.created_at_ms,
-                    &value.updated_at_ms,
+                    &candidate.canonical_key,
+                    &candidate_payload,
+                    &candidate.source,
+                    &candidate.canonical_url,
+                    &candidate.company,
+                    &candidate.title,
+                    &candidate.location,
+                    &candidate.match_score,
+                    &candidate.status,
+                    &candidate.created_at_ms,
+                    &candidate.updated_at_ms,
                 ],
             )?;
-            parse_json(row.get(0), "job posting")
+            let actual: JobPosting = parse_json(
+                tx.query_one(
+                    "SELECT posting_json FROM jobs_postings
+                      WHERE account_id = $1 AND canonical_key = $2 FOR UPDATE",
+                    &[&account_id, &candidate.canonical_key],
+                )?
+                .get(0),
+                "job posting",
+            )?;
+            let saved = prepare_snapshot_posting(
+                &value,
+                Some(actual),
+                profile,
+                preferences,
+                &applications,
+                &reservations,
+                now,
+            )?;
+            let payload = to_json(&saved, "job posting")?;
+            tx.execute(
+                "UPDATE jobs_postings SET posting_json = $3, source = $4, canonical_url = $5,
+                    company = $6, title = $7, location = $8, match_score = $9, status = $10,
+                    updated_at_ms = $11 WHERE account_id = $1 AND canonical_key = $2",
+                &[
+                    &account_id,
+                    &saved.canonical_key,
+                    &payload,
+                    &saved.source,
+                    &saved.canonical_url,
+                    &saved.company,
+                    &saved.title,
+                    &saved.location,
+                    &saved.match_score,
+                    &saved.status,
+                    &saved.updated_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(saved)
         }
     })
+}
+
+/// Build the posting document used by the atomic discovery publisher. Database
+/// reads happen inside that publisher's transaction; this pure step keeps the
+/// same canonical-key, scoring, eligibility, and cross-track rules as normal
+/// job saves without opening a nested connection.
+fn prepare_snapshot_posting(
+    posting: &JobPosting,
+    existing: Option<JobPosting>,
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+    applications: &[JobApplication],
+    reservations: &[AttemptReservation],
+    observed_at_ms: i64,
+) -> Result<JobPosting> {
+    let mut value = posting.clone();
+    if value.id.trim().is_empty() {
+        value.id = uuid::Uuid::new_v4().to_string();
+    }
+    value.source = if value.source.trim().is_empty() {
+        "pasted_link".to_string()
+    } else {
+        value.source.trim().to_lowercase()
+    };
+    value.status = if value.status.trim().is_empty() {
+        default_match_status()
+    } else {
+        value.status.trim().to_lowercase()
+    };
+    value.availability_status = if value.availability_status.trim().is_empty() {
+        default_active_availability()
+    } else {
+        value.availability_status.trim().to_lowercase()
+    };
+    if !matches!(
+        value.availability_status.as_str(),
+        "active" | "expired" | "unknown"
+    ) {
+        anyhow::bail!("invalid job availability status")
+    }
+    value.canonical_key = canonical_job_key(&value);
+    if let Some(existing) = existing {
+        if existing.track_id != value.track_id {
+            anyhow::bail!("job is already bound to another Career Track")
+        }
+        value.id = existing.id;
+        value.created_at_ms = existing.created_at_ms;
+        if value.posted_at_ms.is_none() {
+            value.posted_at_ms = existing.posted_at_ms;
+        }
+    }
+    if value.match_score == 0 {
+        let (score, reasons, missing) = score_posting(&value, profile, preferences);
+        value.match_score = score;
+        value.matched_reasons = reasons;
+        value.missing_requirements = missing;
+    }
+    if value.created_at_ms == 0 {
+        value.created_at_ms = observed_at_ms;
+    }
+    if value.availability_status == "active" && value.last_verified_at_ms.is_none() {
+        value.last_verified_at_ms = Some(observed_at_ms);
+    }
+    value.updated_at_ms = observed_at_ms;
+    let existing_application_id = applications
+        .iter()
+        .find(|application| application.job_id == value.id)
+        .map(|application| application.id.as_str());
+    value.eligibility = Some(build_job_eligibility(
+        &value,
+        profile,
+        preferences,
+        reservations,
+        true,
+        existing_application_id,
+    ));
+    Ok(value)
 }
 
 pub fn list_discovery_sources(pool: &DbPool, account_id: &str) -> Result<Vec<DiscoverySource>> {
@@ -2009,6 +2274,10 @@ pub fn upsert_discovery_source(
     account_id: &str,
     input: &DiscoverySourceInput,
 ) -> Result<DiscoverySource> {
+    // Keep this validation before the write: callers that save an imported
+    // match must be able to reject an invalid track/board binding rather than
+    // make persistence look successful and merely log a failed enrollment.
+    validate_discovery_source_input(pool, account_id, input)?;
     let provider = input.provider.trim().to_ascii_lowercase();
     if !matches!(
         provider.as_str(),
@@ -2104,8 +2373,16 @@ pub fn upsert_discovery_source(
 
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            enforce_discovery_source_authority_sqlite(
+                &tx,
+                account_id,
+                &provider,
+                &source_key,
+                track_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_discovery_sources (
                     id, account_id, track_id, provider, source_key, source_json,
                     status, health, consecutive_failures, run_interval_ms,
@@ -2123,20 +2400,37 @@ pub fn upsert_discovery_source(
                     updated_at_ms = excluded.updated_at_ms",
                 params![id, account_id, track_id, provider, source_key, payload, interval, now],
             )?;
-            conn.query_row(
-                "SELECT id, account_id, track_id, provider, source_key, source_json,
+            let source = tx
+                .query_row(
+                    "SELECT id, account_id, track_id, provider, source_key, source_json,
                         status, health, consecutive_failures, run_interval_ms,
                         next_run_at_ms, last_success_at_ms, last_failure_at_ms,
                         last_error_code, lease_expires_at_ms, created_at_ms, updated_at_ms
                    FROM jobs_discovery_sources
                   WHERE account_id = ?1 AND provider = ?2 AND source_key = ?3 AND track_id = ?4",
-                params![account_id, provider, source_key, track_id],
-                discovery_source_from_sqlite_row,
-            )
-            .context("upsert Jobs discovery source")
+                    params![account_id, provider, source_key, track_id],
+                    discovery_source_from_sqlite_row,
+                )
+                .context("upsert Jobs discovery source")?;
+            tx.commit()?;
+            Ok(source)
         }
         DbPool::Postgres(_) => {
-            let row = pool.get_pg()?.query_one(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            // PostgreSQL does not take a predicate lock for an empty source
+            // list, so serialize enrollment decisions per account. This keeps
+            // the quota and one-board/one-track contract authoritative even
+            // when two imports arrive at the same time.
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            enforce_discovery_source_authority_postgres(
+                &mut tx,
+                account_id,
+                &provider,
+                &source_key,
+                track_id,
+            )?;
+            let row = tx.query_one(
                 "INSERT INTO jobs_discovery_sources (
                     id, account_id, track_id, provider, source_key, source_json,
                     status, health, consecutive_failures, run_interval_ms,
@@ -2158,7 +2452,438 @@ pub fn upsert_discovery_source(
                            last_error_code, lease_expires_at_ms, created_at_ms, updated_at_ms",
                 &[&id, &account_id, &track_id, &provider, &source_key, &payload, &interval, &now],
             )?;
-            discovery_source_from_pg_row(row)
+            let source = discovery_source_from_pg_row(row)?;
+            tx.commit()?;
+            Ok(source)
+        }
+    })
+}
+
+fn enforce_discovery_source_authority_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    provider: &str,
+    source_key: &str,
+    track_id: &str,
+) -> Result<()> {
+    if !track_id.is_empty()
+        && tx
+            .query_row(
+                "SELECT 1 FROM jobs_tracks WHERE account_id = ?1 AND id = ?2",
+                params![account_id, track_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none()
+    {
+        anyhow::bail!("discovery source Career Track was not found")
+    }
+    let bound_track: Option<String> = tx
+        .query_row(
+            "SELECT track_id FROM jobs_discovery_sources
+              WHERE account_id = ?1 AND provider = ?2 AND source_key = ?3",
+            params![account_id, provider, source_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if bound_track
+        .as_deref()
+        .is_some_and(|bound| bound != track_id)
+    {
+        anyhow::bail!("discovery board is already bound to another Career Track")
+    }
+    if bound_track.is_none() {
+        let account_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM jobs_discovery_sources WHERE account_id = ?1",
+            params![account_id],
+            |row| row.get(0),
+        )?;
+        if account_count as usize >= DISCOVERY_MAX_SOURCES_PER_ACCOUNT {
+            anyhow::bail!("discovery source limit reached for this account")
+        }
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM jobs_discovery_sources WHERE account_id = ?1 AND track_id = ?2",
+            params![account_id, track_id],
+            |row| row.get(0),
+        )?;
+        if count as usize >= DISCOVERY_MAX_SOURCES_PER_TRACK {
+            anyhow::bail!("discovery source limit reached for this Career Track")
+        }
+    }
+    Ok(())
+}
+
+fn enforce_discovery_source_authority_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    provider: &str,
+    source_key: &str,
+    track_id: &str,
+) -> Result<()> {
+    if !track_id.is_empty()
+        && tx
+            .query_opt(
+                "SELECT 1 FROM jobs_tracks WHERE account_id = $1 AND id = $2",
+                &[&account_id, &track_id],
+            )?
+            .is_none()
+    {
+        anyhow::bail!("discovery source Career Track was not found")
+    }
+    let bound_track = tx
+        .query_opt(
+            "SELECT track_id FROM jobs_discovery_sources
+              WHERE account_id = $1 AND provider = $2 AND source_key = $3",
+            &[&account_id, &provider, &source_key],
+        )?
+        .map(|row| row.get::<_, String>(0));
+    if bound_track
+        .as_deref()
+        .is_some_and(|bound| bound != track_id)
+    {
+        anyhow::bail!("discovery board is already bound to another Career Track")
+    }
+    if bound_track.is_none() {
+        let account_count: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM jobs_discovery_sources WHERE account_id = $1",
+                &[&account_id],
+            )?
+            .get(0);
+        if account_count as usize >= DISCOVERY_MAX_SOURCES_PER_ACCOUNT {
+            anyhow::bail!("discovery source limit reached for this account")
+        }
+        let count: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM jobs_discovery_sources WHERE account_id = $1 AND track_id = $2",
+                &[&account_id, &track_id],
+            )?
+            .get(0);
+        if count as usize >= DISCOVERY_MAX_SOURCES_PER_TRACK {
+            anyhow::bail!("discovery source limit reached for this Career Track")
+        }
+    }
+    Ok(())
+}
+
+/// Validate an automatic public-ATS board binding before any job data is
+/// persisted. A board deliberately belongs to one Career Track per account;
+/// multi-track discovery will require an explicit join model rather than
+/// silently overwriting a posting's track.
+pub fn validate_discovery_source_input(
+    pool: &DbPool,
+    account_id: &str,
+    input: &DiscoverySourceInput,
+) -> Result<()> {
+    let provider = input.provider.trim().to_ascii_lowercase();
+    if !matches!(
+        provider.as_str(),
+        "greenhouse" | "lever" | "ashby" | "smartrecruiters" | "workday"
+    ) {
+        anyhow::bail!("unsupported Jobs discovery provider")
+    }
+    let source_key = input.source_key.trim();
+    if source_key.is_empty()
+        || source_key.len() > 160
+        || !source_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'~'))
+    {
+        anyhow::bail!("discovery source key contains unsupported characters")
+    }
+    if provider != "workday" && source_key.contains('~') {
+        anyhow::bail!("discovery source key contains unsupported characters")
+    }
+    if provider == "workday" {
+        let identifiers = source_key.split('~').collect::<Vec<_>>();
+        if identifiers.len() != 3 || identifiers.iter().any(|value| value.is_empty()) {
+            anyhow::bail!("Workday source key must use tenant~instance~site")
+        }
+    }
+    let company = input.company.trim();
+    if company.is_empty() || company.chars().count() > 200 {
+        anyhow::bail!("discovery source company is required")
+    }
+    let track_id = input.track_id.trim();
+    if !track_id.is_empty()
+        && !list_tracks(pool, account_id)?
+            .iter()
+            .any(|track| track.id == track_id)
+    {
+        anyhow::bail!("discovery source Career Track was not found")
+    }
+
+    let sources = list_discovery_sources(pool, account_id)?;
+    if sources.iter().any(|source| {
+        source.provider == provider
+            && source.source_key == source_key
+            && source.track_id != track_id
+    }) {
+        anyhow::bail!("discovery board is already bound to another Career Track")
+    }
+    let exists = sources.iter().any(|source| {
+        source.provider == provider
+            && source.source_key == source_key
+            && source.track_id == track_id
+    });
+    if !exists {
+        if sources.len() >= DISCOVERY_MAX_SOURCES_PER_ACCOUNT {
+            anyhow::bail!("discovery source limit reached for this account")
+        }
+        if sources
+            .iter()
+            .filter(|source| source.track_id == track_id)
+            .count()
+            >= DISCOVERY_MAX_SOURCES_PER_TRACK
+        {
+            anyhow::bail!("discovery source limit reached for this Career Track")
+        }
+    }
+    Ok(())
+}
+
+fn normalized_discovery_source_values(
+    account_id: &str,
+    input: &DiscoverySourceInput,
+) -> Result<(String, String, String, i64, String, String)> {
+    let provider = input.provider.trim().to_ascii_lowercase();
+    let source_key = input.source_key.trim().to_string();
+    let track_id = input.track_id.trim().to_string();
+    let company = input.company.trim();
+    let interval = input
+        .run_interval_ms
+        .clamp(DISCOVERY_MIN_INTERVAL_MS, DISCOVERY_MAX_INTERVAL_MS);
+    let config = match provider.as_str() {
+        "greenhouse" => {
+            json!({ "kind": "greenhouse", "boardToken": source_key, "company": company })
+        }
+        "lever" => json!({ "kind": "lever", "site": source_key, "company": company }),
+        "ashby" => json!({ "kind": "ashby", "boardName": source_key, "company": company }),
+        "smartrecruiters" => {
+            json!({ "kind": "smartrecruiters", "companyIdentifier": source_key, "company": company })
+        }
+        "workday" => {
+            let identifiers = source_key.split('~').collect::<Vec<_>>();
+            if identifiers.len() != 3 || identifiers.iter().any(|value| value.is_empty()) {
+                anyhow::bail!("Workday source key must use tenant~instance~site")
+            }
+            json!({
+                "kind": "workday", "tenant": identifiers[0], "instance": identifiers[1],
+                "site": identifiers[2], "locale": "en-US", "company": company,
+            })
+        }
+        _ => anyhow::bail!("unsupported Jobs discovery provider"),
+    };
+    let digest = hex::encode(Sha256::digest(format!(
+        "{account_id}\0{provider}\0{source_key}\0{track_id}"
+    )));
+    Ok((
+        provider,
+        source_key,
+        track_id,
+        interval,
+        to_json(&config, "Jobs discovery source")?,
+        format!("source-{}", &digest[..32]),
+    ))
+}
+
+/// Atomically accept a verified public import and its required board binding.
+/// Manual and unsupported links intentionally continue through `upsert_posting`
+/// alone. For a verified import, neither a source nor a match becomes visible
+/// unless both writes succeed under the same account/source authority lock.
+pub fn save_verified_import_posting_with_source(
+    pool: &DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+    source: &DiscoverySourceInput,
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+) -> Result<JobPosting> {
+    validate_discovery_source_input(pool, account_id, source)?;
+    let (provider, source_key, track_id, interval, source_payload, source_id) =
+        normalized_discovery_source_values(account_id, source)?;
+    if posting.track_id.trim() != track_id {
+        anyhow::bail!("verified import discovery source does not match the job Career Track")
+    }
+    let applications = list_applications(pool, account_id)?;
+    let reservations = list_attempt_reservations(pool, account_id)?;
+    let now = now_ms();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            enforce_discovery_source_authority_sqlite(
+                &tx,
+                account_id,
+                &provider,
+                &source_key,
+                &track_id,
+            )?;
+            tx.execute(
+                "INSERT INTO jobs_discovery_sources (
+                    id, account_id, track_id, provider, source_key, source_json,
+                    status, health, consecutive_failures, run_interval_ms,
+                    next_run_at_ms, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 'waiting', 0, ?7, ?8, ?8, ?8)
+                 ON CONFLICT(account_id, provider, source_key, track_id) DO UPDATE SET
+                    source_json = excluded.source_json, run_interval_ms = excluded.run_interval_ms,
+                    status = 'active',
+                    health = CASE WHEN jobs_discovery_sources.health = 'paused'
+                                  THEN CASE WHEN jobs_discovery_sources.last_success_at_ms IS NULL
+                                            THEN 'waiting' ELSE 'degraded' END
+                                  ELSE jobs_discovery_sources.health END,
+                    next_run_at_ms = MIN(jobs_discovery_sources.next_run_at_ms, excluded.next_run_at_ms),
+                    updated_at_ms = excluded.updated_at_ms",
+                params![source_id, account_id, track_id, provider, source_key, source_payload, interval, now],
+            )?;
+            let existing = tx
+                .query_row(
+                    "SELECT posting_json FROM jobs_postings WHERE account_id = ?1 AND canonical_key = ?2",
+                    params![account_id, canonical_job_key(posting)],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|raw| parse_json(raw, "job posting"))
+                .transpose()?;
+            let saved = prepare_snapshot_posting(
+                posting,
+                existing,
+                profile,
+                preferences,
+                &applications,
+                &reservations,
+                now,
+            )?;
+            let payload = to_json(&saved, "job posting")?;
+            tx.execute(
+                "INSERT INTO jobs_postings (
+                    id, account_id, canonical_key, posting_json, source, canonical_url,
+                    company, title, location, match_score, status, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(account_id, canonical_key) DO UPDATE SET
+                    posting_json = excluded.posting_json, source = excluded.source,
+                    canonical_url = excluded.canonical_url, company = excluded.company,
+                    title = excluded.title, location = excluded.location,
+                    match_score = excluded.match_score, status = excluded.status,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    saved.id,
+                    account_id,
+                    saved.canonical_key,
+                    payload,
+                    saved.source,
+                    saved.canonical_url,
+                    saved.company,
+                    saved.title,
+                    saved.location,
+                    saved.match_score,
+                    saved.status,
+                    saved.created_at_ms,
+                    saved.updated_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(saved)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            enforce_discovery_source_authority_postgres(
+                &mut tx,
+                account_id,
+                &provider,
+                &source_key,
+                &track_id,
+            )?;
+            tx.execute(
+                "INSERT INTO jobs_discovery_sources (
+                    id, account_id, track_id, provider, source_key, source_json,
+                    status, health, consecutive_failures, run_interval_ms,
+                    next_run_at_ms, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, 'active', 'waiting', 0, $7, $8, $8, $8)
+                 ON CONFLICT(account_id, provider, source_key, track_id) DO UPDATE SET
+                    source_json = EXCLUDED.source_json, run_interval_ms = EXCLUDED.run_interval_ms,
+                    status = 'active',
+                    health = CASE WHEN jobs_discovery_sources.health = 'paused'
+                                  THEN CASE WHEN jobs_discovery_sources.last_success_at_ms IS NULL
+                                            THEN 'waiting' ELSE 'degraded' END
+                                  ELSE jobs_discovery_sources.health END,
+                    next_run_at_ms = LEAST(jobs_discovery_sources.next_run_at_ms, EXCLUDED.next_run_at_ms),
+                    updated_at_ms = EXCLUDED.updated_at_ms",
+                &[&source_id, &account_id, &track_id, &provider, &source_key, &source_payload, &interval, &now],
+            )?;
+            let candidate = prepare_snapshot_posting(
+                posting,
+                None,
+                profile,
+                preferences,
+                &applications,
+                &reservations,
+                now,
+            )?;
+            let candidate_payload = to_json(&candidate, "job posting")?;
+            tx.execute(
+                "INSERT INTO jobs_postings (
+                    id, account_id, canonical_key, posting_json, source, canonical_url,
+                    company, title, location, match_score, status, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 ON CONFLICT(account_id, canonical_key) DO NOTHING",
+                &[
+                    &candidate.id,
+                    &account_id,
+                    &candidate.canonical_key,
+                    &candidate_payload,
+                    &candidate.source,
+                    &candidate.canonical_url,
+                    &candidate.company,
+                    &candidate.title,
+                    &candidate.location,
+                    &candidate.match_score,
+                    &candidate.status,
+                    &candidate.created_at_ms,
+                    &candidate.updated_at_ms,
+                ],
+            )?;
+            let actual: JobPosting = parse_json(
+                tx.query_one(
+                    "SELECT posting_json FROM jobs_postings
+                      WHERE account_id = $1 AND canonical_key = $2 FOR UPDATE",
+                    &[&account_id, &candidate.canonical_key],
+                )?
+                .get(0),
+                "job posting",
+            )?;
+            let saved = prepare_snapshot_posting(
+                posting,
+                Some(actual),
+                profile,
+                preferences,
+                &applications,
+                &reservations,
+                now,
+            )?;
+            let payload = to_json(&saved, "job posting")?;
+            tx.execute(
+                "UPDATE jobs_postings SET posting_json = $3, source = $4, canonical_url = $5,
+                    company = $6, title = $7, location = $8, match_score = $9, status = $10,
+                    updated_at_ms = $11 WHERE account_id = $1 AND canonical_key = $2",
+                &[
+                    &account_id,
+                    &saved.canonical_key,
+                    &payload,
+                    &saved.source,
+                    &saved.canonical_url,
+                    &saved.company,
+                    &saved.title,
+                    &saved.location,
+                    &saved.match_score,
+                    &saved.status,
+                    &saved.updated_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(saved)
         }
     })
 }
@@ -2175,8 +2900,9 @@ pub fn set_discovery_source_status(
     let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            let changed = conn.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 "UPDATE jobs_discovery_sources
                     SET status = ?3,
                         health = CASE WHEN ?3 = 'paused' THEN 'paused'
@@ -2189,19 +2915,23 @@ pub fn set_discovery_source_status(
                 params![account_id, source_id, status, now],
             )?;
             if changed == 0 {
+                tx.commit()?;
                 return Ok(None);
             }
-            conn.query_row(
-                "SELECT id, account_id, track_id, provider, source_key, source_json,
+            let source = tx
+                .query_row(
+                    "SELECT id, account_id, track_id, provider, source_key, source_json,
                         status, health, consecutive_failures, run_interval_ms,
                         next_run_at_ms, last_success_at_ms, last_failure_at_ms,
                         last_error_code, lease_expires_at_ms, created_at_ms, updated_at_ms
                    FROM jobs_discovery_sources WHERE account_id = ?1 AND id = ?2",
-                params![account_id, source_id],
-                discovery_source_from_sqlite_row,
-            )
-            .optional()
-            .context("update Jobs discovery source")
+                    params![account_id, source_id],
+                    discovery_source_from_sqlite_row,
+                )
+                .optional()
+                .context("update Jobs discovery source")?;
+            tx.commit()?;
+            Ok(source)
         }
         DbPool::Postgres(_) => pool
             .get_pg()?
@@ -2291,6 +3021,8 @@ pub fn lease_due_discovery_source(
     let lease_token_hash = discovery_lease_token_hash(&lease_token);
     let now = now_ms();
     let lease_expires = now + DISCOVERY_LEASE_MS;
+
+    recover_legacy_stale_discovery_commits(pool, now)?;
 
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -2427,6 +3159,800 @@ fn discovery_run_id(source_id: &str, replay_key: &str) -> String {
     format!("discovery-run-{}", &digest[..32])
 }
 
+/// Compatibility-only cleanup for rows written by the pre-atomic publisher.
+/// New publication never enters `committing`; this releases an old stranded
+/// row after its lease expires so it cannot block a source forever.
+fn recover_legacy_stale_discovery_commits(pool: &DbPool, now: i64) -> Result<()> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let recovered = tx.execute(
+                "UPDATE jobs_discovery_runs
+                    SET status = 'failed', error_code = 'commit_timeout', completed_at_ms = ?1
+                  WHERE status = 'committing'
+                    AND EXISTS (
+                        SELECT 1 FROM jobs_discovery_sources s
+                         WHERE s.id = jobs_discovery_runs.source_id
+                           AND (s.lease_expires_at_ms IS NULL OR s.lease_expires_at_ms <= ?1)
+                    )",
+                params![now],
+            )?;
+            if recovered > 0 {
+                tx.execute(
+                    "UPDATE jobs_discovery_sources
+                        SET health = CASE WHEN consecutive_failures + 1 >= 3 THEN 'paused' ELSE 'degraded' END,
+                            consecutive_failures = consecutive_failures + 1,
+                            last_failure_at_ms = ?1, last_error_code = 'commit_timeout',
+                            next_run_at_ms = ?1, lease_owner = NULL, lease_token = NULL,
+                            lease_expires_at_ms = NULL, updated_at_ms = ?1
+                      WHERE EXISTS (
+                          SELECT 1 FROM jobs_discovery_runs r
+                           WHERE r.source_id = jobs_discovery_sources.id
+                             AND r.status = 'failed' AND r.error_code = 'commit_timeout'
+                             AND r.completed_at_ms = ?1
+                      )",
+                    params![now],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let recovered = tx.execute(
+                "UPDATE jobs_discovery_runs r
+                    SET status = 'failed', error_code = 'commit_timeout', completed_at_ms = $1
+                   FROM jobs_discovery_sources s
+                  WHERE r.source_id = s.id AND r.status = 'committing'
+                    AND (s.lease_expires_at_ms IS NULL OR s.lease_expires_at_ms <= $1)",
+                &[&now],
+            )?;
+            if recovered > 0 {
+                tx.execute(
+                    "UPDATE jobs_discovery_sources s
+                        SET health = CASE WHEN s.consecutive_failures + 1 >= 3 THEN 'paused' ELSE 'degraded' END,
+                            consecutive_failures = s.consecutive_failures + 1,
+                            last_failure_at_ms = $1, last_error_code = 'commit_timeout',
+                            next_run_at_ms = $1, lease_owner = NULL, lease_token = NULL,
+                            lease_expires_at_ms = NULL, updated_at_ms = $1
+                      WHERE EXISTS (
+                          SELECT 1 FROM jobs_discovery_runs r
+                           WHERE r.source_id = s.id AND r.status = 'failed'
+                             AND r.error_code = 'commit_timeout' AND r.completed_at_ms = $1
+                      )",
+                    &[&now],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_discovery_snapshot(
+    pool: &DbPool,
+    source: &DiscoverySource,
+    lease_token: &str,
+    replay_key: &str,
+    scheduled_for_ms: i64,
+    normalized: &BTreeMap<String, (JobPosting, String)>,
+    snapshot_hash: &str,
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+    applications: &[JobApplication],
+    reservations: &[AttemptReservation],
+    observed_at_ms: i64,
+) -> Result<DiscoveryRunResult> {
+    let token_hash = discovery_lease_token_hash(lease_token);
+    let run_id = discovery_run_id(&source.id, replay_key);
+    let next_run_at = discovery_next_run_at(source, observed_at_ms, 0);
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx_now = now_ms();
+            let fresh = tx
+                .query_row(
+                    "SELECT provider, source_key, track_id, source_json, status, updated_at_ms,
+                            next_run_at_ms, lease_expires_at_ms, lease_token
+                       FROM jobs_discovery_sources WHERE id = ?1 AND account_id = ?2",
+                    params![source.id, source.account_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, Option<i64>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                provider,
+                source_key,
+                track_id,
+                raw_config,
+                status,
+                updated_at_ms,
+                next_run,
+                lease_expires,
+                stored_token,
+            )) = fresh
+            else {
+                anyhow::bail!("discovery lease is stale")
+            };
+            if provider != source.provider
+                || source_key != source.source_key
+                || track_id != source.track_id
+                || parse_json::<Value>(raw_config, "Jobs discovery source")? != source.config
+                || status != "active"
+                || updated_at_ms != source.updated_at_ms
+                || next_run != scheduled_for_ms
+                || lease_expires.is_none_or(|expiry| expiry <= tx_now)
+                || stored_token.as_deref() != Some(token_hash.as_str())
+            {
+                anyhow::bail!("discovery lease is stale")
+            }
+            let run = tx
+                .query_row(
+                    "SELECT id, status, discovered_count, upserted_count, closed_count, snapshot_hash
+                       FROM jobs_discovery_runs WHERE source_id = ?1 AND replay_key = ?2",
+                    params![source.id, replay_key],
+                    |row| Ok((
+                        row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, Option<String>>(5)?,
+                    )),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("discovery lease is stale"))?;
+            if matches!(run.1.as_str(), "completed" | "failed") {
+                if run.1 == "completed" && run.5.as_deref() != Some(snapshot_hash) {
+                    anyhow::bail!("discovery replay payload does not match the completed snapshot")
+                }
+                return Ok(DiscoveryRunResult {
+                    run_id: run.0,
+                    replay_key: replay_key.to_string(),
+                    status: run.1,
+                    discovered_count: run.2,
+                    upserted_count: run.3,
+                    closed_count: run.4,
+                    replayed: true,
+                });
+            }
+            if run.1 != "running" || run.5.as_deref().is_some_and(|hash| hash != snapshot_hash) {
+                anyhow::bail!("discovery lease is stale")
+            }
+            tx.execute(
+                "UPDATE jobs_discovery_runs SET snapshot_hash = ?3
+                  WHERE source_id = ?1 AND replay_key = ?2 AND status = 'running'",
+                params![source.id, replay_key, snapshot_hash],
+            )?;
+
+            let mut seen = Vec::with_capacity(normalized.len());
+            for (external_id, (posting, content_hash)) in normalized {
+                let membership_job_id: Option<String> = tx
+                    .query_row(
+                        "SELECT job_id FROM jobs_discovery_memberships
+                          WHERE source_id = ?1 AND external_id = ?2",
+                        params![source.id, external_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let membership_posting = match membership_job_id {
+                    Some(job_id) => tx
+                        .query_row(
+                            "SELECT posting_json FROM jobs_postings
+                              WHERE account_id = ?1 AND id = ?2",
+                            params![source.account_id, job_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .map(|raw| parse_json::<JobPosting>(raw, "job posting"))
+                        .transpose()?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("discovery membership refers to a missing job")
+                        })
+                        .map(Some)?,
+                    None => None,
+                };
+                let canonical_posting = tx
+                    .query_row(
+                        "SELECT posting_json FROM jobs_postings
+                          WHERE account_id = ?1 AND canonical_key = ?2",
+                        params![source.account_id, posting.canonical_key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|raw| parse_json::<JobPosting>(raw, "job posting"))
+                    .transpose()?;
+                if membership_posting
+                    .as_ref()
+                    .zip(canonical_posting.as_ref())
+                    .is_some_and(|(membership, canonical)| membership.id != canonical.id)
+                {
+                    anyhow::bail!("discovery membership and canonical job disagree")
+                }
+                let existing = membership_posting.or(canonical_posting);
+                let saved = prepare_snapshot_posting(
+                    posting,
+                    existing.as_ref().cloned(),
+                    profile,
+                    preferences,
+                    applications,
+                    reservations,
+                    observed_at_ms,
+                )?;
+                let payload = to_json(&saved, "job posting")?;
+                if existing.is_some() {
+                    tx.execute(
+                        "UPDATE jobs_postings SET canonical_key = ?3, posting_json = ?4,
+                            source = ?5, canonical_url = ?6, company = ?7, title = ?8,
+                            location = ?9, match_score = ?10, status = ?11, updated_at_ms = ?12
+                          WHERE account_id = ?1 AND id = ?2",
+                        params![
+                            source.account_id,
+                            saved.id,
+                            saved.canonical_key,
+                            payload,
+                            saved.source,
+                            saved.canonical_url,
+                            saved.company,
+                            saved.title,
+                            saved.location,
+                            saved.match_score,
+                            saved.status,
+                            saved.updated_at_ms,
+                        ],
+                    )?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO jobs_postings (
+                            id, account_id, canonical_key, posting_json, source, canonical_url,
+                            company, title, location, match_score, status, created_at_ms, updated_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        params![
+                            saved.id, source.account_id, saved.canonical_key, payload,
+                            saved.source, saved.canonical_url, saved.company, saved.title,
+                            saved.location, saved.match_score, saved.status, saved.created_at_ms,
+                            saved.updated_at_ms,
+                        ],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO jobs_discovery_memberships (
+                        source_id, account_id, canonical_key, external_id, job_id,
+                        content_hash, first_seen_at_ms, last_seen_at_ms,
+                        last_seen_run_id, availability_status
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 'active')
+                     ON CONFLICT(source_id, external_id) DO UPDATE SET
+                        canonical_key = excluded.canonical_key, job_id = excluded.job_id,
+                        content_hash = excluded.content_hash, last_seen_at_ms = excluded.last_seen_at_ms,
+                        last_seen_run_id = excluded.last_seen_run_id, availability_status = 'active',
+                        missing_count = 0, missing_since_at_ms = NULL",
+                    params![
+                        source.id, source.account_id, saved.canonical_key, external_id, saved.id,
+                        content_hash, observed_at_ms, run_id,
+                    ],
+                )?;
+                seen.push(external_id.clone());
+            }
+            let closed_count = close_missing_snapshot_memberships_sqlite(
+                &tx,
+                source,
+                &run_id,
+                observed_at_ms,
+                &seen,
+                profile,
+                preferences,
+                applications,
+                reservations,
+            )?;
+            let source_changed = tx.execute(
+                "UPDATE jobs_discovery_sources
+                    SET health = 'healthy', consecutive_failures = 0,
+                        last_success_at_ms = ?4, last_error_code = NULL,
+                        next_run_at_ms = ?5, lease_owner = NULL, lease_token = NULL,
+                        lease_expires_at_ms = NULL, updated_at_ms = ?4
+                  WHERE id = ?1 AND account_id = ?2 AND lease_token = ?3",
+                params![
+                    source.id,
+                    source.account_id,
+                    token_hash,
+                    observed_at_ms,
+                    next_run_at
+                ],
+            )?;
+            if source_changed != 1 {
+                anyhow::bail!("discovery lease is stale")
+            }
+            let completed = tx.execute(
+                "UPDATE jobs_discovery_runs
+                    SET status = 'completed', discovered_count = ?3, upserted_count = ?4,
+                        closed_count = ?5, error_code = NULL, snapshot_hash = ?7,
+                        completed_at_ms = ?6
+                  WHERE source_id = ?1 AND replay_key = ?2 AND status = 'running'
+                    AND snapshot_hash = ?7",
+                params![
+                    source.id,
+                    replay_key,
+                    normalized.len() as i64,
+                    seen.len() as i64,
+                    closed_count,
+                    observed_at_ms,
+                    snapshot_hash,
+                ],
+            )?;
+            if completed != 1 {
+                anyhow::bail!("discovery lease is stale")
+            }
+            tx.commit()?;
+            Ok(DiscoveryRunResult {
+                run_id,
+                replay_key: replay_key.to_string(),
+                status: "completed".to_string(),
+                discovered_count: normalized.len() as i64,
+                upserted_count: seen.len() as i64,
+                closed_count,
+                replayed: false,
+            })
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, &source.account_id)?;
+            let tx_now = now_ms();
+            let fresh = tx.query_opt(
+                "SELECT provider, source_key, track_id, source_json, status, updated_at_ms,
+                        next_run_at_ms, lease_expires_at_ms, lease_token
+                   FROM jobs_discovery_sources
+                  WHERE id = $1 AND account_id = $2 FOR UPDATE",
+                &[&source.id, &source.account_id],
+            )?;
+            let Some(fresh) = fresh else {
+                anyhow::bail!("discovery lease is stale")
+            };
+            let provider: String = fresh.get(0);
+            let source_key: String = fresh.get(1);
+            let track_id: String = fresh.get(2);
+            let raw_config: String = fresh.get(3);
+            let status: String = fresh.get(4);
+            let updated_at_ms: i64 = fresh.get(5);
+            let next_run: i64 = fresh.get(6);
+            let lease_expires: Option<i64> = fresh.get(7);
+            let stored_token: Option<String> = fresh.get(8);
+            if provider != source.provider
+                || source_key != source.source_key
+                || track_id != source.track_id
+                || parse_json::<Value>(raw_config, "Jobs discovery source")? != source.config
+                || status != "active"
+                || updated_at_ms != source.updated_at_ms
+                || next_run != scheduled_for_ms
+                || lease_expires.is_none_or(|expiry| expiry <= tx_now)
+                || stored_token.as_deref() != Some(token_hash.as_str())
+            {
+                anyhow::bail!("discovery lease is stale")
+            }
+            let run = tx.query_opt(
+                "SELECT id, status, discovered_count, upserted_count, closed_count, snapshot_hash
+                   FROM jobs_discovery_runs
+                  WHERE source_id = $1 AND replay_key = $2 FOR UPDATE",
+                &[&source.id, &replay_key],
+            )?.ok_or_else(|| anyhow::anyhow!("discovery lease is stale"))?;
+            let run_id: String = run.get(0);
+            let run_status: String = run.get(1);
+            let discovered_count: i64 = run.get(2);
+            let upserted_count: i64 = run.get(3);
+            let closed_count: i64 = run.get(4);
+            let stored_hash: Option<String> = run.get(5);
+            if matches!(run_status.as_str(), "completed" | "failed") {
+                if run_status == "completed" && stored_hash.as_deref() != Some(snapshot_hash) {
+                    anyhow::bail!("discovery replay payload does not match the completed snapshot")
+                }
+                return Ok(DiscoveryRunResult {
+                    run_id,
+                    replay_key: replay_key.to_string(),
+                    status: run_status,
+                    discovered_count,
+                    upserted_count,
+                    closed_count,
+                    replayed: true,
+                });
+            }
+            if run_status != "running"
+                || stored_hash
+                    .as_deref()
+                    .is_some_and(|hash| hash != snapshot_hash)
+            {
+                anyhow::bail!("discovery lease is stale")
+            }
+            tx.execute(
+                "UPDATE jobs_discovery_runs SET snapshot_hash = $3
+                  WHERE source_id = $1 AND replay_key = $2 AND status = 'running'",
+                &[&source.id, &replay_key, &snapshot_hash],
+            )?;
+
+            let mut seen = Vec::with_capacity(normalized.len());
+            for (external_id, (posting, content_hash)) in normalized {
+                let membership_job_id = tx
+                    .query_opt(
+                        "SELECT job_id FROM jobs_discovery_memberships
+                          WHERE source_id = $1 AND external_id = $2 FOR UPDATE",
+                        &[&source.id, &external_id],
+                    )?
+                    .map(|row| row.get::<_, String>(0));
+                let membership_posting = match membership_job_id {
+                    Some(job_id) => tx
+                        .query_opt(
+                            "SELECT posting_json FROM jobs_postings
+                              WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                            &[&source.account_id, &job_id],
+                        )?
+                        .map(|row| parse_json::<JobPosting>(row.get(0), "job posting"))
+                        .transpose()?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("discovery membership refers to a missing job")
+                        })
+                        .map(Some)?,
+                    None => None,
+                };
+                let canonical_posting = tx
+                    .query_opt(
+                        "SELECT posting_json FROM jobs_postings
+                          WHERE account_id = $1 AND canonical_key = $2 FOR UPDATE",
+                        &[&source.account_id, &posting.canonical_key],
+                    )?
+                    .map(|row| parse_json::<JobPosting>(row.get(0), "job posting"))
+                    .transpose()?;
+                if membership_posting
+                    .as_ref()
+                    .zip(canonical_posting.as_ref())
+                    .is_some_and(|(membership, canonical)| membership.id != canonical.id)
+                {
+                    anyhow::bail!("discovery membership and canonical job disagree")
+                }
+                let existing = membership_posting.or(canonical_posting);
+                let saved = prepare_snapshot_posting(
+                    posting,
+                    existing.as_ref().cloned(),
+                    profile,
+                    preferences,
+                    applications,
+                    reservations,
+                    observed_at_ms,
+                )?;
+                let payload = to_json(&saved, "job posting")?;
+                if existing.is_some() {
+                    tx.execute(
+                        "UPDATE jobs_postings SET canonical_key = $3, posting_json = $4,
+                            source = $5, canonical_url = $6, company = $7, title = $8,
+                            location = $9, match_score = $10, status = $11, updated_at_ms = $12
+                          WHERE account_id = $1 AND id = $2",
+                        &[
+                            &source.account_id,
+                            &saved.id,
+                            &saved.canonical_key,
+                            &payload,
+                            &saved.source,
+                            &saved.canonical_url,
+                            &saved.company,
+                            &saved.title,
+                            &saved.location,
+                            &saved.match_score,
+                            &saved.status,
+                            &saved.updated_at_ms,
+                        ],
+                    )?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO jobs_postings (
+                            id, account_id, canonical_key, posting_json, source, canonical_url,
+                            company, title, location, match_score, status, created_at_ms, updated_at_ms
+                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                        &[
+                            &saved.id,
+                            &source.account_id,
+                            &saved.canonical_key,
+                            &payload,
+                            &saved.source,
+                            &saved.canonical_url,
+                            &saved.company,
+                            &saved.title,
+                            &saved.location,
+                            &saved.match_score,
+                            &saved.status,
+                            &saved.created_at_ms,
+                            &saved.updated_at_ms,
+                        ],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO jobs_discovery_memberships (
+                        source_id, account_id, canonical_key, external_id, job_id,
+                        content_hash, first_seen_at_ms, last_seen_at_ms,
+                        last_seen_run_id, availability_status
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, 'active')
+                     ON CONFLICT(source_id, external_id) DO UPDATE SET
+                        canonical_key = EXCLUDED.canonical_key, job_id = EXCLUDED.job_id,
+                        content_hash = EXCLUDED.content_hash, last_seen_at_ms = EXCLUDED.last_seen_at_ms,
+                        last_seen_run_id = EXCLUDED.last_seen_run_id, availability_status = 'active',
+                        missing_count = 0, missing_since_at_ms = NULL",
+                    &[
+                        &source.id, &source.account_id, &saved.canonical_key, &external_id,
+                        &saved.id, &content_hash, &observed_at_ms, &run_id,
+                    ],
+                )?;
+                seen.push(external_id.clone());
+            }
+            let closed_count = close_missing_snapshot_memberships_postgres(
+                &mut tx,
+                source,
+                &run_id,
+                observed_at_ms,
+                &seen,
+                profile,
+                preferences,
+                applications,
+                reservations,
+            )?;
+            let source_changed = tx.execute(
+                "UPDATE jobs_discovery_sources
+                    SET health = 'healthy', consecutive_failures = 0,
+                        last_success_at_ms = $4, last_error_code = NULL,
+                        next_run_at_ms = $5, lease_owner = NULL, lease_token = NULL,
+                        lease_expires_at_ms = NULL, updated_at_ms = $4
+                  WHERE id = $1 AND account_id = $2 AND lease_token = $3",
+                &[
+                    &source.id,
+                    &source.account_id,
+                    &token_hash,
+                    &observed_at_ms,
+                    &next_run_at,
+                ],
+            )?;
+            if source_changed != 1 {
+                anyhow::bail!("discovery lease is stale")
+            }
+            let completed = tx.execute(
+                "UPDATE jobs_discovery_runs
+                    SET status = 'completed', discovered_count = $3, upserted_count = $4,
+                        closed_count = $5, error_code = NULL, snapshot_hash = $7,
+                        completed_at_ms = $6
+                  WHERE source_id = $1 AND replay_key = $2 AND status = 'running'
+                    AND snapshot_hash = $7",
+                &[
+                    &source.id,
+                    &replay_key,
+                    &(normalized.len() as i64),
+                    &(seen.len() as i64),
+                    &closed_count,
+                    &observed_at_ms,
+                    &snapshot_hash,
+                ],
+            )?;
+            if completed != 1 {
+                anyhow::bail!("discovery lease is stale")
+            }
+            tx.commit()?;
+            Ok(DiscoveryRunResult {
+                run_id,
+                replay_key: replay_key.to_string(),
+                status: "completed".to_string(),
+                discovered_count: normalized.len() as i64,
+                upserted_count: seen.len() as i64,
+                closed_count,
+                replayed: false,
+            })
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn close_missing_snapshot_memberships_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    source: &DiscoverySource,
+    _run_id: &str,
+    observed_at_ms: i64,
+    seen: &[String],
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+    applications: &[JobApplication],
+    reservations: &[AttemptReservation],
+) -> Result<i64> {
+    const MISSING_GRACE_MS: i64 = 30 * 60 * 1_000;
+    let mut stmt = tx.prepare(
+        "SELECT external_id, job_id, missing_count, missing_since_at_ms
+           FROM jobs_discovery_memberships
+          WHERE source_id = ?1 AND availability_status = 'active'",
+    )?;
+    let active = stmt
+        .query_map(params![source.id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    let seen = seen.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut closed = 0;
+    for (external_id, job_id, missing_count, missing_since_at_ms) in active {
+        if seen.contains(external_id.as_str()) {
+            continue;
+        }
+        let missing_since = missing_since_at_ms.unwrap_or(observed_at_ms);
+        let next_missing_count = missing_count + 1;
+        let should_close = next_missing_count >= 2
+            && observed_at_ms.saturating_sub(missing_since) >= MISSING_GRACE_MS;
+        let availability = if should_close { "expired" } else { "active" };
+        let changed = tx.execute(
+            "UPDATE jobs_discovery_memberships
+                SET availability_status = ?4, missing_count = ?5, missing_since_at_ms = ?3
+              WHERE source_id = ?1 AND external_id = ?2 AND availability_status = 'active'",
+            params![
+                source.id,
+                external_id,
+                missing_since,
+                availability,
+                next_missing_count,
+            ],
+        )?;
+        if changed == 0 || !should_close {
+            continue;
+        }
+        let still_active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs_discovery_memberships
+              WHERE account_id = ?1 AND job_id = ?2 AND availability_status = 'active')",
+            params![source.account_id, job_id],
+            |row| row.get(0),
+        )?;
+        if still_active {
+            continue;
+        }
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT posting_json FROM jobs_postings WHERE account_id = ?1 AND id = ?2",
+                params![source.account_id, job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = raw {
+            let mut posting: JobPosting = parse_json(raw, "job posting")?;
+            posting.availability_status = "expired".to_string();
+            posting.last_verified_at_ms = Some(observed_at_ms);
+            posting.updated_at_ms = observed_at_ms;
+            let existing_application_id = applications
+                .iter()
+                .find(|application| application.job_id == posting.id)
+                .map(|application| application.id.as_str());
+            posting.eligibility = Some(build_job_eligibility(
+                &posting,
+                profile,
+                preferences,
+                reservations,
+                true,
+                existing_application_id,
+            ));
+            let payload = to_json(&posting, "job posting")?;
+            tx.execute(
+                "UPDATE jobs_postings SET posting_json = ?3, updated_at_ms = ?4
+                  WHERE account_id = ?1 AND id = ?2",
+                params![source.account_id, job_id, payload, observed_at_ms],
+            )?;
+        }
+        closed += 1;
+    }
+    Ok(closed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn close_missing_snapshot_memberships_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    source: &DiscoverySource,
+    _run_id: &str,
+    observed_at_ms: i64,
+    seen: &[String],
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+    applications: &[JobApplication],
+    reservations: &[AttemptReservation],
+) -> Result<i64> {
+    const MISSING_GRACE_MS: i64 = 30 * 60 * 1_000;
+    let active = tx
+        .query(
+            "SELECT external_id, job_id, missing_count, missing_since_at_ms
+               FROM jobs_discovery_memberships
+              WHERE source_id = $1 AND availability_status = 'active' FOR UPDATE",
+            &[&source.id],
+        )?
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, i64>(2),
+                row.get::<_, Option<i64>>(3),
+            )
+        })
+        .collect::<Vec<_>>();
+    let seen = seen.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut closed = 0;
+    for (external_id, job_id, missing_count, missing_since_at_ms) in active {
+        if seen.contains(external_id.as_str()) {
+            continue;
+        }
+        let missing_since = missing_since_at_ms.unwrap_or(observed_at_ms);
+        let next_missing_count = missing_count + 1;
+        let should_close = next_missing_count >= 2
+            && observed_at_ms.saturating_sub(missing_since) >= MISSING_GRACE_MS;
+        let availability = if should_close { "expired" } else { "active" };
+        let changed = tx.execute(
+            "UPDATE jobs_discovery_memberships
+                SET availability_status = $4, missing_count = $5, missing_since_at_ms = $3
+              WHERE source_id = $1 AND external_id = $2 AND availability_status = 'active'",
+            &[
+                &source.id,
+                &external_id,
+                &missing_since,
+                &availability,
+                &next_missing_count,
+            ],
+        )?;
+        if changed == 0 || !should_close {
+            continue;
+        }
+        let still_active: bool = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM jobs_discovery_memberships
+              WHERE account_id = $1 AND job_id = $2 AND availability_status = 'active')",
+                &[&source.account_id, &job_id],
+            )?
+            .get(0);
+        if still_active {
+            continue;
+        }
+        let raw = tx.query_opt(
+            "SELECT posting_json FROM jobs_postings WHERE account_id = $1 AND id = $2 FOR UPDATE",
+            &[&source.account_id, &job_id],
+        )?.map(|row| row.get::<_, String>(0));
+        if let Some(raw) = raw {
+            let mut posting: JobPosting = parse_json(raw, "job posting")?;
+            posting.availability_status = "expired".to_string();
+            posting.last_verified_at_ms = Some(observed_at_ms);
+            posting.updated_at_ms = observed_at_ms;
+            let existing_application_id = applications
+                .iter()
+                .find(|application| application.job_id == posting.id)
+                .map(|application| application.id.as_str());
+            posting.eligibility = Some(build_job_eligibility(
+                &posting,
+                profile,
+                preferences,
+                reservations,
+                true,
+                existing_application_id,
+            ));
+            let payload = to_json(&posting, "job posting")?;
+            tx.execute(
+                "UPDATE jobs_postings SET posting_json = $3, updated_at_ms = $4
+                  WHERE account_id = $1 AND id = $2",
+                &[&source.account_id, &job_id, &payload, &observed_at_ms],
+            )?;
+        }
+        closed += 1;
+    }
+    Ok(closed)
+}
+
 pub fn complete_discovery_run(
     pool: &DbPool,
     source_id: &str,
@@ -2454,8 +3980,9 @@ pub fn complete_discovery_run(
         .ok_or_else(|| anyhow::anyhow!("discovery source company is missing"))?;
     let profile = get_profile(pool, &source.account_id, "")?;
     let preferences = get_preferences(pool, &source.account_id)?;
+    let applications = list_applications(pool, &source.account_id)?;
+    let reservations = list_attempt_reservations(pool, &source.account_id)?;
     let fetched_at_ms = now_ms();
-    let run_id = discovery_run_id(source_id, replay_key);
     let mut normalized = BTreeMap::<String, (JobPosting, String)>::new();
     for input in jobs {
         validate_discovered_job(&source, input)?;
@@ -2512,40 +4039,18 @@ pub fn complete_discovery_run(
             ..existing
         });
     }
-    if let Some(existing) = acquire_discovery_commit_fence(
+    publish_discovery_snapshot(
         pool,
         &source,
         lease_token,
         replay_key,
         scheduled_for_ms,
+        &normalized,
         &snapshot_hash,
-    )? {
-        return Ok(existing);
-    }
-    let mut seen = Vec::with_capacity(normalized.len());
-    for (external_id, (posting, content_hash)) in normalized {
-        let saved = upsert_posting(pool, &source.account_id, &posting, &profile, &preferences)?;
-        save_discovery_membership(pool, &source, &saved, &content_hash, &run_id, fetched_at_ms)?;
-        seen.push(external_id);
-    }
-    let closed_count = close_missing_discovery_memberships(
-        pool,
-        &source,
-        &run_id,
-        fetched_at_ms,
-        &seen,
         &profile,
         &preferences,
-    )?;
-    finish_discovery_success(
-        pool,
-        &source,
-        lease_token,
-        replay_key,
-        jobs.len() as i64,
-        seen.len() as i64,
-        closed_count,
-        &snapshot_hash,
+        &applications,
+        &reservations,
         fetched_at_ms,
     )
 }
@@ -2558,12 +4063,6 @@ pub fn fail_discovery_run(
     scheduled_for_ms: i64,
     error_code: &str,
 ) -> Result<DiscoveryRunResult> {
-    if let Some(existing) = completed_discovery_run(pool, source_id, replay_key, None)? {
-        return Ok(DiscoveryRunResult {
-            replayed: true,
-            ..existing
-        });
-    }
     if !matches!(
         error_code,
         "throttled"
@@ -2576,19 +4075,75 @@ pub fn fail_discovery_run(
     ) {
         anyhow::bail!("invalid discovery failure code")
     }
-    let source = get_discovery_source(pool, source_id)?
-        .ok_or_else(|| anyhow::anyhow!("discovery source not found"))?;
-    validate_discovery_lease(pool, &source, lease_token, replay_key, scheduled_for_ms)?;
     let now = now_ms();
-    let failures = source.consecutive_failures + 1;
-    let health = if failures >= 3 { "paused" } else { "degraded" };
-    let next_run_at = now + source.run_interval_ms;
-    let run_id = discovery_run_id(source_id, replay_key);
     let token_hash = discovery_lease_token_hash(lease_token);
-    let changed = crate::db::run_blocking_db(|| match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            let changed = conn.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (source, stored_token) = tx
+                .query_row(
+                    "SELECT id, account_id, track_id, provider, source_key, source_json,
+                            status, health, consecutive_failures, run_interval_ms,
+                            next_run_at_ms, last_success_at_ms, last_failure_at_ms,
+                            last_error_code, lease_expires_at_ms, created_at_ms, updated_at_ms,
+                            lease_token
+                       FROM jobs_discovery_sources WHERE id = ?1",
+                    params![source_id],
+                    |row| {
+                        Ok((
+                            discovery_source_from_sqlite_row(row)?,
+                            row.get::<_, Option<String>>(17)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("discovery source not found"))?;
+            let run = tx
+                .query_row(
+                    "SELECT id, status, discovered_count, upserted_count, closed_count
+                       FROM jobs_discovery_runs WHERE source_id = ?1 AND replay_key = ?2",
+                    params![source.id, replay_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("discovery lease is stale"))?;
+            if matches!(run.1.as_str(), "completed" | "failed") {
+                tx.commit()?;
+                return Ok(DiscoveryRunResult {
+                    run_id: run.0,
+                    replay_key: replay_key.to_string(),
+                    status: run.1,
+                    discovered_count: run.2,
+                    upserted_count: run.3,
+                    closed_count: run.4,
+                    replayed: true,
+                });
+            }
+            if lease_token.len() < 32
+                || replay_key != discovery_replay_key(&source.id, scheduled_for_ms)
+                || scheduled_for_ms != source.next_run_at_ms
+                || source.status != "active"
+                || source
+                    .lease_expires_at_ms
+                    .is_none_or(|expiry| expiry <= now)
+                || stored_token.as_deref() != Some(token_hash.as_str())
+                || run.1 != "running"
+            {
+                anyhow::bail!("discovery lease is stale")
+            }
+            let failures = source.consecutive_failures + 1;
+            let health = if failures >= 3 { "paused" } else { "degraded" };
+            let next_run_at = discovery_next_run_at(&source, now, failures);
+            let source_changed = tx.execute(
                 "UPDATE jobs_discovery_sources
                     SET health = ?4, consecutive_failures = ?5,
                         last_failure_at_ms = ?6, last_error_code = ?7,
@@ -2606,20 +4161,98 @@ pub fn fail_discovery_run(
                     next_run_at
                 ],
             )?;
-            if changed > 0 {
-                conn.execute(
-                    "UPDATE jobs_discovery_runs
-                        SET status = 'failed', error_code = ?3, completed_at_ms = ?4
-                      WHERE source_id = ?1 AND replay_key = ?2 AND status = 'running'",
-                    params![source.id, replay_key, error_code, now],
-                )?;
+            if source_changed != 1 {
+                anyhow::bail!("discovery lease is stale")
             }
-            Ok::<u64, anyhow::Error>(changed as u64)
+            let run_changed = tx.execute(
+                "UPDATE jobs_discovery_runs
+                    SET status = 'failed', error_code = ?3, completed_at_ms = ?4
+                  WHERE source_id = ?1 AND replay_key = ?2 AND status = 'running'",
+                params![source.id, replay_key, error_code, now],
+            )?;
+            if run_changed != 1 {
+                anyhow::bail!("discovery lease is stale")
+            }
+            tx.commit()?;
+            Ok(DiscoveryRunResult {
+                run_id: run.0,
+                replay_key: replay_key.to_string(),
+                status: "failed".to_string(),
+                discovered_count: 0,
+                upserted_count: 0,
+                closed_count: 0,
+                replayed: false,
+            })
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            let changed = tx.execute(
+            let account_id: String = tx
+                .query_opt(
+                    "SELECT account_id FROM jobs_discovery_sources WHERE id = $1",
+                    &[&source_id],
+                )?
+                .map(|row| row.get(0))
+                .ok_or_else(|| anyhow::anyhow!("discovery source not found"))?;
+            lock_discovery_account_postgres(&mut tx, &account_id)?;
+            let row = tx
+                .query_opt(
+                    "SELECT id, account_id, track_id, provider, source_key, source_json,
+                            status, health, consecutive_failures, run_interval_ms,
+                            next_run_at_ms, last_success_at_ms, last_failure_at_ms,
+                            last_error_code, lease_expires_at_ms, created_at_ms, updated_at_ms,
+                            lease_token
+                       FROM jobs_discovery_sources WHERE id = $1 FOR UPDATE",
+                    &[&source_id],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("discovery source not found"))?;
+            let stored_token: Option<String> = row.get(17);
+            let source = discovery_source_from_pg_row(row)?;
+            let run = tx
+                .query_opt(
+                    "SELECT id, status, discovered_count, upserted_count, closed_count
+                       FROM jobs_discovery_runs
+                      WHERE source_id = $1 AND replay_key = $2 FOR UPDATE",
+                    &[&source.id, &replay_key],
+                )?
+                .map(|row| {
+                    (
+                        row.get::<_, String>(0),
+                        row.get::<_, String>(1),
+                        row.get::<_, i64>(2),
+                        row.get::<_, i64>(3),
+                        row.get::<_, i64>(4),
+                    )
+                })
+                .ok_or_else(|| anyhow::anyhow!("discovery lease is stale"))?;
+            if matches!(run.1.as_str(), "completed" | "failed") {
+                tx.commit()?;
+                return Ok(DiscoveryRunResult {
+                    run_id: run.0,
+                    replay_key: replay_key.to_string(),
+                    status: run.1,
+                    discovered_count: run.2,
+                    upserted_count: run.3,
+                    closed_count: run.4,
+                    replayed: true,
+                });
+            }
+            if lease_token.len() < 32
+                || replay_key != discovery_replay_key(&source.id, scheduled_for_ms)
+                || scheduled_for_ms != source.next_run_at_ms
+                || source.status != "active"
+                || source
+                    .lease_expires_at_ms
+                    .is_none_or(|expiry| expiry <= now)
+                || stored_token.as_deref() != Some(token_hash.as_str())
+                || run.1 != "running"
+            {
+                anyhow::bail!("discovery lease is stale")
+            }
+            let failures = source.consecutive_failures + 1;
+            let health = if failures >= 3 { "paused" } else { "degraded" };
+            let next_run_at = discovery_next_run_at(&source, now, failures);
+            let source_changed = tx.execute(
                 "UPDATE jobs_discovery_sources
                     SET health = $4, consecutive_failures = $5,
                         last_failure_at_ms = $6, last_error_code = $7,
@@ -2637,206 +4270,30 @@ pub fn fail_discovery_run(
                     &next_run_at,
                 ],
             )?;
-            if changed > 0 {
-                tx.execute(
-                    "UPDATE jobs_discovery_runs
-                        SET status = 'failed', error_code = $3, completed_at_ms = $4
-                      WHERE source_id = $1 AND replay_key = $2 AND status = 'running'",
-                    &[&source.id, &replay_key, &error_code, &now],
-                )?;
+            if source_changed != 1 {
+                anyhow::bail!("discovery lease is stale")
+            }
+            let run_changed = tx.execute(
+                "UPDATE jobs_discovery_runs
+                    SET status = 'failed', error_code = $3, completed_at_ms = $4
+                  WHERE source_id = $1 AND replay_key = $2 AND status = 'running'",
+                &[&source.id, &replay_key, &error_code, &now],
+            )?;
+            if run_changed != 1 {
+                anyhow::bail!("discovery lease is stale")
             }
             tx.commit()?;
-            Ok(changed)
+            Ok(DiscoveryRunResult {
+                run_id: run.0,
+                replay_key: replay_key.to_string(),
+                status: "failed".to_string(),
+                discovered_count: 0,
+                upserted_count: 0,
+                closed_count: 0,
+                replayed: false,
+            })
         }
-    })?;
-    if changed == 0 {
-        anyhow::bail!("discovery lease is stale")
-    }
-    Ok(DiscoveryRunResult {
-        run_id,
-        replay_key: replay_key.to_string(),
-        status: "failed".to_string(),
-        discovered_count: 0,
-        upserted_count: 0,
-        closed_count: 0,
-        replayed: false,
     })
-}
-
-fn validate_discovery_lease(
-    pool: &DbPool,
-    source: &DiscoverySource,
-    lease_token: &str,
-    replay_key: &str,
-    scheduled_for_ms: i64,
-) -> Result<()> {
-    if lease_token.len() < 32
-        || replay_key != discovery_replay_key(&source.id, scheduled_for_ms)
-        || scheduled_for_ms != source.next_run_at_ms
-    {
-        anyhow::bail!("discovery lease does not match its scheduled run")
-    }
-    let token_hash = discovery_lease_token_hash(lease_token);
-    let valid = crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => pool
-            .get()?
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM jobs_discovery_sources s
-                    JOIN jobs_discovery_runs r ON r.source_id = s.id
-                    WHERE s.id = ?1 AND s.lease_token = ?2
-                      AND s.lease_expires_at_ms > ?4
-                      AND r.replay_key = ?3 AND r.status = 'running'
-                 )",
-                params![source.id, token_hash, replay_key, now_ms()],
-                |row| row.get::<_, bool>(0),
-            )
-            .context("validate discovery lease"),
-        DbPool::Postgres(_) => pool
-            .get_pg()?
-            .query_one(
-                "SELECT EXISTS(
-                    SELECT 1 FROM jobs_discovery_sources s
-                    JOIN jobs_discovery_runs r ON r.source_id = s.id
-                    WHERE s.id = $1 AND s.lease_token = $2
-                      AND s.lease_expires_at_ms > $4
-                      AND r.replay_key = $3 AND r.status = 'running'
-                 )",
-                &[&source.id, &token_hash, &replay_key, &now_ms()],
-            )
-            .map(|row| row.get::<_, bool>(0))
-            .context("validate discovery lease"),
-    })?;
-    if !valid {
-        anyhow::bail!("discovery lease is stale")
-    }
-    Ok(())
-}
-
-fn acquire_discovery_commit_fence(
-    pool: &DbPool,
-    source: &DiscoverySource,
-    lease_token: &str,
-    replay_key: &str,
-    scheduled_for_ms: i64,
-    snapshot_hash: &str,
-) -> Result<Option<DiscoveryRunResult>> {
-    if lease_token.len() < 32
-        || replay_key != discovery_replay_key(&source.id, scheduled_for_ms)
-        || scheduled_for_ms != source.next_run_at_ms
-    {
-        anyhow::bail!("discovery lease does not match its scheduled run")
-    }
-    let token_hash = discovery_lease_token_hash(lease_token);
-    let now = now_ms();
-    let commit_expires_at = now + DISCOVERY_COMMIT_LEASE_MS;
-    let acquired = crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => {
-            let mut conn = pool.get()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let source_changed = tx.execute(
-                "UPDATE jobs_discovery_sources
-                    SET lease_expires_at_ms = ?5, updated_at_ms = ?6
-                  WHERE id = ?1 AND account_id = ?2 AND lease_token = ?3
-                    AND next_run_at_ms = ?4 AND lease_expires_at_ms > ?6",
-                params![
-                    source.id,
-                    source.account_id,
-                    token_hash,
-                    scheduled_for_ms,
-                    commit_expires_at,
-                    now,
-                ],
-            )?;
-            if source_changed == 0 {
-                return Ok::<bool, anyhow::Error>(false);
-            }
-            let run_changed = tx.execute(
-                "UPDATE jobs_discovery_runs
-                    SET status = 'committing', snapshot_hash = ?3
-                  WHERE source_id = ?1 AND replay_key = ?2 AND status = 'running'
-                    AND (snapshot_hash IS NULL OR snapshot_hash = ?3)",
-                params![source.id, replay_key, snapshot_hash],
-            )?;
-            if run_changed != 1 {
-                let existing: Option<(String, Option<String>)> = tx
-                    .query_row(
-                        "SELECT status, snapshot_hash FROM jobs_discovery_runs
-                          WHERE source_id = ?1 AND replay_key = ?2",
-                        params![source.id, replay_key],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
-                if existing
-                    .as_ref()
-                    .and_then(|(_, hash)| hash.as_deref())
-                    .is_some_and(|hash| hash != snapshot_hash)
-                {
-                    anyhow::bail!("discovery replay payload does not match the scheduled snapshot")
-                }
-                anyhow::bail!("discovery scheduled run is already committing")
-            }
-            tx.commit()?;
-            Ok(true)
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            let mut tx = conn.transaction()?;
-            let source_changed = tx.execute(
-                "UPDATE jobs_discovery_sources
-                    SET lease_expires_at_ms = $5, updated_at_ms = $6
-                  WHERE id = $1 AND account_id = $2 AND lease_token = $3
-                    AND next_run_at_ms = $4 AND lease_expires_at_ms > $6",
-                &[
-                    &source.id,
-                    &source.account_id,
-                    &token_hash,
-                    &scheduled_for_ms,
-                    &commit_expires_at,
-                    &now,
-                ],
-            )?;
-            if source_changed == 0 {
-                return Ok::<bool, anyhow::Error>(false);
-            }
-            let run_changed = tx.execute(
-                "UPDATE jobs_discovery_runs
-                    SET status = 'committing', snapshot_hash = $3
-                  WHERE source_id = $1 AND replay_key = $2 AND status = 'running'
-                    AND (snapshot_hash IS NULL OR snapshot_hash = $3)",
-                &[&source.id, &replay_key, &snapshot_hash],
-            )?;
-            if run_changed != 1 {
-                let existing = tx.query_opt(
-                    "SELECT status, snapshot_hash FROM jobs_discovery_runs
-                      WHERE source_id = $1 AND replay_key = $2",
-                    &[&source.id, &replay_key],
-                )?;
-                if existing
-                    .as_ref()
-                    .and_then(|row| row.get::<_, Option<String>>(1))
-                    .is_some_and(|hash| hash != snapshot_hash)
-                {
-                    anyhow::bail!("discovery replay payload does not match the scheduled snapshot")
-                }
-                anyhow::bail!("discovery scheduled run is already committing")
-            }
-            tx.commit()?;
-            Ok(true)
-        }
-    })?;
-    if acquired {
-        return Ok(None);
-    }
-    if let Some(existing) =
-        completed_discovery_run(pool, &source.id, replay_key, Some(snapshot_hash))?
-    {
-        return Ok(Some(DiscoveryRunResult {
-            replayed: true,
-            ..existing
-        }));
-    }
-    anyhow::bail!("discovery lease is stale")
 }
 
 fn validate_discovered_job(source: &DiscoverySource, input: &DiscoveredJobInput) -> Result<()> {
@@ -2892,7 +4349,10 @@ pub fn discovery_source_input_from_verified_import(
     }))
 }
 
-fn canonical_public_discovery_url(provider: &str, raw: &str) -> Result<(String, String)> {
+/// Parse one of the public ATS links used by both the server importer and the
+/// scheduler. Keeping one parser prevents an import from being saved in a form
+/// that discovery later refuses to enroll.
+pub fn canonical_public_discovery_url(provider: &str, raw: &str) -> Result<(String, String)> {
     let mut url = reqwest::Url::parse(raw.trim()).context("parse discovered job URL")?;
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         anyhow::bail!("discovery job URL must be public HTTPS without credentials")
@@ -2924,14 +4384,12 @@ fn canonical_public_discovery_url(provider: &str, raw: &str) -> Result<(String, 
         "workday" => workday_source_key(&host, &segments)?,
         _ => anyhow::bail!("discovery job URL does not belong to the configured provider"),
     };
-    let retained_query = url
+    let mut retained_query = url
         .query_pairs()
-        .filter(|(key, _)| {
-            let key = key.to_ascii_lowercase();
-            !key.starts_with("utm_") && key != "gh_src" && key != "lever-source"
-        })
+        .filter(|(key, _)| !is_tracking_query_key(key))
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect::<Vec<_>>();
+    retained_query.sort();
     url.set_query(None);
     if !retained_query.is_empty() {
         let mut query = url.query_pairs_mut();
@@ -3136,323 +4594,6 @@ fn completed_discovery_run(
         }
     }
     Ok(completed.map(|(result, _)| result))
-}
-
-fn save_discovery_membership(
-    pool: &DbPool,
-    source: &DiscoverySource,
-    posting: &JobPosting,
-    content_hash: &str,
-    run_id: &str,
-    seen_at_ms: i64,
-) -> Result<()> {
-    crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => {
-            pool.get()?.execute(
-                "INSERT INTO jobs_discovery_memberships (
-                    source_id, account_id, canonical_key, external_id, job_id,
-                    content_hash, first_seen_at_ms, last_seen_at_ms,
-                    last_seen_run_id, availability_status
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 'active')
-                 ON CONFLICT(source_id, external_id) DO UPDATE SET
-                    canonical_key = excluded.canonical_key,
-                    job_id = excluded.job_id,
-                    content_hash = excluded.content_hash,
-                    last_seen_at_ms = excluded.last_seen_at_ms,
-                    last_seen_run_id = excluded.last_seen_run_id,
-                    availability_status = 'active', missing_count = 0,
-                    missing_since_at_ms = NULL",
-                params![
-                    source.id,
-                    source.account_id,
-                    posting.canonical_key,
-                    posting.external_id,
-                    posting.id,
-                    content_hash,
-                    seen_at_ms,
-                    run_id
-                ],
-            )?;
-            Ok(())
-        }
-        DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
-                "INSERT INTO jobs_discovery_memberships (
-                    source_id, account_id, canonical_key, external_id, job_id,
-                    content_hash, first_seen_at_ms, last_seen_at_ms,
-                    last_seen_run_id, availability_status
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, 'active')
-                 ON CONFLICT(source_id, external_id) DO UPDATE SET
-                    canonical_key = EXCLUDED.canonical_key,
-                    job_id = EXCLUDED.job_id,
-                    content_hash = EXCLUDED.content_hash,
-                    last_seen_at_ms = EXCLUDED.last_seen_at_ms,
-                    last_seen_run_id = EXCLUDED.last_seen_run_id,
-                    availability_status = 'active', missing_count = 0,
-                    missing_since_at_ms = NULL",
-                &[
-                    &source.id,
-                    &source.account_id,
-                    &posting.canonical_key,
-                    &posting.external_id,
-                    &posting.id,
-                    &content_hash,
-                    &seen_at_ms,
-                    &run_id,
-                ],
-            )?;
-            Ok(())
-        }
-    })
-}
-
-fn close_missing_discovery_memberships(
-    pool: &DbPool,
-    source: &DiscoverySource,
-    run_id: &str,
-    observed_at_ms: i64,
-    seen: &[String],
-    profile: &CareerProfile,
-    preferences: &JobPreferences,
-) -> Result<i64> {
-    const MISSING_GRACE_MS: i64 = 30 * 60 * 1_000;
-    let active = crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            let mut stmt = conn.prepare(
-                "SELECT external_id, job_id, missing_count, missing_since_at_ms
-                   FROM jobs_discovery_memberships
-                  WHERE source_id = ?1 AND availability_status = 'active'",
-            )?;
-            let rows = stmt.query_map(params![source.id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                ))
-            })?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .context("list active discovery memberships")
-        }
-        DbPool::Postgres(_) => Ok(pool
-            .get_pg()?
-            .query(
-                "SELECT external_id, job_id, missing_count, missing_since_at_ms
-                   FROM jobs_discovery_memberships
-                  WHERE source_id = $1 AND availability_status = 'active'",
-                &[&source.id],
-            )?
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
-            .collect::<Vec<(String, String, i64, Option<i64>)>>()),
-    })?;
-    let seen = seen
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut closed = 0;
-    for (external_id, job_id, missing_count, missing_since_at_ms) in active {
-        if seen.contains(external_id.as_str()) {
-            continue;
-        }
-        let missing_since = missing_since_at_ms.unwrap_or(observed_at_ms);
-        let next_missing_count = missing_count + 1;
-        let should_close = next_missing_count >= 2
-            && observed_at_ms.saturating_sub(missing_since) >= MISSING_GRACE_MS;
-        let availability = if should_close { "expired" } else { "active" };
-        let changed = crate::db::run_blocking_db(|| match pool {
-            DbPool::Sqlite(_) => Ok::<u64, anyhow::Error>(pool.get()?.execute(
-                "UPDATE jobs_discovery_memberships
-                    SET availability_status = ?5, missing_count = ?6,
-                        missing_since_at_ms = ?4,
-                        last_seen_run_id = ?3
-                  WHERE source_id = ?1 AND external_id = ?2
-                    AND availability_status = 'active'",
-                params![
-                    source.id,
-                    external_id,
-                    run_id,
-                    missing_since,
-                    availability,
-                    next_missing_count
-                ],
-            )? as u64),
-            DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
-                "UPDATE jobs_discovery_memberships
-                    SET availability_status = $5, missing_count = $6,
-                        missing_since_at_ms = $4,
-                        last_seen_run_id = $3
-                  WHERE source_id = $1 AND external_id = $2
-                    AND availability_status = 'active'",
-                &[
-                    &source.id,
-                    &external_id,
-                    &run_id,
-                    &missing_since,
-                    &availability,
-                    &next_missing_count,
-                ],
-            )?),
-        })?;
-        if changed == 0 || !should_close {
-            continue;
-        }
-        closed += 1;
-        let still_active = crate::db::run_blocking_db(|| match pool {
-            DbPool::Sqlite(_) => pool
-                .get()?
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM jobs_discovery_memberships
-                      WHERE account_id = ?1 AND job_id = ?2 AND availability_status = 'active')",
-                    params![source.account_id, job_id],
-                    |row| row.get::<_, bool>(0),
-                )
-                .context("check remaining discovery membership"),
-            DbPool::Postgres(_) => pool
-                .get_pg()?
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM jobs_discovery_memberships
-                      WHERE account_id = $1 AND job_id = $2 AND availability_status = 'active')",
-                    &[&source.account_id, &job_id],
-                )
-                .map(|row| row.get::<_, bool>(0))
-                .context("check remaining discovery membership"),
-        })?;
-        if !still_active {
-            if let Some(mut posting) = get_posting(pool, &source.account_id, &job_id)? {
-                posting.availability_status = "expired".to_string();
-                posting.last_verified_at_ms = Some(observed_at_ms);
-                upsert_posting(pool, &source.account_id, &posting, profile, preferences)?;
-            }
-        }
-    }
-    Ok(closed)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finish_discovery_success(
-    pool: &DbPool,
-    source: &DiscoverySource,
-    lease_token: &str,
-    replay_key: &str,
-    discovered_count: i64,
-    upserted_count: i64,
-    closed_count: i64,
-    snapshot_hash: &str,
-    completed_at_ms: i64,
-) -> Result<DiscoveryRunResult> {
-    let run_id = discovery_run_id(&source.id, replay_key);
-    let token_hash = discovery_lease_token_hash(lease_token);
-    let next_run_at = completed_at_ms + source.run_interval_ms;
-    let changed = crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => {
-            let mut conn = pool.get()?;
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let changed = tx.execute(
-                "UPDATE jobs_discovery_sources
-                    SET health = 'healthy', consecutive_failures = 0,
-                        last_success_at_ms = ?4, last_error_code = NULL,
-                        next_run_at_ms = ?5, lease_owner = NULL, lease_token = NULL,
-                        lease_expires_at_ms = NULL, updated_at_ms = ?4
-                  WHERE id = ?1 AND account_id = ?2 AND lease_token = ?3",
-                params![
-                    source.id,
-                    source.account_id,
-                    token_hash,
-                    completed_at_ms,
-                    next_run_at
-                ],
-            )?;
-            if changed > 0 {
-                let run_changed = tx.execute(
-                    "UPDATE jobs_discovery_runs
-                        SET status = 'completed', discovered_count = ?3,
-                            upserted_count = ?4, closed_count = ?5,
-                            error_code = NULL, snapshot_hash = ?7, completed_at_ms = ?6
-                      WHERE source_id = ?1 AND replay_key = ?2 AND status = 'committing'
-                        AND snapshot_hash = ?7",
-                    params![
-                        source.id,
-                        replay_key,
-                        discovered_count,
-                        upserted_count,
-                        closed_count,
-                        completed_at_ms,
-                        snapshot_hash
-                    ],
-                )?;
-                if run_changed != 1 {
-                    anyhow::bail!("discovery commit fence was lost")
-                }
-            }
-            tx.commit()?;
-            Ok::<u64, anyhow::Error>(changed as u64)
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            let mut tx = conn.transaction()?;
-            let changed = tx.execute(
-                "UPDATE jobs_discovery_sources
-                    SET health = 'healthy', consecutive_failures = 0,
-                        last_success_at_ms = $4, last_error_code = NULL,
-                        next_run_at_ms = $5, lease_owner = NULL, lease_token = NULL,
-                        lease_expires_at_ms = NULL, updated_at_ms = $4
-                  WHERE id = $1 AND account_id = $2 AND lease_token = $3",
-                &[
-                    &source.id,
-                    &source.account_id,
-                    &token_hash,
-                    &completed_at_ms,
-                    &next_run_at,
-                ],
-            )?;
-            if changed > 0 {
-                let run_changed = tx.execute(
-                    "UPDATE jobs_discovery_runs
-                        SET status = 'completed', discovered_count = $3,
-                            upserted_count = $4, closed_count = $5,
-                            error_code = NULL, snapshot_hash = $7, completed_at_ms = $6
-                      WHERE source_id = $1 AND replay_key = $2 AND status = 'committing'
-                        AND snapshot_hash = $7",
-                    &[
-                        &source.id,
-                        &replay_key,
-                        &discovered_count,
-                        &upserted_count,
-                        &closed_count,
-                        &completed_at_ms,
-                        &snapshot_hash,
-                    ],
-                )?;
-                if run_changed != 1 {
-                    anyhow::bail!("discovery commit fence was lost")
-                }
-            }
-            tx.commit()?;
-            Ok(changed)
-        }
-    })?;
-    if changed == 0 {
-        if let Some(existing) =
-            completed_discovery_run(pool, &source.id, replay_key, Some(snapshot_hash))?
-        {
-            return Ok(DiscoveryRunResult {
-                replayed: true,
-                ..existing
-            });
-        }
-        anyhow::bail!("discovery lease is stale")
-    }
-    Ok(DiscoveryRunResult {
-        run_id,
-        replay_key: replay_key.to_string(),
-        status: "completed".to_string(),
-        discovered_count,
-        upserted_count,
-        closed_count,
-        replayed: false,
-    })
 }
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -10116,6 +11257,14 @@ mod tests {
     }
 
     #[test]
+    fn discovery_writers_share_one_postgres_account_lock_namespace() {
+        assert_eq!(
+            DISCOVERY_ACCOUNT_LOCK_SQL,
+            "SELECT pg_advisory_xact_lock(hashtextextended('jobs-discovery-account:' || $1, 0))"
+        );
+    }
+
+    #[test]
     fn sponsorship_detection_never_treats_explicit_rejections_as_offers() {
         let mut posting = test_posting("https://jobs.example.com/role", now_ms(), now_ms());
         for rejection in [
@@ -10603,6 +11752,15 @@ mod tests {
             .iter()
             .all(|posting| posting.availability_status == "active"));
         let conn = pool.get().unwrap();
+        let last_seen_run_id: String = conn
+            .query_row(
+                "SELECT last_seen_run_id FROM jobs_discovery_memberships
+                  WHERE source_id = ?1 AND external_id = '100'",
+                params![source.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_seen_run_id, completed.run_id);
         conn.execute(
             "UPDATE jobs_discovery_memberships SET missing_since_at_ms = ?1",
             params![now_ms() - 31 * 60 * 1_000],
@@ -10737,10 +11895,22 @@ mod tests {
                 "northstar",
             ),
             (
+                "smartrecruiters_import",
+                "https://jobs.smartrecruiters.com/Experian/744000138411689",
+                "smartrecruiters",
+                "Experian",
+            ),
+            (
                 "workday_import",
                 "https://contoso.wd5.myworkdayjobs.com/en-US/Careers/job/Austin/Software-Engineer_R12345",
                 "workday",
                 "contoso~wd5~Careers",
+            ),
+            (
+                "workday_import",
+                "https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/Ireland-Dublin/Senior-Software-Engineer_JR-0107796",
+                "workday",
+                "workday~wd5~Workday",
             ),
         ];
 
@@ -11023,6 +12193,930 @@ mod tests {
         )
         .unwrap_err();
         assert!(changed_error.to_string().contains("replay payload"));
+    }
+
+    #[test]
+    fn concurrent_discovery_completion_and_failure_have_one_terminal_writer() {
+        let pool = test_pool();
+        let source = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "greenhouse".to_string(),
+                source_key: "acme".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap();
+        let lease = lease_due_discovery_source(&pool, "race-worker")
+            .unwrap()
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let complete_pool = pool.clone();
+        let complete_barrier = barrier.clone();
+        let complete_source = source.id.clone();
+        let complete_token = lease.lease_token.clone();
+        let complete_replay = lease.replay_key.clone();
+        let complete = std::thread::spawn(move || {
+            complete_barrier.wait();
+            complete_discovery_run(
+                &complete_pool,
+                &complete_source,
+                &complete_token,
+                &complete_replay,
+                lease.scheduled_for_ms,
+                &[discovered_job(
+                    "completion-failure-race",
+                    "Platform Engineer",
+                )],
+                true,
+            )
+        });
+        let fail_pool = pool.clone();
+        let fail_barrier = barrier.clone();
+        let fail_source = source.id.clone();
+        let fail_token = lease.lease_token.clone();
+        let fail_replay = lease.replay_key.clone();
+        let fail = std::thread::spawn(move || {
+            fail_barrier.wait();
+            fail_discovery_run(
+                &fail_pool,
+                &fail_source,
+                &fail_token,
+                &fail_replay,
+                lease.scheduled_for_ms,
+                "timeout",
+            )
+        });
+        barrier.wait();
+        let results = [complete.join().unwrap(), fail.join().unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.as_ref().is_ok_and(|value| !value.replayed))
+                .count(),
+            1
+        );
+        let status: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM jobs_discovery_runs WHERE source_id = ?1 AND replay_key = ?2",
+                params![source.id, lease.replay_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        match status.as_str() {
+            "completed" => assert_eq!(list_postings(&pool, "acct-jobs").unwrap().len(), 1),
+            "failed" => assert!(list_postings(&pool, "acct-jobs").unwrap().is_empty()),
+            _ => panic!("unexpected terminal run status: {status}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_replay_payloads_commit_once_without_mixing_snapshots() {
+        let pool = test_pool();
+        let source = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "greenhouse".to_string(),
+                source_key: "acme".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap();
+        let lease = lease_due_discovery_source(&pool, "replay-race-worker")
+            .unwrap()
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = ["One", "Two"]
+            .into_iter()
+            .map(|title| {
+                let pool = pool.clone();
+                let source_id = source.id.clone();
+                let token = lease.lease_token.clone();
+                let replay = lease.replay_key.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    complete_discovery_run(
+                        &pool,
+                        &source_id,
+                        &token,
+                        &replay,
+                        lease.scheduled_for_ms,
+                        &[discovered_job("replay-race", title)],
+                        true,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.as_ref().is_ok_and(|value| !value.replayed))
+                .count(),
+            1
+        );
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let postings = list_postings(&pool, "acct-jobs").unwrap();
+        assert_eq!(postings.len(), 1);
+        assert!(matches!(postings[0].title.as_str(), "One" | "Two"));
+    }
+
+    #[test]
+    fn concurrent_identical_replays_commit_once_and_remain_replayable() {
+        let pool = test_pool();
+        let source = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "greenhouse".to_string(),
+                source_key: "acme".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap();
+        let lease = lease_due_discovery_source(&pool, "identical-replay-worker")
+            .unwrap()
+            .unwrap();
+        let snapshot = vec![discovered_job("identical-replay", "Same title")];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let pool = pool.clone();
+                let source_id = source.id.clone();
+                let token = lease.lease_token.clone();
+                let replay = lease.replay_key.clone();
+                let snapshot = snapshot.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    complete_discovery_run(
+                        &pool,
+                        &source_id,
+                        &token,
+                        &replay,
+                        lease.scheduled_for_ms,
+                        &snapshot,
+                        true,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.as_ref().is_ok_and(|value| !value.replayed))
+                .count(),
+            1
+        );
+        let replayed = complete_discovery_run(
+            &pool,
+            &source.id,
+            &lease.lease_token,
+            &lease.replay_key,
+            lease.scheduled_for_ms,
+            &snapshot,
+            true,
+        )
+        .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(list_postings(&pool, "acct-jobs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_discovery_and_ordinary_save_keep_one_posting_identity() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let source = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "greenhouse".to_string(),
+                source_key: "acme".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap();
+        let lease = lease_due_discovery_source(&pool, "posting-race-worker")
+            .unwrap()
+            .unwrap();
+        let mut manual = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/posting-race?utm_source=manual",
+            now_ms(),
+            now_ms(),
+        );
+        manual.title = "Platform Engineer".to_string();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let discovery_pool = pool.clone();
+        let discovery_barrier = barrier.clone();
+        let discovery_source = source.id.clone();
+        let discovery_token = lease.lease_token.clone();
+        let discovery_replay = lease.replay_key.clone();
+        let discover = std::thread::spawn(move || {
+            discovery_barrier.wait();
+            complete_discovery_run(
+                &discovery_pool,
+                &discovery_source,
+                &discovery_token,
+                &discovery_replay,
+                lease.scheduled_for_ms,
+                &[discovered_job("posting-race", "Platform Engineer")],
+                true,
+            )
+        });
+        let ordinary_pool = pool.clone();
+        let ordinary_barrier = barrier.clone();
+        let ordinary_profile = profile.clone();
+        let ordinary = std::thread::spawn(move || {
+            ordinary_barrier.wait();
+            upsert_posting(
+                &ordinary_pool,
+                "acct-jobs",
+                &manual,
+                &ordinary_profile,
+                &JobPreferences::default(),
+            )
+        });
+        barrier.wait();
+        assert!(discover.join().unwrap().is_ok());
+        assert!(ordinary.join().unwrap().is_ok());
+        let posting = list_postings(&pool, "acct-jobs").unwrap().pop().unwrap();
+        let raw: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT posting_json FROM jobs_postings WHERE account_id = ?1 AND id = ?2",
+                params!["acct-jobs", posting.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            parse_json::<JobPosting>(raw, "job posting").unwrap().id,
+            posting.id
+        );
+        let membership_job_id: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT job_id FROM jobs_discovery_memberships WHERE source_id = ?1",
+                params![source.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(membership_job_id, posting.id);
+        let (application, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        assert_eq!(application.job_id, posting.id);
+    }
+
+    #[test]
+    fn snapshot_publish_rolls_back_mid_commit_and_legacy_stale_commits_recover() {
+        let pool = test_pool();
+        let source = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "greenhouse".to_string(),
+                source_key: "acme".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap();
+        let lease = lease_due_discovery_source(&pool, "recovery-worker")
+            .unwrap()
+            .unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_discovery_membership_insert
+             BEFORE INSERT ON jobs_discovery_memberships
+             BEGIN SELECT RAISE(FAIL, 'injected membership failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let snapshot = vec![discovered_job("commit-recovery", "Platform Engineer")];
+        assert!(complete_discovery_run(
+            &pool,
+            &source.id,
+            &lease.lease_token,
+            &lease.replay_key,
+            lease.scheduled_for_ms,
+            &snapshot,
+            true,
+        )
+        .is_err());
+        let conn = pool.get().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM jobs_discovery_runs WHERE source_id = ?1 AND replay_key = ?2",
+                params![source.id, lease.replay_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // The trigger fires after a candidate membership write. The single
+        // publish transaction rolls that posting, membership, and run-fence
+        // update back together instead of exposing a partial snapshot.
+        assert_eq!(status, "running");
+        assert!(list_postings(&pool, "acct-jobs").unwrap().is_empty());
+        let memberships: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_discovery_memberships WHERE source_id = ?1",
+                params![source.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memberships, 0);
+        conn.execute_batch("DROP TRIGGER fail_discovery_membership_insert;")
+            .unwrap();
+        // This state can only be left by the pre-atomic release. Preserve the
+        // recovery path for it without depending on it for new failures.
+        conn.execute(
+            "UPDATE jobs_discovery_runs SET status = 'committing' WHERE source_id = ?1 AND replay_key = ?2",
+            params![source.id, lease.replay_key],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_discovery_sources SET lease_expires_at_ms = ?2 WHERE id = ?1",
+            params![source.id, now_ms() - 1],
+        )
+        .unwrap();
+        drop(conn);
+
+        let recovered = lease_due_discovery_source(&pool, "recovery-worker-two")
+            .unwrap()
+            .unwrap();
+        let conn = pool.get().unwrap();
+        let (status, error): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, error_code FROM jobs_discovery_runs WHERE source_id = ?1 AND replay_key = ?2",
+                params![source.id, lease.replay_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(error.as_deref(), Some("commit_timeout"));
+        drop(conn);
+        complete_discovery_run(
+            &pool,
+            &source.id,
+            &recovered.lease_token,
+            &recovered.replay_key,
+            recovered.scheduled_for_ms,
+            &snapshot,
+            true,
+        )
+        .unwrap();
+        assert_eq!(list_postings(&pool, "acct-jobs").unwrap().len(), 1);
+        assert_eq!(
+            get_discovery_source(&pool, &source.id)
+                .unwrap()
+                .unwrap()
+                .health,
+            "healthy"
+        );
+    }
+
+    #[test]
+    fn discovery_membership_preserves_identity_when_a_job_key_drifts() {
+        let pool = test_pool();
+        let source = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "greenhouse".to_string(),
+                source_key: "acme".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap();
+        let first_lease = lease_due_discovery_source(&pool, "key-drift-first")
+            .unwrap()
+            .unwrap();
+        complete_discovery_run(
+            &pool,
+            &source.id,
+            &first_lease.lease_token,
+            &first_lease.replay_key,
+            first_lease.scheduled_for_ms,
+            &[discovered_job("key-drift", "Original title")],
+            true,
+        )
+        .unwrap();
+        let first = list_postings(&pool, "acct-jobs").unwrap().pop().unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_discovery_sources SET next_run_at_ms = ?2 WHERE id = ?1",
+                params![source.id, now_ms() - 1],
+            )
+            .unwrap();
+        let second_lease = lease_due_discovery_source(&pool, "key-drift-second")
+            .unwrap()
+            .unwrap();
+        complete_discovery_run(
+            &pool,
+            &source.id,
+            &second_lease.lease_token,
+            &second_lease.replay_key,
+            second_lease.scheduled_for_ms,
+            &[discovered_job("key-drift", "Changed title")],
+            true,
+        )
+        .unwrap();
+        let postings = list_postings(&pool, "acct-jobs").unwrap();
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].id, first.id);
+        assert_eq!(postings[0].title, "Changed title");
+        let membership_job_id: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT job_id FROM jobs_discovery_memberships WHERE source_id = ?1 AND external_id = ?2",
+                params![source.id, "key-drift"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(membership_job_id, first.id);
+    }
+
+    #[test]
+    fn discovery_disagreement_between_membership_and_canonical_job_rolls_back() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        let preferences = JobPreferences::default();
+        let source = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: String::new(),
+                provider: "greenhouse".to_string(),
+                source_key: "acme".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap();
+        let member = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/membership-old",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &preferences,
+        )
+        .unwrap();
+        let mut canonical = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/disagreement?utm_source=test",
+            now_ms(),
+            now_ms(),
+        );
+        canonical.title = "Target title".to_string();
+        let canonical =
+            upsert_posting(&pool, "acct-jobs", &canonical, &profile, &preferences).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_discovery_memberships (
+                    source_id, account_id, canonical_key, external_id, job_id, content_hash,
+                    first_seen_at_ms, last_seen_at_ms, last_seen_run_id, availability_status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'old', ?6, ?6, 'old-run', 'active')",
+                params![
+                    source.id,
+                    "acct-jobs",
+                    member.canonical_key,
+                    "disagreement",
+                    member.id,
+                    now_ms(),
+                ],
+            )
+            .unwrap();
+        let lease = lease_due_discovery_source(&pool, "disagreement-worker")
+            .unwrap()
+            .unwrap();
+        let error = complete_discovery_run(
+            &pool,
+            &source.id,
+            &lease.lease_token,
+            &lease.replay_key,
+            lease.scheduled_for_ms,
+            &[discovered_job("disagreement", "Target title")],
+            true,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("membership and canonical job disagree"));
+        let membership_job_id: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT job_id FROM jobs_discovery_memberships WHERE source_id = ?1 AND external_id = ?2",
+                params![source.id, "disagreement"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(membership_job_id, member.id);
+        assert_eq!(
+            get_posting(&pool, "acct-jobs", &canonical.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "Target title"
+        );
+        let run_status: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM jobs_discovery_runs WHERE source_id = ?1 AND replay_key = ?2",
+                params![source.id, lease.replay_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_status, "running");
+    }
+
+    #[test]
+    fn discovery_source_limits_and_track_cleanup_are_enforced() {
+        let pool = test_pool();
+        let track = upsert_track(
+            &pool,
+            "acct-jobs",
+            &CareerTrack {
+                id: "track-discovery".to_string(),
+                name: "Engineering".to_string(),
+                role: "Engineer".to_string(),
+                locations: vec![],
+                remote_preference: "hybrid_ok".to_string(),
+                application_identity_id: None,
+                active: true,
+                match_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        for index in 0..DISCOVERY_MAX_SOURCES_PER_TRACK {
+            upsert_discovery_source(
+                &pool,
+                "acct-jobs",
+                &DiscoverySourceInput {
+                    track_id: track.id.clone(),
+                    provider: "greenhouse".to_string(),
+                    source_key: format!("limit-board-{index}"),
+                    company: "Acme".to_string(),
+                    run_interval_ms: 0,
+                },
+            )
+            .unwrap();
+        }
+        // Updating an already-counted binding remains idempotent and does not
+        // consume an additional slot.
+        upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: track.id.clone(),
+                provider: "greenhouse".to_string(),
+                source_key: "limit-board-0".to_string(),
+                company: "Acme updated".to_string(),
+                run_interval_ms: 0,
+            },
+        )
+        .unwrap();
+        let limit_error = upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: track.id.clone(),
+                provider: "greenhouse".to_string(),
+                source_key: "limit-board-overflow".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(limit_error.to_string().contains("source limit"));
+        let delete_error = delete_track(&pool, "acct-jobs", &track.id).unwrap_err();
+        assert!(delete_error
+            .to_string()
+            .contains("still has Jobs matches or discovery sources"));
+        assert_eq!(
+            list_discovery_sources(&pool, "acct-jobs").unwrap().len(),
+            DISCOVERY_MAX_SOURCES_PER_TRACK
+        );
+    }
+
+    #[test]
+    fn concurrent_source_enrollment_has_one_quota_winner() {
+        let pool = test_pool();
+        for index in 0..(DISCOVERY_MAX_SOURCES_PER_TRACK - 1) {
+            upsert_discovery_source(
+                &pool,
+                "acct-jobs",
+                &DiscoverySourceInput {
+                    track_id: String::new(),
+                    provider: "lever".to_string(),
+                    source_key: format!("quota-existing-{index}"),
+                    company: "Acme".to_string(),
+                    run_interval_ms: 0,
+                },
+            )
+            .unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = ["quota-race-a", "quota-race-b"]
+            .into_iter()
+            .map(|source_key| {
+                let pool = pool.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    upsert_discovery_source(
+                        &pool,
+                        "acct-jobs",
+                        &DiscoverySourceInput {
+                            track_id: String::new(),
+                            provider: "lever".to_string(),
+                            source_key: source_key.to_string(),
+                            company: "Acme".to_string(),
+                            run_interval_ms: 0,
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            list_discovery_sources(&pool, "acct-jobs").unwrap().len(),
+            DISCOVERY_MAX_SOURCES_PER_TRACK
+        );
+    }
+
+    #[test]
+    fn concurrent_verified_imports_bind_a_final_board_slot_to_one_track() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        let preferences = JobPreferences::default();
+        for index in 0..3 {
+            upsert_track(
+                &pool,
+                "acct-jobs",
+                &CareerTrack {
+                    id: format!("filler-final-{index}"),
+                    name: format!("Filler {index}"),
+                    role: "Engineer".to_string(),
+                    locations: Vec::new(),
+                    remote_preference: "hybrid_ok".to_string(),
+                    application_identity_id: None,
+                    active: true,
+                    match_count: 0,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            )
+            .unwrap();
+        }
+        for index in 0..(DISCOVERY_MAX_SOURCES_PER_ACCOUNT - 1) {
+            upsert_discovery_source(
+                &pool,
+                "acct-jobs",
+                &DiscoverySourceInput {
+                    track_id: format!("filler-final-{}", index / DISCOVERY_MAX_SOURCES_PER_TRACK),
+                    provider: "lever".to_string(),
+                    source_key: format!("account-final-slot-{index}"),
+                    company: "Acme".to_string(),
+                    run_interval_ms: 0,
+                },
+            )
+            .unwrap();
+        }
+        let tracks = ["track-final-a", "track-final-b"]
+            .into_iter()
+            .map(|id| {
+                upsert_track(
+                    &pool,
+                    "acct-jobs",
+                    &CareerTrack {
+                        id: id.to_string(),
+                        name: id.to_string(),
+                        role: "Engineer".to_string(),
+                        locations: Vec::new(),
+                        remote_preference: "hybrid_ok".to_string(),
+                        application_identity_id: None,
+                        active: true,
+                        match_count: 0,
+                        created_at_ms: 0,
+                        updated_at_ms: 0,
+                    },
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = tracks
+            .into_iter()
+            .enumerate()
+            .map(|(index, track)| {
+                let pool = pool.clone();
+                let profile = profile.clone();
+                let preferences = preferences.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let source = DiscoverySourceInput {
+                        track_id: track.id.clone(),
+                        provider: "ashby".to_string(),
+                        source_key: "shared-final-board".to_string(),
+                        company: "Acme".to_string(),
+                        run_interval_ms: 0,
+                    };
+                    let mut posting = test_posting(
+                        &format!("https://jobs.ashbyhq.com/shared-final-board/job-{index}"),
+                        now_ms(),
+                        now_ms(),
+                    );
+                    posting.source = "ashby".to_string();
+                    posting.track_id = track.id;
+                    barrier.wait();
+                    save_verified_import_posting_with_source(
+                        &pool,
+                        "acct-jobs",
+                        &posting,
+                        &source,
+                        &profile,
+                        &preferences,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let sources = list_discovery_sources(&pool, "acct-jobs").unwrap();
+        assert_eq!(sources.len(), DISCOVERY_MAX_SOURCES_PER_ACCOUNT);
+        let bound = sources
+            .iter()
+            .find(|source| source.provider == "ashby" && source.source_key == "shared-final-board")
+            .unwrap();
+        assert!(matches!(
+            bound.track_id.as_str(),
+            "track-final-a" | "track-final-b"
+        ));
+        let postings = list_postings(&pool, "acct-jobs").unwrap();
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].track_id, bound.track_id);
+    }
+
+    #[test]
+    fn verified_import_source_and_posting_commit_or_roll_back_together() {
+        let profile = default_profile("jobs@example.com");
+        let preferences = JobPreferences::default();
+        let source = DiscoverySourceInput {
+            track_id: String::new(),
+            provider: "ashby".to_string(),
+            source_key: "atomic-board".to_string(),
+            company: "Acme".to_string(),
+            run_interval_ms: 0,
+        };
+        let posting = test_posting(
+            "https://jobs.ashbyhq.com/atomic-board/job-123",
+            now_ms(),
+            now_ms(),
+        );
+
+        let source_failure_pool = test_pool();
+        source_failure_pool
+            .get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_verified_source_insert
+                 BEFORE INSERT ON jobs_discovery_sources
+                 BEGIN SELECT RAISE(FAIL, 'injected source failure'); END;",
+            )
+            .unwrap();
+        assert!(save_verified_import_posting_with_source(
+            &source_failure_pool,
+            "acct-jobs",
+            &posting,
+            &source,
+            &profile,
+            &preferences,
+        )
+        .is_err());
+        assert!(list_discovery_sources(&source_failure_pool, "acct-jobs")
+            .unwrap()
+            .is_empty());
+        assert!(list_postings(&source_failure_pool, "acct-jobs")
+            .unwrap()
+            .is_empty());
+
+        let posting_failure_pool = test_pool();
+        posting_failure_pool
+            .get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_verified_posting_insert
+                 BEFORE INSERT ON jobs_postings
+                 BEGIN SELECT RAISE(FAIL, 'injected posting failure'); END;",
+            )
+            .unwrap();
+        assert!(save_verified_import_posting_with_source(
+            &posting_failure_pool,
+            "acct-jobs",
+            &posting,
+            &source,
+            &profile,
+            &preferences,
+        )
+        .is_err());
+        assert!(list_discovery_sources(&posting_failure_pool, "acct-jobs")
+            .unwrap()
+            .is_empty());
+        assert!(list_postings(&posting_failure_pool, "acct-jobs")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn track_deletion_rejects_a_posting_without_a_discovery_source() {
+        let pool = test_pool();
+        let track = upsert_track(
+            &pool,
+            "acct-jobs",
+            &CareerTrack {
+                id: "track-with-posting".to_string(),
+                name: "Engineering".to_string(),
+                role: "Engineer".to_string(),
+                locations: Vec::new(),
+                remote_preference: "hybrid_ok".to_string(),
+                application_identity_id: None,
+                active: true,
+                match_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/track-bound-posting",
+            now_ms(),
+            now_ms(),
+        );
+        posting.track_id = track.id.clone();
+        upsert_posting(
+            &pool,
+            "acct-jobs",
+            &posting,
+            &default_profile("jobs@example.com"),
+            &JobPreferences::default(),
+        )
+        .unwrap();
+
+        let error = delete_track(&pool, "acct-jobs", &track.id).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("still has Jobs matches or discovery sources"));
+        assert!(list_tracks(&pool, "acct-jobs")
+            .unwrap()
+            .iter()
+            .any(|item| item.id == track.id));
     }
 
     #[test]
@@ -11344,7 +13438,8 @@ mod tests {
         };
         let mut b = a.clone();
         b.company = "ACME".to_string();
-        b.canonical_url = "https://boards.example/jobs/1".to_string();
+        b.canonical_url =
+            "https://boards.example/jobs/1?ref=feed&utm_source=newsletter".to_string();
         assert_eq!(canonical_job_key(&a), canonical_job_key(&b));
     }
 
