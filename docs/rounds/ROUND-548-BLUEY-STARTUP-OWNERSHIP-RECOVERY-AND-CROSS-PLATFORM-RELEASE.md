@@ -2,8 +2,8 @@
 
 Date: 2026-07-19
 
-Status: release candidate; publication and corrected Jobs deployment are still
-gated by the checks marked pending below.
+Status: desktop `0.1.103` is live; corrected Jobs deployment remains gated by
+the checks marked pending below.
 
 ## Scope
 
@@ -179,6 +179,14 @@ The main Bluey API PID and Caddy PID remained unchanged throughout. Migration
 and environment snapshots are retained as evidence; the single generation row
 is not printed or copied into release evidence.
 
+After desktop publication, a completed parallel build/deploy process replaced
+Jobs with the later unreviewed `d79310dc…` binary and reset managed generation
+to `1`. The same containment procedure ran again immediately. The second
+unexpected binary and environment were preserved under
+`/var/backups/bluey-api/releases/20260719T065206Z-contain-unsafe-jobs-d79310dc`,
+then production was restored to the exact `f3a0a043…` binary and all three
+execution flags were verified `0`. The parallel process subsequently exited.
+
 ## PostgreSQL Restore Drill
 
 A preliminary drill restored the verified 2026-07-19 06:00 production backup
@@ -195,6 +203,44 @@ The exact final source must repeat the restore, migration replay, schema and
 ledger checks, stale-token/quota/cascade tests, restart idempotence, and old
 binary compatibility before production deployment.
 
+## Live Desktop Publication
+
+Desktop fixes and release-candidate documentation were pushed to `main` at
+commit `aabf18c7e86fe23bff7147619c54f781650e83c4`. The packaged desktop inputs
+remain exactly the sealed `381cbd53…` source described above.
+
+The signed public identities are:
+
+```text
+latest.json SHA-256:
+  fce60206d0af59eac71539aea5ff656e4ea0f64ac2978d64ed03fafc02f0f3eb
+latest.json.sig SHA-256:
+  56f01623b45416cd961d91fc7b0fd01a3ffa2c5884cedd9f09283b950c831d49
+install.sh SHA-256:
+  63e7ed0d4e8af63016a46f6be622d1f93905fa744bddf7a4f69cc46a8517ca36
+install.ps1 SHA-256:
+  74de690c5eebf6a03cac6aafb2e00ab96b410fab9db919ecfc55ef1e111481b3
+```
+
+The detached Ed25519 signature verifies with Bluey's embedded release public
+key. Live verification passed independently for `darwin-arm64`,
+`darwin-universal`, `darwin-x86_64`, and `windows-x86_64`; every immutable URL,
+size, artifact hash, installer hash, checksum, and content type matched the
+signed manifest.
+
+An isolated fresh installer downloaded the live arm64 archive, verified its
+checksum, installed and ad-hoc signed every executable, reported CLI and daemon
+`0.1.103`, and left the existing global CLI link unchanged.
+
+An isolated production updater then installed `0.1.102`, verified the signed
+live manifest, upgraded to `0.1.103`, started the exact updated daemon, returned
+a healthy status with capture exclusion, and shut down cleanly. All secure
+store and plaintext fallback flags were `0` throughout.
+
+The pre-publication root manifest, signature, and installers are preserved at
+`/var/backups/bluey-api/releases/20260719T064643Z-before-bluey-0.1.103-desktop`.
+Publishing static desktop files did not restart any production service.
+
 ## Pending Combined Gates
 
 - [ ] Independent Jobs/server review reports no P0/P1 findings.
@@ -204,12 +250,14 @@ binary compatibility before production deployment.
 - [ ] Jobs JavaScript tests, typecheck, privacy/provenance/schema guards, and
   production portal build pass with no source maps.
 - [ ] PostgreSQL 18 restored-backup drill passes against the exact final commit.
-- [ ] Latest `origin/main` is reconciled without accepting the permissive
-  cross-evidence narrative implementation.
-- [ ] Documentation is committed and `git diff --check` passes.
-- [ ] Signed `0.1.103` manifest and immutable artifacts publish successfully.
-- [ ] Every live artifact hash, content type, checksum, and signature verifies.
-- [ ] Isolated fresh install and `0.1.102` to `0.1.103` updater smoke pass.
+- [x] Desktop fixes were reconciled with the then-current `origin/main` without
+  using the permissive cross-evidence narrative implementation as release
+  evidence.
+- [x] Desktop release documentation was committed and `git diff --check`
+  passed.
+- [x] Signed `0.1.103` manifest and immutable artifacts published successfully.
+- [x] Every live artifact hash, content type, checksum, and signature verified.
+- [x] Isolated fresh install and `0.1.102` to `0.1.103` updater smoke passed.
 - [ ] Corrected Jobs binary/portal deploy with model/browser execution disabled,
   scoped health checks, and rollback verification passes.
 

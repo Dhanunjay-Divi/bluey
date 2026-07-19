@@ -1,6 +1,6 @@
 # Bluey Release v0.1.103
 
-Release candidate date: 2026-07-19
+Released: 2026-07-19
 
 Audience: known production-beta users
 
@@ -17,11 +17,10 @@ The desktop artifacts are built from sealed source commit
 source and deployment provenance and does not change the packaged desktop
 inputs.
 
-Publication remains gated until the signed live manifest, installer, updater,
-and rollback checks recorded in
+Signed live-manifest, installer, updater, and rollback checks are recorded in
 `docs/rounds/ROUND-548-BLUEY-STARTUP-OWNERSHIP-RECOVERY-AND-CROSS-PLATFORM-RELEASE.md`
-have passed. This document must not be read as evidence that the release is
-live before those checks are complete.
+The desktop release is live. Corrected Jobs/server deployment remains a
+separate, disabled-by-default workstream and is not implied by this release.
 
 ## Desktop Changes
 
@@ -116,15 +115,22 @@ pool, mailbox integration, or calendar integration exists in production.
   distribution; macOS installed executables are ad-hoc signed and verified by
   the installer.
 
-## Remaining Publication Gates
+## Publication Verification
 
-Before `0.1.103` is declared live, the release round must record:
+The immutable release and signed manifest are live at `https://bluey.sh`.
+Verification completed for:
 
-1. the final combined source and documentation commits;
-2. all workspace, server, Jobs, and portal gates;
-3. the exact PostgreSQL 18 restored-backup migration drill;
-4. signed manifest and versioned-asset publication;
-5. live verification of every platform hash and signature;
-6. an isolated installer smoke test;
-7. a real isolated `0.1.102` to `0.1.103` updater smoke test; and
-8. rollback evidence that leaves the unrelated main API and Caddy untouched.
+1. signed manifest SHA-256
+   `fce60206d0af59eac71539aea5ff656e4ea0f64ac2978d64ed03fafc02f0f3eb`;
+2. detached signature SHA-256
+   `56f01623b45416cd961d91fc7b0fd01a3ffa2c5884cedd9f09283b950c831d49`;
+3. every macOS and Windows platform URL, size, hash, content type, checksum,
+   installer hash, and manifest signature;
+4. an isolated fresh install that reported CLI and daemon `0.1.103` without
+   changing the existing global CLI link; and
+5. an isolated signed updater run from `0.1.102` to `0.1.103` that started the
+   exact packaged daemon, reported capture exclusion, and shut down cleanly.
+
+Jobs/server truth, accounting, PostgreSQL migration 008, and scoped deployment
+gates remain pending and model/browser execution remains disabled in
+production. They do not block or weaken the shipped desktop startup repair.
