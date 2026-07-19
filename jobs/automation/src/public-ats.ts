@@ -245,9 +245,14 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
       .filter((value) => asRecord(value).isListed !== false)
       .map((value) => {
         const item = asRecord(value);
+        const externalId = asString(item.id || item.jobId);
         return normalizeJob("ashby", {
-          externalId: asString(item.id || item.jobId),
-          canonicalUrl: asString(item.jobUrl || item.applyUrl),
+          externalId,
+          canonicalUrl: ashbyCanonicalUrl(
+            source.boardName,
+            externalId,
+            asString(item.jobUrl || item.applyUrl),
+          ),
           company: source.company ?? humanizeIdentifier(source.boardName),
           title: asString(item.title),
           location: asString(item.location),
@@ -394,6 +399,32 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
     }
     throw lastError ?? new Error("ATS request failed");
   }
+}
+
+function ashbyCanonicalUrl(boardName: string, externalId: string, raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return "";
+  }
+  const segments = url.pathname.split('/').filter(Boolean);
+  if (
+    url.protocol !== "https:"
+    || url.username
+    || url.password
+    || url.port
+    || url.hostname.toLowerCase() !== "jobs.ashbyhq.com"
+    || segments.length < 2
+    || segments[0] !== boardName
+    || segments[1] !== externalId
+    || !SAFE_IDENTIFIER.test(segments[0])
+    || !SAFE_IDENTIFIER.test(segments[1])
+  ) {
+    return "";
+  }
+  url.hash = "";
+  return url.toString();
 }
 
 function smartrecruitersCanonicalUrl(companyIdentifier: string, externalId: string): string {
