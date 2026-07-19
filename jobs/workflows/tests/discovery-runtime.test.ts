@@ -394,6 +394,51 @@ describe("discovery worker runtime", () => {
     expect(api.failed[0]?.input.error_code).toBe("provider_error");
   });
 
+  it("fails instead of completing when a provider-listed row is malformed", async () => {
+    const api = new FakeApi([lease({
+      id: "source-workday-workday",
+      provider: "workday",
+      source_key: "workday~wd5~Workday",
+      config: {
+        kind: "workday",
+        tenant: "workday",
+        instance: "wd5",
+        site: "Workday",
+        locale: "en-US",
+        company: "Workday",
+      },
+    })]);
+    const atsFetch: JobsFetch = vi.fn(async () => response({
+      total: 1,
+      jobPostings: [{
+        title: "Still listed but malformed",
+        externalPath: "https://evil.example/job/Elsewhere/Blocked_JR-BAD",
+        locationsText: "Remote",
+        bulletFields: ["JR-BAD"],
+        postedOn: "Posted Today",
+      }],
+    }));
+    const worker = new DiscoveryWorkerRuntime({
+      api,
+      atsFetch,
+      loopClock: new ImmediateClock(),
+      logger: new RecordingLogger(),
+    });
+
+    await expect(worker.pollOnce()).resolves.toBe("failed");
+    expect(atsFetch).toHaveBeenCalledTimes(1);
+    expect(api.completed).toEqual([]);
+    expect(api.failed).toEqual([{
+      sourceId: "source-workday-workday",
+      input: {
+        lease_token: "lease-token-test",
+        replay_key: "replay-key-test",
+        scheduled_for_ms: SCHEDULED_FOR_MS,
+        error_code: "provider_error",
+      },
+    }]);
+  });
+
   it("replays a duplicate lease without polling the provider again", async () => {
     const duplicate = lease();
     const api = new FakeApi([duplicate, duplicate]);

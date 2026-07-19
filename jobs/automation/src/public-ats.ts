@@ -49,6 +49,15 @@ export class IncompletePublicAtsSnapshotError extends Error {
   }
 }
 
+export class InvalidPublicAtsSnapshotError extends Error {
+  constructor(provider: PublicAtsSource["kind"], rowIndex?: number) {
+    super(rowIndex === undefined
+      ? `${provider} snapshot payload did not contain the expected job list`
+      : `${provider} snapshot contained an invalid listed row at index ${rowIndex}`);
+    this.name = "InvalidPublicAtsSnapshotError";
+  }
+}
+
 /**
  * Public ATS discovery adapted from career-ops provider patterns. Each request is
  * host-pinned, redirect-free, bounded, and normalized before it reaches Bluey.
@@ -114,9 +123,23 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
       excludedCompanies: [],
       sources: [source],
     }, true);
-    return deduplicateJobs(jobs)
-      .filter((job) => job.externalId.length > 0)
-      .filter((job) => job.title.length > 0 && job.canonicalUrl.length > 0);
+    const invalidRow = jobs.findIndex((job) => (
+      job.externalId.length === 0
+      || job.title.length === 0
+      || job.canonicalUrl.length === 0
+    ));
+    if (invalidRow >= 0) {
+      // A scheduled snapshot is closure evidence. Silently dropping even one
+      // provider-listed row would turn a parser/URL failure into false proof
+      // that the corresponding job closed. Search mode remains best-effort,
+      // but scheduled publication must fail closed and preserve the last good
+      // snapshot in full.
+      throw new InvalidPublicAtsSnapshotError(source.kind, invalidRow);
+    }
+    // Do not search-deduplicate a closure-authoritative snapshot. The server
+    // owns external-ID/canonical reconciliation and rejects conflicting rows
+    // atomically; dropping a row here would erase that evidence.
+    return jobs;
   }
 
   private async searchSource(
@@ -126,11 +149,11 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
   ): Promise<NormalizedJob[]> {
     switch (source.kind) {
       case "greenhouse":
-        return this.searchGreenhouse(source);
+        return this.searchGreenhouse(source, requireCompleteSnapshot);
       case "lever":
-        return this.searchLever(source);
+        return this.searchLever(source, requireCompleteSnapshot);
       case "ashby":
-        return this.searchAshby(source);
+        return this.searchAshby(source, requireCompleteSnapshot);
       case "smartrecruiters":
         return this.searchSmartRecruiters(source, requireCompleteSnapshot);
       case "workday":
@@ -138,13 +161,19 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
     }
   }
 
-  private async searchGreenhouse(source: Extract<PublicAtsSource, { kind: "greenhouse" }>): Promise<NormalizedJob[]> {
+  private async searchGreenhouse(
+    source: Extract<PublicAtsSource, { kind: "greenhouse" }>,
+    requireCompleteSnapshot: boolean,
+  ): Promise<NormalizedJob[]> {
     assertIdentifier(source.boardToken, "Greenhouse board token");
     const host = "boards-api.greenhouse.io";
     const payload = asRecord(await this.requestJson(
       `https://${host}/v1/boards/${encodeURIComponent(source.boardToken)}/jobs?content=true`,
       [host],
     ));
+    if (requireCompleteSnapshot && !Array.isArray(payload.jobs)) {
+      throw new InvalidPublicAtsSnapshotError("greenhouse");
+    }
     return asArray(payload.jobs).map((value) => {
       const item = asRecord(value);
       const externalId = asString(item.id);
@@ -164,13 +193,20 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
     });
   }
 
-  private async searchLever(source: Extract<PublicAtsSource, { kind: "lever" }>): Promise<NormalizedJob[]> {
+  private async searchLever(
+    source: Extract<PublicAtsSource, { kind: "lever" }>,
+    requireCompleteSnapshot: boolean,
+  ): Promise<NormalizedJob[]> {
     assertIdentifier(source.site, "Lever site");
     const host = "api.lever.co";
-    const payload = asArray(await this.requestJson(
+    const rawPayload = await this.requestJson(
       `https://${host}/v0/postings/${encodeURIComponent(source.site)}?mode=json`,
       [host],
-    ));
+    );
+    if (requireCompleteSnapshot && !Array.isArray(rawPayload)) {
+      throw new InvalidPublicAtsSnapshotError("lever");
+    }
+    const payload = asArray(rawPayload);
     return payload.map((value) => {
       const item = asRecord(value);
       const categories = asRecord(item.categories);
@@ -192,13 +228,19 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
     });
   }
 
-  private async searchAshby(source: Extract<PublicAtsSource, { kind: "ashby" }>): Promise<NormalizedJob[]> {
+  private async searchAshby(
+    source: Extract<PublicAtsSource, { kind: "ashby" }>,
+    requireCompleteSnapshot: boolean,
+  ): Promise<NormalizedJob[]> {
     assertIdentifier(source.boardName, "Ashby board name");
     const host = "api.ashbyhq.com";
     const payload = asRecord(await this.requestJson(
       `https://${host}/posting-api/job-board/${encodeURIComponent(source.boardName)}`,
       [host],
     ));
+    if (requireCompleteSnapshot && !Array.isArray(payload.jobs)) {
+      throw new InvalidPublicAtsSnapshotError("ashby");
+    }
     return asArray(payload.jobs)
       .filter((value) => asRecord(value).isListed !== false)
       .map((value) => {
@@ -231,6 +273,9 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
         `https://${host}/v1/companies/${encodeURIComponent(source.companyIdentifier)}/postings?limit=${limit}&offset=${offset}`,
         [host],
       ));
+      if (requireCompleteSnapshot && !Array.isArray(payload.content)) {
+        throw new InvalidPublicAtsSnapshotError("smartrecruiters");
+      }
       const content = asArray(payload.content);
       for (const value of content) {
         const item = asRecord(value);
@@ -281,6 +326,9 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
         headers: { "content-type": "application/json", "accept-language": locale },
         body: JSON.stringify({ appliedFacets: {}, limit, offset, searchText: query.roles.join(" ") }),
       }));
+      if (requireCompleteSnapshot && !Array.isArray(payload.jobPostings)) {
+        throw new InvalidPublicAtsSnapshotError("workday");
+      }
       const postings = asArray(payload.jobPostings);
       for (const value of postings) {
         const item = asRecord(value);

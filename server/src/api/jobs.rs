@@ -291,7 +291,13 @@ pub async fn workspace(
 ) -> Result<Json<JobsWorkspace>, ApiError> {
     let mut workspace =
         jobs::workspace(&state.pool, &account.id, &account.email).map_err(internal)?;
-    if backfill_verified_import_discovery_sources(&state.pool, &account.id, &workspace.matches) > 0
+    if backfill_verified_import_discovery_sources(
+        &state.pool,
+        &account.id,
+        &workspace.matches,
+        &workspace.profile,
+        &workspace.preferences,
+    ) > 0
     {
         match jobs::list_discovery_sources(&state.pool, &account.id) {
             Ok(sources) => {
@@ -699,6 +705,8 @@ fn backfill_verified_import_discovery_sources(
     pool: &crate::db::DbPool,
     account_id: &str,
     postings: &[JobPosting],
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
 ) -> usize {
     let tracks = match jobs::list_tracks(pool, account_id) {
         Ok(tracks) => tracks,
@@ -788,25 +796,53 @@ fn backfill_verified_import_discovery_sources(
             source.source_key.clone(),
             source.track_id.clone(),
         );
-        if known_bindings.contains(&binding) {
-            continue;
+        let binding_exists = known_bindings.contains(&binding);
+        match jobs::verified_import_discovery_membership_job_id(
+            pool,
+            account_id,
+            &source.provider,
+            &source.source_key,
+            &posting.external_id,
+        ) {
+            Ok(Some(job_id)) if binding_exists && job_id == posting.id => continue,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    account_fingerprint = %discovery_log_fingerprint(account_id),
+                    provider = discovery_provider_label(&posting.source),
+                    source_fingerprint = %discovery_log_fingerprint(&format!("{}\0{}", posting.source, posting.canonical_url)),
+                    error_category = discovery_enrollment_error_category(&error),
+                    "Jobs workspace could not inspect a verified-import membership"
+                );
+                continue;
+            }
         }
-        if existing_sources.len() + enrolled >= jobs::DISCOVERY_MAX_SOURCES_PER_ACCOUNT
-            || source_counts_by_track
-                .get(&source.track_id)
-                .copied()
-                .unwrap_or_default()
-                >= jobs::DISCOVERY_MAX_SOURCES_PER_TRACK
+        if !binding_exists
+            && (existing_sources.len() + enrolled >= jobs::DISCOVERY_MAX_SOURCES_PER_ACCOUNT
+                || source_counts_by_track
+                    .get(&source.track_id)
+                    .copied()
+                    .unwrap_or_default()
+                    >= jobs::DISCOVERY_MAX_SOURCES_PER_TRACK)
         {
             continue;
         }
-        match jobs::upsert_discovery_source(pool, account_id, &source) {
+        match jobs::save_verified_import_posting_with_source(
+            pool,
+            account_id,
+            posting,
+            &source,
+            profile,
+            preferences,
+        ) {
             Ok(_) => {
-                known_bindings.insert(binding);
-                *source_counts_by_track
-                    .entry(source.track_id.clone())
-                    .or_default() += 1;
-                enrolled += 1;
+                if !binding_exists {
+                    known_bindings.insert(binding);
+                    *source_counts_by_track
+                        .entry(source.track_id.clone())
+                        .or_default() += 1;
+                    enrolled += 1;
+                }
             }
             Err(error) => tracing::warn!(
                 account_fingerprint = %discovery_log_fingerprint(account_id),
@@ -5013,11 +5049,23 @@ mod tests {
         let postings = jobs::list_postings(&pool, "acct-one").unwrap();
 
         assert_eq!(
-            backfill_verified_import_discovery_sources(&pool, "acct-one", &postings),
+            backfill_verified_import_discovery_sources(
+                &pool,
+                "acct-one",
+                &postings,
+                &CareerProfile::default(),
+                &JobPreferences::default(),
+            ),
             1
         );
         assert_eq!(
-            backfill_verified_import_discovery_sources(&pool, "acct-one", &postings),
+            backfill_verified_import_discovery_sources(
+                &pool,
+                "acct-one",
+                &postings,
+                &CareerProfile::default(),
+                &JobPreferences::default(),
+            ),
             0
         );
         let sources = jobs::list_discovery_sources(&pool, "acct-one").unwrap();
@@ -5025,6 +5073,59 @@ mod tests {
         assert_eq!(sources[0].provider, "workday");
         assert_eq!(sources[0].source_key, "workday~wd5~Workday");
         assert_eq!(sources[0].track_id, "track-one");
+    }
+
+    #[test]
+    fn workspace_backfill_repairs_a_legacy_source_without_membership() {
+        let pool = discovery_enrollment_test_pool();
+        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        let stored = store_discovery_posting(
+            &pool,
+            "acct-one",
+            &imported_discovery_posting(
+                "lever_import",
+                "https://jobs.eu.lever.co/acme/job-123",
+                "track-one",
+            ),
+        );
+        jobs::upsert_discovery_source(
+            &pool,
+            "acct-one",
+            &jobs::DiscoverySourceInput {
+                track_id: "track-one".to_string(),
+                provider: "lever".to_string(),
+                source_key: "acme".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            jobs::verified_import_discovery_membership_job_id(
+                &pool, "acct-one", "lever", "acme", "job-123",
+            )
+            .unwrap(),
+            None,
+        );
+        assert_eq!(
+            backfill_verified_import_discovery_sources(
+                &pool,
+                "acct-one",
+                std::slice::from_ref(&stored),
+                &CareerProfile::default(),
+                &JobPreferences::default(),
+            ),
+            0,
+        );
+        assert_eq!(
+            jobs::verified_import_discovery_membership_job_id(
+                &pool, "acct-one", "lever", "acme", "job-123",
+            )
+            .unwrap(),
+            Some(stored.id),
+        );
+        assert_eq!(jobs::list_postings(&pool, "acct-one").unwrap().len(), 1);
     }
 
     #[test]
@@ -5046,7 +5147,13 @@ mod tests {
             "track-one",
         ));
         assert_eq!(
-            backfill_verified_import_discovery_sources(&pool, "acct-one", &postings),
+            backfill_verified_import_discovery_sources(
+                &pool,
+                "acct-one",
+                &postings,
+                &CareerProfile::default(),
+                &JobPreferences::default(),
+            ),
             1
         );
     }
@@ -5093,7 +5200,13 @@ mod tests {
 
         let stored = jobs::list_postings(&pool, "acct-one").unwrap();
         assert_eq!(
-            backfill_verified_import_discovery_sources(&pool, "acct-one", &stored),
+            backfill_verified_import_discovery_sources(
+                &pool,
+                "acct-one",
+                &stored,
+                &CareerProfile::default(),
+                &JobPreferences::default(),
+            ),
             0
         );
         assert!(jobs::list_discovery_sources(&pool, "acct-one")
@@ -5125,7 +5238,13 @@ mod tests {
             "track-one",
         );
         assert_eq!(
-            backfill_verified_import_discovery_sources(&pool, "acct-one", &[legacy]),
+            backfill_verified_import_discovery_sources(
+                &pool,
+                "acct-one",
+                &[legacy],
+                &CareerProfile::default(),
+                &JobPreferences::default(),
+            ),
             0
         );
         assert_eq!(
