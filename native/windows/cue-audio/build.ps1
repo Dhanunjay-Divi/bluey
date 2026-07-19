@@ -88,9 +88,11 @@ if ($Msvc) {
     "main.c",
     "audio_args.c",
     "resampler.c",
+    # /TC treats every input before /link as C source. Keep import libraries
+    # after this boundary so MSVC passes them to link.exe instead of cl.exe.
+    "/link",
     "ole32.lib",
     "uuid.lib",
-    "/link",
     "/SUBSYSTEM:CONSOLE,10.00"
   ))
 } else {
