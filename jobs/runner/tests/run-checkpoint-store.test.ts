@@ -51,8 +51,10 @@ describe("encrypted cloud run checkpoints", () => {
     expect(encrypted.subarray(0, 8).toString("ascii")).toBe("BLUEYJP2");
     expect(encrypted.includes(Buffer.from("person@example.test"))).toBe(false);
     expect(encrypted.includes(Buffer.from("private answer"))).toBe(false);
-    expect((await stat(path)).mode & 0o777).toBe(0o600);
-    expect((await stat(dirname(path))).mode & 0o777).toBe(0o700);
+    if (process.platform !== "win32") {
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      expect((await stat(dirname(path))).mode & 0o777).toBe(0o700);
+    }
     expect((await readdir(dirname(path))).every((name) => name.endsWith(".json.enc"))).toBe(true);
 
     await expect(readRunCheckpoint(root, checkpoint.profileScope, scope, key))

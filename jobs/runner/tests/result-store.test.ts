@@ -1,7 +1,7 @@
 import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 import { encryptFile } from "../src/crypto-envelope.js";
 import {
@@ -29,13 +29,15 @@ describe("runner step result store", () => {
     const encrypted = await readFile(resultPath(root, context));
     expect(encrypted.subarray(0, 8).toString("ascii")).toBe("BLUEYJP2");
     expect(encrypted.toString("utf8")).not.toContain("submitted");
-    expect((await stat(resultPath(root, context))).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect((await stat(resultPath(root, context))).mode & 0o777).toBe(0o600);
+    }
   });
 
   it("hashes request IDs instead of placing them in filesystem paths", () => {
     const path = resultPath("/tmp/runner", resultContext("../../another-account"));
 
-    expect(path.startsWith("/tmp/runner/step-results/")).toBe(true);
+    expect(path.startsWith(`${join("/tmp/runner", "step-results")}${sep}`)).toBe(true);
     expect(path).not.toContain("another-account");
     expect(path).not.toContain(PROFILE_SCOPE);
   });
@@ -161,7 +163,9 @@ describe("runner step result store", () => {
 
     await expect(readResult(root, context, key)).resolves.toEqual({ revision: 2 });
     expect(await readdir(dirname(path))).toEqual([basename(path)]);
-    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+    }
   });
 });
 

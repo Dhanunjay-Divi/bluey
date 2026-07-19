@@ -16,7 +16,9 @@ describe("encrypted cloud browser profiles", () => {
     const snapshot = await readFile(paths.encryptedSnapshot);
     expect(snapshot.subarray(0, 8).toString("ascii")).toBe("BLUEYJP2");
     expect(snapshot.includes(Buffer.from("session-cookie"))).toBe(false);
-    expect((await stat(paths.encryptedSnapshot)).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect((await stat(paths.encryptedSnapshot)).mode & 0o777).toBe(0o600);
+    }
     await restoreProfile(paths, key);
     expect(await readFile(join(paths.directory, "Cookies"), "utf8")).toBe("session-cookie");
     await rm(root, { recursive: true, force: true });
