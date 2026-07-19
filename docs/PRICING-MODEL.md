@@ -44,21 +44,22 @@
 > - The Light tier projection (~1,500 cues per $15) reflects the
 >   1¢ floor; under fractional-cent billing it would be ~10x higher.
 
-> **Provider price snapshot date:** 2026-06-29. List prices from
+> **Provider price snapshot date:** 2026-07-19. List prices from
 > `https://platform.openai.com/docs/models`,
 > `https://docs.anthropic.com/en/docs/about-claude/pricing`, and
 > `https://ai.google.dev/gemini-api/docs/pricing`,
 > `https://docs.z.ai/guides/overview/pricing`, and
-> `https://api-docs.deepseek.com/quick_start/pricing`.
+> `https://api-docs.deepseek.com/quick_start/pricing`, and
+> `https://platform.kimi.ai/docs/pricing/chat-k3`.
 > Refresh at every minor release. Managed LLM routes currently price
 > OpenAI `gpt-5.4-mini`, OpenAI `gpt-5.5`, Anthropic
 > `claude-sonnet-4-6`, Anthropic `claude-opus-4-8`, Anthropic
 > `claude-haiku-4-5-20251001`, Gemini `gemini-3.1-pro-preview`,
 > Gemini `gemini-3.5-flash`, Gemini `gemini-3.1-flash-lite`,
 > Z.AI `glm-5.2`, Z.AI `glm-4.7-flashx`, DeepSeek `deepseek-v4-pro`, and DeepSeek
-> `deepseek-v4-flash`.
+> `deepseek-v4-flash`, and Moonshot `kimi-k3`.
 >
-> **Cache-price caveat:** DeepSeek and Z.AI publish lower cached-input prices.
+> **Cache-price caveat:** DeepSeek, Z.AI, and Moonshot publish lower cached-input prices.
 > Bluey v0.2 uses cache-miss input pricing for reservation and billing until
 > usage events store cache-hit/cache-miss token splits.
 >
@@ -89,6 +90,7 @@
 | Z.AI `glm-5.2` | $1.40/1M cache-miss tokens | $4.40/1M tokens | 150% | Flagship deep candidate and balanced fallback when `ZAI_API_KEY(S)` is configured |
 | DeepSeek `deepseek-v4-pro` | $0.435/1M cache-miss tokens | $0.87/1M tokens | 150% | Deep candidate in default `provider_mix`; second deep candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `DEEPSEEK_API_KEY(S)` is configured |
 | DeepSeek `deepseek-v4-flash` | $0.14/1M cache-miss tokens | $0.28/1M tokens | 200% | Instant/balanced candidate in default `provider_mix`; first instant candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `DEEPSEEK_API_KEY(S)` is configured |
+| Moonshot `kimi-k3` | $3.00/1M cache-miss tokens ($0.30/1M cached) | $15.00/1M tokens | 150% | Optional always-reasoning deep/vision fallback; Bluey reserves and meters input at cache-miss price until cached-token accounting is persisted |
 
 **STT pricing used by server meters:**
 

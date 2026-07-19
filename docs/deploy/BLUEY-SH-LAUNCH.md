@@ -56,6 +56,7 @@ Caddy routes the API paths to `bluey-server` and serves everything else from
    - `GEMINI_API_KEYS`
    - `DEEPGRAM_API_KEYS`
    - optional `ZAI_API_KEYS` and `DEEPSEEK_API_KEYS` for GLM/DeepSeek routes
+   - optional `MOONSHOT_API_KEYS` for the Kimi K3 deep/vision fallback
    - `BLUEY_ANSWER_PLAN_ROUTING=1` for explicit deploy posture
    - `BLUEY_ROUTE_POLICY=provider_mix` by default, or
      `BLUEY_ROUTE_POLICY=cost_optimized` for an owner-controlled GLM/DeepSeek

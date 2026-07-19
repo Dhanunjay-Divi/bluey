@@ -1058,6 +1058,8 @@ struct PricedRoute {
     provider: &'static str,
     model: &'static str,
     pricing: pricing::ModelPricing,
+    max_output_tokens: u32,
+    reservation_eligible: bool,
     estimated_cost_cents: i64,
     estimated_bluey_cost_cents: i64,
 }
@@ -1465,6 +1467,33 @@ async fn next_nonempty_completion_event(
     }
 }
 
+async fn next_visible_completion_event_with_private_activity(
+    events: &mut routing::CompletionEventStream,
+    first_output_deadline: Duration,
+    activity_idle_deadline: Duration,
+) -> Result<Option<anyhow::Result<routing::CompletionStreamEvent>>, tokio::time::error::Elapsed> {
+    let started = tokio::time::Instant::now();
+    let hard_deadline = started + first_output_deadline + activity_idle_deadline;
+    let mut wait_deadline = started + first_output_deadline;
+    loop {
+        match tokio::time::timeout_at(
+            wait_deadline.min(hard_deadline),
+            next_nonempty_completion_event(events),
+        )
+        .await?
+        {
+            Some(Ok(routing::CompletionStreamEvent::Activity)) => {
+                // Private reasoning proves that the provider is alive, but it
+                // is not customer-visible output and must not commit the route.
+                // Extend the inactivity window while keeping a hard total cap.
+                wait_deadline =
+                    (tokio::time::Instant::now() + activity_idle_deadline).min(hard_deadline);
+            }
+            event => return Ok(event),
+        }
+    }
+}
+
 fn missing_provider_key_error(provider: &str) -> anyhow::Error {
     anyhow::anyhow!("{provider} API key pool is not configured on bluey-server")
 }
@@ -1634,6 +1663,8 @@ fn priced_routes_for(
                     provider,
                     model,
                     pricing: route_pricing,
+                    max_output_tokens: u32::try_from(max_output_tokens.max(0)).unwrap_or(u32::MAX),
+                    reservation_eligible: true,
                     estimated_cost_cents: pricing::estimate_cost_ceiling(
                         &route_pricing,
                         estimated_input_tokens,
@@ -1643,6 +1674,55 @@ fn priced_routes_for(
                         &route_pricing,
                         estimated_input_tokens,
                         max_output_tokens,
+                    ),
+                }
+            })
+        })
+        .collect()
+}
+
+fn priced_completion_routes_for(
+    upstream: &crate::config::UpstreamKeys,
+    lane: &str,
+    estimated_input_tokens: i64,
+    route_seed: &str,
+    requested: Option<u32>,
+    thinking: routing::ThinkingBudget,
+    output: AnswerOutput,
+) -> Vec<PricedRoute> {
+    let planned = max_tokens_for_answer_plan(requested, output);
+    routing::resolve_route_candidates_with_seed(lane, route_seed)
+        .into_iter()
+        .filter_map(|(provider, model)| {
+            pricing::lookup(provider, model).map(|entry| {
+                let mut route_pricing = *entry;
+                if lane == "deep" {
+                    route_pricing.markup_percent = 150;
+                }
+                let max_output_tokens = routing::effective_max_output_tokens_for_provider(
+                    provider, model, planned, thinking,
+                );
+                let reservation_eligible = !upstream
+                    .key_candidates(
+                        provider,
+                        &format!("output-budget:{route_seed}:{provider}:{model}"),
+                    )
+                    .is_empty();
+                PricedRoute {
+                    provider,
+                    model,
+                    pricing: route_pricing,
+                    max_output_tokens,
+                    reservation_eligible,
+                    estimated_cost_cents: pricing::estimate_cost_ceiling(
+                        &route_pricing,
+                        estimated_input_tokens,
+                        i64::from(max_output_tokens),
+                    ),
+                    estimated_bluey_cost_cents: pricing::estimate_bluey_cost_ceiling(
+                        &route_pricing,
+                        estimated_input_tokens,
+                        i64::from(max_output_tokens),
                     ),
                 }
             })
@@ -2440,15 +2520,6 @@ fn max_tokens_for_answer_plan(requested: Option<u32>, output: AnswerOutput) -> O
         AnswerOutput::InterviewAnswer => Some(700),
         AnswerOutput::SourceAnswer => Some(900),
     }
-}
-
-fn estimate_max_output_tokens_for_answer_plan(
-    requested: Option<u32>,
-    thinking: routing::ThinkingBudget,
-    output: AnswerOutput,
-) -> u32 {
-    let planned = max_tokens_for_answer_plan(requested, output);
-    routing::effective_max_output_tokens(planned, thinking)
 }
 
 fn generated_answer_quality_failure(
@@ -7273,19 +7344,6 @@ async fn complete_stream_inner(
         vision_text_fallback_has_thinking_budget,
     );
     let provider_max_tokens = max_tokens_for_answer_plan(req.max_tokens, answer_plan.output);
-    let effective_max_out =
-        estimate_max_output_tokens_for_answer_plan(req.max_tokens, thinking, answer_plan.output);
-    let vision_text_fallback_max_out = estimate_max_output_tokens_for_answer_plan(
-        req.max_tokens,
-        vision_text_fallback_thinking,
-        answer_plan.output,
-    );
-    let quality_max_tokens = if vision_text_fallback_possible {
-        effective_max_out.max(vision_text_fallback_max_out)
-    } else {
-        effective_max_out
-    };
-    let max_out = i64::from(quality_max_tokens);
     let primary_server_est_in = ((provider_system.len() + provider_user.len()) as i64) / 4
         + image_token_estimate(req.image_data_urls.len());
     let server_est_in = if vision_text_fallback_possible {
@@ -7318,7 +7376,15 @@ async fn complete_stream_inner(
         thinking = ?thinking.mode,
         "managed chat pre-dispatch phases completed"
     );
-    let routes = priced_routes_for(&effective_lane, est_in, max_out, &req.request_id);
+    let routes = priced_completion_routes_for(
+        &state.config.upstream,
+        &effective_lane,
+        est_in,
+        &req.request_id,
+        req.max_tokens,
+        thinking,
+        answer_plan.output,
+    );
     if routes.is_empty() {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
         return Err((
@@ -7340,7 +7406,15 @@ async fn complete_stream_inner(
         );
     }
     let vision_text_fallback_routes = if vision_text_fallback_possible {
-        priced_routes_for(vision_text_fallback_lane, est_in, max_out, &req.request_id)
+        priced_completion_routes_for(
+            &state.config.upstream,
+            vision_text_fallback_lane,
+            est_in,
+            &req.request_id,
+            req.max_tokens,
+            vision_text_fallback_thinking,
+            answer_plan.output,
+        )
     } else {
         Vec::new()
     };
@@ -7348,6 +7422,7 @@ async fn complete_stream_inner(
     let est_cost = routes
         .iter()
         .chain(vision_text_fallback_routes.iter())
+        .filter(|route| route.reservation_eligible)
         .map(|route| route.estimated_cost_cents)
         .max()
         .unwrap_or(1)
@@ -7355,6 +7430,7 @@ async fn complete_stream_inner(
     let est_bluey_cost = routes
         .iter()
         .chain(vision_text_fallback_routes.iter())
+        .filter(|route| route.reservation_eligible)
         .map(|route| route.estimated_bluey_cost_cents)
         .max()
         .unwrap_or(1)
@@ -7570,18 +7646,19 @@ async fn complete_stream_inner(
 
                 match tokio::time::timeout(dispatch_stream_connect_deadline, dispatch).await {
                     Ok(Ok(streaming)) => {
-                        // B2: a 2xx connection is not yet a usable stream. Only a
-                        // non-empty text delta commits this route. A pre-output
-                        // error, empty completion, or silent end falls back while
-                        // Bluey still has other providers available.
+                        // B2: a 2xx connection is not yet a usable stream. Only
+                        // a non-empty visible text delta commits this route.
+                        // Private reasoning extends the bounded preflight wait
+                        // but remains eligible for fallback until visible text.
                         let routing::StreamingCompletion {
                             provider: stream_provider,
                             model: stream_model,
                             events: mut stream_events,
                         } = streaming;
-                        match tokio::time::timeout(
+                        match next_visible_completion_event_with_private_activity(
+                            &mut stream_events,
                             dispatch_first_output_deadline,
-                            next_nonempty_completion_event(&mut stream_events),
+                            dispatch_stream_idle_deadline,
                         )
                         .await
                         {
@@ -7672,6 +7749,9 @@ async fn complete_stream_inner(
                                 last_failure_was_capacity = false;
                                 break;
                             }
+                            Ok(Some(Ok(routing::CompletionStreamEvent::Activity))) => {
+                                unreachable!("private activity is consumed by stream preflight")
+                            }
                             Ok(Some(Err(e))) => {
                                 if !vision_text_fallback_active
                                     && !vision_text_fallback_routes.is_empty()
@@ -7756,6 +7836,7 @@ async fn complete_stream_inner(
                                     provider = %route.provider,
                                     model = %route.model,
                                     first_token_timeout_ms = dispatch_first_output_deadline.as_millis() as u64,
+                                    private_activity_grace_ms = dispatch_stream_idle_deadline.as_millis() as u64,
                                     "streaming first-token deadline exceeded; trying next route"
                                 );
                                 last_error = Some(anyhow::anyhow!("first-token deadline exceeded"));
@@ -7958,6 +8039,7 @@ async fn complete_stream_inner(
             ));
         }
     };
+    let quality_max_tokens = selected_route.max_output_tokens;
     let stream_idle_deadline = selected_stream_idle_deadline;
 
     let stream_status_events =
@@ -8081,6 +8163,10 @@ async fn complete_stream_inner(
                 return;
             }
             match event {
+                Ok(routing::CompletionStreamEvent::Activity) => {
+                    // Keep the provider stream and idle deadline alive while
+                    // withholding private chain-of-thought from customers.
+                }
                 Ok(routing::CompletionStreamEvent::Delta(delta)) => {
                     if let Some(safe_delta) = output.push(&delta) {
                         let visible_delta = if split_canvas_stream {
@@ -8965,19 +9051,6 @@ async fn complete_inner(
     let vision_text_fallback_possible =
         effective_lane == "vision" && !req.image_data_urls.is_empty();
     let provider_max_tokens = max_tokens_for_answer_plan(req.max_tokens, answer_plan.output);
-    let effective_max_out =
-        estimate_max_output_tokens_for_answer_plan(req.max_tokens, thinking, answer_plan.output);
-    let vision_text_fallback_max_out = estimate_max_output_tokens_for_answer_plan(
-        req.max_tokens,
-        vision_text_fallback_thinking,
-        answer_plan.output,
-    );
-    let quality_max_tokens = if vision_text_fallback_possible {
-        effective_max_out.max(vision_text_fallback_max_out)
-    } else {
-        effective_max_out
-    };
-    let max_out = i64::from(quality_max_tokens);
     let primary_server_est_in = ((provider_system.len() + provider_user.len()) as i64) / 4
         + image_token_estimate(req.image_data_urls.len());
     let server_est_in = if vision_text_fallback_possible {
@@ -8990,7 +9063,15 @@ async fn complete_inner(
         .estimated_input_tokens
         .unwrap_or_default()
         .max(server_est_in);
-    let routes = priced_routes_for(&effective_lane, est_in, max_out, &req.request_id);
+    let routes = priced_completion_routes_for(
+        &state.config.upstream,
+        &effective_lane,
+        est_in,
+        &req.request_id,
+        req.max_tokens,
+        thinking,
+        answer_plan.output,
+    );
     if routes.is_empty() {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
         return Err((
@@ -9012,7 +9093,15 @@ async fn complete_inner(
         );
     }
     let vision_text_fallback_routes = if vision_text_fallback_possible {
-        priced_routes_for(vision_text_fallback_lane, est_in, max_out, &req.request_id)
+        priced_completion_routes_for(
+            &state.config.upstream,
+            vision_text_fallback_lane,
+            est_in,
+            &req.request_id,
+            req.max_tokens,
+            vision_text_fallback_thinking,
+            answer_plan.output,
+        )
     } else {
         Vec::new()
     };
@@ -9021,6 +9110,7 @@ async fn complete_inner(
     let est_cost = routes
         .iter()
         .chain(vision_text_fallback_routes.iter())
+        .filter(|route| route.reservation_eligible)
         .map(|route| route.estimated_cost_cents)
         .max()
         .unwrap_or(1)
@@ -9028,6 +9118,7 @@ async fn complete_inner(
     let est_bluey_cost = routes
         .iter()
         .chain(vision_text_fallback_routes.iter())
+        .filter(|route| route.reservation_eligible)
         .map(|route| route.estimated_bluey_cost_cents)
         .max()
         .unwrap_or(1)
@@ -9428,6 +9519,7 @@ async fn complete_inner(
             ));
         }
     };
+    let quality_max_tokens = selected_route.max_output_tokens;
 
     if let Some(err) = account_not_active_error(&state.pool, &account.id) {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
@@ -12219,6 +12311,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn stream_preflight_waits_through_private_reasoning_for_visible_output() {
+        let mut events: routing::CompletionEventStream = Box::pin(stream::iter(vec![
+            Ok(routing::CompletionStreamEvent::Activity),
+            Ok(routing::CompletionStreamEvent::Delta("ready".to_string())),
+        ]));
+
+        match next_visible_completion_event_with_private_activity(
+            &mut events,
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        )
+        .await
+        {
+            Ok(Some(Ok(routing::CompletionStreamEvent::Delta(delta)))) => {
+                assert_eq!(delta, "ready");
+            }
+            _ => panic!("private activity must not commit before visible output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_preflight_preserves_fallback_after_private_reasoning_error() {
+        let mut events: routing::CompletionEventStream = Box::pin(stream::iter(vec![
+            Ok(routing::CompletionStreamEvent::Activity),
+            Err(anyhow::anyhow!("provider failed before visible output")),
+        ]));
+
+        match next_visible_completion_event_with_private_activity(
+            &mut events,
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        )
+        .await
+        {
+            Ok(Some(Err(error))) => {
+                assert!(error.to_string().contains("failed before visible output"));
+            }
+            _ => panic!("pre-output reasoning failure must remain eligible for fallback"),
+        }
+    }
+
     #[test]
     fn first_token_deadline_is_lane_specific() {
         for name in [
@@ -13019,6 +13153,50 @@ mod tests {
         assert_eq!(
             max_tokens_for_answer_plan(None, AnswerOutput::InterviewAnswer),
             Some(700)
+        );
+    }
+
+    #[test]
+    fn completion_routes_use_provider_specific_reservation_budgets() {
+        let upstream = crate::config::UpstreamKeys {
+            openai_api_key: Some("sk-test-openai".to_string()),
+            moonshot_api_key: Some("sk-test-moonshot".to_string()),
+            ..Default::default()
+        };
+        let routes = priced_completion_routes_for(
+            &upstream,
+            "vision",
+            1_000,
+            "vision-budget-test",
+            None,
+            routing::ThinkingBudget::off(),
+            AnswerOutput::CanvasDetail,
+        );
+        let openai = routes
+            .iter()
+            .find(|route| route.provider == "openai")
+            .expect("vision keeps an OpenAI route");
+        let kimi = routes
+            .iter()
+            .find(|route| route.provider == "moonshot")
+            .expect("vision keeps a Kimi route");
+
+        assert!(openai.reservation_eligible);
+        assert!(kimi.reservation_eligible);
+        assert_eq!(openai.max_output_tokens, 2_048);
+        assert_eq!(kimi.max_output_tokens, 5_120);
+        assert_eq!(
+            openai.estimated_bluey_cost_cents,
+            pricing::estimate_bluey_cost_ceiling(&openai.pricing, 1_000, 2_048)
+        );
+        assert_eq!(
+            kimi.estimated_bluey_cost_cents,
+            pricing::estimate_bluey_cost_ceiling(&kimi.pricing, 1_000, 5_120)
+        );
+        assert_ne!(
+            openai.estimated_bluey_cost_cents,
+            pricing::estimate_bluey_cost_ceiling(&openai.pricing, 1_000, 5_120),
+            "Kimi's mandatory reasoning room must not inflate OpenAI's reservation"
         );
     }
 

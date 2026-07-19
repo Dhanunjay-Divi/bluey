@@ -141,6 +141,11 @@ if [[ -z "${DEEPSEEK_API_KEYS:-}" && -z "${DEEPSEEK_API_KEY:-}" ]]; then
 else
   ok "DeepSeek server-side provider env is present"
 fi
+if [[ -z "${MOONSHOT_API_KEYS:-}" && -z "${MOONSHOT_API_KEY:-}" && -z "${KIMI_API_KEYS:-}" && -z "${KIMI_API_KEY:-}" ]]; then
+  warn "MOONSHOT_API_KEYS/MOONSHOT_API_KEY is missing; Kimi K3 fallback routes will be skipped"
+else
+  ok "Moonshot Kimi K3 server-side provider env is present"
+fi
 if [[ "${provider_ready}" == "1" ]]; then
   ok "OpenAI, Anthropic, Gemini, and Deepgram server-side provider env is present"
 fi

@@ -52,6 +52,8 @@ const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
 const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
 const ZAI_FLAGSHIP_MODEL: &str = "glm-5.2";
 const ZAI_FAST_MODEL: &str = "glm-4.7-flashx";
+const MOONSHOT_KIMI_K3_MODEL: &str = "kimi-k3";
+const MOONSHOT_KIMI_K3_MIN_REASONING_TOKENS: u32 = 4_096;
 const DEFAULT_DEEPGRAM_LANGUAGE: &str = "en-IN";
 
 /// Reuse upstream TCP/TLS connections across requests. Creating a new
@@ -230,6 +232,10 @@ pub struct Completion {
 /// Provider-neutral event returned by a streaming upstream completion.
 #[derive(Debug)]
 pub enum CompletionStreamEvent {
+    /// Provider-side work is progressing, but no user-visible final-answer
+    /// text is available yet. This keeps always-reasoning streams alive
+    /// without exposing chain-of-thought content.
+    Activity,
     Delta(String),
     Done {
         input_tokens: i64,
@@ -336,6 +342,40 @@ pub fn effective_max_output_tokens(requested: Option<u32>, thinking: ThinkingBud
         // Non-thinking lanes (instant/balanced): clamp to the ceiling so a
         // client cannot reserve an unbounded output budget.
         (false, _) => base.min(non_thinking_output_ceiling()),
+    }
+}
+
+/// Provider-aware output reservation. Kimi K3 always performs maximum
+/// reasoning, including on Bluey's otherwise non-thinking vision lane, so its
+/// total completion budget must reserve room for reasoning plus visible text.
+pub fn effective_max_output_tokens_for_provider(
+    provider: &str,
+    model: &str,
+    requested: Option<u32>,
+    thinking: ThinkingBudget,
+) -> u32 {
+    effective_max_output_tokens(
+        requested,
+        provider_output_thinking_budget(provider, model, thinking),
+    )
+}
+
+fn provider_output_thinking_budget(
+    provider: &str,
+    model: &str,
+    thinking: ThinkingBudget,
+) -> ThinkingBudget {
+    if provider != "moonshot" || !model.eq_ignore_ascii_case(MOONSHOT_KIMI_K3_MODEL) {
+        return thinking;
+    }
+    ThinkingBudget {
+        mode: ThinkingMode::High,
+        max_tokens: Some(
+            thinking
+                .max_tokens
+                .unwrap_or_default()
+                .max(MOONSHOT_KIMI_K3_MIN_REASONING_TOKENS),
+        ),
     }
 }
 
@@ -460,12 +500,14 @@ fn resolve_route_candidates_for_policy_and_seed(
             ("anthropic", ANTHROPIC_BALANCED_MODEL),
             ("deepseek", DEEPSEEK_FLASH_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
+            ("moonshot", MOONSHOT_KIMI_K3_MODEL),
         ],
         (RoutePolicy::CostOptimized, "vision") => vec![
             ("openai", OPENAI_ACCURATE_MODEL),
             ("gemini", GEMINI_PRO_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
             ("openai", OPENAI_FAST_MODEL),
+            ("moonshot", MOONSHOT_KIMI_K3_MODEL),
         ],
         (RoutePolicy::CostOptimized, "local") => vec![],
         (RoutePolicy::CostOptimized, _) => vec![
@@ -496,12 +538,14 @@ fn resolve_route_candidates_for_policy_and_seed(
             ("anthropic", ANTHROPIC_BALANCED_MODEL),
             ("deepseek", DEEPSEEK_FLASH_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
+            ("moonshot", MOONSHOT_KIMI_K3_MODEL),
         ],
         (RoutePolicy::QualityFirst, "vision") => vec![
             ("openai", OPENAI_ACCURATE_MODEL),
             ("gemini", GEMINI_PRO_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
             ("openai", OPENAI_FAST_MODEL),
+            ("moonshot", MOONSHOT_KIMI_K3_MODEL),
         ],
         (RoutePolicy::QualityFirst, "local") => vec![],
         (RoutePolicy::QualityFirst, _) => vec![
@@ -545,6 +589,7 @@ fn resolve_provider_mix_candidates(lane: &str, seed: &str) -> Vec<(&'static str,
                 ("anthropic", ANTHROPIC_BALANCED_MODEL),
                 ("deepseek", DEEPSEEK_FLASH_MODEL),
                 ("gemini", GEMINI_FLASH_MODEL),
+                ("moonshot", MOONSHOT_KIMI_K3_MODEL),
             ],
             lane,
             seed,
@@ -554,7 +599,11 @@ fn resolve_provider_mix_candidates(lane: &str, seed: &str) -> Vec<(&'static str,
                 ("gemini", GEMINI_FLASH_MODEL),
                 ("openai", OPENAI_ACCURATE_MODEL),
             ],
-            vec![("gemini", GEMINI_PRO_MODEL), ("openai", OPENAI_FAST_MODEL)],
+            vec![
+                ("gemini", GEMINI_PRO_MODEL),
+                ("openai", OPENAI_FAST_MODEL),
+                ("moonshot", MOONSHOT_KIMI_K3_MODEL),
+            ],
             lane,
             seed,
         ),
@@ -726,6 +775,24 @@ pub async fn complete(
             )
             .await
         }
+        "moonshot" => {
+            let key = keys
+                .moonshot_key(&format!("chat:{model}:{system}:{user}"))
+                .ok_or_else(|| anyhow!("MOONSHOT_API_KEY(S) not configured on bluey-server"))?;
+            openai_compatible_complete(
+                "moonshot",
+                key,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                thinking,
+                fallback_input_tokens,
+                image_data_urls,
+            )
+            .await
+        }
         // Codex S4.4: explicit failure for unsupported providers
         // including `ollama` (which only the daemon's local fallback
         // path should run).
@@ -791,7 +858,7 @@ pub async fn complete_with_key(
             )
             .await
         }
-        "deepseek" | "zai" => {
+        "deepseek" | "zai" | "moonshot" => {
             openai_compatible_complete(
                 provider,
                 api_key,
@@ -868,7 +935,7 @@ pub async fn complete_stream_with_key(
             )
             .await
         }
-        "deepseek" | "zai" => {
+        "deepseek" | "zai" | "moonshot" => {
             openai_compatible_complete_stream(
                 provider,
                 api_key,
@@ -923,7 +990,8 @@ struct OpenAiCompatibleThinking {
 }
 
 fn openai_token_limit_fields(model: &str, max_tokens: Option<u32>) -> (Option<u32>, Option<u32>) {
-    if model.to_ascii_lowercase().starts_with("gpt-5") {
+    let model = model.to_ascii_lowercase();
+    if model.starts_with("gpt-5") || model == MOONSHOT_KIMI_K3_MODEL {
         (None, max_tokens)
     } else {
         (max_tokens, None)
@@ -955,6 +1023,10 @@ fn openai_compatible_chat_url(provider: &str) -> Result<String> {
             "https://api.z.ai/api/paas/v4/chat/completions",
             "BLUEY_TEST_ZAI_URL",
         )),
+        "moonshot" => Ok(override_url(
+            "https://api.moonshot.ai/v1/chat/completions",
+            "BLUEY_TEST_MOONSHOT_URL",
+        )),
         other => Err(anyhow!("unsupported OpenAI-compatible provider: {other}")),
     }
 }
@@ -963,6 +1035,11 @@ fn openai_compatible_thinking_for(
     provider: &str,
     thinking: ThinkingBudget,
 ) -> (Option<OpenAiCompatibleThinking>, Option<&'static str>) {
+    // Kimi K3 is always-thinking and currently accepts only top-level
+    // reasoning_effort="max". It rejects the K2.x `thinking` object.
+    if provider == "moonshot" {
+        return (None, Some("max"));
+    }
     if !matches!(provider, "deepseek" | "zai") {
         return (None, None);
     }
@@ -984,10 +1061,53 @@ fn openai_compatible_temperature_for(
     model: &str,
     temperature: Option<f32>,
 ) -> Option<f32> {
-    if provider == "openai" && model.to_ascii_lowercase().starts_with("gpt-5") {
+    if provider == "moonshot"
+        || (provider == "openai" && model.to_ascii_lowercase().starts_with("gpt-5"))
+    {
         return None;
     }
     temperature
+}
+
+#[allow(clippy::too_many_arguments)]
+fn openai_compatible_chat_request<'a>(
+    provider: &str,
+    model: &'a str,
+    system: &'a str,
+    user: &'a str,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    thinking: ThinkingBudget,
+    image_data_urls: &'a [String],
+    stream: bool,
+) -> OpenAiChatReq<'a> {
+    let user_content = openai_user_content(user, image_data_urls);
+    let output_thinking = provider_output_thinking_budget(provider, model, thinking);
+    let (max_tokens, max_completion_tokens) =
+        openai_effective_token_limit_fields(model, max_tokens, output_thinking);
+    let (thinking, reasoning_effort) = openai_compatible_thinking_for(provider, output_thinking);
+    OpenAiChatReq {
+        model,
+        messages: vec![
+            OpenAiMessage {
+                role: "system",
+                content: OpenAiMessageContent::Text(system),
+            },
+            OpenAiMessage {
+                role: "user",
+                content: user_content,
+            },
+        ],
+        max_tokens,
+        max_completion_tokens,
+        temperature: openai_compatible_temperature_for(provider, model, temperature),
+        stream: stream.then_some(true),
+        stream_options: stream.then_some(OpenAiStreamOptions {
+            include_usage: true,
+        }),
+        thinking,
+        reasoning_effort,
+    }
 }
 
 fn estimated_tokens_from_chars(chars: usize) -> i64 {
@@ -1186,30 +1306,17 @@ async fn openai_compatible_complete(
     fallback_input_tokens: Option<i64>,
     image_data_urls: &[String],
 ) -> Result<Completion> {
-    let user_content = openai_user_content(user, image_data_urls);
-    let (max_tokens, max_completion_tokens) =
-        openai_effective_token_limit_fields(model, max_tokens, thinking);
-    let (thinking, reasoning_effort) = openai_compatible_thinking_for(provider, thinking);
-    let req = OpenAiChatReq {
+    let req = openai_compatible_chat_request(
+        provider,
         model,
-        messages: vec![
-            OpenAiMessage {
-                role: "system",
-                content: OpenAiMessageContent::Text(system),
-            },
-            OpenAiMessage {
-                role: "user",
-                content: user_content,
-            },
-        ],
+        system,
+        user,
         max_tokens,
-        max_completion_tokens,
-        temperature: openai_compatible_temperature_for(provider, model, temperature),
-        stream: None,
-        stream_options: None,
+        temperature,
         thinking,
-        reasoning_effort,
-    };
+        image_data_urls,
+        false,
+    );
     let resp = upstream_http_client()
         .post(openai_compatible_chat_url(provider)?.as_str())
         .bearer_auth(key)
@@ -1276,11 +1383,13 @@ struct OpenAiStreamError {
 struct OpenAiStreamChoice {
     delta: OpenAiStreamDelta,
     finish_reason: Option<String>,
+    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Deserialize)]
 struct OpenAiStreamDelta {
     content: Option<String>,
+    reasoning_content: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1323,32 +1432,17 @@ async fn openai_compatible_complete_stream(
     fallback_input_tokens: Option<i64>,
     image_data_urls: &[String],
 ) -> Result<StreamingCompletion> {
-    let user_content = openai_user_content(user, image_data_urls);
-    let (max_tokens, max_completion_tokens) =
-        openai_effective_token_limit_fields(model, max_tokens, thinking);
-    let (thinking, reasoning_effort) = openai_compatible_thinking_for(provider, thinking);
-    let req = OpenAiChatReq {
+    let req = openai_compatible_chat_request(
+        provider,
         model,
-        messages: vec![
-            OpenAiMessage {
-                role: "system",
-                content: OpenAiMessageContent::Text(system),
-            },
-            OpenAiMessage {
-                role: "user",
-                content: user_content,
-            },
-        ],
+        system,
+        user,
         max_tokens,
-        max_completion_tokens,
-        temperature: openai_compatible_temperature_for(provider, model, temperature),
-        stream: Some(true),
-        stream_options: Some(OpenAiStreamOptions {
-            include_usage: true,
-        }),
+        temperature,
         thinking,
-        reasoning_effort,
-    };
+        image_data_urls,
+        true,
+    );
     let resp = upstream_http_client()
         .post(openai_compatible_chat_url(provider)?.as_str())
         .bearer_auth(key)
@@ -1400,6 +1494,9 @@ async fn openai_compatible_complete_stream(
                     data,
                     &mut final_usage,
                 )?;
+                if openai_stream_has_reasoning_activity(data) {
+                    yield CompletionStreamEvent::Activity;
+                }
                 for delta in deltas {
                     output_chars = output_chars.saturating_add(delta.chars().count());
                     yield CompletionStreamEvent::Delta(delta);
@@ -1431,6 +1528,9 @@ async fn openai_compatible_complete_stream(
                 data,
                 &mut final_usage,
             )?;
+            if openai_stream_has_reasoning_activity(data) {
+                yield CompletionStreamEvent::Activity;
+            }
             for delta in deltas {
                 output_chars = output_chars.saturating_add(delta.chars().count());
                 yield CompletionStreamEvent::Delta(delta);
@@ -1469,8 +1569,12 @@ fn parse_openai_stream_chunk(
     data: &str,
     final_usage: &mut Option<OpenAiUsage>,
 ) -> Result<ParsedTextStreamChunk> {
-    let parsed: OpenAiStreamChunk =
-        serde_json::from_str(data).with_context(|| format!("openai stream json: {data}"))?;
+    let mut parsed: OpenAiStreamChunk = serde_json::from_str(data).with_context(|| {
+        format!(
+            "openai-compatible stream JSON decode failed for {provider} ({} bytes)",
+            data.len()
+        )
+    })?;
     if let Some(error) = parsed.error {
         let message = error
             .message
@@ -1487,7 +1591,12 @@ fn parse_openai_stream_chunk(
         }
         return Err(anyhow!("openai stream error: {message}"));
     }
-    if let Some(usage) = parsed.usage {
+    if let Some(usage) = parsed.usage.take().or_else(|| {
+        parsed
+            .choices
+            .iter_mut()
+            .find_map(|choice| choice.usage.take())
+    }) {
         *final_usage = Some(usage);
     }
     let abnormal_terminal_reason = first_abnormal_terminal_reason(
@@ -1506,6 +1615,19 @@ fn parse_openai_stream_chunk(
         deltas,
         abnormal_terminal_reason,
     })
+}
+
+fn openai_stream_has_reasoning_activity(data: &str) -> bool {
+    serde_json::from_str::<OpenAiStreamChunk>(data)
+        .ok()
+        .is_some_and(|chunk| {
+            chunk.choices.into_iter().any(|choice| {
+                choice
+                    .delta
+                    .reasoning_content
+                    .is_some_and(|reasoning| !reasoning.is_empty())
+            })
+        })
 }
 
 fn openai_user_content<'a>(
@@ -2974,7 +3096,8 @@ mod tests {
                 ("openai", "gpt-5.5"),
                 ("anthropic", "claude-sonnet-4-6"),
                 ("deepseek", "deepseek-v4-flash"),
-                ("gemini", "gemini-3.5-flash")
+                ("gemini", "gemini-3.5-flash"),
+                ("moonshot", "kimi-k3")
             ]
         );
         assert_eq!(
@@ -2983,7 +3106,8 @@ mod tests {
                 ("openai", "gpt-5.5"),
                 ("gemini", "gemini-3.1-pro-preview"),
                 ("gemini", "gemini-3.5-flash"),
-                ("openai", "gpt-5.4-mini")
+                ("openai", "gpt-5.4-mini"),
+                ("moonshot", "kimi-k3")
             ]
         );
         assert!(
@@ -3035,7 +3159,8 @@ mod tests {
                 ("openai", "gpt-5.5"),
                 ("anthropic", "claude-sonnet-4-6"),
                 ("deepseek", "deepseek-v4-flash"),
-                ("gemini", "gemini-3.5-flash")
+                ("gemini", "gemini-3.5-flash"),
+                ("moonshot", "kimi-k3")
             ]
         );
         assert_eq!(
@@ -3142,7 +3267,7 @@ mod tests {
             assert!(
                 routes
                     .iter()
-                    .all(|(provider, _model)| *provider == "openai" || *provider == "gemini"),
+                    .all(|(provider, _model)| matches!(*provider, "openai" | "gemini" | "moonshot")),
                 "vision provider mix must not route image payloads to text-only providers: {routes:?}"
             );
             assert!(
@@ -3205,6 +3330,31 @@ mod tests {
             value["content"][1]["image_url"]["url"],
             "data:image/png;base64,aGVsbG8="
         );
+    }
+
+    #[test]
+    fn kimi_k3_request_uses_the_moonshot_contract() {
+        let req = openai_compatible_chat_request(
+            "moonshot",
+            MOONSHOT_KIMI_K3_MODEL,
+            "answer from verified evidence",
+            "Summarize this role",
+            Some(1024),
+            Some(0.2),
+            ThinkingBudget::off(),
+            &[],
+            true,
+        );
+        let value = serde_json::to_value(req).unwrap();
+
+        assert_eq!(value["model"], "kimi-k3");
+        assert!(value.get("max_tokens").is_none());
+        assert_eq!(value["max_completion_tokens"], 5120);
+        assert!(value.get("temperature").is_none());
+        assert!(value.get("thinking").is_none());
+        assert_eq!(value["reasoning_effort"], "max");
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["stream_options"]["include_usage"], true);
     }
 
     #[test]
@@ -3345,6 +3495,34 @@ mod tests {
             assert!(anthropic.deltas.is_empty());
             assert!(anthropic.abnormal_terminal_reason.is_none());
         }
+    }
+
+    #[test]
+    fn kimi_k3_reasoning_activity_stays_private_and_nested_usage_is_counted() {
+        let data = r#"{"choices":[{"delta":{"reasoning_content":"private chain of thought"},"finish_reason":null,"usage":{"prompt_tokens":19,"completion_tokens":13}}]}"#;
+        let mut usage = None;
+
+        assert!(openai_stream_has_reasoning_activity(data));
+        let parsed = parse_openai_stream_chunk("moonshot", data, &mut usage).unwrap();
+
+        assert!(parsed.deltas.is_empty());
+        assert!(parsed.abnormal_terminal_reason.is_none());
+        let usage = usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 19);
+        assert_eq!(usage.completion_tokens, 13);
+    }
+
+    #[test]
+    fn malformed_kimi_stream_error_never_echoes_private_reasoning() {
+        let data = r#"{"choices":[{"delta":{"reasoning_content":"private chain of thought"}"#;
+        let mut usage = None;
+
+        let error = parse_openai_stream_chunk("moonshot", data, &mut usage).unwrap_err();
+
+        assert!(!error.to_string().contains("private chain of thought"));
+        assert!(error
+            .to_string()
+            .contains("JSON decode failed for moonshot"));
     }
 
     #[test]
@@ -3683,6 +3861,33 @@ mod tests {
             openai_effective_token_limit_fields("gpt-4o", Some(8000), off);
         assert_eq!(max_tokens, Some(expected));
         assert_eq!(max_completion_tokens, None);
+
+        let (max_tokens, max_completion_tokens) =
+            openai_effective_token_limit_fields(MOONSHOT_KIMI_K3_MODEL, Some(1024), off);
+        assert_eq!(max_tokens, None);
+        assert_eq!(max_completion_tokens, Some(1024));
+    }
+
+    #[test]
+    fn kimi_k3_reserves_reasoning_room_even_on_non_thinking_lanes() {
+        assert_eq!(
+            effective_max_output_tokens_for_provider(
+                "moonshot",
+                MOONSHOT_KIMI_K3_MODEL,
+                Some(1024),
+                ThinkingBudget::off(),
+            ),
+            5120
+        );
+        assert_eq!(
+            effective_max_output_tokens_for_provider(
+                "openai",
+                "gpt-5.4-mini",
+                Some(1024),
+                ThinkingBudget::off(),
+            ),
+            1024
+        );
     }
 
     #[test]
@@ -3713,6 +3918,10 @@ mod tests {
         let (thinking, effort) = openai_compatible_thinking_for("zai", budget);
         assert_eq!(thinking.unwrap().ty, "enabled");
         assert_eq!(effort, Some("max"));
+
+        let (thinking, effort) = openai_compatible_thinking_for("moonshot", ThinkingBudget::off());
+        assert!(thinking.is_none());
+        assert_eq!(effort, Some("max"));
     }
 
     #[test]
@@ -3732,6 +3941,10 @@ mod tests {
         assert_eq!(
             openai_compatible_temperature_for("zai", "glm-5.2", Some(0.2)),
             Some(0.2)
+        );
+        assert_eq!(
+            openai_compatible_temperature_for("moonshot", "kimi-k3", Some(0.2)),
+            None
         );
     }
 

@@ -347,6 +347,8 @@ pub struct RateLimiters {
     pub provider_deepseek_llm: SharedLimiter,
     /// Provider-wide capacity bucket for Z.AI GLM chat requests.
     pub provider_zai_llm: SharedLimiter,
+    /// Provider-wide capacity bucket for Moonshot Kimi chat requests.
+    pub provider_moonshot_llm: SharedLimiter,
     /// Provider-wide capacity bucket for OpenAI embeddings.
     pub provider_openai_embed: SharedLimiter,
     /// Provider-wide capacity bucket for Deepgram STT.
@@ -472,6 +474,13 @@ impl Default for RateLimiters {
                 60,
                 redis.clone(),
             ),
+            provider_moonshot_llm: limiter_from_env(
+                "provider_moonshot_llm",
+                "BLUEY_LIMIT_PROVIDER_MOONSHOT_LLM_PER_MIN",
+                120,
+                30,
+                redis.clone(),
+            ),
             provider_openai_embed: limiter_from_env(
                 "provider_openai_embed",
                 "BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN",
@@ -585,6 +594,14 @@ impl RateLimiters {
                 .map_err(|retry| CapacityDenied {
                     retry_after_secs: retry,
                     reason: "provider_zai_llm_busy",
+                }),
+            "moonshot" => self
+                .provider_moonshot_llm
+                .check(&key)
+                .await
+                .map_err(|retry| CapacityDenied {
+                    retry_after_secs: retry,
+                    reason: "provider_moonshot_llm_busy",
                 }),
             _ => Ok(()),
         }
@@ -1166,6 +1183,7 @@ mod tests {
         let limits = RateLimiters {
             provider_deepseek_llm: SharedLimiter::new("test_provider_deepseek_llm", 60, 1, None),
             provider_zai_llm: SharedLimiter::new("test_provider_zai_llm", 60, 1, None),
+            provider_moonshot_llm: SharedLimiter::new("test_provider_moonshot_llm", 60, 1, None),
             ..RateLimiters::default()
         };
         limits
@@ -1184,6 +1202,16 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(denied.reason, "provider_zai_llm_busy");
+
+        limits
+            .check_provider_llm("moonshot", "kimi-k3")
+            .await
+            .unwrap();
+        let denied = limits
+            .check_provider_llm("moonshot", "kimi-k3")
+            .await
+            .unwrap_err();
+        assert_eq!(denied.reason, "provider_moonshot_llm_busy");
         assert!(limits.check_provider_llm("openai", "gpt-5.5").await.is_ok());
     }
 

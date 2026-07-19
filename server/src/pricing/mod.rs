@@ -2,7 +2,7 @@
 //!
 //! Source of truth lives here AND in `docs/PRICING-MODEL.md`. Any
 //! change to either must be reflected in both. Last reconciled
-//! 2026-07-10 against PRICING-MODEL.md and MODEL-ROUTING.md.
+//! 2026-07-19 against PRICING-MODEL.md and MODEL-ROUTING.md.
 //!
 //! ## Unit semantics
 //!
@@ -121,6 +121,16 @@ pub const PRICING: &[ModelPricing] = &[
         upstream_in_microcents_per_1m: 70_000,
         upstream_out_microcents_per_1m: 400_000,
         markup_percent: 200,
+    },
+    ModelPricing {
+        // Moonshot Kimi K3: $3/1M cache-miss input, $15/1M output.
+        // Cached input is $0.30/1M upstream, but Bluey charges/reserves at
+        // cache-miss pricing until provider cache-token accounting is modeled.
+        provider: "moonshot",
+        model: "kimi-k3",
+        upstream_in_microcents_per_1m: 3_000_000,
+        upstream_out_microcents_per_1m: 15_000_000,
+        markup_percent: 150,
     },
     ModelPricing {
         // DeepSeek V4 Pro: $0.435/1M cache-miss input, $0.87/1M output.
@@ -267,6 +277,7 @@ mod tests {
         );
         assert_eq!(lookup("zai", "glm-5.2").unwrap().markup_percent, 150);
         assert_eq!(lookup("zai", "glm-4.7-flashx").unwrap().markup_percent, 200);
+        assert_eq!(lookup("moonshot", "kimi-k3").unwrap().markup_percent, 150);
         assert_eq!(
             lookup("deepseek", "deepseek-v4-pro")
                 .unwrap()
@@ -372,6 +383,10 @@ mod tests {
         let flash = lookup("deepseek", "deepseek-v4-flash").unwrap();
         assert_eq!(flash.upstream_in_microcents_per_1m, 140_000);
         assert_eq!(flash.upstream_out_microcents_per_1m, 280_000);
+
+        let kimi = lookup("moonshot", "kimi-k3").unwrap();
+        assert_eq!(kimi.upstream_in_microcents_per_1m, 3_000_000);
+        assert_eq!(kimi.upstream_out_microcents_per_1m, 15_000_000);
     }
 
     #[test]

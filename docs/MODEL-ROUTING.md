@@ -1,6 +1,6 @@
 # Bluey Model Routing
 
-Last updated: 2026-06-30
+Last updated: 2026-07-19
 
 This document is the source-of-truth snapshot for the model/provider routing
 currently implemented in the Bluey codebase. It is intentionally operational:
@@ -13,7 +13,7 @@ Provider model catalogs and prices change frequently. Before every deploy that
 can reach paying users, treat model freshness as a required release gate:
 
 1. Check the official provider docs/dashboards for OpenAI, Anthropic, Gemini,
-   Z.AI, DeepSeek, Deepgram, and the embedding provider in use.
+   Z.AI, DeepSeek, Moonshot/Kimi, Deepgram, and the embedding provider in use.
 2. Confirm each Bluey lane still points at an available, non-deprecated model:
    `instant`, `balanced`, `deep`, `vision`, `embed`, and STT.
 3. Re-check pricing for every routed model and update
@@ -39,6 +39,7 @@ can reach paying users, treat model freshness as a required release gate:
    Gemini: <model ids> / pricing checked
    Z.AI: <model ids> / pricing checked
    DeepSeek: <model ids> / pricing checked
+   Moonshot/Kimi: <model ids> / pricing checked
    Deepgram/STT: <model ids> / pricing checked
    Embeddings: <model ids> / pricing checked
    Live smoke: pass/fail + trace ids
@@ -55,8 +56,10 @@ actual upstream models.
 
 Default routing is `provider_mix`: Bluey keeps a lane-appropriate top tier, then
 rotates the first attempt by request id so one burst does not hammer only Claude,
-OpenAI, Gemini, GLM, or DeepSeek. Missing keys, provider capacity denials, and
-HTTP 429/529 cooldowns still fall through to the next approved route.
+OpenAI, Gemini, GLM, or DeepSeek. Moonshot Kimi K3 is a deliberately late
+deep/vision fallback because it always reasons at maximum effort. Missing keys,
+provider capacity denials, and HTTP 429/529 cooldowns still fall through to the
+next approved route.
 
 | Bluey lane | Default top tier | Primary use |
 | --- | --- | --- |
@@ -74,6 +77,7 @@ configured:
 | Z.AI | `glm-5.2` | `deep` and balanced fallback | OpenAI-compatible flagship route; deep lane sends thinking enabled |
 | DeepSeek | `deepseek-v4-pro` | `deep` | OpenAI-compatible endpoint; deep lane sends thinking enabled |
 | DeepSeek | `deepseek-v4-flash` | `instant`, `balanced`, `deep` fallback | OpenAI-compatible endpoint; instant/balanced send thinking disabled |
+| Moonshot | `kimi-k3` | `deep`, `vision` fallback | Dedicated Chat Completions adapter; always sends `reasoning_effort=max`, omits incompatible temperature/thinking fields, and never exposes streamed `reasoning_content` |
 
 ## AnswerPlan Pre-Routing
 
@@ -101,8 +105,8 @@ When AnswerPlan is enabled, it may promote `balanced` Auto traffic to `instant`,
 rolled back with `BLUEY_ANSWER_PLAN_ROUTING=0`, managed requests keep the lane
 selected by the client.
 Provider selection remains separate: `provider_mix`, `quality_first`, or
-`cost_optimized` still decides which approved Claude/OpenAI/Gemini/GLM/DeepSeek
-candidate handles the chosen lane.
+`cost_optimized` still decides which approved Claude/OpenAI/Gemini/GLM/DeepSeek/
+Kimi candidate handles the chosen lane.
 
 ### AI Fallback Classifier
 
@@ -189,6 +193,13 @@ Provider mapping today:
   Completions shape. Bluey sends `thinking: {"type":"disabled"}` on non-deep
   lanes and enables provider reasoning on deep lanes without exposing reasoning
   text in the overlay.
+- Moonshot `kimi-k3` uses its dedicated OpenAI-compatible Chat Completions
+  contract. K3 is always-thinking, so Bluey sends `reasoning_effort: "max"`,
+  omits `temperature` and the K2.x `thinking` object, treats private
+  `reasoning_content` only as bounded preflight liveness, and returns only final
+  content. Private activity never commits a route before visible output, and
+  Kimi requests/reservations keep at least 4,096 reasoning tokens plus 1,024
+  visible-answer tokens available even on the otherwise non-thinking vision lane.
 
 This gives us the operational knob the user asked for without making every
 easy question slower or more expensive.
@@ -209,8 +220,8 @@ harder work.
 | --- | --- | --- |
 | `instant` | OpenAI `gpt-5.4-mini` / DeepSeek `deepseek-v4-flash` / Gemini `gemini-3.1-flash-lite` / Anthropic `claude-haiku-4-5-20251001` / Z.AI `glm-4.7-flashx` | Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
 | `balanced` | Anthropic `claude-sonnet-4-6` / DeepSeek `deepseek-v4-flash` / Gemini `gemini-3.5-flash` / OpenAI `gpt-5.4-mini` / Z.AI `glm-4.7-flashx` | Anthropic `claude-haiku-4-5-20251001` -> OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Z.AI `glm-5.2` |
-| `deep` | Anthropic `claude-opus-4-8` / Z.AI `glm-5.2` / DeepSeek `deepseek-v4-pro` / Gemini `gemini-3.1-pro-preview` / OpenAI `gpt-5.5` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` |
-| `vision` | Gemini `gemini-3.5-flash` / OpenAI `gpt-5.5` | Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.4-mini` |
+| `deep` | Anthropic `claude-opus-4-8` / Z.AI `glm-5.2` / DeepSeek `deepseek-v4-pro` / Gemini `gemini-3.1-pro-preview` / OpenAI `gpt-5.5` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` -> Moonshot `kimi-k3` |
+| `vision` | Gemini `gemini-3.5-flash` / OpenAI `gpt-5.5` | Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.4-mini` -> Moonshot `kimi-k3` |
 
 Optional `quality_first` candidate order:
 
@@ -221,8 +232,8 @@ static first-provider order.
 | --- | --- |
 | `instant` | OpenAI `gpt-5.4-mini` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
 | `balanced` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Z.AI `glm-5.2` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` |
-| `deep` | Anthropic `claude-opus-4-8` -> Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` |
-| `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` |
+| `deep` | Anthropic `claude-opus-4-8` -> Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` -> Moonshot `kimi-k3` |
+| `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` -> Moonshot `kimi-k3` |
 
 Optional `cost_optimized` candidate order:
 
@@ -235,8 +246,8 @@ image support.
 | --- | --- |
 | `instant` | DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> Z.AI `glm-4.7-flashx` -> OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
 | `balanced` | Z.AI `glm-4.7-flashx` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-4-5-20251001` -> Anthropic `claude-sonnet-4-6` -> Z.AI `glm-5.2` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` |
-| `deep` | Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Anthropic `claude-opus-4-8` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` |
-| `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` |
+| `deep` | Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Anthropic `claude-opus-4-8` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` -> Moonshot `kimi-k3` |
+| `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` -> Moonshot `kimi-k3` |
 
 Every managed LLM candidate above has a matching entry in
 `server/src/pricing/mod.rs`; the dispatcher unit tests assert this so an
@@ -272,8 +283,8 @@ Bluey protects realtime work at three layers:
    punishing legitimate customers behind the same office/VPN/NAT; operators can
    enable them during an incident with `BLUEY_LIMIT_ROUTER_*`.
 2. **Provider/model buckets**: keeps OpenAI, Anthropic, Gemini, Z.AI, DeepSeek,
-   Deepgram, and embedding calls inside configured capacity and lets LLM lanes
-   fall back before failing.
+   Moonshot, Deepgram, and embedding calls inside configured capacity and lets
+   LLM lanes fall back before failing.
 3. **Provider/model/key health ledger**: if an upstream key returns a capacity
    response such as HTTP 429, Bluey cools down that exact provider/model/key for
    `Retry-After` and immediately tries the next approved key or route.
@@ -293,6 +304,7 @@ Default server knobs:
 | `BLUEY_LIMIT_PROVIDER_GEMINI_LLM_PER_MIN` | 600/min, burst 120 | Gemini text/vision capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPSEEK_LLM_PER_MIN` | 600/min, burst 120 | DeepSeek text capacity |
 | `BLUEY_LIMIT_PROVIDER_ZAI_LLM_PER_MIN` | 300/min, burst 60 | Z.AI GLM text capacity |
+| `BLUEY_LIMIT_PROVIDER_MOONSHOT_LLM_PER_MIN` | 120/min, burst 30 | Moonshot Kimi K3 deep/vision fallback capacity |
 | `BLUEY_ANSWER_PLAN_ROUTING` | enabled | Set to `0` only for rollback; default server AnswerPlan promotes Auto requests to instant/deep/vision/research-aware behavior before provider routing |
 | `BLUEY_ANSWER_PLAN_AI_FALLBACK` | disabled | Set to `1` only to enable the low-confidence/mixed-signal tiny classifier fallback |
 | `BLUEY_ROUTE_POLICY` | `provider_mix` | Default rotates first attempts across configured providers. Set `quality_first` for the older static order or `cost_optimized` to prefer GLM/DeepSeek first for managed text lanes |
@@ -311,10 +323,12 @@ Each capacity env var also supports a `_BURST` suffix, for example
 
 Provider keys can be supplied either as single-key env vars (`OPENAI_API_KEY`,
 `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `DEEPSEEK_API_KEY`,
-`ZAI_API_KEY`, `ZHIPU_API_KEY`, `DEEPGRAM_API_KEY`) or
+`ZAI_API_KEY`, `ZHIPU_API_KEY`, `MOONSHOT_API_KEY`, `KIMI_API_KEY`,
+`DEEPGRAM_API_KEY`) or
 as comma-separated, provider-approved key pools (`OPENAI_API_KEYS`,
 `ANTHROPIC_API_KEYS`, `GEMINI_API_KEYS`, `GOOGLE_API_KEYS`,
-`DEEPSEEK_API_KEYS`, `ZAI_API_KEYS`, `ZHIPU_API_KEYS`, `DEEPGRAM_API_KEYS`).
+`DEEPSEEK_API_KEYS`, `ZAI_API_KEYS`, `ZHIPU_API_KEYS`, `MOONSHOT_API_KEYS`,
+`KIMI_API_KEYS`, `DEEPGRAM_API_KEYS`).
 Bluey shards requests across the pool. This is for approved capacity across
 projects, regions, or enterprise allocations; do not use it for provider-limit
 evasion.
@@ -579,6 +593,12 @@ BLUEY_JWT_SECRET=...
 BLUEY_PUBLIC_URL=https://bluey.sh
 ```
 
+Optional Moonshot Kimi K3 fallback (server only):
+
+```bash
+MOONSHOT_API_KEYS=...
+```
+
 Billing/live-balance keys:
 
 ```bash
@@ -600,8 +620,8 @@ BLUEY_SMTP_FROM="Bluey <hello@bluey.sh>"
 | Provider/system | Current status |
 | --- | --- |
 | Codex runtime model | Not used by Bluey runtime. Codex is the development/review agent. |
-| Gemini | Not wired in managed routing. Candidate for future cheap vision/classifier fallback. |
 | Groq/Cerebras | Mentioned in older strategy/reference docs, not active in the current managed route map. |
+| Moonshot web-search tool | Not enabled. Kimi K3 is used only for Bluey-supplied chat/vision context; managed public web retrieval remains on Bluey's separately bounded search path. |
 
 ## Recommended Next Hardening
 
@@ -609,5 +629,5 @@ BLUEY_SMTP_FROM="Bluey <hello@bluey.sh>"
    not require a redeploy.
 2. Add latency/cost telemetry by lane so we can tune Auto routing with real
    data.
-3. Add Gemini only after the first managed test pass, as a measured fallback
-   rather than another visible customer option.
+3. Keep Kimi K3 as a late fallback until funded staging canaries establish
+   latency, answer quality, vision reliability, and actual cache-hit economics.

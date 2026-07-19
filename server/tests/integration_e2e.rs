@@ -37,6 +37,7 @@ struct Harness {
     pub pool: DbPool,
     pub openai: MockServer,
     pub anthropic: MockServer,
+    pub moonshot: MockServer,
     pub stripe: MockServer,
     pub square: MockServer,
     pub deepgram: MockServer,
@@ -2263,6 +2264,7 @@ async fn boot_harness() -> Harness {
         gemini_api_key: None,
         deepseek_api_key: None,
         zai_api_key: None,
+        moonshot_api_key: None,
         deepgram_api_key: Some("dg-test".to_string()),
         ollama_base_url: None,
     })
@@ -2296,6 +2298,7 @@ async fn boot_harness_with_config(
 ) -> Harness {
     let openai = MockServer::start().await;
     let anthropic = MockServer::start().await;
+    let moonshot = MockServer::start().await;
     let stripe = MockServer::start().await;
     let square = MockServer::start().await;
     let deepgram = MockServer::start().await;
@@ -2343,6 +2346,7 @@ async fn boot_harness_with_config(
     std::env::set_var("BLUEY_ANSWER_PLAN_ROUTING", "0");
     std::env::set_var("BLUEY_TEST_OPENAI_URL", openai.uri());
     std::env::set_var("BLUEY_TEST_ANTHROPIC_URL", anthropic.uri());
+    std::env::set_var("BLUEY_TEST_MOONSHOT_URL", moonshot.uri());
     std::env::set_var("BLUEY_TEST_STRIPE_URL", stripe.uri());
     std::env::set_var("BLUEY_TEST_SQUARE_URL", square.uri());
     std::env::set_var("BLUEY_TEST_DEEPGRAM_URL", deepgram.uri());
@@ -2357,6 +2361,7 @@ async fn boot_harness_with_config(
         pool,
         openai,
         anthropic,
+        moonshot,
         stripe,
         square,
         deepgram,
@@ -3024,6 +3029,58 @@ async fn router_complete_happy_path_with_mocked_openai() {
 
 #[tokio::test]
 #[serial]
+async fn router_complete_uses_kimi_k3_when_moonshot_is_the_available_deep_provider() {
+    let h = boot_harness_with_upstream(UpstreamKeys {
+        moonshot_api_key: Some("sk-test-moonshot".to_string()),
+        ..UpstreamKeys::default()
+    })
+    .await;
+    let access = signup_and_login(&h, "kimi-deep@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer sk-test-moonshot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"content": "Kimi deep answer"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 21, "completion_tokens": 8}
+        })))
+        .expect(1)
+        .mount(&h.moonshot)
+        .await;
+
+    let req = Request::post("/router/complete")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "kimi-deep-1",
+                "system": "answer from verified evidence",
+                "user": "analyze this architecture",
+                "lane": "deep",
+                "max_tokens": 1024,
+                "temperature": 0.2
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["text"], "Kimi deep answer");
+    assert_eq!(value["provider"], "moonshot");
+    assert_eq!(value["model"], "kimi-k3");
+    assert_eq!(value["input_tokens"], 21);
+    assert_eq!(value["output_tokens"], 8);
+}
+
+#[tokio::test]
+#[serial]
 async fn router_embed_consumes_trial_seconds_and_records_bluey_cost() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "trial-embed@example.com", "longenoughpw").await;
@@ -3137,6 +3194,7 @@ async fn router_complete_upstream_spend_guard_blocks_before_provider_hit() {
             gemini_api_key: None,
             deepseek_api_key: None,
             zai_api_key: None,
+            moonshot_api_key: None,
             deepgram_api_key: Some("dg-test".to_string()),
             ollama_base_url: None,
         },
@@ -3273,6 +3331,63 @@ async fn router_complete_stream_proxies_openai_deltas_then_billing() {
     assert!(body.contains("\"model\":\"gpt-5.4-mini\""));
     assert!(body.contains("\"input_tokens\":12"));
     assert!(body.contains("\"output_tokens\":4"));
+    assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_stream_withholds_kimi_reasoning_and_releases_final_content() {
+    let h = boot_harness_with_upstream(UpstreamKeys {
+        moonshot_api_key: Some("sk-test-moonshot-stream".to_string()),
+        ..UpstreamKeys::default()
+    })
+    .await;
+    let access = signup_and_login(&h, "kimi-stream@example.com", "longenoughpw").await;
+
+    let stream = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private Kimi reasoning\"},\"finish_reason\":null,\"usage\":{\"prompt_tokens\":23,\"completion_tokens\":11}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Kimi final answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer sk-test-moonshot-stream"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(stream),
+        )
+        .expect(1)
+        .mount(&h.moonshot)
+        .await;
+
+    let req = Request::post("/router/complete/stream")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "kimi-stream-1",
+                "system": "answer from verified evidence",
+                "user": "reason carefully",
+                "lane": "deep"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(body.contains("Kimi final answer"));
+    assert!(!body.contains("private Kimi reasoning"));
+    assert!(body.contains("\"provider\":\"moonshot\""));
+    assert!(body.contains("\"model\":\"kimi-k3\""));
+    assert!(body.contains("\"input_tokens\":23"));
+    assert!(body.contains("\"output_tokens\":11"));
+    assert!(body.contains("event: billing"));
     assert!(body.contains("data: [DONE]"));
 }
 
@@ -3780,6 +3895,7 @@ async fn router_complete_retries_next_openai_key_on_429_without_customer_wait() 
         gemini_api_key: None,
         deepseek_api_key: None,
         zai_api_key: None,
+        moonshot_api_key: None,
         deepgram_api_key: Some("dg-test".to_string()),
         ollama_base_url: None,
     };
@@ -3855,6 +3971,7 @@ async fn router_complete_short_waits_account_llm_burst_guard() {
         gemini_api_key: None,
         deepseek_api_key: None,
         zai_api_key: None,
+        moonshot_api_key: None,
         deepgram_api_key: Some("dg-test".to_string()),
         ollama_base_url: None,
     })

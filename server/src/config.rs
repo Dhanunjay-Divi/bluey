@@ -146,6 +146,8 @@ pub struct UpstreamKeys {
     /// Single key or comma-separated, provider-approved key pool.
     pub zai_api_key: Option<String>,
     /// Single key or comma-separated, provider-approved key pool.
+    pub moonshot_api_key: Option<String>,
+    /// Single key or comma-separated, provider-approved key pool.
     pub deepgram_api_key: Option<String>,
     pub ollama_base_url: Option<String>,
 }
@@ -218,6 +220,10 @@ impl UpstreamKeys {
         select_key_from_pool(self.zai_api_key.as_deref(), shard_key)
     }
 
+    pub fn moonshot_key(&self, shard_key: &str) -> Option<&str> {
+        select_key_from_pool(self.moonshot_api_key.as_deref(), shard_key)
+    }
+
     pub fn deepgram_key(&self, shard_key: &str) -> Option<&str> {
         select_key_from_pool(self.deepgram_api_key.as_deref(), shard_key)
     }
@@ -229,6 +235,7 @@ impl UpstreamKeys {
             "gemini" => self.gemini_api_key.as_deref(),
             "deepseek" => self.deepseek_api_key.as_deref(),
             "zai" => self.zai_api_key.as_deref(),
+            "moonshot" => self.moonshot_api_key.as_deref(),
             "deepgram" => self.deepgram_api_key.as_deref(),
             _ => None,
         };
@@ -294,6 +301,12 @@ impl Config {
                 "ZAI_API_KEY",
                 "ZHIPU_API_KEYS",
                 "ZHIPU_API_KEY",
+            ]),
+            moonshot_api_key: env_any(&[
+                "MOONSHOT_API_KEYS",
+                "MOONSHOT_API_KEY",
+                "KIMI_API_KEYS",
+                "KIMI_API_KEY",
             ]),
             deepgram_api_key: env_any(&["DEEPGRAM_API_KEYS", "DEEPGRAM_API_KEY"]),
             ollama_base_url: std::env::var("OLLAMA_BASE_URL")
@@ -769,12 +782,15 @@ mod tests {
         let keys = UpstreamKeys {
             deepseek_api_key: Some("ds-a,ds-b".into()),
             zai_api_key: Some("zai-a,zai-b".into()),
+            moonshot_api_key: Some("ms-a,ms-b".into()),
             ..Default::default()
         };
         assert!(["ds-a", "ds-b"].contains(&keys.deepseek_key("chat").unwrap()));
         assert!(["zai-a", "zai-b"].contains(&keys.zai_key("chat").unwrap()));
+        assert!(["ms-a", "ms-b"].contains(&keys.moonshot_key("chat").unwrap()));
         assert_eq!(keys.key_candidates("deepseek", "chat").len(), 2);
         assert_eq!(keys.key_candidates("zai", "chat").len(), 2);
+        assert_eq!(keys.key_candidates("moonshot", "chat").len(), 2);
     }
 
     #[test]

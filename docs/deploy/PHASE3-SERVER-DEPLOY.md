@@ -116,6 +116,7 @@ Use the current contract in `ops/bluey-api.env.example`. Important names:
 - `BLUEY_JWT_SECRET=<openssl rand -hex 32>`
 - `OPENAI_API_KEYS`, `ANTHROPIC_API_KEYS`, `GEMINI_API_KEYS`,
   `DEEPGRAM_API_KEYS`
+- optional `MOONSHOT_API_KEYS` for the Kimi K3 deep/vision fallback
 - `BLUEY_ANSWER_PLAN_ROUTING=1` is explicit in the env example, but the server
   is default-on; set `0` only for temporary rollback.
 - `BLUEY_ROUTE_POLICY=provider_mix` is the safe default. For owner-controlled

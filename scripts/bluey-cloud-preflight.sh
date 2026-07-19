@@ -321,6 +321,15 @@ for provider in OPENAI_API_KEYS ANTHROPIC_API_KEYS GEMINI_API_KEYS DEEPGRAM_API_
   fi
 done
 
+moonshot_keys="${MOONSHOT_API_KEYS:-${MOONSHOT_API_KEY:-${KIMI_API_KEYS:-${KIMI_API_KEY:-}}}}"
+if [ -n "$moonshot_keys" ] && ! is_placeholder "$moonshot_keys"; then
+  ok "Moonshot Kimi K3 key pool set ($(key_count "$moonshot_keys") key(s))"
+elif [ -n "$moonshot_keys" ]; then
+  fail "Moonshot/Kimi key pool still has a placeholder value"
+else
+  warn "MOONSHOT_API_KEYS/MOONSHOT_API_KEY is missing; optional Kimi K3 fallback routes will be skipped"
+fi
+
 if [ -n "${BLUEY_ANSWER_PLAN_ROUTING:-}" ] && falsey_env "$BLUEY_ANSWER_PLAN_ROUTING"; then
   warn "BLUEY_ANSWER_PLAN_ROUTING is disabled; managed Auto will not promote coding/research/behavioral lanes before provider routing"
 elif [ -n "${BLUEY_ANSWER_PLAN_ROUTING:-}" ] && ! truthy_env "$BLUEY_ANSWER_PLAN_ROUTING"; then

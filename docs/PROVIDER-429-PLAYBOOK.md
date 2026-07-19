@@ -120,7 +120,8 @@ In priority order:
 
 | Env | Purpose | Default |
 |---|---|---|
-| `OPENAI_API_KEYS` / `ANTHROPIC_API_KEYS` / `GEMINI_API_KEYS` / `GOOGLE_API_KEYS` / `DEEPGRAM_API_KEYS` | comma-separated key pools (fall back to singular `*_API_KEY`) | - |
+| `OPENAI_API_KEYS` / `ANTHROPIC_API_KEYS` / `GEMINI_API_KEYS` / `GOOGLE_API_KEYS` / `DEEPSEEK_API_KEYS` / `ZAI_API_KEYS` / `MOONSHOT_API_KEYS` / `KIMI_API_KEYS` / `DEEPGRAM_API_KEYS` | comma-separated key pools (fall back to singular `*_API_KEY`) | - |
+| `BLUEY_LIMIT_PROVIDER_MOONSHOT_LLM_PER_MIN` | isolated Moonshot Kimi K3 provider bucket; `_BURST` sets burst capacity | 120/min, burst 30 |
 | `BLUEY_PROVIDER_429_COOLDOWN_SECS` | cooldown when no Retry-After header | 30 |
 | `BLUEY_PROVIDER_MAX_COOLDOWN_SECS` | maximum key cooldown after any upstream Retry-After | 300 |
 | `BLUEY_MAX_OUTPUT_TOKENS` | non-thinking output ceiling (TPM/cost) | 2048 |
