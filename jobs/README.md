@@ -70,8 +70,11 @@ internal pricing and margin model.
 - Local and cloud runners consume the same adapter contract.
 - Public Workday, Greenhouse, Lever, Ashby, and SmartRecruiters connectors share
   host-pinned, retry-bounded normalization. The scheduled, server-leased worker
-  accepts only server-provisioned official identifiers for those five ATS
-  families; unknown sites remain review-only browser imports until certified.
+  accepts only official identifiers for those five ATS families. An account can
+  receive a source from an administrator or from one of its own verified public
+  ATS imports; enrollment preserves the original Career Track and never turns
+  manual, LinkedIn, Indeed, ZipRecruiter, Dice, unknown, or private links into
+  scheduled discovery.
 - Form planning uses confirmed facts and company/track/account answer memory;
   unknown required questions become interventions.
 - Company Answer Memory overrides Career Track memory, which overrides account
