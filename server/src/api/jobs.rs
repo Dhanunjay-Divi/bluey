@@ -42,6 +42,7 @@ const MAX_RECEIPT_DOCUMENTS: usize = 8;
 const MAX_RECEIPT_SCREENSHOTS: usize = 4;
 const MAX_RECEIPT_EVIDENCE_OBJECTS: usize = 12;
 const MAX_RECEIPT_EVIDENCE_BYTES: usize = 40 * 1024 * 1024;
+const MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS: usize = 250;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -290,6 +291,22 @@ pub async fn workspace(
 ) -> Result<Json<JobsWorkspace>, ApiError> {
     let mut workspace =
         jobs::workspace(&state.pool, &account.id, &account.email).map_err(internal)?;
+    if backfill_verified_import_discovery_sources(&state.pool, &account.id, &workspace.matches) > 0
+    {
+        match jobs::list_discovery_sources(&state.pool, &account.id) {
+            Ok(sources) => {
+                workspace.discovery_sources = sources
+                    .iter()
+                    .map(jobs::DiscoverySourceSummary::from)
+                    .collect();
+            }
+            Err(_error) => tracing::warn!(
+                account_fingerprint = %discovery_log_fingerprint(&account.id),
+                error_category = "source_summary_refresh_failed",
+                "Jobs workspace completed without refreshed discovery source summaries"
+            ),
+        }
+    }
     apply_jobs_distribution_gates(
         &mut workspace.entitlement,
         jobs_local_browser_distribution_enabled(),
@@ -471,10 +488,21 @@ pub async fn delete_track(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(track_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if jobs::delete_track(&state.pool, &account.id, &track_id).map_err(internal)? {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err((StatusCode::NOT_FOUND, "Career Track not found.".to_string()))
+    match jobs::delete_track(&state.pool, &account.id, &track_id) {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err((StatusCode::NOT_FOUND, "Career Track not found.".to_string())),
+        Err(error)
+            if error
+                .to_string()
+                .contains("still has Jobs matches or discovery sources") =>
+        {
+            Err((
+                StatusCode::CONFLICT,
+                "Career Track cannot be deleted while it has Jobs matches or discovery sources."
+                    .to_string(),
+            ))
+        }
+        Err(error) => Err(internal(error)),
     }
 }
 
@@ -527,8 +555,11 @@ pub async fn match_detail(
 pub async fn save_match(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-    Json(input): Json<UserJobInput>,
+    Json(mut input): Json<UserJobInput>,
 ) -> Result<Json<JobPosting>, ApiError> {
+    // Track ownership is a server-side authority check. Trim once so the
+    // persisted match and its discovery source cannot disagree about a track.
+    input.track_id = input.track_id.trim().to_string();
     let imported = if input.canonical_url.trim().is_empty() {
         None
     } else {
@@ -544,19 +575,87 @@ pub async fn save_match(
     let verified_import = imported.is_some();
     let posting = posting_from_user_input(input, imported);
     validate_posting(&posting)?;
+    validate_match_track(&state.pool, &account.id, &posting.track_id)?;
+    let discovery_source = if verified_import {
+        let source = jobs::discovery_source_input_from_verified_import(
+            &posting.source,
+            &posting.canonical_url,
+            &posting.company,
+            &posting.track_id,
+        )
+        .map_err(discovery_source_validation_error)?;
+        if let Some(source) = source.as_ref() {
+            jobs::validate_discovery_source_input(&state.pool, &account.id, source)
+                .map_err(discovery_source_validation_error)?;
+        }
+        source
+    } else {
+        None
+    };
     let profile = jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?;
     let preferences = jobs::get_preferences(&state.pool, &account.id).map_err(internal)?;
-    let saved = jobs::upsert_posting(&state.pool, &account.id, &posting, &profile, &preferences)
-        .map_err(internal)?;
-    if verified_import {
-        try_enroll_verified_import_discovery_source(&state.pool, &account.id, &saved);
-    }
+    // The verified posting and its automatic board are one transaction. A
+    // source conflict/failure rolls the posting back, and a posting failure
+    // rolls the source back, so no invisible unscheduled state is created.
+    let saved = match discovery_source.as_ref() {
+        Some(source) => jobs::save_verified_import_posting_with_source(
+            &state.pool,
+            &account.id,
+            &posting,
+            source,
+            &profile,
+            &preferences,
+        )
+        .map_err(discovery_source_validation_error)?,
+        None => jobs::upsert_posting(&state.pool, &account.id, &posting, &profile, &preferences)
+            .map_err(internal)?,
+    };
     Ok(Json(saved))
+}
+
+fn validate_match_track(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    track_id: &str,
+) -> Result<(), ApiError> {
+    if track_id.is_empty() {
+        return Ok(());
+    }
+    if jobs::list_tracks(pool, account_id)
+        .map_err(internal)?
+        .iter()
+        .any(|track| track.id == track_id)
+    {
+        Ok(())
+    } else {
+        bad_request("Career Track was not found.")
+    }
+}
+
+fn discovery_source_validation_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.contains("discovery")
+        || message.contains("Workday")
+        || message.contains("verified job import")
+        || message.contains("job is already bound")
+    {
+        (
+            if message.contains("already bound") || message.contains("source limit") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            message,
+        )
+    } else {
+        internal(error)
+    }
 }
 
 // Discovery enrollment is a retryable convenience after the verified match is
 // durable. A discovery DB outage must not turn a successfully saved import into
 // a false API failure; replaying the same import retries the idempotent upsert.
+#[cfg(test)]
 fn try_enroll_verified_import_discovery_source(
     pool: &crate::db::DbPool,
     account_id: &str,
@@ -566,10 +665,10 @@ fn try_enroll_verified_import_discovery_source(
         Ok(()) => true,
         Err(error) => {
             tracing::warn!(
-                account_id,
-                source = %posting.source,
-                canonical_url = %posting.canonical_url,
-                error = %error,
+                account_fingerprint = %discovery_log_fingerprint(account_id),
+                provider = discovery_provider_label(&posting.source),
+                source_fingerprint = %discovery_log_fingerprint(&format!("{}\0{}", posting.source, posting.canonical_url)),
+                error_category = discovery_enrollment_error_category(&error),
                 "verified Jobs import was saved without scheduled discovery enrollment"
             );
             false
@@ -577,6 +676,7 @@ fn try_enroll_verified_import_discovery_source(
     }
 }
 
+#[cfg(test)]
 fn enroll_verified_import_discovery_source(
     pool: &crate::db::DbPool,
     account_id: &str,
@@ -593,6 +693,160 @@ fn enroll_verified_import_discovery_source(
     };
     jobs::upsert_discovery_source(pool, account_id, &source)?;
     Ok(())
+}
+
+fn backfill_verified_import_discovery_sources(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    postings: &[JobPosting],
+) -> usize {
+    let tracks = match jobs::list_tracks(pool, account_id) {
+        Ok(tracks) => tracks,
+        Err(error) => {
+            tracing::warn!(
+                account_fingerprint = %discovery_log_fingerprint(account_id),
+                error_category = discovery_enrollment_error_category(&error),
+                "Jobs workspace skipped discovery source backfill because Career Tracks could not be read"
+            );
+            return 0;
+        }
+    };
+    let valid_track_ids = tracks
+        .into_iter()
+        .map(|track| track.id)
+        .collect::<BTreeSet<_>>();
+    let existing_sources = match jobs::list_discovery_sources(pool, account_id) {
+        Ok(sources) => sources,
+        Err(error) => {
+            tracing::warn!(
+                account_fingerprint = %discovery_log_fingerprint(account_id),
+                error_category = discovery_enrollment_error_category(&error),
+                "Jobs workspace skipped discovery source backfill because sources could not be read"
+            );
+            return 0;
+        }
+    };
+    let mut known_bindings = existing_sources
+        .iter()
+        .map(|source| {
+            (
+                source.provider.clone(),
+                source.source_key.clone(),
+                source.track_id.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut source_counts_by_track = BTreeMap::<String, usize>::new();
+    for source in &existing_sources {
+        *source_counts_by_track
+            .entry(source.track_id.clone())
+            .or_default() += 1;
+    }
+    let mut candidates = postings
+        .iter()
+        .filter(|posting| {
+            posting.last_verified_at_ms.is_some() && posting.source.ends_with("_import")
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        (&left.source, &left.canonical_url, &left.track_id).cmp(&(
+            &right.source,
+            &right.canonical_url,
+            &right.track_id,
+        ))
+    });
+    let mut enrolled = 0;
+
+    for posting in candidates
+        .into_iter()
+        .take(MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS)
+    {
+        let source = match jobs::discovery_source_input_from_verified_import(
+            &posting.source,
+            &posting.canonical_url,
+            &posting.company,
+            &posting.track_id,
+        ) {
+            Ok(Some(source)) => source,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    account_fingerprint = %discovery_log_fingerprint(account_id),
+                    provider = discovery_provider_label(&posting.source),
+                    source_fingerprint = %discovery_log_fingerprint(&format!("{}\0{}", posting.source, posting.canonical_url)),
+                    error_category = discovery_enrollment_error_category(&error),
+                    "Jobs workspace skipped an invalid verified-import discovery source backfill"
+                );
+                continue;
+            }
+        };
+        if !source.track_id.is_empty() && !valid_track_ids.contains(&source.track_id) {
+            continue;
+        }
+        let binding = (
+            source.provider.clone(),
+            source.source_key.clone(),
+            source.track_id.clone(),
+        );
+        if known_bindings.contains(&binding) {
+            continue;
+        }
+        if existing_sources.len() + enrolled >= jobs::DISCOVERY_MAX_SOURCES_PER_ACCOUNT
+            || source_counts_by_track
+                .get(&source.track_id)
+                .copied()
+                .unwrap_or_default()
+                >= jobs::DISCOVERY_MAX_SOURCES_PER_TRACK
+        {
+            continue;
+        }
+        match jobs::upsert_discovery_source(pool, account_id, &source) {
+            Ok(_) => {
+                known_bindings.insert(binding);
+                *source_counts_by_track
+                    .entry(source.track_id.clone())
+                    .or_default() += 1;
+                enrolled += 1;
+            }
+            Err(error) => tracing::warn!(
+                account_fingerprint = %discovery_log_fingerprint(account_id),
+                provider = discovery_provider_label(&posting.source),
+                source_fingerprint = %discovery_log_fingerprint(&format!("{}\0{}", posting.source, posting.canonical_url)),
+                error_category = discovery_enrollment_error_category(&error),
+                "Jobs workspace could not backfill a verified-import discovery source"
+            ),
+        }
+    }
+
+    enrolled
+}
+
+fn discovery_log_fingerprint(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))[..16].to_string()
+}
+
+fn discovery_provider_label(source: &str) -> &'static str {
+    match source {
+        "greenhouse_import" => "greenhouse",
+        "lever_import" => "lever",
+        "ashby_import" => "ashby",
+        "smartrecruiters_import" => "smartrecruiters",
+        "workday_import" => "workday",
+        _ => "unknown",
+    }
+}
+
+fn discovery_enrollment_error_category(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("Career Track") {
+        "invalid_track"
+    } else if message.contains("configured provider") || message.contains("configured source") {
+        "invalid_source"
+    } else if message.contains("unsupported") || message.contains("public HTTPS") {
+        "invalid_import"
+    } else {
+        "storage_failure"
+    }
 }
 
 fn posting_from_user_input(
@@ -4630,6 +4884,21 @@ mod tests {
         }
     }
 
+    fn store_discovery_posting(
+        pool: &crate::db::DbPool,
+        account_id: &str,
+        posting: &JobPosting,
+    ) -> JobPosting {
+        jobs::upsert_posting(
+            pool,
+            account_id,
+            posting,
+            &CareerProfile::default(),
+            &JobPreferences::default(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn client_supplied_track_id_cannot_bypass_plan_limit() {
         let current = vec![test_track("existing-track")];
@@ -4674,12 +4943,16 @@ mod tests {
             "https://jobs.ashbyhq.com/acme/job-123",
             "track-two",
         );
-        enroll_verified_import_discovery_source(&pool, "acct-one", &second_track).unwrap();
+        let conflict =
+            enroll_verified_import_discovery_source(&pool, "acct-one", &second_track).unwrap_err();
+        assert!(conflict
+            .to_string()
+            .contains("already bound to another Career Track"));
         assert_eq!(
             jobs::list_discovery_sources(&pool, "acct-one")
                 .unwrap()
                 .len(),
-            2
+            1
         );
 
         assert!(!try_enroll_verified_import_discovery_source(
@@ -4720,8 +4993,150 @@ mod tests {
             jobs::list_discovery_sources(&pool, "acct-one")
                 .unwrap()
                 .len(),
-            2
+            1
         );
+    }
+
+    #[test]
+    fn workspace_backfills_a_legacy_verified_import_once() {
+        let pool = discovery_enrollment_test_pool();
+        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        store_discovery_posting(
+            &pool,
+            "acct-one",
+            &imported_discovery_posting(
+                "workday_import",
+                "https://workday.wd5.myworkdayjobs.com/en-US/Workday/job/Ireland-Dublin/Senior-Software-Engineer_JR-0107796",
+                "track-one",
+            ),
+        );
+        let postings = jobs::list_postings(&pool, "acct-one").unwrap();
+
+        assert_eq!(
+            backfill_verified_import_discovery_sources(&pool, "acct-one", &postings),
+            1
+        );
+        assert_eq!(
+            backfill_verified_import_discovery_sources(&pool, "acct-one", &postings),
+            0
+        );
+        let sources = jobs::list_discovery_sources(&pool, "acct-one").unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].provider, "workday");
+        assert_eq!(sources[0].source_key, "workday~wd5~Workday");
+        assert_eq!(sources[0].track_id, "track-one");
+    }
+
+    #[test]
+    fn workspace_backfill_filters_before_its_bounded_scan() {
+        let pool = discovery_enrollment_test_pool();
+        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        let mut postings = (0..MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS)
+            .map(|index| {
+                imported_discovery_posting(
+                    "pasted_link",
+                    &format!("https://example.invalid/manual-{index}"),
+                    "track-one",
+                )
+            })
+            .collect::<Vec<_>>();
+        postings.push(imported_discovery_posting(
+            "lever_import",
+            "https://jobs.lever.co/acme/job-123",
+            "track-one",
+        ));
+        assert_eq!(
+            backfill_verified_import_discovery_sources(&pool, "acct-one", &postings),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_backfill_skips_manual_restricted_unverified_and_invalid_imports() {
+        let pool = discovery_enrollment_test_pool();
+        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        let postings = [
+            imported_discovery_posting(
+                "pasted_link",
+                "https://jobs.ashbyhq.com/acme/manual-job",
+                "track-one",
+            ),
+            imported_discovery_posting(
+                "linkedin_import",
+                "https://www.linkedin.com/jobs/view/123",
+                "track-one",
+            ),
+            imported_discovery_posting(
+                "greenhouse_import",
+                "https://jobs.ashbyhq.com/acme/forged-source",
+                "track-one",
+            ),
+            imported_discovery_posting(
+                "ashby_import",
+                "https://jobs.ashbyhq.com/acme/unverified-job",
+                "track-one",
+            ),
+            imported_discovery_posting(
+                "ashby_import",
+                "https://jobs.ashbyhq.com/acme/missing-track",
+                "missing-track",
+            ),
+        ];
+        for (index, posting) in postings.into_iter().enumerate() {
+            let mut posting = posting;
+            if index == 3 {
+                posting.last_verified_at_ms = None;
+                posting.availability_status = "unknown".to_string();
+            }
+            store_discovery_posting(&pool, "acct-one", &posting);
+        }
+
+        let stored = jobs::list_postings(&pool, "acct-one").unwrap();
+        assert_eq!(
+            backfill_verified_import_discovery_sources(&pool, "acct-one", &stored),
+            0
+        );
+        assert!(jobs::list_discovery_sources(&pool, "acct-one")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn workspace_backfill_is_quota_aware_and_track_validation_precedes_writes() {
+        let pool = discovery_enrollment_test_pool();
+        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        for index in 0..jobs::DISCOVERY_MAX_SOURCES_PER_TRACK {
+            jobs::upsert_discovery_source(
+                &pool,
+                "acct-one",
+                &jobs::DiscoverySourceInput {
+                    track_id: "track-one".to_string(),
+                    provider: "ashby".to_string(),
+                    source_key: format!("existing-board-{index}"),
+                    company: "Acme".to_string(),
+                    run_interval_ms: 0,
+                },
+            )
+            .unwrap();
+        }
+        let legacy = imported_discovery_posting(
+            "ashby_import",
+            "https://jobs.ashbyhq.com/new-board/job-123",
+            "track-one",
+        );
+        assert_eq!(
+            backfill_verified_import_discovery_sources(&pool, "acct-one", &[legacy]),
+            0
+        );
+        assert_eq!(
+            jobs::list_discovery_sources(&pool, "acct-one")
+                .unwrap()
+                .len(),
+            jobs::DISCOVERY_MAX_SOURCES_PER_TRACK
+        );
+        let error = validate_match_track(&pool, "acct-one", "forged-track").unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(jobs::list_postings(&pool, "acct-one").unwrap().is_empty());
     }
 
     fn strict_receipt_fixture() -> (

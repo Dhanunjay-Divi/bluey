@@ -42,6 +42,13 @@ interface RawJob {
   department?: string;
 }
 
+export class IncompletePublicAtsSnapshotError extends Error {
+  constructor(provider: "smartrecruiters" | "workday") {
+    super(`${provider} snapshot reached the bounded pagination cap before completion`);
+    this.name = "IncompletePublicAtsSnapshotError";
+  }
+}
+
 /**
  * Public ATS discovery adapted from career-ops provider patterns. Each request is
  * host-pinned, redirect-free, bounded, and normalized before it reaches Bluey.
@@ -106,13 +113,17 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
       remotePreference: "any",
       excludedCompanies: [],
       sources: [source],
-    });
+    }, true);
     return deduplicateJobs(jobs)
       .filter((job) => job.externalId.length > 0)
       .filter((job) => job.title.length > 0 && job.canonicalUrl.length > 0);
   }
 
-  private async searchSource(source: PublicAtsSource, query: DiscoveryQuery): Promise<NormalizedJob[]> {
+  private async searchSource(
+    source: PublicAtsSource,
+    query: DiscoveryQuery,
+    requireCompleteSnapshot = false,
+  ): Promise<NormalizedJob[]> {
     switch (source.kind) {
       case "greenhouse":
         return this.searchGreenhouse(source);
@@ -121,9 +132,9 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
       case "ashby":
         return this.searchAshby(source);
       case "smartrecruiters":
-        return this.searchSmartRecruiters(source);
+        return this.searchSmartRecruiters(source, requireCompleteSnapshot);
       case "workday":
-        return this.searchWorkday(source, query);
+        return this.searchWorkday(source, query, requireCompleteSnapshot);
     }
   }
 
@@ -208,6 +219,7 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
 
   private async searchSmartRecruiters(
     source: Extract<PublicAtsSource, { kind: "smartrecruiters" }>,
+    requireCompleteSnapshot: boolean,
   ): Promise<NormalizedJob[]> {
     assertIdentifier(source.companyIdentifier, "SmartRecruiters company identifier");
     const host = "api.smartrecruiters.com";
@@ -224,12 +236,10 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
         const item = asRecord(value);
         const location = asRecord(item.location);
         const company = asRecord(item.company);
-        const sourceUrl = asString(item.ref || item.postingUrl);
+        const externalId = asString(item.id);
         jobs.push(normalizeJob("smartrecruiters", {
-          externalId: asString(item.id),
-          canonicalUrl: sourceUrl.startsWith("http")
-            ? sourceUrl
-            : `https://jobs.smartrecruiters.com/${source.companyIdentifier}/${asString(item.id)}`,
+          externalId,
+          canonicalUrl: smartrecruitersCanonicalUrl(source.companyIdentifier, externalId),
           company: source.company || asString(company.name) || humanizeIdentifier(source.companyIdentifier),
           title: asString(item.name),
           location: [location.city, location.region, location.country].map(asOptionalString).filter(Boolean).join(", "),
@@ -241,7 +251,12 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
       }
       offset += content.length;
       const total = asNumber(payload.totalFound);
-      if (content.length < limit || (total !== undefined && offset >= total)) break;
+      const hasMore = total === undefined ? content.length === limit : offset < total;
+      if (!hasMore) break;
+      if (page === this.maxPages - 1) {
+        if (requireCompleteSnapshot) throw new IncompletePublicAtsSnapshotError("smartrecruiters");
+        break;
+      }
     }
     return jobs;
   }
@@ -249,6 +264,7 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
   private async searchWorkday(
     source: Extract<PublicAtsSource, { kind: "workday" }>,
     query: DiscoveryQuery,
+    requireCompleteSnapshot: boolean,
   ): Promise<NormalizedJob[]> {
     assertIdentifier(source.tenant, "Workday tenant");
     assertIdentifier(source.instance, "Workday instance");
@@ -271,7 +287,7 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
         const externalPath = asString(item.externalPath);
         jobs.push(normalizeJob("workday", {
           externalId: asString(item.bulletFields ? asArray(item.bulletFields)[0] : externalPath),
-          canonicalUrl: externalPath.startsWith("http") ? externalPath : `https://${host}${externalPath}`,
+          canonicalUrl: workdayCanonicalUrl(host, locale, source.site, externalPath),
           company: source.company ?? humanizeIdentifier(source.tenant),
           title: asString(item.title),
           location: asString(item.locationsText),
@@ -282,7 +298,12 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
       }
       offset += postings.length;
       const total = asNumber(payload.total);
-      if (postings.length < limit || (total !== undefined && offset >= total)) break;
+      const hasMore = total === undefined ? postings.length === limit : offset < total;
+      if (!hasMore) break;
+      if (page === this.maxPages - 1) {
+        if (requireCompleteSnapshot) throw new IncompletePublicAtsSnapshotError("workday");
+        break;
+      }
     }
     return jobs;
   }
@@ -325,6 +346,41 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
     }
     throw lastError ?? new Error("ATS request failed");
   }
+}
+
+function smartrecruitersCanonicalUrl(companyIdentifier: string, externalId: string): string {
+  if (!SAFE_IDENTIFIER.test(externalId)) return "";
+  return `https://jobs.smartrecruiters.com/${encodeURIComponent(companyIdentifier)}/${encodeURIComponent(externalId)}`;
+}
+
+function workdayCanonicalUrl(host: string, locale: string, site: string, externalPath: string): string {
+  let url: URL;
+  try {
+    url = new URL(externalPath, `https://${host}`);
+  } catch {
+    return "";
+  }
+  if (
+    url.protocol !== "https:"
+    || url.username
+    || url.password
+    || url.port
+    || url.hostname !== host.toLowerCase()
+  ) {
+    return "";
+  }
+
+  if (url.pathname.startsWith("/job/")) {
+    url.pathname = `/${encodeURIComponent(locale)}/${encodeURIComponent(site)}${url.pathname}`;
+  } else {
+    const segments = url.pathname.split("/");
+    const jobIndex = segments.indexOf("job");
+    if (jobIndex < 1 || jobIndex === segments.length - 1 || segments[jobIndex - 1] !== site) {
+      return "";
+    }
+  }
+  url.hash = "";
+  return url.toString();
 }
 
 async function boundedResponseText(response: FetchResponse): Promise<string> {
