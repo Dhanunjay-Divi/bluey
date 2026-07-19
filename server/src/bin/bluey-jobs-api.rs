@@ -20,6 +20,8 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env().context("load Bluey configuration")?;
     db::jobs::validate_data_encryption_config().context("validate Jobs data encryption")?;
+    api::jobs_local_capability::validate_runtime_config()
+        .context("validate Bluey Browser capability configuration")?;
     let port = std::env::var("BLUEY_JOBS_API_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())

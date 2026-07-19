@@ -817,6 +817,12 @@ pub struct LocalRunTicket {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRunAuthorityPhase {
+    Claim,
+    Submit,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LocalRunResumeAction {
     pub run_id: String,
@@ -10508,7 +10514,8 @@ pub fn get_local_run_ticket_by_hash(
     })
 }
 
-pub fn claim_local_run_ticket(
+#[cfg(test)]
+fn claim_local_run_ticket(
     pool: &DbPool,
     run_id: &str,
     ticket_hash: &str,
@@ -10579,6 +10586,397 @@ pub fn claim_local_run_ticket(
             }))
         }
     })
+}
+
+/// Claims a local-browser ticket only while the account, application,
+/// verified application identity, browser profile, and local-run entitlement
+/// still match the exact queued packet. This is the server-side admission
+/// authority; the launch URL alone is not enough.
+pub fn claim_authorized_local_run_ticket(
+    pool: &DbPool,
+    run_id: &str,
+    ticket_hash: &str,
+) -> Result<Option<LocalRunTicket>> {
+    let now = now_ms();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let value = sqlite_local_run_authority(
+                &tx,
+                run_id,
+                ticket_hash,
+                now,
+                LocalRunAuthorityPhase::Claim,
+            )?;
+            let Some(mut value) = value else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            if tx.execute(
+                "UPDATE jobs_local_run_tickets SET status = 'claimed', updated_at_ms = ?3
+                  WHERE id = ?1 AND ticket_hash = ?2 AND status = 'queued'
+                    AND expires_at_ms > ?3",
+                params![run_id, ticket_hash, now],
+            )? != 1
+            {
+                tx.commit()?;
+                return Ok(None);
+            }
+            tx.commit()?;
+            value.status = "claimed".to_string();
+            value.updated_at_ms = now;
+            Ok(Some(value))
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let value = postgres_local_run_authority(
+                &mut tx,
+                run_id,
+                ticket_hash,
+                now,
+                LocalRunAuthorityPhase::Claim,
+            )?;
+            let Some(mut value) = value else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            if tx.execute(
+                "UPDATE jobs_local_run_tickets SET status = 'claimed', updated_at_ms = $3
+                  WHERE id = $1 AND ticket_hash = $2 AND status = 'queued'
+                    AND expires_at_ms > $3",
+                &[&run_id, &ticket_hash, &now],
+            )? != 1
+            {
+                tx.commit()?;
+                return Ok(None);
+            }
+            tx.commit()?;
+            value.status = "claimed".to_string();
+            value.updated_at_ms = now;
+            Ok(Some(value))
+        }
+    })
+}
+
+/// Performs a non-mutating, current-authority check immediately before the
+/// local browser crosses the irreversible employer Submit boundary.
+pub fn local_run_submit_authorized(pool: &DbPool, run_id: &str, ticket_hash: &str) -> Result<bool> {
+    let now = now_ms();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let authorized = sqlite_local_run_authority(
+                &tx,
+                run_id,
+                ticket_hash,
+                now,
+                LocalRunAuthorityPhase::Submit,
+            )?
+            .is_some();
+            tx.commit()?;
+            Ok(authorized)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let authorized = postgres_local_run_authority(
+                &mut tx,
+                run_id,
+                ticket_hash,
+                now,
+                LocalRunAuthorityPhase::Submit,
+            )?
+            .is_some();
+            tx.commit()?;
+            Ok(authorized)
+        }
+    })
+}
+
+fn sqlite_local_run_authority(
+    tx: &rusqlite::Transaction<'_>,
+    run_id: &str,
+    ticket_hash: &str,
+    now: i64,
+    phase: LocalRunAuthorityPhase,
+) -> Result<Option<LocalRunTicket>> {
+    let expected_ticket_status = match phase {
+        LocalRunAuthorityPhase::Claim => "queued",
+        LocalRunAuthorityPhase::Submit => "claimed",
+    };
+    let ticket = tx
+        .query_row(
+            "SELECT id, account_id, application_id, ticket_hash, ticket_secret,
+                    payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+               FROM jobs_local_run_tickets
+              WHERE id = ?1 AND ticket_hash = ?2 AND status = ?3
+                AND expires_at_ms > ?4",
+            params![run_id, ticket_hash, expected_ticket_status, now],
+            local_run_ticket_from_sqlite_row,
+        )
+        .optional()?;
+    let Some(ticket) = ticket else {
+        return Ok(None);
+    };
+    let application_row: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT job_id, application_json, state FROM jobs_applications
+              WHERE account_id = ?1 AND id = ?2",
+            params![ticket.account_id, ticket.application_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((job_id, application_raw, application_state)) = application_row else {
+        return Ok(None);
+    };
+    let application = parse_application_json(
+        application_raw,
+        &ticket.application_id,
+        &job_id,
+        "job application",
+    )?;
+    let identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let session_row: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT session_json, runner, status FROM jobs_browser_sessions
+              WHERE account_id = ?1 AND id = ?2",
+            params![ticket.account_id, run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let identity_row: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT identity_json, verification_status, is_default
+               FROM jobs_application_identities
+              WHERE account_id = ?1 AND id = ?2",
+            params![ticket.account_id, identity_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let local_browser: Option<i64> = tx
+        .query_row(
+            "SELECT local_browser FROM jobs_entitlements WHERE account_id = ?1",
+            params![ticket.account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let canonical_url: Option<String> = tx
+        .query_row(
+            "SELECT canonical_url FROM jobs_postings WHERE account_id = ?1 AND id = ?2",
+            params![ticket.account_id, job_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let (
+        Some((session_raw, session_runner, session_status)),
+        Some((identity_raw, identity_status, is_default)),
+        Some(canonical_url),
+    ) = (session_row, identity_row, canonical_url)
+    else {
+        return Ok(None);
+    };
+    let session: BrowserSession = parse_json(session_raw, "browser session")?;
+    let identity =
+        parse_application_identity_row(identity_raw, identity_status.clone(), is_default != 0)?;
+    Ok(local_run_authority_matches(
+        &ticket,
+        &application,
+        &application_state,
+        &session,
+        &session_runner,
+        &session_status,
+        &identity,
+        &identity_status,
+        local_browser == Some(1),
+        &canonical_url,
+        phase,
+        now,
+    )
+    .then_some(ticket))
+}
+
+fn postgres_local_run_authority(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    ticket_hash: &str,
+    now: i64,
+    phase: LocalRunAuthorityPhase,
+) -> Result<Option<LocalRunTicket>> {
+    let expected_ticket_status = match phase {
+        LocalRunAuthorityPhase::Claim => "queued",
+        LocalRunAuthorityPhase::Submit => "claimed",
+    };
+    let ticket = tx
+        .query_opt(
+            "SELECT id, account_id, application_id, ticket_hash, ticket_secret,
+                    payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+               FROM jobs_local_run_tickets
+              WHERE id = $1 AND ticket_hash = $2 AND status = $3
+                AND expires_at_ms > $4
+              FOR UPDATE",
+            &[&run_id, &ticket_hash, &expected_ticket_status, &now],
+        )?
+        .map(local_run_ticket_from_pg_row)
+        .transpose()?;
+    let Some(ticket) = ticket else {
+        return Ok(None);
+    };
+    let Some(application_row) = tx.query_opt(
+        "SELECT job_id, application_json, state FROM jobs_applications
+          WHERE account_id = $1 AND id = $2",
+        &[&ticket.account_id, &ticket.application_id],
+    )?
+    else {
+        return Ok(None);
+    };
+    let job_id: String = application_row.get(0);
+    let application_raw: String = application_row.get(1);
+    let application_state: String = application_row.get(2);
+    let application = parse_application_json(
+        application_raw,
+        &ticket.application_id,
+        &job_id,
+        "job application",
+    )?;
+    let identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let session_row = tx.query_opt(
+        "SELECT session_json, runner, status FROM jobs_browser_sessions
+          WHERE account_id = $1 AND id = $2",
+        &[&ticket.account_id, &run_id],
+    )?;
+    let identity_row = tx.query_opt(
+        "SELECT identity_json, verification_status, is_default
+           FROM jobs_application_identities
+          WHERE account_id = $1 AND id = $2",
+        &[&ticket.account_id, &identity_id],
+    )?;
+    let local_browser = tx
+        .query_opt(
+            "SELECT local_browser FROM jobs_entitlements WHERE account_id = $1",
+            &[&ticket.account_id],
+        )?
+        .map(|row| row.get::<_, i32>(0) != 0)
+        .unwrap_or(false);
+    let canonical_url = tx
+        .query_opt(
+            "SELECT canonical_url FROM jobs_postings WHERE account_id = $1 AND id = $2",
+            &[&ticket.account_id, &job_id],
+        )?
+        .map(|row| row.get::<_, String>(0));
+    let (Some(session_row), Some(identity_row), Some(canonical_url)) =
+        (session_row, identity_row, canonical_url)
+    else {
+        return Ok(None);
+    };
+    let session_raw: String = session_row.get(0);
+    let session_runner: String = session_row.get(1);
+    let session_status: String = session_row.get(2);
+    let identity_raw: String = identity_row.get(0);
+    let identity_status: String = identity_row.get(1);
+    let is_default = identity_row.get::<_, i32>(2) != 0;
+    let session: BrowserSession = parse_json(session_raw, "browser session")?;
+    let identity =
+        parse_application_identity_row(identity_raw, identity_status.clone(), is_default)?;
+    Ok(local_run_authority_matches(
+        &ticket,
+        &application,
+        &application_state,
+        &session,
+        &session_runner,
+        &session_status,
+        &identity,
+        &identity_status,
+        local_browser,
+        &canonical_url,
+        phase,
+        now,
+    )
+    .then_some(ticket))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_run_authority_matches(
+    ticket: &LocalRunTicket,
+    application: &JobApplication,
+    application_state: &str,
+    session: &BrowserSession,
+    session_runner: &str,
+    session_status: &str,
+    identity: &ApplicationIdentity,
+    identity_status: &str,
+    local_browser: bool,
+    canonical_url: &str,
+    phase: LocalRunAuthorityPhase,
+    now: i64,
+) -> bool {
+    let (expected_ticket_status, expected_application_state, expected_session_status) = match phase
+    {
+        LocalRunAuthorityPhase::Claim => ("queued", "queued", "queued"),
+        LocalRunAuthorityPhase::Submit => ("claimed", "running", "running"),
+    };
+    let frozen_identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let frozen_identity_email = application
+        .receipt
+        .pointer("/application_identity/email")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let expected_browser_profile_id =
+        execution_browser_profile_id(&ticket.account_id, frozen_identity_id);
+    ticket.status == expected_ticket_status
+        && ticket.expires_at_ms > now
+        && local_browser
+        && application.state == application_state
+        && application_state == expected_application_state
+        && application.run_id.as_deref() == Some(ticket.id.as_str())
+        && session.id == ticket.id
+        && session.application_id.as_deref() == Some(ticket.application_id.as_str())
+        && session.runner == session_runner
+        && session_runner == "local"
+        && session.status == session_status
+        && session_status == expected_session_status
+        && identity.verification_status == identity_status
+        && identity_status == "verified"
+        && !frozen_identity_id.is_empty()
+        && identity.id == frozen_identity_id
+        && identity.email == frozen_identity_email
+        && application
+            .receipt
+            .pointer("/application_identity/verified")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && ticket.payload.get("accountId").and_then(Value::as_str)
+            == Some(ticket.account_id.as_str())
+        && ticket.payload.get("applicationId").and_then(Value::as_str)
+            == Some(ticket.application_id.as_str())
+        && ticket.payload.get("runId").and_then(Value::as_str) == Some(ticket.id.as_str())
+        && ticket
+            .payload
+            .get("applicationIdentityId")
+            .and_then(Value::as_str)
+            == Some(frozen_identity_id)
+        && ticket
+            .payload
+            .get("browserProfileId")
+            .and_then(Value::as_str)
+            == Some(expected_browser_profile_id.as_str())
+        && ticket.payload.get("runner").and_then(Value::as_str) == Some("local")
+        && ticket.payload.get("url").and_then(Value::as_str) == Some(canonical_url)
 }
 
 pub fn update_local_run_ticket_status(
@@ -12476,6 +12874,87 @@ mod tests {
             .unwrap();
         let browser_profile_id = execution_browser_profile_id("acct-jobs", identity_id);
         (application, run_id, browser_profile_id)
+    }
+
+    fn local_run_authority_fixture(
+        pool: &DbPool,
+        suffix: &str,
+    ) -> (JobApplication, String, String, String) {
+        let profile = default_profile("jobs@example.com");
+        save_profile(pool, "acct-jobs", &profile).unwrap();
+        set_entitlement_plan(pool, "acct-jobs", "pro").unwrap();
+        let posting = upsert_posting(
+            pool,
+            "acct-jobs",
+            &test_posting(
+                &format!("https://jobs.ashbyhq.com/acme/{suffix}"),
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, _) =
+            prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first").unwrap();
+        let application = update_application(
+            pool,
+            "acct-jobs",
+            &application.id,
+            "queued",
+            Some("review_first"),
+        )
+        .unwrap()
+        .unwrap();
+        let run_id = format!("local-run-{suffix}");
+        upsert_browser_session(
+            pool,
+            "acct-jobs",
+            &BrowserSession {
+                id: run_id.clone(),
+                runner: "local".to_string(),
+                status: "queued".to_string(),
+                current_company: "Acme".to_string(),
+                current_step: "Waiting for Bluey Browser".to_string(),
+                application_id: Some(application.id.clone()),
+                takeover_url: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let application = assign_application_run(pool, "acct-jobs", &application.id, &run_id)
+            .unwrap()
+            .unwrap();
+        let identity_id = application
+            .receipt
+            .pointer("/application_identity/id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let browser_profile_id = execution_browser_profile_id("acct-jobs", &identity_id);
+        let ticket_hash = format!("ticket-hash-{suffix}");
+        save_local_run_ticket(
+            pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &ticket_hash,
+            &format!("ticket-secret-{suffix}"),
+            json!({
+                "accountId": "acct-jobs",
+                "applicationId": application.id,
+                "jobId": posting.id,
+                "applicationIdentityId": identity_id,
+                "browserProfileId": browser_profile_id,
+                "runner": "local",
+                "url": posting.canonical_url,
+                "runId": run_id,
+            }),
+            now_ms() + 60_000,
+        )
+        .unwrap();
+        (application, run_id, ticket_hash, identity_id)
     }
 
     fn discovered_job(external_id: &str, title: &str) -> DiscoveredJobInput {
@@ -16824,6 +17303,113 @@ mod tests {
         assert!(claim_local_run_ticket(&pool, "local-run-1", "ticket-hash")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn local_run_authority_rechecks_entitlement_and_verified_identity_before_submit() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, identity_id) =
+            local_run_authority_fixture(&pool, "live-authority");
+        assert!(
+            claim_authorized_local_run_ticket(&pool, &run_id, &ticket_hash)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            claim_authorized_local_run_ticket(&pool, &run_id, &ticket_hash)
+                .unwrap()
+                .is_none()
+        );
+        update_application(&pool, "acct-jobs", &application.id, "running", None).unwrap();
+        upsert_browser_session(
+            &pool,
+            "acct-jobs",
+            &BrowserSession {
+                id: run_id.clone(),
+                runner: "local".to_string(),
+                status: "running".to_string(),
+                current_company: "Acme".to_string(),
+                current_step: "Ready to submit".to_string(),
+                application_id: Some(application.id.clone()),
+                takeover_url: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        assert!(local_run_submit_authorized(&pool, &run_id, &ticket_hash).unwrap());
+
+        set_entitlement_plan(&pool, "acct-jobs", "free").unwrap();
+        assert!(!local_run_submit_authorized(&pool, &run_id, &ticket_hash).unwrap());
+        set_entitlement_plan(&pool, "acct-jobs", "pro").unwrap();
+        assert!(local_run_submit_authorized(&pool, &run_id, &ticket_hash).unwrap());
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "DELETE FROM jobs_application_identities WHERE account_id = ?1 AND id = ?2",
+                params!["acct-jobs", identity_id],
+            )
+            .unwrap();
+        assert!(!local_run_submit_authorized(&pool, &run_id, &ticket_hash).unwrap());
+    }
+
+    #[test]
+    fn local_run_claim_fails_closed_after_plan_or_identity_revocation() {
+        let downgraded = test_pool();
+        let (_, run_id, ticket_hash, _) = local_run_authority_fixture(&downgraded, "downgraded");
+        set_entitlement_plan(&downgraded, "acct-jobs", "free").unwrap();
+        assert!(
+            claim_authorized_local_run_ticket(&downgraded, &run_id, &ticket_hash)
+                .unwrap()
+                .is_none()
+        );
+
+        let deleted = test_pool();
+        let (_, run_id, ticket_hash, identity_id) =
+            local_run_authority_fixture(&deleted, "identity-deleted");
+        deleted
+            .get()
+            .unwrap()
+            .execute(
+                "DELETE FROM jobs_application_identities WHERE account_id = ?1 AND id = ?2",
+                params!["acct-jobs", identity_id],
+            )
+            .unwrap();
+        assert!(
+            claim_authorized_local_run_ticket(&deleted, &run_id, &ticket_hash)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_authorized_local_claims_have_exactly_one_winner() {
+        let pool = test_pool();
+        let (_, run_id, ticket_hash, _) = local_run_authority_fixture(&pool, "claim-race");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let pool = pool.clone();
+                let run_id = run_id.clone();
+                let ticket_hash = ticket_hash.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_authorized_local_run_ticket(&pool, &run_id, &ticket_hash)
+                        .unwrap()
+                        .is_some()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|won| *won)
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -11,6 +11,22 @@ type HmacSha256 = Hmac<Sha256>;
 const TOKEN_VERSION: u8 = 1;
 const TOKEN_AUDIENCE: &str = "bluey-jobs-local-run";
 
+pub fn validate_runtime_config() -> anyhow::Result<()> {
+    let local_distribution_enabled = cfg!(debug_assertions)
+        || std::env::var("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
+            .unwrap_or(false);
+    if local_distribution_enabled {
+        current_key().map(|_| ())?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalRunCapabilityClaims {
     pub version: u8,
@@ -97,7 +113,7 @@ pub fn verify(
 }
 
 fn validate_operation(operation: &str) -> anyhow::Result<()> {
-    if matches!(operation, "result" | "resume") {
+    if matches!(operation, "result" | "resume" | "submit") {
         Ok(())
     } else {
         anyhow::bail!("invalid local run capability operation")
@@ -154,7 +170,15 @@ mod tests {
         assert_eq!(claims.account_id, "acct");
         assert_eq!(claims.browser_profile_id, "profile");
         assert!(verify(&token, "run", "resume", 1_000).is_err());
+        assert!(verify(&token, "run", "submit", 1_000).is_err());
         assert!(verify(&token, "other-run", "result", 1_000).is_err());
+
+        let submit = issue("acct", "app", "run", "profile", "submit", 2_000).unwrap();
+        assert_eq!(
+            verify(&submit, "run", "submit", 1_000).unwrap().operation,
+            "submit"
+        );
+        assert!(verify(&submit, "run", "result", 1_000).is_err());
         assert!(verify(&token, "run", "result", 2_000).is_err());
 
         let mut tampered = token.into_bytes();

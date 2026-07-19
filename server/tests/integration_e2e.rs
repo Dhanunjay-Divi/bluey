@@ -1762,7 +1762,9 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
 
     const JWT_SECRET: &str = "test-secret-at-least-32-chars-long-xxx";
     let harness = boot_harness().await;
-    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness).await;
+    let (account_id, application_id, run_id, browser_profile_id) =
+        setup_execution_lease_run(&harness).await;
+    jobs::set_entitlement_plan(&harness.pool, &account_id, "pro").unwrap();
     harness
         .pool
         .get()
@@ -1790,6 +1792,17 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
     .unwrap();
     let ticket = "b".repeat(64);
     let ticket_hash = hex::encode(Sha256::digest(ticket.as_bytes()));
+    let application = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    let posting = jobs::get_posting(&harness.pool, &account_id, &application.job_id)
+        .unwrap()
+        .unwrap();
+    let application_identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
     jobs::save_local_run_ticket(
         &harness.pool,
         &account_id,
@@ -1801,7 +1814,11 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
             "runId": run_id,
             "accountId": account_id,
             "applicationId": application_id,
-            "browserProfileId": "profile-local-test"
+            "jobId": application.job_id,
+            "applicationIdentityId": application_identity_id,
+            "browserProfileId": browser_profile_id,
+            "runner": "local",
+            "url": posting.canonical_url
         }),
         chrono::Utc::now().timestamp_millis() + 60_000,
     )
@@ -1833,7 +1850,13 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
         .as_str()
         .unwrap()
         .to_string();
+    let submit_capability = claim["_blueyCapabilities"]["submit"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_ne!(result_capability, resume_capability);
+    assert_ne!(result_capability, submit_capability);
+    assert_ne!(resume_capability, submit_capability);
 
     let swapped_operation = harness
         .router
@@ -1905,6 +1928,21 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
         .await
         .unwrap();
     assert_eq!(unapproved_resume.status(), StatusCode::CONFLICT);
+
+    let unapproved_authority = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/authorize-submit"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "capability": &submit_capability })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unapproved_authority.status(), StatusCode::CONFLICT);
 
     let unapproved_submit = harness
         .router
@@ -2020,6 +2058,37 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
     )
     .unwrap());
 
+    let authorize_submit = || {
+        Request::post(format!("/api/jobs/local-runs/{run_id}/authorize-submit"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "capability": &submit_capability })).unwrap(),
+            ))
+            .unwrap()
+    };
+    let authorized = harness
+        .router
+        .clone()
+        .oneshot(authorize_submit())
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let authorized_body = axum::body::to_bytes(authorized.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let authorized_value: serde_json::Value = serde_json::from_slice(&authorized_body).unwrap();
+    assert_eq!(authorized_value["authorized"], true);
+
+    jobs::set_entitlement_plan(&harness.pool, &account_id, "free").unwrap();
+    let revoked = harness
+        .router
+        .clone()
+        .oneshot(authorize_submit())
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::CONFLICT);
+    jobs::set_entitlement_plan(&harness.pool, &account_id, "pro").unwrap();
+
     let future_expiry = chrono::Utc::now().timestamp_millis() + 60_000;
     harness
         .pool
@@ -2094,7 +2163,9 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
     use sha2::{Digest, Sha256};
 
     let harness = boot_harness().await;
-    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness).await;
+    let (account_id, application_id, run_id, browser_profile_id) =
+        setup_execution_lease_run(&harness).await;
+    jobs::set_entitlement_plan(&harness.pool, &account_id, "pro").unwrap();
     harness
         .pool
         .get()
@@ -2124,6 +2195,17 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
         .unwrap();
     let ticket = "c".repeat(64);
     let ticket_hash = hex::encode(Sha256::digest(ticket.as_bytes()));
+    let application = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    let posting = jobs::get_posting(&harness.pool, &account_id, &application.job_id)
+        .unwrap()
+        .unwrap();
+    let application_identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
     jobs::save_local_run_ticket(
         &harness.pool,
         &account_id,
@@ -2135,7 +2217,11 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
             "runId": run_id,
             "accountId": account_id,
             "applicationId": application_id,
-            "browserProfileId": "profile-local-reconcile"
+            "jobId": application.job_id,
+            "applicationIdentityId": application_identity_id,
+            "browserProfileId": browser_profile_id,
+            "runner": "local",
+            "url": posting.canonical_url
         }),
         chrono::Utc::now().timestamp_millis() + 60_000,
     )

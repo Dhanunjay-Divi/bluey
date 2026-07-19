@@ -204,6 +204,10 @@ pub fn local_runner_router() -> Router<AppState> {
     Router::new()
         .route("/api/jobs/local-runs/:run_id/claim", post(claim_local_run))
         .route(
+            "/api/jobs/local-runs/:run_id/authorize-submit",
+            post(authorize_local_run_submit),
+        )
+        .route(
             "/api/jobs/local-runs/:run_id/resume",
             post(consume_local_run_resume),
         )
@@ -2727,8 +2731,14 @@ async fn claim_local_run(
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunClaimRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    if !jobs_local_browser_distribution_enabled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Browser local runs are currently paused.".to_string(),
+        ));
+    }
     let hash = local_run_ticket_hash(&req.ticket)?;
-    let ticket = jobs::claim_local_run_ticket(&state.pool, &run_id, &hash)
+    let ticket = jobs::claim_authorized_local_run_ticket(&state.pool, &run_id, &hash)
         .map_err(internal)?
         .ok_or((
             StatusCode::NOT_FOUND,
@@ -2796,6 +2806,21 @@ async fn claim_local_run(
             "Bluey Browser could not start securely. Try again.".to_string(),
         )
     })?;
+    let submit_capability = super::jobs_local_capability::issue(
+        &ticket.account_id,
+        &ticket.application_id,
+        &run_id,
+        browser_profile_id,
+        "submit",
+        ticket.expires_at_ms,
+    )
+    .map_err(|error| {
+        tracing::error!(error = %error, "could not issue local submit capability");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Browser could not start securely. Try again.".to_string(),
+        )
+    })?;
     let mut payload = ticket.payload.as_object().cloned().ok_or((
         StatusCode::CONFLICT,
         "This Bluey Browser launch is invalid.".to_string(),
@@ -2805,10 +2830,57 @@ async fn claim_local_run(
         json!({
             "result": result_capability,
             "resume": resume_capability,
+            "submit": submit_capability,
             "expiresAtMs": ticket.expires_at_ms,
         }),
     );
     Ok(Json(Value::Object(payload)))
+}
+
+async fn authorize_local_run_submit(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(req): Json<LocalRunAccessRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !jobs_local_browser_distribution_enabled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Browser local runs are currently paused.".to_string(),
+        ));
+    }
+    let ticket =
+        authorize_local_run_operation(&state, &run_id, &req.capability, &req.ticket, "submit")?;
+    if !jobs::local_run_submit_authorized(&state.pool, &run_id, &ticket.ticket_hash)
+        .map_err(internal)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "This application is no longer authorized to submit. Return to Bluey Jobs to review it."
+                .to_string(),
+        ));
+    }
+    let (application, _) = local_result_binding(&state, &ticket, &run_id)?;
+    let posting = jobs::get_posting(&state.pool, &ticket.account_id, &application.job_id)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
+    if matches!(ats_kind(&posting.canonical_url), "greenhouse" | "lever")
+        && !jobs::local_submission_approval_consumed(
+            &state.pool,
+            &ticket.account_id,
+            &ticket.application_id,
+            &run_id,
+        )
+        .map_err(internal)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Final submission has not been approved for this local run.".to_string(),
+        ));
+    }
+    Ok(Json(json!({
+        "authorized": true,
+        "authorizedAtMs": jobs::now_ms(),
+    })))
 }
 
 async fn consume_local_run_resume(
