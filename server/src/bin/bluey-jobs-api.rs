@@ -41,6 +41,23 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     db::run_migrations(&pool).context("run Jobs migrations")?;
+    let expired_usage_released =
+        db::usage_reservations::reconcile_expired_usage_reservations(&pool)
+            .context("reconcile expired managed usage reservations at startup")?;
+    tracing::info!(
+        expired_usage_released,
+        "startup managed usage reservation reconciliation completed"
+    );
+    let usage_reservation_janitor =
+        db::usage_reservations::spawn_expired_usage_reservation_janitor(pool.clone());
+    let startup_spend_cleanup = db::jobs_provider_cost_holds::prune_expired_spend_truth(&pool)
+        .context("prune expired upstream spend truth at startup")?;
+    tracing::info!(
+        provider_holds_deleted = startup_spend_cleanup.provider_holds_deleted,
+        cutover_baseline_rows_deleted = startup_spend_cleanup.cutover_baseline_rows_deleted,
+        "startup upstream spend truth cleanup completed"
+    );
+    let spend_truth_janitor = db::jobs_provider_cost_holds::spawn_spend_truth_janitor(pool.clone());
 
     let app = api::build_jobs_router(pool, config);
     let addr = SocketAddr::new(host, port);
@@ -56,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .context("serve Bluey Jobs API")?;
+    spend_truth_janitor.abort();
+    usage_reservation_janitor.abort();
     Ok(())
 }
 

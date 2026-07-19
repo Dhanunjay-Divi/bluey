@@ -1446,10 +1446,12 @@ const MIGRATIONS: &[&str] = &[
         model                 TEXT NOT NULL,
         projected_cost_cents  INTEGER NOT NULL,
         settled_cost_cents    INTEGER NOT NULL DEFAULT 0,
+        usage_provenance      TEXT NOT NULL DEFAULT 'missing',
         status                TEXT NOT NULL DEFAULT 'held',
         created_at_ms         INTEGER NOT NULL,
         updated_at_ms         INTEGER NOT NULL,
         CHECK (status IN ('held', 'settled', 'released')),
+        CHECK (usage_provenance IN ('exact', 'estimated', 'missing')),
         CHECK (projected_cost_cents > 0 AND projected_cost_cents <= 100000000),
         CHECK (settled_cost_cents >= 0 AND settled_cost_cents <= 100000000)
     );
@@ -1483,6 +1485,16 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     ensure_column(&conn, "device_codes", "platform", "TEXT")?;
     ensure_column(&conn, "device_codes", "arch", "TEXT")?;
     ensure_column(&conn, "device_codes", "app_version", "TEXT")?;
+    // 0033 - explicit trust provenance for provider-attempt settlement.
+    // SQLite has no broadly supported `ADD COLUMN IF NOT EXISTS`, so use the
+    // same schema-inspection helper as earlier additive migrations. This keeps
+    // startup/replay idempotent for both pre-0033 and already-upgraded files.
+    ensure_column(
+        &conn,
+        "jobs_provider_cost_holds",
+        "usage_provenance",
+        "TEXT NOT NULL DEFAULT 'missing' CHECK (usage_provenance IN ('exact', 'estimated', 'missing'))",
+    )?;
     ensure_column(
         &conn,
         "usage_events",
@@ -1794,6 +1806,8 @@ const POSTGRES_JOBS_RESUME_GENERATIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/007_jobs_resume_generations.sql");
 const POSTGRES_JOBS_GENERATION_ALLOWANCE: &str =
     include_str!("../../../infra/postgres/server-runtime/008_jobs_generation_allowance.sql");
+const POSTGRES_PROVIDER_USAGE_PROVENANCE: &str =
+    include_str!("../../../infra/postgres/server-runtime/010_provider_usage_provenance.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -1817,6 +1831,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "008_jobs_generation_allowance.sql",
         POSTGRES_JOBS_GENERATION_ALLOWANCE,
+    ),
+    (
+        "010_provider_usage_provenance.sql",
+        POSTGRES_PROVIDER_USAGE_PROVENANCE,
     ),
 ];
 
@@ -2168,8 +2186,31 @@ mod sqlite_migration_replay_tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
+            3,
+            "rows outside a short admission window remain for fixed retention"
+        );
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE usage_cutover_spend_baseline
+                    SET occurred_at = datetime('now', '-32 days')",
+                [],
+            )
+            .unwrap();
+        let cleanup = crate::db::jobs_provider_cost_holds::prune_expired_spend_truth(&pool)
+            .expect("fixed-retention cleanup");
+        assert_eq!(cleanup.cutover_baseline_rows_deleted, 3);
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM usage_cutover_spend_baseline",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
             0,
-            "rows older than window plus grace must be deleted"
+            "rows older than the fixed maximum window plus grace are deleted"
         );
     }
 }
@@ -2221,5 +2262,18 @@ mod postgres_migration_tests {
         ));
         assert!(sql.contains("LEAST(GREATEST(cost_cents_to_bluey, 0), 100000000)"));
         assert!(!sql.contains("usage_cutover_spend_baseline (\n  account_id"));
+    }
+
+    #[test]
+    fn provider_usage_provenance_is_a_validated_post_jobs_migration() {
+        let (_, sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == "010_provider_usage_provenance.sql")
+            .expect("provider provenance migration must run before paid routes are served");
+
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS usage_provenance"));
+        assert!(sql.contains("'exact', 'estimated', 'missing'"));
+        assert!(sql.contains("NOT VALID"));
+        assert!(sql.contains("VALIDATE CONSTRAINT jobs_provider_cost_holds_usage_provenance"));
     }
 }

@@ -46,6 +46,8 @@ const DEFAULT_DEEPGRAM_UTTERANCE_END_MS: Option<u32> = None;
 const DEFAULT_DEEPGRAM_LANGUAGE: &str = "en-IN";
 const DEFAULT_DEEPGRAM_NO_DELAY: bool = true;
 const DEFAULT_DEEPGRAM_SMART_FORMAT: bool = false;
+/// 16 kHz, mono, signed 16-bit linear PCM.
+const DEEPGRAM_LINEAR16_BYTES_PER_SECOND: u64 = 32_000;
 const MAX_DEEPGRAM_KEYTERMS: usize = 64;
 const BLUEY_STT_SESSION_HEADER: &str = "x-bluey-stt-session";
 const DEFAULT_DEEPGRAM_KEYTERMS: &[&str] = &[
@@ -100,6 +102,105 @@ const DEFAULT_DEEPGRAM_KEYTERMS: &[&str] = &[
     "monotonic stack",
     "dynamic programming",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PcmFrameAdmissionError {
+    OddLength,
+    SessionAudioLimit,
+    ByteRateLimit,
+}
+
+/// Permit Bluey's eight-read startup preface (8 * 4096 bytes = 1.024 seconds)
+/// plus a small scheduling margin while keeping later PCM close to real time.
+/// The allowance grows only from process-local monotonic elapsed time, so
+/// client clocks and database clocks cannot create extra exposure.
+const RELAY_PCM_JITTER_BURST_MS: u64 = 1_100;
+const RELAY_PCM_JITTER_BURST_BYTES: u64 =
+    DEEPGRAM_LINEAR16_BYTES_PER_SECOND * RELAY_PCM_JITTER_BURST_MS / 1_000;
+
+fn max_relay_pcm_bytes(max_seconds: i64) -> u64 {
+    u64::try_from(max_seconds.max(0))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(DEEPGRAM_LINEAR16_BYTES_PER_SECOND)
+}
+
+fn admit_relay_pcm_frame(
+    forwarded_audio_bytes: u64,
+    frame_bytes: usize,
+    max_seconds: i64,
+    elapsed: Duration,
+) -> Result<u64, PcmFrameAdmissionError> {
+    if !frame_bytes.is_multiple_of(2) {
+        return Err(PcmFrameAdmissionError::OddLength);
+    }
+    let frame_bytes =
+        u64::try_from(frame_bytes).map_err(|_| PcmFrameAdmissionError::SessionAudioLimit)?;
+    let updated = forwarded_audio_bytes
+        .checked_add(frame_bytes)
+        .ok_or(PcmFrameAdmissionError::SessionAudioLimit)?;
+    if updated > max_relay_pcm_bytes(max_seconds) {
+        return Err(PcmFrameAdmissionError::SessionAudioLimit);
+    }
+    let elapsed_bytes = elapsed
+        .as_nanos()
+        .saturating_mul(u128::from(DEEPGRAM_LINEAR16_BYTES_PER_SECOND))
+        / 1_000_000_000_u128;
+    let paced_limit = u64::try_from(elapsed_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(RELAY_PCM_JITTER_BURST_BYTES)
+        .min(max_relay_pcm_bytes(max_seconds));
+    if updated > paced_limit {
+        return Err(PcmFrameAdmissionError::ByteRateLimit);
+    }
+    Ok(updated)
+}
+
+fn verified_relay_provider_seconds(audio_bytes: u64, max_seconds: i64) -> Option<i64> {
+    if !audio_bytes.is_multiple_of(2) || audio_bytes > max_relay_pcm_bytes(max_seconds) {
+        return None;
+    }
+    let seconds = audio_bytes.checked_add(DEEPGRAM_LINEAR16_BYTES_PER_SECOND - 1)?
+        / DEEPGRAM_LINEAR16_BYTES_PER_SECOND;
+    i64::try_from(seconds).ok()
+}
+
+fn relay_provider_usage(
+    audio_bytes: u64,
+    max_seconds: i64,
+    audio_bytes_exact: bool,
+) -> (i64, pricing::UsageProvenance) {
+    if audio_bytes_exact {
+        if let Some(seconds) = verified_relay_provider_seconds(audio_bytes, max_seconds) {
+            return (seconds, pricing::UsageProvenance::Exact);
+        }
+    }
+    (max_seconds.max(0), pricing::UsageProvenance::Missing)
+}
+
+fn relay_customer_billable_elapsed(
+    wall_elapsed: Duration,
+    forwarded_audio_bytes: u64,
+    forwarded_audio_bytes_exact: bool,
+    forwarded_audible_audio_chunks: u64,
+    max_seconds: i64,
+) -> Duration {
+    if forwarded_audible_audio_chunks == 0 {
+        return Duration::ZERO;
+    }
+    let session_cap = Duration::from_secs(u64::try_from(max_seconds.max(0)).unwrap_or(u64::MAX));
+    let wall_elapsed = wall_elapsed.min(session_cap);
+    if !forwarded_audio_bytes_exact {
+        // Provider exposure is conservatively Missing/full-projection after an
+        // ambiguous send, but customer/trial settlement must use only elapsed
+        // time that Bluey can prove instead of charging that full projection.
+        return wall_elapsed;
+    }
+    let pcm_elapsed = verified_relay_provider_seconds(forwarded_audio_bytes, max_seconds)
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::ZERO);
+    wall_elapsed.max(pcm_elapsed).min(session_cap)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SttSessionRequest {
@@ -512,15 +613,15 @@ async fn run_deepgram_relay(
             return Err(error);
         }
     };
+    if let Some((close_reason, error)) = live_stt_admission_denial(&admission) {
+        close_stt_session_without_dispatch(&state, &session, close_reason);
+        anyhow::bail!(error)
+    }
     let mut provider_guard = match admission {
         provider_cost_guard::Admission::Held(guard) => guard,
-        provider_cost_guard::Admission::Unconfigured => {
-            close_stt_session_without_dispatch(&state, &session, "spend_guard_unconfigured");
-            anyhow::bail!("paid STT route unexpectedly had zero projected exposure")
-        }
-        provider_cost_guard::Admission::GlobalLimit => {
-            close_stt_session_without_dispatch(&state, &session, "spend_guard_denied");
-            anyhow::bail!("upstream spend guard denied STT relay dispatch")
+        provider_cost_guard::Admission::Unconfigured
+        | provider_cost_guard::Admission::GlobalLimit => {
+            unreachable!("live STT admission denial returned above")
         }
     };
 
@@ -539,6 +640,7 @@ async fn run_deepgram_relay(
     let deadline = Duration::from_secs(session.max_seconds.max(1) as u64);
     let mut close_reason = "completed".to_string();
     let mut forwarded_audio_bytes = 0_u64;
+    let mut forwarded_audio_bytes_exact = true;
     let mut forwarded_audio_chunks = 0_u64;
     let mut forwarded_audible_audio_chunks = 0_u64;
     let mut first_audible_after_ms: Option<u128> = None;
@@ -555,7 +657,39 @@ async fn run_deepgram_relay(
                 match message? {
                     ClientMessage::Binary(bytes) => {
                         if !bytes.is_empty() {
-                            forwarded_audio_bytes = forwarded_audio_bytes.saturating_add(bytes.len() as u64);
+                            let updated_audio_bytes = match admit_relay_pcm_frame(
+                                forwarded_audio_bytes,
+                                bytes.len(),
+                                session.max_seconds,
+                                started.elapsed(),
+                            ) {
+                                Ok(updated) => updated,
+                                Err(PcmFrameAdmissionError::OddLength) => {
+                                    close_reason = "invalid_pcm_frame".to_string();
+                                    let _ = upstream_tx.send(UpstreamMessage::Close(None)).await;
+                                    break;
+                                }
+                                Err(PcmFrameAdmissionError::SessionAudioLimit) => {
+                                    close_reason = "audio_byte_limit".to_string();
+                                    let _ = upstream_tx.send(UpstreamMessage::Close(None)).await;
+                                    break;
+                                }
+                                Err(PcmFrameAdmissionError::ByteRateLimit) => {
+                                    close_reason = "audio_rate_limit".to_string();
+                                    let _ = upstream_tx.send(UpstreamMessage::Close(None)).await;
+                                    break;
+                                }
+                            };
+                            // A select cancellation or transport error during
+                            // this await makes delivery of the current frame
+                            // ambiguous. Keep the full projection unless the
+                            // upstream sink confirms the complete write.
+                            forwarded_audio_bytes_exact = false;
+                            upstream_tx
+                                .send(UpstreamMessage::Binary(bytes.clone()))
+                                .await?;
+                            forwarded_audio_bytes = updated_audio_bytes;
+                            forwarded_audio_bytes_exact = true;
                             forwarded_audio_chunks = forwarded_audio_chunks.saturating_add(1);
                             let stats = pcm16_i16le_stats(bytes.as_ref());
                             if stats.is_audible_for_stt() {
@@ -585,10 +719,15 @@ async fn run_deepgram_relay(
                                     "STT relay forwarded audio level"
                                 );
                             }
+                        } else {
+                            upstream_tx.send(UpstreamMessage::Binary(bytes)).await?;
                         }
-                        upstream_tx.send(UpstreamMessage::Binary(bytes)).await?
                     }
-                    ClientMessage::Text(text) => upstream_tx.send(UpstreamMessage::Text(text)).await?,
+                    ClientMessage::Text(_) => {
+                        close_reason = "client_control_rejected".to_string();
+                        let _ = upstream_tx.send(UpstreamMessage::Close(None)).await;
+                        break;
+                    }
                     ClientMessage::Ping(bytes) => upstream_tx.send(UpstreamMessage::Ping(bytes)).await?,
                     ClientMessage::Pong(bytes) => upstream_tx.send(UpstreamMessage::Pong(bytes)).await?,
                     ClientMessage::Close(frame) => {
@@ -673,6 +812,8 @@ async fn run_deepgram_relay(
             &mut provider_guard,
             &attempt_request_id,
             started.elapsed(),
+            forwarded_audio_bytes,
+            forwarded_audio_bytes_exact,
         )?;
         tracing::warn!(
             account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
@@ -687,12 +828,14 @@ async fn run_deepgram_relay(
         return Ok(());
     }
 
-    let billable_elapsed = if forwarded_audible_audio_chunks == 0 {
-        Duration::ZERO
-    } else {
-        started.elapsed()
-    };
     let provider_elapsed = started.elapsed();
+    let billable_elapsed = relay_customer_billable_elapsed(
+        provider_elapsed,
+        forwarded_audio_bytes,
+        forwarded_audio_bytes_exact,
+        forwarded_audible_audio_chunks,
+        session.max_seconds,
+    );
     let settle_reason = if forwarded_audible_audio_chunks == 0 {
         format!("{close_reason}:no_audible_audio")
     } else {
@@ -705,6 +848,7 @@ async fn run_deepgram_relay(
         provider = %session.provider,
         model = %session.model,
         forwarded_audio_bytes,
+        forwarded_audio_bytes_exact,
         forwarded_audio_chunks,
         forwarded_audible_audio_chunks,
         provider_text_frames = provider_frame_stats.text_frames,
@@ -732,9 +876,26 @@ async fn run_deepgram_relay(
         billable_elapsed,
         &settle_reason,
         forwarded_audio_bytes,
+        forwarded_audio_bytes_exact,
         forwarded_audio_chunks,
     )?;
     Ok(())
+}
+
+fn live_stt_admission_denial(
+    admission: &provider_cost_guard::Admission,
+) -> Option<(&'static str, &'static str)> {
+    match admission {
+        provider_cost_guard::Admission::Held(_) => None,
+        provider_cost_guard::Admission::Unconfigured => Some((
+            "spend_guard_unconfigured",
+            "paid STT route unexpectedly had zero projected exposure",
+        )),
+        provider_cost_guard::Admission::GlobalLimit => Some((
+            "spend_guard_denied",
+            "upstream spend guard denied STT relay dispatch",
+        )),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1110,6 +1271,7 @@ fn finalize_relay_session(
     customer_elapsed: Duration,
     reason: &str,
     audio_bytes: u64,
+    audio_bytes_exact: bool,
     audio_chunks: u64,
 ) -> anyhow::Result<()> {
     settle_relay_provider_attempt(
@@ -1117,6 +1279,8 @@ fn finalize_relay_session(
         provider_guard,
         attempt_request_id,
         provider_elapsed,
+        audio_bytes,
+        audio_bytes_exact,
     )?;
     let elapsed_ms = customer_elapsed.as_millis().min(i64::MAX as u128) as i64;
     let settled = stt_accounting::settle_session(
@@ -1154,15 +1318,12 @@ fn settle_relay_provider_attempt(
     provider_guard: &mut provider_cost_guard::ProviderCostGuard,
     attempt_request_id: &str,
     elapsed: Duration,
+    audio_bytes: u64,
+    audio_bytes_exact: bool,
 ) -> anyhow::Result<()> {
     let elapsed_ms = elapsed.as_millis().min(i64::MAX as u128) as i64;
-    let provider_seconds = if elapsed_ms <= 0 {
-        0
-    } else {
-        ((elapsed_ms + 999) / 1_000)
-            .max(1)
-            .min(session.max_seconds.max(0))
-    };
+    let (provider_seconds, usage_provenance) =
+        relay_provider_usage(audio_bytes, session.max_seconds, audio_bytes_exact);
     let provider_pricing = pricing::lookup(&session.provider, &session.model)
         .ok_or_else(|| anyhow::anyhow!("missing live STT provider pricing"))?;
     let (provider_bluey_cents, _) = pricing::compute_cost(provider_pricing, provider_seconds, 0);
@@ -1183,6 +1344,7 @@ fn settle_relay_provider_attempt(
             was_fallback: false,
         },
         provider_bluey_cents,
+        usage_provenance,
     )?;
     Ok(())
 }
@@ -1228,6 +1390,150 @@ mod tests {
             stt_relay_session_token(&headers, Some("query-token")).expect_err("conflict");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(message, "conflicting STT session credentials");
+    }
+
+    #[test]
+    fn live_pcm_budget_rejects_audio_beyond_twenty_minutes_even_in_a_burst() {
+        let max_bytes = max_relay_pcm_bytes(MAX_SESSION_SECONDS);
+        assert_eq!(
+            max_bytes,
+            u64::try_from(MAX_SESSION_SECONDS).unwrap() * DEEPGRAM_LINEAR16_BYTES_PER_SECOND
+        );
+        assert_eq!(
+            admit_relay_pcm_frame(
+                max_bytes - 2,
+                2,
+                MAX_SESSION_SECONDS,
+                Duration::from_secs(MAX_SESSION_SECONDS as u64),
+            ),
+            Ok(max_bytes)
+        );
+        assert_eq!(
+            admit_relay_pcm_frame(
+                max_bytes,
+                2,
+                MAX_SESSION_SECONDS,
+                Duration::from_secs(MAX_SESSION_SECONDS as u64),
+            ),
+            Err(PcmFrameAdmissionError::SessionAudioLimit)
+        );
+    }
+
+    #[test]
+    fn live_pcm_frames_require_complete_i16_samples() {
+        assert_eq!(
+            admit_relay_pcm_frame(0, 1, 60, Duration::ZERO),
+            Err(PcmFrameAdmissionError::OddLength)
+        );
+        assert_eq!(admit_relay_pcm_frame(0, 2, 60, Duration::ZERO), Ok(2));
+        assert_eq!(verified_relay_provider_seconds(1, 60), None);
+    }
+
+    #[test]
+    fn hostile_pcm_burst_cannot_front_load_a_twenty_minute_session() {
+        let full_session = usize::try_from(max_relay_pcm_bytes(MAX_SESSION_SECONDS)).unwrap();
+        assert_eq!(
+            admit_relay_pcm_frame(0, full_session, MAX_SESSION_SECONDS, Duration::from_secs(1),),
+            Err(PcmFrameAdmissionError::ByteRateLimit)
+        );
+    }
+
+    #[test]
+    fn bluey_eight_read_preface_and_normal_jitter_fit_but_ninth_frontload_does_not() {
+        assert_eq!(RELAY_PCM_JITTER_BURST_BYTES, 35_200);
+        let mut forwarded = 0;
+        for _ in 0..8 {
+            forwarded = admit_relay_pcm_frame(forwarded, 4_096, 60, Duration::ZERO).unwrap();
+        }
+        assert_eq!(forwarded, 32_768);
+        assert_eq!(
+            admit_relay_pcm_frame(forwarded, 4_096, 60, Duration::ZERO),
+            Err(PcmFrameAdmissionError::ByteRateLimit)
+        );
+        assert_eq!(
+            admit_relay_pcm_frame(forwarded, 5_632, 60, Duration::from_millis(100)),
+            Ok(38_400),
+            "100ms of monotonic elapsed time adds one normal PCM interval"
+        );
+    }
+
+    #[test]
+    fn customer_elapsed_uses_exact_pcm_for_audible_audio_without_silent_or_ambiguous_overcharge() {
+        let ten_seconds = 10 * DEEPGRAM_LINEAR16_BYTES_PER_SECOND;
+        assert_eq!(
+            relay_customer_billable_elapsed(Duration::from_secs(1), ten_seconds, true, 0, 60,),
+            Duration::ZERO,
+            "fully silent audio remains free"
+        );
+        assert_eq!(
+            relay_customer_billable_elapsed(Duration::from_secs(1), ten_seconds, true, 1, 60,),
+            Duration::from_secs(10),
+            "one confirmed audible chunk charges at least exact forwarded PCM duration"
+        );
+        assert_eq!(
+            relay_customer_billable_elapsed(
+                Duration::from_secs(2),
+                ten_seconds,
+                false,
+                1,
+                60,
+            ),
+            Duration::from_secs(2),
+            "ambiguous provider sends retain conservative provider exposure without customer overcharge"
+        );
+    }
+
+    #[test]
+    fn customer_pcm_duration_never_exceeds_the_session_cap() {
+        let max_bytes = max_relay_pcm_bytes(60);
+        assert_eq!(
+            relay_customer_billable_elapsed(Duration::from_secs(120), max_bytes, true, 1, 60,),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn live_provider_duration_is_exactly_derived_from_forwarded_pcm_bytes() {
+        assert_eq!(verified_relay_provider_seconds(0, 60), Some(0));
+        assert_eq!(verified_relay_provider_seconds(2, 60), Some(1));
+        assert_eq!(
+            verified_relay_provider_seconds(DEEPGRAM_LINEAR16_BYTES_PER_SECOND, 60),
+            Some(1)
+        );
+        assert_eq!(
+            verified_relay_provider_seconds(DEEPGRAM_LINEAR16_BYTES_PER_SECOND + 2, 60),
+            Some(2)
+        );
+        assert_eq!(
+            verified_relay_provider_seconds(max_relay_pcm_bytes(60) + 2, 60),
+            None
+        );
+        assert_eq!(
+            relay_provider_usage(DEEPGRAM_LINEAR16_BYTES_PER_SECOND, 60, true),
+            (1, pricing::UsageProvenance::Exact)
+        );
+        assert_eq!(
+            relay_provider_usage(DEEPGRAM_LINEAR16_BYTES_PER_SECOND, 60, false),
+            (60, pricing::UsageProvenance::Missing)
+        );
+    }
+
+    #[test]
+    fn live_spend_guard_denial_keeps_an_explicit_closed_session_reason() {
+        assert_eq!(
+            live_stt_admission_denial(&provider_cost_guard::Admission::GlobalLimit),
+            Some((
+                "spend_guard_denied",
+                "upstream spend guard denied STT relay dispatch"
+            ))
+        );
+        assert_eq!(
+            live_stt_admission_denial(&provider_cost_guard::Admission::Unconfigured),
+            Some((
+                "spend_guard_unconfigured",
+                "paid STT route unexpectedly had zero projected exposure"
+            ))
+        );
     }
 
     static DEEPGRAM_URL_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1341,6 +1647,7 @@ mod tests {
             Duration::from_secs(10),
             "completed",
             16_000,
+            true,
             1,
         )
         .expect_err("provider settlement failure must stop before customer settlement");
@@ -1415,12 +1722,15 @@ mod tests {
                 Duration::from_secs(10),
                 "completed",
                 160_000,
+                true,
                 10,
             )
             .expect("settle live STT A then B");
 
             let pricing = pricing::lookup("deepgram", "nova-3").unwrap();
-            let (expected_bluey_cost, _) = pricing::compute_cost(pricing, 10, 0);
+            let expected_provider_seconds = 5;
+            let (expected_bluey_cost, _) =
+                pricing::compute_cost(pricing, expected_provider_seconds, 0);
             let (_, expected_customer_cost) = pricing::compute_cost(pricing, expected_billable, 0);
             let conn = pool.get().unwrap();
             let attempt: (i64, i64, i64) = conn
@@ -1432,7 +1742,11 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .unwrap();
-            assert_eq!(attempt, (10, expected_bluey_cost, 0), "{case}");
+            assert_eq!(
+                attempt,
+                (expected_provider_seconds, expected_bluey_cost, 0),
+                "{case}"
+            );
             let root: (i64, i64, i64) = conn
                 .query_row(
                     "SELECT input_tokens, cost_cents_to_bluey, cost_cents_to_customer

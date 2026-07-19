@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::{auth, config::Config, db::DbPool};
 
 const ROUTER_COMPLETE_BODY_LIMIT_BYTES: usize = 20 * 1024 * 1024;
+const ROUTER_TRANSCRIBE_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 pub mod account;
 pub mod admin;
@@ -267,12 +268,12 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .route(
             "/router/transcribe",
-            axum::routing::post(router::transcribe).route_layer(
-                axum::middleware::from_fn_with_state(
+            axum::routing::post(router::transcribe)
+                .route_layer(DefaultBodyLimit::max(ROUTER_TRANSCRIBE_BODY_LIMIT_BYTES))
+                .route_layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     crate::rate_limit::limit_router_transcribe,
-                ),
-            ),
+                )),
         )
         .route("/stt/session", axum::routing::post(stt::create_session))
         .route(

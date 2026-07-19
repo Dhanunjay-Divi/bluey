@@ -127,8 +127,10 @@ US-East droplet is acceptable.
   successful Square card-save flow.
 - Keep first reload amount simple, currently `$15`.
 - Review spend, failed provider calls, refunds, and disputes daily.
-- Keep the Bluey-side upstream spend guard enabled while real usage patterns
-  are unknown.
+- Configure a positive `BLUEY_UPSTREAM_SPEND_LIMIT_CENTS` before enabling any
+  managed paid route; unset, invalid, or zero is a fail-closed configuration,
+  not unlimited spend. Keep `BLUEY_UPSTREAM_SPEND_WINDOW_HOURS` within its
+  enforced 1-720-hour range and monitor hold/provenance/janitor metrics.
 - Keep auto-update in signed check-and-notify mode until rollback confidence is
   proven.
 - Do not expose provider keys, BYOK flags, local LLM modes, or dev capture flags

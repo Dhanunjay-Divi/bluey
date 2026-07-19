@@ -6,6 +6,7 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     Extension, Json,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,6 +47,7 @@ const DEFAULT_DEEP_SLOW_FIRST_TOKEN_AUDIT_MS: i64 = 8_000;
 const CODE_ARTIFACT_DEFAULT_OUTPUT_TOKENS: u32 = 4_096;
 const CANVAS_DETAIL_DEFAULT_OUTPUT_TOKENS: u32 = 3_072;
 const DEFAULT_CAPACITY_SHORT_WAIT_MAX_SECS: u64 = 2;
+const UPSTREAM_SPEND_GUARD_RETRY_AFTER_SECS: u64 = 60;
 const DEFAULT_LLM_USAGE_RESERVATION_TTL_SECS: u64 = 30 * 60;
 const LLM_SETTLEMENT_RETRY_ATTEMPTS: usize = 3;
 const LLM_SETTLEMENT_RETRY_DELAY_MS: u64 = 100;
@@ -694,11 +696,12 @@ fn reserve_llm_usage(
         },
     ) {
         Ok(reservation) => {
-            spawn_llm_usage_expiry_reconciler(
+            spawn_usage_expiry_reconciler(
                 state.pool.clone(),
                 account.id.clone(),
                 request_id.to_string(),
-                expires_at_ms,
+                reservation.attempt,
+                reservation.expires_at_ms,
             );
             Ok(reservation)
         }
@@ -775,33 +778,60 @@ fn reserve_llm_usage(
     }
 }
 
-fn spawn_llm_usage_expiry_reconciler(
+fn spawn_usage_expiry_reconciler(
     pool: crate::db::DbPool,
     account_id: String,
     request_id: String,
+    attempt: i64,
     expires_at_ms: i64,
 ) {
     tokio::spawn(async move {
-        let wait_ms = expires_at_ms.saturating_sub(managed_usage_now_ms()).max(0) as u64;
-        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-        match usage_reservations::reconcile_expired_for_account(
+        let delay_ms = match usage_reservations::reservation_expiry_delay_ms(
             &pool,
             &account_id,
-            managed_usage_now_ms(),
+            &request_id,
+            attempt,
+            expires_at_ms,
         ) {
-            Ok(released) if released > 0 => tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
-                request_id,
-                released,
-                "released expired managed usage reservation"
-            ),
-            Ok(_) => {}
-            Err(error) => tracing::error!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
-                request_id,
-                error = %error,
-                "failed delayed managed usage reconciliation"
-            ),
+            Ok(Some(delay_ms)) => delay_ms,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+                    request_id,
+                    error = %error,
+                    "failed to read DB-clock managed usage expiry"
+                );
+                return;
+            }
+        };
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+        }
+        match usage_reservations::release_expired_attempt(
+            &pool,
+            &account_id,
+            &request_id,
+            attempt,
+            expires_at_ms,
+        ) {
+            Ok(true) => {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+                    request_id,
+                    attempt,
+                    "released expired managed usage reservation"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+                    request_id,
+                    error = %error,
+                    "failed delayed managed usage reconciliation"
+                );
+            }
         }
     });
 }
@@ -1139,6 +1169,27 @@ fn capacity_error(reason: &str, retry_after_secs: u64) -> (StatusCode, Json<ApiE
     )
 }
 
+fn upstream_spend_guard_error() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError {
+            error: "Bluey's upstream spend safety boundary is temporarily active".into(),
+            reason: Some("upstream_spend_guard".into()),
+            retry_after_secs: Some(UPSTREAM_SPEND_GUARD_RETRY_AFTER_SECS),
+            ..Default::default()
+        }),
+    )
+}
+
+fn release_and_upstream_spend_guard_error(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    request_id: &str,
+) -> (StatusCode, Json<ApiError>) {
+    let _ = idempotency::release(pool, account_id, request_id);
+    upstream_spend_guard_error()
+}
+
 fn internal_capacity_retry_delay(denied: &crate::rate_limit::CapacityDenied) -> Option<Duration> {
     let retry_after_secs = denied.retry_after_secs.clamp(1, 2);
     let is_account_guard = denied.reason.starts_with("account_");
@@ -1302,23 +1353,33 @@ fn settle_provider_attempt_before_customer(
     guard: &mut provider_cost_guard::ProviderCostGuard,
     event: UsageEvent,
     actual_cost_cents: i64,
+    usage_provenance: pricing::UsageProvenance,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
-    guard.settle(event, actual_cost_cents).map_err(|error| {
-        tracing::error!(
-            request_id = root_request_id,
-            error = %error,
-            "provider attempt settlement pending reconciliation"
-        );
-        provider_accounting_pending_error(pool, account_id, root_request_id)
-    })
+    guard
+        .settle(event, actual_cost_cents, usage_provenance)
+        .map_err(|error| {
+            tracing::error!(
+                request_id = root_request_id,
+                error = %error,
+                "provider attempt settlement pending reconciliation"
+            );
+            provider_accounting_pending_error(pool, account_id, root_request_id)
+        })
+}
+
+fn take_selected_provider_attempt_guard(
+    guard: &mut Option<Box<provider_cost_guard::ProviderCostGuard>>,
+) -> anyhow::Result<Box<provider_cost_guard::ProviderCostGuard>> {
+    guard
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("selected provider attempt has no armed cost guard"))
 }
 
 fn settle_selected_provider_attempt_conservative(
     guard: &mut Option<Box<provider_cost_guard::ProviderCostGuard>>,
 ) -> anyhow::Result<()> {
-    if let Some(mut guard) = guard.take() {
-        guard.settle_conservative()?;
-    }
+    let mut guard = take_selected_provider_attempt_guard(guard)?;
+    guard.settle_conservative()?;
     Ok(())
 }
 
@@ -1595,13 +1656,20 @@ fn missing_provider_key_error(provider: &str) -> anyhow::Error {
 const MAX_COMPLETE_IMAGE_DATA_URLS: usize = 4;
 const MAX_COMPLETE_IMAGE_DATA_URL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COMPLETE_IMAGE_DATA_URL_TOTAL_BYTES: usize = 12 * 1024 * 1024;
+const MAX_COMPLETE_IMAGE_DIMENSION: u32 = 4_096;
+const MAX_COMPLETE_IMAGE_PIXELS: u64 = 4_194_304;
+const MAX_COMPLETE_IMAGE_TOTAL_PIXELS: u64 = 12_582_912;
+/// Fixed accepted-image ceiling across Bluey's enabled OpenAI, Anthropic and
+/// Gemini vision routes at the enforced dimension/pixel limit. This includes
+/// substantial margin above their route-specific tiling formulas, avoiding a
+/// dependency on raw compressed bytes or a client token estimate.
+const MAX_VISION_TOKENS_PER_IMAGE: i64 = 32_768;
 const MAX_COMPLETE_CONTEXT_ITEMS: usize = 64;
 const MAX_COMPLETE_CONTEXT_CONTENT_BYTES: usize = 32 * 1024;
 const MAX_COMPLETE_CONTEXT_TOTAL_BYTES: usize = 256 * 1024;
 const MAX_COMPLETE_CONTEXT_TITLE_BYTES: usize = 1_024;
 const MAX_COMPLETE_CONTEXT_SOURCE_BYTES: usize = 4 * 1024;
 pub(crate) const ANSWER_CONTEXT_SCHEMA_VERSION_V1: u16 = 1;
-const ESTIMATED_TOKENS_PER_IMAGE: i64 = 1_500;
 
 fn image_validation_error(
     error: impl Into<String>,
@@ -1617,6 +1685,307 @@ fn image_validation_error(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompleteImageKind {
+    Png,
+    Jpeg,
+    Webp,
+    Gif,
+}
+
+fn image_kind_from_media_type(media_type: &str) -> Option<CompleteImageKind> {
+    match media_type {
+        "image/png" => Some(CompleteImageKind::Png),
+        "image/jpeg" => Some(CompleteImageKind::Jpeg),
+        "image/webp" => Some(CompleteImageKind::Webp),
+        "image/gif" => Some(CompleteImageKind::Gif),
+        _ => None,
+    }
+}
+
+fn be_u16(bytes: &[u8]) -> Option<u16> {
+    Some(u16::from_be_bytes(bytes.get(..2)?.try_into().ok()?))
+}
+
+fn be_u32(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?))
+}
+
+fn le_u16(bytes: &[u8]) -> Option<u16> {
+    Some(u16::from_le_bytes(bytes.get(..2)?.try_into().ok()?))
+}
+
+fn le_u24(bytes: &[u8]) -> Option<u32> {
+    let bytes = bytes.get(..3)?;
+    Some(u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16))
+}
+
+fn le_u32(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?))
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.get(..8) != Some(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    let mut offset = 8_usize;
+    let mut dimensions = None;
+    let mut saw_iend = false;
+    while offset.checked_add(12)? <= bytes.len() {
+        let length = usize::try_from(be_u32(&bytes[offset..])?).ok()?;
+        let kind = bytes.get(offset + 4..offset + 8)?;
+        let data_start = offset + 8;
+        let data_end = data_start.checked_add(length)?;
+        let chunk_end = data_end.checked_add(4)?;
+        if chunk_end > bytes.len() {
+            return None;
+        }
+        if kind == b"IHDR" {
+            if dimensions.is_some() || length != 13 || offset != 8 {
+                return None;
+            }
+            dimensions = Some((
+                be_u32(&bytes[data_start..data_end])?,
+                be_u32(&bytes[data_start + 4..data_end])?,
+            ));
+        } else if kind == b"acTL" {
+            // Animated PNG provider billing is not locally bounded per frame.
+            return None;
+        } else if kind == b"IEND" {
+            if length != 0 || chunk_end != bytes.len() {
+                return None;
+            }
+            saw_iend = true;
+            break;
+        }
+        offset = chunk_end;
+    }
+    saw_iend.then_some(dimensions?)
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.get(..2) != Some(b"\xff\xd8")
+        || bytes.get(bytes.len().checked_sub(2)?..) != Some(b"\xff\xd9")
+    {
+        return None;
+    }
+    let mut offset = 2_usize;
+    while offset + 1 < bytes.len() {
+        if bytes[offset] != 0xff {
+            offset += 1;
+            continue;
+        }
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset)?;
+        offset += 1;
+        if marker == 0xd9 {
+            break;
+        }
+        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let length = usize::from(be_u16(bytes.get(offset..)?)?);
+        if length < 2 || offset.checked_add(length)? > bytes.len() {
+            return None;
+        }
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) {
+            if length < 7 {
+                return None;
+            }
+            let height = u32::from(be_u16(bytes.get(offset + 3..offset + length)?)?);
+            let width = u32::from(be_u16(bytes.get(offset + 5..offset + length)?)?);
+            return Some((width, height));
+        }
+        if marker == 0xda {
+            return None;
+        }
+        offset += length;
+    }
+    None
+}
+
+fn skip_gif_sub_blocks(bytes: &[u8], mut offset: usize) -> Option<usize> {
+    loop {
+        let size = usize::from(*bytes.get(offset)?);
+        offset += 1;
+        if size == 0 {
+            return Some(offset);
+        }
+        offset = offset.checked_add(size)?;
+        if offset > bytes.len() {
+            return None;
+        }
+    }
+}
+
+fn gif_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !matches!(bytes.get(..6), Some(b"GIF87a") | Some(b"GIF89a")) || bytes.len() < 14 {
+        return None;
+    }
+    let width = u32::from(le_u16(&bytes[6..8])?);
+    let height = u32::from(le_u16(&bytes[8..10])?);
+    let packed = bytes[10];
+    let global_table = if packed & 0x80 != 0 {
+        3_usize.checked_mul(1_usize << (usize::from(packed & 0x07) + 1))?
+    } else {
+        0
+    };
+    let mut offset = 13_usize.checked_add(global_table)?;
+    let mut frames = 0_u32;
+    let mut saw_trailer = false;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            0x21 => {
+                offset = skip_gif_sub_blocks(bytes, offset.checked_add(2)?)?;
+            }
+            0x2c => {
+                if offset.checked_add(10)? > bytes.len() {
+                    return None;
+                }
+                let left = u32::from(le_u16(&bytes[offset + 1..])?);
+                let top = u32::from(le_u16(&bytes[offset + 3..])?);
+                let frame_width = u32::from(le_u16(&bytes[offset + 5..])?);
+                let frame_height = u32::from(le_u16(&bytes[offset + 7..])?);
+                if frame_width == 0
+                    || frame_height == 0
+                    || left.checked_add(frame_width)? > width
+                    || top.checked_add(frame_height)? > height
+                {
+                    return None;
+                }
+                frames = frames.checked_add(1)?;
+                if frames > 1 {
+                    return None;
+                }
+                let local_packed = bytes[offset + 9];
+                offset += 10;
+                if local_packed & 0x80 != 0 {
+                    offset =
+                        offset
+                            .checked_add(3_usize.checked_mul(
+                                1_usize << (usize::from(local_packed & 0x07) + 1),
+                            )?)?;
+                }
+                // LZW minimum code size followed by data sub-blocks.
+                offset = skip_gif_sub_blocks(bytes, offset.checked_add(1)?)?;
+            }
+            0x3b => {
+                saw_trailer = offset + 1 == bytes.len();
+                break;
+            }
+            _ => return None,
+        }
+    }
+    (saw_trailer && frames == 1).then_some((width, height))
+}
+
+fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.get(..4) != Some(b"RIFF") || bytes.get(8..12) != Some(b"WEBP") {
+        return None;
+    }
+    let riff_len = usize::try_from(le_u32(&bytes[4..8])?)
+        .ok()?
+        .checked_add(8)?;
+    if riff_len != bytes.len() {
+        return None;
+    }
+    let mut offset = 12_usize;
+    let mut canvas_dimensions = None;
+    let mut payload_dimensions = None;
+    while offset.checked_add(8)? <= bytes.len() {
+        let chunk = bytes.get(offset..offset + 4)?;
+        let length = usize::try_from(le_u32(&bytes[offset + 4..])?).ok()?;
+        let data_start = offset + 8;
+        let data_end = data_start.checked_add(length)?;
+        if data_end > bytes.len() {
+            return None;
+        }
+        let data = &bytes[data_start..data_end];
+        match chunk {
+            b"VP8X" if length == 10 => {
+                if data[0] & 0x02 != 0 || canvas_dimensions.is_some() {
+                    return None;
+                }
+                canvas_dimensions = Some((
+                    le_u24(&data[4..])?.checked_add(1)?,
+                    le_u24(&data[7..])?.checked_add(1)?,
+                ));
+            }
+            b"VP8 " if length >= 10 => {
+                if data.get(3..6) != Some(b"\x9d\x01\x2a") || payload_dimensions.is_some() {
+                    return None;
+                }
+                payload_dimensions = Some((
+                    u32::from(le_u16(&data[6..])? & 0x3fff),
+                    u32::from(le_u16(&data[8..])? & 0x3fff),
+                ));
+            }
+            b"VP8L" if length >= 5 => {
+                if data[0] != 0x2f || payload_dimensions.is_some() {
+                    return None;
+                }
+                payload_dimensions = Some((
+                    1 + u32::from(data[1]) + ((u32::from(data[2]) & 0x3f) << 8),
+                    1 + (u32::from(data[2]) >> 6)
+                        + (u32::from(data[3]) << 2)
+                        + ((u32::from(data[4]) & 0x0f) << 10),
+                ));
+            }
+            b"ANIM" | b"ANMF" => return None,
+            _ => {}
+        }
+        offset = data_end.checked_add(length & 1)?;
+    }
+    if offset != bytes.len() {
+        return None;
+    }
+    let payload_dimensions = payload_dimensions?;
+    if canvas_dimensions.is_some_and(|canvas| canvas != payload_dimensions) {
+        return None;
+    }
+    Some(payload_dimensions)
+}
+
+fn actual_image_kind_and_dimensions(bytes: &[u8]) -> Option<(CompleteImageKind, u32, u32)> {
+    if let Some((width, height)) = png_dimensions(bytes) {
+        return Some((CompleteImageKind::Png, width, height));
+    }
+    if let Some((width, height)) = jpeg_dimensions(bytes) {
+        return Some((CompleteImageKind::Jpeg, width, height));
+    }
+    if let Some((width, height)) = webp_dimensions(bytes) {
+        return Some((CompleteImageKind::Webp, width, height));
+    }
+    gif_dimensions(bytes).map(|(width, height)| (CompleteImageKind::Gif, width, height))
+}
+
+fn complete_image_token_upper_bound(image_count: usize) -> i64 {
+    i64::try_from(image_count)
+        .unwrap_or(i64::MAX / MAX_VISION_TOKENS_PER_IMAGE)
+        .saturating_mul(MAX_VISION_TOKENS_PER_IMAGE)
+}
+
+fn complete_input_token_upper_bound(system: &str, user: &str, image_count: usize) -> i64 {
+    pricing::utf8_input_token_upper_bound([system, user])
+        .saturating_add(complete_image_token_upper_bound(image_count))
+}
+
 fn validate_complete_images(image_data_urls: &[String]) -> Result<(), ApiError> {
     if image_data_urls.len() > MAX_COMPLETE_IMAGE_DATA_URLS {
         return Err(ApiError {
@@ -1627,6 +1996,7 @@ fn validate_complete_images(image_data_urls: &[String]) -> Result<(), ApiError> 
     }
 
     let mut total_image_bytes = 0usize;
+    let mut total_image_pixels = 0_u64;
     for data_url in image_data_urls {
         if data_url.len() > MAX_COMPLETE_IMAGE_DATA_URL_BYTES {
             return Err(ApiError {
@@ -1643,14 +2013,67 @@ fn validate_complete_images(image_data_urls: &[String]) -> Result<(), ApiError> 
                 ..Default::default()
             });
         }
-        let allowed = data_url.starts_with("data:image/png;base64,")
-            || data_url.starts_with("data:image/jpeg;base64,")
-            || data_url.starts_with("data:image/webp;base64,")
-            || data_url.starts_with("data:image/gif;base64,");
-        if !allowed {
+        let Some((metadata, encoded)) = data_url
+            .strip_prefix("data:")
+            .and_then(|value| value.split_once(','))
+        else {
             return Err(ApiError {
                 error: "unsupported screen image payload".into(),
                 reason: Some("unsupported_image_payload".into()),
+                ..Default::default()
+            });
+        };
+        let Some(media_type) = metadata.strip_suffix(";base64") else {
+            return Err(ApiError {
+                error: "screen image must use strict base64 data URL encoding".into(),
+                reason: Some("unsupported_image_payload".into()),
+                ..Default::default()
+            });
+        };
+        let Some(declared_kind) = image_kind_from_media_type(media_type) else {
+            return Err(ApiError {
+                error: "unsupported screen image payload".into(),
+                reason: Some("unsupported_image_payload".into()),
+                ..Default::default()
+            });
+        };
+        let decoded = BASE64_STANDARD.decode(encoded).map_err(|_| ApiError {
+            error: "screen image payload is not valid base64".into(),
+            reason: Some("invalid_image_data".into()),
+            ..Default::default()
+        })?;
+        let Some((actual_kind, width, height)) = actual_image_kind_and_dimensions(&decoded) else {
+            return Err(ApiError {
+                error: "screen image container is malformed or animated".into(),
+                reason: Some("invalid_image_data".into()),
+                ..Default::default()
+            });
+        };
+        if actual_kind != declared_kind {
+            return Err(ApiError {
+                error: "screen image MIME type does not match its container".into(),
+                reason: Some("image_mime_mismatch".into()),
+                ..Default::default()
+            });
+        }
+        let pixels = u64::from(width).saturating_mul(u64::from(height));
+        if width == 0
+            || height == 0
+            || width > MAX_COMPLETE_IMAGE_DIMENSION
+            || height > MAX_COMPLETE_IMAGE_DIMENSION
+            || pixels > MAX_COMPLETE_IMAGE_PIXELS
+        {
+            return Err(ApiError {
+                error: "screen image dimensions exceed the managed vision limit".into(),
+                reason: Some("image_dimensions_too_large".into()),
+                ..Default::default()
+            });
+        }
+        total_image_pixels = total_image_pixels.saturating_add(pixels);
+        if total_image_pixels > MAX_COMPLETE_IMAGE_TOTAL_PIXELS {
+            return Err(ApiError {
+                error: "screen image pixels exceed the per-answer vision limit".into(),
+                reason: Some("image_pixels_too_large".into()),
                 ..Default::default()
             });
         }
@@ -1731,12 +2154,6 @@ fn validate_complete_context_schema_version(version: Option<u16>) -> Result<(), 
 
 fn uses_typed_answer_context_v1(req: &CompleteRequest) -> bool {
     req.context_schema_version == Some(ANSWER_CONTEXT_SCHEMA_VERSION_V1)
-}
-
-fn image_token_estimate(image_count: usize) -> i64 {
-    i64::try_from(image_count)
-        .unwrap_or(i64::MAX / ESTIMATED_TOKENS_PER_IMAGE)
-        .saturating_mul(ESTIMATED_TOKENS_PER_IMAGE)
 }
 
 fn priced_routes_for(
@@ -3229,7 +3646,7 @@ async fn refine_answer_plan_with_ai_classifier(
         rule_plan.confidence
     );
     let max_tokens = answer_plan_ai_max_tokens();
-    let fallback_input_tokens = ((system.len() + user.len()) as i64 / 4).max(1);
+    let fallback_input_tokens = pricing::utf8_input_token_upper_bound([system, user.as_str()]);
     let routes = priced_routes_for(
         "instant",
         fallback_input_tokens,
@@ -3311,6 +3728,8 @@ async fn refine_answer_plan_with_ai_classifier(
 
             match completion {
                 Ok(Ok(comp)) => {
+                    let route_matches =
+                        comp.provider == route.provider && comp.model == route.model;
                     let event = answer_plan_classifier_usage_event(
                         &hold_request_id,
                         &comp,
@@ -3324,10 +3743,22 @@ async fn refine_answer_plan_with_ai_classifier(
                         &mut cost_guard,
                         event,
                         actual_cost,
+                        comp.usage_provenance,
                     )
                     .is_err()
                     {
                         return AiAnswerPlanRefinement::ProviderAccountingPending;
+                    }
+                    if !route_matches {
+                        tracing::error!(
+                            request_id = %req.request_id,
+                            requested_provider = route.provider,
+                            requested_model = route.model,
+                            completed_provider = %comp.provider,
+                            completed_model = %comp.model,
+                            "answer-plan classifier crossed its routed provider/model boundary"
+                        );
+                        return AiAnswerPlanRefinement::Unavailable;
                     }
                     if let Some(plan) = parse_ai_answer_plan(&comp.text).and_then(|payload| {
                         merge_ai_answer_plan(rule_plan, payload, req, requested_lane)
@@ -7831,6 +8262,7 @@ async fn completion_web_search_budgeted(
                 &mut cost_guard,
                 event,
                 actual_cost,
+                pricing::UsageProvenance::Exact,
             )
             .is_err()
             {
@@ -8934,11 +9366,16 @@ async fn complete_stream_inner(
         effective_max_out
     };
     let max_out = i64::from(quality_max_tokens);
-    let primary_server_est_in = ((provider_system.len() + provider_user.len()) as i64) / 4
-        + image_token_estimate(req.image_data_urls.len());
+    let primary_server_est_in = complete_input_token_upper_bound(
+        &provider_system,
+        &provider_user,
+        req.image_data_urls.len(),
+    );
     let server_est_in = if vision_text_fallback_possible {
-        primary_server_est_in
-            .max(((vision_text_fallback_system.len() + vision_text_fallback_user.len()) as i64) / 4)
+        primary_server_est_in.max(pricing::utf8_input_token_upper_bound([
+            vision_text_fallback_system.as_str(),
+            vision_text_fallback_user.as_str(),
+        ]))
     } else {
         primary_server_est_in
     };
@@ -9225,10 +9662,24 @@ async fn complete_stream_inner(
                         ));
                         break;
                     }
-                    Ok(provider_cost_guard::Admission::GlobalLimit) | Err(_) => {
-                        last_error = Some(anyhow::anyhow!(
-                            "upstream spend guard denied streaming LLM route"
+                    Ok(provider_cost_guard::Admission::GlobalLimit) => {
+                        release_llm_usage(
+                            &state.pool,
+                            &account.id,
+                            &req.request_id,
+                            "upstream_spend_guard",
+                        );
+                        return Err(release_and_upstream_spend_guard_error(
+                            &state.pool,
+                            &account.id,
+                            &req.request_id,
                         ));
+                    }
+                    Err(error) => {
+                        last_error = Some(error.context(
+                            "durable upstream spend admission failed for streaming LLM route",
+                        ));
+                        last_failure_was_capacity = false;
                         break;
                     }
                 };
@@ -9297,6 +9748,7 @@ async fn complete_stream_inner(
                                         &mut attempt_guard,
                                         mismatch_event,
                                         returned_cost,
+                                        pricing::UsageProvenance::Missing,
                                     )?;
                                     last_error = Some(anyhow::anyhow!(
                                         "streaming provider route identity mismatch"
@@ -9380,6 +9832,7 @@ async fn complete_stream_inner(
                             Ok(Some(Ok(routing::CompletionStreamEvent::Done {
                                 input_tokens,
                                 output_tokens,
+                                usage_provenance,
                             }))) => {
                                 // Even an empty stream can carry an exact terminal
                                 // provider usage frame. Prefer that truth over the
@@ -9416,6 +9869,7 @@ async fn complete_stream_inner(
                                     &mut attempt_guard,
                                     event,
                                     actual_bluey_cost,
+                                    usage_provenance,
                                 )?;
                                 tracing::warn!(
                                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
@@ -9949,52 +10403,76 @@ async fn complete_stream_inner(
                         }
                     }
                 }
-                Ok(routing::CompletionStreamEvent::Done { input_tokens, output_tokens }) => {
-                    // A terminal provider usage frame is the first trustworthy
-                    // exact-cost boundary. Persist it immediately, before any
-                    // Bluey quality/account gate can reject the completed
-                    // answer. Streams that never reach Done retain the guard's
-                    // conservative projected settlement through Drop.
+                Ok(routing::CompletionStreamEvent::Done {
+                    input_tokens,
+                    output_tokens,
+                    usage_provenance,
+                }) => {
+                    // Persist provider-attempt accounting immediately, before
+                    // any Bluey quality/account gate can settle the customer
+                    // root. Estimated or missing usage retains the projection.
                     let (exact_bluey_cost, _) = pricing::compute_cost(
                         &selected_route.pricing,
                         input_tokens,
                         output_tokens,
                     );
-                    if let Some(mut attempt_guard) = selected_attempt_guard.take() {
-                        let attempt_event = UsageEvent {
-                            request_id: req.request_id.clone(),
-                            kind: "llm_attempt".into(),
-                            task_type: Some(effective_lane.clone()),
-                            lane: Some(effective_lane.clone()),
-                            provider: Some(streaming.provider.clone()),
-                            model: Some(streaming.model.clone()),
-                            input_tokens,
-                            output_tokens,
-                            latency_ms: started
-                                .elapsed()
-                                .as_millis()
-                                .try_into()
-                                .unwrap_or(i64::MAX),
-                            cost_cents_to_bluey: exact_bluey_cost,
-                            cost_cents_to_customer: 0,
-                            was_speculative: false,
-                            was_fallback: selected_route_idx > 0,
-                        };
-                        if let Err((_, Json(payload))) = settle_provider_attempt_before_customer(
+                    let mut attempt_guard = match take_selected_provider_attempt_guard(
+                        &mut selected_attempt_guard,
+                    ) {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                        tracing::error!(
+                            request_id = %req.request_id,
+                            error = %error,
+                            "selected streaming completion reached Done without an armed provider guard"
+                        );
+                        let (_, Json(payload)) = provider_accounting_pending_error(
                             &state.pool,
                             &account.id,
                             &req.request_id,
-                            &mut attempt_guard,
-                            attempt_event,
-                            exact_bluey_cost,
-                        ) {
-                            yield Ok(Event::default().event("error").data(
-                                serde_json::to_string(&payload).unwrap_or_else(|_| {
-                                    r#"{"error":"provider accounting pending","reason":"provider_accounting_pending"}"#.to_string()
-                                }),
-                            ));
-                            return;
+                        );
+                        yield Ok(Event::default().event("error").data(
+                            serde_json::to_string(&payload).unwrap_or_else(|_| {
+                                r#"{"error":"provider accounting pending","reason":"provider_accounting_pending"}"#.to_string()
+                            }),
+                        ));
+                        return;
                         }
+                    };
+                    let attempt_event = UsageEvent {
+                        request_id: req.request_id.clone(),
+                        kind: "llm_attempt".into(),
+                        task_type: Some(effective_lane.clone()),
+                        lane: Some(effective_lane.clone()),
+                        provider: Some(streaming.provider.clone()),
+                        model: Some(streaming.model.clone()),
+                        input_tokens,
+                        output_tokens,
+                        latency_ms: started
+                            .elapsed()
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(i64::MAX),
+                        cost_cents_to_bluey: exact_bluey_cost,
+                        cost_cents_to_customer: 0,
+                        was_speculative: false,
+                        was_fallback: selected_route_idx > 0,
+                    };
+                    if let Err((_, Json(payload))) = settle_provider_attempt_before_customer(
+                        &state.pool,
+                        &account.id,
+                        &req.request_id,
+                        &mut attempt_guard,
+                        attempt_event,
+                        exact_bluey_cost,
+                        usage_provenance,
+                    ) {
+                        yield Ok(Event::default().event("error").data(
+                            serde_json::to_string(&payload).unwrap_or_else(|_| {
+                                r#"{"error":"provider accounting pending","reason":"provider_accounting_pending"}"#.to_string()
+                            }),
+                        ));
+                        return;
                     }
                     final_tokens = Some((input_tokens, output_tokens));
                     break;
@@ -10953,11 +11431,16 @@ async fn complete_inner(
         effective_max_out
     };
     let max_out = i64::from(quality_max_tokens);
-    let primary_server_est_in = ((provider_system.len() + provider_user.len()) as i64) / 4
-        + image_token_estimate(req.image_data_urls.len());
+    let primary_server_est_in = complete_input_token_upper_bound(
+        &provider_system,
+        &provider_user,
+        req.image_data_urls.len(),
+    );
     let server_est_in = if vision_text_fallback_possible {
-        primary_server_est_in
-            .max(((vision_text_fallback_system.len() + vision_text_fallback_user.len()) as i64) / 4)
+        primary_server_est_in.max(pricing::utf8_input_token_upper_bound([
+            vision_text_fallback_system.as_str(),
+            vision_text_fallback_user.as_str(),
+        ]))
     } else {
         primary_server_est_in
     };
@@ -11198,8 +11681,24 @@ async fn complete_inner(
                         ));
                         break;
                     }
-                    Ok(provider_cost_guard::Admission::GlobalLimit) | Err(_) => {
-                        last_error = Some(anyhow::anyhow!("upstream spend guard denied LLM route"));
+                    Ok(provider_cost_guard::Admission::GlobalLimit) => {
+                        release_llm_usage(
+                            &state.pool,
+                            &account.id,
+                            &req.request_id,
+                            "upstream_spend_guard",
+                        );
+                        return Err(release_and_upstream_spend_guard_error(
+                            &state.pool,
+                            &account.id,
+                            &req.request_id,
+                        ));
+                    }
+                    Err(error) => {
+                        last_error = Some(
+                            error.context("durable upstream spend admission failed for LLM route"),
+                        );
+                        last_failure_was_capacity = false;
                         break;
                     }
                 };
@@ -11254,6 +11753,7 @@ async fn complete_inner(
                             &mut attempt_guard,
                             attempt_event,
                             actual_bluey_cost,
+                            completion.usage_provenance,
                         )?;
                         if !route_matches {
                             last_error = Some(anyhow::anyhow!("provider route identity mismatch"));

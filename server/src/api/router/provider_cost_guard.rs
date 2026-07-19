@@ -9,6 +9,7 @@ use crate::{
         usage::{UsageEvent, MAX_AUTHORITATIVE_EVENT_COST_CENTS},
         DbPool,
     },
+    pricing::UsageProvenance,
 };
 
 pub(crate) enum Admission {
@@ -148,15 +149,28 @@ impl ProviderCostGuard {
         }
     }
 
-    pub(crate) fn settle(&mut self, mut event: UsageEvent, actual_cost_cents: i64) -> Result<()> {
+    pub(crate) fn settle(
+        &mut self,
+        mut event: UsageEvent,
+        actual_cost_cents: i64,
+        usage_provenance: UsageProvenance,
+    ) -> Result<()> {
         let route_matches = event.provider.as_deref() == Some(self.requested_provider.as_str())
             && event.model.as_deref() == Some(self.requested_model.as_str());
-        let settled_cost = if route_matches {
-            actual_cost_cents.clamp(0, MAX_AUTHORITATIVE_EVENT_COST_CENTS)
+        let reported_cost = actual_cost_cents.clamp(0, MAX_AUTHORITATIVE_EVENT_COST_CENTS);
+        let trusted_exact = route_matches && usage_provenance.is_exact();
+        let settled_cost = if trusted_exact {
+            reported_cost
         } else {
             self.projected_cost_cents
-                .max(actual_cost_cents)
+                .max(reported_cost)
                 .clamp(0, MAX_AUTHORITATIVE_EVENT_COST_CENTS)
+        };
+        let projection_exceeded = trusted_exact && reported_cost > self.projected_cost_cents;
+        let persisted_provenance = if route_matches {
+            usage_provenance
+        } else {
+            UsageProvenance::Missing
         };
         event.request_id = self.request_id.clone();
         // The hold is bound to the requested route. A malformed/crossed
@@ -171,10 +185,23 @@ impl ProviderCostGuard {
             &self.account_id,
             &self.request_id,
             &self.reservation_token,
-            settled_cost,
+            reported_cost,
+            persisted_provenance,
             &event,
         )?;
         self.armed = false;
+        if projection_exceeded {
+            tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
+                request_id = %self.request_id,
+                provider = %self.requested_provider,
+                model = %self.requested_model,
+                projected_cost_cents = self.projected_cost_cents,
+                exact_cost_cents = reported_cost,
+                "exact provider cost exceeded its pre-dispatch upper bound"
+            );
+            anyhow::bail!("exact provider cost exceeded pre-dispatch upper bound")
+        }
         Ok(())
     }
 
@@ -189,6 +216,7 @@ impl ProviderCostGuard {
             &self.request_id,
             &self.reservation_token,
             self.fallback_cost_cents,
+            UsageProvenance::Missing,
             &self.fallback_event,
         )?;
         self.armed = false;
@@ -207,6 +235,7 @@ impl Drop for ProviderCostGuard {
             &self.request_id,
             &self.reservation_token,
             self.fallback_cost_cents,
+            UsageProvenance::Missing,
             &self.fallback_event,
         ) {
             tracing::error!(

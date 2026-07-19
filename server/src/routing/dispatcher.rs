@@ -38,7 +38,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::config::UpstreamKeys;
+use crate::{
+    config::UpstreamKeys,
+    pricing::{self, UsageProvenance},
+};
 
 const OPENAI_FAST_MODEL: &str = "gpt-5.4-mini";
 const OPENAI_ACCURATE_MODEL: &str = "gpt-5.5";
@@ -225,6 +228,7 @@ pub struct Completion {
     pub model: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub usage_provenance: UsageProvenance,
 }
 
 /// Provider-neutral event returned by a streaming upstream completion.
@@ -234,6 +238,7 @@ pub enum CompletionStreamEvent {
     Done {
         input_tokens: i64,
         output_tokens: i64,
+        usage_provenance: UsageProvenance,
     },
 }
 
@@ -990,11 +995,34 @@ fn openai_compatible_temperature_for(
     temperature
 }
 
-fn estimated_tokens_from_chars(chars: usize) -> i64 {
-    if chars == 0 {
+fn estimated_tokens_from_utf8_bytes(bytes: usize) -> i64 {
+    if bytes == 0 {
         return 0;
     }
-    ((chars as i64) + 2) / 3
+    i64::try_from(bytes).unwrap_or(i64::MAX)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NormalizedUsage {
+    input_tokens: i64,
+    output_tokens: i64,
+    provenance: UsageProvenance,
+}
+
+fn trusted_text_usage(input_tokens: i64, output_tokens: i64, output_bytes: usize) -> bool {
+    input_tokens > 0 && output_tokens >= 0 && (output_bytes == 0 || output_tokens > 0)
+}
+
+fn fallback_text_usage(
+    fallback_input_tokens: Option<i64>,
+    output_bytes: usize,
+    provenance: UsageProvenance,
+) -> NormalizedUsage {
+    NormalizedUsage {
+        input_tokens: fallback_input_tokens.unwrap_or(0).max(1),
+        output_tokens: estimated_tokens_from_utf8_bytes(output_bytes),
+        provenance,
+    }
 }
 
 fn openai_stream_usage_or_estimate(
@@ -1002,23 +1030,47 @@ fn openai_stream_usage_or_estimate(
     model: &str,
     seen_done: bool,
     final_usage: Option<OpenAiUsage>,
-    output_chars: usize,
+    output_bytes: usize,
     fallback_input_tokens: Option<i64>,
-) -> Result<OpenAiUsage> {
+) -> Result<NormalizedUsage> {
     if !seen_done {
         return Err(anyhow!("{provider} stream ended before [DONE]"));
     }
-    Ok(final_usage.unwrap_or_else(|| {
-        tracing::warn!(
-            provider,
-            model,
-            "OpenAI-compatible stream ended without final usage; using token estimate"
-        );
-        OpenAiUsage {
-            prompt_tokens: fallback_input_tokens.unwrap_or(0),
-            completion_tokens: estimated_tokens_from_chars(output_chars),
+    match final_usage {
+        Some(usage)
+            if trusted_text_usage(usage.prompt_tokens, usage.completion_tokens, output_bytes) =>
+        {
+            Ok(NormalizedUsage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                provenance: UsageProvenance::Exact,
+            })
         }
-    }))
+        Some(_) => {
+            tracing::warn!(
+                provider,
+                model,
+                "OpenAI-compatible stream returned untrusted usage; using conservative estimate"
+            );
+            Ok(fallback_text_usage(
+                fallback_input_tokens,
+                output_bytes,
+                UsageProvenance::Estimated,
+            ))
+        }
+        None => {
+            tracing::warn!(
+                provider,
+                model,
+                "OpenAI-compatible stream ended without final usage; using conservative estimate"
+            );
+            Ok(fallback_text_usage(
+                fallback_input_tokens,
+                output_bytes,
+                UsageProvenance::Missing,
+            ))
+        }
+    }
 }
 
 fn anthropic_stream_usage_or_estimate(
@@ -1026,21 +1078,45 @@ fn anthropic_stream_usage_or_estimate(
     seen_stop: bool,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
-    output_chars: usize,
+    output_bytes: usize,
     fallback_input: i64,
-) -> Result<(i64, i64)> {
+) -> Result<NormalizedUsage> {
     if !seen_stop {
         return Err(anyhow!("anthropic stream ended before message_stop"));
     }
-    let output_tokens = output_tokens.unwrap_or_else(|| {
-        tracing::warn!(
-            provider = "anthropic",
-            model,
-            "Anthropic stream ended without final usage; using token estimate"
-        );
-        estimated_tokens_from_chars(output_chars)
-    });
-    Ok((input_tokens.unwrap_or(fallback_input), output_tokens))
+    match (input_tokens, output_tokens) {
+        (Some(input), Some(output)) if trusted_text_usage(input, output, output_bytes) => {
+            Ok(NormalizedUsage {
+                input_tokens: input,
+                output_tokens: output,
+                provenance: UsageProvenance::Exact,
+            })
+        }
+        (None, None) => {
+            tracing::warn!(
+                provider = "anthropic",
+                model,
+                "Anthropic stream ended without usage; using conservative estimate"
+            );
+            Ok(fallback_text_usage(
+                Some(fallback_input),
+                output_bytes,
+                UsageProvenance::Missing,
+            ))
+        }
+        _ => {
+            tracing::warn!(
+                provider = "anthropic",
+                model,
+                "Anthropic stream returned partial or untrusted usage; using conservative estimate"
+            );
+            Ok(fallback_text_usage(
+                Some(fallback_input),
+                output_bytes,
+                UsageProvenance::Estimated,
+            ))
+        }
+    }
 }
 
 /// Provider terminal reasons are intentionally handled with a small allowlist.
@@ -1239,21 +1315,30 @@ async fn openai_compatible_complete(
         .next()
         .and_then(|c| c.message.content)
         .unwrap_or_default();
-    let (input_tokens, output_tokens) = parsed
-        .usage
-        .map(|u| (u.prompt_tokens, u.completion_tokens))
-        .unwrap_or_else(|| {
-            (
-                fallback_input_tokens.unwrap_or(0),
-                estimated_tokens_from_chars(text.chars().count()),
-            )
-        });
+    let usage = match parsed.usage {
+        Some(usage)
+            if trusted_text_usage(usage.prompt_tokens, usage.completion_tokens, text.len()) =>
+        {
+            NormalizedUsage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                provenance: UsageProvenance::Exact,
+            }
+        }
+        Some(_) => fallback_text_usage(
+            fallback_input_tokens,
+            text.len(),
+            UsageProvenance::Estimated,
+        ),
+        None => fallback_text_usage(fallback_input_tokens, text.len(), UsageProvenance::Missing),
+    };
     Ok(Completion {
         text,
         provider: provider.to_string(),
         model: model.to_string(),
-        input_tokens,
-        output_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        usage_provenance: usage.provenance,
     })
 }
 
@@ -1378,7 +1463,7 @@ async fn openai_compatible_complete_stream(
         let mut pending_utf8 = Vec::new();
         let mut seen_done = false;
         let mut final_usage: Option<OpenAiUsage> = None;
-        let mut output_chars: usize = 0;
+        let mut output_bytes: usize = 0;
 
         while let Some(chunk) = bytes.next().await {
             let chunk = chunk.with_context(|| format!("{stream_provider} stream read"))?;
@@ -1401,7 +1486,7 @@ async fn openai_compatible_complete_stream(
                     &mut final_usage,
                 )?;
                 for delta in deltas {
-                    output_chars = output_chars.saturating_add(delta.chars().count());
+                    output_bytes = output_bytes.saturating_add(delta.len());
                     yield CompletionStreamEvent::Delta(delta);
                 }
                 if let Some(reason) = abnormal_terminal_reason {
@@ -1432,7 +1517,7 @@ async fn openai_compatible_complete_stream(
                 &mut final_usage,
             )?;
             for delta in deltas {
-                output_chars = output_chars.saturating_add(delta.chars().count());
+                output_bytes = output_bytes.saturating_add(delta.len());
                 yield CompletionStreamEvent::Delta(delta);
             }
             if let Some(reason) = abnormal_terminal_reason {
@@ -1447,13 +1532,13 @@ async fn openai_compatible_complete_stream(
             &stream_model,
             seen_done,
             final_usage,
-            output_chars,
+            output_bytes,
             fallback_input_tokens,
         )?;
-        let (input_tokens, output_tokens) = (usage.prompt_tokens, usage.completion_tokens);
         yield CompletionStreamEvent::Done {
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            usage_provenance: usage.provenance,
         };
     };
 
@@ -1666,17 +1751,15 @@ fn ensure_gemini_completion_finished(response: &GeminiGenerateResp) -> Result<()
 }
 
 impl GeminiUsage {
-    fn token_counts(&self, fallback_input_tokens: i64) -> (i64, i64) {
-        let input_tokens = self.prompt_token_count.unwrap_or(fallback_input_tokens);
-        let output_tokens = self
-            .candidates_token_count
-            .or_else(|| {
-                self.total_token_count
-                    .zip(Some(input_tokens))
-                    .map(|(total, input)| total.saturating_sub(input).max(0))
-            })
-            .unwrap_or(0);
-        (input_tokens, output_tokens)
+    fn exact_token_counts(&self, output_bytes: usize) -> Option<(i64, i64)> {
+        let input_tokens = self.prompt_token_count?;
+        let output_tokens = self.candidates_token_count.or_else(|| {
+            self.total_token_count
+                .zip(Some(input_tokens))
+                .map(|(total, input)| total.saturating_sub(input).max(0))
+        })?;
+        trusted_text_usage(input_tokens, output_tokens, output_bytes)
+            .then_some((input_tokens, output_tokens))
     }
 }
 
@@ -1734,18 +1817,30 @@ async fn gemini_complete(
         return Err(anyhow!("gemini error: {message}"));
     }
     ensure_gemini_completion_finished(&parsed)?;
-    let fallback_input = fallback_input_tokens.unwrap_or(0);
-    let (input_tokens, output_tokens) = parsed
-        .usage_metadata
-        .as_ref()
-        .map(|usage| usage.token_counts(fallback_input))
-        .unwrap_or((fallback_input, 0));
+    let usage_metadata = parsed.usage_metadata.clone();
+    let text = parsed.text();
+    let usage = match usage_metadata {
+        Some(metadata) => match metadata.exact_token_counts(text.len()) {
+            Some((input_tokens, output_tokens)) => NormalizedUsage {
+                input_tokens,
+                output_tokens,
+                provenance: UsageProvenance::Exact,
+            },
+            None => fallback_text_usage(
+                fallback_input_tokens,
+                text.len(),
+                UsageProvenance::Estimated,
+            ),
+        },
+        None => fallback_text_usage(fallback_input_tokens, text.len(), UsageProvenance::Missing),
+    };
     Ok(Completion {
-        text: parsed.text(),
+        text,
         provider: "gemini".to_string(),
         model: model.to_string(),
-        input_tokens,
-        output_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        usage_provenance: usage.provenance,
     })
 }
 
@@ -1798,6 +1893,7 @@ async fn gemini_complete_stream(
         let mut final_usage: Option<GeminiUsage> = None;
         let mut seen_done = false;
         let mut seen_terminal = false;
+        let mut output_bytes = 0_usize;
 
         while let Some(chunk) = bytes.next().await {
             let chunk = chunk.context("gemini stream read")?;
@@ -1816,6 +1912,7 @@ async fn gemini_complete_stream(
                     abnormal_terminal_reason,
                 } = parse_gemini_stream_chunk(data, &mut final_usage, &mut seen_terminal)?;
                 for delta in deltas {
+                    output_bytes = output_bytes.saturating_add(delta.len());
                     yield CompletionStreamEvent::Delta(delta);
                 }
                 if let Some(reason) = abnormal_terminal_reason {
@@ -1841,6 +1938,7 @@ async fn gemini_complete_stream(
                 abnormal_terminal_reason,
             } = parse_gemini_stream_chunk(data, &mut final_usage, &mut seen_terminal)?;
             for delta in deltas {
+                output_bytes = output_bytes.saturating_add(delta.len());
                 yield CompletionStreamEvent::Delta(delta);
             }
             if let Some(reason) = abnormal_terminal_reason {
@@ -1850,15 +1948,29 @@ async fn gemini_complete_stream(
         if !seen_done && !seen_terminal {
             Err::<(), anyhow::Error>(anyhow!("gemini stream ended before terminal marker"))?;
         }
-        if seen_done && final_usage.is_none() {
-            Err::<(), anyhow::Error>(anyhow!("gemini stream ended before final usage"))?;
-        }
-        let usage = final_usage
-            .ok_or_else(|| anyhow!("gemini stream ended before final usage"))?;
-        let (input_tokens, output_tokens) = usage.token_counts(fallback_input);
+        let usage = match final_usage {
+            Some(metadata) => match metadata.exact_token_counts(output_bytes) {
+                Some((input_tokens, output_tokens)) => NormalizedUsage {
+                    input_tokens,
+                    output_tokens,
+                    provenance: UsageProvenance::Exact,
+                },
+                None => fallback_text_usage(
+                    Some(fallback_input),
+                    output_bytes,
+                    UsageProvenance::Estimated,
+                ),
+            },
+            None => fallback_text_usage(
+                Some(fallback_input),
+                output_bytes,
+                UsageProvenance::Missing,
+            ),
+        };
         yield CompletionStreamEvent::Done {
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            usage_provenance: usage.provenance,
         };
     };
 
@@ -2129,16 +2241,28 @@ async fn anthropic_complete(
         .map(|c| c.text)
         .collect::<Vec<_>>()
         .join("");
+    let usage = match parsed.usage {
+        Some(usage) if trusted_text_usage(usage.input_tokens, usage.output_tokens, text.len()) => {
+            NormalizedUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                provenance: UsageProvenance::Exact,
+            }
+        }
+        Some(_) => fallback_text_usage(
+            fallback_input_tokens,
+            text.len(),
+            UsageProvenance::Estimated,
+        ),
+        None => fallback_text_usage(fallback_input_tokens, text.len(), UsageProvenance::Missing),
+    };
     Ok(Completion {
         text,
         provider: "anthropic".to_string(),
         model: model.to_string(),
-        input_tokens: parsed
-            .usage
-            .as_ref()
-            .map(|u| u.input_tokens)
-            .unwrap_or_else(|| fallback_input_tokens.unwrap_or(0)),
-        output_tokens: parsed.usage.as_ref().map(|u| u.output_tokens).unwrap_or(0),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        usage_provenance: usage.provenance,
     })
 }
 
@@ -2250,7 +2374,7 @@ async fn anthropic_complete_stream(
         let mut input_tokens: Option<i64> = None;
         let mut output_tokens: Option<i64> = None;
         let mut seen_stop = false;
-        let mut output_chars: usize = 0;
+        let mut output_bytes: usize = 0;
 
         while let Some(chunk) = bytes.next().await {
             let chunk = chunk.context("anthropic stream read")?;
@@ -2267,7 +2391,7 @@ async fn anthropic_complete_stream(
                     &mut seen_stop,
                 )?;
                 for delta in deltas {
-                    output_chars = output_chars.saturating_add(delta.chars().count());
+                    output_bytes = output_bytes.saturating_add(delta.len());
                     yield CompletionStreamEvent::Delta(delta);
                 }
                 if let Some(reason) = abnormal_terminal_reason {
@@ -2291,24 +2415,25 @@ async fn anthropic_complete_stream(
                 &mut seen_stop,
             )?;
             for delta in deltas {
-                output_chars = output_chars.saturating_add(delta.chars().count());
+                output_bytes = output_bytes.saturating_add(delta.len());
                 yield CompletionStreamEvent::Delta(delta);
             }
             if let Some(reason) = abnormal_terminal_reason {
                 Err::<(), anyhow::Error>(abnormal_terminal_error("anthropic", &reason))?;
             }
         }
-        let (input_tokens, output_tokens) = anthropic_stream_usage_or_estimate(
+        let usage = anthropic_stream_usage_or_estimate(
             &stream_model,
             seen_stop,
             input_tokens,
             output_tokens,
-            output_chars,
+            output_bytes,
             fallback_input,
         )?;
         yield CompletionStreamEvent::Done {
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            usage_provenance: usage.provenance,
         };
     };
 
@@ -2578,6 +2703,7 @@ pub struct EmbedCompletion {
     pub provider: String,
     pub model: String,
     pub input_tokens: i64,
+    pub usage_provenance: UsageProvenance,
 }
 
 #[derive(Debug, Clone)]
@@ -2586,6 +2712,7 @@ pub struct EmbedBatchCompletion {
     pub provider: String,
     pub model: String,
     pub input_tokens: i64,
+    pub usage_provenance: UsageProvenance,
 }
 
 #[derive(Deserialize)]
@@ -2597,6 +2724,17 @@ struct OpenAiEmbedResp {
 #[derive(Deserialize)]
 struct OpenAiEmbedData {
     embedding: Vec<f32>,
+}
+
+fn normalize_embedding_usage(
+    usage: Option<OpenAiUsage>,
+    fallback_input_tokens: i64,
+) -> (i64, UsageProvenance) {
+    match usage {
+        Some(usage) if usage.prompt_tokens > 0 => (usage.prompt_tokens, UsageProvenance::Exact),
+        Some(_) => (fallback_input_tokens, UsageProvenance::Estimated),
+        None => (fallback_input_tokens, UsageProvenance::Missing),
+    }
 }
 
 async fn openai_embed(key: &str, model: &str, input: &str) -> Result<EmbedCompletion> {
@@ -2611,6 +2749,7 @@ async fn openai_embed(key: &str, model: &str, input: &str) -> Result<EmbedComple
         provider: batch.provider,
         model: batch.model,
         input_tokens: batch.input_tokens,
+        usage_provenance: batch.usage_provenance,
     })
 }
 
@@ -2658,15 +2797,16 @@ async fn openai_embed_batch(
         .into_iter()
         .map(|item| item.embedding)
         .collect::<Vec<_>>();
-    let input_tokens = parsed
-        .usage
-        .map(|u| u.prompt_tokens)
-        .unwrap_or_else(|| inputs.iter().map(|input| (input.len() as i64) / 4).sum());
+    let fallback_input_tokens =
+        pricing::utf8_input_token_upper_bound(inputs.iter().map(String::as_str));
+    let (input_tokens, usage_provenance) =
+        normalize_embedding_usage(parsed.usage, fallback_input_tokens);
     Ok(EmbedBatchCompletion {
         vectors,
         provider: "openai".to_string(),
         model: model.to_string(),
         input_tokens,
+        usage_provenance,
     })
 }
 
@@ -2677,19 +2817,34 @@ pub async fn transcribe(
     model: &str,
     audio_bytes: &[u8],
     content_type: &str,
+    verified_duration_seconds: i64,
 ) -> Result<TranscribeCompletion> {
     match provider {
         "deepgram" => {
             let key = keys
                 .deepgram_key(&format!("transcribe:{model}:{}", audio_bytes.len()))
                 .ok_or_else(|| anyhow!("DEEPGRAM_API_KEY(S) not configured on bluey-server"))?;
-            deepgram_transcribe(key, model, audio_bytes, content_type).await
+            deepgram_transcribe(
+                key,
+                model,
+                audio_bytes,
+                content_type,
+                verified_duration_seconds,
+            )
+            .await
         }
         "openai" => {
             let key = keys
                 .openai_key(&format!("transcribe:{model}:{}", audio_bytes.len()))
                 .ok_or_else(|| anyhow!("OPENAI_API_KEY(S) not configured on bluey-server"))?;
-            openai_transcribe(key, model, audio_bytes, content_type).await
+            openai_transcribe(
+                key,
+                model,
+                audio_bytes,
+                content_type,
+                verified_duration_seconds,
+            )
+            .await
         }
         other => Err(anyhow!(
             "unsupported transcribe provider for managed dispatch: {other}"
@@ -2703,10 +2858,29 @@ pub async fn transcribe_with_key(
     model: &str,
     audio_bytes: &[u8],
     content_type: &str,
+    verified_duration_seconds: i64,
 ) -> Result<TranscribeCompletion> {
     match provider {
-        "deepgram" => deepgram_transcribe(api_key, model, audio_bytes, content_type).await,
-        "openai" => openai_transcribe(api_key, model, audio_bytes, content_type).await,
+        "deepgram" => {
+            deepgram_transcribe(
+                api_key,
+                model,
+                audio_bytes,
+                content_type,
+                verified_duration_seconds,
+            )
+            .await
+        }
+        "openai" => {
+            openai_transcribe(
+                api_key,
+                model,
+                audio_bytes,
+                content_type,
+                verified_duration_seconds,
+            )
+            .await
+        }
         other => Err(anyhow!(
             "unsupported transcribe provider for managed dispatch: {other}"
         )),
@@ -2720,6 +2894,7 @@ pub struct TranscribeCompletion {
     pub model: String,
     /// Audio duration in seconds (used as "input tokens" for billing).
     pub duration_seconds: i64,
+    pub usage_provenance: UsageProvenance,
 }
 
 #[derive(Deserialize)]
@@ -2758,7 +2933,11 @@ async fn deepgram_transcribe(
     model: &str,
     audio_bytes: &[u8],
     content_type: &str,
+    verified_duration_seconds: i64,
 ) -> Result<TranscribeCompletion> {
+    if verified_duration_seconds <= 0 {
+        return Err(anyhow!("transcribe duration must be locally verified"));
+    }
     // POST to /v1/listen?model=...&punctuate=true with the raw audio
     // bytes as the body. Deepgram accepts audio/wav, audio/mpeg, etc.
     let mut default_url = format!(
@@ -2793,17 +2972,20 @@ async fn deepgram_transcribe(
         .and_then(|c| c.alternatives.into_iter().next())
         .map(|a| a.transcript)
         .unwrap_or_default();
-    let duration_seconds = parsed
+    let provider_duration_seconds = parsed
         .metadata
         .and_then(|m| m.duration)
-        .map(|d| d.ceil() as i64)
-        .unwrap_or(0)
-        .max(1); // bill minimum 1 second
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .map(|duration| duration.ceil().min(i64::MAX as f64) as i64);
+    let duration_seconds = provider_duration_seconds.unwrap_or(verified_duration_seconds);
     Ok(TranscribeCompletion {
         text,
         provider: "deepgram".to_string(),
         model: model.to_string(),
         duration_seconds,
+        // Provider duration is exact when present; otherwise the endpoint has
+        // already verified PCM sample count and byte rate locally.
+        usage_provenance: UsageProvenance::Exact,
     })
 }
 
@@ -2848,7 +3030,11 @@ async fn openai_transcribe(
     model: &str,
     audio_bytes: &[u8],
     content_type: &str,
+    verified_duration_seconds: i64,
 ) -> Result<TranscribeCompletion> {
+    if verified_duration_seconds <= 0 {
+        return Err(anyhow!("transcribe duration must be locally verified"));
+    }
     let file = Part::bytes(audio_bytes.to_vec())
         .file_name(audio_filename(content_type))
         .mime_str(content_type)
@@ -2880,14 +3066,9 @@ async fn openai_transcribe(
         text: parsed.text,
         provider: "openai".to_string(),
         model: model.to_string(),
-        duration_seconds: estimate_audio_seconds(audio_bytes),
+        duration_seconds: verified_duration_seconds,
+        usage_provenance: UsageProvenance::Exact,
     })
-}
-
-fn estimate_audio_seconds(audio_bytes: &[u8]) -> i64 {
-    // Chunked REST STT receives mixed compressed/uncompressed formats. This is
-    // only used when a provider does not return duration metadata.
-    (audio_bytes.len() as i64 / 16_000).max(1)
 }
 
 fn audio_filename(content_type: &str) -> &'static str {
@@ -3285,7 +3466,7 @@ mod tests {
 
         assert_eq!(parsed.deltas, vec!["hello"]);
         assert!(parsed.abnormal_terminal_reason.is_none());
-        assert_eq!(usage.unwrap().token_counts(0), (7, 3));
+        assert_eq!(usage.unwrap().exact_token_counts(0), Some((7, 3)));
         assert!(seen_terminal);
     }
 
@@ -3557,6 +3738,84 @@ mod tests {
                 .unwrap_err();
 
         assert!(err.to_string().contains("message_stop"));
+    }
+
+    #[test]
+    fn omitted_and_zero_provider_usage_never_becomes_exact() {
+        let exact = openai_stream_usage_or_estimate(
+            "openai",
+            "gpt-5.4-mini",
+            true,
+            Some(OpenAiUsage {
+                prompt_tokens: 7,
+                completion_tokens: 3,
+            }),
+            5,
+            Some(100),
+        )
+        .unwrap();
+        assert_eq!(exact.provenance, UsageProvenance::Exact);
+        assert_eq!((exact.input_tokens, exact.output_tokens), (7, 3));
+
+        let zero = openai_stream_usage_or_estimate(
+            "openai",
+            "gpt-5.4-mini",
+            true,
+            Some(OpenAiUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            }),
+            5,
+            Some(100),
+        )
+        .unwrap();
+        assert_eq!(zero.provenance, UsageProvenance::Estimated);
+        assert_eq!((zero.input_tokens, zero.output_tokens), (100, 5));
+
+        let missing =
+            openai_stream_usage_or_estimate("openai", "gpt-5.4-mini", true, None, 5, Some(100))
+                .unwrap();
+        assert_eq!(missing.provenance, UsageProvenance::Missing);
+        assert_eq!((missing.input_tokens, missing.output_tokens), (100, 5));
+
+        let anthropic_partial =
+            anthropic_stream_usage_or_estimate("claude-sonnet-4-6", true, Some(0), Some(0), 5, 100)
+                .unwrap();
+        assert_eq!(anthropic_partial.provenance, UsageProvenance::Estimated);
+        assert_eq!(
+            (
+                anthropic_partial.input_tokens,
+                anthropic_partial.output_tokens
+            ),
+            (100, 5)
+        );
+        let anthropic_missing =
+            anthropic_stream_usage_or_estimate("claude-sonnet-4-6", true, None, None, 5, 100)
+                .unwrap();
+        assert_eq!(anthropic_missing.provenance, UsageProvenance::Missing);
+
+        let gemini_zero = GeminiUsage {
+            prompt_token_count: Some(0),
+            candidates_token_count: Some(0),
+            total_token_count: Some(0),
+        };
+        assert_eq!(gemini_zero.exact_token_counts(5), None);
+
+        let embed_bound = pricing::utf8_input_token_upper_bound(["😀界"]);
+        assert_eq!(
+            normalize_embedding_usage(
+                Some(OpenAiUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                }),
+                embed_bound,
+            ),
+            (embed_bound, UsageProvenance::Estimated)
+        );
+        assert_eq!(
+            normalize_embedding_usage(None, embed_bound),
+            (embed_bound, UsageProvenance::Missing)
+        );
     }
 
     #[test]

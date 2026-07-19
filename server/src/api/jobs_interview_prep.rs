@@ -18,6 +18,7 @@ use super::{
 use crate::{
     auth::AuthedAccount,
     db::jobs::{self, ApplicationEvidence, JobApplication, ResumeVersion},
+    pricing,
 };
 
 type ApiError = (StatusCode, String);
@@ -90,7 +91,8 @@ pub async fn generate(
         "jobs-interview-prep-v1-{}",
         source.grounding.receipt_fingerprint
     );
-    let estimated_input_tokens = ((source.system.len() + source.user.len()) as i64 / 4).max(1);
+    let estimated_input_tokens =
+        pricing::utf8_input_token_upper_bound([source.system.as_str(), source.user.as_str()]);
     let completion = router::complete_for_account(
         state,
         account,

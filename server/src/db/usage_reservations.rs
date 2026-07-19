@@ -9,12 +9,12 @@
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
-use crate::config::UpstreamSpendGuard;
+use crate::config::{UpstreamSpendGuard, UPSTREAM_SPEND_TRUTH_RETENTION_MS};
 use crate::db::{
     balance,
     usage::{
-        UsageEvent, CUTOVER_SPEND_BASELINE_GRACE_MS, MAX_AUTHORITATIVE_EVENT_COST_CENTS,
-        MAX_AUTHORITATIVE_EVENT_LATENCY_MS, MAX_AUTHORITATIVE_EVENT_TOKENS,
+        UsageEvent, MAX_AUTHORITATIVE_EVENT_COST_CENTS, MAX_AUTHORITATIVE_EVENT_LATENCY_MS,
+        MAX_AUTHORITATIVE_EVENT_TOKENS,
     },
     DbPool,
 };
@@ -22,6 +22,7 @@ use crate::db::{
 const STATUS_RESERVED: &str = "reserved";
 const STATUS_SETTLED: &str = "settled";
 const STATUS_RELEASED: &str = "released";
+const MAX_USAGE_RESERVATION_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReserveUsageInput<'a> {
@@ -79,6 +80,20 @@ pub(crate) struct ReleasedUsage {
     pub refunded_trial_seconds: i64,
     pub balance_cents_after: i64,
     pub trial_seconds_remaining: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpiredReleaseFence {
+    attempt: i64,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpiredReservationKey {
+    account_id: String,
+    request_id: String,
+    attempt: i64,
+    expires_at_ms: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -143,6 +158,10 @@ pub(crate) fn reserve(
     input: ReserveUsageInput<'_>,
 ) -> Result<ReservedUsage, UsageReservationError> {
     validate_reserve_input(input)?;
+    // Crash/restart-safe admission: refund any DB-clock-expired reservation
+    // before trial serialization, balance checks, or request-id replay logic.
+    // Delayed tasks are only an optimization; correctness lives here.
+    let _ = reconcile_expired_for_account(pool, input.account_id, 0)?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => reserve_sqlite(pool, input),
         DbPool::Postgres(_) => reserve_postgres(pool, input),
@@ -150,6 +169,7 @@ pub(crate) fn reserve(
 }
 
 fn validate_reserve_input(input: ReserveUsageInput<'_>) -> Result<(), UsageReservationError> {
+    let ttl_ms = input.expires_at_ms.checked_sub(input.created_at_ms);
     if input.account_id.trim().is_empty()
         || input.request_id.trim().is_empty()
         || input.kind.trim().is_empty()
@@ -158,11 +178,30 @@ fn validate_reserve_input(input: ReserveUsageInput<'_>) -> Result<(), UsageReser
         || input.estimated_upstream_cents < 0
         || input.estimated_customer_cents > MAX_AUTHORITATIVE_EVENT_COST_CENTS
         || input.estimated_upstream_cents > MAX_AUTHORITATIVE_EVENT_COST_CENTS
-        || input.expires_at_ms <= input.created_at_ms
+        || !matches!(ttl_ms, Some(1..=MAX_USAGE_RESERVATION_TTL_MS))
     {
         return Err(UsageReservationError::InvalidReservation);
     }
     Ok(())
+}
+
+fn with_db_authoritative_time<'a>(
+    input: ReserveUsageInput<'a>,
+    db_now_ms: i64,
+) -> Result<ReserveUsageInput<'a>, UsageReservationError> {
+    let ttl_ms = input
+        .expires_at_ms
+        .checked_sub(input.created_at_ms)
+        .filter(|ttl| (1..=MAX_USAGE_RESERVATION_TTL_MS).contains(ttl))
+        .ok_or(UsageReservationError::InvalidReservation)?;
+    let expires_at_ms = db_now_ms
+        .checked_add(ttl_ms)
+        .ok_or(UsageReservationError::InvalidReservation)?;
+    Ok(ReserveUsageInput {
+        created_at_ms: db_now_ms,
+        expires_at_ms,
+        ..input
+    })
 }
 
 fn reserve_sqlite(
@@ -173,6 +212,9 @@ fn reserve_sqlite(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| UsageReservationError::Db(error.into()))?;
+    let db_now_ms = super::jobs_provider_cost_holds::sqlite_transaction_now_ms(&tx)
+        .map_err(UsageReservationError::Db)?;
+    let input = with_db_authoritative_time(input, db_now_ms)?;
 
     let account = tx
         .query_row(
@@ -207,29 +249,23 @@ fn reserve_sqlite(
         .map_err(|error| UsageReservationError::Db(error.into()))?;
     let attempt = next_attempt(existing.as_ref())?;
     if let Some(guard) = input.upstream_spend_guard {
-        let baseline_retention_ms = guard
-            .window_hours
-            .max(0)
-            .saturating_mul(3_600_000)
-            .saturating_add(CUTOVER_SPEND_BASELINE_GRACE_MS);
+        let retention_cutoff = db_now_ms.saturating_sub(UPSTREAM_SPEND_TRUTH_RETENTION_MS);
         tx.execute(
             "DELETE FROM usage_cutover_spend_baseline
-              WHERE occurred_at < datetime('now', ?1)",
-            params![format!("-{} seconds", baseline_retention_ms / 1_000)],
+              WHERE occurred_at < datetime(?1 / 1000, 'unixepoch')",
+            params![retention_cutoff],
         )
         .map_err(|error| UsageReservationError::Db(error.into()))?;
+        let window_start = db_now_ms.saturating_sub(guard.window_hours.saturating_mul(3_600_000));
         let usage_without_jobs_holds = super::usage::sqlite_saturated_cost_sum(
             &tx,
             "SELECT u.cost_cents_to_bluey
                    FROM usage_events u
-                  WHERE u.origin = 'server' AND u.ts >= datetime('now', ?1)
+                  WHERE u.origin = 'server' AND u.ts >= datetime(?1 / 1000, 'unixepoch')
                     AND substr(u.kind, -8) != '_attempt'",
-            params![format!("-{} hours", guard.window_hours)],
+            params![window_start],
         )
         .map_err(UsageReservationError::Db)?;
-        let window_start = input
-            .created_at_ms
-            .saturating_sub(guard.window_hours.saturating_mul(3_600_000));
         let jobs_exposure = super::usage::sqlite_saturated_cost_sum(
             &tx,
             "SELECT CASE WHEN status = 'held'
@@ -242,8 +278,8 @@ fn reserve_sqlite(
         let cutover_baseline_exposure = super::usage::sqlite_saturated_cost_sum(
             &tx,
             "SELECT cost_cents FROM usage_cutover_spend_baseline
-              WHERE occurred_at >= datetime('now', ?1)",
-            params![format!("-{} hours", guard.window_hours)],
+              WHERE occurred_at >= datetime(?1 / 1000, 'unixepoch')",
+            params![window_start],
         )
         .map_err(UsageReservationError::Db)?;
         let ordinary_exposure = super::usage::sqlite_saturated_cost_sum(
@@ -261,12 +297,7 @@ fn reserve_sqlite(
                                AND u.origin = 'server'
                                AND u.kind = r.kind
                         )))",
-            params![
-                input.account_id,
-                input.request_id,
-                input.created_at_ms,
-                window_start
-            ],
+            params![input.account_id, input.request_id, db_now_ms, window_start],
         )
         .map_err(UsageReservationError::Db)?;
         if usage_without_jobs_holds
@@ -276,6 +307,8 @@ fn reserve_sqlite(
             .saturating_add(input.estimated_upstream_cents)
             > guard.limit_cents
         {
+            tx.commit()
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
             return Err(UsageReservationError::UpstreamSpendLimit);
         }
     }
@@ -412,6 +445,9 @@ fn reserve_postgres(
     let mut tx = conn
         .transaction()
         .map_err(|error| UsageReservationError::Db(error.into()))?;
+    let db_now_ms = super::jobs_provider_cost_holds::postgres_transaction_now_ms(&mut tx)
+        .map_err(UsageReservationError::Db)?;
+    let input = with_db_authoritative_time(input, db_now_ms)?;
     tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended('jobs-provider-cost-global', 0))",
         &[],
@@ -461,32 +497,26 @@ fn reserve_postgres(
         .transpose()?;
     let attempt = next_attempt(existing.as_ref())?;
     if let Some(guard) = input.upstream_spend_guard {
-        let baseline_retention_ms = guard
-            .window_hours
-            .max(0)
-            .saturating_mul(3_600_000)
-            .saturating_add(CUTOVER_SPEND_BASELINE_GRACE_MS);
+        let retention_cutoff = db_now_ms.saturating_sub(UPSTREAM_SPEND_TRUTH_RETENTION_MS);
         tx.execute(
             "DELETE FROM usage_cutover_spend_baseline
-              WHERE occurred_at < now() - ($1::bigint * interval '1 millisecond')",
-            &[&baseline_retention_ms],
+              WHERE occurred_at < to_timestamp(($1::bigint)::double precision / 1000.0)",
+            &[&retention_cutoff],
         )
         .map_err(|error| UsageReservationError::Db(error.into()))?;
+        let window_start = db_now_ms.saturating_sub(guard.window_hours.saturating_mul(3_600_000));
         let usage_without_jobs_holds: i64 = tx
             .query_one(
                 "SELECT LEAST(COALESCE(SUM(LEAST(GREATEST(u.cost_cents_to_bluey, 0), 100000000)::numeric), 0),
                                   9223372036854775807)::bigint
                    FROM usage_events u
                   WHERE u.origin = 'server'
-                    AND u.ts >= now() - ($1::bigint * interval '1 hour')
+                    AND u.ts >= to_timestamp(($1::bigint)::double precision / 1000.0)
                     AND right(u.kind, 8) != '_attempt'",
-                &[&guard.window_hours],
+                &[&window_start],
             )
             .map_err(|error| UsageReservationError::Db(error.into()))?
             .get(0);
-        let window_start = input
-            .created_at_ms
-            .saturating_sub(guard.window_hours.saturating_mul(3_600_000));
         let jobs_exposure: i64 = tx
             .query_one(
                 "SELECT LEAST(COALESCE(SUM(LEAST(GREATEST(CASE WHEN status = 'held'
@@ -504,8 +534,8 @@ fn reserve_postgres(
                 "SELECT LEAST(COALESCE(SUM(LEAST(GREATEST(cost_cents, 0), 100000000)::numeric), 0),
                                   9223372036854775807)::bigint
                    FROM usage_cutover_spend_baseline
-                  WHERE occurred_at >= now() - ($1::bigint * interval '1 hour')",
-                &[&guard.window_hours],
+                  WHERE occurred_at >= to_timestamp(($1::bigint)::double precision / 1000.0)",
+                &[&window_start],
             )
             .map_err(|error| UsageReservationError::Db(error.into()))?
             .get(0);
@@ -528,7 +558,7 @@ fn reserve_postgres(
                 &[
                     &input.account_id,
                     &input.request_id,
-                    &input.created_at_ms,
+                    &db_now_ms,
                     &window_start,
                 ],
             )
@@ -541,6 +571,8 @@ fn reserve_postgres(
             .saturating_add(input.estimated_upstream_cents)
             > guard.limit_cents
         {
+            tx.commit()
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
             return Err(UsageReservationError::UpstreamSpendLimit);
         }
     }
@@ -847,13 +879,15 @@ fn settle_sqlite(
     actual_customer_cents: i64,
     elapsed_ms: i64,
     reason: &str,
-    settled_at_ms: i64,
+    _settled_at_ms: i64,
     components: &[SettlementUsageEvent],
 ) -> Result<SettledUsage, UsageReservationError> {
     let mut conn = pool.get().map_err(UsageReservationError::Db)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| UsageReservationError::Db(error.into()))?;
+    let settled_at_ms = super::jobs_provider_cost_holds::sqlite_transaction_now_ms(&tx)
+        .map_err(UsageReservationError::Db)?;
     let account = account_snapshot_sqlite(&tx, account_id)?;
     let reservation = load_reservation_sqlite(&tx, account_id, request_id)?;
     if reservation.status == STATUS_SETTLED {
@@ -998,13 +1032,15 @@ fn settle_postgres(
     actual_customer_cents: i64,
     elapsed_ms: i64,
     reason: &str,
-    settled_at_ms: i64,
+    _settled_at_ms: i64,
     components: &[SettlementUsageEvent],
 ) -> Result<SettledUsage, UsageReservationError> {
     let mut conn = pool.get_pg().map_err(UsageReservationError::Db)?;
     let mut tx = conn
         .transaction()
         .map_err(|error| UsageReservationError::Db(error.into()))?;
+    let settled_at_ms = super::jobs_provider_cost_holds::postgres_transaction_now_ms(&mut tx)
+        .map_err(UsageReservationError::Db)?;
     tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended('jobs-provider-cost-global', 0))",
         &[],
@@ -1390,12 +1426,46 @@ pub(crate) fn release(
     if account_id.trim().is_empty() || request_id.trim().is_empty() || reason.trim().is_empty() {
         return Err(UsageReservationError::InvalidReservation);
     }
-    crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => release_sqlite(pool, account_id, request_id, reason, released_at_ms),
+    let released = crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            release_sqlite(pool, account_id, request_id, reason, released_at_ms, None)
+        }
         DbPool::Postgres(_) => {
-            release_postgres(pool, account_id, request_id, reason, released_at_ms)
+            release_postgres(pool, account_id, request_id, reason, released_at_ms, None)
+        }
+    })?;
+    released.ok_or(UsageReservationError::InvalidReservation)
+}
+
+/// Release one exact expired attempt. The attempt and authoritative expiry are
+/// checked in the same transaction that locks and refunds the reservation, so
+/// a stale janitor can never release a replacement attempt using the same
+/// `(account_id, request_id)`.
+pub(crate) fn release_expired_attempt(
+    pool: &DbPool,
+    account_id: &str,
+    request_id: &str,
+    expected_attempt: i64,
+    expected_expires_at_ms: i64,
+) -> Result<bool, UsageReservationError> {
+    if account_id.trim().is_empty()
+        || request_id.trim().is_empty()
+        || expected_attempt <= 0
+        || expected_expires_at_ms <= 0
+    {
+        return Err(UsageReservationError::InvalidReservation);
+    }
+    let fence = Some(ExpiredReleaseFence {
+        attempt: expected_attempt,
+        expires_at_ms: expected_expires_at_ms,
+    });
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => release_sqlite(pool, account_id, request_id, "ttl_expired", 0, fence),
+        DbPool::Postgres(_) => {
+            release_postgres(pool, account_id, request_id, "ttl_expired", 0, fence)
         }
     })
+    .map(|released| released.is_some())
 }
 
 fn release_sqlite(
@@ -1403,19 +1473,31 @@ fn release_sqlite(
     account_id: &str,
     request_id: &str,
     reason: &str,
-    released_at_ms: i64,
-) -> Result<ReleasedUsage, UsageReservationError> {
+    _released_at_ms: i64,
+    expired_fence: Option<ExpiredReleaseFence>,
+) -> Result<Option<ReleasedUsage>, UsageReservationError> {
     let mut conn = pool.get().map_err(UsageReservationError::Db)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| UsageReservationError::Db(error.into()))?;
+    let released_at_ms = super::jobs_provider_cost_holds::sqlite_transaction_now_ms(&tx)
+        .map_err(UsageReservationError::Db)?;
     let account = account_snapshot_sqlite(&tx, account_id)?;
     let reservation = load_reservation_sqlite(&tx, account_id, request_id)?;
+    if let Some(fence) = expired_fence {
+        if reservation.status != STATUS_RESERVED
+            || reservation.attempt != fence.attempt
+            || reservation.expires_at_ms != fence.expires_at_ms
+            || released_at_ms < fence.expires_at_ms
+        {
+            return Ok(None);
+        }
+    }
     if reservation.status == STATUS_SETTLED {
         return Err(UsageReservationError::AlreadySettled);
     }
     if reservation.status == STATUS_RELEASED {
-        return released_from_row(&reservation);
+        return released_from_row(&reservation).map(Some);
     }
     if reservation.status != STATUS_RESERVED {
         return Err(UsageReservationError::InvalidReservation);
@@ -1489,13 +1571,13 @@ fn release_sqlite(
     tx.commit()
         .map_err(|error| UsageReservationError::Db(error.into()))?;
 
-    Ok(ReleasedUsage {
+    Ok(Some(ReleasedUsage {
         attempt: reservation.attempt,
         refunded_cents: reservation.reserved_cents,
         refunded_trial_seconds: reservation.reserved_trial_seconds,
         balance_cents_after: balance_after,
         trial_seconds_remaining: trial_after,
-    })
+    }))
 }
 
 fn release_postgres(
@@ -1503,12 +1585,15 @@ fn release_postgres(
     account_id: &str,
     request_id: &str,
     reason: &str,
-    released_at_ms: i64,
-) -> Result<ReleasedUsage, UsageReservationError> {
+    _released_at_ms: i64,
+    expired_fence: Option<ExpiredReleaseFence>,
+) -> Result<Option<ReleasedUsage>, UsageReservationError> {
     let mut conn = pool.get_pg().map_err(UsageReservationError::Db)?;
     let mut tx = conn
         .transaction()
         .map_err(|error| UsageReservationError::Db(error.into()))?;
+    let released_at_ms = super::jobs_provider_cost_holds::postgres_transaction_now_ms(&mut tx)
+        .map_err(UsageReservationError::Db)?;
     tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended('jobs-provider-cost-global', 0))",
         &[],
@@ -1516,11 +1601,20 @@ fn release_postgres(
     .map_err(|error| UsageReservationError::Db(error.into()))?;
     let account = account_snapshot_postgres(&mut tx, account_id)?;
     let reservation = load_reservation_postgres(&mut tx, account_id, request_id)?;
+    if let Some(fence) = expired_fence {
+        if reservation.status != STATUS_RESERVED
+            || reservation.attempt != fence.attempt
+            || reservation.expires_at_ms != fence.expires_at_ms
+            || released_at_ms < fence.expires_at_ms
+        {
+            return Ok(None);
+        }
+    }
     if reservation.status == STATUS_SETTLED {
         return Err(UsageReservationError::AlreadySettled);
     }
     if reservation.status == STATUS_RELEASED {
-        return released_from_row(&reservation);
+        return released_from_row(&reservation).map(Some);
     }
     if reservation.status != STATUS_RESERVED {
         return Err(UsageReservationError::InvalidReservation);
@@ -1594,13 +1688,13 @@ fn release_postgres(
     tx.commit()
         .map_err(|error| UsageReservationError::Db(error.into()))?;
 
-    Ok(ReleasedUsage {
+    Ok(Some(ReleasedUsage {
         attempt: reservation.attempt,
         refunded_cents: reservation.reserved_cents,
         refunded_trial_seconds: reservation.reserved_trial_seconds,
         balance_cents_after: balance_after,
         trial_seconds_remaining: trial_after,
-    })
+    }))
 }
 
 /// Refund expired reservations for an account.
@@ -1613,57 +1707,311 @@ fn release_postgres(
 pub(crate) fn reconcile_expired_for_account(
     pool: &DbPool,
     account_id: &str,
-    now_ms: i64,
+    _now_ms: i64,
 ) -> Result<usize, UsageReservationError> {
-    let request_ids = crate::db::run_blocking_db(|| match pool {
+    let keys = crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get().map_err(UsageReservationError::Db)?;
-            let mut statement = conn
-                .prepare(
-                    "SELECT request_id
-                       FROM usage_reservations
-                      WHERE account_id = ?1
-                        AND status = 'reserved'
-                        AND expires_at_ms <= ?2",
-                )
+            let mut conn = pool.get().map_err(UsageReservationError::Db)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| UsageReservationError::Db(error.into()))?;
-            let rows = statement
-                .query_map(params![account_id, now_ms], |row| row.get::<_, String>(0))
+            let db_now_ms = super::jobs_provider_cost_holds::sqlite_transaction_now_ms(&tx)
+                .map_err(UsageReservationError::Db)?;
+            let keys = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT request_id, attempt, expires_at_ms
+                           FROM usage_reservations
+                          WHERE account_id = ?1
+                            AND status = 'reserved'
+                            AND expires_at_ms <= ?2",
+                    )
+                    .map_err(|error| UsageReservationError::Db(error.into()))?;
+                let rows = statement
+                    .query_map(params![account_id, db_now_ms], |row| {
+                        Ok(ExpiredReservationKey {
+                            account_id: account_id.to_string(),
+                            request_id: row.get(0)?,
+                            attempt: row.get(1)?,
+                            expires_at_ms: row.get(2)?,
+                        })
+                    })
+                    .map_err(|error| UsageReservationError::Db(error.into()))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| UsageReservationError::Db(error.into()))?
+            };
+            tx.commit()
                 .map_err(|error| UsageReservationError::Db(error.into()))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|error| UsageReservationError::Db(error.into()))
+            Ok::<Vec<ExpiredReservationKey>, UsageReservationError>(keys)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg().map_err(UsageReservationError::Db)?;
-            conn.query(
-                "SELECT request_id
-                   FROM usage_reservations
-                  WHERE account_id = $1
-                    AND status = 'reserved'
-                    AND expires_at_ms <= $2",
-                &[&account_id, &now_ms],
-            )
-            .map_err(|error| UsageReservationError::Db(error.into()))?
-            .into_iter()
-            .map(|row| {
-                row.try_get(0)
-                    .map_err(|error| UsageReservationError::Db(error.into()))
-            })
-            .collect::<Result<Vec<String>, UsageReservationError>>()
+            let mut tx = conn
+                .transaction()
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
+            let db_now_ms = super::jobs_provider_cost_holds::postgres_transaction_now_ms(&mut tx)
+                .map_err(UsageReservationError::Db)?;
+            let keys = tx
+                .query(
+                    "SELECT request_id, attempt, expires_at_ms
+                       FROM usage_reservations
+                      WHERE account_id = $1
+                        AND status = 'reserved'
+                        AND expires_at_ms <= $2",
+                    &[&account_id, &db_now_ms],
+                )
+                .map_err(|error| UsageReservationError::Db(error.into()))?
+                .into_iter()
+                .map(|row| {
+                    Ok(ExpiredReservationKey {
+                        account_id: account_id.to_string(),
+                        request_id: row
+                            .try_get(0)
+                            .map_err(|error| UsageReservationError::Db(error.into()))?,
+                        attempt: row
+                            .try_get(1)
+                            .map_err(|error| UsageReservationError::Db(error.into()))?,
+                        expires_at_ms: row
+                            .try_get(2)
+                            .map_err(|error| UsageReservationError::Db(error.into()))?,
+                    })
+                })
+                .collect::<Result<Vec<ExpiredReservationKey>, UsageReservationError>>()?;
+            tx.commit()
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
+            Ok::<Vec<ExpiredReservationKey>, UsageReservationError>(keys)
         }
     })?;
 
     let mut released = 0;
-    for request_id in request_ids {
-        match release(pool, account_id, &request_id, "ttl_expired", now_ms) {
-            Ok(_) => released += 1,
-            Err(UsageReservationError::AlreadySettled)
+    for key in keys {
+        match release_expired_attempt(
+            pool,
+            &key.account_id,
+            &key.request_id,
+            key.attempt,
+            key.expires_at_ms,
+        ) {
+            Ok(true) => released += 1,
+            Ok(false)
+            | Err(UsageReservationError::AlreadySettled)
             | Err(UsageReservationError::AlreadyReleased)
-            | Err(UsageReservationError::NotFound) => {}
+            | Err(UsageReservationError::NotFound)
+            | Err(UsageReservationError::AccountUnavailable) => {}
             Err(error) => return Err(error),
         }
     }
     Ok(released)
+}
+
+fn expired_reservation_keys(
+    pool: &DbPool,
+    limit: i64,
+) -> Result<Vec<ExpiredReservationKey>, UsageReservationError> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get().map_err(UsageReservationError::Db)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
+            let db_now_ms = super::jobs_provider_cost_holds::sqlite_transaction_now_ms(&tx)
+                .map_err(UsageReservationError::Db)?;
+            let keys = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT account_id, request_id, attempt, expires_at_ms
+                           FROM usage_reservations
+                          WHERE status = 'reserved' AND expires_at_ms <= ?1
+                          ORDER BY expires_at_ms, account_id, request_id
+                          LIMIT ?2",
+                    )
+                    .map_err(|error| UsageReservationError::Db(error.into()))?;
+                let rows = statement
+                    .query_map(params![db_now_ms, limit], |row| {
+                        Ok(ExpiredReservationKey {
+                            account_id: row.get(0)?,
+                            request_id: row.get(1)?,
+                            attempt: row.get(2)?,
+                            expires_at_ms: row.get(3)?,
+                        })
+                    })
+                    .map_err(|error| UsageReservationError::Db(error.into()))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| UsageReservationError::Db(error.into()))?
+            };
+            tx.commit()
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
+            Ok(keys)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg().map_err(UsageReservationError::Db)?;
+            let mut tx = conn
+                .transaction()
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
+            let db_now_ms = super::jobs_provider_cost_holds::postgres_transaction_now_ms(&mut tx)
+                .map_err(UsageReservationError::Db)?;
+            let keys = tx
+                .query(
+                    "SELECT account_id, request_id, attempt, expires_at_ms
+                       FROM usage_reservations
+                      WHERE status = 'reserved' AND expires_at_ms <= $1
+                      ORDER BY expires_at_ms, account_id, request_id
+                      LIMIT $2",
+                    &[&db_now_ms, &limit],
+                )
+                .map_err(|error| UsageReservationError::Db(error.into()))?
+                .into_iter()
+                .map(|row| {
+                    Ok::<_, UsageReservationError>(ExpiredReservationKey {
+                        account_id: row
+                            .try_get(0)
+                            .map_err(|error| UsageReservationError::Db(error.into()))?,
+                        request_id: row
+                            .try_get(1)
+                            .map_err(|error| UsageReservationError::Db(error.into()))?,
+                        attempt: row
+                            .try_get(2)
+                            .map_err(|error| UsageReservationError::Db(error.into()))?,
+                        expires_at_ms: row
+                            .try_get(3)
+                            .map_err(|error| UsageReservationError::Db(error.into()))?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            tx.commit()
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
+            Ok(keys)
+        }
+    })
+}
+
+/// Bounded startup/periodic restart recovery for reservations whose delayed
+/// in-process task disappeared. Concurrent API and Jobs processes may run the
+/// same pass; the terminal transition lock ensures exactly one refund wins.
+fn reconcile_expired_usage_reservations_inner(
+    pool: &DbPool,
+) -> Result<usize, UsageReservationError> {
+    const BATCH_SIZE: i64 = 250;
+    const MAX_BATCHES: usize = 4;
+    let mut released = 0_usize;
+    for _ in 0..MAX_BATCHES {
+        let keys = expired_reservation_keys(pool, BATCH_SIZE)?;
+        let scanned = keys.len();
+        for key in keys {
+            match release_expired_attempt(
+                pool,
+                &key.account_id,
+                &key.request_id,
+                key.attempt,
+                key.expires_at_ms,
+            ) {
+                Ok(true) => released = released.saturating_add(1),
+                Ok(false)
+                | Err(UsageReservationError::AlreadySettled)
+                | Err(UsageReservationError::AlreadyReleased)
+                | Err(UsageReservationError::NotFound)
+                | Err(UsageReservationError::AccountUnavailable) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if scanned < BATCH_SIZE as usize {
+            break;
+        }
+    }
+    Ok(released)
+}
+
+pub fn reconcile_expired_usage_reservations(pool: &DbPool) -> anyhow::Result<usize> {
+    reconcile_expired_usage_reservations_inner(pool).map_err(Into::into)
+}
+
+pub fn spawn_expired_usage_reservation_janitor(pool: DbPool) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(60);
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match reconcile_expired_usage_reservations(&pool) {
+                Ok(released) if released > 0 => {
+                    tracing::warn!(released, "expired managed usage reservations reconciled")
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(error = %error, "managed usage reservation janitor failed")
+                }
+            }
+        }
+    })
+}
+
+/// Return the DB-clock delay until a specific authoritative reservation
+/// expiry. The expected expiry is the value returned by `reserve`, preventing
+/// a delayed task for an older attempt from acting on a replacement attempt.
+pub(crate) fn reservation_expiry_delay_ms(
+    pool: &DbPool,
+    account_id: &str,
+    request_id: &str,
+    expected_attempt: i64,
+    expected_expires_at_ms: i64,
+) -> Result<Option<i64>, UsageReservationError> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get().map_err(UsageReservationError::Db)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
+            let db_now_ms = super::jobs_provider_cost_holds::sqlite_transaction_now_ms(&tx)
+                .map_err(UsageReservationError::Db)?;
+            let delay = tx
+                .query_row(
+                    "SELECT MAX(expires_at_ms - ?5, 0)
+                       FROM usage_reservations
+                      WHERE account_id = ?1 AND request_id = ?2
+                        AND status = 'reserved' AND attempt = ?3 AND expires_at_ms = ?4",
+                    params![
+                        account_id,
+                        request_id,
+                        expected_attempt,
+                        expected_expires_at_ms,
+                        db_now_ms
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
+            tx.commit()
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
+            Ok(delay)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg().map_err(UsageReservationError::Db)?;
+            let mut tx = conn
+                .transaction()
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
+            let db_now_ms = super::jobs_provider_cost_holds::postgres_transaction_now_ms(&mut tx)
+                .map_err(UsageReservationError::Db)?;
+            let delay = tx
+                .query_opt(
+                    "SELECT GREATEST(expires_at_ms - $5, 0)
+                       FROM usage_reservations
+                      WHERE account_id = $1 AND request_id = $2
+                        AND status = 'reserved' AND attempt = $3 AND expires_at_ms = $4",
+                    &[
+                        &account_id,
+                        &request_id,
+                        &expected_attempt,
+                        &expected_expires_at_ms,
+                        &db_now_ms,
+                    ],
+                )
+                .map_err(|error| UsageReservationError::Db(error.into()))?
+                .map(|row| row.get(0));
+            tx.commit()
+                .map_err(|error| UsageReservationError::Db(error.into()))?;
+            Ok(delay)
+        }
+    })
 }
 
 fn elapsed_seconds(elapsed_ms: i64) -> i64 {
@@ -1976,7 +2324,7 @@ fn terminal_ledger_metadata(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::sync::{mpsc, Arc, Barrier};
 
     use super::*;
     use crate::db::{self, accounts::Account, balance, idempotency};
@@ -2069,7 +2417,55 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_cutover_baseline_blocks_generic_reservation_until_window_and_grace_expire() {
+    fn application_clock_skew_cannot_hide_a_fresh_upstream_reservation() {
+        let pool = temp_pool();
+        let account_id = create_paid_account(&pool, "usage-clock-skew@example.com", 100);
+        let guard = UpstreamSpendGuard {
+            limit_cents: 5,
+            window_hours: 24,
+        };
+        let mut past_clock = input(
+            &account_id,
+            "past-clock",
+            10,
+            -4_000_000_000,
+            -3_999_940_000,
+        );
+        past_clock.estimated_upstream_cents = 4;
+        past_clock.upstream_spend_guard = Some(guard);
+        let first = reserve(&pool, past_clock).unwrap();
+
+        let (created_at_ms, expires_at_ms): (i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT created_at_ms, expires_at_ms FROM usage_reservations
+                  WHERE account_id = ?1 AND request_id = 'past-clock'",
+                params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(created_at_ms > 1_000_000_000_000);
+        assert_eq!(expires_at_ms - created_at_ms, 60_000);
+        assert_eq!(first.expires_at_ms, expires_at_ms);
+
+        let mut future_clock = input(
+            &account_id,
+            "future-clock",
+            10,
+            4_000_000_000_000,
+            4_000_000_060_000,
+        );
+        future_clock.estimated_upstream_cents = 2;
+        future_clock.upstream_spend_guard = Some(guard);
+        assert!(matches!(
+            reserve(&pool, future_clock),
+            Err(UsageReservationError::UpstreamSpendLimit)
+        ));
+    }
+
+    #[test]
+    fn anonymous_cutover_baseline_blocks_window_but_uses_fixed_retention() {
         let pool = temp_pool();
         let account_id = create_paid_account(&pool, "usage-cutover@example.com", 100);
         pool.get()
@@ -2101,9 +2497,8 @@ mod tests {
         ));
         assert_eq!(account_money(&pool, &account_id), (100, 0));
 
-        // Twenty-four-hour window plus the one-day cleanup grace has elapsed.
-        // The baseline no longer contributes to admission and is physically
-        // removed by the next guarded transaction.
+        // The row leaves this 24-hour admission window, but physical retention
+        // remains fixed at the maximum configurable window plus grace.
         pool.get()
             .unwrap()
             .execute(
@@ -2132,8 +2527,19 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            0
+            1
         );
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE usage_cutover_spend_baseline
+                    SET occurred_at = datetime('now', '-32 days')",
+                [],
+            )
+            .unwrap();
+        let cleanup =
+            crate::db::jobs_provider_cost_holds::prune_expired_spend_truth(&pool).unwrap();
+        assert_eq!(cleanup.cutover_baseline_rows_deleted, 1);
     }
 
     #[test]
@@ -2201,19 +2607,39 @@ mod tests {
             idempotency::reserve(&pool, &account_id, "ttl-1").unwrap(),
             idempotency::ReserveOutcome::FreshReservation
         );
-        reserve(&pool, input(&account_id, "ttl-1", 70, 1_000, 2_000)).unwrap();
+        let reservation = reserve(&pool, input(&account_id, "ttl-1", 70, 1_000, 2_000)).unwrap();
         assert_eq!(account_money(&pool, &account_id), (30, 70));
 
+        // Caller-provided future time cannot expire a DB-authoritative hold.
         assert_eq!(
-            reconcile_expired_for_account(&pool, &account_id, 1_999).unwrap(),
+            reconcile_expired_for_account(&pool, &account_id, i64::MAX).unwrap(),
             0
         );
+        assert!(reservation_expiry_delay_ms(
+            &pool,
+            &account_id,
+            "ttl-1",
+            reservation.attempt,
+            reservation.expires_at_ms
+        )
+        .unwrap()
+        .is_some_and(|delay| delay > 0));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE usage_reservations
+                    SET expires_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 1
+                  WHERE account_id = ?1 AND request_id = 'ttl-1'",
+                params![account_id],
+            )
+            .unwrap();
+        // Caller-provided past time cannot keep an expired hold alive.
         assert_eq!(
-            reconcile_expired_for_account(&pool, &account_id, 2_000).unwrap(),
+            reconcile_expired_for_account(&pool, &account_id, i64::MIN).unwrap(),
             1
         );
         assert_eq!(
-            reconcile_expired_for_account(&pool, &account_id, 2_000).unwrap(),
+            reconcile_expired_for_account(&pool, &account_id, i64::MAX).unwrap(),
             0
         );
         assert_eq!(account_money(&pool, &account_id), (100, 0));
@@ -2235,5 +2661,167 @@ mod tests {
             .unwrap();
         assert_eq!(status, STATUS_RELEASED);
         assert_eq!(reason, "ttl_expired");
+    }
+
+    #[test]
+    fn concurrent_startup_janitors_refund_an_expired_hold_exactly_once() {
+        let pool = Arc::new(temp_pool());
+        let account_id = create_paid_account(&pool, "usage-startup-janitor@example.com", 100);
+        reserve(
+            &pool,
+            input(&account_id, "restart-expired", 70, 1_000, 61_000),
+        )
+        .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE usage_reservations
+                    SET expires_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 1
+                  WHERE account_id = ?1 AND request_id = 'restart-expired'",
+                params![account_id],
+            )
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reconcile_expired_usage_reservations(&pool).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let released: usize = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .sum();
+        assert_eq!(released, 1);
+        assert_eq!(account_money(&pool, &account_id), (100, 0));
+    }
+
+    #[test]
+    fn stale_janitor_selection_cannot_refund_a_replacement_attempt() {
+        let pool = Arc::new(temp_pool());
+        let account_id = create_paid_account(&pool, "usage-stale-janitor@example.com", 100);
+        let first = reserve(
+            &pool,
+            input(&account_id, "reused-request", 70, 1_000, 61_000),
+        )
+        .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE usage_reservations
+                    SET expires_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 1
+                  WHERE account_id = ?1 AND request_id = 'reused-request'",
+                params![account_id],
+            )
+            .unwrap();
+
+        let (selected_tx, selected_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker_pool = Arc::clone(&pool);
+        let worker = std::thread::spawn(move || {
+            let key = expired_reservation_keys(&worker_pool, 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("expired attempt selected");
+            selected_tx.send(key.clone()).unwrap();
+            resume_rx.recv().unwrap();
+            release_expired_attempt(
+                &worker_pool,
+                &key.account_id,
+                &key.request_id,
+                key.attempt,
+                key.expires_at_ms,
+            )
+            .unwrap()
+        });
+
+        let stale_key = selected_rx.recv().unwrap();
+        assert_eq!(stale_key.attempt, first.attempt);
+        release(
+            &pool,
+            &account_id,
+            "reused-request",
+            "concurrent_release",
+            0,
+        )
+        .unwrap();
+        let replacement = reserve(
+            &pool,
+            input(&account_id, "reused-request", 70, 3_000, 63_000),
+        )
+        .unwrap();
+        assert_eq!(replacement.attempt, first.attempt + 1);
+        assert_eq!(account_money(&pool, &account_id), (30, 70));
+
+        resume_tx.send(()).unwrap();
+        assert!(
+            !worker.join().unwrap(),
+            "stale janitor fence must no-op after request-id replacement"
+        );
+        assert_eq!(account_money(&pool, &account_id), (30, 70));
+        let (status, attempt, expires_at_ms): (String, i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT status, attempt, expires_at_ms
+                   FROM usage_reservations
+                  WHERE account_id = ?1 AND request_id = 'reused-request'",
+                params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, STATUS_RESERVED);
+        assert_eq!(attempt, replacement.attempt);
+        assert_eq!(expires_at_ms, replacement.expires_at_ms);
+        assert_eq!(
+            reservation_expiry_delay_ms(
+                &pool,
+                &account_id,
+                "reused-request",
+                stale_key.attempt,
+                stale_key.expires_at_ms,
+            )
+            .unwrap(),
+            None,
+            "the stale per-request delayed task must be fenced too"
+        );
+    }
+
+    #[test]
+    fn expired_trial_hold_cannot_block_next_endpoint_after_restart() {
+        let pool = temp_pool();
+        let account = Account::create(&pool, "usage-restart-trial@example.com", "hash").unwrap();
+        let trial_seconds = account.trial_seconds_remaining;
+        let first = reserve(
+            &pool,
+            input(&account.id, "stale-endpoint", 50, 1_000, 61_000),
+        )
+        .unwrap();
+        assert_eq!(first.reserved_trial_seconds, trial_seconds);
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE usage_reservations
+                    SET expires_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 1
+                  WHERE account_id = ?1 AND request_id = 'stale-endpoint'",
+                params![account.id],
+            )
+            .unwrap();
+
+        // `reserve` performs DB-clock reconciliation itself, so embed/STT/LLM
+        // callers all recover even if their prior delayed task died.
+        let next = reserve(
+            &pool,
+            input(&account.id, "next-endpoint", 50, 9_000, 69_000),
+        )
+        .unwrap();
+        assert_eq!(next.reserved_trial_seconds, trial_seconds);
     }
 }
