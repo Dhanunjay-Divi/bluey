@@ -1,15 +1,15 @@
 # Bluey Launch Gates And Risk Register
 
-Updated: 2026-07-12
+Updated: 2026-07-19
 
 This is the short owner-level gate list before broader paid alpha or marketing.
 
 ## Launch Verdict
 
-The signed `0.1.99` manifest publishes macOS Apple silicon and Windows x86-64
-artifacts. The release record install-smokes Windows 11 only; it does not claim
-Windows 10, macOS Intel/universal, or Linux support. Broader marketing should
-remain bounded by the unresolved cost-control and operational gates below.
+The signed live manifest and `INSTALL.md` define downloadable platforms. The
+release record install-smokes Windows 11 only and does not claim Windows 10 or
+a Linux desktop artifact. Broader marketing remains bounded by the unresolved
+operational gates below.
 
 ## P1 Gates Before Broad Marketing
 

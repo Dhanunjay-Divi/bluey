@@ -53,8 +53,8 @@
         "name": "Bluey",
         "url": "https://bluey.sh/",
         "applicationCategory": "BusinessApplication",
-        "operatingSystem": "macOS on Apple silicon, Windows 11 on x86-64",
-        "softwareVersion": "0.1.99",
+        "operatingSystem": "macOS on Apple silicon or Intel, Windows 11 on x86-64",
+        "softwareVersion": "0.1.104",
         "description": "A consent-first desktop assistant for live engineering conversations, screen context, files, code, and saved project memory.",
         "image": "https://bluey.sh/assets/bluey-og.png",
         "softwareHelp": "https://bluey.sh/how-bluey-works/",
@@ -947,7 +947,7 @@
       <section class="download-hero">
         <h1>Install Bluey</h1>
         <p>Install once. Run <code>bluey on</code>. The overlay guides permissions and sign-in only when needed.</p>
-        <div class="release-badge">Current release <strong data-release-version>0.1.99</strong></div>
+        <div class="release-badge">Current release <strong data-release-version>0.1.104</strong></div>
       </section>
 
       <div class="download-steps-strip" aria-label="Bluey install flow">
@@ -957,7 +957,7 @@
       </div>
 
       <section class="platform-grid" aria-label="Bluey platform installers">
-        <article class="download-card" data-platform-card="mac" data-release-platform="darwin-arm64" role="button" tabindex="0" aria-label="Show macOS terminal install instructions" aria-controls="macInstallInstructions" aria-expanded="false">
+        <article class="download-card" data-platform-card="mac" data-release-platforms="darwin-arm64,darwin-x86_64,darwin-universal" role="button" tabindex="0" aria-label="Show macOS terminal install instructions" aria-controls="macInstallInstructions" aria-expanded="false">
           <div class="download-card-head">
             <div class="platform-name">
               <span class="os-icon" aria-hidden="true">
@@ -970,7 +970,7 @@
             </div>
             <span class="availability">Ready</span>
           </div>
-          <p>Apple Silicon only. Release <span data-release-version>0.1.99</span> is listed in the signed, checksum-pinned manifest.</p>
+          <p><span data-release-platform-summary>Apple silicon, Intel, and universal archives</span> for release <span data-release-version>0.1.104</span> are listed in the signed, checksum-pinned manifest.</p>
           <span class="download-card-action">Show terminal steps</span>
         </article>
         <article class="download-card" data-platform-card="windows" data-release-platform="windows-x86_64" role="button" tabindex="0" aria-label="Show Windows PowerShell install instructions" aria-controls="windowsInstallInstructions" aria-expanded="false">
@@ -988,7 +988,7 @@
             </div>
             <span class="availability">Ready</span>
           </div>
-          <p>x86-64 build from release <span data-release-version>0.1.99</span>, install-smoked on Windows 11.</p>
+          <p>x86-64 build from release <span data-release-version>0.1.104</span>, install-smoked on Windows 11.</p>
           <span class="download-card-action">Show PowerShell steps</span>
         </article>
         <article class="download-card disabled coming-soon" aria-disabled="true">

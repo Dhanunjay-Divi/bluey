@@ -178,10 +178,23 @@ operation-scoped result/resume capabilities and frozen request are held only in
 an AES-256-GCM checkpoint under Electron's per-user data directory; the root
 claim ticket is never persisted. On macOS/Linux the random installation key is
 an owner-only `0600` file under a `0700` recovery directory, deliberately
-avoiding Keychain prompts. On Windows the installation key is additionally
-wrapped with Electron `safeStorage` (DPAPI) and the recovery paths receive a
-current-user ACL. A durable local final-submit marker always overrides a stale
-safe checkpoint and forces manual reconciliation.
+avoiding Keychain prompts. On Windows, the secure-store-disabled path uses the
+same random file key and removes ACL inheritance before granting only the
+current account access. Electron `safeStorage`/DPAPI is loaded only when an
+operator explicitly enables `BLUEY_USE_OS_KEYCHAIN` or
+`BLUEY_USE_SECURE_STORE`; the release test environment sets both to `0` and
+proves zero secure-store calls. A durable local final-submit marker always
+overrides a stale safe checkpoint and forces manual reconciliation.
+
+Immediately before every local final click, Bluey sends only the scoped submit
+capability to `POST /api/jobs/local-runs/:run_id/authorize-submit`. The server
+atomically rechecks current local-run entitlement, verified application
+identity, ticket/session/application/profile binding, and the stored
+provider-final-review approval. The Browser rejects redirects, credentials,
+cache, non-success responses, malformed payloads, and requests that exceed ten
+seconds; it rechecks local capability expiry after the response. No denial path
+may write the durable submit marker or click. A crash after the marker or click
+is `side_effect_unknown` and is never automatically retried.
 Production should replicate the encrypted snapshot and receipt directory to
 R2/S3 with lifecycle and tenant-deletion jobs.
 

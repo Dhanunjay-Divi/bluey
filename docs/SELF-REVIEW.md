@@ -1,8 +1,8 @@
 # Self Review
 
 > Historical self-review of the original macOS-first build. It is not a current
-> release certification. The public manifest now reports `0.1.99` with macOS
-> Apple silicon and Windows x86-64 artifacts.
+> release certification. Use the signed live manifest and `INSTALL.md` for
+> current platform facts.
 
 ## Current Review
 

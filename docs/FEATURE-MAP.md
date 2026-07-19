@@ -16,7 +16,7 @@ This translates the reference-app comparison language into Bluey's ethical produ
 - Simple session setup: overlay paperclip attaches files or shows attached context, and overlay notepad sets answer instructions.
 - Overlay ask flow: the speech-bubble button asks Bluey a question and renders the answer back into the overlay.
 - Source-labeled transcript cards: audio/STT segments render as system-audio or microphone transcript cards in the overlay.
-- Real audio/STT runtime: when STT is configured, Bluey captures mic/system audio through bundled native helpers, applies VAD, routes through managed or local transcription paths, deletes Bluey's temporary raw-audio chunk after transcription, and stores source-labeled transcript text. Release `0.1.99` lists macOS Apple silicon and Windows x86-64 artifacts; its Windows proof is on Windows 11.
+- Real audio/STT runtime: when STT is configured, Bluey captures mic/system audio through bundled native helpers, applies VAD, routes through managed or local transcription paths, deletes Bluey's temporary raw-audio chunk after transcription, and stores source-labeled transcript text. The signed live manifest and current release note define supported artifacts; the Windows release proof is on Windows 11.
 - Live provider answer path: OpenAI, Groq, Cerebras, and OpenAI-compatible Bluey managed endpoints can answer when credentials are present; local deterministic answers remain available for offline tests.
 - Built-in control legend: the overlay explains every icon, dot, quick action, and card type from the question-mark/Help control.
 - Safe shutdown: overlay close button asks for confirmation before stopping Bluey.

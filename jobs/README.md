@@ -89,6 +89,11 @@ internal pricing and margin model.
   durable idempotency keys so a completed submit action cannot run twice.
 - Local runs use encrypted, short-lived launch tickets. The custom protocol
   never carries a long-lived Bluey token or the application packet itself.
+- New local runs receive distinct result, resume, and final-submit
+  capabilities. Every adapter must obtain a live server authorization using
+  the submit capability immediately before the irreversible click; current
+  entitlement, verified identity, exact run binding, and provider review are
+  rechecked, and every denial fails before the durable marker and click.
 - Bluey Browser reports local results to the Jobs API and keeps the same visible
   page alive while the account owner completes an intervention.
 - Browser navigation is checked at initial load and on redirects against

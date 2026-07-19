@@ -1,9 +1,8 @@
 # Roadmap
 
-Current release note: the live manifest reports `0.1.99` with macOS Apple
-silicon and Windows x86-64 artifacts. The version sections below preserve the
-product's thematic roadmap; they are not a current platform support matrix.
-Linux and macOS Intel/universal are not in the current manifest.
+Current release facts come from the signed live manifest and `INSTALL.md`. The
+version sections below preserve the product's thematic roadmap; they are not a
+current platform support matrix and cannot expand the live manifest.
 
 Trust gates apply to every roadmap slice: visible capture controls, opt-in
 cloud sync and automatic payments, no retained-audio claim without storage and
@@ -47,7 +46,8 @@ no covert or process-impersonation positioning.
 
 ## Version 0.3: Platform Expansion
 
-- macOS x86_64 artifact if Intel support is required.
+- Maintain Apple silicon, Intel, and universal macOS artifacts while keeping
+  their runtime proofs separate.
 - Maintain the current Windows x86-64 artifact and expand real-hardware proof
   beyond the release-recorded Windows 11 install smoke before claiming more.
 - Linux build decision after audio/capture feasibility review.

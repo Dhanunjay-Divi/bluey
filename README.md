@@ -9,14 +9,15 @@ assessment, security, or consent rules.
 
 ## Current Release
 
-The public signed release manifest at `https://bluey.sh/latest.json` currently
-reports `0.1.99`, released July 11, 2026 UTC.
+This source tree targets Bluey `0.1.104`. The signed live manifest at
+`https://bluey.sh/latest.json` is the authority for the version and artifacts
+that customers can download; source, tags, or locally built packages do not
+expand that public support promise.
 
 | Platform | Current public artifact |
 | --- | --- |
-| macOS | Apple silicon (`darwin-arm64`) |
+| macOS | Apple silicon, Intel, and universal archives |
 | Windows | x86-64; install-smoked on Windows 11 |
-| macOS Intel/universal | Not listed in the current manifest |
 | Linux | Not listed in the current manifest |
 
 The installers verify the signed release manifest and checksum-pinned artifact
@@ -44,7 +45,7 @@ See `https://bluey.sh/privacy`, `https://bluey.sh/terms`, and
 
 ## Install And Run
 
-macOS on Apple silicon:
+macOS on Apple silicon or Intel:
 
 ```bash
 curl -fsSL https://bluey.sh/install.sh | bash

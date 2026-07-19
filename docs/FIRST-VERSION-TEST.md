@@ -1,9 +1,8 @@
 # First Version Test
 
 > Historical first-version test plan. It is not the current platform matrix.
-> The July 12, 2026 signed manifest reports `0.1.99` for macOS Apple silicon and
-> Windows x86-64. Use the current release notes and `INSTALL.md` for release
-> validation.
+> Use the signed live manifest, current release note, and `INSTALL.md` for
+> release validation.
 
 This test does not require API keys or audio permissions. It verifies the core Bluey loop:
 

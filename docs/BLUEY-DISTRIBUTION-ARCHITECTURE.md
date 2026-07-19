@@ -1,9 +1,8 @@
 # Bluey Distribution Architecture — v0.1
 
 > The `0.1.0` manifest shown below is a historical shape example, not the live
-> release. The current signed manifest is `https://bluey.sh/latest.json`; as of
-> July 12, 2026 it reports `0.1.99` with `darwin-arm64` and
-> `windows-x86_64` artifacts.
+> release. Use the signed live manifest and `INSTALL.md` for current version and
+> platform facts.
 
 > **Decision (2026-05-19, user):** Bluey is a separate product from Pinky.
 > Bluey distribution is on its own infrastructure, not piggybacked on the

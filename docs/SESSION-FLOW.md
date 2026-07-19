@@ -28,11 +28,11 @@ Use the bottom tray for the main loop:
 Audio/STT text appears as source-labeled transcript cards: `System transcript`
 for system/browser audio and `Mic transcript` for microphone audio. Typed
 questions render as `You` cards, and model output renders as `Bluey / Response`
-cards. Release `0.1.99` includes public artifacts for macOS Apple silicon and
-Windows x86-64. Bluey captures audio through bundled native helpers, applies
-VAD, and routes transcription through configured managed or local paths.
-The release record install-smokes Windows on Windows 11; it does not claim
-Windows 10. FFmpeg and mock/echo providers remain fallback/dev paths.
+cards. The signed live manifest and current release note define supported
+artifacts. Bluey captures audio through bundled native helpers, applies VAD,
+and routes transcription through configured managed or local paths. Windows
+release proof is on Windows 11; unsupported operating systems are not implied.
+FFmpeg and mock/echo providers remain fallback/dev paths.
 
 Use the header icons for setup and window control:
 

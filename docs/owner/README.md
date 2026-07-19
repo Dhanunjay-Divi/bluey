@@ -1,6 +1,6 @@
 # Bluey Owner Docs
 
-Updated: 2026-07-12
+Updated: 2026-07-19
 
 This folder is the owner-facing map for Bluey's current state. It exists because
 the repo has many useful historical docs, but several older docs now conflict
@@ -33,9 +33,10 @@ guarantee.
 
 Current public release record:
 
-- The signed manifest reports `0.1.99` for macOS Apple silicon and Windows
-  x86-64. Its release record install-smokes Windows 11; it does not claim
-  Windows 10, macOS Intel/universal, or Linux support.
+- The signed live manifest and `INSTALL.md` define the current downloadable
+  version and platform matrix. The source tree does not expand that promise;
+  Windows release proof remains bounded to Windows 11 and Linux has no public
+  desktop artifact.
 - Signed manifest and checksum verification are distinct from Apple Developer
   ID/notarization or Windows Authenticode signing.
 - Cloud sync and Auto Reload are separate opt-in choices. Sign-in alone must not
@@ -66,7 +67,7 @@ Known drift:
 ## Owner Decisions Needed
 
 - Confirm first ICP: engineering meetings is the recommended wedge.
-- Decide whether macOS Intel/universal or Linux should enter the release matrix.
+- Decide whether Linux should enter the public desktop release matrix.
 - Keep reload amount and payment-provider copy sourced from the live product
   configuration rather than owner-doc defaults.
 - Confirm legal-hold policy for billing/usage evidence after deletion.

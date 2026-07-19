@@ -1,15 +1,17 @@
 # Installing Bluey
 
-The public release manifest at `https://bluey.sh/latest.json` currently reports
-Bluey `0.1.99`.
+This source documentation targets Bluey `0.1.104`. The signed live manifest at
+`https://bluey.sh/latest.json` is the authority for the version and artifacts
+customers can currently download.
 
 ## Supported Release Artifacts
 
 | Platform | Status |
 | --- | --- |
 | macOS on Apple silicon | Available as `darwin-arm64` |
+| macOS on Intel | Available as `darwin-x86_64` |
+| macOS universal | Available as `darwin-universal` |
 | Windows x86-64 | Available; install-smoked on Windows 11 |
-| macOS Intel/universal | Not in the current manifest |
 | Linux | Not in the current manifest |
 
 Do not treat source compatibility or an older artifact as a current support
@@ -24,9 +26,10 @@ curl -fsSL https://bluey.sh/install.sh | bash
 bluey on
 ```
 
-The current macOS release requires Apple silicon. Bluey requests operating
-system permissions only when a selected feature needs them. Microphone access
-is needed for mic transcription; system-audio, screen-recording, automation, or
+The installer selects the signed Apple silicon or Intel archive for the current
+machine; a universal archive is also published. Bluey requests operating system
+permissions only when a selected feature needs them. Microphone access is
+needed for mic transcription; system-audio, screen-recording, automation, or
 accessibility access depends on the context features you choose.
 
 ## Windows

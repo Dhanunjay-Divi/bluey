@@ -102,13 +102,34 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         document.querySelectorAll('[data-release-version]').forEach((element) => {
           element.textContent = version;
         });
-        document.querySelectorAll('[data-release-platform]').forEach((card) => {
-          const platform = card.dataset.releasePlatform || '';
-          const available = Boolean(manifest?.platforms?.[platform]?.url);
+        document.querySelectorAll('[data-release-platform], [data-release-platforms]').forEach((card) => {
+          const platforms = (card.dataset.releasePlatforms || card.dataset.releasePlatform || '')
+            .split(',')
+            .map((platform) => platform.trim())
+            .filter(Boolean);
+          const availablePlatforms = platforms.filter(
+            (platform) => Boolean(manifest?.platforms?.[platform]?.url),
+          );
+          const available = availablePlatforms.length > 0;
           card.classList.toggle('is-release-unavailable', !available);
           if (!available) {
             card.setAttribute('aria-disabled', 'true');
             card.querySelector('.download-card-action')?.replaceChildren('Not in current release');
+          } else {
+            card.removeAttribute('aria-disabled');
+          }
+          const summary = card.querySelector('[data-release-platform-summary]');
+          if (summary && availablePlatforms.length > 0) {
+            const labels = {
+              'darwin-arm64': 'Apple silicon',
+              'darwin-x86_64': 'Intel',
+              'darwin-universal': 'universal',
+            };
+            const names = availablePlatforms.map((platform) => labels[platform] || platform);
+            const joined = names.length === 1
+              ? `${names[0]} archive`
+              : `${names.slice(0, -1).join(', ')}${names.length > 2 ? ',' : ''} and ${names.at(-1)} archives`;
+            summary.textContent = joined;
           }
         });
       } catch {

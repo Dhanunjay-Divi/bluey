@@ -1,9 +1,8 @@
 # Product Strategy
 
 Bluey is a commercial managed product, not an open-source/BYOK clone. The
-current public release is `0.1.99` with manifest-listed artifacts for macOS
-Apple silicon and Windows x86-64. Source parity or roadmap work must not be
-presented as a shipped platform.
+signed live manifest and `INSTALL.md` define the downloadable version and
+platforms. Source parity or roadmap work must not be presented as shipped.
 
 The recommended public position is:
 

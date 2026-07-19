@@ -5,11 +5,10 @@
 > **Companion:** `docs/PRODUCTION-DEPLOY-RUNBOOK.md` and
 > `docs/deploy/BLUEY-SH-LAUNCH.md`
 
-> **Current release record (2026-07-12):** the signed manifest reports `0.1.99`
-> for macOS Apple silicon and Windows x86-64. Windows 11 is install-smoked in
-> the release record. Linux, macOS Intel/universal, and Windows 10 are not
-> claimed. Older gates below remain as an audit ledger, not current platform
-> copy.
+> **Current release record:** the signed live manifest and `INSTALL.md` define
+> downloadable platforms. Windows release proof is bounded to Windows 11 and
+> there is no public Linux desktop artifact. Older versioned gates below remain
+> an audit ledger, not current platform copy.
 
 This is the master gate before public alpha. Every item must be ticked or explicitly waived (with rationale) before announcing the product.
 

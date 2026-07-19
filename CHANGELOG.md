@@ -5,6 +5,30 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+## [0.1.104] - 2026-07-19
+
+### Added
+
+- Added a gated, undistributed Bluey Browser controller with explicit
+  background opt-in, tray controls, intervention notifications, crash-safe
+  checkpoints, dedicated platform icon families, and truthful
+  local-versus-cloud status copy.
+- Added scheduled, verified public-ATS discovery for Greenhouse, Lever, Ashby,
+  SmartRecruiters, and Workday with canonical board ownership, atomic snapshot
+  publication, bounded reads, deduplication, and stale-job filtering.
+- Added live server authorization immediately before every irreversible local
+  browser submit, with distinct result, resume, and submit capabilities.
+- Added global managed-provider spend holds, authoritative usage provenance,
+  conservative migration baselines, and fail-closed accounting across answer,
+  search, embedding, transcription, vision, and Jobs generation routes.
+
+### Changed
+
+- Split the oversized Jobs persistence and answer-router modules into focused
+  domain modules while preserving reconstructed source identity and behavior.
+- Aligned embedded and operator PostgreSQL migrations, including the physical
+  Jobs discovery-board ownership migration and operator-discoverable targets.
+
 ### Fixed
 
 - Skip the macOS installer sudo prompt during an update when every public
@@ -12,6 +36,13 @@ under `docs/release/`.
 - Kept managed Jobs resume ranking extractive and default-off, with exact
   evidence composition, bounded provider deadlines and spend, fail-closed
   attempt accounting, and authoritative recovery of legacy application IDs.
+- Kept secure-store access disabled when the release environment sets its four
+  opt-out flags to `0`, including a current-user-only Windows recovery key path
+  that does not invoke DPAPI.
+- Removed Playwright dependency-scanner tooling that is not required by the
+  packaged Windows Browser runtime.
+
+See `docs/release/RELEASE-v0.1.104.md` for release detail.
 
 ## [0.1.103] - 2026-07-19
 

@@ -1,8 +1,8 @@
 # Bluey Handoff
 
-> Current implementation handoff for `0.1.103`. Release acceptance and runtime
+> Current implementation handoff for `0.1.104`. Release acceptance and runtime
 > boundaries are recorded in
-> `docs/rounds/ROUND-548-BLUEY-STARTUP-OWNERSHIP-RECOVERY-AND-CROSS-PLATFORM-RELEASE.md`.
+> `docs/rounds/ROUND-550-INTEGRATED-JOBS-BROWSER-DISCOVERY-SPEND-AND-CROSS-PLATFORM-RELEASE.md`.
 
 This document is the quick-start map for the next agent or engineer picking up Bluey.
 
@@ -51,6 +51,17 @@ This document is the quick-start map for the next agent or engineer picking up B
   discovery, ranking, factual resume tailoring, answer memory, final review,
   ATS-specific execution, handoff-only sites, receipts, interview preparation,
   and encrypted crash recovery.
+- Scheduled discovery is enabled in source for verified Greenhouse, Lever,
+  Ashby, SmartRecruiters, and Workday boards. Imported snapshots are not
+  application truth: canonical employer/ATS verification, board ownership,
+  deduplication, and source-health gates remain mandatory.
+- Bluey Browser has an opt-in background controller and tray on macOS and
+  Windows. Local work runs only while the computer is online, awake, and
+  unlocked; only an entitled cloud runner may claim computer-off operation.
+- Every local final click requires a fresh, scoped server authorization after
+  current entitlement, identity, run binding, and provider review are checked.
+  A crash after the durable marker or click remains `side_effect_unknown` and
+  is never automatically retried.
 
 ## Keys And Local Models Needed For Real Testing
 
@@ -107,9 +118,9 @@ Product smoke:
 
 ## Remaining Runtime And Dependency Gates
 
-- Run physical Windows launch, overlay, dual-audio, UI Automation context,
-  update, DPAPI checkpoint, and managed-live-caption canaries before broad
-  Windows rollout.
+- Preserve the physical Windows release gate for launch, overlay, dual-audio,
+  UI Automation context, update, secure-store-disabled recovery, and managed
+  live-caption canaries before broad Windows rollout.
 - Run macOS Intel and clean-machine universal install/update canaries.
 - Validate Chrome/Edge semantic capture under customer browser permission
   policies; unsupported policies fail closed instead of silently taking
@@ -119,6 +130,10 @@ Product smoke:
   are available.
 - Measure tenant-filtered vector retrieval before replacing the current bounded
   retrieval strategy with a production ANN index.
+- Keep `BLUEY_JOBS_MODEL_GENERATION_ENABLED`,
+  `BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED`, and
+  `BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED` disabled until their separate
+  production canaries and operator approvals pass.
 
 ## Review Notes
 

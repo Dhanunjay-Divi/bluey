@@ -1,10 +1,8 @@
 # Bluey Architecture
 
 > Historical architecture snapshot. It records the `0.1.0` system and rollout
-> plan, not the current release matrix. As of July 12, 2026, the public signed
-> manifest reports `0.1.99` with `darwin-arm64` and `windows-x86_64` artifacts.
-> Use `README.md`, `INSTALL.md`, and `https://bluey.sh/latest.json` for current
-> product, platform, and install claims.
+> plan, not the current release matrix. Use `README.md`, `INSTALL.md`, and the
+> signed live manifest for current product, platform, and install claims.
 
 > **Source of truth for system shape, server topology, deploy paths,
 > platform status, and the staged monetization rollout.**

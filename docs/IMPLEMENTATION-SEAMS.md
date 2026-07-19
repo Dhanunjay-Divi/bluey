@@ -1,8 +1,8 @@
 # Implementation Seams
 
 > Historical implementation baseline. Its `0.1.0` platform statements are not
-> current support claims. The public `0.1.99` manifest lists macOS Apple silicon
-> and Windows x86-64 artifacts.
+> current support claims. Use the signed live manifest and `INSTALL.md` for
+> downloadable-platform facts.
 
 This is the map for the next backend hardening work. The current build exposes
 the product surfaces and now has native macOS audio, two-stage VAD, streaming
