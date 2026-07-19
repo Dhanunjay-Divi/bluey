@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    api::{jobs_import, AppState},
+    api::{jobs_import, jobs_resume_generation, AppState},
     auth::AuthedAccount,
     db::jobs::{
         self, AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession,
@@ -261,8 +261,27 @@ fn jobs_local_browser_distribution_enabled() -> bool {
             .unwrap_or(false)
 }
 
-fn apply_jobs_distribution_gates(entitlement: &mut JobsEntitlement, local_browser: bool) {
+fn jobs_cloud_browser_distribution_enabled() -> bool {
+    cfg!(debug_assertions)
+        || (std::env::var("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
+            .unwrap_or(false)
+            && std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN")
+                .is_ok_and(|value| !value.trim().is_empty()))
+}
+
+fn apply_jobs_distribution_gates(
+    entitlement: &mut JobsEntitlement,
+    local_browser: bool,
+    cloud_browser: bool,
+) {
     entitlement.local_browser &= local_browser;
+    entitlement.cloud_browser &= cloud_browser;
 }
 
 pub async fn workspace(
@@ -274,6 +293,7 @@ pub async fn workspace(
     apply_jobs_distribution_gates(
         &mut workspace.entitlement,
         jobs_local_browser_distribution_enabled(),
+        jobs_cloud_browser_distribution_enabled(),
     );
     Ok(Json(workspace))
 }
@@ -659,7 +679,7 @@ pub async fn prepare_application(
             "Finish your Career Profile before preparing applications.".to_string(),
         ));
     }
-    let (mut application, resume_version) = jobs::prepare_application(
+    let (draft, baseline_resume) = jobs::prepare_application_draft(
         &state.pool,
         &account.id,
         &req.job_id,
@@ -667,11 +687,38 @@ pub async fn prepare_application(
         &req.submission_mode,
     )
     .map_err(internal)?;
+    let posting = jobs::get_posting(&state.pool, &account.id, &req.job_id)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
+    let generated =
+        jobs_resume_generation::generate(&state, &account.id, &profile, &posting, &baseline_resume)
+            .await
+            .map_err(|error| {
+                if error
+                    .to_string()
+                    .contains("resume generation is already in progress")
+                {
+                    (
+                        StatusCode::CONFLICT,
+                        "Bluey is already preparing this resume. Try again in a moment."
+                            .to_string(),
+                    )
+                } else {
+                    internal(error)
+                }
+            })?;
+    let (mut application, resume_version) = jobs::finalize_prepared_application(
+        &state.pool,
+        &account.id,
+        &draft.id,
+        &baseline_resume,
+        generated.content,
+        generated.diff,
+        generated.public_provenance,
+    )
+    .map_err(internal)?;
     let mut metering = None;
     if application.state == "queued" {
-        let posting = jobs::get_posting(&state.pool, &account.id, &application.job_id)
-            .map_err(internal)?
-            .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
         application = freeze_approved_execution(
             &state,
             &account.id,
@@ -938,22 +985,6 @@ pub async fn queue_application_run(
     if !matches!(req.runner.as_str(), "local" | "cloud") {
         return bad_request("Choose the local or cloud runner.");
     }
-    if req.runner == "local" && !jobs_local_browser_distribution_enabled() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser is still an invited beta and is not distributed in this release."
-                .to_string(),
-        ));
-    }
-    let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
-    if (req.runner == "local" && !entitlement.local_browser)
-        || (req.runner == "cloud" && !entitlement.cloud_browser)
-    {
-        return Err((
-            StatusCode::PAYMENT_REQUIRED,
-            "That browser runner is not included in your Jobs plan.".to_string(),
-        ));
-    }
     let mut application = jobs::get_application(&state.pool, &account.id, &application_id)
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
@@ -970,6 +1001,29 @@ pub async fn queue_application_run(
         return Err((
             StatusCode::CONFLICT,
             "Only queued applications can start a browser runner.".to_string(),
+        ));
+    }
+    if req.runner == "local" && !jobs_local_browser_distribution_enabled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Browser is still an invited beta and is not distributed in this release."
+                .to_string(),
+        ));
+    }
+    let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
+    if (req.runner == "local" && !entitlement.local_browser)
+        || (req.runner == "cloud" && !entitlement.cloud_browser)
+    {
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            "That browser runner is not included in your Jobs plan.".to_string(),
+        ));
+    }
+    if req.runner == "cloud" && !jobs_cloud_browser_distribution_enabled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The cloud runner is still an invited beta and is not available in this release."
+                .to_string(),
         ));
     }
     let posting = jobs::get_posting(&state.pool, &account.id, &application.job_id)
@@ -1498,6 +1552,13 @@ pub async fn save_browser_session(
         return Err((
             StatusCode::PAYMENT_REQUIRED,
             "This browser runner is not included in your Jobs plan.".to_string(),
+        ));
+    }
+    if session.runner == "cloud" && !jobs_cloud_browser_distribution_enabled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The cloud runner is still an invited beta and is not available in this release."
+                .to_string(),
         ));
     }
     jobs::upsert_browser_session(&state.pool, &account.id, &session)
@@ -4425,14 +4486,27 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_local_browser_distribution_masks_plan_entitlement() {
+    fn unavailable_runner_distribution_masks_plan_entitlements() {
         let mut entitlement = test_entitlement(3);
         entitlement.local_browser = true;
+        entitlement.cloud_browser = true;
 
-        apply_jobs_distribution_gates(&mut entitlement, false);
+        apply_jobs_distribution_gates(&mut entitlement, false, false);
 
         assert!(!entitlement.local_browser);
         assert!(!entitlement.cloud_browser);
+    }
+
+    #[test]
+    fn available_runner_distribution_preserves_plan_entitlements() {
+        let mut entitlement = test_entitlement(5);
+        entitlement.local_browser = true;
+        entitlement.cloud_browser = true;
+
+        apply_jobs_distribution_gates(&mut entitlement, true, true);
+
+        assert!(entitlement.local_browser);
+        assert!(entitlement.cloud_browser);
     }
 
     fn test_track(id: &str) -> CareerTrack {

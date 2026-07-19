@@ -4886,6 +4886,27 @@ pub fn prepare_application(
     mode: &str,
     submission_mode: &str,
 ) -> Result<(JobApplication, ResumeVersion)> {
+    prepare_application_inner(pool, account_id, job_id, mode, submission_mode, true)
+}
+
+pub fn prepare_application_draft(
+    pool: &DbPool,
+    account_id: &str,
+    job_id: &str,
+    mode: &str,
+    submission_mode: &str,
+) -> Result<(JobApplication, ResumeVersion)> {
+    prepare_application_inner(pool, account_id, job_id, mode, submission_mode, false)
+}
+
+fn prepare_application_inner(
+    pool: &DbPool,
+    account_id: &str,
+    job_id: &str,
+    mode: &str,
+    submission_mode: &str,
+    finalize_immediately: bool,
+) -> Result<(JobApplication, ResumeVersion)> {
     let profile = get_profile(pool, account_id, "")?;
     let posting =
         get_posting(pool, account_id, job_id)?.ok_or_else(|| anyhow::anyhow!("job not found"))?;
@@ -4963,18 +4984,31 @@ pub fn prepare_application(
     let diff = tailored_resume.diff;
     let checksum_source = format!("{}|{}|{}", account_id, job_id, content);
     let checksum = hex::encode(Sha256::digest(checksum_source.as_bytes()));
-    let resume = save_resume_version(
-        pool,
-        account_id,
-        job_id,
-        mode,
-        content,
-        diff,
-        approved_fact_ids,
-        checksum,
-    )?;
-
     let now = now_ms();
+    let resume = if finalize_immediately {
+        save_resume_version(
+            pool,
+            account_id,
+            job_id,
+            mode,
+            content,
+            diff,
+            approved_fact_ids.clone(),
+            checksum,
+        )?
+    } else {
+        ResumeVersion {
+            id: String::new(),
+            job_id: job_id.to_string(),
+            version_no: 0,
+            mode: mode.to_string(),
+            content,
+            diff,
+            claim_ids: approved_fact_ids.clone(),
+            checksum,
+            created_at_ms: now,
+        }
+    };
     let mut application = existing_application.unwrap_or(JobApplication {
         id: uuid::Uuid::new_v4().to_string(),
         job_id: job_id.to_string(),
@@ -5008,9 +5042,11 @@ pub fn prepare_application(
             application.answers.push(remembered);
         }
     }
-    application.resume_version_id = Some(resume.id.clone());
+    application.resume_version_id = (!resume.id.is_empty()).then(|| resume.id.clone());
     let auto_submit_eligible = submission_mode == "auto_submit" && eligibility.can_auto_submit;
-    application.state = if auto_submit_eligible {
+    application.state = if !finalize_immediately {
+        "preparing".to_string()
+    } else if auto_submit_eligible {
         "queued".to_string()
     } else {
         "awaiting_review".to_string()
@@ -5020,7 +5056,7 @@ pub fn prepare_application(
     application.updated_at_ms = now;
     application.receipt = json!({
         "job_snapshot": posting,
-        "resume_version_id": resume.id,
+        "resume_version_id": if resume.id.is_empty() { Value::Null } else { json!(resume.id) },
         "career_track_id": posting.track_id,
         "candidate_truth_fingerprint": truth_fingerprint,
         "candidate_truth_fingerprint_version": 1,
@@ -5035,13 +5071,116 @@ pub fn prepare_application(
         "eligibility": eligibility,
         "cover_letter_status": if application.cover_letter.trim().is_empty() { "not_included" } else { "included" },
         "metering": {
-            "status": if auto_submit_eligible { "counts_when_queued" } else { "counts_when_approved_or_downloaded" },
+            "status": if !finalize_immediately { "pending_generation" } else if auto_submit_eligible { "counts_when_queued" } else { "counts_when_approved_or_downloaded" },
             "canonical_job_key": posting.canonical_key,
+        },
+        "resume_generation": {
+            "status": if finalize_immediately { "deterministic" } else { "pending" },
         },
         "confirmation": Value::Null,
     });
     save_application(pool, account_id, &application)?;
     Ok((application, resume))
+}
+
+pub fn finalize_prepared_application(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    baseline: &ResumeVersion,
+    content: Value,
+    diff: Value,
+    generation: Value,
+) -> Result<(JobApplication, ResumeVersion)> {
+    let Some(mut application) = get_application(pool, account_id, application_id)? else {
+        anyhow::bail!("application not found")
+    };
+    if application.state != "preparing" {
+        anyhow::bail!("application is not waiting for resume generation")
+    }
+    let posting = get_posting(pool, account_id, &application.job_id)?
+        .ok_or_else(|| anyhow::anyhow!("job not found"))?;
+    if baseline.job_id != posting.id {
+        anyhow::bail!("application baseline targets a different job")
+    }
+    if content.pointer("/target/job_id").and_then(Value::as_str) != Some(posting.id.as_str()) {
+        anyhow::bail!("generated resume targets a different job")
+    }
+    let expected_truth_fingerprint = application
+        .receipt
+        .get("candidate_truth_fingerprint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("application draft has no truth fingerprint"))?;
+    if content
+        .pointer("/provenance/candidate_truth_fingerprint")
+        .and_then(Value::as_str)
+        != Some(expected_truth_fingerprint)
+    {
+        anyhow::bail!("generated resume does not match the candidate truth snapshot")
+    }
+    let expected_identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("application draft has no verified identity"))?;
+    if content
+        .pointer("/provenance/application_identity_id")
+        .and_then(Value::as_str)
+        != Some(expected_identity_id)
+    {
+        anyhow::bail!("generated resume does not match the verified application identity")
+    }
+
+    let checksum_source = format!("{}|{}|{}", account_id, posting.id, content);
+    let checksum = hex::encode(Sha256::digest(checksum_source.as_bytes()));
+    let resume = save_resume_version(
+        pool,
+        account_id,
+        &posting.id,
+        &baseline.mode,
+        content,
+        diff,
+        baseline.claim_ids.clone(),
+        checksum,
+    )?;
+    let eligibility = evaluate_job_eligibility(
+        pool,
+        account_id,
+        &posting,
+        false,
+        Some(application.id.as_str()),
+    )?;
+    let auto_submit_eligible =
+        application.submission_mode == "auto_submit" && eligibility.can_auto_submit;
+    application.resume_version_id = Some(resume.id.clone());
+    application.state = if auto_submit_eligible {
+        "queued".to_string()
+    } else {
+        "awaiting_review".to_string()
+    };
+    application.updated_at_ms = now_ms();
+    let receipt = application
+        .receipt
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("application receipt must be an object"))?;
+    receipt.insert("resume_version_id".to_string(), json!(resume.id));
+    receipt.insert(
+        "eligibility".to_string(),
+        serde_json::to_value(eligibility)?,
+    );
+    receipt.insert("resume_generation".to_string(), generation);
+    receipt.insert(
+        "prepared_at_ms".to_string(),
+        json!(application.updated_at_ms),
+    );
+    receipt.insert(
+        "metering".to_string(),
+        json!({
+            "status": if auto_submit_eligible { "counts_when_queued" } else { "counts_when_approved_or_downloaded" },
+            "canonical_job_key": posting.canonical_key,
+        }),
+    );
+    save_application(pool, account_id, &application).map(|application| (application, resume))
 }
 
 fn answers_for_posting(
@@ -11538,6 +11677,112 @@ mod tests {
         let (application, _) =
             prepare_application(&pool, "acct-jobs", &posting.id, "factual", "auto_submit").unwrap();
         assert_eq!(application.state, "awaiting_review");
+    }
+
+    #[test]
+    fn resume_generation_draft_is_not_runnable_or_visible_until_finalized() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/generated-resume",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (draft, baseline) =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "auto_submit")
+                .unwrap();
+        assert_eq!(draft.state, "preparing");
+        assert!(draft.resume_version_id.is_none());
+        assert!(baseline.id.is_empty());
+        assert!(list_resume_versions(&pool, "acct-jobs").unwrap().is_empty());
+        assert_eq!(
+            draft.receipt.pointer("/metering/status"),
+            Some(&json!("pending_generation"))
+        );
+
+        let mut content = baseline.content.clone();
+        content["provenance"]["resume_generation"] = json!({
+            "kind": "model",
+            "schema_version": 1,
+            "truth_guard": "passed",
+            "claims_added": 0,
+        });
+        let generation = content["provenance"]["resume_generation"].clone();
+        let (application, resume) = finalize_prepared_application(
+            &pool,
+            "acct-jobs",
+            &draft.id,
+            &baseline,
+            content.clone(),
+            baseline.diff.clone(),
+            generation,
+        )
+        .unwrap();
+        assert_eq!(application.state, "awaiting_review");
+        assert_eq!(
+            application.resume_version_id.as_deref(),
+            Some(resume.id.as_str())
+        );
+        assert_eq!(resume.version_no, 1);
+        assert_eq!(resume.content, content);
+        assert_eq!(
+            application.receipt.pointer("/resume_generation/kind"),
+            Some(&json!("model"))
+        );
+        assert_eq!(list_resume_versions(&pool, "acct-jobs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn resume_generation_finalization_rejects_a_changed_truth_snapshot() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/tampered-resume",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (draft, baseline) =
+            prepare_application_draft(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let mut content = baseline.content.clone();
+        content["provenance"]["candidate_truth_fingerprint"] = json!("tampered");
+        let error = finalize_prepared_application(
+            &pool,
+            "acct-jobs",
+            &draft.id,
+            &baseline,
+            content,
+            baseline.diff.clone(),
+            json!({"kind": "model"}),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the candidate truth snapshot"));
+        assert_eq!(
+            get_application(&pool, "acct-jobs", &draft.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "preparing"
+        );
+        assert!(list_resume_versions(&pool, "acct-jobs").unwrap().is_empty());
     }
 
     #[test]

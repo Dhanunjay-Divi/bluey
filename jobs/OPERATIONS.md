@@ -20,6 +20,12 @@ Keep `BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0` until versioned Bluey
 Browser packages and updater metadata are published and physical macOS/Windows
 install, launch, protocol, and rollback canaries pass. Plan entitlement alone
 must never expose an undistributed client.
+Keep `BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0` until the authenticated
+workflow gateway, Temporal workers, and isolated Chromium pool are deployed and
+their start, intervention, restart-recovery, receipt, and rollback canaries pass.
+The Jobs workspace masks Cloud plan runner access unless both that explicit
+release gate and a non-empty workflow credential are present. A plan entitlement
+must never be presented as runtime availability.
 Install `ops/bluey-api-jobs-env.conf.example` as the main API service drop-in so
 account export, account deletion, and Jobs admin routes use the same data key.
 The standalone Jobs API binds to loopback by default; container deployments
@@ -35,6 +41,8 @@ and browser pool share `BLUEY_JOBS_RUNNER_TOKEN`. Use independently generated
 ```text
 BLUEY_JOBS_BETA_ENABLED=1
 BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0
+BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0
+BLUEY_JOBS_MODEL_GENERATION_ENABLED=1
 BLUEY_JOBS_WORKFLOW_ORIGIN=https://jobs-workflows.internal
 BLUEY_JOBS_WORKFLOW_TOKEN=<random secret>
 BLUEY_JOBS_WORKER_TOKEN=<random secret>
