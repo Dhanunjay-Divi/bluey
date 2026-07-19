@@ -199,6 +199,43 @@ describe("public ATS discovery", () => {
     }
   });
 
+  it("rejects Ashby rows whose public URL is outside the configured board", async () => {
+    for (const jobUrl of [
+      "https://evil.example/acme/a-hostile",
+      "https://jobs.ashbyhq.com/other-board/a-hostile",
+      "https://jobs.ashbyhq.com/acme/different-job",
+      "https://jobs.ashbyhq.com:444/acme/a-hostile",
+    ]) {
+      const provider = new PublicAtsDiscoveryProvider({
+        fetch: async () => response({ jobs: [{
+          id: "a-hostile",
+          title: "Platform Engineer",
+          jobUrl,
+          publishedAt: new Date().toISOString(),
+        }] }),
+        sleep: async () => undefined,
+      });
+
+      await expect(provider.snapshot({ kind: "ashby", boardName: "acme" }))
+        .rejects.toThrow("invalid listed row");
+    }
+
+    const valid = new PublicAtsDiscoveryProvider({
+      fetch: async () => response({ jobs: [{
+        id: "a-valid",
+        title: "Platform Engineer",
+        jobUrl: "https://jobs.ashbyhq.com/acme/a-valid?utm_source=feed#details",
+        publishedAt: new Date().toISOString(),
+      }] }),
+      sleep: async () => undefined,
+    });
+    await expect(valid.snapshot({ kind: "ashby", boardName: "acme" }))
+      .resolves.toMatchObject([{
+        externalId: "a-valid",
+        canonicalUrl: "https://jobs.ashbyhq.com/acme/a-valid",
+      }]);
+  });
+
   it("derives SmartRecruiters public URLs from the configured company and posting ID", async () => {
     const fetcher: JobsFetch = vi.fn(async (url) => {
       expect(url).toBe("https://api.smartrecruiters.com/v1/companies/Experian/postings?limit=100&offset=0");

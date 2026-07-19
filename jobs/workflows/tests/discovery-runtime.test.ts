@@ -439,6 +439,31 @@ describe("discovery worker runtime", () => {
     }]);
   });
 
+  it("fails instead of completing an Ashby row from another host", async () => {
+    const api = new FakeApi([lease({
+      id: "source-ashby-acme",
+      provider: "ashby",
+      source_key: "acme",
+      config: { kind: "ashby", boardName: "acme", company: "Acme" },
+    })]);
+    const worker = new DiscoveryWorkerRuntime({
+      api,
+      atsFetch: async () => response({ jobs: [{
+        id: "a-hostile",
+        title: "Platform Engineer",
+        jobUrl: "https://evil.example/acme/a-hostile",
+        publishedAt: new Date().toISOString(),
+      }] }),
+      loopClock: new ImmediateClock(),
+      logger: new RecordingLogger(),
+    });
+
+    await expect(worker.pollOnce()).resolves.toBe("failed");
+    expect(api.completed).toEqual([]);
+    expect(api.failed).toHaveLength(1);
+    expect(api.failed[0]?.input.error_code).toBe("provider_error");
+  });
+
   it("replays a duplicate lease without polling the provider again", async () => {
     const duplicate = lease();
     const api = new FakeApi([duplicate, duplicate]);
