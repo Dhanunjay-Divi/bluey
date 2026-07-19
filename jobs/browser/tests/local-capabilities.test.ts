@@ -26,6 +26,7 @@ describe("local run capabilities", () => {
     expect(parsed.capabilities).toEqual({
       result: capability("result"),
       resume: capability("resume"),
+      submit: capability("submit"),
       expiresAtMs: EXPIRES_AT_MS,
       runId: "run-123",
     });
@@ -44,6 +45,9 @@ describe("local run capabilities", () => {
     expect(scopedLocalRunAuthorization(capabilities, "resume", NOW_MS)).toEqual({
       capability: capability("resume"),
     });
+    expect(scopedLocalRunAuthorization(capabilities, "submit", NOW_MS)).toEqual({
+      capability: capability("submit"),
+    });
     expect(scopedLocalRunAuthorization(capabilities, "result", NOW_MS)).not.toHaveProperty("ticket");
   });
 
@@ -56,9 +60,13 @@ describe("local run capabilities", () => {
     malformed._blueyCapabilities.result = "malformed";
     expect(() => parseLocalRunClaim(malformed, "run-123", NOW_MS)).toThrow();
 
+    const missingSubmit = claimResponse();
+    delete missingSubmit._blueyCapabilities.submit;
+    expect(() => parseLocalRunClaim(missingSubmit, "run-123", NOW_MS)).toThrow();
+
     const swapped = claimResponse();
-    swapped._blueyCapabilities.result = capability("resume");
-    swapped._blueyCapabilities.resume = capability("result");
+    swapped._blueyCapabilities.submit = capability("resume");
+    swapped._blueyCapabilities.resume = capability("submit");
     expect(() => parseLocalRunClaim(swapped, "run-123", NOW_MS)).toThrow();
 
     const wrongRun = claimResponse();
@@ -84,6 +92,7 @@ describe("local run capabilities", () => {
     );
     expect(() => scopedLocalRunAuthorization(capabilities, "result", EXPIRES_AT_MS)).toThrow();
     expect(() => scopedLocalRunAuthorization(capabilities, "resume", EXPIRES_AT_MS)).toThrow();
+    expect(() => scopedLocalRunAuthorization(capabilities, "submit", EXPIRES_AT_MS)).toThrow();
   });
 
   it("rejects malformed token shape and non-resume authority in resume links", () => {
@@ -110,13 +119,14 @@ function claimResponse() {
     _blueyCapabilities: {
       result: capability("result"),
       resume: capability("resume"),
+      submit: capability("submit"),
       expiresAtMs: EXPIRES_AT_MS,
     },
   };
 }
 
 function capability(
-  operation: "result" | "resume",
+  operation: "result" | "resume" | "submit",
   overrides: Record<string, unknown> = {},
 ): string {
   const claims = {

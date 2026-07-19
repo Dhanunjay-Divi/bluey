@@ -1,8 +1,14 @@
-export type LocalRunCapabilityOperation = "result" | "resume";
+export type LocalRunCapabilityOperation = "result" | "resume" | "submit";
 
 export interface LocalRunCapabilities {
   readonly result: string;
   readonly resume: string;
+  /**
+   * Optional only so checkpoints written by an older Browser release remain
+   * readable. New claims always require this value, and a restored legacy run
+   * fails closed if it reaches the final-submit fence.
+   */
+  readonly submit?: string;
   readonly expiresAtMs: number;
   readonly runId: string;
 }
@@ -52,11 +58,15 @@ export function parseLocalRunClaim<T extends object>(
   const expiresAtMs = requireExpiry(rawCapabilities.expiresAtMs, nowMs);
   const result = requireString(rawCapabilities.result, "result capability");
   const resume = requireString(rawCapabilities.resume, "resume capability");
-  if (result === resume) throw new Error("Local run capabilities must be operation-scoped");
+  const submit = requireString(rawCapabilities.submit, "submit capability");
+  if (new Set([result, resume, submit]).size !== 3) {
+    throw new Error("Local run capabilities must be operation-scoped");
+  }
 
   const resultClaims = parseLocalRunCapability(result, "result", runId, nowMs);
   const resumeClaims = parseLocalRunCapability(resume, "resume", runId, nowMs);
-  for (const capabilityClaims of [resultClaims, resumeClaims]) {
+  const submitClaims = parseLocalRunCapability(submit, "submit", runId, nowMs);
+  for (const capabilityClaims of [resultClaims, resumeClaims, submitClaims]) {
     if (capabilityClaims.expires_at_ms !== expiresAtMs
       || capabilityClaims.account_id !== bindings.accountId
       || capabilityClaims.application_id !== bindings.applicationId
@@ -69,7 +79,7 @@ export function parseLocalRunClaim<T extends object>(
   delete request._blueyCapabilities;
   return {
     request: request as T,
-    capabilities: Object.freeze({ result, resume, expiresAtMs, runId }),
+    capabilities: Object.freeze({ result, resume, submit, expiresAtMs, runId }),
   };
 }
 
@@ -80,6 +90,7 @@ export function scopedLocalRunAuthorization(
 ): { capability: string } {
   if (capabilities.expiresAtMs <= nowMs) throw new Error("Local run capability has expired");
   const capability = capabilities[operation];
+  if (!capability) throw new Error("Local run capability is unavailable");
   const claims = parseLocalRunCapability(capability, operation, capabilities.runId, nowMs);
   if (claims.expires_at_ms !== capabilities.expiresAtMs) {
     throw new Error("Local run capability expiry does not match the claim response");

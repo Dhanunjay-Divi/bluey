@@ -211,8 +211,12 @@ function validateCheckpoint(value: unknown): asserts value is LocalRunCheckpoint
   }
   const capabilities = requireRecord(delivery.capabilities, "checkpoint capabilities");
   for (const field of ["result", "resume", "runId"] as const) requireString(capabilities[field], field);
+  if (capabilities.submit !== undefined) requireString(capabilities.submit, "submit");
   const request = requireRecord(checkpoint.request, "checkpoint request");
-  if (capabilities.runId !== request.runId || capabilities.result === capabilities.resume) {
+  if (capabilities.runId !== request.runId
+    || capabilities.result === capabilities.resume
+    || (capabilities.submit !== undefined
+      && [capabilities.result, capabilities.resume].includes(capabilities.submit))) {
     throw new Error("Invalid local run checkpoint capability bindings");
   }
   const packet = requireRecord(request.packet, "checkpoint packet");

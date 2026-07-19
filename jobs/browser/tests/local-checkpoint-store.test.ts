@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { restartDisposition } from "@bluey/jobs-automation";
 import { acquireFinalSubmitAuthority, finalSubmitMarkerExists } from "../src/irreversible-submit.js";
+import { scopedLocalRunAuthorization } from "../src/local-capabilities.js";
 import {
   LocalCheckpointStore,
   type LocalRunCheckpoint,
@@ -68,6 +69,23 @@ describe("encrypted local browser checkpoints", () => {
     await expect(store.list()).resolves.toEqual([]);
   });
 
+  it("loads legacy checkpoints without manufacturing submit authority", async () => {
+    const root = await temporaryDirectory();
+    const store = await LocalCheckpointStore.open(root);
+    const checkpoint = fixture();
+    delete checkpoint.delivery.capabilities.submit;
+    const scope = store.scopeFor(checkpoint.request);
+    await store.write(checkpoint);
+
+    const restored = await store.read(scope);
+    expect(restored?.delivery.capabilities.submit).toBeUndefined();
+    expect(() => scopedLocalRunAuthorization(
+      restored!.delivery.capabilities,
+      "submit",
+      Date.parse("2026-07-16T12:02:00.000Z"),
+    )).toThrow("unavailable");
+  });
+
   it("restores before the durable submit marker and fails closed after it", async () => {
     const root = await temporaryDirectory();
     const runDirectory = join(root, "run");
@@ -130,6 +148,7 @@ function fixture(requestOverrides: Record<string, unknown> = {}): LocalRunCheckp
       capabilities: {
         result: "scoped-result-capability",
         resume: "scoped-resume-capability",
+        submit: "scoped-submit-capability",
         expiresAtMs,
         runId: String(requestOverrides.runId || "run-123"),
       },

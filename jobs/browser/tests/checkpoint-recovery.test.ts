@@ -80,6 +80,7 @@ function fixture(): LocalRunCheckpoint<StartRunRequest> {
       capabilities: {
         result: capability("result", expiresAtMs),
         resume: capability("resume", expiresAtMs),
+        submit: capability("submit", expiresAtMs),
         expiresAtMs,
         runId: "run-123",
       },
@@ -90,7 +91,7 @@ function fixture(): LocalRunCheckpoint<StartRunRequest> {
   };
 }
 
-function capability(operation: "result" | "resume", expiresAtMs: number): string {
+function capability(operation: "result" | "resume" | "submit", expiresAtMs: number): string {
   const claims = {
     version: 1,
     audience: "bluey-jobs-local-run",
