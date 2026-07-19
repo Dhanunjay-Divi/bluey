@@ -768,8 +768,9 @@ async fn try_model_generation(
                 completion.provider != provider || completion.model != model;
             let cost_rejected = settled_bluey_cost > MAX_ATTEMPT_BLUEY_COST_CENTS;
             let deadline_rejected = generation_started.elapsed() >= MODEL_GENERATION_DEADLINE;
-            let plan =
-                parse_plan(&completion.text).and_then(|plan| validate_plan(profile, catalog, plan));
+            let plan = parse_plan(&completion.text)
+                .map(|plan| normalize_plan(profile, catalog, plan))
+                .and_then(|plan| validate_plan(profile, catalog, plan));
             let outcome = if provider_boundary_rejected {
                 AttemptOutcome::RejectedProviderBoundary
             } else if cost_rejected {
@@ -1255,13 +1256,6 @@ fn normalize_plan(
         })
         .collect();
 
-    plan.headline = normalize_narrative(
-        &plan.headline,
-        &profile.headline,
-        catalog,
-        MAX_HEADLINE_CHARS,
-    );
-    plan.summary = normalize_narrative(&plan.summary, &profile.summary, catalog, MAX_SUMMARY_CHARS);
     plan
 }
 
@@ -1304,41 +1298,6 @@ fn normalize_permutation(values: Vec<usize>, expected_len: usize) -> Vec<usize> 
         }
     }
     normalized
-}
-
-fn normalize_narrative(
-    proposed: &str,
-    fallback: &str,
-    catalog: &EvidenceCatalog,
-    max_chars: usize,
-) -> String {
-    let all_verified_evidence = catalog
-        .values
-        .values()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let proposed = truncate_at_boundary(proposed.trim(), max_chars);
-    if validate_narrative(&proposed, &all_verified_evidence, "narrative").is_ok() {
-        return proposed;
-    }
-    truncate_at_boundary(fallback.trim(), max_chars)
-}
-
-fn truncate_at_boundary(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let prefix = value.chars().take(max_chars).collect::<String>();
-    let boundary = prefix
-        .char_indices()
-        .filter(|(_, character)| character.is_whitespace() || matches!(character, '.' | ',' | ';'))
-        .map(|(index, _)| index)
-        .next_back()
-        .unwrap_or(prefix.len());
-    prefix[..boundary]
-        .trim_end_matches(|character: char| character.is_whitespace() || character == ',')
-        .to_string()
 }
 
 fn validate_permutation(values: &[usize], expected_len: usize, label: &str) -> Result<()> {
@@ -1639,6 +1598,21 @@ mod tests {
     }
 
     #[test]
+    fn missing_rank_arrays_normalize_to_verified_profile_order() {
+        let profile = profile();
+        let catalog = EvidenceCatalog::from_profile(&profile);
+        let normalized = normalize_plan(&profile, &catalog, parse_plan("{}").unwrap());
+        assert_eq!(normalized.employment_order, vec![0]);
+        assert_eq!(normalized.project_order, vec![0]);
+        assert_eq!(normalized.skill_order, profile.skills);
+        assert_eq!(
+            normalized.employment_highlight_order[0].highlight_indices,
+            vec![0, 1]
+        );
+        validate_plan(&profile, &catalog, normalized).unwrap();
+    }
+
+    #[test]
     fn rejects_unknown_skill_and_duplicate_evidence() {
         let profile = profile();
         let catalog = EvidenceCatalog::from_profile(&profile);
@@ -1729,9 +1703,16 @@ mod tests {
         profile.skills.push("REST APIs".into());
         let catalog = EvidenceCatalog::from_profile(&profile);
         let mut plan = valid_plan();
-        plan.headline = "Senior API Engineer".into();
-        plan.summary = "Invented leadership claim for an unrelated industry.".into();
-        plan.headline_evidence_ids = vec!["missing:evidence".into()];
+        plan.headline_evidence_ids = vec![
+            "missing:evidence".into(),
+            "profile:headline".into(),
+            "profile:headline".into(),
+        ];
+        plan.summary_evidence_ids = vec![
+            "profile:summary".into(),
+            "missing:summary".into(),
+            "profile:summary".into(),
+        ];
         plan.skill_order = vec![
             "REST APIs".into(),
             "Rust".into(),
@@ -1743,8 +1724,8 @@ mod tests {
         plan.project_order.clear();
 
         let normalized = normalize_plan(&profile, &catalog, plan);
-        assert_eq!(normalized.headline, profile.headline);
-        assert_eq!(normalized.summary, profile.summary);
+        assert_eq!(normalized.headline_evidence_ids, vec!["profile:headline"]);
+        assert_eq!(normalized.summary_evidence_ids, vec!["profile:summary"]);
         assert_eq!(normalized.skill_order, vec!["REST APIs", "Rust"]);
         assert_eq!(normalized.employment_order, vec![0]);
         assert_eq!(
@@ -1753,17 +1734,6 @@ mod tests {
         );
         assert_eq!(normalized.project_order, vec![0]);
         validate_plan(&profile, &catalog, normalized).unwrap();
-    }
-
-    #[test]
-    fn verified_profile_evidence_can_support_narrative_without_selected_id_echo() {
-        let mut profile = profile();
-        profile.skills.push("REST APIs".into());
-        let catalog = EvidenceCatalog::from_profile(&profile);
-        let mut plan = valid_plan();
-        plan.summary = "Built reliable REST APIs for healthcare teams.".into();
-        plan.summary_evidence_ids = vec!["profile:summary".into()];
-        validate_plan(&profile, &catalog, plan).unwrap();
     }
 
     #[test]
