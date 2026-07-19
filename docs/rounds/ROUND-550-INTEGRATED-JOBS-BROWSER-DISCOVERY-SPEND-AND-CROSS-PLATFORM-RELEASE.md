@@ -472,12 +472,14 @@ protected account and Jobs routes returned `401`.
 - [x] Live health, versions, hashes, flags, and `NRestarts` are verified.
 - [x] Round 549 and this round are updated with exact final rollout and public
       release evidence.
-- [ ] The continuation Codex receives the final main/deploy handoff.
+- [x] The continuation Codex receives the final main/deploy handoff.
 
 ## Concrete implementation handoff
 
-The next agent must start from the then-current `origin/main` named in the
-continuation message, verify a clean worktree and live flags, and must not
+The continuation task received the full release/deploy handoff from
+documentation commit `cbf730c8bbe3d15a11b51eceb2ebf6085619c77e`; a follow-up
+names the final docs-only successor after this record lands. It must start from
+that then-current `origin/main`, verify a clean worktree and live flags, and not
 resurrect a stale branch. Its first Jobs work item is the owner-approved Career
 Track and tailoring policy: non-overlapping relevant months, a default
 `-1/+2-year` window, required-versus-preferred experience, seniority and
@@ -510,6 +512,6 @@ GitHub Actions is covered only by the documented infrastructure waiver: every
 job had zero steps because the account Actions budget prevented it from
 starting. No GitHub job is represented as green.
 
-Public release is complete. The remaining coordination step is to send the
-continuation task the exact final `origin/main`, deployed seal, live hashes,
-disabled flags, infrastructure waiver, recovery residuals, and P0 roadmap.
+Public release is complete. The continuation task received the deployed seal,
+live hashes, disabled flags, infrastructure waiver, recovery residuals, and P0
+roadmap; the final follow-up names this document's post-handoff main commit.
