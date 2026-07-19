@@ -1,4 +1,5 @@
 -- Atomic managed-usage reservations for provider-backed requests.
+-- Target: PostgreSQL only.
 --
 -- `accounts.balance_cents` is spendable balance. A reservation moves its
 -- ceiling out of that balance and into `accounts.reserved_cents` in the same

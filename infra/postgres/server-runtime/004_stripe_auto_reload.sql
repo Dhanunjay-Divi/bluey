@@ -1,4 +1,5 @@
 -- Durable Stripe Auto Reload state.
+-- Target: PostgreSQL only.
 -- A PaymentIntent is persisted while still unconfirmed so every possible
 -- charge has a local reconciliation key before Stripe can collect funds.
 

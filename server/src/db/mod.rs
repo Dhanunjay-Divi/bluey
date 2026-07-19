@@ -1813,10 +1813,8 @@ const POSTGRES_JOBS_RESUME_GENERATIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/007_jobs_resume_generations.sql");
 const POSTGRES_JOBS_GENERATION_ALLOWANCE: &str =
     include_str!("../../../infra/postgres/server-runtime/008_jobs_generation_allowance.sql");
-const POSTGRES_JOBS_DISCOVERY_BOARD_OWNER: &str = r#"
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_discovery_sources_board_owner
-        ON jobs_discovery_sources(account_id, provider, source_key);
-"#;
+const POSTGRES_JOBS_DISCOVERY_BOARD_OWNER: &str =
+    include_str!("../../../infra/postgres/server-runtime/009_jobs_discovery_board_owner.sql");
 const POSTGRES_PROVIDER_USAGE_PROVENANCE: &str =
     include_str!("../../../infra/postgres/server-runtime/010_provider_usage_provenance.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -2232,7 +2230,32 @@ mod sqlite_migration_replay_tests {
 
 #[cfg(test)]
 mod postgres_migration_tests {
-    use super::POSTGRES_POST_JOBS_MIGRATIONS;
+    use super::{
+        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_SCHEMA, POSTGRES_MIGRATIONS,
+        POSTGRES_POST_JOBS_MIGRATIONS,
+    };
+
+    #[test]
+    fn embedded_postgres_migrations_are_operator_discoverable() {
+        let migrations = POSTGRES_MIGRATIONS
+            .iter()
+            .copied()
+            .chain(std::iter::once(("002_jobs.sql", POSTGRES_JOBS_SCHEMA)))
+            .chain(POSTGRES_POST_JOBS_MIGRATIONS.iter().copied())
+            .chain(std::iter::once((
+                "006_context_artifact_revisions.sql",
+                POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
+            )));
+
+        for (version, sql) in migrations {
+            assert!(
+                sql.lines()
+                    .take(12)
+                    .any(|line| line.to_ascii_lowercase().contains("target: postgres")),
+                "{version} would be skipped by scripts/bluey-postgres-migrate.sh"
+            );
+        }
+    }
 
     #[test]
     fn candidate_events_are_part_of_runtime_postgres_migrations() {
@@ -2255,6 +2278,19 @@ mod postgres_migration_tests {
         assert!(sql.contains("UNIQUE(account_id, generation_key)"));
         assert!(sql.contains("reservation_token TEXT NOT NULL"));
         assert!(sql.contains("created_at_ms BIGINT"));
+    }
+
+    #[test]
+    fn discovery_board_owner_is_a_unique_post_jobs_migration() {
+        let (_, sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == "009_jobs_discovery_board_owner.sql")
+            .expect("discovery board ownership must be enforced before Jobs routes are served");
+        let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(normalized.contains(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_discovery_sources_board_owner ON jobs_discovery_sources(account_id, provider, source_key);"
+        ));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 -- Durable, account-scoped controls for customer object uploads.
+-- Target: PostgreSQL only.
 --
 -- Postgres is the source of truth for quota reservations and object lifecycle
 -- state. R2/S3 receives only idempotent writes described by this ledger.
