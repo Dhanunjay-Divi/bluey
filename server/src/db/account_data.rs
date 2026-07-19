@@ -195,9 +195,12 @@ pub fn artifact_object_refs(pool: &DbPool, account_id: &str) -> Result<Vec<Artif
 fn usage_summary_sqlite(pool: &DbPool, account_id: &str) -> Result<UsageSummary> {
     let conn = pool.get()?;
     let (total_cues, total_cents_spent): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(cost_cents_to_customer), 0)
+        "SELECT COUNT(*),
+                CAST(MIN(MAX(TOTAL(MIN(MAX(cost_cents_to_customer, 0), 100000000)), 0),
+                         9223372036854775807) AS INTEGER)
          FROM usage_events
-         WHERE account_id = ?1 AND ts >= datetime('now', '-7 days')",
+         WHERE origin = 'server' AND account_id = ?1
+           AND ts >= datetime('now', '-7 days')",
         params![account_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -205,9 +208,11 @@ fn usage_summary_sqlite(pool: &DbPool, account_id: &str) -> Result<UsageSummary>
     let mut stmt = conn.prepare(
         "SELECT COALESCE(task_type, lane, 'general') AS bucket,
                 COUNT(*) AS cnt,
-                COALESCE(SUM(cost_cents_to_customer), 0) AS cost
+                CAST(MIN(MAX(TOTAL(MIN(MAX(cost_cents_to_customer, 0), 100000000)), 0),
+                         9223372036854775807) AS INTEGER) AS cost
          FROM usage_events
-         WHERE account_id = ?1 AND ts >= datetime('now', '-7 days')
+         WHERE origin = 'server' AND account_id = ?1
+           AND ts >= datetime('now', '-7 days')
          GROUP BY bucket
          ORDER BY cost DESC",
     )?;
@@ -230,9 +235,12 @@ fn usage_summary_sqlite(pool: &DbPool, account_id: &str) -> Result<UsageSummary>
 fn usage_summary_postgres(pool: &DbPool, account_id: &str) -> Result<UsageSummary> {
     let mut conn = pool.get_pg()?;
     let row = conn.query_one(
-        "SELECT COUNT(*)::bigint, COALESCE(SUM(cost_cents_to_customer), 0)::bigint
+        "SELECT COUNT(*)::bigint,
+                LEAST(COALESCE(SUM(LEAST(GREATEST(cost_cents_to_customer, 0), 100000000)::numeric), 0),
+                      9223372036854775807)::bigint
          FROM usage_events
-         WHERE account_id = $1 AND ts >= now() - interval '7 days'",
+         WHERE origin = 'server' AND account_id = $1
+           AND ts >= now() - interval '7 days'",
         &[&account_id],
     )?;
     let total_cues: i64 = row.try_get(0)?;
@@ -240,9 +248,11 @@ fn usage_summary_postgres(pool: &DbPool, account_id: &str) -> Result<UsageSummar
     let rows = conn.query(
         "SELECT COALESCE(task_type, lane, 'general') AS bucket,
                 COUNT(*)::bigint AS cnt,
-                COALESCE(SUM(cost_cents_to_customer), 0)::bigint AS cost
+                LEAST(COALESCE(SUM(LEAST(GREATEST(cost_cents_to_customer, 0), 100000000)::numeric), 0),
+                      9223372036854775807)::bigint AS cost
          FROM usage_events
-         WHERE account_id = $1 AND ts >= now() - interval '7 days'
+         WHERE origin = 'server' AND account_id = $1
+           AND ts >= now() - interval '7 days'
          GROUP BY bucket
          ORDER BY cost DESC",
         &[&account_id],

@@ -3,6 +3,8 @@ use super::*;
 #[path = "tests/story_grounding.rs"]
 mod story_grounding;
 
+static FIRST_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn temp_pool() -> crate::db::DbPool {
     let path = std::env::temp_dir().join(format!("bluey-router-{}.db", uuid::Uuid::new_v4()));
     let pool = crate::db::open_pool(&path).unwrap();
@@ -229,6 +231,7 @@ fn rag_retrieval_budget_default_and_override() {
 
 #[test]
 fn first_token_deadline_default_and_override() {
+    let _guard = FIRST_TOKEN_ENV_LOCK.lock().unwrap();
     std::env::remove_var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS");
     std::env::remove_var("BLUEY_STREAM_BALANCED_FIRST_TOKEN_TIMEOUT_MS");
     assert_eq!(
@@ -254,6 +257,247 @@ fn first_token_deadline_default_and_override() {
     std::env::remove_var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS");
 }
 
+#[test]
+fn external_web_search_cost_is_explicit_and_positive() {
+    assert_eq!(configured_web_search_bluey_cost(None), None);
+    assert_eq!(configured_web_search_bluey_cost(Some("")), None);
+    assert_eq!(configured_web_search_bluey_cost(Some("0")), None);
+    assert_eq!(configured_web_search_bluey_cost(Some("-1")), None);
+    assert_eq!(configured_web_search_bluey_cost(Some("101")), None);
+    assert_eq!(configured_web_search_bluey_cost(Some("1")), Some(1));
+    assert_eq!(configured_web_search_bluey_cost(Some(" 7 ")), Some(7));
+}
+
+#[test]
+fn router_prefix_fence_blocks_both_mode_switch_directions_exactly() {
+    let pool = temp_pool();
+    let account_id = make_account(&pool, "mode-switch-fence@bluey.test");
+    let guard = crate::config::UpstreamSpendGuard {
+        limit_cents: 1_000,
+        window_hours: 24,
+    };
+    for (request_id, attempt_suffix) in [
+        ("stream%_☃-to-nonstream", "llm-stream-attempt:0"),
+        ("nonstream%_☃-to-stream", "llm-attempt:0"),
+    ] {
+        assert!(matches!(
+            idempotency::reserve(&pool, &account_id, request_id).unwrap(),
+            idempotency::ReserveOutcome::FreshReservation
+        ));
+        let attempt_request_id = format!("{request_id}:{attempt_suffix}");
+        assert!(matches!(
+            crate::db::jobs_provider_cost_holds::reserve(
+                &pool,
+                &account_id,
+                &format!("router:{request_id}:llm"),
+                &format!("token-{request_id}"),
+                &attempt_request_id,
+                "openai",
+                "gpt-5.4-mini",
+                2,
+                100,
+                guard,
+            )
+            .unwrap(),
+            crate::db::jobs_provider_cost_holds::CostHoldReservation::Held { .. }
+        ));
+        let error = prior_provider_prefix_exposure_error(&pool, &account_id, request_id)
+            .expect("opposite completion mode must be fenced");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(
+            error.1.reason.as_deref(),
+            Some("provider_exposure_ambiguous")
+        );
+    }
+
+    let near_prefix = "stream%_☃-to-nonstream-extra";
+    assert!(matches!(
+        idempotency::reserve(&pool, &account_id, near_prefix).unwrap(),
+        idempotency::ReserveOutcome::FreshReservation
+    ));
+    assert!(prior_provider_prefix_exposure_error(&pool, &account_id, near_prefix).is_none());
+}
+
+#[test]
+fn crossed_unknown_routes_settle_to_cap_in_stream_and_nonstream_modes() {
+    let pool = temp_pool();
+    let account_id = make_account(&pool, "crossed-route-cost@bluey.test");
+    for mode in ["stream", "nonstream"] {
+        let request_id = format!("crossed-{mode}:attempt:0");
+        let mut guard = match provider_cost_guard::reserve(
+            &pool,
+            Some(crate::config::UpstreamSpendGuard {
+                limit_cents: i64::MAX,
+                window_hours: 24,
+            }),
+            &account_id,
+            &format!("router:crossed-{mode}:llm"),
+            &request_id,
+            "openai",
+            "gpt-5.4-mini",
+            1,
+            "llm_attempt",
+            "balanced",
+        )
+        .unwrap()
+        {
+            provider_cost_guard::Admission::Held(guard) => guard,
+            _ => panic!("expected durable provider hold"),
+        };
+        let returned_cost =
+            returned_route_bluey_cost_or_cap("crossed-provider", "unknown-expensive-model", 10, 10);
+        assert_eq!(
+            returned_cost,
+            crate::db::usage::MAX_AUTHORITATIVE_EVENT_COST_CENTS
+        );
+        guard
+            .settle(
+                UsageEvent {
+                    request_id,
+                    kind: "llm_attempt".into(),
+                    task_type: Some("balanced".into()),
+                    lane: Some("balanced".into()),
+                    provider: Some("crossed-provider".into()),
+                    model: Some("unknown-expensive-model".into()),
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    latency_ms: 1,
+                    cost_cents_to_bluey: returned_cost,
+                    cost_cents_to_customer: 0,
+                    was_speculative: false,
+                    was_fallback: false,
+                },
+                returned_cost,
+            )
+            .unwrap();
+    }
+
+    let conn = pool.get().unwrap();
+    let settled_at_cap: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_provider_cost_holds
+              WHERE status = 'settled' AND settled_cost_cents = ?1",
+            rusqlite::params![crate::db::usage::MAX_AUTHORITATIVE_EVENT_COST_CENTS],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(settled_at_cap, 2);
+}
+
+#[test]
+fn provider_settlement_failure_leaves_customer_roots_unsettled_for_all_endpoints() {
+    let pool = temp_pool();
+    let account_id = make_account(&pool, "settlement-precondition@bluey.test");
+    pool.get()
+        .unwrap()
+        .execute(
+            "UPDATE accounts SET trial_seconds_remaining = 0 WHERE id = ?1",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+    balance::credit_internal(&pool, &account_id, 100, "settlement-precondition").unwrap();
+    let endpoint_cases = [
+        ("llm-stream", "llm", "llm_attempt", true),
+        ("llm-nonstream", "llm", "llm_attempt", true),
+        ("embed", "embed", "embed_attempt", true),
+        ("transcribe", "transcribe", "stt_attempt", true),
+        ("web", "web_search", "web_search_attempt", false),
+    ];
+    for (mode, root_kind, attempt_kind, has_customer_reservation) in endpoint_cases {
+        let root_request_id = format!("settlement-failure-{mode}");
+        if has_customer_reservation {
+            usage_reservations::reserve(
+                &pool,
+                ReserveUsageInput {
+                    account_id: &account_id,
+                    request_id: &root_request_id,
+                    kind: root_kind,
+                    reason: mode,
+                    estimated_customer_cents: 1,
+                    estimated_upstream_cents: 0,
+                    upstream_spend_guard: None,
+                    created_at_ms: 1_000,
+                    expires_at_ms: i64::MAX,
+                },
+            )
+            .unwrap();
+        }
+        let attempt_request_id = format!("{root_request_id}:{attempt_kind}:0");
+        let mut guard = match provider_cost_guard::reserve(
+            &pool,
+            Some(crate::config::UpstreamSpendGuard {
+                limit_cents: 1_000,
+                window_hours: 24,
+            }),
+            &account_id,
+            &format!("router:{root_request_id}:{root_kind}"),
+            &attempt_request_id,
+            "openai",
+            "gpt-5.4-mini",
+            1,
+            attempt_kind,
+            mode,
+        )
+        .unwrap()
+        {
+            provider_cost_guard::Admission::Held(guard) => guard,
+            _ => panic!("expected provider hold for {mode}"),
+        };
+        crate::db::jobs_provider_cost_holds::fail_next_settlement_for_test();
+        let (_, Json(error)) = settle_provider_attempt_before_customer(
+            &pool,
+            &account_id,
+            &root_request_id,
+            &mut guard,
+            UsageEvent {
+                request_id: attempt_request_id,
+                kind: attempt_kind.into(),
+                task_type: Some(mode.into()),
+                lane: Some(mode.into()),
+                provider: Some("openai".into()),
+                model: Some("gpt-5.4-mini".into()),
+                input_tokens: 1,
+                output_tokens: 1,
+                latency_ms: 1,
+                cost_cents_to_bluey: 1,
+                cost_cents_to_customer: 0,
+                was_speculative: false,
+                was_fallback: false,
+            },
+            1,
+        )
+        .expect_err("shared endpoint transition must fail closed when A is unavailable");
+        assert_eq!(
+            error.reason.as_deref(),
+            Some("provider_accounting_pending"),
+            "{mode} must return the shared fail-closed API result"
+        );
+        drop(guard); // crash-safety retry may terminalize A, never B.
+
+        let conn = pool.get().unwrap();
+        let root_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                  WHERE account_id = ?1 AND request_id = ?2 AND kind = ?3",
+                rusqlite::params![account_id, root_request_id, root_kind],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_events, 0, "{mode} must not persist customer root B");
+        if has_customer_reservation {
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM usage_reservations
+                      WHERE account_id = ?1 AND request_id = ?2",
+                    rusqlite::params![account_id, root_request_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "reserved", "{mode} must leave B for reconciliation");
+        }
+    }
+}
+
 #[tokio::test]
 async fn stream_preflight_skips_empty_deltas_before_real_output() {
     let mut events: routing::CompletionEventStream = Box::pin(stream::iter(vec![
@@ -271,6 +515,7 @@ async fn stream_preflight_skips_empty_deltas_before_real_output() {
 
 #[test]
 fn first_token_deadline_is_lane_specific() {
+    let _guard = FIRST_TOKEN_ENV_LOCK.lock().unwrap();
     for name in [
         "BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS",
         "BLUEY_STREAM_INSTANT_FIRST_TOKEN_TIMEOUT_MS",
@@ -296,6 +541,7 @@ fn first_token_deadline_is_lane_specific() {
 
 #[test]
 fn deep_first_token_deadline_uses_deep_budget() {
+    let _guard = FIRST_TOKEN_ENV_LOCK.lock().unwrap();
     std::env::remove_var("BLUEY_STREAM_DEEP_FIRST_TOKEN_TIMEOUT_MS");
     assert_eq!(
         first_token_deadline_for_lane("deep", true),
@@ -452,6 +698,7 @@ async fn detached_stream_settles_while_connected_receiver_never_polls() {
             reason: "llm_stream",
             estimated_customer_cents: 60,
             estimated_upstream_cents: 20,
+            upstream_spend_guard: None,
             created_at_ms: 1_000,
             expires_at_ms: 61_000,
         },
@@ -1452,7 +1699,9 @@ fn web_search_usage_event_records_separate_search_cost() {
     assert_eq!(event.input_tokens, 1);
     assert_eq!(event.output_tokens, 1);
     assert_eq!(event.cost_cents_to_customer, 2);
-    assert_eq!(event.cost_cents_to_bluey, 1);
+    // Upstream cost is recorded exactly once on the durable attempt row.
+    // The customer-facing root allocates only the customer charge.
+    assert_eq!(event.cost_cents_to_bluey, 0);
 }
 
 #[test]

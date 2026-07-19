@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::{
 };
 
 use super::AppState;
+use crate::api::router::provider_cost_guard;
 use crate::auth::AuthedAccount;
 use crate::db::{
     accounts::Account,
@@ -174,14 +175,6 @@ pub async fn create_session(
         .unwrap_or(DEFAULT_MAX_SECONDS)
         .clamp(30, MAX_SESSION_SECONDS);
 
-    let estimated_bluey_cost_cents = estimate_deepgram_bluey_cost_cents(&model, max_seconds)?;
-    check_upstream_spend_guard(
-        &state,
-        &account.id,
-        estimated_bluey_cost_cents,
-        "stt_session",
-    )?;
-
     let token = random_token();
     let now = now_ms();
     let expires_at = now + (max_seconds * 1000);
@@ -283,13 +276,22 @@ pub async fn relay(
         .config
         .upstream
         .deepgram_key(&session.token)
-        .map(str::to_string)
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "STT relay is not configured".to_string(),
-            )
-        })?;
+        .map(str::to_string);
+    let Some(deepgram_key) = deepgram_key else {
+        let _ = stt_accounting::settle_session(
+            &state.pool,
+            &session.token,
+            &session.account_id,
+            &session.model,
+            0,
+            "provider_not_configured",
+            now_ms(),
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "STT relay is not configured".to_string(),
+        ));
+    };
     Ok(ws
         .on_upgrade(move |socket| async move {
             if let Err(err) = run_deepgram_relay(socket, state, session, deepgram_key).await {
@@ -426,36 +428,23 @@ fn estimate_deepgram_bluey_cost_cents(
     Ok(bluey_cents + (bluey_cents / 10).max(1))
 }
 
-fn check_upstream_spend_guard(
-    state: &AppState,
-    account_id: &str,
-    projected_bluey_cents: i64,
-    kind: &str,
-) -> Result<(), (StatusCode, String)> {
-    let Some(guard) = state.config.upstream_spend_guard else {
-        return Ok(());
-    };
-    if projected_bluey_cents <= 0 {
-        return Ok(());
-    }
-    let current =
-        usage::bluey_spend_cents_in_window(&state.pool, guard.window_hours).map_err(internal)?;
-    if current.saturating_add(projected_bluey_cents) > guard.limit_cents {
-        tracing::warn!(
-            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
-            kind,
-            current_bluey_cents = current,
-            projected_bluey_cents,
-            limit_bluey_cents = guard.limit_cents,
-            window_hours = guard.window_hours,
-            "upstream spend guard paused STT session creation"
+fn close_stt_session_without_dispatch(state: &AppState, session: &ClaimedSttSession, reason: &str) {
+    if let Err(error) = stt_accounting::settle_session(
+        &state.pool,
+        &session.token,
+        &session.account_id,
+        &session.model,
+        0,
+        reason,
+        now_ms(),
+    ) {
+        tracing::error!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
+            reason,
+            error = %error,
+            "failed to refund an unstarted STT relay session"
         );
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey live-test budget is paused; operator action required".to_string(),
-        ));
     }
-    Ok(())
 }
 
 fn claim_relay_session(
@@ -477,14 +466,74 @@ async fn run_deepgram_relay(
     deepgram_key: String,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
+    let projected_bluey_cost =
+        match estimate_deepgram_bluey_cost_cents(&session.model, session.max_seconds) {
+            Ok(cost) => cost,
+            Err((_, message)) => {
+                close_stt_session_without_dispatch(&state, &session, "pricing_unavailable");
+                anyhow::bail!(message)
+            }
+        };
     let url = deepgram_realtime_url(&session);
-    let mut request = url.into_client_request()?;
-    request.headers_mut().insert(
-        "Authorization",
-        HeaderValue::from_str(&format!("Token {deepgram_key}"))?,
-    );
+    let mut request = match url.into_client_request() {
+        Ok(request) => request,
+        Err(error) => {
+            close_stt_session_without_dispatch(&state, &session, "provider_request_invalid");
+            return Err(error.into());
+        }
+    };
+    let authorization = match HeaderValue::from_str(&format!("Token {deepgram_key}")) {
+        Ok(value) => value,
+        Err(error) => {
+            close_stt_session_without_dispatch(&state, &session, "provider_key_invalid");
+            return Err(error.into());
+        }
+    };
+    request.headers_mut().insert("Authorization", authorization);
 
-    let (upstream, _) = tokio_tungstenite::connect_async(request).await?;
+    // The durable hold is the last local step before network dispatch. Local
+    // URL/header validation failures above therefore create no paid exposure.
+    let attempt_request_id = format!("stt-live-{}:attempt", session.token);
+    let admission = match provider_cost_guard::reserve(
+        &state.pool,
+        state.config.upstream_spend_guard,
+        &session.account_id,
+        &format!("stt-live:{}", session.token),
+        &attempt_request_id,
+        &session.provider,
+        &session.model,
+        projected_bluey_cost,
+        "stt_live_attempt",
+        "transcription",
+    ) {
+        Ok(admission) => admission,
+        Err(error) => {
+            close_stt_session_without_dispatch(&state, &session, "spend_guard_unavailable");
+            return Err(error);
+        }
+    };
+    let mut provider_guard = match admission {
+        provider_cost_guard::Admission::Held(guard) => guard,
+        provider_cost_guard::Admission::Unconfigured => {
+            close_stt_session_without_dispatch(&state, &session, "spend_guard_unconfigured");
+            anyhow::bail!("paid STT route unexpectedly had zero projected exposure")
+        }
+        provider_cost_guard::Admission::GlobalLimit => {
+            close_stt_session_without_dispatch(&state, &session, "spend_guard_denied");
+            anyhow::bail!("upstream spend guard denied STT relay dispatch")
+        }
+    };
+
+    let (upstream, _) = match tokio_tungstenite::connect_async(request).await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            // A network attempt may have reached the provider. Terminalize the
+            // conservative hold before refunding/releasing customer state.
+            provider_guard.settle_conservative()?;
+            close_stt_session_without_dispatch(&state, &session, "provider_connect_failed");
+            return Err(error.into());
+        }
+    };
     let (mut client_tx, mut client_rx) = socket.split();
     let (mut upstream_tx, mut upstream_rx) = upstream.split();
     let deadline = Duration::from_secs(session.max_seconds.max(1) as u64);
@@ -616,6 +665,15 @@ async fn run_deepgram_relay(
     }
 
     if close_reason == "account_deleted" {
+        // Customer-owned session/usage rows are removed by privacy deletion,
+        // but the opaque provider hold deliberately survives for the bounded
+        // global spend window. Terminalize it before returning.
+        settle_relay_provider_attempt(
+            &session,
+            &mut provider_guard,
+            &attempt_request_id,
+            started.elapsed(),
+        )?;
         tracing::warn!(
             account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
             source = %session.source,
@@ -634,6 +692,7 @@ async fn run_deepgram_relay(
     } else {
         started.elapsed()
     };
+    let provider_elapsed = started.elapsed();
     let settle_reason = if forwarded_audible_audio_chunks == 0 {
         format!("{close_reason}:no_audible_audio")
     } else {
@@ -641,6 +700,7 @@ async fn run_deepgram_relay(
     };
     tracing::info!(
         account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
+        bluey_session_ref = %cue_core::short_observability_ref(Some(&session.bluey_session_id)),
         source = %session.source,
         provider = %session.provider,
         model = %session.model,
@@ -664,8 +724,11 @@ async fn run_deepgram_relay(
         "STT relay settlement prepared"
     );
     finalize_relay_session(
-        &state,
+        &state.pool,
         &session,
+        &mut provider_guard,
+        &attempt_request_id,
+        provider_elapsed,
         billable_elapsed,
         &settle_reason,
         forwarded_audio_bytes,
@@ -1037,42 +1100,33 @@ fn pcm16_dbfs(magnitude: f64) -> f64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_relay_session(
-    state: &AppState,
+    pool: &crate::db::DbPool,
     session: &ClaimedSttSession,
-    elapsed: Duration,
+    provider_guard: &mut provider_cost_guard::ProviderCostGuard,
+    attempt_request_id: &str,
+    provider_elapsed: Duration,
+    customer_elapsed: Duration,
     reason: &str,
     audio_bytes: u64,
     audio_chunks: u64,
 ) -> anyhow::Result<()> {
-    let elapsed_ms = elapsed.as_millis().min(i64::MAX as u128) as i64;
+    settle_relay_provider_attempt(
+        session,
+        provider_guard,
+        attempt_request_id,
+        provider_elapsed,
+    )?;
+    let elapsed_ms = customer_elapsed.as_millis().min(i64::MAX as u128) as i64;
     let settled = stt_accounting::settle_session(
-        &state.pool,
+        pool,
         &session.token,
         &session.account_id,
         &session.model,
         elapsed_ms,
         reason,
         now_ms(),
-    )?;
-    usage::record(
-        &state.pool,
-        &session.account_id,
-        &usage::UsageEvent {
-            request_id: format!("stt-{}-{}", session.bluey_session_id, session.token),
-            kind: "stt".to_string(),
-            task_type: Some("transcription".to_string()),
-            lane: Some(session.source.clone()),
-            provider: Some(session.provider.clone()),
-            model: Some(session.model.clone()),
-            input_tokens: settled.elapsed_seconds,
-            output_tokens: 0,
-            latency_ms: settled.elapsed_ms,
-            cost_cents_to_bluey: settled.bluey_cents,
-            cost_cents_to_customer: settled.customer_cents,
-            was_speculative: false,
-            was_fallback: false,
-        },
     )?;
     tracing::info!(
         account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
@@ -1092,6 +1146,44 @@ fn finalize_relay_session(
         reason,
         "STT relay session settled"
     );
+    Ok(())
+}
+
+fn settle_relay_provider_attempt(
+    session: &ClaimedSttSession,
+    provider_guard: &mut provider_cost_guard::ProviderCostGuard,
+    attempt_request_id: &str,
+    elapsed: Duration,
+) -> anyhow::Result<()> {
+    let elapsed_ms = elapsed.as_millis().min(i64::MAX as u128) as i64;
+    let provider_seconds = if elapsed_ms <= 0 {
+        0
+    } else {
+        ((elapsed_ms + 999) / 1_000)
+            .max(1)
+            .min(session.max_seconds.max(0))
+    };
+    let provider_pricing = pricing::lookup(&session.provider, &session.model)
+        .ok_or_else(|| anyhow::anyhow!("missing live STT provider pricing"))?;
+    let (provider_bluey_cents, _) = pricing::compute_cost(provider_pricing, provider_seconds, 0);
+    provider_guard.settle(
+        usage::UsageEvent {
+            request_id: attempt_request_id.to_string(),
+            kind: "stt_live_attempt".to_string(),
+            task_type: Some("transcription".to_string()),
+            lane: Some(session.source.clone()),
+            provider: Some(session.provider.clone()),
+            model: Some(session.model.clone()),
+            input_tokens: provider_seconds,
+            output_tokens: 0,
+            latency_ms: elapsed_ms,
+            cost_cents_to_bluey: provider_bluey_cents,
+            cost_cents_to_customer: 0,
+            was_speculative: false,
+            was_fallback: false,
+        },
+        provider_bluey_cents,
+    )?;
     Ok(())
 }
 
@@ -1147,6 +1239,61 @@ mod tests {
         pool
     }
 
+    fn reserve_live_provider_guard(
+        pool: &crate::db::DbPool,
+        session: &ClaimedSttSession,
+        attempt_request_id: &str,
+    ) -> provider_cost_guard::ProviderCostGuard {
+        let projected_bluey_cost =
+            estimate_deepgram_bluey_cost_cents(&session.model, session.max_seconds)
+                .expect("priced Deepgram route");
+        match provider_cost_guard::reserve(
+            pool,
+            Some(crate::config::UpstreamSpendGuard {
+                limit_cents: 10_000,
+                window_hours: 24,
+            }),
+            &session.account_id,
+            &format!("stt-live:{}", session.token),
+            attempt_request_id,
+            &session.provider,
+            &session.model,
+            projected_bluey_cost,
+            "stt_live_attempt",
+            "transcription",
+        )
+        .expect("reserve provider exposure")
+        {
+            provider_cost_guard::Admission::Held(guard) => *guard,
+            _ => panic!("expected live STT provider hold"),
+        }
+    }
+
+    fn reserve_and_claim_live_session(
+        pool: &crate::db::DbPool,
+        account_id: &str,
+        token: &str,
+    ) -> ClaimedSttSession {
+        stt_accounting::reserve_session(
+            pool,
+            ReserveSessionInput {
+                account_id,
+                bluey_session_id: "live-accounting",
+                provider: "deepgram",
+                model: "nova-3",
+                source: "microphone",
+                mode: "server_relay",
+                token,
+                max_seconds: 60,
+                created_at_ms: 1_000,
+                expires_at_ms: 61_000,
+            },
+        )
+        .expect("reserve customer STT session");
+        stt_accounting::claim_relay_session(pool, account_id, token, 2_000)
+            .expect("claim customer STT session")
+    }
+
     #[test]
     fn stt_account_liveness_distinguishes_active_closed_and_missing_accounts() {
         let pool = temp_pool();
@@ -1163,6 +1310,158 @@ mod tests {
             ensure_stt_account_active(&pool, "missing-account"),
             Err(SttAccountLivenessError::Deleted)
         ));
+    }
+
+    #[test]
+    fn live_stt_provider_settlement_failure_blocks_customer_finalization() {
+        let pool = temp_pool();
+        let account =
+            Account::create(&pool, "stt-a-before-b@example.com", "hash").expect("create account");
+        let session = reserve_and_claim_live_session(&pool, &account.id, "stt-a-before-b");
+        let attempt_request_id = "stt-live-stt-a-before-b:attempt";
+        let mut provider_guard = reserve_live_provider_guard(&pool, &session, attempt_request_id);
+        let before: (i64, i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT balance_cents, reserved_cents, trial_seconds_remaining
+                   FROM accounts WHERE id = ?1",
+                rusqlite::params![account.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        crate::db::jobs_provider_cost_holds::fail_next_settlement_for_test();
+        let error = finalize_relay_session(
+            &pool,
+            &session,
+            &mut provider_guard,
+            attempt_request_id,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            "completed",
+            16_000,
+            1,
+        )
+        .expect_err("provider settlement failure must stop before customer settlement");
+        assert!(error
+            .to_string()
+            .contains("injected provider hold settlement failure"));
+        drop(provider_guard); // crash-safety retry may settle A, but never B.
+
+        let conn = pool.get().unwrap();
+        let after: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT balance_cents, reserved_cents, trial_seconds_remaining
+                   FROM accounts WHERE id = ?1",
+                rusqlite::params![account.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before, "customer money/trial state must not advance");
+        let (consumed_seconds, ended_at_ms): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT consumed_seconds, ended_at_ms
+                   FROM stt_sessions WHERE session_token = ?1",
+                rusqlite::params![session.token],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(consumed_seconds, 0);
+        assert_eq!(ended_at_ms, None);
+        let customer_roots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                  WHERE account_id = ?1 AND kind = 'stt'",
+                rusqlite::params![account.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(customer_roots, 0);
+    }
+
+    #[test]
+    fn live_stt_trial_and_mixed_sessions_split_upstream_and_customer_cost_once() {
+        for (case, trial_seconds, expected_trial, expected_billable) in
+            [("trial", 60, 10, 0), ("mixed", 5, 5, 5)]
+        {
+            let pool = temp_pool();
+            let account =
+                Account::create(&pool, &format!("stt-{case}-accounting@example.com"), "hash")
+                    .expect("create account");
+            pool.get()
+                .unwrap()
+                .execute(
+                    "UPDATE accounts SET trial_seconds_remaining = ?1 WHERE id = ?2",
+                    rusqlite::params![trial_seconds, account.id],
+                )
+                .unwrap();
+            if case == "mixed" {
+                crate::db::balance::credit_internal(&pool, &account.id, 100, "stt-mixed-test")
+                    .unwrap();
+            }
+            let token = format!("stt-{case}-exact");
+            let session = reserve_and_claim_live_session(&pool, &account.id, &token);
+            let attempt_request_id = format!("stt-live-{token}:attempt");
+            let mut provider_guard =
+                reserve_live_provider_guard(&pool, &session, &attempt_request_id);
+
+            finalize_relay_session(
+                &pool,
+                &session,
+                &mut provider_guard,
+                &attempt_request_id,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                "completed",
+                160_000,
+                10,
+            )
+            .expect("settle live STT A then B");
+
+            let pricing = pricing::lookup("deepgram", "nova-3").unwrap();
+            let (expected_bluey_cost, _) = pricing::compute_cost(pricing, 10, 0);
+            let (_, expected_customer_cost) = pricing::compute_cost(pricing, expected_billable, 0);
+            let conn = pool.get().unwrap();
+            let attempt: (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT input_tokens, cost_cents_to_bluey, cost_cents_to_customer
+                       FROM usage_events
+                      WHERE account_id = ?1 AND kind = 'stt_live_attempt'",
+                    rusqlite::params![account.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(attempt, (10, expected_bluey_cost, 0), "{case}");
+            let root: (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT input_tokens, cost_cents_to_bluey, cost_cents_to_customer
+                       FROM usage_events
+                      WHERE account_id = ?1 AND kind = 'stt'",
+                    rusqlite::params![account.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(root, (10, 0, expected_customer_cost), "{case}");
+            let settled: (i64, i64) = conn
+                .query_row(
+                    "SELECT settled_trial_seconds, consumed_seconds
+                       FROM stt_sessions WHERE session_token = ?1",
+                    rusqlite::params![token],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(settled, (expected_trial, 10), "{case}");
+            drop(conn);
+
+            let summary = crate::db::usage::provider_routing_summary(&pool, 24).unwrap();
+            assert_eq!(summary.total_events, 1, "{case}");
+            assert_eq!(summary.cost_cents_to_bluey, expected_bluey_cost, "{case}");
+            assert_eq!(
+                summary.cost_cents_to_customer, expected_customer_cost,
+                "{case}"
+            );
+        }
     }
 
     #[test]

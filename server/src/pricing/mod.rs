@@ -189,13 +189,25 @@ pub fn lookup(provider: &str, model: &str) -> Option<&'static ModelPricing> {
 /// Compute the cost in cents (rounded up to the nearest cent).
 /// Returns (bluey_cost_cents, customer_cost_cents).
 pub fn compute_cost(pricing: &ModelPricing, input_tokens: i64, output_tokens: i64) -> (i64, i64) {
-    let bluey_microcents = pricing.upstream_in_microcents_per_1m * input_tokens / 1_000_000
-        + pricing.upstream_out_microcents_per_1m * output_tokens / 1_000_000;
-    let customer_microcents = bluey_microcents * (100 + pricing.markup_percent) / 100;
+    let input_microcents = i128::from(pricing.upstream_in_microcents_per_1m.max(0))
+        .saturating_mul(i128::from(input_tokens.max(0)))
+        / 1_000_000;
+    let output_microcents = i128::from(pricing.upstream_out_microcents_per_1m.max(0))
+        .saturating_mul(i128::from(output_tokens.max(0)))
+        / 1_000_000;
+    let bluey_microcents = input_microcents.saturating_add(output_microcents);
+    let markup_multiplier = 100_i128.saturating_add(i128::from(pricing.markup_percent.max(0)));
+    let customer_microcents = bluey_microcents.saturating_mul(markup_multiplier) / 100;
 
-    let bluey_cents = (bluey_microcents + MICROCENTS_PER_CENT - 1) / MICROCENTS_PER_CENT;
-    let customer_cents = (customer_microcents + MICROCENTS_PER_CENT - 1) / MICROCENTS_PER_CENT;
-    (bluey_cents.max(0), customer_cents.max(0))
+    let cents_ceil = |microcents: i128| {
+        let cents = microcents.saturating_add(i128::from(MICROCENTS_PER_CENT) - 1)
+            / i128::from(MICROCENTS_PER_CENT);
+        i64::try_from(cents).unwrap_or(i64::MAX)
+    };
+    (
+        cents_ceil(bluey_microcents),
+        cents_ceil(customer_microcents),
+    )
 }
 
 /// Estimate cost upper bound for the entry check.
@@ -208,7 +220,7 @@ pub fn estimate_cost_ceiling(
     max_output_tokens: i64,
 ) -> i64 {
     let (_, customer_cents) = compute_cost(pricing, input_tokens, max_output_tokens);
-    customer_cents + (customer_cents / 10).max(1)
+    customer_cents.saturating_add((customer_cents / 10).max(1))
 }
 
 pub fn estimate_bluey_cost_ceiling(
@@ -217,7 +229,7 @@ pub fn estimate_bluey_cost_ceiling(
     max_output_tokens: i64,
 ) -> i64 {
     let (bluey_cents, _) = compute_cost(pricing, input_tokens, max_output_tokens);
-    bluey_cents + (bluey_cents / 10).max(1)
+    bluey_cents.saturating_add((bluey_cents / 10).max(1))
 }
 
 #[cfg(test)]
@@ -412,5 +424,29 @@ mod tests {
         let (bluey, customer) = compute_cost(pricing, 1_000, 0);
         assert_eq!(bluey, 1); // both bluey and customer round UP to 1c minimum
         assert_eq!(customer, 1); // customer pays 1c minimum (S4.3 floor)
+    }
+
+    #[test]
+    fn provider_usage_cannot_overflow_or_become_negative() {
+        let hostile = ModelPricing {
+            provider: "test",
+            model: "hostile-usage",
+            upstream_in_microcents_per_1m: i64::MAX,
+            upstream_out_microcents_per_1m: i64::MAX,
+            markup_percent: i64::MAX,
+        };
+        assert_eq!(
+            compute_cost(&hostile, i64::MAX, i64::MAX),
+            (i64::MAX, i64::MAX)
+        );
+        assert_eq!(
+            estimate_cost_ceiling(&hostile, i64::MAX, i64::MAX),
+            i64::MAX
+        );
+        assert_eq!(
+            estimate_bluey_cost_ceiling(&hostile, i64::MAX, i64::MAX),
+            i64::MAX
+        );
+        assert_eq!(compute_cost(&hostile, -1, i64::MIN), (0, 0));
     }
 }

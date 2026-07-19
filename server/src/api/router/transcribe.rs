@@ -3,11 +3,16 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     billing_restricted_error, capacity_error, missing_provider_key_error,
-    priced_transcribe_routes_for, release_and_capacity_error,
-    release_and_upstream_spend_guard_check, ApiError, AppState, PricedTranscribeRoute,
+    priced_transcribe_routes_for, prior_provider_exposure_error, provider_accounting_pending_error,
+    provider_cost_guard, release_and_capacity_error, settle_provider_attempt_before_customer,
+    ApiError, AppState, PricedTranscribeRoute,
 };
 use crate::auth::AuthedAccount;
-use crate::db::{balance, idempotency, usage::UsageEvent};
+use crate::db::{
+    balance, idempotency,
+    usage::UsageEvent,
+    usage_reservations::{self, ReserveUsageInput, SettlementUsageEvent},
+};
 use crate::{pricing, routing};
 
 #[derive(Deserialize)]
@@ -122,7 +127,6 @@ pub async fn transcribe(
             denied.retry_after_secs,
         ));
     }
-    let on_trial = account.trial_seconds_remaining > 0;
     // Estimate ~1s per ~16KB of audio (rough). Real cost from upstream metadata.
     let est_seconds = (body.len() as i64 / 16_000).max(1);
     let routes = priced_transcribe_routes_for(q.model.as_deref(), est_seconds);
@@ -141,47 +145,54 @@ pub async fn transcribe(
         .map(|route| route.estimated_cost_cents)
         .max()
         .unwrap_or(1);
-    let est_bluey_cost = routes
-        .iter()
-        .map(|route| route.estimated_bluey_cost_cents)
-        .max()
-        .unwrap_or(1);
-    if let Some(err) = release_and_upstream_spend_guard_check(
+    if let Some(err) = prior_provider_exposure_error(
         &state,
         &account.id,
         &q.request_id,
-        est_bluey_cost,
-        "stt",
+        &format!("router:{}:stt", q.request_id),
     ) {
         return Err(err);
     }
-    if !on_trial {
-        let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: format!("balance: {e}"),
-                    ..Default::default()
-                }),
-            )
-        })?;
-        if !can {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
-            let bal = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
-            return Err((
+    let created_at_ms = chrono::Utc::now().timestamp_millis();
+    let usage_reservation = usage_reservations::reserve(
+        &state.pool,
+        ReserveUsageInput {
+            account_id: &account.id,
+            request_id: &q.request_id,
+            kind: "stt",
+            reason: "transcribe",
+            estimated_customer_cents: est_cost,
+            estimated_upstream_cents: 0,
+            upstream_spend_guard: state.config.upstream_spend_guard,
+            created_at_ms,
+            expires_at_ms: created_at_ms.saturating_add(30 * 60 * 1_000),
+        },
+    )
+    .map_err(|error| {
+        let _ = idempotency::release(&state.pool, &account.id, &q.request_id);
+        match error {
+            usage_reservations::UsageReservationError::InsufficientBalance => (
                 StatusCode::PAYMENT_REQUIRED,
                 Json(ApiError {
                     error: "insufficient balance".into(),
-                    balance_cents: Some(bal),
+                    balance_cents: balance::current_balance(&state.pool, &account.id).ok(),
                     estimated_cost_cents: Some(est_cost),
                     reason: Some("insufficient_balance".into()),
                     reload_url: Some(format!("{}/reload", state.config.public_url)),
                     ..Default::default()
                 }),
-            ));
+            ),
+            _ => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError {
+                    error: format!("transcribe usage reservation failed: {error}"),
+                    reason: Some("usage_reservation_failed".into()),
+                    ..Default::default()
+                }),
+            ),
         }
-    }
+    })?;
+    let on_trial = usage_reservation.is_trial();
 
     let mut last_error: Option<anyhow::Error> = None;
     let mut last_capacity: Option<crate::rate_limit::CapacityDenied> = None;
@@ -189,6 +200,7 @@ pub async fn transcribe(
     let mut selected_route_idx = 0usize;
     let mut selected_route: Option<&PricedTranscribeRoute> = None;
     let mut selected_completion: Option<routing::TranscribeCompletion> = None;
+    let mut dispatch_index = 0_usize;
 
     for (idx, route) in routes.iter().enumerate() {
         let key_candidates = state.config.upstream.key_candidates(
@@ -242,6 +254,33 @@ pub async fn transcribe(
                 break;
             }
 
+            let attempt_request_id = format!("{}:stt-attempt:{dispatch_index}", q.request_id);
+            dispatch_index = dispatch_index.saturating_add(1);
+            let mut attempt_guard = match provider_cost_guard::reserve(
+                &state.pool,
+                state.config.upstream_spend_guard,
+                &account.id,
+                &format!("router:{}:stt", q.request_id),
+                &attempt_request_id,
+                route.provider,
+                &route.model,
+                route.estimated_bluey_cost_cents,
+                "stt_attempt",
+                "stt",
+            ) {
+                Ok(provider_cost_guard::Admission::Held(guard)) => guard,
+                Ok(provider_cost_guard::Admission::Unconfigured) => {
+                    last_error = Some(anyhow::anyhow!(
+                        "paid STT route unexpectedly had zero projected exposure"
+                    ));
+                    break;
+                }
+                Ok(provider_cost_guard::Admission::GlobalLimit) | Err(_) => {
+                    last_error = Some(anyhow::anyhow!("upstream spend guard denied STT route"));
+                    break;
+                }
+            };
+
             match routing::transcribe_with_key(
                 &selected_key.secret,
                 route.provider,
@@ -252,12 +291,52 @@ pub async fn transcribe(
             .await
             {
                 Ok(c) => {
+                    let route_matches = c.provider == route.provider && c.model == route.model;
+                    let actual_bluey_cost = pricing::lookup(&c.provider, &c.model)
+                        .map(|price| pricing::compute_cost(price, c.duration_seconds, 0).0)
+                        .unwrap_or(crate::db::usage::MAX_AUTHORITATIVE_EVENT_COST_CENTS);
+                    let attempt_event = UsageEvent {
+                        request_id: attempt_request_id,
+                        kind: "stt_attempt".into(),
+                        task_type: Some("stt".into()),
+                        lane: None,
+                        provider: Some(c.provider.clone()),
+                        model: Some(c.model.clone()),
+                        input_tokens: c.duration_seconds,
+                        output_tokens: 0,
+                        latency_ms: 0,
+                        cost_cents_to_bluey: actual_bluey_cost,
+                        cost_cents_to_customer: 0,
+                        was_speculative: false,
+                        was_fallback: idx > 0,
+                    };
+                    settle_provider_attempt_before_customer(
+                        &state.pool,
+                        &account.id,
+                        &q.request_id,
+                        &mut attempt_guard,
+                        attempt_event,
+                        actual_bluey_cost,
+                    )?;
+                    if !route_matches {
+                        last_error = Some(anyhow::anyhow!("STT provider route identity mismatch"));
+                        last_failure_was_capacity = false;
+                        break;
+                    }
                     selected_route_idx = idx;
                     selected_route = Some(route);
                     selected_completion = Some(c);
                     break;
                 }
                 Err(e) => {
+                    if let Err(error) = attempt_guard.settle_conservative() {
+                        tracing::error!(request_id = %q.request_id, error = %error, "STT failed-attempt settlement pending reconciliation");
+                        return Err(provider_accounting_pending_error(
+                            &state.pool,
+                            &account.id,
+                            &q.request_id,
+                        ));
+                    }
                     if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
                         let cooldown_secs = state
                             .provider_health
@@ -308,6 +387,13 @@ pub async fn transcribe(
     let (selected_route, comp) = match (selected_route, selected_completion) {
         (Some(route), Some(completion)) => (route, completion),
         _ => {
+            let _ = usage_reservations::release(
+                &state.pool,
+                &account.id,
+                &q.request_id,
+                "provider_dispatch_failed",
+                chrono::Utc::now().timestamp_millis(),
+            );
             let _ = idempotency::release(&state.pool, &account.id, &q.request_id);
             if last_failure_was_capacity {
                 let denied = last_capacity.expect("capacity flag set with no capacity denial");
@@ -333,50 +419,49 @@ pub async fn transcribe(
     };
 
     // Cost billed against duration_seconds as input "tokens".
-    let (bluey_cost, customer_cost) =
+    let (_bluey_cost, customer_cost) =
         pricing::compute_cost(selected_route.pricing, comp.duration_seconds, 0);
-    let charged_customer_cost = if on_trial { 0 } else { customer_cost };
-
-    if on_trial {
-        let trial_ms = comp.duration_seconds.max(1) * 1000;
-        if let Err(e) = balance::consume_trial_seconds(&state.pool, &account.id, trial_ms) {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: format!("trial: {e}"),
-                    ..Default::default()
-                }),
-            ));
-        }
-    } else {
-        let ok = balance::deduct_for_request(
-            &state.pool,
-            &account.id,
-            customer_cost,
-            "transcribe",
-            &q.request_id,
+    let event = UsageEvent {
+        request_id: q.request_id.clone(),
+        kind: "stt".into(),
+        task_type: None,
+        lane: None,
+        provider: Some(comp.provider.clone()),
+        model: Some(comp.model.clone()),
+        input_tokens: comp.duration_seconds,
+        output_tokens: 0,
+        latency_ms: 0,
+        cost_cents_to_bluey: 0,
+        cost_cents_to_customer: customer_cost,
+        was_speculative: false,
+        was_fallback: selected_route_idx > 0,
+    };
+    let settled = usage_reservations::settle_with_events(
+        &state.pool,
+        &account.id,
+        &q.request_id,
+        customer_cost,
+        comp.duration_seconds.max(1).saturating_mul(1_000),
+        "completed",
+        chrono::Utc::now().timestamp_millis(),
+        &[SettlementUsageEvent {
+            event,
+            customer_cost_cents: customer_cost,
+        }],
+    )
+    .map_err(|error| {
+        tracing::error!(trace_id = %trace_id, error = %error, "transcribe usage settlement pending");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "transcribe usage settlement is pending reconciliation".into(),
+                reason: Some("usage_settlement_pending".into()),
+                ..Default::default()
+            }),
         )
-        .map_err(|e| {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: format!("deduct: {e}"),
-                    ..Default::default()
-                }),
-            )
-        })?;
-        if !ok {
-            tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                cost_cents = customer_cost,
-                "transcribe post-completion deduct failed; bluey absorbs overrun"
-            );
-        }
-    }
-
-    let balance_after = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
+    })?;
+    let charged_customer_cost = settled.charged_customer_cents;
+    let balance_after = settled.balance_cents_after;
 
     if !on_trial {
         crate::billing::topup::maybe_spawn(
@@ -392,25 +477,6 @@ pub async fn transcribe(
             account.square_card_id.clone(),
             account.auto_topup_amount_cents,
         );
-    }
-
-    let event = UsageEvent {
-        request_id: q.request_id.clone(),
-        kind: "stt".into(),
-        task_type: None,
-        lane: None,
-        provider: Some(comp.provider.clone()),
-        model: Some(comp.model.clone()),
-        input_tokens: comp.duration_seconds,
-        output_tokens: 0,
-        latency_ms: 0,
-        cost_cents_to_bluey: bluey_cost,
-        cost_cents_to_customer: charged_customer_cost,
-        was_speculative: false,
-        was_fallback: selected_route_idx > 0,
-    };
-    if let Err(e) = crate::db::usage::record(&state.pool, &account.id, &event) {
-        tracing::warn!(trace_id = %trace_id, error = %e, "failed to record transcribe usage event");
     }
 
     let response = TranscribeResponse {

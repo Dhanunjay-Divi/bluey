@@ -26,6 +26,8 @@ pub mod diagnostic_logs;
 pub mod idempotency;
 pub mod jobs;
 pub mod jobs_generation;
+pub mod jobs_generation_allowance;
+pub mod jobs_provider_cost_holds;
 mod jobs_tailoring;
 pub mod legal_acceptances;
 pub mod link_codes;
@@ -342,6 +344,7 @@ const MIGRATIONS: &[&str] = &[
         account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
         request_id            TEXT NOT NULL,
         ts                    DATETIME NOT NULL DEFAULT (datetime('now')),
+        origin                TEXT NOT NULL DEFAULT 'legacy_unverified',
         kind                  TEXT NOT NULL,            -- llm | embed | stt | vision
         task_type             TEXT,                      -- general | code | system_design | meeting | writing | vision
         lane                  TEXT,                      -- instant | balanced | deep | vision
@@ -353,7 +356,8 @@ const MIGRATIONS: &[&str] = &[
         cost_cents_to_bluey   INTEGER NOT NULL DEFAULT 0,
         cost_cents_to_customer INTEGER NOT NULL DEFAULT 0,
         was_speculative       INTEGER NOT NULL DEFAULT 0,
-        was_fallback          INTEGER NOT NULL DEFAULT 0
+        was_fallback          INTEGER NOT NULL DEFAULT 0,
+        CHECK (origin IN ('server', 'client', 'legacy_unverified'))
     );
     CREATE INDEX IF NOT EXISTS idx_usage_events_account_ts ON usage_events(account_id, ts);
     CREATE INDEX IF NOT EXISTS idx_usage_events_request ON usage_events(request_id);
@@ -1399,6 +1403,63 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_resume_generations_job
         ON jobs_resume_generations(account_id, job_id, updated_at_ms DESC);
     "#,
+    // 0032 - pre-dispatch Jobs packet allowance reservation.
+    //
+    // Managed resume generation consumes the Jobs packet allowance rather
+    // than general chat credit. A job-scoped row fences duplicate generation
+    // attempts and is converted into ordinary packet metering on commit.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_generation_allowance_reservations (
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        job_id                TEXT NOT NULL REFERENCES jobs_postings(id) ON DELETE CASCADE,
+        generation_key        TEXT NOT NULL,
+        reservation_token     TEXT NOT NULL,
+        status                TEXT NOT NULL DEFAULT 'reserved',
+        period_start_ms       INTEGER NOT NULL,
+        application_id        TEXT REFERENCES jobs_applications(id) ON DELETE SET NULL,
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL,
+        PRIMARY KEY (account_id, job_id),
+        UNIQUE(account_id, generation_key),
+        CHECK (status IN ('reserved', 'released', 'committed'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_generation_allowance_status
+        ON jobs_generation_allowance_reservations(account_id, status, updated_at_ms DESC);
+
+    -- Anonymous conservative spend carried across the authority cutover.
+    -- This table deliberately has no account, request, provider, or model key.
+    CREATE TABLE IF NOT EXISTS usage_cutover_spend_baseline (
+        occurred_at          DATETIME NOT NULL,
+        cost_cents           INTEGER NOT NULL,
+        CHECK (cost_cents > 0 AND cost_cents <= 100000000)
+    );
+    CREATE INDEX IF NOT EXISTS idx_usage_cutover_spend_baseline_time
+        ON usage_cutover_spend_baseline(occurred_at);
+
+    CREATE TABLE IF NOT EXISTS jobs_provider_cost_holds (
+        request_scope_hash    TEXT PRIMARY KEY,
+        account_scope_hash    TEXT NOT NULL,
+        generation_scope_hash TEXT NOT NULL,
+        root_scope_hash       TEXT NOT NULL,
+        reservation_token     TEXT NOT NULL,
+        provider              TEXT NOT NULL,
+        model                 TEXT NOT NULL,
+        projected_cost_cents  INTEGER NOT NULL,
+        settled_cost_cents    INTEGER NOT NULL DEFAULT 0,
+        status                TEXT NOT NULL DEFAULT 'held',
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL,
+        CHECK (status IN ('held', 'settled', 'released')),
+        CHECK (projected_cost_cents > 0 AND projected_cost_cents <= 100000000),
+        CHECK (settled_cost_cents >= 0 AND settled_cost_cents <= 100000000)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_provider_cost_holds_generation
+        ON jobs_provider_cost_holds(account_scope_hash, generation_scope_hash, status, updated_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS idx_jobs_provider_cost_holds_root
+        ON jobs_provider_cost_holds(account_scope_hash, root_scope_hash, status, updated_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS idx_jobs_provider_cost_holds_global
+        ON jobs_provider_cost_holds(status, updated_at_ms DESC);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1422,6 +1483,158 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     ensure_column(&conn, "device_codes", "platform", "TEXT")?;
     ensure_column(&conn, "device_codes", "arch", "TEXT")?;
     ensure_column(&conn, "device_codes", "app_version", "TEXT")?;
+    ensure_column(
+        &conn,
+        "usage_events",
+        "origin",
+        "TEXT NOT NULL DEFAULT 'legacy_unverified'",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS bluey_data_migrations (
+             name TEXT PRIMARY KEY,
+             applied_at DATETIME NOT NULL DEFAULT (datetime('now'))
+         );",
+    )?;
+    let usage_origin_cutover_applied: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bluey_data_migrations
+          WHERE name = 'usage-origin-authority-cutover-v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    let usage_cutover_spend_baseline_applied: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bluey_data_migrations
+          WHERE name = 'usage-cutover-spend-baseline-v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !usage_origin_cutover_applied && !usage_cutover_spend_baseline_applied {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO usage_cutover_spend_baseline(occurred_at, cost_cents)
+             SELECT ts, MIN(MAX(cost_cents_to_bluey, 0), 100000000)
+               FROM usage_events
+              WHERE cost_cents_to_bluey > 0
+                AND NOT EXISTS (
+                    SELECT 1 FROM bluey_data_migrations
+                     WHERE name = 'usage-cutover-spend-baseline-v1'
+                );
+             INSERT OR IGNORE INTO bluey_data_migrations(name)
+              VALUES ('usage-cutover-spend-baseline-v1');
+             UPDATE usage_events
+            SET origin = 'legacy_unverified'
+          WHERE NOT EXISTS (
+              SELECT 1 FROM bluey_data_migrations
+               WHERE name = 'usage-origin-authority-cutover-v1'
+          );
+             INSERT OR IGNORE INTO bluey_data_migrations(name) VALUES
+              ('usage-origin-authority-cutover-v1'),
+              ('usage-origin-taxonomy-repair-v1');
+             COMMIT;",
+        )?;
+    } else {
+        if !usage_cutover_spend_baseline_applied {
+            // A database that already crossed authority using an earlier
+            // build no longer has trustworthy row provenance. Snapshot every
+            // positive cost conservatively; temporary double counting is
+            // safer than resetting the rolling cap.
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 INSERT INTO usage_cutover_spend_baseline(occurred_at, cost_cents)
+                 SELECT ts, MIN(MAX(cost_cents_to_bluey, 0), 100000000)
+                   FROM usage_events
+                  WHERE cost_cents_to_bluey > 0
+                    AND NOT EXISTS (
+                        SELECT 1 FROM bluey_data_migrations
+                         WHERE name = 'usage-cutover-spend-baseline-v1'
+                    );
+                 INSERT OR IGNORE INTO bluey_data_migrations(name)
+                  VALUES ('usage-cutover-spend-baseline-v1');
+                 COMMIT;",
+            )?;
+        }
+        if !usage_origin_cutover_applied {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 UPDATE usage_events
+                    SET origin = 'legacy_unverified'
+                  WHERE NOT EXISTS (
+                      SELECT 1 FROM bluey_data_migrations
+                       WHERE name = 'usage-origin-authority-cutover-v1'
+                  );
+                 INSERT OR IGNORE INTO bluey_data_migrations(name) VALUES
+                  ('usage-origin-authority-cutover-v1'),
+                  ('usage-origin-taxonomy-repair-v1');
+                 COMMIT;",
+            )?;
+        }
+    }
+    let usage_origin_taxonomy_repair_applied: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bluey_data_migrations
+          WHERE name = 'usage-origin-taxonomy-repair-v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !usage_origin_taxonomy_repair_applied {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE usage_events
+                SET origin = 'legacy_unverified'
+              WHERE (origin IS NULL
+                 OR origin NOT IN ('server', 'client', 'legacy_unverified'))
+                AND NOT EXISTS (
+                    SELECT 1 FROM bluey_data_migrations
+                     WHERE name = 'usage-origin-taxonomy-repair-v1'
+                );
+             INSERT OR IGNORE INTO bluey_data_migrations(name)
+              VALUES ('usage-origin-taxonomy-repair-v1');
+             COMMIT;",
+        )?;
+    }
+    let usage_reservation_repair_applied: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bluey_data_migrations
+          WHERE name = 'usage-reservations-settled-at-repair-v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !usage_reservation_repair_applied {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE usage_reservations
+                SET settled_at_ms = created_at_ms
+              WHERE status = 'settled' AND settled_at_ms IS NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM bluey_data_migrations
+                     WHERE name = 'usage-reservations-settled-at-repair-v1'
+                );
+             INSERT OR IGNORE INTO bluey_data_migrations(name)
+              VALUES ('usage-reservations-settled-at-repair-v1');
+             COMMIT;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_usage_events_server_ts
+             ON usage_events(ts) WHERE origin = 'server';
+         CREATE INDEX IF NOT EXISTS idx_usage_events_server_identity
+             ON usage_events(account_id, request_id, kind)
+             WHERE origin = 'server';
+         CREATE TRIGGER IF NOT EXISTS trg_usage_events_origin_insert
+         BEFORE INSERT ON usage_events
+         WHEN NEW.origin IS NULL
+           OR NEW.origin NOT IN ('server', 'client', 'legacy_unverified')
+         BEGIN
+             SELECT RAISE(ABORT, 'invalid usage event origin');
+         END;
+         CREATE TRIGGER IF NOT EXISTS trg_usage_events_origin_update
+         BEFORE UPDATE OF origin ON usage_events
+         WHEN NEW.origin IS NULL
+           OR NEW.origin NOT IN ('server', 'client', 'legacy_unverified')
+         BEGIN
+             SELECT RAISE(ABORT, 'invalid usage event origin');
+         END;
+         CREATE INDEX IF NOT EXISTS idx_usage_reservations_settled_exposure
+             ON usage_reservations(settled_at_ms)
+             WHERE status = 'settled';",
+    )?;
     ensure_column(&conn, "refresh_tokens", "device_id", "TEXT")?;
     ensure_column(
         &conn,
@@ -1579,6 +1792,8 @@ const POSTGRES_CONTEXT_ARTIFACT_REVISIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/006_context_artifact_revisions.sql");
 const POSTGRES_JOBS_RESUME_GENERATIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/007_jobs_resume_generations.sql");
+const POSTGRES_JOBS_GENERATION_ALLOWANCE: &str =
+    include_str!("../../../infra/postgres/server-runtime/008_jobs_generation_allowance.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -1598,6 +1813,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "007_jobs_resume_generations.sql",
         POSTGRES_JOBS_RESUME_GENERATIONS,
+    ),
+    (
+        "008_jobs_generation_allowance.sql",
+        POSTGRES_JOBS_GENERATION_ALLOWANCE,
     ),
 ];
 
@@ -1735,6 +1954,227 @@ mod blocking_boundary_tests {
 }
 
 #[cfg(test)]
+mod sqlite_migration_replay_tests {
+    use super::{open_pool, run_migrations};
+
+    #[test]
+    fn data_repairs_do_not_update_rows_after_markers_exist() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-migration-replay-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account =
+            crate::db::accounts::Account::create(&pool, "migration-replay@bluey.test", "hash")
+                .unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO usage_reservations
+                (account_id, request_id, kind, status, attempt,
+                 estimated_customer_cents, estimated_upstream_cents,
+                 created_at_ms, expires_at_ms, settled_at_ms,
+                 reservation_reason)
+             VALUES (?1, 'replay', 'llm', 'settled', 1, 0, 0,
+                     1000, 2000, NULL, 'replay-test')",
+            rusqlite::params![account.id],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE migration_update_audit (table_name TEXT NOT NULL);
+             CREATE TRIGGER audit_usage_event_repair
+             AFTER UPDATE ON usage_events BEGIN
+               INSERT INTO migration_update_audit VALUES ('usage_events');
+             END;
+             CREATE TRIGGER audit_usage_reservation_repair
+             AFTER UPDATE ON usage_reservations BEGIN
+               INSERT INTO migration_update_audit VALUES ('usage_reservations');
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        run_migrations(&pool).unwrap();
+
+        let conn = pool.get().unwrap();
+        let updates: i64 = conn
+            .query_row("SELECT COUNT(*) FROM migration_update_audit", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bluey_data_migrations WHERE name IN (
+                    'usage-cutover-spend-baseline-v1',
+                    'usage-origin-authority-cutover-v1',
+                    'usage-origin-taxonomy-repair-v1',
+                    'usage-reservations-settled-at-repair-v1'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let settled_at: Option<i64> = conn
+            .query_row(
+                "SELECT settled_at_ms FROM usage_reservations
+                  WHERE account_id = ?1 AND request_id = 'replay'",
+                rusqlite::params![account.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updates, 0);
+        assert_eq!(markers, 4);
+        assert_eq!(settled_at, None);
+    }
+
+    #[test]
+    fn cutover_spend_baseline_is_anonymous_replay_safe_bounded_and_conservative() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-cutover-baseline-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account =
+            crate::db::accounts::Account::create(&pool, "cutover-baseline@bluey.test", "hash")
+                .unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "DELETE FROM bluey_data_migrations WHERE name IN (
+                'usage-cutover-spend-baseline-v1',
+                'usage-origin-authority-cutover-v1',
+                'usage-origin-taxonomy-repair-v1'
+             )",
+            [],
+        )
+        .unwrap();
+        for (request_id, cost, age) in [
+            ("recent", 7_i64, "now"),
+            ("hostile", i64::MAX, "now"),
+            ("negative", -5, "now"),
+            ("expired", 11, "-3 days"),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_events (
+                    id, account_id, request_id, origin, kind,
+                    cost_cents_to_bluey, ts
+                 ) VALUES (?1, ?2, ?3, 'server', 'llm', ?4,
+                           CASE WHEN ?5 = 'now' THEN datetime('now')
+                                ELSE datetime('now', ?5) END)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    account.id,
+                    request_id,
+                    cost,
+                    age,
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        run_migrations(&pool).unwrap();
+        run_migrations(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        let costs: Vec<i64> = conn
+            .prepare("SELECT cost_cents FROM usage_cutover_spend_baseline ORDER BY cost_cents")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(costs, vec![7, 11, 100_000_000]);
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(usage_cutover_spend_baseline)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(columns, vec!["occurred_at", "cost_cents"]);
+        conn.execute(
+            "DELETE FROM accounts WHERE id = ?1",
+            rusqlite::params![account.id],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM usage_cutover_spend_baseline",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            3,
+            "privacy deletion must not erase anonymous rolling spend truth"
+        );
+        drop(conn);
+
+        let next =
+            crate::db::accounts::Account::create(&pool, "cutover-baseline-next@bluey.test", "hash")
+                .unwrap();
+        assert_eq!(
+            crate::db::jobs_provider_cost_holds::reserve(
+                &pool,
+                &next.id,
+                "router:after-cutover:llm",
+                "after-cutover-token",
+                "after-cutover:attempt:0",
+                "openai",
+                "gpt-5.4-mini",
+                1,
+                100,
+                crate::config::UpstreamSpendGuard {
+                    limit_cents: 100_000_007,
+                    window_hours: 24,
+                },
+            )
+            .unwrap(),
+            crate::db::jobs_provider_cost_holds::CostHoldReservation::GlobalLimit
+        );
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE usage_cutover_spend_baseline
+                    SET occurred_at = datetime('now', '-3 days')",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            crate::db::jobs_provider_cost_holds::reserve(
+                &pool,
+                &next.id,
+                "router:after-expiry:llm",
+                "after-expiry-token",
+                "after-expiry:attempt:0",
+                "openai",
+                "gpt-5.4-mini",
+                1,
+                100,
+                crate::config::UpstreamSpendGuard {
+                    limit_cents: 1,
+                    window_hours: 24,
+                },
+            )
+            .unwrap(),
+            crate::db::jobs_provider_cost_holds::CostHoldReservation::Held { .. }
+        ));
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM usage_cutover_spend_baseline",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "rows older than window plus grace must be deleted"
+        );
+    }
+}
+
+#[cfg(test)]
 mod postgres_migration_tests {
     use super::POSTGRES_POST_JOBS_MIGRATIONS;
 
@@ -1759,5 +2199,27 @@ mod postgres_migration_tests {
         assert!(sql.contains("UNIQUE(account_id, generation_key)"));
         assert!(sql.contains("reservation_token TEXT NOT NULL"));
         assert!(sql.contains("created_at_ms BIGINT"));
+    }
+
+    #[test]
+    fn spend_cutover_migration_captures_anonymous_clamped_baseline_once() {
+        let (_, sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == "008_jobs_generation_allowance.sql")
+            .expect("spend cutover migration must run before paid routes are served");
+
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS usage_cutover_spend_baseline"));
+        assert!(sql.contains("usage-cutover-spend-baseline-v1"));
+        assert!(sql.contains("LOCK TABLE usage_events IN SHARE ROW EXCLUSIVE MODE"));
+        assert_eq!(
+            sql.matches("LOCK TABLE usage_events IN SHARE ROW EXCLUSIVE MODE")
+                .count(),
+            1
+        );
+        assert!(sql.contains(
+            "WHERE name = 'usage-origin-taxonomy-repair-v1'\n  ) THEN\n    LOCK TABLE usage_events"
+        ));
+        assert!(sql.contains("LEAST(GREATEST(cost_cents_to_bluey, 0), 100000000)"));
+        assert!(!sql.contains("usage_cutover_spend_baseline (\n  account_id"));
     }
 }

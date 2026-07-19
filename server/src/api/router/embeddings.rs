@@ -2,11 +2,16 @@ use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    billing_restricted_error, release_and_capacity_error, release_and_upstream_spend_guard_check,
+    billing_restricted_error, prior_provider_exposure_error, provider_accounting_pending_error,
+    provider_cost_guard, release_and_capacity_error, settle_provider_attempt_before_customer,
     ApiError, AppState,
 };
 use crate::auth::AuthedAccount;
-use crate::db::{balance, idempotency, usage::UsageEvent};
+use crate::db::{
+    balance, idempotency,
+    usage::UsageEvent,
+    usage_reservations::{self, ReserveUsageInput, SettlementUsageEvent},
+};
 use crate::{pricing, routing};
 
 #[derive(Deserialize)]
@@ -107,7 +112,7 @@ pub async fn embed_batch(
 async fn embed_batch_inner(
     state: &AppState,
     account: &crate::db::accounts::Account,
-    trace_id: &str,
+    _trace_id: &str,
     req: EmbedBatchRequest,
 ) -> Result<EmbedBatchResponse, (StatusCode, Json<ApiError>)> {
     if let Some(err) = billing_restricted_error(account) {
@@ -212,8 +217,8 @@ async fn embed_batch_inner(
             denied.retry_after_secs,
         ));
     }
-    // Entry check (skipped on trial).
-    let on_trial = account.trial_seconds_remaining > 0;
+    // Entry estimate. Customer funds/trial are atomically reserved below,
+    // after provider configuration is verified and before network dispatch.
     let est_in = req
         .inputs
         .iter()
@@ -221,43 +226,14 @@ async fn embed_batch_inner(
         .sum();
     let est_cost = pricing::estimate_cost_ceiling(pricing_entry, est_in, 0);
     let est_bluey_cost = pricing::estimate_bluey_cost_ceiling(pricing_entry, est_in, 0);
-    if let Some(err) = release_and_upstream_spend_guard_check(
+    if let Some(err) = prior_provider_exposure_error(
         state,
         &account.id,
         &req.request_id,
-        est_bluey_cost,
-        "embed",
+        &format!("router:{}:embed", req.request_id),
     ) {
         return Err(err);
     }
-    if !on_trial {
-        let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: format!("balance: {e}"),
-                    ..Default::default()
-                }),
-            )
-        })?;
-        if !can {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            let bal = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
-            return Err((
-                StatusCode::PAYMENT_REQUIRED,
-                Json(ApiError {
-                    error: "insufficient balance".into(),
-                    balance_cents: Some(bal),
-                    estimated_cost_cents: Some(est_cost),
-                    reason: Some("insufficient_balance".into()),
-                    reload_url: Some(format!("{}/reload", state.config.public_url)),
-                    ..Default::default()
-                }),
-            ));
-        }
-    }
-
     let key_candidates = state.config.upstream.key_candidates(
         provider,
         &format!("embed:{}:{provider}:{model}", req.request_id),
@@ -274,6 +250,48 @@ async fn embed_batch_inner(
         ));
     }
 
+    let created_at_ms = chrono::Utc::now().timestamp_millis();
+    let usage_reservation = usage_reservations::reserve(
+        &state.pool,
+        ReserveUsageInput {
+            account_id: &account.id,
+            request_id: &req.request_id,
+            kind: "embed",
+            reason: "embed",
+            estimated_customer_cents: est_cost,
+            estimated_upstream_cents: 0,
+            upstream_spend_guard: state.config.upstream_spend_guard,
+            created_at_ms,
+            expires_at_ms: created_at_ms.saturating_add(30 * 60 * 1_000),
+        },
+    )
+    .map_err(|error| {
+        let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+        match error {
+            usage_reservations::UsageReservationError::InsufficientBalance => (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(ApiError {
+                    error: "insufficient balance".into(),
+                    balance_cents: balance::current_balance(&state.pool, &account.id).ok(),
+                    estimated_cost_cents: Some(est_cost),
+                    reason: Some("insufficient_balance".into()),
+                    reload_url: Some(format!("{}/reload", state.config.public_url)),
+                    ..Default::default()
+                }),
+            ),
+            _ => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError {
+                    error: format!("embed usage reservation failed: {error}"),
+                    reason: Some("usage_reservation_failed".into()),
+                    ..Default::default()
+                }),
+            ),
+        }
+    })?;
+    let on_trial = usage_reservation.is_trial();
+
+    let mut dispatch_index = 0_usize;
     let comp = loop {
         let selected_key = match state
             .provider_health
@@ -282,6 +300,13 @@ async fn embed_batch_inner(
         {
             Ok(key) => key,
             Err(denied) => {
+                let _ = usage_reservations::release(
+                    &state.pool,
+                    &account.id,
+                    &req.request_id,
+                    "provider_capacity",
+                    chrono::Utc::now().timestamp_millis(),
+                );
                 return Err(release_and_capacity_error(
                     &state.pool,
                     &account.id,
@@ -297,6 +322,13 @@ async fn embed_batch_inner(
             .check_provider_embed(provider, model)
             .await
         {
+            let _ = usage_reservations::release(
+                &state.pool,
+                &account.id,
+                &req.request_id,
+                "provider_capacity",
+                chrono::Utc::now().timestamp_millis(),
+            );
             return Err(release_and_capacity_error(
                 &state.pool,
                 &account.id,
@@ -306,11 +338,119 @@ async fn embed_batch_inner(
             ));
         }
 
+        let attempt_request_id = format!("{}:embed-attempt:{dispatch_index}", req.request_id);
+        dispatch_index = dispatch_index.saturating_add(1);
+        let mut attempt_guard = match provider_cost_guard::reserve(
+            &state.pool,
+            state.config.upstream_spend_guard,
+            &account.id,
+            &format!("router:{}:embed", req.request_id),
+            &attempt_request_id,
+            provider,
+            model,
+            est_bluey_cost,
+            "embed_attempt",
+            "embed",
+        ) {
+            Ok(provider_cost_guard::Admission::Held(guard)) => guard,
+            Ok(provider_cost_guard::Admission::Unconfigured) => {
+                let _ = usage_reservations::release(
+                    &state.pool,
+                    &account.id,
+                    &req.request_id,
+                    "upstream_spend_guard",
+                    chrono::Utc::now().timestamp_millis(),
+                );
+                let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError {
+                        error: "embed pricing produced no durable upstream exposure".into(),
+                        reason: Some("upstream_spend_guard".into()),
+                        ..Default::default()
+                    }),
+                ));
+            }
+            Ok(provider_cost_guard::Admission::GlobalLimit) | Err(_) => {
+                let _ = usage_reservations::release(
+                    &state.pool,
+                    &account.id,
+                    &req.request_id,
+                    "upstream_spend_guard",
+                    chrono::Utc::now().timestamp_millis(),
+                );
+                let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError {
+                        error: "upstream spend guard paused embedding dispatch".into(),
+                        reason: Some("upstream_spend_guard".into()),
+                        ..Default::default()
+                    }),
+                ));
+            }
+        };
+
         match routing::embed_batch_with_key(&selected_key.secret, provider, model, &req.inputs)
             .await
         {
-            Ok(c) => break c,
+            Ok(c) => {
+                let route_matches = c.provider == provider && c.model == model;
+                let actual_bluey_cost = pricing::lookup(&c.provider, &c.model)
+                    .map(|price| pricing::compute_cost(price, c.input_tokens, 0).0)
+                    .unwrap_or(crate::db::usage::MAX_AUTHORITATIVE_EVENT_COST_CENTS);
+                let attempt_event = UsageEvent {
+                    request_id: attempt_request_id,
+                    kind: "embed_attempt".into(),
+                    task_type: Some("embed".into()),
+                    lane: None,
+                    provider: Some(c.provider.clone()),
+                    model: Some(c.model.clone()),
+                    input_tokens: c.input_tokens,
+                    output_tokens: 0,
+                    latency_ms: 0,
+                    cost_cents_to_bluey: actual_bluey_cost,
+                    cost_cents_to_customer: 0,
+                    was_speculative: false,
+                    was_fallback: dispatch_index > 1,
+                };
+                settle_provider_attempt_before_customer(
+                    &state.pool,
+                    &account.id,
+                    &req.request_id,
+                    &mut attempt_guard,
+                    attempt_event,
+                    actual_bluey_cost,
+                )?;
+                if !route_matches {
+                    let _ = usage_reservations::release(
+                        &state.pool,
+                        &account.id,
+                        &req.request_id,
+                        "upstream_route_mismatch",
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                    let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        Json(ApiError {
+                            error: "embedding provider route identity mismatch".into(),
+                            reason: Some("upstream_route_mismatch".into()),
+                            ..Default::default()
+                        }),
+                    ));
+                }
+                break c;
+            }
             Err(e) => {
+                if let Err(error) = attempt_guard.settle_conservative() {
+                    tracing::error!(request_id = %req.request_id, error = %error, "embed failed-attempt settlement pending reconciliation");
+                    return Err(provider_accounting_pending_error(
+                        &state.pool,
+                        &account.id,
+                        &req.request_id,
+                    ));
+                }
                 if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
                     let cooldown_secs = state
                         .provider_health
@@ -342,6 +482,13 @@ async fn embed_batch_inner(
                     "embed dispatch failed"
                 );
                 let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+                let _ = usage_reservations::release(
+                    &state.pool,
+                    &account.id,
+                    &req.request_id,
+                    "upstream_error",
+                    chrono::Utc::now().timestamp_millis(),
+                );
                 return Err((
                     StatusCode::BAD_GATEWAY,
                     Json(ApiError {
@@ -354,6 +501,13 @@ async fn embed_batch_inner(
         }
     };
     if comp.vectors.len() != req.inputs.len() {
+        let _ = usage_reservations::release(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+            "invalid_provider_response",
+            chrono::Utc::now().timestamp_millis(),
+        );
         let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -370,51 +524,49 @@ async fn embed_batch_inner(
     }
 
     // Cost (no output tokens for embeddings).
-    let (bluey_cost, customer_cost) = pricing::compute_cost(pricing_entry, comp.input_tokens, 0);
-    let charged_customer_cost = if on_trial { 0 } else { customer_cost };
-
-    // Charge.
-    let trial_remaining = if on_trial {
-        let trial_ms = (((comp.input_tokens.max(1) + 999) / 1000).max(1)) * 1000;
-        balance::consume_trial_seconds(&state.pool, &account.id, trial_ms).map_err(|e| {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: format!("trial: {e}"),
-                    ..Default::default()
-                }),
-            )
-        })?
-    } else {
-        let ok = balance::deduct_for_request(
-            &state.pool,
-            &account.id,
-            customer_cost,
-            "embed",
-            &req.request_id,
-        )
-        .map_err(|e| {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: format!("deduct: {e}"),
-                    ..Default::default()
-                }),
-            )
-        })?;
-        if !ok {
-            tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                cost_cents = customer_cost,
-                "embed post-completion deduct failed; bluey absorbs overrun"
-            );
-        }
-        account.trial_seconds_remaining
+    let (_bluey_cost, customer_cost) = pricing::compute_cost(pricing_entry, comp.input_tokens, 0);
+    let trial_ms = (((comp.input_tokens.max(1) + 999) / 1000).max(1)) * 1000;
+    let event = UsageEvent {
+        request_id: req.request_id.clone(),
+        kind: "embed".into(),
+        task_type: None,
+        lane: None,
+        provider: Some(comp.provider.clone()),
+        model: Some(comp.model.clone()),
+        input_tokens: comp.input_tokens,
+        output_tokens: 0,
+        latency_ms: 0,
+        cost_cents_to_bluey: 0,
+        cost_cents_to_customer: customer_cost,
+        was_speculative: false,
+        was_fallback: false,
     };
-
-    let balance_after = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
+    let settled = usage_reservations::settle_with_events(
+        &state.pool,
+        &account.id,
+        &req.request_id,
+        customer_cost,
+        trial_ms,
+        "completed",
+        chrono::Utc::now().timestamp_millis(),
+        &[SettlementUsageEvent {
+            event,
+            customer_cost_cents: customer_cost,
+        }],
+    )
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("embed usage settlement failed: {error}"),
+                reason: Some("usage_settlement_pending".into()),
+                ..Default::default()
+            }),
+        )
+    })?;
+    let charged_customer_cost = settled.charged_customer_cents;
+    let trial_remaining = settled.trial_seconds_remaining;
+    let balance_after = settled.balance_cents_after;
 
     // Auto top-up trigger (same as /router/complete).
     if !on_trial {
@@ -431,26 +583,6 @@ async fn embed_batch_inner(
             account.square_card_id.clone(),
             account.auto_topup_amount_cents,
         );
-    }
-
-    // Usage event.
-    let event = UsageEvent {
-        request_id: req.request_id.clone(),
-        kind: "embed".into(),
-        task_type: None,
-        lane: None,
-        provider: Some(comp.provider.clone()),
-        model: Some(comp.model.clone()),
-        input_tokens: comp.input_tokens,
-        output_tokens: 0,
-        latency_ms: 0,
-        cost_cents_to_bluey: bluey_cost,
-        cost_cents_to_customer: charged_customer_cost,
-        was_speculative: false,
-        was_fallback: false,
-    };
-    if let Err(e) = crate::db::usage::record(&state.pool, &account.id, &event) {
-        tracing::warn!(trace_id = %trace_id, error = %e, "failed to record embed usage event");
     }
 
     let response = EmbedBatchResponse {

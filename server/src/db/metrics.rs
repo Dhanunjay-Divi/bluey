@@ -53,7 +53,7 @@ pub fn snapshot(pool: &DbPool) -> Result<MetricsSnapshot> {
                 credit_batches: count_one_sqlite(&conn, "SELECT COUNT(*) FROM credit_batches")?,
                 usage_24h: count_one_sqlite(
                     &conn,
-                    "SELECT COUNT(*) FROM usage_events WHERE ts >= datetime('now', '-1 day')",
+                    "SELECT COUNT(*) FROM usage_events WHERE origin = 'server' AND ts >= datetime('now', '-1 day')",
                 )?,
                 webhook_processed: count_one_sqlite(
                     &conn,
@@ -97,7 +97,7 @@ pub fn snapshot(pool: &DbPool) -> Result<MetricsSnapshot> {
                 )?,
                 usage_24h: count_one_pg(
                     &mut conn,
-                    "SELECT COUNT(*)::bigint FROM usage_events WHERE ts >= now() - interval '1 day'",
+                    "SELECT COUNT(*)::bigint FROM usage_events WHERE origin = 'server' AND ts >= now() - interval '1 day'",
                 )?,
                 webhook_processed: count_one_pg(
                     &mut conn,

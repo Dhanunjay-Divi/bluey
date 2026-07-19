@@ -121,7 +121,9 @@ pub(crate) fn reserve_session(
 
                 let reserved_trial_seconds = trial_remaining.max(0).min(input.max_seconds);
                 let reserved_billable_seconds = (input.max_seconds - reserved_trial_seconds).max(0);
-                let (projected_bluey_cents, reserved_cents) =
+                let (projected_bluey_cents, _) =
+                    pricing::compute_cost(pricing, input.max_seconds.max(0), 0);
+                let (_, reserved_cents) =
                     pricing::compute_cost(pricing, reserved_billable_seconds, 0);
                 if available_cents < reserved_cents {
                     return Err(SttAccountingError::InsufficientBalance);
@@ -228,7 +230,9 @@ pub(crate) fn reserve_session(
 
                 let reserved_trial_seconds = trial_remaining.max(0).min(input.max_seconds);
                 let reserved_billable_seconds = (input.max_seconds - reserved_trial_seconds).max(0);
-                let (projected_bluey_cents, reserved_cents) =
+                let (projected_bluey_cents, _) =
+                    pricing::compute_cost(pricing, input.max_seconds.max(0), 0);
+                let (_, reserved_cents) =
                     pricing::compute_cost(pricing, reserved_billable_seconds, 0);
                 if available_cents < reserved_cents {
                     return Err(SttAccountingError::InsufficientBalance);
@@ -560,22 +564,35 @@ pub(crate) fn settle_session(
                     .map_err(|err| SttAccountingError::Db(err.into()))?;
 
                 let (
-                        max_seconds,
-                        reserved_cents,
-                        reserved_trial_seconds,
-                        ended_at_ms,
-                        bluey_session_id,
-                    ): (i64, i64, i64, Option<i64>, String) = tx
+                    max_seconds,
+                    reserved_cents,
+                    reserved_trial_seconds,
+                    ended_at_ms,
+                    bluey_session_id,
+                    source,
+                ): (i64, i64, i64, Option<i64>, String, String) = tx
                     .query_row(
-                        "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms, bluey_session_id
+                        "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms,
+                                bluey_session_id, source
                          FROM stt_sessions
                          WHERE session_token = ?1 AND account_id = ?2",
                         params![session_token, account_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
                     )
                     .optional()
                     .map_err(|err| SttAccountingError::Db(err.into()))?
-                    .ok_or_else(|| SttAccountingError::Db(anyhow::anyhow!("missing STT session")))?;
+                    .ok_or_else(|| {
+                        SttAccountingError::Db(anyhow::anyhow!("missing STT session"))
+                    })?;
 
                 if ended_at_ms.is_some() {
                     return Err(SttAccountingError::AlreadySettled);
@@ -584,8 +601,8 @@ pub(crate) fn settle_session(
                 let capped_seconds = elapsed_seconds.min(max_seconds.max(0));
                 let trial_seconds = reserved_trial_seconds.min(capped_seconds);
                 let billable_seconds = capped_seconds - trial_seconds;
-                let (bluey_cents, customer_cents) =
-                    pricing::compute_cost(pricing, billable_seconds, 0);
+                let (bluey_cents, _) = pricing::compute_cost(pricing, capped_seconds, 0);
+                let (_, customer_cents) = pricing::compute_cost(pricing, billable_seconds, 0);
                 let refunded_cents = (reserved_cents - customer_cents).max(0);
                 let extra_cents = (customer_cents - reserved_cents).max(0);
                 let refunded_trial_seconds = (reserved_trial_seconds - trial_seconds).max(0);
@@ -691,6 +708,34 @@ pub(crate) fn settle_session(
                     return Err(SttAccountingError::AlreadySettled);
                 }
 
+                let usage_request_id = format!("stt-{bluey_session_id}-{session_token}");
+                let inserted = tx
+                    .execute(
+                        "INSERT OR IGNORE INTO usage_events
+                            (id, account_id, request_id, origin, kind, task_type, lane,
+                             provider, model, input_tokens, output_tokens, latency_ms,
+                             cost_cents_to_bluey, cost_cents_to_customer,
+                             was_speculative, was_fallback)
+                         VALUES (?1, ?2, ?3, 'server', 'stt', 'transcription', ?4,
+                                 'deepgram', ?5, ?6, 0, ?7, 0, ?8, 0, 0)",
+                        params![
+                            uuid::Uuid::new_v4().to_string(),
+                            account_id,
+                            usage_request_id,
+                            source,
+                            model,
+                            capped_seconds,
+                            elapsed_ms.max(0),
+                            customer_cents,
+                        ],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if inserted != 1 {
+                    return Err(SttAccountingError::Db(anyhow::anyhow!(
+                        "live STT customer usage identity collision"
+                    )));
+                }
+
                 tx.commit()
                     .map_err(|err| SttAccountingError::Db(err.into()))?;
                 (
@@ -711,13 +756,16 @@ pub(crate) fn settle_session(
 
                 let row = tx
                     .query_opt(
-                        "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms, bluey_session_id
+                        "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms,
+                                bluey_session_id, source
                          FROM stt_sessions
                          WHERE session_token = $1 AND account_id = $2",
                         &[&session_token, &account_id],
                     )
                     .map_err(|err| SttAccountingError::Db(err.into()))?
-                    .ok_or_else(|| SttAccountingError::Db(anyhow::anyhow!("missing STT session")))?;
+                    .ok_or_else(|| {
+                        SttAccountingError::Db(anyhow::anyhow!("missing STT session"))
+                    })?;
                 let max_seconds: i64 = row
                     .try_get(0)
                     .map_err(|err| SttAccountingError::Db(err.into()))?;
@@ -733,6 +781,9 @@ pub(crate) fn settle_session(
                 let bluey_session_id: String = row
                     .try_get(4)
                     .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let source: String = row
+                    .try_get(5)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
 
                 if ended_at_ms.is_some() {
                     return Err(SttAccountingError::AlreadySettled);
@@ -741,8 +792,8 @@ pub(crate) fn settle_session(
                 let capped_seconds = elapsed_seconds.min(max_seconds.max(0));
                 let trial_seconds = reserved_trial_seconds.min(capped_seconds);
                 let billable_seconds = capped_seconds - trial_seconds;
-                let (bluey_cents, customer_cents) =
-                    pricing::compute_cost(pricing, billable_seconds, 0);
+                let (bluey_cents, _) = pricing::compute_cost(pricing, capped_seconds, 0);
+                let (_, customer_cents) = pricing::compute_cost(pricing, billable_seconds, 0);
                 let refunded_cents = (reserved_cents - customer_cents).max(0);
                 let extra_cents = (customer_cents - reserved_cents).max(0);
                 let refunded_trial_seconds = (reserved_trial_seconds - trial_seconds).max(0);
@@ -848,6 +899,39 @@ pub(crate) fn settle_session(
                     .map_err(|err| SttAccountingError::Db(err.into()))?;
                 if updated != 1 {
                     return Err(SttAccountingError::AlreadySettled);
+                }
+
+                let usage_request_id = format!("stt-{bluey_session_id}-{session_token}");
+                let was_speculative = 0_i32;
+                let was_fallback = 0_i32;
+                let inserted = tx
+                    .execute(
+                        "INSERT INTO usage_events
+                            (id, account_id, request_id, origin, kind, task_type, lane,
+                             provider, model, input_tokens, output_tokens, latency_ms,
+                             cost_cents_to_bluey, cost_cents_to_customer,
+                             was_speculative, was_fallback)
+                         VALUES ($1, $2, $3, 'server', 'stt', 'transcription', $4,
+                                 'deepgram', $5, $6, 0, $7, 0, $8, $9, $10)
+                         ON CONFLICT (account_id, request_id, kind) DO NOTHING",
+                        &[
+                            &uuid::Uuid::new_v4().to_string(),
+                            &account_id,
+                            &usage_request_id,
+                            &source,
+                            &model,
+                            &capped_seconds,
+                            &elapsed_ms.max(0),
+                            &customer_cents,
+                            &was_speculative,
+                            &was_fallback,
+                        ],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if inserted != 1 {
+                    return Err(SttAccountingError::Db(anyhow::anyhow!(
+                        "live STT customer usage identity collision"
+                    )));
                 }
 
                 tx.commit()
