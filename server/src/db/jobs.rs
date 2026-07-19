@@ -12628,4 +12628,8 @@ pub fn account_export(
     }))
 }
 
+#[cfg(test)]
+#[path = "jobs/postgres_local_authority_tests.rs"]
+mod postgres_local_authority_tests;
+
 include!("jobs/tests.rs");
