@@ -1468,7 +1468,11 @@ mod tests {
                 "UPDATE jobs_provider_cost_holds SET updated_at_ms = ?1",
                 params![crate::db::jobs::now_ms()
                     .saturating_sub(UPSTREAM_SPEND_TRUTH_RETENTION_MS)
-                    .saturating_sub(1)],
+                    // SQLite's julianday conversion is millisecond-granular
+                    // and may round a boundary timestamp slightly backward.
+                    // Keep this fixture decisively outside retention so the
+                    // test measures deletion, not clock-conversion jitter.
+                    .saturating_sub(1_000)],
             )
             .unwrap();
         let cleanup = prune_expired_spend_truth(&pool).unwrap();
