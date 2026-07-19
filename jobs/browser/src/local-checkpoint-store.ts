@@ -34,6 +34,18 @@ const SCOPE_PATTERN = /^[a-f0-9]{64}$/;
 const WINDOWS_KEY_MAGIC = Buffer.from("BLUEYLK1");
 const execFileAsync = promisify(execFile);
 
+interface WindowsSafeStorage {
+  isEncryptionAvailable(): boolean;
+  encryptString(plaintext: string): Buffer;
+  decryptString(ciphertext: Buffer): string;
+}
+
+type WindowsSafeStorageLoader = () => Promise<WindowsSafeStorage>;
+
+export interface LocalCheckpointStoreOpenOptions {
+  loadWindowsSafeStorage?: WindowsSafeStorageLoader;
+}
+
 export interface LocalCheckpointDelivery {
   apiOrigin: string;
   capabilities: LocalRunCapabilities;
@@ -68,12 +80,18 @@ export class LocalCheckpointStore {
     private readonly key: Buffer,
   ) {}
 
-  static async open(baseDirectory: string): Promise<LocalCheckpointStore> {
+  static async open(
+    baseDirectory: string,
+    options: LocalCheckpointStoreOpenOptions = {},
+  ): Promise<LocalCheckpointStore> {
     const recoveryDirectory = join(baseDirectory, "recovery");
     const directory = join(recoveryDirectory, "checkpoints");
     await ensurePrivateDirectory(recoveryDirectory);
     await ensurePrivateDirectory(directory);
-    const key = await loadOrCreateKey(join(recoveryDirectory, "checkpoint-key-v1"));
+    const key = await loadOrCreateKey(
+      join(recoveryDirectory, "checkpoint-key-v1"),
+      options.loadWindowsSafeStorage,
+    );
     return new LocalCheckpointStore(directory, key);
   }
 
@@ -317,8 +335,17 @@ function checkpointKey(masterKey: Buffer, aad: Buffer): Buffer {
   ));
 }
 
-async function loadOrCreateKey(path: string): Promise<Buffer> {
-  if (process.platform === "win32") return loadOrCreateWindowsProtectedKey(path);
+async function loadOrCreateKey(
+  path: string,
+  loadWindowsSafeStorage: WindowsSafeStorageLoader = defaultWindowsSafeStorageLoader,
+): Promise<Buffer> {
+  if (process.platform === "win32" && osSecureStoreEnabled()) {
+    return loadOrCreateWindowsProtectedKey(path, loadWindowsSafeStorage);
+  }
+  return loadOrCreatePrivateFileKey(path);
+}
+
+async function loadOrCreatePrivateFileKey(path: string): Promise<Buffer> {
   let handle;
   try {
     handle = await open(
@@ -349,8 +376,11 @@ async function loadOrCreateKey(path: string): Promise<Buffer> {
   return readFile(path);
 }
 
-async function loadOrCreateWindowsProtectedKey(path: string): Promise<Buffer> {
-  const { safeStorage } = await import("electron");
+async function loadOrCreateWindowsProtectedKey(
+  path: string,
+  loadWindowsSafeStorage: WindowsSafeStorageLoader,
+): Promise<Buffer> {
+  const safeStorage = await loadWindowsSafeStorage();
   if (!safeStorage.isEncryptionAvailable()) {
     throw new Error("Windows user-scoped checkpoint encryption is unavailable");
   }
@@ -396,6 +426,23 @@ async function loadOrCreateWindowsProtectedKey(path: string): Promise<Buffer> {
   }
   if (decoded.length !== KEY_BYTES) throw new Error("Invalid Windows checkpoint key");
   return decoded;
+}
+
+async function defaultWindowsSafeStorageLoader(): Promise<WindowsSafeStorage> {
+  const { safeStorage } = await import("electron");
+  if (!safeStorage) throw new Error("Windows user-scoped checkpoint encryption is unavailable");
+  return safeStorage;
+}
+
+function osSecureStoreEnabled(): boolean {
+  return truthyEnvironmentVariable("BLUEY_USE_OS_KEYCHAIN")
+    || truthyEnvironmentVariable("BLUEY_USE_SECURE_STORE");
+}
+
+function truthyEnvironmentVariable(name: string): boolean {
+  return ["1", "true", "yes", "on"].includes(
+    String(process.env[name] || "").trim().toLowerCase(),
+  );
 }
 
 async function ensurePrivateDirectory(path: string): Promise<void> {

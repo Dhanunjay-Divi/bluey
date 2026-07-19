@@ -1,6 +1,8 @@
-import { copyFile, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { restartDisposition } from "@bluey/jobs-automation";
 import { acquireFinalSubmitAuthority, finalSubmitMarkerExists } from "../src/irreversible-submit.js";
@@ -11,6 +13,13 @@ import {
 } from "../src/local-checkpoint-store.js";
 
 const temporaryDirectories: string[] = [];
+const execFileAsync = promisify(execFile);
+const SECURE_STORE_ENVIRONMENT = [
+  "BLUEY_USE_OS_KEYCHAIN",
+  "BLUEY_USE_SECURE_STORE",
+  "BLUEY_LEGACY_KEYRING_FALLBACK",
+  "BLUEY_ALLOW_PLAINTEXT_TOKENS",
+] as const;
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, {
@@ -32,10 +41,10 @@ describe("encrypted local browser checkpoints", () => {
     expect(encrypted.subarray(0, 8).toString("ascii")).toBe("BLUEYLJ1");
     expect(encrypted.includes(Buffer.from("person@example.test"))).toBe(false);
     expect(encrypted.includes(Buffer.from("scoped-resume-capability"))).toBe(false);
-    expect((await stat(encryptedPath)).mode & 0o777).toBe(0o600);
-    expect((await stat(join(root, "recovery", "checkpoint-key-v1"))).mode & 0o777).toBe(0o600);
-    expect((await stat(join(root, "recovery"))).mode & 0o777).toBe(0o700);
-    expect((await stat(first.directory)).mode & 0o777).toBe(0o700);
+    await expectPrivatePath(encryptedPath, 0o600);
+    await expectPrivatePath(join(root, "recovery", "checkpoint-key-v1"), 0o600);
+    await expectPrivatePath(join(root, "recovery"), 0o700);
+    await expectPrivatePath(first.directory, 0o700);
 
     const restarted = await LocalCheckpointStore.open(root);
     await expect(restarted.read(scope)).resolves.toEqual(checkpoint);
@@ -117,6 +126,52 @@ describe("encrypted local browser checkpoints", () => {
       true,
     )).toBe("side_effect_unknown");
   });
+
+  it("never loads Windows safeStorage when every secure-store switch is disabled", async () => {
+    const root = await temporaryDirectory();
+    let safeStorageLoads = 0;
+
+    await withSecureStoreEnvironment("0", async () => {
+      const store = await LocalCheckpointStore.open(root, {
+        loadWindowsSafeStorage: async () => {
+          safeStorageLoads += 1;
+          throw new Error("safeStorage must not be loaded while opted out");
+        },
+      });
+      const checkpoint = fixture();
+      const scope = store.scopeFor(checkpoint.request);
+      await store.write(checkpoint);
+      await expect(store.read(scope)).resolves.toEqual(checkpoint);
+    });
+
+    expect(safeStorageLoads).toBe(0);
+    const key = await readFile(join(root, "recovery", "checkpoint-key-v1"));
+    expect(key).toHaveLength(32);
+    expect(key.subarray(0, 7).toString("ascii")).not.toBe("BLUEYLK1");
+    await expectPrivatePath(join(root, "recovery", "checkpoint-key-v1"), 0o600);
+  });
+
+  it("fails closed on a legacy DPAPI key envelope after secure-store opt-out", async () => {
+    const root = await temporaryDirectory();
+    const recovery = join(root, "recovery");
+    await mkdir(recovery, { recursive: true });
+    await writeFile(
+      join(recovery, "checkpoint-key-v1"),
+      Buffer.concat([Buffer.from("BLUEYLK1"), Buffer.alloc(48, 7)]),
+    );
+    let safeStorageLoads = 0;
+
+    await withSecureStoreEnvironment("0", async () => {
+      await expect(LocalCheckpointStore.open(root, {
+        loadWindowsSafeStorage: async () => {
+          safeStorageLoads += 1;
+          throw new Error("safeStorage must not be loaded while opted out");
+        },
+      })).rejects.toThrow("Invalid local checkpoint key file");
+    });
+
+    expect(safeStorageLoads).toBe(0);
+  });
 });
 
 function fixture(requestOverrides: Record<string, unknown> = {}): LocalRunCheckpoint {
@@ -164,4 +219,36 @@ async function temporaryDirectory(): Promise<string> {
   const path = await mkdtemp(join(tmpdir(), "bluey-local-checkpoint-"));
   temporaryDirectories.push(path);
   return path;
+}
+
+async function expectPrivatePath(path: string, posixMode: number): Promise<void> {
+  if (process.platform !== "win32") {
+    expect((await stat(path)).mode & 0o777).toBe(posixMode);
+    return;
+  }
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  const options = { windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 } as const;
+  const [{ stdout: acl }, { stdout: account }] = await Promise.all([
+    execFileAsync(join(systemRoot, "System32", "icacls.exe"), [path], options),
+    execFileAsync(join(systemRoot, "System32", "whoami.exe"), [], options),
+  ]);
+  expect(acl.toLowerCase()).toContain(account.trim().toLowerCase());
+  expect(acl).not.toContain("(I)");
+}
+
+async function withSecureStoreEnvironment(
+  value: string,
+  action: () => Promise<void>,
+): Promise<void> {
+  const previous = new Map(SECURE_STORE_ENVIRONMENT.map((name) => [name, process.env[name]]));
+  for (const name of SECURE_STORE_ENVIRONMENT) process.env[name] = value;
+  try {
+    await action();
+  } finally {
+    for (const name of SECURE_STORE_ENVIRONMENT) {
+      const old = previous.get(name);
+      if (old === undefined) delete process.env[name];
+      else process.env[name] = old;
+    }
+  }
 }

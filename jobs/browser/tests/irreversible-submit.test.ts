@@ -37,7 +37,15 @@ describe("irreversible submit authority", () => {
       status: "rejected",
       reason: { code: "submit_authority_exists" },
     });
-    expect((await stat(join(runDirectory, FINAL_SUBMIT_MARKER_FILE))).mode & 0o777).toBe(0o600);
+    const markerPath = join(runDirectory, FINAL_SUBMIT_MARKER_FILE);
+    if (process.platform === "win32") {
+      await expect(finalSubmitMarkerExists(runDirectory)).resolves.toBe(true);
+      await expect(readFile(markerPath, "utf8")).resolves.toBe(
+        '{"phase":"authority_acquired","at":"2026-07-12T12:00:00.000Z"}\n',
+      );
+    } else {
+      expect((await stat(markerPath)).mode & 0o777).toBe(0o600);
+    }
   });
 
   it("persists authority across a simulated process restart", async () => {
