@@ -37,6 +37,26 @@ The installed dependency distributes the complete Apache 2.0 license in its
 own `LICENSE` file. Bluey uses PDF.js only for bounded PDF parsing and text-layer
 validation before an application document can enter a submission packet.
 
+## parse5 7.3.0
+
+License: MIT
+
+Copyright (c) 2013-2019 Ivan Nikulin
+
+Bluey uses parse5 to read bounded, allowlisted HTML job tables without
+executing third-party scripts. The complete license is distributed by the
+installed dependency and retained in the package-manager artifact.
+
+## entities 6.0.1
+
+License: BSD-2-Clause
+
+Copyright (c) Felix Bohm
+
+This transitive parse5 dependency decodes HTML entities while reading curated
+job tables. The complete license is distributed by the installed dependency
+and retained in the package-manager artifact.
+
 ## Bundled Noto Fonts
 
 `assets/fonts/NotoSans-Regular.ttf`, `NotoSansSC-Regular.ttf`, and

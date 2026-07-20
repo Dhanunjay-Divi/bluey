@@ -29,6 +29,33 @@ The GitHub [`job-application` topic](https://github.com/topics/job-application)
 was used as a discovery index. Bluey did not treat the topic page as a license
 or clone every listed repository.
 
+## Curated public job-list readers
+
+Bluey includes an original bounded parser for four owner-requested public job
+lists. No list repository source code, images, or branding is copied into the
+product. The reader fetches only the allowlisted README, does not follow
+redirects, caps both bytes and rows, ignores aggregator links, and retains the
+original employer application URL as the candidate lead.
+
+| Feed | Bluey source ID | Production meaning |
+| --- | --- | --- |
+| [`SimplifyJobs/New-Grad-Positions`](https://github.com/SimplifyJobs/New-Grad-Positions) | `feed-simplify-new-grad` | Candidate new-grad lead only. |
+| [`PrepAIJobs/Summer2026-Internships`](https://github.com/PrepAIJobs/Summer2026-Internships) | `feed-prepai-internships` | Candidate internship lead only. |
+| [`PrepAIJobs/New-Grad-2026`](https://github.com/PrepAIJobs/New-Grad-2026) | `feed-prepai-new-grad` | Candidate new-grad lead only. |
+| [`zapplyjobs/New-Grad-Jobs-2027`](https://github.com/zapplyjobs/New-Grad-Jobs-2027) | `feed-zapply-new-grad` | Candidate new-grad lead only. |
+
+The public lists are discovery indexes, not application truth. A candidate URL
+must be canonicalized, deduplicated, fetched from the original employer or ATS,
+verified open, rescored against the Career Track, and passed through current
+server-owned eligibility before it may become an application. A list's license
+does not establish rights in every upstream job posting. Bluey must honor
+removals and source terms and must not retain a stale list row as an open job.
+
+The reader uses `parse5` 7.3.0 (MIT, Ivan Nikulin) and its transitive `entities`
+6.0.1 dependency (BSD-2-Clause, Felix Bohm). Their notices are recorded in
+`automation/THIRD_PARTY_NOTICES.md`; dependency versions remain locked by
+`jobs/package-lock.json`.
+
 ## Downloaded AI/browser archives
 
 The following ZIP archives under `/Users/uno/Downloads/job and AI browser` were

@@ -2,6 +2,7 @@ export * from "./adapters.js";
 export * from "./answer-memory.js";
 export * from "./challenge-handling.js";
 export * from "./contracts.js";
+export * from "./curated-feeds.js";
 export * from "./form-intelligence.js";
 export * from "./interview-prep.js";
 export * from "./packet-guards.js";
