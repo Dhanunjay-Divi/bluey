@@ -57,6 +57,39 @@ reviewed as read-only research material. They are not shipped with Bluey.
 | [`leopu00/job-hunter-team`](https://github.com/leopu00/job-hunter-team) | `f2575c976f8a` | MIT | Multi-agent architecture research only. |
 | [`suxrobGM/jobpilot`](https://github.com/suxrobGM/jobpilot) | `272b7aca424c` | MIT | Product and queue architecture research only. |
 
+## External company-directory feed
+
+Bluey may use the public company directory published by
+[`kalil0321/ats-scrapers`](https://github.com/kalil0321/ats-scrapers), now
+published as Jobhive, to suggest employer career pages a user can explicitly
+connect to a Career Track. The repository was reviewed at commit
+`d825caefc8e97c3533efe1707b4daddfeed58706` and exposes an MIT code license
+(copyright Kalil Bouzigues, 2026).
+
+No Jobhive source code, scraper, proxy, anti-bot, or browser-evasion component
+is shipped by Bluey. Bluey reads only the bounded `name,slug,url` company CSVs
+declared by the pinned v1 manifest. Every selected company is converted into a
+Bluey public-ATS source and all job records are fetched from, revalidated
+against, and attributed to the original employer ATS before ranking or use.
+The external directory is therefore a discovery lead, never application truth.
+
+Manifest reviewed on July 20, 2026:
+`https://storage.stapply.ai/jobhive/v1/manifest.json`.
+
+| ATS directory | Rows | SHA-256 declared by manifest |
+| --- | ---: | --- |
+| Greenhouse | 4,966 | `94307570bfe88a1b06bd888619652703441c5a4b7a710af39a3f95f617f428aa` |
+| Lever | 2,113 | `e6ef68e92d65192027cdadd15fc0462bffee4548f4e2d2a5984a6ce955315ba5` |
+| Ashby | 2,856 | `50d570e781768937b1bc7a6d8770cd2b8c4bc2f9a446ecbfc27ac995bf04b792` |
+| SmartRecruiters | 2,214 | `ce0cddbe531bd2e6de97ff2c513d48ef2f103fe8ff065fd02eff326fb450ffba` |
+| Workday | 2,604 | `034811ae293215fb60c21145e32d3e5a9ab49caba6080cb6639c02f60731b0b8` |
+
+The MIT software license does not itself establish rights in every directory
+record or upstream job posting. Production use remains subject to source-owner
+review, source attribution, removal handling, and the terms of each original
+ATS. Bluey retains no Jobhive full-job snapshot and never uses this directory
+to bypass access controls.
+
 ## Bundled document fonts
 
 The automation package ships the following font files for Unicode PDF

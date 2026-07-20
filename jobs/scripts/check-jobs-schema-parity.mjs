@@ -23,7 +23,8 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
     "jobs_discovery_sources",
     [
       "idx_jobs_discovery_sources_due on jobs_discovery_sources (status, health, next_run_at_ms, lease_expires_at_ms)",
-    ],
+      "unique idx_jobs_discovery_sources_board_owner on jobs_discovery_sources (account_id, provider, source_key)",
+    ].sort(),
   ],
   [
     "jobs_execution_leases",
@@ -121,7 +122,7 @@ function extractIndexes(sql, tableName) {
       normalizeSql(`${match[1] ? "unique " : ""}${match[2]} on ${match[3]} (${match[4]}) ${match[5] ?? ""}`),
     );
   }
-  return indexes.sort();
+  return [...new Set(indexes)].sort();
 }
 
 function parityTableNames(sql) {

@@ -98,6 +98,8 @@ function jobsParitySchema(integerType) {
     );
     CREATE INDEX IF NOT EXISTS idx_jobs_discovery_sources_due
       ON jobs_discovery_sources(status, health, next_run_at_ms, lease_expires_at_ms);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_discovery_sources_board_owner
+      ON jobs_discovery_sources(account_id, provider, source_key);
     CREATE TABLE IF NOT EXISTS jobs_discovery_runs (
       id TEXT PRIMARY KEY,
       source_id TEXT NOT NULL REFERENCES jobs_discovery_sources(id) ON DELETE CASCADE,

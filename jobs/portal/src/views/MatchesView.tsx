@@ -22,9 +22,19 @@ import {
   Undo2,
   TriangleAlert,
 } from "lucide-react";
-import type { CandidateEventInput, DiscoverySource, DiscoverySourceHealth, JobPosting, JobsWorkspace, UserJobInput } from "../types";
+import type {
+  CandidateEventInput,
+  DiscoverySource,
+  DiscoverySourceCatalogEntry,
+  DiscoverySourceCatalogResponse,
+  DiscoverySourceHealth,
+  JobPosting,
+  JobsWorkspace,
+  UserJobInput,
+} from "../types";
 import { relativeTime, titleCase } from "../lib/format";
 import { Dialog } from "../components/Dialog";
+import { DiscoverySourceDialog } from "../components/DiscoverySourceDialog";
 import { effectiveSubmissionMode } from "../lib/application-flow";
 import { isJobPassed, matchPassReasons } from "../lib/candidate-events";
 
@@ -33,9 +43,18 @@ interface Props {
   onAddJob(job: UserJobInput): Promise<JobPosting>;
   onPrepare(job: JobPosting, mode: string, submissionMode: string): Promise<void>;
   onSaveCandidateEvent(event: CandidateEventInput): Promise<unknown>;
+  onSearchDiscoverySources(query: string, trackId: string, provider: string): Promise<DiscoverySourceCatalogResponse>;
+  onConnectDiscoverySource(trackId: string, entry: DiscoverySourceCatalogEntry): Promise<DiscoverySource>;
 }
 
-export function MatchesView({ workspace, onAddJob, onPrepare, onSaveCandidateEvent }: Props) {
+export function MatchesView({
+  workspace,
+  onAddJob,
+  onPrepare,
+  onSaveCandidateEvent,
+  onSearchDiscoverySources,
+  onConnectDiscoverySource,
+}: Props) {
   const [query, setQuery] = useState("");
   const [activeTrack, setActiveTrack] = useState("all");
   const [selected, setSelected] = useState<JobPosting | null>(null);
@@ -53,6 +72,7 @@ export function MatchesView({ workspace, onAddJob, onPrepare, onSaveCandidateEve
   const [passReasons, setPassReasons] = useState<string[]>([]);
   const [passNote, setPassNote] = useState("");
   const [feedbackBusy, setFeedbackBusy] = useState(false);
+  const [sourceOpen, setSourceOpen] = useState(false);
 
   const preparedJobIds = useMemo(
     () => new Set(workspace.applications.map((application) => application.job_id)),
@@ -169,7 +189,11 @@ export function MatchesView({ workspace, onAddJob, onPrepare, onSaveCandidateEve
         <Link className="button secondary compact" to={`../settings${window.location.search}#tracks`}>Adjust search<ChevronRight size={14} /></Link>
       </section>
 
-      <DiscoverySourceHealthList sources={workspace.discovery_sources} onAddJob={() => setAddOpen(true)} />
+      <DiscoverySourceHealthList
+        sources={workspace.discovery_sources}
+        onAddJob={() => setAddOpen(true)}
+        onWatchCompanies={() => setSourceOpen(true)}
+      />
 
       <section className="track-strip" aria-label="Career Tracks">
         <button className={activeTrack === "all" ? "active" : ""} onClick={() => setActiveTrack("all")}><span>All matches</span><b>{workspace.matches.length}</b></button>
@@ -232,6 +256,14 @@ export function MatchesView({ workspace, onAddJob, onPrepare, onSaveCandidateEve
       </Dialog>
 
       <AddJobDialog open={addOpen} onClose={() => setAddOpen(false)} trackId={selectedTrack?.id || ""} onSave={async (job) => { const saved = await onAddJob(job); setAddOpen(false); setSelected(saved); }} />
+      <DiscoverySourceDialog
+        open={sourceOpen}
+        tracks={workspace.tracks}
+        initialTrackId={selectedTrack?.id || ""}
+        onClose={() => setSourceOpen(false)}
+        onSearch={onSearchDiscoverySources}
+        onConnect={onConnectDiscoverySource}
+      />
       <Dialog open={filterOpen} title="Filter matches" description="Narrow this view without changing your Career Track." onClose={() => setFilterOpen(false)}>
         <div className="dialog-form"><label><span>Minimum match score</span><div className="range-field"><input type="range" min="0" max="95" step="5" value={minimumScore} onChange={(event) => setMinimumScore(Number(event.target.value))} /><b>{minimumScore || "Any"}{minimumScore ? "%" : ""}</b></div></label><label><span>Workplace</span><select value={workplace} onChange={(event) => setWorkplace(event.target.value)}><option value="all">Any workplace</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on-site">On-site</option></select></label><label className="setting-line simple"><div><b>Only jobs not prepared</b><span>Hide applications you already prepared.</span></div><button type="button" className={`toggle ${onlyUnprepared ? "on" : ""}`} role="switch" aria-checked={onlyUnprepared} onClick={() => setOnlyUnprepared((current) => !current)}><span /></button></label></div>
         <div className="dialog-actions"><button className="button secondary" onClick={() => { setMinimumScore(0); setWorkplace("all"); setOnlyUnprepared(false); }}>Reset</button><button className="button primary" onClick={() => setFilterOpen(false)}>Show {filtered.length} match{filtered.length === 1 ? "" : "es"}</button></div>
@@ -240,7 +272,15 @@ export function MatchesView({ workspace, onAddJob, onPrepare, onSaveCandidateEve
   );
 }
 
-export function DiscoverySourceHealthList({ sources, onAddJob }: { sources: DiscoverySource[]; onAddJob(): void }) {
+export function DiscoverySourceHealthList({
+  sources,
+  onAddJob,
+  onWatchCompanies,
+}: {
+  sources: DiscoverySource[];
+  onAddJob(): void;
+  onWatchCompanies(): void;
+}) {
   const healthyCount = sources.filter((source) => discoverySourceState(source) === "healthy").length;
 
   return (
@@ -250,16 +290,22 @@ export function DiscoverySourceHealthList({ sources, onAddJob }: { sources: Disc
           <p>DISCOVERY SOURCES</p>
           <h2 id="discovery-health-title">Source health</h2>
         </div>
-        {sources.length > 0 && <span>{healthyCount} of {sources.length} healthy</span>}
+        <div className="discovery-header-actions">
+          {sources.length > 0 && <span>{healthyCount} of {sources.length} healthy</span>}
+          <button className="button secondary compact" onClick={onWatchCompanies}><Radar size={15} />Watch companies</button>
+        </div>
       </header>
       {sources.length === 0 ? (
         <div className="discovery-source-empty">
           <Radar size={18} aria-hidden="true" />
           <div>
             <strong>Automatic discovery is not connected</strong>
-            <span>Add a job link now. Bluey will verify and rank it against the selected Career Track.</span>
+            <span>Connect employer career pages for automatic checks, or add a job link you already found.</span>
           </div>
-          <button className="button secondary compact" onClick={onAddJob}><Link2 size={15} />Add job link</button>
+          <div className="discovery-source-empty-actions">
+            <button className="button primary compact" onClick={onWatchCompanies}><Radar size={15} />Watch companies</button>
+            <button className="button secondary compact" onClick={onAddJob}><Link2 size={15} />Add job link</button>
+          </div>
         </div>
       ) : (
         <>

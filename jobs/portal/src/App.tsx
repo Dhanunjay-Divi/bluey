@@ -12,6 +12,9 @@ import type {
   CandidateEventInput,
   CareerProfile,
   CareerTrack,
+  DiscoverySource,
+  DiscoverySourceCatalogEntry,
+  DiscoverySourceCatalogResponse,
   Intervention,
   JobApplication,
   JobPosting,
@@ -201,6 +204,48 @@ export default function App() {
       setToast(isPreview
         ? "Preview mode cannot verify live job facts. Sign in to import and check this listing."
         : "Job added. Bluey scored it against your profile.");
+      return saved;
+    },
+    [],
+  );
+
+  const searchDiscoverySources = useCallback(
+    async (query: string, trackId: string, provider: string): Promise<DiscoverySourceCatalogResponse> => {
+      if (!isPreview) return jobsApi.searchDiscoveryCatalog(query, trackId, provider);
+      const samples: DiscoverySourceCatalogEntry[] = [
+        { id: "a".repeat(64), company: "Northwind Labs", provider: "greenhouse", connected: false },
+        { id: "b".repeat(64), company: "Contoso Systems", provider: "lever", connected: false },
+        { id: "c".repeat(64), company: "Fabrikam", provider: "ashby", connected: false },
+      ];
+      const needle = query.trim().toLowerCase();
+      return {
+        refreshed_at_ms: Date.now(),
+        catalog_generated_at: new Date().toISOString(),
+        entries: samples.filter((entry) =>
+          entry.company.toLowerCase().includes(needle)
+          && (provider === "all" || entry.provider === provider)),
+      };
+    },
+    [],
+  );
+
+  const connectDiscoverySource = useCallback(
+    async (trackId: string, entry: DiscoverySourceCatalogEntry): Promise<DiscoverySource> => {
+      const saved = isPreview
+        ? {
+            id: `source-${entry.id.slice(0, 12)}`,
+            provider: entry.provider,
+            config: { company: entry.company },
+            status: "active" as const,
+            health: "waiting" as const,
+            last_success_at_ms: null,
+          }
+        : await jobsApi.connectDiscoverySource(trackId, entry.id);
+      setWorkspace((current) => current ? {
+        ...current,
+        discovery_sources: [saved, ...current.discovery_sources.filter((item) => item.id !== saved.id)],
+      } : current);
+      setToast(`${entry.company} is connected. Bluey will check its public careers page.`);
       return saved;
     },
     [],
@@ -630,6 +675,8 @@ export default function App() {
               onAddJob={addJob}
               onPrepare={prepareApplication}
               onSaveCandidateEvent={saveCandidateEvent}
+              onSearchDiscoverySources={searchDiscoverySources}
+              onConnectDiscoverySource={connectDiscoverySource}
             />
           }
         />

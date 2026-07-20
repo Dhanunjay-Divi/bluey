@@ -9,6 +9,8 @@ import type {
   CareerTrack,
   CandidateEvent,
   CandidateEventInput,
+  DiscoverySource,
+  DiscoverySourceCatalogResponse,
   AnswerMemory,
   Intervention,
   InterventionResolutionResult,
@@ -186,6 +188,15 @@ export const jobsApi = {
     request<void>(`/api/jobs/tracks/${encodeURIComponent(id)}`, { method: "DELETE" }),
   saveMatch: (job: UserJobInput) =>
     request<JobPosting>("/api/jobs/matches", { method: "POST", body: JSON.stringify(job) }),
+  searchDiscoveryCatalog: (query: string, trackId: string, provider = "all") =>
+    request<DiscoverySourceCatalogResponse>(
+      `/api/jobs/discovery/catalog?q=${encodeURIComponent(query)}&track_id=${encodeURIComponent(trackId)}&provider=${encodeURIComponent(provider)}`,
+    ),
+  connectDiscoverySource: (trackId: string, catalogEntryId: string) =>
+    request<DiscoverySource>("/api/jobs/discovery/sources", {
+      method: "POST",
+      body: JSON.stringify({ track_id: trackId, catalog_entry_id: catalogEntryId }),
+    }),
   prepareApplication: (jobId: string, mode: string, submissionMode: string) =>
     request<PrepareApplicationResponse>("/api/jobs/applications", {
       method: "POST",

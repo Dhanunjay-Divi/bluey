@@ -38,10 +38,17 @@ describe("discovery source health", () => {
   });
 
   it("keeps paste-link discovery available when sources are not configured", () => {
-    const html = renderToStaticMarkup(<DiscoverySourceHealthList sources={[]} onAddJob={() => undefined} />);
+    const html = renderToStaticMarkup(
+      <DiscoverySourceHealthList
+        sources={[]}
+        onAddJob={() => undefined}
+        onWatchCompanies={() => undefined}
+      />,
+    );
 
     expect(html).toContain("Automatic discovery is not connected");
-    expect(html).toContain("Add a job link now. Bluey will verify and rank it against the selected Career Track.");
+    expect(html).toContain("Connect employer career pages for automatic checks");
+    expect(html).toContain("Watch companies");
     expect(html).toContain("Add job link");
   });
 });

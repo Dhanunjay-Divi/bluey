@@ -22,6 +22,8 @@ mod jobs_import;
 pub mod jobs_interview_prep;
 pub mod jobs_local_capability;
 pub(crate) mod jobs_resume_generation;
+mod jobs_source_directory;
+mod jobs_source_directory_catalog;
 pub mod jobs_worker_auth;
 pub mod metrics;
 pub mod middleware;

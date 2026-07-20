@@ -360,6 +360,19 @@ export interface DiscoverySource {
   last_success_at_ms: number | null;
 }
 
+export interface DiscoverySourceCatalogEntry {
+  id: string;
+  provider: string;
+  company: string;
+  connected: boolean;
+}
+
+export interface DiscoverySourceCatalogResponse {
+  refreshed_at_ms: number;
+  catalog_generated_at: string;
+  entries: DiscoverySourceCatalogEntry[];
+}
+
 export interface JobsEntitlement {
   plan: "free" | "pro" | "cloud";
   track_limit: number;

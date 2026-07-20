@@ -64,6 +64,14 @@ pub fn router() -> Router<AppState> {
         .route("/api/jobs/matches", get(matches).post(save_match))
         .route("/api/jobs/matches/:job_id", get(match_detail))
         .route(
+            "/api/jobs/discovery/catalog",
+            get(super::jobs_source_directory::search_catalog),
+        )
+        .route(
+            "/api/jobs/discovery/sources",
+            post(super::jobs_source_directory::connect_source),
+        )
+        .route(
             "/api/jobs/applications",
             get(applications).post(prepare_application),
         )
