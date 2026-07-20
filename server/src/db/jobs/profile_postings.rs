@@ -803,12 +803,12 @@ pub fn upsert_posting(
         anyhow::bail!("invalid job availability status")
     }
     value.canonical_key = canonical_job_key(&value);
-    if value.match_score == 0 {
-        let (score, reasons, missing) = score_posting(&value, profile, preferences);
-        value.match_score = score;
-        value.matched_reasons = reasons;
-        value.missing_requirements = missing;
-    }
+    let tracks = list_tracks(pool, account_id)?;
+    let track = tracks.iter().find(|track| track.id == value.track_id);
+    let (score, reasons, missing) = score_posting(&value, profile, preferences, track);
+    value.match_score = score;
+    value.matched_reasons = reasons;
+    value.missing_requirements = missing;
     let now = now_ms();
     if value.created_at_ms == 0 {
         value.created_at_ms = now;
@@ -830,6 +830,7 @@ pub fn upsert_posting(
         &reservations,
         true,
         existing_application_id,
+        track,
     ));
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -838,11 +839,14 @@ pub fn upsert_posting(
             let candidate = prepare_snapshot_posting(
                 &value,
                 None,
-                profile,
-                preferences,
-                &applications,
-                &reservations,
-                now,
+                &PostingSnapshotContext {
+                    profile,
+                    preferences,
+                    applications: &applications,
+                    reservations: &reservations,
+                    track,
+                    observed_at_ms: now,
+                },
             )?;
             let candidate_payload = to_json(&candidate, "job posting")?;
             tx.execute(
@@ -876,11 +880,14 @@ pub fn upsert_posting(
             let saved = prepare_snapshot_posting(
                 &value,
                 Some(actual),
-                profile,
-                preferences,
-                &applications,
-                &reservations,
-                now,
+                &PostingSnapshotContext {
+                    profile,
+                    preferences,
+                    applications: &applications,
+                    reservations: &reservations,
+                    track,
+                    observed_at_ms: now,
+                },
             )?;
             let payload = to_json(&saved, "job posting")?;
             tx.execute(
@@ -911,11 +918,14 @@ pub fn upsert_posting(
             let candidate = prepare_snapshot_posting(
                 &value,
                 None,
-                profile,
-                preferences,
-                &applications,
-                &reservations,
-                now,
+                &PostingSnapshotContext {
+                    profile,
+                    preferences,
+                    applications: &applications,
+                    reservations: &reservations,
+                    track,
+                    observed_at_ms: now,
+                },
             )?;
             let candidate_payload = to_json(&candidate, "job posting")?;
             tx.execute(
@@ -952,11 +962,14 @@ pub fn upsert_posting(
             let saved = prepare_snapshot_posting(
                 &value,
                 Some(actual),
-                profile,
-                preferences,
-                &applications,
-                &reservations,
-                now,
+                &PostingSnapshotContext {
+                    profile,
+                    preferences,
+                    applications: &applications,
+                    reservations: &reservations,
+                    track,
+                    observed_at_ms: now,
+                },
             )?;
             let payload = to_json(&saved, "job posting")?;
             tx.execute(
@@ -987,14 +1000,19 @@ pub fn upsert_posting(
 /// reads happen inside that publisher's transaction; this pure step keeps the
 /// same canonical-key, scoring, eligibility, and cross-track rules as normal
 /// job saves without opening a nested connection.
+struct PostingSnapshotContext<'a> {
+    profile: &'a CareerProfile,
+    preferences: &'a JobPreferences,
+    applications: &'a [JobApplication],
+    reservations: &'a [AttemptReservation],
+    track: Option<&'a CareerTrack>,
+    observed_at_ms: i64,
+}
+
 fn prepare_snapshot_posting(
     posting: &JobPosting,
     existing: Option<JobPosting>,
-    profile: &CareerProfile,
-    preferences: &JobPreferences,
-    applications: &[JobApplication],
-    reservations: &[AttemptReservation],
-    observed_at_ms: i64,
+    context: &PostingSnapshotContext<'_>,
 ) -> Result<JobPosting> {
     let mut value = posting.clone();
     if value.id.trim().is_empty() {
@@ -1032,30 +1050,35 @@ fn prepare_snapshot_posting(
             value.posted_at_ms = existing.posted_at_ms;
         }
     }
-    if value.match_score == 0 {
-        let (score, reasons, missing) = score_posting(&value, profile, preferences);
-        value.match_score = score;
-        value.matched_reasons = reasons;
-        value.missing_requirements = missing;
-    }
+    let (score, reasons, missing) = score_posting(
+        &value,
+        context.profile,
+        context.preferences,
+        context.track,
+    );
+    value.match_score = score;
+    value.matched_reasons = reasons;
+    value.missing_requirements = missing;
     if value.created_at_ms == 0 {
-        value.created_at_ms = observed_at_ms;
+        value.created_at_ms = context.observed_at_ms;
     }
     if value.availability_status == "active" && value.last_verified_at_ms.is_none() {
-        value.last_verified_at_ms = Some(observed_at_ms);
+        value.last_verified_at_ms = Some(context.observed_at_ms);
     }
-    value.updated_at_ms = observed_at_ms;
-    let existing_application_id = applications
+    value.updated_at_ms = context.observed_at_ms;
+    let existing_application_id = context
+        .applications
         .iter()
         .find(|application| application.job_id == value.id)
         .map(|application| application.id.as_str());
     value.eligibility = Some(build_job_eligibility(
         &value,
-        profile,
-        preferences,
-        reservations,
+        context.profile,
+        context.preferences,
+        context.reservations,
         true,
         existing_application_id,
+        context.track,
     ));
     Ok(value)
 }

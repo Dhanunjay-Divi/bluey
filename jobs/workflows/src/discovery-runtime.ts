@@ -397,6 +397,8 @@ function completedJobs(
       workplace: mutation.job.payload.workplace,
       description: mutation.job.payload.description,
       compensation: mutation.job.payload.compensation,
+      employment_type: mutation.job.payload.employment_type,
+      engagement_type: mutation.job.payload.engagement_type,
       posted_at_ms: postedAtMs === null || !Number.isFinite(postedAtMs) ? null : postedAtMs,
     }];
   });

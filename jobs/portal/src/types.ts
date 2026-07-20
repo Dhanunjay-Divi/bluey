@@ -94,6 +94,7 @@ export interface JobPreferences {
   location_policy: "local" | "willing_to_relocate" | "remote_only" | "ask";
   remote_preference: string;
   employment_types: string[];
+  engagement_types: string[];
   minimum_compensation?: number;
   sponsorship: string;
   excluded_companies: string[];
@@ -105,6 +106,14 @@ export interface JobPreferences {
   updated_at_ms: number;
 }
 
+export interface CareerTrackPolicy {
+  role_family: string;
+  relevant_employment_ids: string[];
+  employment_types: string[];
+  engagement_types: string[];
+  work_authorizations: string[];
+}
+
 export interface CareerTrack {
   id: string;
   name: string;
@@ -112,6 +121,7 @@ export interface CareerTrack {
   locations: string[];
   remote_preference: string;
   application_identity_id?: string;
+  policy: CareerTrackPolicy;
   active: boolean;
   match_count: number;
   created_at_ms: number;

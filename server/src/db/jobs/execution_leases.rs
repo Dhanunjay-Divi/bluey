@@ -216,6 +216,14 @@ fn sqlite_execution_target(
         application_id,
         run_id,
     )?;
+    if !current_execution_authorized_sqlite(
+        tx,
+        account_id,
+        &application,
+        ExecutionAuthorityRunner::Cloud,
+    )? {
+        return Err(ExecutionLeaseError::Conflict);
+    }
     Ok(execution_browser_profile_id(account_id, identity_id))
 }
 
@@ -277,6 +285,14 @@ fn postgres_execution_target(
         application_id,
         run_id,
     )?;
+    if !current_execution_authorized_postgres(
+        tx,
+        account_id,
+        &application,
+        ExecutionAuthorityRunner::Cloud,
+    )? {
+        return Err(ExecutionLeaseError::Conflict);
+    }
     Ok(execution_browser_profile_id(account_id, &identity_id))
 }
 

@@ -44,6 +44,11 @@ import {
 import { useLocationSuggestions } from "../data/use-location-suggestions";
 import { SearchPolicySummary } from "../components/SearchPolicySummary";
 import {
+  ENGAGEMENT_TYPE_OPTIONS,
+  EMPLOYMENT_TYPE_OPTIONS,
+  JobCategoryChoices,
+} from "../components/JobCategoryChoices";
+import {
   BLUEY_AUTO_SUBMIT_THRESHOLD,
   BLUEY_DAILY_APPLICATION_LIMIT,
   BLUEY_MAX_POSTING_AGE_DAYS,
@@ -88,6 +93,7 @@ export function SettingsView({
   const [preferences, setPreferences] = useState({
     ...workspace.preferences,
     desired_roles: canonicalTargetRoles(workspace.preferences.desired_roles),
+    engagement_types: workspace.preferences.engagement_types || [],
   });
   const [profile, setProfile] = useState(workspace.profile);
   const [trackOpen, setTrackOpen] = useState(false);
@@ -127,7 +133,11 @@ export function SettingsView({
 
   useEffect(() => {
     if (searchDirty) return;
-    setPreferences({ ...workspace.preferences, desired_roles: canonicalTargetRoles(workspace.preferences.desired_roles) });
+    setPreferences({
+      ...workspace.preferences,
+      desired_roles: canonicalTargetRoles(workspace.preferences.desired_roles),
+      engagement_types: workspace.preferences.engagement_types || [],
+    });
     setProfile(workspace.profile);
   }, [searchDirty, workspace.preferences, workspace.profile]);
 
@@ -235,7 +245,20 @@ export function SettingsView({
             <CareerTagField label="Target roles" values={preferences.desired_roles} onChange={(values) => updatePreferences({ ...preferences, desired_roles: canonicalTargetRoles(values) })} placeholder="Software Engineer" suggestions={targetRoleSuggestionValues} normalizeValue={canonicalizeTargetRole} filterSuggestions={(query, _suggestions, selected, limit) => filterTargetRoleSuggestions(query, selected, limit)} customHint="Choose the full role name. Custom roles are saved exactly as entered for this search." />
             <CareerTagField label="Target locations" values={preferences.desired_locations} onChange={(values) => updatePreferences({ ...preferences, desired_locations: values })} placeholder="Add a city, region, or remote" suggestions={locationSuggestions} />
             <label><span>When a job uses another location</span><select value={preferences.location_policy} onChange={(event) => updatePreferences({ ...preferences, location_policy: event.target.value as JobPreferences["location_policy"] })}><option value="ask">Ask me what to say</option><option value="local">Use my current location only</option><option value="willing_to_relocate">Say I am willing to relocate</option><option value="remote_only">Skip unless remote</option></select></label>
-            <CareerTagField label="Employment types" values={preferences.employment_types} onChange={(values) => updatePreferences({ ...preferences, employment_types: values })} placeholder="Full-time, contract, internship..." suggestions={["Full-time", "Part-time", "Contract", "Temporary", "Internship", "Apprenticeship"]} />
+            <JobCategoryChoices
+              label="Employment types"
+              description="Choose the job arrangements Bluey may match."
+              values={preferences.employment_types}
+              options={EMPLOYMENT_TYPE_OPTIONS}
+              onChange={(values) => updatePreferences({ ...preferences, employment_types: values })}
+            />
+            <JobCategoryChoices
+              label="Contract engagement"
+              description="Optional. Use this only when W-2, C2C, 1099, or direct-hire terms matter."
+              values={preferences.engagement_types}
+              options={ENGAGEMENT_TYPE_OPTIONS}
+              onChange={(values) => updatePreferences({ ...preferences, engagement_types: values })}
+            />
             <label><span>Sponsorship filter</span><select value={preferences.sponsorship} onChange={(event) => updatePreferences({ ...preferences, sponsorship: event.target.value })}><option value="ask">Ask when unclear</option><option value="required">Only roles offering sponsorship</option><option value="not_required">Sponsorship not required</option><option value="any">Do not filter</option></select></label>
             <SearchPolicySummary profile={profile} compact />
             <label><span>Minimum salary</span><input type="number" value={preferences.minimum_compensation || ""} onChange={(event) => updatePreferences({ ...preferences, minimum_compensation: Number(event.target.value) || undefined })} /></label>
@@ -541,12 +564,12 @@ function MailboxDialog({ open, onClose, onSave }: { open: boolean; onClose(): vo
 
 function TrackDialog({ open, track, identities, roleSuggestions, locationSuggestions, onClose, onSave, onDelete }: { open: boolean; track: CareerTrack | null; identities: ApplicationIdentity[]; roleSuggestions: string[]; locationSuggestions: string[]; onClose(): void; onSave(track: CareerTrack): Promise<void>; onDelete(track: CareerTrack): void }) {
   const defaultIdentityId = identities.find((identity) => identity.is_default && identity.verification_status === "verified")?.id;
-  const [draft, setDraft] = useState<CareerTrack>(track || emptyTrack(defaultIdentityId));
+  const [draft, setDraft] = useState<CareerTrack>(normalizeTrack(track, defaultIdentityId));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   useEffect(() => {
     if (open) {
-      setDraft(track || emptyTrack(defaultIdentityId));
+      setDraft(normalizeTrack(track, defaultIdentityId));
       setError("");
     }
   }, [open, track, defaultIdentityId]);
@@ -567,7 +590,21 @@ function TrackDialog({ open, track, identities, roleSuggestions, locationSuggest
       setSaving(false);
     }
   };
-  return <Dialog open={open} title={track ? "Edit Career Track" : "New Career Track"} description="Give this agent one role, location policy, and application email." onClose={onClose}><div className="dialog-form"><CareerField label="Track name" value={current.name} onChange={(value) => update({ ...current, name: value })} placeholder="Product engineering" /><CareerField label="Target role" value={current.role} onChange={(value) => update({ ...current, role: value })} placeholder="Software Engineer" suggestions={roleSuggestions} /><p className="field-note">Choose the full role name. Bluey maps common abbreviations such as SWE and SDE to Software Engineer.</p><CareerTagField label="Locations" values={current.locations} onChange={(values) => update({ ...current, locations: values })} placeholder="Add a location" suggestions={locationSuggestions} /><label><span>Workplace preference</span><select value={current.remote_preference} onChange={(event) => update({ ...current, remote_preference: event.target.value })}><option value="remote_or_hybrid">Remote or hybrid</option><option value="remote_only">Remote only</option><option value="hybrid_ok">Hybrid is fine</option><option value="onsite_ok">On-site is fine</option></select></label><label><span>Application email</span><select value={current.application_identity_id || defaultIdentityId || ""} onChange={(event) => update({ ...current, application_identity_id: event.target.value || undefined })}>{identities.filter((identity) => identity.verification_status === "verified").map((identity) => <option key={identity.id} value={identity.id}>{identity.email}{identity.is_default ? " (default)" : ""}</option>)}</select></label><label className="setting-line simple"><div><b>Agent active</b><span>Paused agents keep history but stop discovery.</span></div><Toggle checked={current.active} onChange={(checked) => update({ ...current, active: checked })} /></label>{error && <div className="inline-error" role="alert">{error}</div>}</div><div className="dialog-actions">{track && <button className="button danger subtle" onClick={() => onDelete(track)}><Trash2 size={15} />Delete</button>}<span /><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !current.name || !current.role || !(current.application_identity_id || defaultIdentityId)} onClick={() => void save()}>{saving ? "Saving..." : "Save track"}</button></div></Dialog>;
+  return <Dialog open={open} title={track ? "Edit Career Track" : "New Career Track"} description="Give this agent one role, location policy, job category, and application email." onClose={onClose}>
+    <div className="dialog-form">
+      <CareerField label="Track name" value={current.name} onChange={(value) => update({ ...current, name: value })} placeholder="Product engineering" />
+      <CareerField label="Target role" value={current.role} onChange={(value) => update({ ...current, role: value })} placeholder="Software Engineer" suggestions={roleSuggestions} />
+      <p className="field-note">Choose the full role name. Bluey maps common abbreviations such as SWE and SDE to Software Engineer.</p>
+      <CareerTagField label="Locations" values={current.locations} onChange={(values) => update({ ...current, locations: values })} placeholder="Add a location" suggestions={locationSuggestions} />
+      <label><span>Workplace preference</span><select value={current.remote_preference} onChange={(event) => update({ ...current, remote_preference: event.target.value })}><option value="remote_or_hybrid">Remote or hybrid</option><option value="remote_only">Remote only</option><option value="hybrid_ok">Hybrid is fine</option><option value="onsite_ok">On-site is fine</option></select></label>
+      <JobCategoryChoices label="Employment types" description="Only match these job arrangements for this Career Track." values={current.policy.employment_types} options={EMPLOYMENT_TYPE_OPTIONS} onChange={(values) => update({ ...current, policy: { ...current.policy, employment_types: values } })} />
+      <JobCategoryChoices label="Contract engagement" description="Optional. Restrict contract work to the selected engagement types." values={current.policy.engagement_types} options={ENGAGEMENT_TYPE_OPTIONS} onChange={(values) => update({ ...current, policy: { ...current.policy, engagement_types: values } })} />
+      <label><span>Application email</span><select value={current.application_identity_id || defaultIdentityId || ""} onChange={(event) => update({ ...current, application_identity_id: event.target.value || undefined })}>{identities.filter((identity) => identity.verification_status === "verified").map((identity) => <option key={identity.id} value={identity.id}>{identity.email}{identity.is_default ? " (default)" : ""}</option>)}</select></label>
+      <label className="setting-line simple"><div><b>Agent active</b><span>Paused agents keep history but stop discovery.</span></div><Toggle checked={current.active} onChange={(checked) => update({ ...current, active: checked })} /></label>
+      {error && <div className="inline-error" role="alert">{error}</div>}
+    </div>
+    <div className="dialog-actions">{track && <button className="button danger subtle" onClick={() => onDelete(track)}><Trash2 size={15} />Delete</button>}<span /><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !current.name || !current.role || !(current.application_identity_id || defaultIdentityId)} onClick={() => void save()}>{saving ? "Saving..." : "Save track"}</button></div>
+  </Dialog>;
 }
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange(checked: boolean): void }) {
@@ -595,5 +632,38 @@ function showError(setError: (message: string) => void): (error: unknown) => voi
 }
 
 function emptyTrack(applicationIdentityId?: string): CareerTrack {
-  return { id: "", name: "", role: "", locations: [], remote_preference: "remote_or_hybrid", application_identity_id: applicationIdentityId, active: true, match_count: 0, created_at_ms: 0, updated_at_ms: 0 };
+  return {
+    id: "",
+    name: "",
+    role: "",
+    locations: [],
+    remote_preference: "remote_or_hybrid",
+    application_identity_id: applicationIdentityId,
+    policy: {
+      role_family: "",
+      relevant_employment_ids: [],
+      employment_types: [],
+      engagement_types: [],
+      work_authorizations: [],
+    },
+    active: true,
+    match_count: 0,
+    created_at_ms: 0,
+    updated_at_ms: 0,
+  };
+}
+
+function normalizeTrack(track: CareerTrack | null, applicationIdentityId?: string): CareerTrack {
+  if (!track) return emptyTrack(applicationIdentityId);
+  return {
+    ...track,
+    application_identity_id: track.application_identity_id || applicationIdentityId,
+    policy: {
+      role_family: track.policy?.role_family || "",
+      relevant_employment_ids: track.policy?.relevant_employment_ids || [],
+      employment_types: track.policy?.employment_types || [],
+      engagement_types: track.policy?.engagement_types || [],
+      work_authorizations: track.policy?.work_authorizations || [],
+    },
+  };
 }

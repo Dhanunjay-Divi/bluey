@@ -206,6 +206,8 @@ describe("discovery worker runtime", () => {
           workplace: "remote",
           description: "Build reliable systems.",
           compensation: "",
+          employment_type: "",
+          engagement_type: "",
           posted_at_ms: SCHEDULED_FOR_MS,
         }],
       },

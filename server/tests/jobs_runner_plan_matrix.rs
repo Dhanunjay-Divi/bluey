@@ -112,6 +112,30 @@ impl TestContext {
     fn prepare(&self, account: &Account, label: &str) -> JobApplication {
         let profile = jobs::default_profile(&account.email);
         jobs::save_profile(&self.pool, &account.id, &profile).expect("save matrix profile");
+        let identity =
+            jobs::ensure_primary_application_identity(&self.pool, &account.id, &account.email)
+                .expect("create matrix application identity");
+        let track = jobs::upsert_track(
+            &self.pool,
+            &account.id,
+            &jobs::CareerTrack {
+                id: format!("track-{label}"),
+                name: "Software engineering".to_string(),
+                role: "Software Engineer".to_string(),
+                locations: vec!["New York, NY".to_string()],
+                remote_preference: "hybrid_ok".to_string(),
+                application_identity_id: Some(identity.id),
+                policy: jobs::CareerTrackPolicy {
+                    role_family: "software_engineering".to_string(),
+                    ..jobs::CareerTrackPolicy::default()
+                },
+                active: true,
+                match_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .expect("save matrix career track");
         let now = chrono::Utc::now().timestamp_millis();
         let slug = format!("{label}-{}", uuid::Uuid::new_v4().simple());
         let posting = jobs::upsert_posting(
@@ -130,7 +154,7 @@ impl TestContext {
                 description: "Build reliable distributed systems.".to_string(),
                 compensation: "$170k-$200k".to_string(),
                 employment_type: "full_time".to_string(),
-                track_id: String::new(),
+                track_id: track.id,
                 match_score: 92,
                 matched_reasons: Vec::new(),
                 missing_requirements: Vec::new(),

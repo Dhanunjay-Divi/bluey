@@ -40,6 +40,8 @@ interface RawJob {
   postedAt?: string;
   compensation?: string;
   department?: string;
+  employmentType?: string;
+  engagementType?: string;
 }
 
 export class IncompletePublicAtsSnapshotError extends Error {
@@ -189,6 +191,7 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
         description: asString(item.content),
         postedAt: asOptionalString(item.updated_at),
         department: asArray(item.departments).map((department) => asString(asRecord(department).name)).filter(Boolean).join(", "),
+        employmentType: asOptionalString(item.employment_type || item.employmentType),
       });
     });
   }
@@ -224,6 +227,8 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
         postedAt: asOptionalString(item.createdAt),
         compensation: leverCompensation(item.salaryRange),
         department: asString(categories.department || categories.team),
+        employmentType: asOptionalString(categories.commitment),
+        engagementType: asOptionalString(categories.engagement || item.engagementType),
       });
     });
   }
@@ -260,6 +265,8 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
           description: asString(item.descriptionPlain || item.descriptionHtml),
           postedAt: asOptionalString(item.publishedAt),
           department: asOptionalString(item.department),
+          employmentType: asOptionalString(item.employmentType || item.employmentTypeLabel),
+          engagementType: asOptionalString(item.engagementType),
         });
       });
   }
@@ -297,6 +304,8 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
           description: extractSmartRecruitersDescription(item),
           postedAt: asOptionalString(item.releasedDate),
           department: asOptionalString(asRecord(item.department).label),
+          employmentType: asOptionalString(asRecord(item.typeOfEmployment).label || item.employmentType),
+          engagementType: asOptionalString(item.engagementType),
         }));
       }
       offset += content.length;
@@ -347,6 +356,8 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
           workplace: asString(item.workplaceType),
           description: asString(item.descriptionPreview),
           postedAt: asOptionalString(item.postedOn),
+          employmentType: asOptionalString(item.timeType || item.employmentType),
+          engagementType: asOptionalString(item.engagementType),
         }));
       }
       offset += postings.length;
@@ -511,6 +522,12 @@ export function deduplicateJobs(jobs: NormalizedJob[]): NormalizedJob[] {
 
 function normalizeJob(source: AtsKind, raw: RawJob): NormalizedJob {
   const canonicalUrl = canonicalizeUrl(raw.canonicalUrl);
+  const description = stripMarkup(raw.description ?? "");
+  const categoryText = [raw.employmentType, raw.engagementType, raw.title, description]
+    .filter(Boolean)
+    .join(" ");
+  const employmentType = normalizeEmploymentType(raw.employmentType, categoryText);
+  const engagementType = normalizeEngagementType(raw.engagementType, categoryText);
   return {
     externalId: raw.externalId || canonicalUrl,
     canonicalUrl,
@@ -518,12 +535,36 @@ function normalizeJob(source: AtsKind, raw: RawJob): NormalizedJob {
     title: raw.title.trim(),
     location: raw.location.trim() || "Location not listed",
     workplace: inferWorkplace(raw.workplace, raw.location),
-    description: stripMarkup(raw.description ?? ""),
+    description,
     source,
     postedAt: raw.postedAt,
     compensation: raw.compensation,
     department: raw.department || undefined,
+    ...(employmentType ? { employmentType } : {}),
+    ...(engagementType ? { engagementType } : {}),
   };
+}
+
+function normalizeEmploymentType(explicit: string | undefined, fallback: string): string | undefined {
+  const value = `${explicit ?? ""} ${fallback}`.toLowerCase().replace(/[^a-z0-9+]+/g, " ");
+  if (/\b(intern(ship)?)\b/.test(value)) return "internship";
+  if (/\b(apprentice(ship)?)\b/.test(value)) return "apprenticeship";
+  if (/\b(per diem|perdiem)\b/.test(value)) return "per_diem";
+  if (/\bseasonal\b/.test(value)) return "seasonal";
+  if (/\b(part time|parttime|pt)\b/.test(value)) return "part_time";
+  if (/\b(full time|fulltime|ft|permanent|direct hire)\b/.test(value)) return "full_time";
+  if (/\b(contract(or)?|consultant|consulting)\b/.test(value)) return "contract";
+  if (/\b(temp(orary)?)\b/.test(value)) return "temporary";
+  return undefined;
+}
+
+function normalizeEngagementType(explicit: string | undefined, fallback: string): string | undefined {
+  const value = `${explicit ?? ""} ${fallback}`.toLowerCase().replace(/[^a-z0-9+]+/g, " ");
+  if (/\b(c2c|corp to corp|corporation to corporation)\b/.test(value)) return "c2c";
+  if (/\b(w 2|w2)\b/.test(value)) return "w2";
+  if (/\b(1099|independent contractor)\b/.test(value)) return "1099";
+  if (/\b(direct hire|permanent hire)\b/.test(value)) return "direct_hire";
+  return undefined;
 }
 
 function leverCompensation(value: unknown): string | undefined {

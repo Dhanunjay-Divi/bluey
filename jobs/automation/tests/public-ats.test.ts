@@ -35,7 +35,7 @@ describe("public ATS discovery", () => {
         id: "lever-1",
         text: "Senior Software Engineer",
         hostedUrl: "https://boards.greenhouse.io/acme/jobs/10",
-        categories: { location: "New York, NY", department: "Engineering" },
+        categories: { location: "New York, NY", department: "Engineering", commitment: "Contract W2" },
         descriptionPlain: "Duplicate feed entry",
         lists: [{ text: "Experience", content: "<li>Build reliable systems</li>" }],
         additional: "<div>Visa Sponsorship</div><div>This position is eligible for visa sponsorship.</div>",
@@ -67,6 +67,30 @@ describe("public ATS discovery", () => {
       .toBe("USD 150000-450000 per-year-salary");
     expect(page.jobs.find((job) => job.source === "lever")?.description)
       .toContain("This position is eligible for visa sponsorship.");
+    expect(page.jobs.find((job) => job.source === "lever")).toMatchObject({
+      employmentType: "contract",
+      engagementType: "w2",
+    });
+  });
+
+  it("normalizes explicit internship categories without inventing engagement", async () => {
+    const provider = new PublicAtsDiscoveryProvider({
+      fetch: async () => response({
+        totalFound: 1,
+        content: [{
+          id: "intern-1",
+          name: "Software Engineering Intern",
+          company: { name: "Acme" },
+          location: { city: "Austin", region: "TX", country: "US" },
+          typeOfEmployment: { label: "Internship" },
+          releasedDate: new Date().toISOString(),
+        }],
+      }),
+      sleep: async () => undefined,
+    });
+    const jobs = await provider.snapshot({ kind: "smartrecruiters", companyIdentifier: "Acme" });
+    expect(jobs[0]).toMatchObject({ employmentType: "internship" });
+    expect(jobs[0]?.engagementType).toBeUndefined();
   });
 
   it("uses bounded Workday pagination and a pinned POST target", async () => {

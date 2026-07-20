@@ -684,6 +684,8 @@ pub fn save_verified_import_posting_with_source(
     }
     let applications = list_applications(pool, account_id)?;
     let reservations = list_attempt_reservations(pool, account_id)?;
+    let tracks = list_tracks(pool, account_id)?;
+    let track = tracks.iter().find(|track| track.id == track_id);
     let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -729,11 +731,14 @@ pub fn save_verified_import_posting_with_source(
             let saved = prepare_snapshot_posting(
                 posting,
                 existing.clone(),
-                profile,
-                preferences,
-                &applications,
-                &reservations,
-                now,
+                &PostingSnapshotContext {
+                    profile,
+                    preferences,
+                    applications: &applications,
+                    reservations: &reservations,
+                    track,
+                    observed_at_ms: now,
+                },
             )?;
             let payload = to_json(&saved, "job posting")?;
             if existing.is_some() {
@@ -855,11 +860,14 @@ pub fn save_verified_import_posting_with_source(
             let saved = prepare_snapshot_posting(
                 posting,
                 existing.clone(),
-                profile,
-                preferences,
-                &applications,
-                &reservations,
-                now,
+                &PostingSnapshotContext {
+                    profile,
+                    preferences,
+                    applications: &applications,
+                    reservations: &reservations,
+                    track,
+                    observed_at_ms: now,
+                },
             )?;
             let payload = to_json(&saved, "job posting")?;
             if existing.is_some() {
@@ -1294,6 +1302,7 @@ fn publish_discovery_snapshot(
     preferences: &JobPreferences,
     applications: &[JobApplication],
     reservations: &[AttemptReservation],
+    track: Option<&CareerTrack>,
     observed_at_ms: i64,
 ) -> Result<DiscoveryRunResult> {
     let token_hash = discovery_lease_token_hash(lease_token);
@@ -1434,11 +1443,14 @@ fn publish_discovery_snapshot(
                 let saved = prepare_snapshot_posting(
                     posting,
                     existing.as_ref().cloned(),
-                    profile,
-                    preferences,
-                    applications,
-                    reservations,
-                    observed_at_ms,
+                    &PostingSnapshotContext {
+                        profile,
+                        preferences,
+                        applications,
+                        reservations,
+                        track,
+                        observed_at_ms,
+                    },
                 )?;
                 let payload = to_json(&saved, "job posting")?;
                 if existing.is_some() {
@@ -1504,6 +1516,7 @@ fn publish_discovery_snapshot(
                 preferences,
                 applications,
                 reservations,
+                track,
             )?;
             let source_changed = tx.execute(
                 "UPDATE jobs_discovery_sources
@@ -1672,11 +1685,14 @@ fn publish_discovery_snapshot(
                 let saved = prepare_snapshot_posting(
                     posting,
                     existing.as_ref().cloned(),
-                    profile,
-                    preferences,
-                    applications,
-                    reservations,
-                    observed_at_ms,
+                    &PostingSnapshotContext {
+                        profile,
+                        preferences,
+                        applications,
+                        reservations,
+                        track,
+                        observed_at_ms,
+                    },
                 )?;
                 let payload = to_json(&saved, "job posting")?;
                 if existing.is_some() {
@@ -1751,6 +1767,7 @@ fn publish_discovery_snapshot(
                 preferences,
                 applications,
                 reservations,
+                track,
             )?;
             let source_changed = tx.execute(
                 "UPDATE jobs_discovery_sources
@@ -1815,6 +1832,7 @@ fn close_missing_snapshot_memberships_sqlite(
     preferences: &JobPreferences,
     applications: &[JobApplication],
     reservations: &[AttemptReservation],
+    track: Option<&CareerTrack>,
 ) -> Result<i64> {
     const MISSING_GRACE_MS: i64 = 30 * 60 * 1_000;
     let mut stmt = tx.prepare(
@@ -1891,6 +1909,7 @@ fn close_missing_snapshot_memberships_sqlite(
                 reservations,
                 true,
                 existing_application_id,
+                track,
             ));
             let payload = to_json(&posting, "job posting")?;
             tx.execute(
@@ -1915,6 +1934,7 @@ fn close_missing_snapshot_memberships_postgres(
     preferences: &JobPreferences,
     applications: &[JobApplication],
     reservations: &[AttemptReservation],
+    track: Option<&CareerTrack>,
 ) -> Result<i64> {
     const MISSING_GRACE_MS: i64 = 30 * 60 * 1_000;
     let active = tx
@@ -1990,6 +2010,7 @@ fn close_missing_snapshot_memberships_postgres(
                 reservations,
                 true,
                 existing_application_id,
+                track,
             ));
             let payload = to_json(&posting, "job posting")?;
             tx.execute(
@@ -2032,6 +2053,8 @@ pub fn complete_discovery_run(
     let preferences = get_preferences(pool, &source.account_id)?;
     let applications = list_applications(pool, &source.account_id)?;
     let reservations = list_attempt_reservations(pool, &source.account_id)?;
+    let tracks = list_tracks(pool, &source.account_id)?;
+    let track = tracks.iter().find(|track| track.id == source.track_id);
     let fetched_at_ms = now_ms();
     let mut normalized = BTreeMap::<String, (JobPosting, String)>::new();
     for input in jobs {
@@ -2050,7 +2073,14 @@ pub fn complete_discovery_run(
             canonical_url,
             description: input.description.trim().to_string(),
             compensation: input.compensation.trim().to_string(),
-            employment_type: String::new(),
+            employment_type: [
+                input.employment_type.trim(),
+                input.engagement_type.trim(),
+            ]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
             track_id: source.track_id.clone(),
             match_score: 0,
             matched_reasons: Vec::new(),
@@ -2101,6 +2131,7 @@ pub fn complete_discovery_run(
         &preferences,
         &applications,
         &reservations,
+        track,
         fetched_at_ms,
     )
 }
@@ -2352,11 +2383,37 @@ fn validate_discovered_job(source: &DiscoverySource, input: &DiscoveredJobInput)
         || input.title.trim().is_empty()
         || input.title.chars().count() > 500
         || input.description.chars().count() > 200_000
+        || input.employment_type.chars().count() > 80
+        || input.engagement_type.chars().count() > 80
     {
         anyhow::bail!("discovery job is invalid")
     }
+    if !is_canonical_discovered_employment_type(&input.employment_type)
+        || !is_canonical_discovered_engagement_type(&input.engagement_type)
+    {
+        anyhow::bail!("discovery job category is invalid")
+    }
     canonicalize_discovered_url(source, &input.canonical_url)?;
     Ok(())
+}
+
+fn is_canonical_discovered_employment_type(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        ""
+            | "full_time"
+            | "part_time"
+            | "contract"
+            | "temporary"
+            | "internship"
+            | "apprenticeship"
+            | "seasonal"
+            | "per_diem"
+    )
+}
+
+fn is_canonical_discovered_engagement_type(value: &str) -> bool {
+    matches!(value.trim(), "" | "w2" | "c2c" | "1099" | "direct_hire")
 }
 
 fn canonicalize_discovered_url(source: &DiscoverySource, raw: &str) -> Result<String> {
@@ -2546,6 +2603,8 @@ fn discovered_job_content_hash(
         "workplace": input.workplace.trim(),
         "description": input.description.trim(),
         "compensation": input.compensation.trim(),
+        "employment_type": input.employment_type.trim(),
+        "engagement_type": input.engagement_type.trim(),
         "posted_at_ms": input.posted_at_ms,
     });
     hex::encode(Sha256::digest(

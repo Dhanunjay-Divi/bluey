@@ -33,7 +33,8 @@ fn postgres_pool() -> Option<DbPool> {
             "SELECT version FROM bluey_schema_migrations
               WHERE version IN ('002_jobs.sql', '008_jobs_generation_allowance.sql',
                                 '009_jobs_discovery_board_owner.sql',
-                                '010_provider_usage_provenance.sql')",
+                                '010_provider_usage_provenance.sql',
+                                '011_jobs_candidate_evidence.sql')",
             &[],
         )
         .expect("query Jobs migration ledger")
@@ -45,6 +46,7 @@ fn postgres_pool() -> Option<DbPool> {
         "008_jobs_generation_allowance.sql",
         "009_jobs_discovery_board_owner.sql",
         "010_provider_usage_provenance.sql",
+        "011_jobs_candidate_evidence.sql",
     ] {
         assert!(
             migrations.contains(required),

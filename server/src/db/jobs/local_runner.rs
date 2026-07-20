@@ -422,7 +422,7 @@ fn sqlite_local_run_authority(
     let session: BrowserSession = parse_json(session_raw, "browser session")?;
     let identity =
         parse_application_identity_row(identity_raw, identity_status.clone(), is_default != 0)?;
-    Ok(local_run_authority_matches(
+    let packet_matches = local_run_authority_matches(
         &ticket,
         &application,
         &application_state,
@@ -435,8 +435,18 @@ fn sqlite_local_run_authority(
         &canonical_url,
         phase,
         now,
-    )
-    .then_some(ticket))
+    );
+    if !packet_matches
+        || !current_execution_authorized_sqlite(
+            tx,
+            &ticket.account_id,
+            &application,
+            ExecutionAuthorityRunner::Local,
+        )?
+    {
+        return Ok(None);
+    }
+    Ok(Some(ticket))
 }
 
 fn postgres_local_run_authority(
@@ -526,7 +536,7 @@ fn postgres_local_run_authority(
     let session: BrowserSession = parse_json(session_raw, "browser session")?;
     let identity =
         parse_application_identity_row(identity_raw, identity_status.clone(), is_default)?;
-    Ok(local_run_authority_matches(
+    let packet_matches = local_run_authority_matches(
         &ticket,
         &application,
         &application_state,
@@ -539,8 +549,18 @@ fn postgres_local_run_authority(
         &canonical_url,
         phase,
         now,
-    )
-    .then_some(ticket))
+    );
+    if !packet_matches
+        || !current_execution_authorized_postgres(
+            tx,
+            &ticket.account_id,
+            &application,
+            ExecutionAuthorityRunner::Local,
+        )?
+    {
+        return Ok(None);
+    }
+    Ok(Some(ticket))
 }
 
 #[allow(clippy::too_many_arguments)]

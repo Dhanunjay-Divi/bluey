@@ -1469,6 +1469,39 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_discovery_sources_board_owner
         ON jobs_discovery_sources(account_id, provider, source_key);
     "#,
+    // 0034 - immutable candidate evidence revisions and claim-level resume
+    // provenance. Packet generation and runner claims fence against these
+    // records so a changed profile, Track, identity, or confirmed fact cannot
+    // silently reach an employer.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_profile_evidence_revisions (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        career_track_id       TEXT NOT NULL REFERENCES jobs_tracks(id) ON DELETE CASCADE,
+        revision_no           INTEGER NOT NULL,
+        content_hash          TEXT NOT NULL,
+        snapshot_json         TEXT NOT NULL,
+        created_at_ms         INTEGER NOT NULL,
+        UNIQUE(account_id, career_track_id, revision_no),
+        UNIQUE(account_id, career_track_id, content_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_evidence_revisions_track
+        ON jobs_profile_evidence_revisions(account_id, career_track_id, revision_no DESC);
+
+    CREATE TABLE IF NOT EXISTS jobs_resume_claim_evidence (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        resume_version_id     TEXT NOT NULL REFERENCES jobs_resume_versions(id) ON DELETE CASCADE,
+        claim_id              TEXT NOT NULL,
+        evidence_revision_id  TEXT NOT NULL REFERENCES jobs_profile_evidence_revisions(id) ON DELETE RESTRICT,
+        source_ids_json       TEXT NOT NULL,
+        claim_json            TEXT NOT NULL,
+        created_at_ms         INTEGER NOT NULL,
+        UNIQUE(account_id, resume_version_id, claim_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_claim_evidence_revision
+        ON jobs_resume_claim_evidence(account_id, evidence_revision_id, created_at_ms DESC);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1817,6 +1850,8 @@ const POSTGRES_JOBS_DISCOVERY_BOARD_OWNER: &str =
     include_str!("../../../infra/postgres/server-runtime/009_jobs_discovery_board_owner.sql");
 const POSTGRES_PROVIDER_USAGE_PROVENANCE: &str =
     include_str!("../../../infra/postgres/server-runtime/010_provider_usage_provenance.sql");
+const POSTGRES_JOBS_CANDIDATE_EVIDENCE: &str =
+    include_str!("../../../infra/postgres/server-runtime/011_jobs_candidate_evidence.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -1848,6 +1883,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "010_provider_usage_provenance.sql",
         POSTGRES_PROVIDER_USAGE_PROVENANCE,
+    ),
+    (
+        "011_jobs_candidate_evidence.sql",
+        POSTGRES_JOBS_CANDIDATE_EVIDENCE,
     ),
 ];
 
@@ -2326,5 +2365,20 @@ mod postgres_migration_tests {
         assert!(sql.contains("'exact', 'estimated', 'missing'"));
         assert!(sql.contains("NOT VALID"));
         assert!(sql.contains("VALIDATE CONSTRAINT jobs_provider_cost_holds_usage_provenance"));
+    }
+
+    #[test]
+    fn candidate_evidence_is_an_immutable_post_jobs_migration() {
+        let (_, sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == "011_jobs_candidate_evidence.sql")
+            .expect("candidate evidence migration must run before Jobs routes are served");
+
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS jobs_profile_evidence_revisions"));
+        assert!(sql.contains("UNIQUE(account_id, career_track_id, revision_no)"));
+        assert!(sql.contains("UNIQUE(account_id, career_track_id, content_hash)"));
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS jobs_resume_claim_evidence"));
+        assert!(sql.contains("UNIQUE(account_id, resume_version_id, claim_id)"));
+        assert!(sql.contains("evidence_revision_id TEXT NOT NULL REFERENCES jobs_profile_evidence_revisions(id) ON DELETE RESTRICT"));
     }
 }

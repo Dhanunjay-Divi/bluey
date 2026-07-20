@@ -42,6 +42,8 @@ export interface DiscoveredJobInput {
   workplace: string;
   description: string;
   compensation: string;
+  employment_type: string;
+  engagement_type: string;
   posted_at_ms: number | null;
 }
 

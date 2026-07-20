@@ -22,10 +22,11 @@ use crate::{
     api::{jobs_import, jobs_resume_generation, AppState},
     auth::AuthedAccount,
     db::jobs::{
-        self, AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession,
-        CandidateEvent, CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication,
-        JobPosting, JobPreferences, JobsEntitlement, JobsIntegration, JobsWorkspace,
-        MailboxConnection, PacketCommitResult, ResumeVersion, RunEvent,
+        self, normalize_candidate_employment_type, normalize_candidate_engagement_type,
+        AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession, CandidateEvent,
+        CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication, JobPosting,
+        JobPreferences, JobsEntitlement, JobsIntegration, JobsWorkspace, MailboxConnection,
+        PacketCommitResult, ResumeVersion, RunEvent,
     },
     object_storage::{sha256_hex, ObjectStorage},
 };
@@ -4554,12 +4555,42 @@ fn validate_preferences(preferences: &JobPreferences) -> Result<(), ApiError> {
     if !(-840..=840).contains(&preferences.time_zone_offset_minutes) {
         return bad_request("Choose a valid account time zone.");
     }
+    if preferences
+        .employment_types
+        .iter()
+        .any(|value| normalize_candidate_employment_type(value).is_none())
+    {
+        return bad_request("Choose a supported employment type.");
+    }
+    if preferences
+        .engagement_types
+        .iter()
+        .any(|value| normalize_candidate_engagement_type(value).is_none())
+    {
+        return bad_request("Choose a supported engagement type.");
+    }
     Ok(())
 }
 
 fn validate_track(track: &CareerTrack) -> Result<(), ApiError> {
     if track.name.trim().is_empty() || track.role.trim().is_empty() {
         return bad_request("Give this Career Track a name and target role.");
+    }
+    if track
+        .policy
+        .employment_types
+        .iter()
+        .any(|value| normalize_candidate_employment_type(value).is_none())
+    {
+        return bad_request("Choose a supported Career Track employment type.");
+    }
+    if track
+        .policy
+        .engagement_types
+        .iter()
+        .any(|value| normalize_candidate_engagement_type(value).is_none())
+    {
+        return bad_request("Choose a supported Career Track engagement type.");
     }
     Ok(())
 }
@@ -4886,6 +4917,7 @@ fn internal(error: anyhow::Error) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::jobs::CareerTrackPolicy;
 
     fn test_entitlement(track_limit: i64) -> JobsEntitlement {
         JobsEntitlement {
@@ -4937,6 +4969,7 @@ mod tests {
             locations: vec!["Austin, TX".to_string()],
             remote_preference: "hybrid_ok".to_string(),
             application_identity_id: None,
+            policy: CareerTrackPolicy::default(),
             active: true,
             match_count: 0,
             created_at_ms: 0,

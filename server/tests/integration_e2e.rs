@@ -728,6 +728,30 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
         .unwrap();
     let profile = jobs::default_profile(&account.email);
     jobs::save_profile(&harness.pool, &account.id, &profile).unwrap();
+    let identity =
+        jobs::ensure_primary_application_identity(&harness.pool, &account.id, &account.email)
+            .unwrap();
+    let track = jobs::upsert_track(
+        &harness.pool,
+        &account.id,
+        &jobs::CareerTrack {
+            id: "track-execution-lease".to_string(),
+            name: "Platform engineering".to_string(),
+            role: "Platform Engineer".to_string(),
+            locations: vec!["New York, NY".to_string()],
+            remote_preference: "hybrid_ok".to_string(),
+            application_identity_id: Some(identity.id),
+            policy: jobs::CareerTrackPolicy {
+                role_family: "software_engineering".to_string(),
+                ..jobs::CareerTrackPolicy::default()
+            },
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .unwrap();
     let now = chrono::Utc::now().timestamp_millis();
     let posting = jobs::upsert_posting(
         &harness.pool,
@@ -745,7 +769,7 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
             description: "Build reliable systems.".to_string(),
             compensation: "$170k-$200k".to_string(),
             employment_type: "full_time".to_string(),
-            track_id: String::new(),
+            track_id: track.id,
             match_score: 92,
             matched_reasons: Vec::new(),
             missing_requirements: Vec::new(),

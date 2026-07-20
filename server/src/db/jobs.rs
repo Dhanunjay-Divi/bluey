@@ -259,6 +259,8 @@ pub struct JobPreferences {
     #[serde(default)]
     pub employment_types: Vec<String>,
     #[serde(default)]
+    pub engagement_types: Vec<String>,
+    #[serde(default)]
     pub minimum_compensation: Option<i64>,
     #[serde(default)]
     pub sponsorship: String,
@@ -286,6 +288,7 @@ impl Default for JobPreferences {
             location_policy: default_location_policy(),
             remote_preference: "hybrid_ok".to_string(),
             employment_types: vec!["full_time".to_string()],
+            engagement_types: Vec::new(),
             minimum_compensation: None,
             sponsorship: "ask".to_string(),
             excluded_companies: Vec::new(),
@@ -295,6 +298,32 @@ impl Default for JobPreferences {
             max_posting_age_days: default_max_posting_age_days(),
             time_zone_offset_minutes: 0,
             updated_at_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CareerTrackPolicy {
+    #[serde(default)]
+    pub role_family: String,
+    #[serde(default)]
+    pub relevant_employment_ids: Vec<String>,
+    #[serde(default)]
+    pub employment_types: Vec<String>,
+    #[serde(default)]
+    pub engagement_types: Vec<String>,
+    #[serde(default)]
+    pub work_authorizations: Vec<String>,
+}
+
+impl Default for CareerTrackPolicy {
+    fn default() -> Self {
+        Self {
+            role_family: String::new(),
+            relevant_employment_ids: Vec::new(),
+            employment_types: vec!["full_time".to_string()],
+            engagement_types: Vec::new(),
+            work_authorizations: Vec::new(),
         }
     }
 }
@@ -311,6 +340,8 @@ pub struct CareerTrack {
     pub remote_preference: String,
     #[serde(default)]
     pub application_identity_id: Option<String>,
+    #[serde(default)]
+    pub policy: CareerTrackPolicy,
     #[serde(default = "default_true")]
     pub active: bool,
     #[serde(default)]
@@ -460,6 +491,10 @@ pub struct DiscoveredJobInput {
     #[serde(default)]
     pub compensation: String,
     #[serde(default)]
+    pub employment_type: String,
+    #[serde(default)]
+    pub engagement_type: String,
+    #[serde(default)]
     pub posted_at_ms: Option<i64>,
 }
 
@@ -491,6 +526,34 @@ pub struct EligibilityReason {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExperienceRequirement {
+    #[serde(default)]
+    pub required_min_months: Option<i64>,
+    #[serde(default)]
+    pub required_max_months: Option<i64>,
+    #[serde(default)]
+    pub preferred_min_months: Option<i64>,
+    #[serde(default)]
+    pub preferred_max_months: Option<i64>,
+    #[serde(default)]
+    pub title_floor_months: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleExperienceEvidence {
+    #[serde(default)]
+    pub role_family: String,
+    #[serde(default)]
+    pub relevant_employment_ids: Vec<String>,
+    #[serde(default)]
+    pub total_months: i64,
+    #[serde(default)]
+    pub target_min_months: i64,
+    #[serde(default)]
+    pub target_max_months: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobEligibilityDecision {
     pub capability: String,
@@ -504,6 +567,20 @@ pub struct JobEligibilityDecision {
     pub review_reasons: Vec<EligibilityReason>,
     #[serde(default)]
     pub passed_checks: Vec<String>,
+    #[serde(default)]
+    pub base_profile_fit: i64,
+    #[serde(default)]
+    pub tailored_packet_coverage: Option<i64>,
+    #[serde(default)]
+    pub experience_requirement: ExperienceRequirement,
+    #[serde(default)]
+    pub experience_evidence: RoleExperienceEvidence,
+    #[serde(default)]
+    pub career_track_id: String,
+    #[serde(default)]
+    pub application_identity_id: Option<String>,
+    #[serde(default)]
+    pub evidence_revision_id: Option<String>,
     pub evaluated_at_ms: i64,
 }
 
@@ -518,6 +595,13 @@ impl Default for JobEligibilityDecision {
             hard_failures: Vec::new(),
             review_reasons: Vec::new(),
             passed_checks: Vec::new(),
+            base_profile_fit: 0,
+            tailored_packet_coverage: None,
+            experience_requirement: ExperienceRequirement::default(),
+            experience_evidence: RoleExperienceEvidence::default(),
+            career_track_id: String::new(),
+            application_identity_id: None,
+            evidence_revision_id: None,
             evaluated_at_ms: 0,
         }
     }
@@ -534,6 +618,29 @@ pub struct ResumeVersion {
     #[serde(default)]
     pub claim_ids: Vec<String>,
     pub checksum: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileEvidenceRevision {
+    pub id: String,
+    pub career_track_id: String,
+    #[serde(default)]
+    pub revision_no: i64,
+    pub content_hash: String,
+    pub snapshot: Value,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeClaimEvidence {
+    pub id: String,
+    pub resume_version_id: String,
+    pub claim_id: String,
+    pub evidence_revision_id: String,
+    #[serde(default)]
+    pub source_ids: Vec<String>,
+    pub claim: Value,
     pub created_at_ms: i64,
 }
 
@@ -577,6 +684,14 @@ pub struct PreparedApplicationDraft {
     /// Exact candidate snapshot used to build `baseline_resume` and its truth
     /// fingerprint. Callers must use this snapshot for any async generation.
     pub profile: CareerProfile,
+    /// Confirmed facts frozen with the candidate snapshot.
+    pub facts: Vec<CareerFact>,
+    /// Active Career Track selected for this exact job.
+    pub track: CareerTrack,
+    /// Verified application identity bound to `track`.
+    pub identity: ApplicationIdentity,
+    /// Immutable candidate/Track/identity snapshot referenced by every claim.
+    pub evidence_revision: ProfileEvidenceRevision,
     /// Exact posting snapshot used for tailoring, generation, and the frozen
     /// application receipt. Finalization rejects a concurrent posting refresh.
     pub posting: JobPosting,
@@ -1191,11 +1306,14 @@ fn parse_json_lossy<T: DeserializeOwned>(raw: &str) -> Option<T> {
         .and_then(|plain| serde_json::from_str(&plain).ok())
 }
 
+include!("jobs/candidate_policy.rs");
+include!("jobs/evidence.rs");
 include!("jobs/profile_postings.rs");
 include!("jobs/discovery.rs");
 include!("jobs/eligibility.rs");
 include!("jobs/applications.rs");
 include!("jobs/customer_data.rs");
+include!("jobs/execution_authority.rs");
 include!("jobs/local_runner.rs");
 include!("jobs/execution_leases.rs");
 include!("jobs/workspace.rs");

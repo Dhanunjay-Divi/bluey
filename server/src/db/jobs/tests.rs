@@ -19,6 +19,29 @@ mod tests {
         )
         .unwrap();
         drop(conn);
+        let identity = ensure_primary_application_identity(&pool, "acct-jobs", "jobs@example.com")
+            .unwrap();
+        upsert_track(
+            &pool,
+            "acct-jobs",
+            &CareerTrack {
+                id: "track-default".to_string(),
+                name: "Software engineering".to_string(),
+                role: "Software Engineer".to_string(),
+                locations: vec!["New York, NY".to_string()],
+                remote_preference: "hybrid_ok".to_string(),
+                application_identity_id: Some(identity.id),
+                policy: CareerTrackPolicy {
+                    role_family: "software_engineering".to_string(),
+                    ..CareerTrackPolicy::default()
+                },
+                active: true,
+                match_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
         pool
     }
 
@@ -36,7 +59,7 @@ mod tests {
             description: "Build reliable products with Rust and TypeScript.".to_string(),
             compensation: "$170k-$200k".to_string(),
             employment_type: "full_time".to_string(),
-            track_id: String::new(),
+            track_id: "track-default".to_string(),
             match_score: 90,
             matched_reasons: vec!["Skills fit".to_string()],
             missing_requirements: Vec::new(),
@@ -141,13 +164,38 @@ mod tests {
     fn experience_fit_is_derived_from_profile_dates_and_posting_requirements() {
         let mut profile = default_profile("jobs@example.com");
         profile.employment = vec![EmploymentEntry {
+            id: "employment-software".to_string(),
             company: "Example Company".to_string(),
             title: "Software Engineer".to_string(),
             start_date: "2022-01".to_string(),
             end_date: "2023-12".to_string(),
             ..EmploymentEntry::default()
         }];
-        assert_eq!(candidate_experience_range(&profile), Some((1, 4)));
+        let track = CareerTrack {
+            id: "track-software".to_string(),
+            name: "Software engineering".to_string(),
+            role: "Software Engineer".to_string(),
+            locations: vec!["New York, NY".to_string()],
+            remote_preference: "hybrid_ok".to_string(),
+            application_identity_id: Some("identity-primary".to_string()),
+            policy: CareerTrackPolicy {
+                role_family: "software_engineering".to_string(),
+                relevant_employment_ids: vec!["employment-software".to_string()],
+                ..CareerTrackPolicy::default()
+            },
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let evidence = role_experience_evidence(&profile, Some(&track), &test_posting(
+            "https://boards.greenhouse.io/example/jobs/evidence",
+            now_ms(),
+            now_ms(),
+        ));
+        assert_eq!(evidence.total_months, 24);
+        assert_eq!(evidence.target_min_months, 12);
+        assert_eq!(evidence.target_max_months, 48);
 
         let preferences = JobPreferences {
             sponsorship: "not_required".to_string(),
@@ -158,10 +206,11 @@ mod tests {
             now_ms(),
             now_ms(),
         );
+        aligned.track_id = track.id.clone();
         aligned.description = "Requires 4+ years of software engineering experience.".to_string();
-        assert_eq!(explicit_required_experience_years(&aligned), Some(4));
+        assert_eq!(experience_requirement(&aligned).required_min_months, Some(48));
         let aligned_decision =
-            build_job_eligibility(&aligned, &profile, &preferences, &[], false, None);
+            build_job_eligibility(&aligned, &profile, &preferences, &[], false, None, Some(&track));
         assert!(aligned_decision
             .passed_checks
             .iter()
@@ -170,7 +219,15 @@ mod tests {
         let mut too_senior = aligned;
         too_senior.description =
             "Requires at least 5 years of software engineering experience.".to_string();
-        let blocked = build_job_eligibility(&too_senior, &profile, &preferences, &[], false, None);
+        let blocked = build_job_eligibility(
+            &too_senior,
+            &profile,
+            &preferences,
+            &[],
+            false,
+            None,
+            Some(&track),
+        );
         assert!(blocked
             .hard_failures
             .iter()
@@ -181,10 +238,19 @@ mod tests {
             now_ms(),
             now_ms(),
         );
+        title_only_senior.track_id = track.id.clone();
         title_only_senior.title = "Senior Software Engineer".to_string();
         title_only_senior.description = "Build reliable products with Rust.".to_string();
         let blocked =
-            build_job_eligibility(&title_only_senior, &profile, &preferences, &[], false, None);
+            build_job_eligibility(
+                &title_only_senior,
+                &profile,
+                &preferences,
+                &[],
+                false,
+                None,
+                Some(&track),
+            );
         assert!(blocked
             .hard_failures
             .iter()
@@ -213,7 +279,7 @@ mod tests {
             "acct-jobs",
             &application.id,
             "queued",
-            Some("auto_submit"),
+            Some("review_first"),
         )
         .unwrap()
         .unwrap();
@@ -338,6 +404,8 @@ mod tests {
             workplace: "hybrid".to_string(),
             description: "Build reliable products with Rust and TypeScript.".to_string(),
             compensation: "$170k-$200k".to_string(),
+            employment_type: "full_time".to_string(),
+            engagement_type: "direct_hire".to_string(),
             posted_at_ms: Some(now_ms() - DAY_MS),
         }
     }
@@ -393,7 +461,7 @@ mod tests {
         assert_eq!(
             resume
                 .content
-                .pointer("/provenance/fact_ids")
+                .pointer("/provenance/confirmed_fact_ids")
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(0)
@@ -1286,7 +1354,7 @@ mod tests {
             &pool,
             "acct-jobs",
             &DiscoverySourceInput {
-                track_id: String::new(),
+                track_id: "track-default".to_string(),
                 provider: "greenhouse".to_string(),
                 source_key: "acme".to_string(),
                 company: "Acme".to_string(),
@@ -1653,6 +1721,7 @@ mod tests {
                 locations: vec![],
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: None,
+                policy: CareerTrackPolicy::default(),
                 active: true,
                 match_count: 0,
                 created_at_ms: 0,
@@ -1778,6 +1847,7 @@ mod tests {
                     locations: Vec::new(),
                     remote_preference: "hybrid_ok".to_string(),
                     application_identity_id: None,
+                    policy: CareerTrackPolicy::default(),
                     active: true,
                     match_count: 0,
                     created_at_ms: 0,
@@ -1813,6 +1883,7 @@ mod tests {
                         locations: Vec::new(),
                         remote_preference: "hybrid_ok".to_string(),
                         application_identity_id: None,
+                        policy: CareerTrackPolicy::default(),
                         active: true,
                         match_count: 0,
                         created_at_ms: 0,
@@ -1987,7 +2058,7 @@ mod tests {
             let profile = default_profile("jobs@example.com");
             let preferences = JobPreferences::default();
             let source = DiscoverySourceInput {
-                track_id: String::new(),
+                track_id: "track-default".to_string(),
                 provider: provider.to_string(),
                 source_key: source_key.to_string(),
                 company: "Alias Co".to_string(),
@@ -2060,6 +2131,8 @@ mod tests {
                     workplace: imported.workplace.clone(),
                     description: imported.description.clone(),
                     compensation: imported.compensation.clone(),
+                    employment_type: imported.employment_type.clone(),
+                    engagement_type: String::new(),
                     posted_at_ms: imported.posted_at_ms,
                 }],
                 true,
@@ -2106,6 +2179,7 @@ mod tests {
                 locations: Vec::new(),
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: None,
+                policy: CareerTrackPolicy::default(),
                 active: true,
                 match_count: 0,
                 created_at_ms: 0,
@@ -2658,14 +2732,14 @@ mod tests {
                 source: "pasted_link".to_string(),
                 external_id: String::new(),
                 company: "Northstar".to_string(),
-                title: "Senior Product Engineer".to_string(),
+                title: "Software Product Engineer".to_string(),
                 location: "Remote".to_string(),
                 workplace: "remote".to_string(),
                 canonical_url: "https://example.com/jobs/42".to_string(),
                 description: "Rust and TypeScript".to_string(),
                 compensation: String::new(),
                 employment_type: String::new(),
-                track_id: String::new(),
+                track_id: "track-default".to_string(),
                 match_score: 86,
                 matched_reasons: vec!["Skills fit".to_string()],
                 missing_requirements: Vec::new(),
@@ -2861,6 +2935,7 @@ mod tests {
                 locations: vec!["New York, NY".to_string()],
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: Some(primary.id),
+                policy: CareerTrackPolicy::default(),
                 active: true,
                 match_count: 0,
                 created_at_ms: 0,
@@ -2878,6 +2953,10 @@ mod tests {
                 locations: vec!["New York, NY".to_string()],
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: Some(data_email.id),
+                policy: CareerTrackPolicy {
+                    role_family: "data_engineering".to_string(),
+                    ..CareerTrackPolicy::default()
+                },
                 active: true,
                 match_count: 0,
                 created_at_ms: 0,
@@ -3032,7 +3111,7 @@ mod tests {
                 description: String::new(),
                 compensation: String::new(),
                 employment_type: String::new(),
-                track_id: String::new(),
+                track_id: "track-default".to_string(),
                 match_score: 80,
                 matched_reasons: Vec::new(),
                 missing_requirements: Vec::new(),
@@ -3073,14 +3152,14 @@ mod tests {
                 source: "linkedin_handoff".to_string(),
                 external_id: String::new(),
                 company: "Northstar".to_string(),
-                title: "Staff Engineer".to_string(),
+                title: "Software Engineer".to_string(),
                 location: "Remote".to_string(),
                 workplace: "remote".to_string(),
                 canonical_url: "https://linkedin.com/jobs/view/123".to_string(),
                 description: "Distributed systems".to_string(),
                 compensation: String::new(),
                 employment_type: String::new(),
-                track_id: String::new(),
+                track_id: "track-default".to_string(),
                 match_score: 96,
                 matched_reasons: Vec::new(),
                 missing_requirements: Vec::new(),
@@ -3408,6 +3487,7 @@ mod tests {
                 locations: Vec::new(),
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: Some(primary.id),
+                policy: CareerTrackPolicy::default(),
                 active: true,
                 match_count: 0,
                 created_at_ms: 0,
@@ -3847,20 +3927,22 @@ mod tests {
             now_ms(),
             now_ms(),
         );
-        sponsorship.description =
-            "Must be a U.S. citizen. We are unable to sponsor visas.".to_string();
+        sponsorship.description = "We are unable to sponsor visas.".to_string();
         let sponsorship =
             upsert_posting(&pool, "acct-jobs", &sponsorship, &profile, &preferences).unwrap();
-        assert!(prepare_application(
+        let sponsorship_error = prepare_application(
             &pool,
             "acct-jobs",
             &sponsorship.id,
             "factual",
-            "review_first"
+            "review_first",
         )
         .unwrap_err()
-        .to_string()
-        .contains("sponsorship"));
+        .to_string();
+        assert!(
+            sponsorship_error.contains("sponsorship"),
+            "unexpected hard-filter reason: {sponsorship_error}"
+        );
 
         let mut sponsorship_available = test_posting(
             "https://jobs.lever.co/ifm-us/1454349c-eb2b-480b-9a57-edfbb2aeeffe",
@@ -3889,6 +3971,95 @@ mod tests {
             .review_reasons
             .iter()
             .any(|reason| reason.code.starts_with("sponsorship_")));
+    }
+
+    #[test]
+    fn engagement_preferences_block_known_mismatches() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let preferences = JobPreferences {
+            employment_types: vec!["contract".to_string()],
+            engagement_types: vec!["w2".to_string()],
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/c2c-contract",
+            now_ms(),
+            now_ms(),
+        );
+        posting.employment_type = "contract c2c".to_string();
+        let posting =
+            upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+
+        let decision = evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
+        assert!(!decision.can_prepare);
+        assert!(decision
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "engagement_type_mismatch"));
+    }
+
+    #[test]
+    fn unknown_contract_engagement_requires_review_instead_of_guessing() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let mut track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        track.policy.employment_types = vec!["contract".to_string()];
+        track.policy.engagement_types = vec!["w2".to_string()];
+        upsert_track(&pool, "acct-jobs", &track).unwrap();
+        let preferences = JobPreferences {
+            employment_types: vec!["contract".to_string()],
+            engagement_types: vec!["w2".to_string()],
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/unknown-contract",
+            now_ms(),
+            now_ms(),
+        );
+        posting.employment_type = "contract".to_string();
+        let posting =
+            upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+
+        let decision = evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
+        assert!(decision.can_prepare, "unexpected decision: {decision:#?}");
+        assert!(!decision.can_auto_submit);
+        assert!(decision
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "engagement_type_unverified"));
+    }
+
+    #[test]
+    fn scheduled_discovery_accepts_only_canonical_job_categories() {
+        for employment_type in [
+            "",
+            "full_time",
+            "part_time",
+            "contract",
+            "temporary",
+            "internship",
+            "apprenticeship",
+            "seasonal",
+            "per_diem",
+        ] {
+            assert!(is_canonical_discovered_employment_type(employment_type));
+        }
+        for engagement_type in ["", "w2", "c2c", "1099", "direct_hire"] {
+            assert!(is_canonical_discovered_engagement_type(engagement_type));
+        }
+        for invalid in ["full time", "intern", "permanent", "freelance"] {
+            assert!(!is_canonical_discovered_employment_type(invalid));
+        }
+        for invalid in ["W-2", "corp-to-corp", "independent_contractor"] {
+            assert!(!is_canonical_discovered_engagement_type(invalid));
+        }
     }
 
     #[test]
@@ -4126,7 +4297,7 @@ mod tests {
                 description: String::new(),
                 compensation: String::new(),
                 employment_type: String::new(),
-                track_id: String::new(),
+                track_id: "track-default".to_string(),
                 match_score: 84,
                 matched_reasons: Vec::new(),
                 missing_requirements: Vec::new(),
@@ -4310,6 +4481,7 @@ mod tests {
                 locations: vec!["New York, NY".to_string()],
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: Some(alternate.id.clone()),
+                policy: CareerTrackPolicy::default(),
                 active: true,
                 match_count: 0,
                 created_at_ms: 0,

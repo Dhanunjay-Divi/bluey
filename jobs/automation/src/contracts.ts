@@ -79,6 +79,8 @@ export interface NormalizedJob {
   postedAt?: string;
   compensation?: string;
   department?: string;
+  employmentType?: string;
+  engagementType?: string;
 }
 
 export interface ApplicationPacket {

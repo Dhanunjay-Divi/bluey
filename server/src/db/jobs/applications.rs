@@ -173,9 +173,19 @@ pub fn prepare_application(
     mode: &str,
     submission_mode: &str,
 ) -> Result<(JobApplication, ResumeVersion)> {
-    let (application, resume, _, _, _) =
-        prepare_application_inner(pool, account_id, job_id, mode, submission_mode, true)?;
-    Ok((application, resume))
+    let prepared = prepare_application_draft(pool, account_id, job_id, mode, submission_mode)?;
+    finalize_prepared_application(
+        pool,
+        account_id,
+        &prepared,
+        prepared.baseline_resume.content.clone(),
+        prepared.baseline_resume.diff.clone(),
+        json!({
+            "status": "deterministic",
+            "provider": "bluey-evidence-planner",
+            "claims_added": 0,
+        }),
+    )
 }
 
 pub fn prepare_application_draft(
@@ -185,15 +195,7 @@ pub fn prepare_application_draft(
     mode: &str,
     submission_mode: &str,
 ) -> Result<PreparedApplicationDraft> {
-    let (application, baseline_resume, expected_application, profile, posting) =
-        prepare_application_inner(pool, account_id, job_id, mode, submission_mode, false)?;
-    Ok(PreparedApplicationDraft {
-        application,
-        baseline_resume,
-        profile,
-        posting,
-        expected_application,
-    })
+    prepare_application_inner(pool, account_id, job_id, mode, submission_mode)
 }
 
 fn prepare_application_inner(
@@ -202,14 +204,7 @@ fn prepare_application_inner(
     job_id: &str,
     mode: &str,
     submission_mode: &str,
-    finalize_immediately: bool,
-) -> Result<(
-    JobApplication,
-    ResumeVersion,
-    Option<ExpectedApplicationRevision>,
-    CareerProfile,
-    JobPosting,
-)> {
+) -> Result<PreparedApplicationDraft> {
     let profile = get_profile(pool, account_id, "")?;
     let posting =
         get_posting(pool, account_id, job_id)?.ok_or_else(|| anyhow::anyhow!("job not found"))?;
@@ -236,14 +231,16 @@ fn prepare_application_inner(
     let login_email = account_login_email(pool, account_id)?;
     let _ = ensure_primary_application_identity(pool, account_id, &login_email)?;
     let identities = list_application_identities(pool, account_id)?;
-    let track_identity_id = list_tracks(pool, account_id)?
+    let track = list_tracks(pool, account_id)?
         .into_iter()
         .find(|track| track.id == posting.track_id)
-        .and_then(|track| track.application_identity_id);
+        .ok_or_else(|| anyhow::anyhow!("choose an active Career Track before preparing"))?;
+    let track_identity_id = track.application_identity_id.as_deref();
     let application_identity =
-        selected_application_identity(track_identity_id.as_deref(), &identities).ok_or_else(
+        selected_application_identity(track_identity_id, &identities).ok_or_else(
             || anyhow::anyhow!("verify an application email before preparing this packet"),
-        )?;
+        )?
+        .clone();
     let facts = list_facts(pool, account_id)?;
     let approved_fact_ids: Vec<String> = facts
         .iter()
@@ -251,6 +248,14 @@ fn prepare_application_inner(
         .map(|fact| fact.id.clone())
         .collect();
     let confirmed_facts_fingerprint = confirmed_facts_fingerprint(&facts);
+    let evidence_revision = build_profile_evidence_revision(
+        account_id,
+        &profile,
+        &facts,
+        &track,
+        &application_identity,
+        &eligibility.experience_evidence,
+    )?;
     let tailored_resume = tailor_resume(&profile, &posting, mode);
     let truth_fingerprint = candidate_truth_fingerprint(&profile);
     let content = json!({
@@ -277,7 +282,7 @@ fn prepare_application_inner(
         "certifications": profile.certifications,
         "source_resume_name": profile.source_resume_name,
         "provenance": {
-            "fact_ids": approved_fact_ids,
+            "confirmed_fact_ids": approved_fact_ids,
             "mode": mode,
             "generated_for_job_id": posting.id,
             "application_identity_id": application_identity.id,
@@ -287,35 +292,24 @@ fn prepare_application_inner(
             "confirmed_facts_fingerprint": confirmed_facts_fingerprint,
             "confirmed_facts_fingerprint_version": 1,
             "job_snapshot_fingerprint": posting_fingerprint,
+            "evidence_revision_id": evidence_revision.id,
+            "evidence_content_hash": evidence_revision.content_hash,
         },
     });
     let diff = tailored_resume.diff;
     let checksum_source = format!("{}|{}|{}", account_id, job_id, content);
     let checksum = hex::encode(Sha256::digest(checksum_source.as_bytes()));
     let now = now_ms();
-    let resume = if finalize_immediately {
-        save_resume_version(
-            pool,
-            account_id,
-            job_id,
-            mode,
-            content,
-            diff,
-            approved_fact_ids.clone(),
-            checksum,
-        )?
-    } else {
-        ResumeVersion {
-            id: String::new(),
-            job_id: job_id.to_string(),
-            version_no: 0,
-            mode: mode.to_string(),
-            content,
-            diff,
-            claim_ids: approved_fact_ids.clone(),
-            checksum,
-            created_at_ms: now,
-        }
+    let resume = ResumeVersion {
+        id: String::new(),
+        job_id: job_id.to_string(),
+        version_no: 0,
+        mode: mode.to_string(),
+        content,
+        diff,
+        claim_ids: Vec::new(),
+        checksum,
+        created_at_ms: now,
     };
     let mut application = existing_application.unwrap_or(JobApplication {
         id: uuid::Uuid::new_v4().to_string(),
@@ -350,27 +344,22 @@ fn prepare_application_inner(
             application.answers.push(remembered);
         }
     }
-    application.resume_version_id = (!resume.id.is_empty()).then(|| resume.id.clone());
-    let auto_submit_eligible = submission_mode == "auto_submit" && eligibility.can_auto_submit;
-    application.state = if !finalize_immediately {
-        "preparing".to_string()
-    } else if auto_submit_eligible {
-        "queued".to_string()
-    } else {
-        "awaiting_review".to_string()
-    };
+    application.resume_version_id = None;
+    application.state = "preparing".to_string();
     application.submission_mode = submission_mode.to_string();
     application.match_score = posting.match_score;
     application.updated_at_ms = now;
     application.receipt = json!({
         "job_snapshot": posting,
-        "resume_version_id": if resume.id.is_empty() { Value::Null } else { json!(resume.id) },
+        "resume_version_id": Value::Null,
         "career_track_id": posting.track_id,
         "candidate_truth_fingerprint": truth_fingerprint,
         "candidate_truth_fingerprint_version": 1,
         "confirmed_facts_fingerprint": confirmed_facts_fingerprint,
         "confirmed_facts_fingerprint_version": 1,
         "job_snapshot_fingerprint": posting_fingerprint,
+        "evidence_revision_id": evidence_revision.id,
+        "evidence_content_hash": evidence_revision.content_hash,
         "application_identity": {
             "id": application_identity.id,
             "email": application_identity.email,
@@ -382,18 +371,25 @@ fn prepare_application_inner(
         "eligibility": eligibility,
         "cover_letter_status": if application.cover_letter.trim().is_empty() { "not_included" } else { "included" },
         "metering": {
-            "status": if !finalize_immediately { "pending_generation" } else if auto_submit_eligible { "counts_when_queued" } else { "counts_when_approved_or_downloaded" },
+            "status": "pending_generation",
             "canonical_job_key": posting.canonical_key,
         },
         "resume_generation": {
-            "status": if finalize_immediately { "deterministic" } else { "pending" },
+            "status": "pending",
         },
         "confirmation": Value::Null,
     });
-    if finalize_immediately {
-        save_application(pool, account_id, &application)?;
-    }
-    Ok((application, resume, expected_application, profile, posting))
+    Ok(PreparedApplicationDraft {
+        application,
+        baseline_resume: resume,
+        profile,
+        facts,
+        track,
+        identity: application_identity,
+        evidence_revision,
+        posting,
+        expected_application,
+    })
 }
 
 pub fn finalize_prepared_application(
@@ -487,16 +483,57 @@ pub fn finalize_prepared_application(
     {
         anyhow::bail!("generated resume does not match the verified application identity")
     }
+    if content
+        .pointer("/provenance/career_track_id")
+        .and_then(Value::as_str)
+        != Some(prepared.track.id.as_str())
+        || posting.track_id != prepared.track.id
+    {
+        anyhow::bail!("generated resume does not match the selected Career Track")
+    }
+    if content
+        .pointer("/provenance/evidence_revision_id")
+        .and_then(Value::as_str)
+        != Some(prepared.evidence_revision.id.as_str())
+        || content
+            .pointer("/provenance/evidence_content_hash")
+            .and_then(Value::as_str)
+            != Some(prepared.evidence_revision.content_hash.as_str())
+        || application
+            .receipt
+            .get("evidence_revision_id")
+            .and_then(Value::as_str)
+            != Some(prepared.evidence_revision.id.as_str())
+    {
+        anyhow::bail!("generated resume does not match its candidate evidence revision")
+    }
 
     let checksum_source = format!("{}|{}|{}", account_id, posting.id, content);
     let checksum = hex::encode(Sha256::digest(checksum_source.as_bytes()));
-    let eligibility = evaluate_job_eligibility(
+    let mut eligibility = evaluate_job_eligibility(
         pool,
         account_id,
         &posting,
         false,
         Some(application.id.as_str()),
     )?;
+    eligibility.evidence_revision_id = Some(prepared.evidence_revision.id.clone());
+    eligibility.tailored_packet_coverage = Some(tailored_packet_coverage(
+        &posting,
+        &prepared.profile,
+        &content,
+    ));
+    let claim_evidence = build_resume_claim_evidence(ResumeClaimEvidenceContext {
+        account_id,
+        job_id: &posting.id,
+        resume_version_id: "",
+        content: &content,
+        profile: &prepared.profile,
+        facts: &prepared.facts,
+        track: &prepared.track,
+        identity: &prepared.identity,
+        evidence_revision: &prepared.evidence_revision,
+    })?;
     let auto_submit_eligible =
         application.submission_mode == "auto_submit" && eligibility.can_auto_submit;
     application.state = if auto_submit_eligible {
@@ -539,6 +576,9 @@ pub fn finalize_prepared_application(
         &expected_identity_id,
         &expected_identity_email,
         &expected_facts_fingerprint,
+        &prepared.evidence_revision,
+        &claim_evidence,
+        &prepared.facts,
     )
 }
 
@@ -557,11 +597,17 @@ fn commit_prepared_application(
     expected_identity_id: &str,
     expected_identity_email: &str,
     expected_facts_fingerprint: &str,
+    expected_evidence_revision: &ProfileEvidenceRevision,
+    claim_evidence: &[ResumeClaimEvidence],
+    expected_facts: &[CareerFact],
 ) -> Result<(JobApplication, ResumeVersion)> {
     validate_application_state(&application.state)?;
     let content_json = to_json(&content, "resume content")?;
     let diff_json = to_json(&diff, "resume diff")?;
-    let claim_ids = baseline.claim_ids.clone();
+    let claim_ids = claim_evidence
+        .iter()
+        .map(|claim| claim.claim_id.clone())
+        .collect::<Vec<_>>();
     let claim_ids_json = to_json(&claim_ids, "resume claims")?;
     let resume_created_at_ms = now_ms();
 
@@ -608,7 +654,9 @@ fn commit_prepared_application(
                 .optional()?
                 .map(|raw| parse_json(raw, "career track during application finalization"))
                 .transpose()?;
-            let track_identity_id = current_track.and_then(|track| track.application_identity_id);
+            let track_identity_id = current_track
+                .as_ref()
+                .and_then(|track| track.application_identity_id.clone());
             let mut identity_stmt = tx.prepare(
                 "SELECT identity_json, verification_status, is_default
                    FROM jobs_application_identities WHERE account_id = ?1",
@@ -650,7 +698,11 @@ fn commit_prepared_application(
                 .map(|fact| fact.id.as_str())
                 .collect::<Vec<_>>();
             current_fact_ids.sort_unstable();
-            let mut expected_fact_ids = claim_ids.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut expected_fact_ids = expected_facts
+                .iter()
+                .filter(|fact| fact.verification_status == "confirmed")
+                .map(|fact| fact.id.as_str())
+                .collect::<Vec<_>>();
             expected_fact_ids.sort_unstable();
             if current_fact_ids != expected_fact_ids
                 || confirmed_facts_fingerprint(&current_facts) != expected_facts_fingerprint
@@ -714,13 +766,36 @@ fn commit_prepared_application(
                 &current_posting,
                 &current_profile,
                 &preferences,
+                current_track.as_ref(),
                 &reservations,
                 &authorities,
             )?;
+            let current_track = current_track
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Career Track was removed during generation"))?;
+            let current_identity = current_identity
+                .ok_or_else(|| anyhow::anyhow!("application identity changed during generation"))?;
+            let current_experience =
+                role_experience_evidence(&current_profile, Some(current_track), &current_posting);
+            let current_evidence = build_profile_evidence_revision(
+                account_id,
+                &current_profile,
+                &current_facts,
+                current_track,
+                current_identity,
+                &current_experience,
+            )?;
+            if current_evidence.id != expected_evidence_revision.id
+                || current_evidence.content_hash != expected_evidence_revision.content_hash
+            {
+                anyhow::bail!("candidate evidence changed during resume generation")
+            }
             drop(identity_stmt);
             drop(fact_stmt);
             drop(reservation_stmt);
             drop(authority_stmt);
+            let stored_evidence =
+                persist_evidence_revision_sqlite(&tx, account_id, &current_evidence)?;
             let resume = if let Some(existing) = tx
                 .query_row(
                     "SELECT id, job_id, version_no, mode, content_json, diff_json,
@@ -778,6 +853,25 @@ fn commit_prepared_application(
                 .as_object_mut()
                 .ok_or_else(|| anyhow::anyhow!("application receipt must be an object"))?
                 .insert("resume_version_id".to_string(), json!(resume.id));
+            let receipt = application
+                .receipt
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("application receipt must be an object"))?;
+            receipt.insert(
+                "evidence_revision".to_string(),
+                json!({
+                    "id": stored_evidence.id,
+                    "revision_no": stored_evidence.revision_no,
+                    "content_hash": stored_evidence.content_hash,
+                }),
+            );
+            receipt.insert("claim_ids".to_string(), json!(claim_ids));
+            persist_claim_evidence_sqlite(
+                &tx,
+                account_id,
+                &resume.id,
+                claim_evidence,
+            )?;
             let payload = to_json(application, "job application")?;
             let changed = match expected {
                 Some(expected) => tx.execute(
@@ -878,7 +972,9 @@ fn commit_prepared_application(
                     )
                 })
                 .transpose()?;
-            let track_identity_id = current_track.and_then(|track| track.application_identity_id);
+            let track_identity_id = current_track
+                .as_ref()
+                .and_then(|track| track.application_identity_id.clone());
             let identities = tx
                 .query(
                     "SELECT identity_json, verification_status, is_default
@@ -920,7 +1016,11 @@ fn commit_prepared_application(
                 .map(|fact| fact.id.as_str())
                 .collect::<Vec<_>>();
             current_fact_ids.sort_unstable();
-            let mut expected_fact_ids = claim_ids.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut expected_fact_ids = expected_facts
+                .iter()
+                .filter(|fact| fact.verification_status == "confirmed")
+                .map(|fact| fact.id.as_str())
+                .collect::<Vec<_>>();
             expected_fact_ids.sort_unstable();
             if current_fact_ids != expected_fact_ids
                 || confirmed_facts_fingerprint(&current_facts) != expected_facts_fingerprint
@@ -988,9 +1088,32 @@ fn commit_prepared_application(
                 &current_posting,
                 &current_profile,
                 &preferences,
+                current_track.as_ref(),
                 &reservations,
                 &authorities,
             )?;
+            let current_track = current_track
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Career Track was removed during generation"))?;
+            let current_identity = current_identity
+                .ok_or_else(|| anyhow::anyhow!("application identity changed during generation"))?;
+            let current_experience =
+                role_experience_evidence(&current_profile, Some(current_track), &current_posting);
+            let current_evidence = build_profile_evidence_revision(
+                account_id,
+                &current_profile,
+                &current_facts,
+                current_track,
+                current_identity,
+                &current_experience,
+            )?;
+            if current_evidence.id != expected_evidence_revision.id
+                || current_evidence.content_hash != expected_evidence_revision.content_hash
+            {
+                anyhow::bail!("candidate evidence changed during resume generation")
+            }
+            let stored_evidence =
+                persist_evidence_revision_postgres(&mut tx, account_id, &current_evidence)?;
             let resume = if let Some(row) = tx.query_opt(
                 "SELECT id, job_id, version_no, mode, content_json, diff_json,
                         claim_ids_json, checksum, created_at_ms
@@ -1047,6 +1170,25 @@ fn commit_prepared_application(
                 .as_object_mut()
                 .ok_or_else(|| anyhow::anyhow!("application receipt must be an object"))?
                 .insert("resume_version_id".to_string(), json!(resume.id));
+            let receipt = application
+                .receipt
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("application receipt must be an object"))?;
+            receipt.insert(
+                "evidence_revision".to_string(),
+                json!({
+                    "id": stored_evidence.id,
+                    "revision_no": stored_evidence.revision_no,
+                    "content_hash": stored_evidence.content_hash,
+                }),
+            );
+            receipt.insert("claim_ids".to_string(), json!(claim_ids));
+            persist_claim_evidence_postgres(
+                &mut tx,
+                account_id,
+                &resume.id,
+                claim_evidence,
+            )?;
             let payload = to_json(application, "job application")?;
             let changed = match expected {
                 Some(expected) => tx.execute(
@@ -1172,126 +1314,6 @@ fn account_login_email(pool: &DbPool, account_id: &str) -> Result<String> {
             .get_pg()?
             .query_one("SELECT email FROM accounts WHERE id = $1", &[&account_id])?
             .get(0)),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn save_resume_version(
-    pool: &DbPool,
-    account_id: &str,
-    job_id: &str,
-    mode: &str,
-    content: Value,
-    diff: Value,
-    claim_ids: Vec<String>,
-    checksum: String,
-) -> Result<ResumeVersion> {
-    let content_json = to_json(&content, "resume content")?;
-    let diff_json = to_json(&diff, "resume diff")?;
-    let claim_ids_json = to_json(&claim_ids, "resume claims")?;
-    let now = now_ms();
-    crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            if let Some(existing) = conn
-                .query_row(
-                    "SELECT id, job_id, version_no, mode, content_json, diff_json,
-                            claim_ids_json, checksum, created_at_ms
-                       FROM jobs_resume_versions
-                      WHERE account_id = ?1 AND job_id = ?2 AND checksum = ?3",
-                    params![account_id, job_id, checksum],
-                    resume_from_sqlite_row,
-                )
-                .optional()?
-            {
-                return Ok(existing);
-            }
-            let version_no: i64 = conn.query_row(
-                "SELECT COALESCE(MAX(version_no), 0) + 1 FROM jobs_resume_versions
-                  WHERE account_id = ?1 AND job_id = ?2",
-                params![account_id, job_id],
-                |row| row.get(0),
-            )?;
-            let id = uuid::Uuid::new_v4().to_string();
-            conn.execute(
-                "INSERT INTO jobs_resume_versions (
-                    id, account_id, job_id, version_no, mode, content_json,
-                    diff_json, claim_ids_json, checksum, created_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    id,
-                    account_id,
-                    job_id,
-                    version_no,
-                    mode,
-                    content_json,
-                    diff_json,
-                    claim_ids_json,
-                    checksum,
-                    now,
-                ],
-            )?;
-            Ok(ResumeVersion {
-                id,
-                job_id: job_id.to_string(),
-                version_no,
-                mode: mode.to_string(),
-                content,
-                diff,
-                claim_ids,
-                checksum,
-                created_at_ms: now,
-            })
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            if let Some(row) = conn.query_opt(
-                "SELECT id, job_id, version_no, mode, content_json, diff_json,
-                        claim_ids_json, checksum, created_at_ms
-                   FROM jobs_resume_versions
-                  WHERE account_id = $1 AND job_id = $2 AND checksum = $3",
-                &[&account_id, &job_id, &checksum],
-            )? {
-                return resume_from_pg_row(row);
-            }
-            let version_no: i64 = conn
-                .query_one(
-                    "SELECT COALESCE(MAX(version_no), 0) + 1 FROM jobs_resume_versions
-                      WHERE account_id = $1 AND job_id = $2",
-                    &[&account_id, &job_id],
-                )?
-                .get(0);
-            let id = uuid::Uuid::new_v4().to_string();
-            conn.execute(
-                "INSERT INTO jobs_resume_versions (
-                    id, account_id, job_id, version_no, mode, content_json,
-                    diff_json, claim_ids_json, checksum, created_at_ms
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-                &[
-                    &id,
-                    &account_id,
-                    &job_id,
-                    &version_no,
-                    &mode,
-                    &content_json,
-                    &diff_json,
-                    &claim_ids_json,
-                    &checksum,
-                    &now,
-                ],
-            )?;
-            Ok(ResumeVersion {
-                id,
-                job_id: job_id.to_string(),
-                version_no,
-                mode: mode.to_string(),
-                content,
-                diff,
-                claim_ids,
-                checksum,
-                created_at_ms: now,
-            })
-        }
     })
 }
 

@@ -3,6 +3,7 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
     let _ = ensure_primary_application_identity(pool, account_id, email)?;
     let profile = get_profile(pool, account_id, email)?;
     let preferences = get_preferences(pool, account_id)?;
+    let tracks = list_tracks(pool, account_id)?;
     let applications = list_applications(pool, account_id)?;
     let reservations = list_attempt_reservations(pool, account_id)?;
     let mut matches = list_postings(pool, account_id)?;
@@ -11,6 +12,7 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
             .iter()
             .find(|application| application.job_id == posting.id)
             .map(|application| application.id.as_str());
+        let track = tracks.iter().find(|track| track.id == posting.track_id);
         let mut eligibility = build_job_eligibility(
             posting,
             &profile,
@@ -18,6 +20,7 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
             &reservations,
             true,
             existing_application_id,
+            track,
         );
         apply_discovery_authority(pool, account_id, posting, &mut eligibility)?;
         posting.eligibility = Some(eligibility);
@@ -26,7 +29,7 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
         profile,
         preferences,
         facts: list_facts(pool, account_id)?,
-        tracks: list_tracks(pool, account_id)?,
+        tracks,
         matches,
         applications,
         application_evidence: list_application_evidence(pool, account_id, None)?,

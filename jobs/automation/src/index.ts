@@ -15,3 +15,5 @@ export * from "./playwright-page.js";
 export * from "./documents.js";
 export * from "./network.js";
 export * from "./recovery.js";
+export * from "./source-catalog.js";
+export * from "./visual-observation.js";

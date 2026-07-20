@@ -657,6 +657,13 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .settings-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; }
 .settings-form { display: grid; gap: 15px; }
 .settings-form > label > span, .tag-setting > span { color: var(--muted); font-size: 10px; font-weight: 800; }
+.job-category-choices { min-width: 0; margin: 0; padding: 0; display: grid; gap: 7px; border: 0; }
+.job-category-choices legend { padding: 0; color: var(--muted); font-size: 10px; font-weight: 800; }
+.job-category-choices > p { margin: 0; color: var(--text-soft); font-size: 10px; line-height: 1.45; }
+.job-category-choices > div { display: flex; flex-wrap: wrap; gap: 6px; }
+.job-category-choices button { min-height: 32px; padding: 0 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--text-soft); font: inherit; font-size: 10px; font-weight: 750; }
+.job-category-choices button:hover { border-color: var(--accent-border); color: var(--text); }
+.job-category-choices button.selected { border-color: var(--accent-border); background: var(--accent-soft); color: var(--accent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 12%, transparent); }
 .tag-setting > div { min-height: 42px; padding: 5px; display: flex; align-items: center; flex-wrap: wrap; gap: 5px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); }
 .tag-setting button { height: 26px; padding: 0 7px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border)); border-radius: 5px; background: var(--accent-soft); color: var(--text-soft); font-size: 10px; }
 .tag-setting button i { color: var(--accent); font-style: normal; }

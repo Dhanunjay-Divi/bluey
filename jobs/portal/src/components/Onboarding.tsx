@@ -57,6 +57,11 @@ import {
 import { useLocationSuggestions } from "../data/use-location-suggestions";
 import { SearchPolicySummary } from "./SearchPolicySummary";
 import {
+  ENGAGEMENT_TYPE_OPTIONS,
+  EMPLOYMENT_TYPE_OPTIONS,
+  JobCategoryChoices,
+} from "./JobCategoryChoices";
+import {
   BLUEY_AUTO_SUBMIT_THRESHOLD,
   BLUEY_DAILY_APPLICATION_LIMIT,
   BLUEY_MAX_POSTING_AGE_DAYS,
@@ -86,6 +91,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
   const [preferences, setPreferences] = useState<JobPreferences>({
     ...workspace.preferences,
     desired_roles: canonicalTargetRoles(workspace.preferences.desired_roles),
+    engagement_types: workspace.preferences.engagement_types || [],
   });
   const [notes, setNotes] = useState("");
   const [importing, setImporting] = useState(false);
@@ -107,12 +113,19 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
       role: preferences.desired_roles[0] || profile.headline,
       locations: preferences.desired_locations,
       remote_preference: preferences.remote_preference,
+      policy: {
+        role_family: "",
+        relevant_employment_ids: profile.employment.map((entry) => entry.id).filter(Boolean),
+        employment_types: preferences.employment_types,
+        engagement_types: preferences.engagement_types,
+        work_authorizations: profile.work_authorization ? [profile.work_authorization] : [],
+      },
       active: true,
       match_count: 0,
       created_at_ms: workspace.tracks[0]?.created_at_ms || 0,
       updated_at_ms: 0,
     }),
-    [preferences, profile.headline, workspace.tracks],
+    [preferences, profile.employment, profile.headline, profile.work_authorization, workspace.tracks],
   );
   const roleSuggestions = useMemo(
     () => mergeCareerSuggestions(
@@ -403,6 +416,8 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
                   ["not_required", "I do not require sponsorship"],
                   ["required", "I require sponsorship"],
                 ]} />
+                <JobCategoryChoices label="Employment types" description="Select every arrangement you want Bluey to match." values={preferences.employment_types} options={EMPLOYMENT_TYPE_OPTIONS} onChange={(values) => updatePreferences("employment_types", values)} />
+                <JobCategoryChoices label="Contract engagement" description="Optional. Choose W-2, C2C, 1099, or direct hire when those terms matter." values={preferences.engagement_types} options={ENGAGEMENT_TYPE_OPTIONS} onChange={(values) => updatePreferences("engagement_types", values)} />
               </div>
             </>
           )}

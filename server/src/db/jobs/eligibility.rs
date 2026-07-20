@@ -117,6 +117,7 @@ fn enforce_application_finalization_eligibility(
     posting: &JobPosting,
     profile: &CareerProfile,
     preferences: &JobPreferences,
+    track: Option<&CareerTrack>,
     reservations: &[AttemptReservation],
     authorities: &[JobDiscoveryAuthority],
 ) -> Result<()> {
@@ -127,6 +128,7 @@ fn enforce_application_finalization_eligibility(
         reservations,
         false,
         Some(application.id.as_str()),
+        track,
     );
     apply_discovery_authorities(authorities, &mut decision);
     if !decision.can_prepare {
@@ -152,6 +154,8 @@ pub fn evaluate_job_eligibility(
 ) -> Result<JobEligibilityDecision> {
     let profile = get_profile(pool, account_id, "")?;
     let preferences = get_preferences(pool, account_id)?;
+    let tracks = list_tracks(pool, account_id)?;
+    let track = tracks.iter().find(|track| track.id == posting.track_id);
     let reservations = list_attempt_reservations(pool, account_id)?;
     let mut decision = build_job_eligibility(
         posting,
@@ -160,6 +164,7 @@ pub fn evaluate_job_eligibility(
         &reservations,
         require_live_verification,
         existing_application_id,
+        track,
     );
     apply_discovery_authority(pool, account_id, posting, &mut decision)?;
     Ok(decision)
@@ -172,12 +177,56 @@ fn build_job_eligibility(
     reservations: &[AttemptReservation],
     require_live_verification: bool,
     existing_application_id: Option<&str>,
+    track: Option<&CareerTrack>,
 ) -> JobEligibilityDecision {
     let now = now_ms();
     let capability = submission_capability(posting);
     let mut hard_failures = Vec::new();
     let mut review_reasons = Vec::new();
     let mut passed_checks = Vec::new();
+    let experience_evidence = role_experience_evidence(profile, track, posting);
+    let experience_requirement = experience_requirement(posting);
+
+    match track {
+        None => push_reason(
+            &mut hard_failures,
+            "career_track_missing",
+            "Choose an active Career Track before Bluey prepares this application.",
+        ),
+        Some(track) if !track.active => push_reason(
+            &mut hard_failures,
+            "career_track_inactive",
+            "This Career Track is paused.",
+        ),
+        Some(track) if track.application_identity_id.is_none() => push_reason(
+            &mut hard_failures,
+            "application_identity_required",
+            "Choose a verified application identity for this Career Track.",
+        ),
+        Some(track) => {
+            passed_checks.push("career_track_active".to_string());
+            passed_checks.push("application_identity_bound".to_string());
+            let posting_family = posting_role_family(posting);
+            if posting_family != ROLE_FAMILY_GENERIC
+                && experience_evidence.role_family != ROLE_FAMILY_GENERIC
+                && posting_family != experience_evidence.role_family
+            {
+                push_reason(
+                    &mut hard_failures,
+                    "role_family_mismatch",
+                    "This role belongs to a different Career Track.",
+                );
+            } else if posting.track_id != track.id {
+                push_reason(
+                    &mut hard_failures,
+                    "career_track_binding_changed",
+                    "This job is not bound to the selected Career Track.",
+                );
+            } else {
+                passed_checks.push("role_family_aligned".to_string());
+            }
+        }
+    }
 
     match posting.availability_status.as_str() {
         "active" => passed_checks.push("job_active".to_string()),
@@ -274,36 +323,110 @@ fn build_job_eligibility(
         passed_checks.push("location_allowed".to_string());
     }
 
-    if has_employment_type_conflict(posting, preferences) {
-        push_reason(
-            &mut hard_failures,
-            "employment_type_mismatch",
-            "This job uses an employment type you did not select.",
-        );
-    } else {
-        passed_checks.push("employment_type_allowed".to_string());
+    if !preferences.employment_types.is_empty() {
+        match candidate_employment_type(posting) {
+            Some(kind)
+                if preferences.employment_types.iter().any(|allowed| {
+                    normalize_candidate_employment_type(allowed) == Some(kind)
+                }) =>
+            {
+                passed_checks.push("employment_type_allowed".to_string());
+            }
+            Some(_) => push_reason(
+                &mut hard_failures,
+                "employment_type_mismatch",
+                "This job uses an employment type you did not select.",
+            ),
+            None => push_reason(
+                &mut review_reasons,
+                "employment_type_unverified",
+                "Bluey must confirm this job's employment type before Auto-submit.",
+            ),
+        }
     }
 
-    if let (Some((minimum, maximum)), Some((required, inferred_from_title))) = (
-        candidate_experience_range(profile),
-        required_experience_years(posting),
-    ) {
-        if required < minimum || required > maximum {
-            let source = if inferred_from_title {
-                "Bluey inferred the level from the job title"
-            } else {
-                "The posting"
-            };
-            push_reason(
+    if !preferences.engagement_types.is_empty() {
+        match candidate_engagement_type(posting) {
+            Some(kind)
+                if preferences.engagement_types.iter().any(|allowed| {
+                    normalize_candidate_engagement_type(allowed) == Some(kind)
+                }) =>
+            {
+                passed_checks.push("engagement_type_allowed".to_string());
+            }
+            Some(_) => push_reason(
                 &mut hard_failures,
-                "experience_outside_target_range",
-                &format!(
-                    "{source} indicates about {required} years of experience; Bluey is targeting roles requesting {minimum}-{maximum} years for your profile."
-                ),
-            );
-        } else {
-            passed_checks.push("experience_aligned".to_string());
+                "engagement_type_mismatch",
+                "This job uses an engagement type you did not select.",
+            ),
+            None => push_reason(
+                &mut review_reasons,
+                "engagement_type_unverified",
+                "Bluey must confirm whether this role is W2, C2C, 1099, or direct hire before Auto-submit.",
+            ),
         }
+    }
+
+    if let Some(reason) = track_employment_type_failure(posting, track) {
+        push_reason(
+            &mut hard_failures,
+            "track_employment_type_mismatch",
+            &reason,
+        );
+    } else if track.is_some() {
+        passed_checks.push("track_employment_type_allowed".to_string());
+    }
+    if let Some(reason) = track_engagement_type_failure(posting, track) {
+        push_reason(
+            &mut hard_failures,
+            "track_engagement_type_mismatch",
+            &reason,
+        );
+    } else if track.is_some() {
+        passed_checks.push("track_engagement_type_allowed".to_string());
+    }
+    if let Some(reason) = track_work_authorization_failure(profile, posting, track) {
+        push_reason(
+            &mut hard_failures,
+            "work_authorization_mismatch",
+            &reason,
+        );
+    } else if track.is_some() {
+        passed_checks.push("work_authorization_allowed".to_string());
+    }
+
+    let required_minimum = experience_requirement
+        .required_min_months
+        .into_iter()
+        .chain(experience_requirement.title_floor_months)
+        .max();
+    let required_maximum = experience_requirement.required_max_months;
+    let misses_required_minimum = required_minimum
+        .is_some_and(|months| months > experience_evidence.target_max_months);
+    let exceeds_required_maximum = required_maximum
+        .is_some_and(|months| months < experience_evidence.target_min_months);
+    if misses_required_minimum || exceeds_required_maximum {
+        push_reason(
+            &mut hard_failures,
+            "experience_outside_target_range",
+            &format!(
+                "This role's required level is outside this Career Track's {}-{} year target range.",
+                experience_evidence.target_min_months / 12,
+                (experience_evidence.target_max_months + 11) / 12,
+            ),
+        );
+    } else if required_minimum.is_some() || required_maximum.is_some() {
+        passed_checks.push("experience_aligned".to_string());
+    }
+    if experience_requirement
+        .preferred_min_months
+        .is_some_and(|months| months > experience_evidence.target_max_months)
+    {
+        push_reason(
+            &mut review_reasons,
+            "preferred_experience_above_target",
+            "The preferred experience is above this Career Track's target range.",
+        );
     }
 
     if preferences.sponsorship == "required" {
@@ -433,6 +556,13 @@ fn build_job_eligibility(
         hard_failures,
         review_reasons,
         passed_checks,
+        base_profile_fit: posting.match_score,
+        tailored_packet_coverage: None,
+        experience_requirement,
+        experience_evidence,
+        career_track_id: track.map(|value| value.id.clone()).unwrap_or_default(),
+        application_identity_id: track.and_then(|value| value.application_identity_id.clone()),
+        evidence_revision_id: None,
         evaluated_at_ms: now,
     }
 }
@@ -631,48 +761,6 @@ fn compensation_range(compensation: &str) -> Option<(i64, i64)> {
     }
 }
 
-fn has_employment_type_conflict(posting: &JobPosting, preferences: &JobPreferences) -> bool {
-    let allowed: Vec<String> = preferences
-        .employment_types
-        .iter()
-        .map(|item| item.trim().to_lowercase())
-        .filter(|item| !item.is_empty())
-        .collect();
-    if allowed.is_empty() {
-        return false;
-    }
-    let detected = normalize_employment_type(&posting.employment_type).or_else(|| {
-        let text = format!("{} {}", posting.title, posting.description).to_lowercase();
-        if text.contains("internship") || text.contains(" intern ") {
-            Some("internship")
-        } else if text.contains("contract") || text.contains("contractor") {
-            Some("contract")
-        } else if text.contains("part-time") || text.contains("part time") {
-            Some("part_time")
-        } else if text.contains("full-time") || text.contains("full time") {
-            Some("full_time")
-        } else {
-            None
-        }
-    });
-    detected.is_some_and(|kind| !allowed.iter().any(|allowed_kind| allowed_kind == kind))
-}
-
-fn normalize_employment_type(value: &str) -> Option<&'static str> {
-    let normalized = value.trim().to_ascii_lowercase().replace(['-', ' '], "_");
-    if normalized.contains("intern") {
-        Some("internship")
-    } else if normalized.contains("contract") || normalized.contains("temporary") {
-        Some("contract")
-    } else if normalized.contains("part_time") || normalized == "parttime" {
-        Some("part_time")
-    } else if normalized.contains("full_time") || normalized == "fulltime" {
-        Some("full_time")
-    } else {
-        None
-    }
-}
-
 fn clearly_blocks_sponsorship(posting: &JobPosting) -> bool {
     let text = format!("{} {}", posting.title, posting.description).to_lowercase();
     [
@@ -732,161 +820,37 @@ fn clearly_offers_sponsorship(posting: &JobPosting) -> bool {
     .any(|phrase| text.contains(phrase))
 }
 
-fn candidate_experience_range(profile: &CareerProfile) -> Option<(i64, i64)> {
-    let now = Utc::now();
-    let current_month = i64::from(now.year()) * 12 + i64::from(now.month0());
-    let mut intervals: Vec<(i64, i64)> = profile
-        .employment
-        .iter()
-        .filter_map(|entry| {
-            let start = parse_year_month(&entry.start_date)?;
-            let end = if entry.current || entry.end_date.trim().is_empty() {
-                current_month
-            } else {
-                parse_year_month(&entry.end_date)?.saturating_add(1)
-            };
-            (end > start).then_some((start, end))
-        })
-        .collect();
-    if intervals.is_empty() {
-        return None;
-    }
-    intervals.sort_unstable_by_key(|interval| interval.0);
-    let mut total_months = 0i64;
-    let mut merged = intervals[0];
-    for interval in intervals.into_iter().skip(1) {
-        if interval.0 <= merged.1 {
-            merged.1 = merged.1.max(interval.1);
-        } else {
-            total_months = total_months.saturating_add(merged.1 - merged.0);
-            merged = interval;
-        }
-    }
-    total_months = total_months.saturating_add(merged.1 - merged.0);
-    let years = (total_months + 6) / 12;
-    Some((years.saturating_sub(1), years.saturating_add(2)))
-}
-
-fn parse_year_month(value: &str) -> Option<i64> {
-    let mut parts = value.trim().split('-');
-    let year = parts.next()?.parse::<i64>().ok()?;
-    if !(1900..=2200).contains(&year) {
-        return None;
-    }
-    let month = parts
-        .next()
-        .and_then(|part| part.parse::<i64>().ok())
-        .unwrap_or(1);
-    if !(1..=12).contains(&month) {
-        return None;
-    }
-    Some(year * 12 + month - 1)
-}
-
-fn explicit_required_experience_years(posting: &JobPosting) -> Option<i64> {
-    let text = format!("{} {}", posting.title, posting.description).to_ascii_lowercase();
-    let normalized: String = text
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '+' | '-') {
-                character
-            } else {
-                ' '
-            }
-        })
-        .collect();
-    let tokens: Vec<&str> = normalized.split_whitespace().collect();
-    tokens
-        .iter()
-        .enumerate()
-        .filter(|(_, token)| matches!(**token, "year" | "years"))
-        .filter(|(index, _)| tokens.get(index + 1).is_none_or(|token| *token != "ago"))
-        .filter_map(|(index, _)| {
-            let start = index.saturating_sub(3);
-            tokens[start..index]
-                .iter()
-                .rev()
-                .find_map(|token| parse_year_requirement(token))
-        })
-        .filter(|years| (0..=20).contains(years))
-        .max()
-}
-
-fn required_experience_years(posting: &JobPosting) -> Option<(i64, bool)> {
-    explicit_required_experience_years(posting)
-        .map(|years| (years, false))
-        .or_else(|| title_seniority_floor(&posting.title).map(|years| (years, true)))
-}
-
-fn title_seniority_floor(title: &str) -> Option<i64> {
-    let normalized: String = title
-        .to_ascii_lowercase()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                ' '
-            }
-        })
-        .collect();
-    let words: Vec<&str> = normalized.split_whitespace().collect();
-    if words.contains(&"principal") {
-        Some(9)
-    } else if words.contains(&"director") {
-        Some(8)
-    } else if words.contains(&"staff") {
-        Some(7)
-    } else if words
-        .iter()
-        .any(|word| matches!(*word, "senior" | "sr" | "lead"))
-    {
-        Some(5)
-    } else {
-        None
-    }
-}
-
-fn parse_year_requirement(token: &str) -> Option<i64> {
-    let numeric = token
-        .trim_matches('+')
-        .split('-')
-        .next()
-        .unwrap_or_default();
-    numeric.parse::<i64>().ok().or(match numeric {
-        "one" => Some(1),
-        "two" => Some(2),
-        "three" => Some(3),
-        "four" => Some(4),
-        "five" => Some(5),
-        "six" => Some(6),
-        "seven" => Some(7),
-        "eight" => Some(8),
-        "nine" => Some(9),
-        "ten" => Some(10),
-        _ => None,
-    })
-}
-
 fn score_posting(
     posting: &JobPosting,
     profile: &CareerProfile,
     preferences: &JobPreferences,
+    track: Option<&CareerTrack>,
 ) -> (i64, Vec<String>, Vec<String>) {
-    let mut score = 45i64;
+    let mut score = 25i64;
     let mut reasons = Vec::new();
     let mut missing = Vec::new();
     let title = posting.title.to_lowercase();
     let description = posting.description.to_lowercase();
     let location = posting.location.to_lowercase();
 
-    if preferences
-        .desired_roles
-        .iter()
-        .any(|role| title.contains(&role.to_lowercase()) || role.to_lowercase().contains(&title))
-    {
-        score += 20;
-        reasons.push("Role matches your target".to_string());
+    let target_roles = track
+        .map(|value| vec![value.role.as_str()])
+        .unwrap_or_else(|| preferences.desired_roles.iter().map(String::as_str).collect());
+    let role_text_matches = target_roles.iter().any(|role| {
+        let role = role.to_lowercase();
+        !role.trim().is_empty() && (title.contains(&role) || role.contains(&title))
+    });
+    let target_family = canonical_role_family(track, posting);
+    let posting_family = posting_role_family(posting);
+    if role_text_matches {
+        score += 25;
+        reasons.push("Role matches this Career Track".to_string());
+    } else if target_family == posting_family && target_family != ROLE_FAMILY_GENERIC {
+        score += 15;
+        reasons.push("Role family matches this Career Track".to_string());
+    } else if target_family != ROLE_FAMILY_GENERIC && posting_family != ROLE_FAMILY_GENERIC {
+        score -= 20;
+        missing.push("Role belongs to a different Career Track".to_string());
     }
 
     let matching_skills: Vec<String> = profile
@@ -897,7 +861,7 @@ fn score_posting(
         .cloned()
         .collect();
     if !matching_skills.is_empty() {
-        score += (matching_skills.len() as i64 * 4).min(20);
+        score += (matching_skills.len() as i64 * 5).min(25);
         reasons.push(format!("Matches {} profile skills", matching_skills.len()));
     } else if !profile.skills.is_empty() && !description.is_empty() {
         missing.push("No direct skill overlap found yet".to_string());
@@ -909,25 +873,44 @@ fn score_posting(
     }) || (preferences.remote_preference.contains("remote")
         && (posting.workplace.eq_ignore_ascii_case("remote") || location.contains("remote")))
     {
-        score += 10;
+        score += 15;
         reasons.push("Location preference fits".to_string());
     }
 
-    if let (Some((minimum, maximum)), Some((required, _))) = (
-        candidate_experience_range(profile),
-        required_experience_years(posting),
-    ) {
-        if (minimum..=maximum).contains(&required) {
-            score += 10;
+    let evidence = role_experience_evidence(profile, track, posting);
+    let requirement = experience_requirement(posting);
+    let required_minimum = requirement
+        .required_min_months
+        .into_iter()
+        .chain(requirement.title_floor_months)
+        .max();
+    let required_maximum = requirement.required_max_months;
+    let required_aligned = required_minimum
+        .is_none_or(|months| months <= evidence.target_max_months)
+        && required_maximum.is_none_or(|months| months >= evidence.target_min_months);
+    if required_minimum.is_some() || required_maximum.is_some() {
+        if required_aligned {
+            score += 15;
             reasons.push(format!(
-                "Experience request fits your {minimum}-{maximum} year target range"
+                "Required experience fits this Track's {}-{} year range",
+                evidence.target_min_months / 12,
+                (evidence.target_max_months + 11) / 12,
             ));
         } else {
-            score -= 15;
+            score -= 25;
             missing.push(format!(
-                "Role requests {required} years; your target range is {minimum}-{maximum} years"
+                "Required experience is outside this Track's {}-{} year range",
+                evidence.target_min_months / 12,
+                (evidence.target_max_months + 11) / 12,
             ));
         }
+    }
+    if requirement
+        .preferred_min_months
+        .is_some_and(|months| months <= evidence.target_max_months)
+    {
+        score += 5;
+        reasons.push("Preferred experience also fits".to_string());
     }
 
     if posting.compensation.is_empty() || preferences.minimum_compensation.is_none() {

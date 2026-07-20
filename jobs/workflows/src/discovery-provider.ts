@@ -49,6 +49,8 @@ export type PublicAtsDiscoveryPayload = JsonObject & {
   description: string;
   compensation: string;
   department: string;
+  employment_type: string;
+  engagement_type: string;
   source: string;
 };
 
@@ -221,6 +223,8 @@ function scheduledJob(
       description: job.description,
       compensation: job.compensation ?? "",
       department: job.department ?? "",
+      employment_type: job.employmentType ?? "",
+      engagement_type: job.engagementType ?? "",
       source: job.source,
     },
   };
