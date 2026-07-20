@@ -16,6 +16,8 @@ const CATALOG_PATH_PREFIX: &str = "/jobhive/v1/";
 const MANIFEST_MAX_BYTES: usize = 256 * 1024;
 const COMPANY_CSV_MAX_BYTES: usize = 2 * 1024 * 1024;
 const CATALOG_TTL_MS: i64 = 6 * 60 * 60 * 1_000;
+const MAX_REJECTED_ROWS: usize = 100;
+const MAX_REJECTED_ROW_PERCENT: usize = 2;
 
 pub(super) const DISCOVERY_INTERVAL_MS: i64 = 4 * 60 * 60 * 1_000;
 pub(super) const ALLOWED_PROVIDERS: [&str; 5] =
@@ -221,14 +223,39 @@ fn parse_company_csv(
         bail!("Jobs source-directory CSV headers are invalid")
     }
     let mut records = Vec::with_capacity(descriptor.rows);
+    let mut raw_rows = 0usize;
+    let mut rejected_rows = 0usize;
     for row in reader.deserialize::<CompanyCsvRow>() {
         let row = row.context("parse Jobs source-directory CSV row")?;
+        raw_rows = raw_rows.saturating_add(1);
         if let Some(record) = catalog_record_from_row(provider, row) {
             records.push(record);
+        } else {
+            rejected_rows = rejected_rows.saturating_add(1);
         }
     }
-    if records.len() != descriptor.rows {
+    if raw_rows != descriptor.rows {
         bail!("Jobs source-directory CSV row count did not match its manifest")
+    }
+    let rejection_limit = descriptor
+        .rows
+        .saturating_mul(MAX_REJECTED_ROW_PERCENT)
+        .div_ceil(100)
+        .min(MAX_REJECTED_ROWS);
+    if rejected_rows > rejection_limit {
+        bail!("Jobs source-directory CSV contained too many invalid rows")
+    }
+    if rejected_rows > 0 {
+        tracing::warn!(
+            provider,
+            raw_rows,
+            accepted_rows = records.len(),
+            rejected_rows,
+            "Filtered invalid rows from the Jobs source directory"
+        );
+    }
+    if records.is_empty() {
+        bail!("Jobs source-directory CSV has no trusted rows")
     }
     Ok(records)
 }
@@ -343,6 +370,36 @@ mod tests {
         assert_eq!(rows[0].company, "Acme");
         assert_eq!(rows[0].source_key, "acme");
         assert_eq!(rows[0].id.len(), 64);
+    }
+
+    #[test]
+    fn verifies_raw_manifest_rows_before_filtering_untrusted_records() {
+        let bytes = b"name,slug,url\nAcme,acme,https://job-boards.greenhouse.io/acme\nUntrusted,untrusted,https://evil.example/untrusted\n";
+        let descriptor = descriptor_for(bytes, 2);
+        let rows = parse_company_csv("greenhouse", &descriptor, bytes).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].company, "Acme");
+    }
+
+    #[test]
+    fn rejects_raw_manifest_count_mismatches() {
+        let bytes = b"name,slug,url\nAcme,acme,https://job-boards.greenhouse.io/acme\n";
+        let descriptor = descriptor_for(bytes, 2);
+        assert!(parse_company_csv("greenhouse", &descriptor, bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_catalogs_with_too_many_untrusted_rows() {
+        let mut csv = String::from("name,slug,url\n");
+        csv.push_str("Acme,acme,https://job-boards.greenhouse.io/acme\n");
+        for index in 0..2 {
+            csv.push_str(&format!(
+                "Untrusted {index},untrusted-{index},https://evil.example/untrusted-{index}\n"
+            ));
+        }
+        let bytes = csv.as_bytes();
+        let descriptor = descriptor_for(bytes, 3);
+        assert!(parse_company_csv("greenhouse", &descriptor, bytes).is_err());
     }
 
     #[test]
