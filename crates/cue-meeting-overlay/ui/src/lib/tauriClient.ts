@@ -858,9 +858,6 @@ export function createTauriClient(): MeetingClient {
             ? body.slice(lastBody.length)
             : body;
           lastBody = body;
-          console.log(
-            `[ask] update_card body.len=${body.length} delta.len=${delta.length} done=${u.done}`,
-          );
           if (delta.length > 0) {
             const chunk: AnswerChunk = { text: delta };
             onChunk(chunk);

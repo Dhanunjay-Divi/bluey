@@ -52,7 +52,9 @@ impl MeetingMemorySource for Fixture {
     }
     async fn search_agent_history(&self, query: &str, _limit: usize) -> Vec<AgentHistoryHitOut> {
         vec![AgentHistoryHitOut {
-            text: format!("prior reasoning about {query}: we chose advisory locks over table locks"),
+            text: format!(
+                "prior reasoning about {query}: we chose advisory locks over table locks"
+            ),
             agent: "Claude Code".to_string(),
             session_id: "fixture-session".to_string(),
             when: "1750000000".to_string(),
