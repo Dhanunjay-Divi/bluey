@@ -4,7 +4,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -14,7 +14,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::Parser;
 use cue_agent_bridge::{
     discover_agents,
-    drive::{drive_with_mode, DriveMode},
+    drive::DriveMode,
     fix::{extract_diff, fix_apply_prompt, fix_proposal_prompt, parse_fix_proposal, FixProposal},
     is_transient_network_error, read_connectors, reader_for,
     registry::{fix_profile_for, KindTag},
@@ -299,7 +299,7 @@ fn streaming_word_chunks(text: &str) -> Vec<String> {
 /// label. Only registry agents are selectable for driving — a freeform
 /// `Other`/`Unknown` value is intentionally rejected so we never route a
 /// live answer to something we cannot drive.
-fn parse_attached_agent(label: Option<&str>) -> Option<AgentKind> {
+pub(crate) fn parse_attached_agent(label: Option<&str>) -> Option<AgentKind> {
     let label = label.map(str::trim).filter(|value| !value.is_empty())?;
     // `AgentKind` derives serde with `rename_all = "snake_case"`; round-trip
     // the bare label through JSON to map it onto a known variant.
@@ -1079,6 +1079,16 @@ pub(crate) struct Daemon {
     /// archives the meeting, or those tail finals commit after the archive and
     /// re-fragment into a fresh 1-line meeting. `None` when no session is running.
     system_audio_task: Mutex<Option<JoinHandle<()>>>,
+    /// MICROPHONE capture handle (the operator's own voice). Runs INDEPENDENTLY
+    /// of the system-audio capture above, with its OWN STT provider instance —
+    /// the streaming model is stateful, so one model PER source is mandatory
+    /// (sharing corrupts transcript text + mislabels speakers). Toggled by the
+    /// composer's mic button (`enable_microphone`); `None` when mic is off.
+    microphone: Mutex<Option<crate::audio::capture::MicrophoneCapture>>,
+    /// JoinHandle for the mic STT + ordered-sink task (mirrors
+    /// `system_audio_task`). Awaited on stop so trailing mic finals commit before
+    /// any auto-end archives the meeting.
+    microphone_task: Mutex<Option<JoinHandle<()>>>,
     /// Running decisions ledger for the active meeting (see [`crate::ledger`]).
     /// Populated by stateless cheap-lane extraction on a WORD-count cadence;
     /// rendered as a pinned context block on the answer path. Reset per meeting.
@@ -1089,6 +1099,14 @@ pub(crate) struct Daemon {
     last_ledger_words: std::sync::atomic::AtomicUsize,
     /// Same word-count gate for the running SUMMARY pass (see `crate::summary`).
     last_summary_words: std::sync::atomic::AtomicUsize,
+    /// Rolling summary of the in-meeting CONVERSATION (older Q&A turns folded
+    /// down by the stateless one-shot). In-memory for Wave 1 — the raw turns in
+    /// `conversation_turns` are the durable source of truth and are re-foldable.
+    /// Reset per meeting alongside the ledger. See `crate::conversation`.
+    pub(crate) conv_summary: Mutex<Option<String>>,
+    /// Single-flight guard for the conversation-summary fold task, so an
+    /// overflow while a fold is already running does not spawn a second.
+    pub(crate) conv_fold_inflight: std::sync::atomic::AtomicBool,
     live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
     rag: Option<Arc<crate::db::rag::RagPipeline>>,
     rag_index_lock: Arc<Mutex<()>>,
@@ -1131,7 +1149,14 @@ pub(crate) struct Daemon {
     /// `None` until the background init finishes (first run downloads the
     /// ~35MB embedding model); every consumer treats `None` as "memory off".
     #[cfg(feature = "local-memory")]
-    facts_memory: Mutex<Option<Arc<crate::memory::FactsMemory>>>,
+    pub(crate) facts_memory: Mutex<Option<Arc<crate::memory::FactsMemory>>>,
+    /// Cross-agent session-history retrieval index (the "borrow their reasoning"
+    /// side-channel, Wave 2). Always present but INERT unless the feature flag
+    /// (`BLUEY_AGENT_HISTORY`) + session-history consent are both on; builds
+    /// lazily on the first `search_agent_history` and refreshes on a TTL. Reuses
+    /// the `facts_memory` embedder (no second model copy).
+    #[cfg(feature = "local-memory")]
+    pub(crate) agent_history: Arc<crate::agent_history::AgentHistoryStore>,
     /// Stage-2 question classifier (two-stage for-me detection). `None` when
     /// the bundled model is absent — detection stays regex-only.
     #[cfg(feature = "local-memory")]
@@ -1384,9 +1409,13 @@ pub async fn run() -> Result<()> {
         pending_fixes: Mutex::new(HashMap::new()),
         system_audio: Mutex::new(None),
         system_audio_task: Mutex::new(None),
+        microphone: Mutex::new(None),
+        microphone_task: Mutex::new(None),
         ledger: Mutex::new(cue_core::LedgerState::default()),
         last_ledger_words: std::sync::atomic::AtomicUsize::new(0),
         last_summary_words: std::sync::atomic::AtomicUsize::new(0),
+        conv_summary: Mutex::new(None),
+        conv_fold_inflight: std::sync::atomic::AtomicBool::new(false),
         live_transcript_tx: broadcast::channel(64).0,
         rag: rag_pipeline,
         rag_index_lock: Arc::new(Mutex::new(())),
@@ -1400,6 +1429,8 @@ pub async fn run() -> Result<()> {
         summary_inflight: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "local-memory")]
         facts_memory: Mutex::new(None),
+        #[cfg(feature = "local-memory")]
+        agent_history: Arc::new(crate::agent_history::AgentHistoryStore::new()),
         #[cfg(feature = "local-memory")]
         qdetect: Mutex::new(None),
         mcp_server: Mutex::new(None),
@@ -1689,6 +1720,7 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                     daemon
                         .last_summary_words
                         .store(0, std::sync::atomic::Ordering::Relaxed);
+                    crate::conversation::reset_for_meeting(daemon, Some(meeting.id)).await;
                     update_state_from_meeting(daemon, Some(&meeting)).await?;
                 }
             }
@@ -2116,6 +2148,7 @@ async fn handle_request_inner(
             daemon
                 .last_summary_words
                 .store(0, std::sync::atomic::Ordering::Relaxed);
+            crate::conversation::reset_for_meeting(daemon, Some(meeting.id)).await;
 
             update_state_from_meeting(daemon, Some(&meeting)).await?;
             let card = CueCard::new(
@@ -3335,15 +3368,35 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::RecordingStartRequested {
             enable_microphone,
-            enable_system: _,
+            enable_system,
         } => {
-            // v1 streams SYSTEM audio only (the other people in the meeting —
-            // the question trigger). Mic streaming is a deliberate follow-up,
-            // so the per-source toggles are not honored yet; the overlay copy
-            // says "Listen (system audio)" so this is not a false promise. We
-            // route to the proven continuous streaming task (no chunk files).
-            let _ = enable_microphone;
+            // Per-source toggles are now BOTH honored. System audio (the other
+            // people — the question trigger) and the microphone (the operator's
+            // own voice) each run their OWN continuous-streaming capture + STT
+            // model. The composer's speaker button drives `enable_system`; its
+            // mic button drives `enable_microphone`. Either can be on alone or
+            // both together; mic segments are stamped Microphone → "You".
             set_overlay_listening_state(daemon, ListeningState::Connecting).await;
+
+            // Microphone: start or stop independently of the system path.
+            if enable_microphone {
+                if let Err(e) = start_microphone_capture_task(daemon).await {
+                    warn!("microphone capture failed to start: {e:#}");
+                }
+            } else {
+                stop_microphone_capture(daemon).await;
+            }
+
+            // System audio: if not requested, this Start is mic-only — reflect a
+            // listening state and skip the system capture.
+            if !enable_system {
+                if daemon.microphone.lock().await.is_some() {
+                    set_overlay_listening_state(daemon, ListeningState::Listening).await;
+                } else {
+                    set_overlay_listening_state(daemon, ListeningState::Idle).await;
+                }
+                return Ok(());
+            }
             match start_system_audio_capture_task(daemon, false).await {
                 Ok(()) => {
                     set_overlay_listening_state(daemon, ListeningState::Listening).await;
@@ -3400,7 +3453,13 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             .await;
         }
         OverlayEvent::CloseRequested => {
+            // The × button ("Turn Bluey off"). Logged so a click that doesn't
+            // visibly stop Bluey leaves evidence (the event reached the daemon
+            // vs. was dropped at the socket/token layer). Full teardown + exit —
+            // the same end state as `bluey off`'s DaemonRequest::Shutdown.
+            info!("close_requested (× button): shutting down the daemon");
             shutdown_daemon(daemon).await;
+            info!("close_requested: teardown complete, exiting");
             std::process::exit(0);
         }
         OverlayEvent::Exited => {
@@ -4430,6 +4489,10 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                 daemon
                     .last_summary_words
                     .store(0, std::sync::atomic::Ordering::Relaxed);
+                // Reset the in-memory conversation summary (it belonged to the
+                // outgoing meeting). The target meeting's own turns stay in the
+                // DB and re-assemble when it becomes active — do NOT clear them.
+                crate::conversation::reset_for_meeting(daemon, None).await;
             }
 
             // (b) Load the target. A missing/failed target leaves state clean (the
@@ -4895,9 +4958,26 @@ async fn drive_and_collect(
     question: AgentQuestion,
     mode: DriveMode,
 ) -> std::result::Result<String, String> {
-    let stream = drive_with_mode(agent, question, mode)
-        .await
-        .map_err(|error| format!("{error:#}"))?;
+    drive_and_collect_ephemeral(agent, question, mode, false).await
+}
+
+/// [`drive_and_collect`] with the ephemeral switch, for the BACKGROUND one-shots
+/// (ledger / summary / conversation fold). These are the majority of all drives
+/// in a meeting (~30/hour vs. a handful of asks), so leaving them non-ephemeral
+/// would leave most of the on-disk residue in place even with the answer path
+/// wired. Honored only where the agent's CLI has a real flag (Codex today);
+/// elsewhere it degrades to a normal, persisting drive.
+async fn drive_and_collect_ephemeral(
+    agent: AgentKind,
+    question: AgentQuestion,
+    mode: DriveMode,
+    ephemeral: bool,
+) -> std::result::Result<String, String> {
+    let ephemeral = ephemeral && cue_agent_bridge::agent_supports_ephemeral(&agent);
+    let stream =
+        cue_agent_bridge::drive::drive_with_mode_ephemeral(agent, question, mode, ephemeral)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
     futures_util::pin_mut!(stream);
     let mut body = String::new();
     while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
@@ -5264,6 +5344,195 @@ async fn build_system_audio_stt_provider() -> anyhow::Result<Box<dyn cue_core::s
     crate::stt::factory::build_stt_chain(&stt_cfg, AudioSource::System)
         .await
         .map_err(|e| anyhow::anyhow!("STT factory: {e}"))
+}
+
+/// A SEPARATE STT provider instance for the microphone source. The streaming
+/// model is stateful, so mic and system audio MUST each drive their own model —
+/// one shared model would interleave two speakers into one cache and corrupt
+/// both transcripts. Same chain/config as system, only the source differs (so
+/// its segments are stamped `Microphone` → the "You" label downstream).
+async fn build_microphone_stt_provider() -> anyhow::Result<Box<dyn cue_core::stt::SttProvider>> {
+    use cue_core::pcm::AudioSource;
+    use cue_core::stt::SttConfig;
+
+    let stt_cfg = SttConfig {
+        source: AudioSource::Microphone,
+        ..Default::default()
+    };
+
+    crate::stt::factory::build_stt_chain(&stt_cfg, AudioSource::Microphone)
+        .await
+        .map_err(|e| anyhow::anyhow!("STT factory (mic): {e}"))
+}
+
+/// Linear-interpolation downsample from an arbitrary device rate to 16 kHz mono
+/// (the rate the streaming STT model expects). The mic device is typically
+/// 44.1/48 kHz; the STT engine self-buffers to its encoder window, so simple
+/// linear resampling is sufficient here (mirrors `resample_16k_to_24k`'s
+/// approach on the OpenAI path). Returns the input unchanged when already 16 kHz.
+fn resample_to_16k(samples: &[i16], src_hz: u32) -> Vec<i16> {
+    const DST_HZ: u32 = 16_000;
+    if src_hz == DST_HZ || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let ratio = src_hz as f64 / DST_HZ as f64;
+    let out_len = ((samples.len() as f64) / ratio).floor() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos.floor() as usize;
+        let frac = src_pos - idx as f64;
+        let a = samples[idx.min(samples.len() - 1)] as f64;
+        let b = samples[(idx + 1).min(samples.len() - 1)] as f64;
+        out.push((a + (b - a) * frac).round() as i16);
+    }
+    out
+}
+
+/// Start CONTINUOUS microphone capture into its OWN STT provider, committing
+/// mic transcript segments (stamped `Microphone` → "You") into the same ordered
+/// sink the system path uses. Runs alongside system audio, fully independent:
+/// its own capture thread, its own STT model, its own 100 ms-coalesced feed.
+/// Idempotent — a prior mic session is stopped first. Never creates a meeting
+/// (system audio / MeetingStart owns that); it only contributes segments.
+async fn start_microphone_capture_task(daemon: &Arc<Daemon>) -> Result<()> {
+    use cue_core::pcm::{AudioChunk, AudioSource, SampleRate};
+
+    // Idempotent restart: stop any prior mic session + join its task first.
+    {
+        let mut slot = daemon.microphone.lock().await;
+        if let Some(prev) = slot.take() {
+            prev.stop();
+            if let Some(prev_task) = daemon.microphone_task.lock().await.take() {
+                let _ = prev_task.await;
+            }
+        }
+    }
+
+    let mic_device = {
+        let db_path = daemon.paths.data_dir.join("sessions.db");
+        crate::audio::capture::load_mic_device_setting(db_path.to_str().unwrap_or("sessions.db"))
+    };
+    let opts = crate::audio::capture::CaptureOptions {
+        source: AudioSource::Microphone,
+        chunk_ms: 20,
+        device_name: mic_device,
+    };
+    let (handle, mut mic_rx) = crate::audio::capture::MicrophoneCapture::start(opts)
+        .context("start microphone capture")?;
+    let device_hz = handle.sample_rate().hz();
+    info!(device_hz, "microphone continuous capture started");
+    *daemon.microphone.lock().await = Some(handle);
+
+    let daemon_mic = daemon.clone();
+    let task = tokio::spawn(async move {
+        // Ordered sink (same discipline as the system path): a single consumer
+        // commits mic segments in receipt order so the dedup tail stays consistent.
+        let (seg_tx, mut seg_rx) = mpsc::unbounded_channel::<cue_core::audio::SttSegmentMetadata>();
+        let sink_daemon = daemon_mic.clone();
+        let sink_task = tokio::spawn(async move {
+            while let Some(segment) = seg_rx.recv().await {
+                if let Err(e) =
+                    add_audio_transcript_segment_allowing_session_start(&sink_daemon, &segment)
+                        .await
+                {
+                    warn!("mic STT drain: forward failed: {e:#}");
+                }
+            }
+        });
+
+        let mut stt = match build_microphone_stt_provider().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("microphone STT provider failed to start: {e:#}");
+                return;
+            }
+        };
+
+        // Same uniform 100 ms coalescing the system path uses — but the mic
+        // arrives at the device rate, so resample to 16 kHz FIRST, then coalesce
+        // the 16 kHz stream to exactly 1600-sample chunks.
+        const COALESCE_SAMPLES: usize = 1600; // 100 ms @ 16 kHz mono
+        let mut coalesce_buf: Vec<i16> = Vec::with_capacity(COALESCE_SAMPLES);
+        let mut coalesce_started_at_ms: u64 = 0;
+
+        loop {
+            tokio::select! {
+                chunk_opt = mic_rx.recv() => {
+                    match chunk_opt {
+                        Some(chunk) => {
+                            let samples16 = resample_to_16k(&chunk.samples, device_hz);
+                            if coalesce_buf.is_empty() {
+                                coalesce_started_at_ms = chunk.captured_at_ms;
+                            }
+                            coalesce_buf.extend_from_slice(&samples16);
+                            while coalesce_buf.len() >= COALESCE_SAMPLES {
+                                let batch: Vec<i16> =
+                                    coalesce_buf.drain(..COALESCE_SAMPLES).collect();
+                                let batched = AudioChunk {
+                                    source: AudioSource::Microphone,
+                                    sample_rate: SampleRate::SR_16K,
+                                    samples: batch,
+                                    captured_at_ms: coalesce_started_at_ms,
+                                };
+                                coalesce_started_at_ms = coalesce_started_at_ms
+                                    .saturating_add((COALESCE_SAMPLES as u64) * 1000 / 16_000);
+                                if let Err(e) = stt.send_audio(&batched).await {
+                                    warn!("mic STT send failed: {e}");
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                event_opt = stt.next_event() => {
+                    match event_opt {
+                        Some(Ok(event)) => {
+                            if let Some(segment) = transcript_event_to_stt_segment(&event) {
+                                if seg_tx.send(segment).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!("mic STT drain: provider error: {e}");
+                            if !e.is_retryable() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        // Flush the sub-100 ms remainder, close the provider, drain the sink.
+        if !coalesce_buf.is_empty() {
+            let tail = AudioChunk {
+                source: AudioSource::Microphone,
+                sample_rate: SampleRate::SR_16K,
+                samples: std::mem::take(&mut coalesce_buf),
+                captured_at_ms: coalesce_started_at_ms,
+            };
+            let _ = stt.send_audio(&tail).await;
+        }
+        let _ = stt.close().await;
+        drop(seg_tx);
+        let _ = sink_task.await;
+    });
+    *daemon.microphone_task.lock().await = Some(task);
+    Ok(())
+}
+
+/// Stop the microphone capture (if running) and await its STT/sink drain, so
+/// trailing mic finals commit before any auto-end archives the meeting.
+async fn stop_microphone_capture(daemon: &Arc<Daemon>) {
+    if let Some(mic) = daemon.microphone.lock().await.take() {
+        mic.stop();
+    }
+    if let Some(task) = daemon.microphone_task.lock().await.take() {
+        let _ = task.await;
+    }
 }
 
 /// Whether a CLOUD speech-to-text path is configured, using the SAME precedence
@@ -7391,6 +7660,7 @@ async fn auto_end_active_meeting(daemon: &Arc<Daemon>) -> Result<Option<MeetingR
     daemon
         .last_summary_words
         .store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::conversation::reset_for_meeting(daemon, None).await;
     update_state_from_meeting(daemon, None).await?;
     debug!(meeting_id = %meeting.id, path = %path.display(), "meeting auto-ended and archived");
     // R10: Auto-recap via LLM (best-effort, fire-and-forget).
@@ -7426,6 +7696,10 @@ async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
     if let Some(capture) = daemon.system_audio.lock().await.take() {
         capture.stop().await;
     }
+
+    // Tear down the microphone capture too (independent source). Awaits its
+    // STT/sink drain so trailing mic finals commit before any auto-end archive.
+    stop_microphone_capture(daemon).await;
 
     // Await the outer STT/sink task to completion. `capture.stop()` above joined
     // only the capture *supervisor*, which closed `sys_rx`; the outer task then
@@ -7469,7 +7743,7 @@ async fn add_audio_transcript_segment_allowing_session_start(
 /// override); otherwise the `live_memory_enabled` setting decides (default ON —
 /// extraction now runs through the user's own attached agent, so the original
 /// cloud-cost reason for gating no longer applies by default).
-fn live_memory_enabled(daemon: &Arc<Daemon>) -> bool {
+pub(crate) fn live_memory_enabled(daemon: &Arc<Daemon>) -> bool {
     if std::env::var("BLUEY_LEDGER").is_ok() {
         return crate::ledger::enabled();
     }
@@ -7478,13 +7752,87 @@ fn live_memory_enabled(daemon: &Arc<Daemon>) -> bool {
         .unwrap_or(true)
 }
 
+/// Whether **ephemeral drive** is on (WAVE 3): the answer drive asks the
+/// attached agent to persist NOTHING to its own session store and starts a
+/// fresh, non-resumed turn every time (the app-owned conversation block carries
+/// continuity). The `BLUEY_EPHEMERAL_DRIVE` env var, when set, wins in both
+/// directions (dev/test override) — `1`/`true` forces ON, anything else forces
+/// OFF; otherwise the `ephemeral_drive` setting decides. Default OFF: this is
+/// behavior-changing and unvalidated live, and only Claude Code / Codex can
+/// honor it (unsupported agents still persist — see `resolve_ephemeral`).
+pub(crate) fn ephemeral_drive_enabled(daemon: &Arc<Daemon>) -> bool {
+    let setting = load_settings(&daemon.paths)
+        .map(|settings| settings.ephemeral_drive)
+        .unwrap_or(false);
+    resolve_ephemeral_enabled(
+        std::env::var("BLUEY_EPHEMERAL_DRIVE").ok().as_deref(),
+        setting,
+    )
+}
+
+/// Ephemeral-drive policy WITHOUT a `Daemon` handle. The policy is a
+/// daemon-level setting (env over persisted setting), not a property of the
+/// overlay — so headless drives (`bluey ask`, tests, any path with no overlay
+/// stream) must honor it too. Live-verified 2026-07-18: gating this on the
+/// overlay stream silently disabled ephemeral for every headless ask, which
+/// still wrote a session file. Falls back to env-only when the settings path
+/// can't be discovered (env alone is enough for the dev/test hook).
+pub(crate) fn ephemeral_drive_enabled_ambient() -> bool {
+    let setting = AppPaths::discover()
+        .ok()
+        .and_then(|paths| load_settings(&paths).ok())
+        .map(|settings| settings.ephemeral_drive)
+        .unwrap_or(false);
+    resolve_ephemeral_enabled(
+        std::env::var("BLUEY_EPHEMERAL_DRIVE").ok().as_deref(),
+        setting,
+    )
+}
+
+/// Pure env-over-setting resolution for `ephemeral_drive_enabled`, split out so
+/// it is unit-testable without touching process env (which is racy + `unsafe` in
+/// recent editions) or a `Daemon`. When `BLUEY_EPHEMERAL_DRIVE` is present it
+/// WINS in both directions — `1`/`true` (case-insensitive) forces ON, any other
+/// value forces OFF — otherwise the persisted `setting` decides. Default is OFF.
+fn resolve_ephemeral_enabled(env: Option<&str>, setting: bool) -> bool {
+    match env {
+        Some(raw) => raw == "1" || raw.eq_ignore_ascii_case("true"),
+        None => setting,
+    }
+}
+
+/// Pure decision for the ephemeral-drive drive site: given whether ephemeral was
+/// requested (`want`) and whether the attached agent can honor it (`supported`,
+/// from `cue_agent_bridge::agent_supports_ephemeral`), return
+/// `(effective, honored)` where `effective` is the ephemeral flag actually
+/// passed to the bridge and `honored` is whether the request could be satisfied.
+///
+/// - not requested        → `(false, true)`  (nothing to honor; today's behavior)
+/// - requested + supported → `(true,  true)`  (ephemeral, no resume)
+/// - requested + unsupported → `(false, false)` (fall back to a normal drive; the
+///   caller logs a best-effort note — the agent still persists)
+///
+/// Side-effect-free so the 4-way truth table is unit-testable without a drive.
+fn resolve_ephemeral(want: bool, supported: bool) -> (bool, bool) {
+    let honored = !want || supported;
+    let effective = want && supported;
+    (effective, honored)
+}
+
+/// One-shot guard so the "ephemeral requested but unsupported" fallback is
+/// logged at most once per daemon process instead of on every answer turn.
+static EPHEMERAL_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Run one **stateless, throwaway one-shot drive** of the attached agent for
 /// background memory work (ledger extraction / rolling summary). `resume: None`
 /// drives the agent's headless print mode — verified (claude, 2026-07) to
 /// persist NO session, so this never pollutes the user's session list or their
 /// answer session (PLAN-CONTEXT-WARMUP Appendix C). Returns `None` when no
 /// agent is attached or the drive fails — callers fall back or skip.
-async fn memory_oneshot_via_agent(daemon: &Arc<Daemon>, prompt: String) -> Option<String> {
+pub(crate) async fn memory_oneshot_via_agent(
+    daemon: &Arc<Daemon>,
+    prompt: String,
+) -> Option<String> {
     let settings = load_settings(&daemon.paths).ok()?;
     let kind = parse_attached_agent(settings.attached_agent.as_deref())?;
     let question = AgentQuestion {
@@ -7493,7 +7841,12 @@ async fn memory_oneshot_via_agent(daemon: &Arc<Daemon>, prompt: String) -> Optio
         resume: None,
         cwd: None,
     };
-    match drive_and_collect(kind.clone(), question, DriveMode::Answer).await {
+    // Background one-shots honor the ephemeral setting too. `resume: None` only
+    // means "don't CONTINUE a session" — the agent still WRITES one unless the
+    // ephemeral flag is passed. These passes fire ~30x per meeting-hour (ledger,
+    // summary, conversation fold), so they are the bulk of the on-disk residue.
+    let ephemeral = ephemeral_drive_enabled(daemon);
+    match drive_and_collect_ephemeral(kind.clone(), question, DriveMode::Answer, ephemeral).await {
         Ok(body) => Some(body),
         Err(error) => {
             debug!(
@@ -7561,9 +7914,50 @@ impl cue_mcp::MeetingMemorySource for DaemonMemorySource {
     async fn search_past_meetings(&self, query: &str, limit: usize) -> Vec<cue_mcp::FactHitOut> {
         self.facts_hits(query, limit, true).await
     }
+
+    async fn search_agent_history(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Vec<cue_mcp::AgentHistoryHitOut> {
+        self.agent_history_hits(query, limit).await
+    }
 }
 
 impl DaemonMemorySource {
+    /// Cross-agent session-history search (the "borrow their reasoning" tool).
+    /// Delegates to the daemon's [`crate::agent_history::AgentHistoryStore`],
+    /// which returns `[]` when the feature/consent is off or the index is empty
+    /// (fail-soft, never errors — an off feature just yields no hits). Only SHORT
+    /// lock holds happen inside the store.
+    async fn agent_history_hits(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Vec<cue_mcp::AgentHistoryHitOut> {
+        #[cfg(feature = "local-memory")]
+        {
+            let hits = self
+                .daemon
+                .agent_history
+                .search(&self.daemon, query, limit)
+                .await;
+            hits.into_iter()
+                .map(|hit| cue_mcp::AgentHistoryHitOut {
+                    text: hit.text,
+                    agent: hit.agent,
+                    session_id: hit.session_id,
+                    when: format_epoch_when(hit.epoch_secs),
+                    score: hit.score,
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "local-memory"))]
+        {
+            let _ = (query, limit);
+            Vec::new()
+        }
+    }
     /// Hybrid facts search shared by the two search tools. `exclude_active`
     /// drops the live meeting's own facts (its ledger is served whole by
     /// `get_meeting_summary`). Fail-soft: store errors log and return empty.
@@ -7605,6 +7999,19 @@ impl DaemonMemorySource {
             let _ = (query, limit, exclude_active);
             Vec::new()
         }
+    }
+}
+
+/// Render an agent-history hit's `epoch_secs` as the tool's `when` field. There
+/// is no date library in-tree (the session readers use epoch strings too), so we
+/// surface the raw epoch seconds as a stable, dependency-free recency marker and
+/// leave `when` empty for the unknown-timestamp sentinel (`0`).
+#[cfg(feature = "local-memory")]
+fn format_epoch_when(epoch_secs: u64) -> String {
+    if epoch_secs == 0 {
+        String::new()
+    } else {
+        epoch_secs.to_string()
     }
 }
 
@@ -7701,6 +8108,7 @@ async fn warmup_open(daemon: &Arc<Daemon>, title: Option<String>) -> Result<Warm
                 daemon
                     .last_summary_words
                     .store(0, std::sync::atomic::Ordering::Relaxed);
+                crate::conversation::reset_for_meeting(daemon, Some(meeting.id)).await;
                 update_state_from_meeting(daemon, Some(&meeting)).await?;
                 t
             }
@@ -8794,6 +9202,19 @@ async fn answer_with_provider_runtime(
                 Some(source.clone()),
                 Some(outcome.provider.display_label()),
             ));
+            // App-owned conversation memory (see `crate::conversation`): persist
+            // this exchange to the turn store so it re-supplies as context on
+            // later asks (the durable back-end of "follow up on that"). Skip the
+            // warm-up drive — it primes the session, it is not a Q&A turn.
+            // Fire-and-forget; a DB hiccup must never surface on the answer path.
+            if source != "warmup" {
+                crate::conversation::record_turns(
+                    daemon,
+                    meeting.id,
+                    &visible_question,
+                    &response.answer,
+                );
+            }
             daemon.store.save_active(meeting)?;
             meeting.clone()
         } else {
@@ -9587,7 +10008,40 @@ async fn drive_answer_attempt(
     effort_override: &[String],
     stream: &mut Option<&mut OverlayAnswerStream>,
 ) -> Result<DriveOutcome, DriveFailure> {
-    let mut question = agent_question_from_payload(payload, resume);
+    // Ephemeral-drive decision (WAVE 3, default OFF). When ON *and* the attached
+    // agent can honor it (Claude Code / Codex), the drive persists NOTHING to the
+    // agent's session store and runs a fresh, non-resumed turn — the app-owned
+    // conversation block (assembled in `answer_context_for_question`, independent
+    // of resume) carries dialogue continuity instead. The policy is daemon-level
+    // (env over persisted setting) and is read AMBIENTLY — NOT through the overlay
+    // stream: gating on the stream silently disabled ephemeral for every headless
+    // ask (live-verified 2026-07-18, a session file was still written). When
+    // requested but unsupported we log ONCE and fall back to a normal (persisting)
+    // drive — best-effort, never silent.
+    let want_ephemeral = match stream.as_ref() {
+        Some(s) => ephemeral_drive_enabled(&s.daemon),
+        None => ephemeral_drive_enabled_ambient(),
+    };
+    let supports_ephemeral = cue_agent_bridge::agent_supports_ephemeral(kind);
+    let (effective_ephemeral, ephemeral_honored) =
+        resolve_ephemeral(want_ephemeral, supports_ephemeral);
+    if want_ephemeral
+        && !ephemeral_honored
+        && !EPHEMERAL_FALLBACK_WARNED.swap(true, Ordering::SeqCst)
+    {
+        warn!(
+            agent = %label,
+            "ephemeral drive requested but this agent has no ephemeral flag; \
+             it will persist normally (best-effort — unsupported agents still persist)"
+        );
+    }
+    // When ephemeral is effective, drop the resume so nothing is continued: a
+    // fresh session every turn, with continuity re-supplied via the conversation
+    // block. When not effective, this is EXACTLY `resume` — today's path, byte
+    // for byte. Threaded into both the question and the continuation tier below.
+    let effective_resume = if effective_ephemeral { None } else { resume };
+
+    let mut question = agent_question_from_payload(payload, effective_resume);
     // The spawn-time session ledger lives next to the other session stores in
     // the daemon's data dir. Only available with an overlay stream (headless
     // paths have no daemon handle → None → today's store-re-scrape behavior).
@@ -9610,7 +10064,16 @@ async fn drive_answer_attempt(
     // transcript as context instead of trusting `session/load`.
     let via_acp = acp_answer_enabled(kind);
     if !cue_agent_bridge::cloud::is_cloud_kind(kind) {
-        apply_continuation_tier(&mut question, kind, resume, via_acp, ledger_path.clone()).await;
+        // `effective_resume` is `None` under an honored ephemeral drive, so the
+        // tier step is a fresh-question no-op then — no session is loaded/replayed.
+        apply_continuation_tier(
+            &mut question,
+            kind,
+            effective_resume,
+            via_acp,
+            ledger_path.clone(),
+        )
+        .await;
     }
 
     // The EFFECTIVE cwd the drive will run in — captured AFTER the tier step set
@@ -9636,7 +10099,8 @@ async fn drive_answer_attempt(
     debug!(
         agent = %label,
         drive_via = ?drive_kind,
-        resuming = resume.is_some(),
+        resuming = effective_resume.is_some(),
+        ephemeral = effective_ephemeral,
         replay_context = question.context.is_some(),
         cwd_set = question.cwd.is_some(),
         model_override = model_override.len(),
@@ -9653,13 +10117,14 @@ async fn drive_answer_attempt(
     // model/effort parameter). Adding an agent is a registry row, not a new
     // branch here. Cloud agents load credentials from the OS keychain and emit
     // one audit line per HTTP call (vendor, endpoint, status — never the token).
-    let answer_stream = match cue_agent_bridge::drive_with_overrides(
+    let answer_stream = match cue_agent_bridge::drive_with_overrides_ephemeral(
         kind.clone(),
         question,
         cue_agent_bridge::DriveOverrides {
             model_args: model_override.to_vec(),
             effort_args: effort_override.to_vec(),
         },
+        effective_ephemeral,
     )
     .await
     {
@@ -11222,6 +11687,37 @@ async fn answer_context_for_question(
             AnswerContext::new(AnswerContextKind::MeetingMemory, block)
                 .with_title("Verified decisions ledger")
                 .with_source("live meeting ledger (quote-verified)"),
+        );
+    }
+
+    // App-owned CONVERSATION memory (see `crate::conversation`): the running
+    // dialogue (rolling summary + verbatim recent Q&A) so "follow up on that"
+    // works without depending on the agent's session. Positioned AFTER the
+    // rolling meeting summary and BEFORE the raw transcript — the conversation
+    // is higher-value than raw speech under compaction (which drops in
+    // insertion order), and it carries the agent's prior ANSWERS, which the
+    // transcript does not. The `between-summary-and-transcript` regression test
+    // guards this placement. Async here (unlike the sync meeting builder)
+    // because it reads the turn store + summary lock.
+    let attached_model = load_settings(&daemon.paths)
+        .ok()
+        .and_then(|s| s.attached_model);
+    if let Some(block) = crate::conversation::conversation_context_block(
+        daemon,
+        meeting.id,
+        attached_model.as_deref(),
+    )
+    .await
+    {
+        let transcript_idx = context
+            .iter()
+            .position(|c| c.source.as_deref() == Some("active meeting transcript"))
+            .unwrap_or(context.len());
+        context.insert(
+            transcript_idx,
+            AnswerContext::new(AnswerContextKind::MeetingMemory, block)
+                .with_title("Conversation so far")
+                .with_source("live conversation memory"),
         );
     }
 
@@ -14376,6 +14872,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resample_to_16k_passes_through_at_16k_and_downsamples_by_rate() {
+        // Already 16 kHz → unchanged (no interpolation artifacts).
+        let s: Vec<i16> = (0..100).collect();
+        assert_eq!(resample_to_16k(&s, 16_000), s);
+        // Empty input is safe.
+        assert!(resample_to_16k(&[], 48_000).is_empty());
+        // 48 kHz → 16 kHz is a 3:1 downsample: output ≈ len/3.
+        let src: Vec<i16> = (0..300).map(|i| (i % 50) as i16).collect();
+        let out = resample_to_16k(&src, 48_000);
+        assert_eq!(out.len(), 100, "48k→16k must produce ~1/3 the samples");
+        // First sample preserved; monotonic index mapping stays in range (no
+        // panic / out-of-bounds at the tail — the .min() guards prove it).
+        assert_eq!(out[0], src[0]);
+        // 44.1 kHz → 16 kHz also lands in range and shrinks.
+        let out441 = resample_to_16k(&src, 44_100);
+        assert!(out441.len() < src.len() && !out441.is_empty());
+    }
+
+    #[test]
     fn streamed_partials_replace_not_pile_up() {
         // The assembler streams a GROWING partial each tick. Each new partial
         // must REPLACE the prior open one, not accumulate prefix-duplicated lines.
@@ -14693,6 +15208,53 @@ mod tests {
                 .iter()
                 .any(|i| i.source.as_deref() == Some("active meeting transcript")),
             "the recent transcript is part of the lean envelope"
+        );
+    }
+
+    #[test]
+    fn conversation_block_sits_between_summary_and_transcript() {
+        // The conversation-memory block is inserted in `answer_context_for_question`
+        // at the transcript's index (pushing the transcript down), so it lands
+        // AFTER the rolling summary and BEFORE the raw transcript. Compaction
+        // drops in insertion order, so the running dialogue (which carries the
+        // agent's prior ANSWERS — not in the transcript) must outrank raw speech.
+        // This mirrors the exact index logic in the async builder.
+        let mut meeting = MeetingRecord::new(Some("Platform sync".to_string()));
+        meeting.summary = Some("- shipping friday".to_string());
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            "we ship friday",
+            true,
+        ));
+        let mut context = answer_context_from_meeting_within(&meeting);
+
+        let transcript_idx = context
+            .iter()
+            .position(|c| c.source.as_deref() == Some("active meeting transcript"))
+            .unwrap_or(context.len());
+        context.insert(
+            transcript_idx,
+            AnswerContext::new(AnswerContextKind::MeetingMemory, "You: q\nCopilot: a")
+                .with_title("Conversation so far")
+                .with_source("live conversation memory"),
+        );
+
+        let summary_pos = context
+            .iter()
+            .position(|c| c.source.as_deref() == Some("live rolling summary"))
+            .expect("summary present");
+        let conv_pos = context
+            .iter()
+            .position(|c| c.source.as_deref() == Some("live conversation memory"))
+            .expect("conversation present");
+        let transcript_pos = context
+            .iter()
+            .position(|c| c.source.as_deref() == Some("active meeting transcript"))
+            .expect("transcript present");
+        assert!(
+            summary_pos < conv_pos && conv_pos < transcript_pos,
+            "order must be summary < conversation < transcript, got \
+             summary={summary_pos} conv={conv_pos} transcript={transcript_pos}"
         );
     }
 
@@ -15748,6 +16310,31 @@ mod tests {
         // A blank id never becomes a resume target.
         let blank = agent_question_from_payload(&payload, Some("   "));
         assert!(blank.resume.is_none());
+    }
+
+    #[test]
+    fn resolve_ephemeral_covers_the_four_combinations() {
+        // not requested → nothing to honor, non-ephemeral (today's behavior).
+        assert_eq!(resolve_ephemeral(false, false), (false, true));
+        assert_eq!(resolve_ephemeral(false, true), (false, true));
+        // requested + supported → ephemeral is effective and honored.
+        assert_eq!(resolve_ephemeral(true, true), (true, true));
+        // requested + unsupported → NOT effective (falls back), NOT honored.
+        assert_eq!(resolve_ephemeral(true, false), (false, false));
+    }
+
+    #[test]
+    fn resolve_ephemeral_enabled_env_wins_over_setting_in_both_directions() {
+        // No env → the persisted setting decides (default OFF).
+        assert!(!resolve_ephemeral_enabled(None, false));
+        assert!(resolve_ephemeral_enabled(None, true));
+        // Env present → it wins in BOTH directions regardless of the setting.
+        assert!(resolve_ephemeral_enabled(Some("1"), false));
+        assert!(resolve_ephemeral_enabled(Some("true"), false));
+        assert!(resolve_ephemeral_enabled(Some("TRUE"), false)); // case-insensitive
+        assert!(!resolve_ephemeral_enabled(Some("0"), true));
+        assert!(!resolve_ephemeral_enabled(Some("false"), true));
+        assert!(!resolve_ephemeral_enabled(Some(""), true)); // any non-truthy → OFF
     }
 
     #[test]

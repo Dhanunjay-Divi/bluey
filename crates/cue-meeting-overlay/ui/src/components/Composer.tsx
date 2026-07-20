@@ -5,7 +5,13 @@ import { useState, type ReactNode } from "react";
 import type { AskMode, ListeningState } from "../lib/types";
 import { PlusMenu } from "./PlusMenu";
 import { ModelPicker } from "./ModelPicker";
-import { AlertIcon, MicIcon, SpinnerIcon, StopIcon } from "./icons";
+import {
+  AlertIcon,
+  MicIcon,
+  SpinnerIcon,
+  StopIcon,
+  SystemAudioIcon,
+} from "./icons";
 
 /** The three answer-speed presets, ordered fast → deep. `hint` is the title
  *  tooltip; the label is what the pill shows. Data-driven so adding/removing a
@@ -25,6 +31,8 @@ export function Composer({
   contextLabel,
   onSubmit,
   onMic,
+  onToggleMicInput,
+  micInputOn = false,
   listenState = "idle",
   mode,
   onModeChange,
@@ -38,6 +46,11 @@ export function Composer({
   contextLabel?: string;
   onSubmit: (text: string) => void;
   onMic?: () => void;
+  /** Toggle MICROPHONE capture (your own voice) — independent of the system-audio
+   *  button above, which captures the call. Omit to hide the mic button. */
+  onToggleMicInput?: () => void;
+  /** Whether microphone capture is currently on (drives the mic button's tint). */
+  micInputOn?: boolean;
   /** Manual "ask about what was just said" — fires the same ask pipeline as a
    *  typed question with a canonical prompt. Omit to hide the button. */
   onAskRecent?: () => void;
@@ -235,6 +248,27 @@ export function Composer({
             {micMeta(listenState).glyph}
           </span>
         </button>
+        {onToggleMicInput && (
+          <button
+            onClick={onToggleMicInput}
+            aria-label={
+              micInputOn ? "Stop microphone input" : "Start microphone input"
+            }
+            aria-pressed={micInputOn}
+            title={
+              micInputOn
+                ? "Microphone on — your voice is captured (click to stop)"
+                : "Microphone off — click to capture your voice too"
+            }
+            style={{
+              ...iconBtn,
+              background: micInputOn ? "rgba(99,102,241,.14)" : "transparent",
+              color: micInputOn ? "var(--tint-ink)" : "var(--ink-2)",
+            }}
+          >
+            <MicIcon size={16} />
+          </button>
+        )}
         <span
           style={{
             fontSize: 10,
@@ -329,9 +363,12 @@ function micMeta(state: ListeningState): {
     case "idle":
     default:
       return {
-        glyph: <MicIcon size={16} />,
-        label: "Listen",
-        title: "Listen",
+        // SPEAKER, not a mic: this button toggles SYSTEM audio (the other people
+        // in the call). The microphone is its own button beside it — showing a
+        // mic here implied this captured YOUR voice, which it never did.
+        glyph: <SystemAudioIcon size={16} />,
+        label: "Listen to system audio",
+        title: "Listen to system audio (the call)",
         bg: "transparent",
         fg: "var(--ink-2)",
       };

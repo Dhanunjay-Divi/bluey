@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **App-owned conversation memory.** Every in-meeting Q&A turn is stored in
+  Bluey's own `conversation_turns` table (migration 012) and re-supplied to the
+  agent each turn as a token-bounded block (rolling summary + verbatim tail).
+  "Follow up on that" now works WITHOUT depending on the agent's resumable
+  session — the foundation for driving agents ephemerally.
+- **Agent-history retrieval.** New `search_agent_history` MCP tool surfaces the
+  driven agent's prior coding-session reasoning, scoped to the attached agent
+  family by default (`BLUEY_AGENT_HISTORY_SCOPE` to widen).
+- **Ephemeral drive.** `codex exec --ephemeral` drives a question without
+  persisting a session. Only Codex exposes a real ephemeral flag; other agents
+  degrade gracefully. Requesting it forces the CLI route (ACP cannot honor it).
+- **Real agent logos.** Official brand marks (Simple Icons CC0 / LobeHub) for
+  Claude, Codex, Cursor, Gemini, Copilot, VS Code, and Antigravity, replacing
+  the generic glyph. "Code - Insiders" maps to the VS Code family.
+- **Live transcript bar + mic input** in the overlay, with speaker labels and
+  drag/click expand.
+
 ### Changed
+- **Shared STT weights.** Per-source engines now share one loaded Parakeet
+  weight set (`SttEngineHandle` + `SttEngine::from_shared`) instead of loading
+  a full ~650MB copy per source, while keeping independent decoder state.
+- **Live-first memory cadence.** Ledger fires every ~350 words (~2-3 min) and
+  the rolling summary every ~800 words (~6 min), tuned for a LIVE pinned card
+  rather than a post-meeting batch summarizer. Cost is bounded by SELECTIVITY,
+  not cadence: both prompts may record nothing when a window adds nothing.
+  Conversation tail raised to 10k tokens (was 2k) for modern context windows.
 - **Density-first answer style.** The copilot persona, per-ask style reminder,
   and fast/balanced mode instructions now optimize for
   completeness-at-minimum-length ("cover every point that matters in as few

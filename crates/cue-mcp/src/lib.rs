@@ -35,7 +35,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-pub use tools::{FactHitOut, MeetingSummaryOut, TranscriptSliceOut};
+pub use tools::{AgentHistoryHitOut, FactHitOut, MeetingSummaryOut, TranscriptSliceOut};
 
 /// What the daemon exposes to the MCP layer. Tool-shaped on purpose: cue-mcp
 /// holds no meeting-model logic and no cue-core dependency — the daemon does
@@ -54,6 +54,10 @@ pub trait MeetingMemorySource: Send + Sync + 'static {
     async fn search_decisions(&self, query: &str, limit: usize) -> Vec<FactHitOut>;
     /// Cross-meeting facts recall, excluding the active meeting.
     async fn search_past_meetings(&self, query: &str, limit: usize) -> Vec<FactHitOut>;
+    /// Cross-AGENT session-history recall: the driven agent's OTHER coding-agent
+    /// sessions' past prose reasoning, relevant to this meeting question. Read-
+    /// only. Returns `[]` when the feature/consent is off or the index is empty.
+    async fn search_agent_history(&self, query: &str, limit: usize) -> Vec<AgentHistoryHitOut>;
 }
 
 /// A running MCP server: bound address + rotating bearer token + shutdown.
@@ -187,6 +191,28 @@ mod tests {
                 relevance: 0.8,
             }]
         }
+        async fn search_agent_history(
+            &self,
+            query: &str,
+            _limit: usize,
+        ) -> Vec<AgentHistoryHitOut> {
+            vec![
+                AgentHistoryHitOut {
+                    text: format!("prior reasoning about {query}: we chose advisory locks"),
+                    agent: "Claude Code".to_string(),
+                    session_id: "sess-abc".to_string(),
+                    when: "1700000000".to_string(),
+                    score: 0.91,
+                },
+                AgentHistoryHitOut {
+                    text: "the retry budget for the webhook is three attempts".to_string(),
+                    agent: "Codex".to_string(),
+                    session_id: "sess-def".to_string(),
+                    when: "1699990000".to_string(),
+                    score: 0.72,
+                },
+            ]
+        }
     }
 
     async fn start() -> McpServerHandle {
@@ -246,7 +272,8 @@ mod tests {
                 "get_recent_transcript",
                 "get_meeting_summary",
                 "search_meeting_decisions",
-                "search_past_meetings"
+                "search_past_meetings",
+                "search_agent_history"
             ]
         );
 

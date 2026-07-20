@@ -42,22 +42,29 @@ pub fn interval_segments() -> usize {
 }
 
 /// Words of new transcript between summary passes. WORD-based (not segment-
-/// based) so cadence is insensitive to STT fragmentation — the direct-emit path
-/// yields ~2-word fragments, so a segment trigger re-summarized every ~10s (an
-/// LLM call each, the costliest of the background passes). ~450 words ≈ 3 min of
-/// speech. The summary is a RUNNING summary (each pass folds in everything since
-/// the last), so it can lag more than the ledger without losing information — it
-/// catches up on the next pass. ~700 words ≈ 5 min: coarser than the ledger's
-/// 350 so the two passes don't stack, and it's cumulative so staleness is cheap.
-/// Override with `BLUEY_SUMMARY_INTERVAL_WORDS`.
-pub const DEFAULT_INTERVAL_WORDS: usize = 700;
+/// based) so cadence is insensitive to STT fragmentation.
+///
+/// LIVE-FIRST (2026): the rolling summary is a LIVE overlay artifact re-shown on
+/// every ask DURING the meeting — not a post-meeting batch summarizer. Batch
+/// summarizers fire at ~20-32k tokens because latency is irrelevant when the
+/// summary is only read once, at the end; a live copilot is the opposite. If the
+/// summary only refreshes every ~20 min, the first 20 min of a meeting has NO
+/// summary at all, and the card is stale for anyone who asks mid-meeting. The
+/// narrative changes slower than decisions, so the summary can be coarser than
+/// the ledger (~350 words) — but it must exist EARLY and stay reasonably fresh.
+/// At ~130 wpm, ~800 words ≈ ~6 min of speech: a summary appears within the
+/// first few minutes and never lags more than ~6. Cost is bounded by SELECTIVITY,
+/// not cadence: `build_prompt` lets the model return the summary UNCHANGED when a
+/// window added nothing meaningful (see `build_prompt`), so a chitchat stretch is
+/// a cheap near-no-op. Override with `BLUEY_SUMMARY_INTERVAL_WORDS`.
+pub const DEFAULT_INTERVAL_WORDS: usize = 800;
 
-/// Words between summary passes (env `BLUEY_SUMMARY_INTERVAL_WORDS`, min 80).
+/// Words between summary passes (env `BLUEY_SUMMARY_INTERVAL_WORDS`, min 150).
 pub fn interval_words() -> usize {
     env::var("BLUEY_SUMMARY_INTERVAL_WORDS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .map(|n| n.max(80))
+        .map(|n| n.max(150))
         .unwrap_or(DEFAULT_INTERVAL_WORDS)
 }
 
@@ -78,9 +85,11 @@ pub fn build_prompt(current_summary: Option<&str>, window: &str) -> String {
          Update the summary below with the new transcript lines. Keep every \
          still-relevant fact from the current summary (topics, decisions, \
          owners, blockers, numbers, ticket/PR ids); fold in what the new lines \
-         add; drop filler. Output ONLY the updated summary as at most 12 short \
-         plain-text bullet lines starting with \"- \". No markdown fences, no \
-         preamble, no commentary.\n\n",
+         add; drop filler. If the new lines add NOTHING that belongs in a \
+         meeting summary (small talk, tangents, repetition), return the CURRENT \
+         SUMMARY exactly as-is, unchanged. Output ONLY the summary as at most 12 \
+         short plain-text bullet lines starting with \"- \". No markdown fences, \
+         no preamble, no commentary.\n\n",
     );
     match current_summary.map(str::trim).filter(|s| !s.is_empty()) {
         Some(summary) => {
@@ -122,13 +131,15 @@ mod tests {
 
     #[test]
     fn should_fire_words_respects_interval() {
-        // default 700 words between summary passes.
+        // Value-agnostic: assert the behavior against the live interval so
+        // tuning the default never breaks this test.
+        let n = interval_words();
         assert!(!should_fire_words(0, 0));
-        assert!(!should_fire_words(699, 0));
-        assert!(should_fire_words(700, 0));
-        // Next boundary after a fire at 700 is 1400.
-        assert!(!should_fire_words(1399, 700));
-        assert!(should_fire_words(1400, 700));
+        assert!(!should_fire_words(n - 1, 0), "one word short must not fire");
+        assert!(should_fire_words(n, 0), "the first boundary fires");
+        // Next boundary after a fire at `n` is `2n`.
+        assert!(!should_fire_words(2 * n - 1, n));
+        assert!(should_fire_words(2 * n, n));
     }
 
     #[test]

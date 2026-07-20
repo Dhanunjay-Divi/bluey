@@ -330,6 +330,14 @@ impl FactsMemory {
             .map_err(|e| anyhow::anyhow!("embed revised fact: {e}"))
     }
 
+    /// Share the loaded embedder as a cheap handle (its ONNX session +
+    /// tokenizer are `Arc`-internal, so this clones the handle, NOT the ~35MB
+    /// model). Lets other daemon retrieval paths (e.g. the agent-history index)
+    /// reuse the SAME loaded model rather than loading a second copy.
+    pub fn embedder(&self) -> LocalBgeEmbedder {
+        self.embedder.clone()
+    }
+
     /// Cross-meeting recall for a question, excluding the active meeting (its
     /// ledger is already pinned in context). Runs the full mem0 v3 hybrid
     /// pipeline: semantic + BM25 (sigmoid-normalized) + entity boosts, fused

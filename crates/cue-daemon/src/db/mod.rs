@@ -1,3 +1,4 @@
+pub mod conversation;
 pub mod diarize;
 pub mod rag;
 pub mod search;
@@ -74,6 +75,8 @@ impl Database {
             include_str!("../../../../infra/migrations/009_cue_responses.sql");
         const MIGRATION_010: &str =
             include_str!("../../../../infra/migrations/010_diarization.sql");
+        const MIGRATION_012: &str =
+            include_str!("../../../../infra/migrations/012_conversation_turns.sql");
         self.conn
             .execute_batch(MIGRATION_002)
             .context("failed to run session migration")?;
@@ -101,6 +104,9 @@ impl Database {
         self.conn
             .execute_batch(MIGRATION_010)
             .context("failed to run diarization migration")?;
+        self.conn
+            .execute_batch(MIGRATION_012)
+            .context("failed to run conversation_turns migration")?;
         self.ensure_cue_response_billing_columns()
             .context("failed to ensure cue_response billing columns")?;
         Ok(())

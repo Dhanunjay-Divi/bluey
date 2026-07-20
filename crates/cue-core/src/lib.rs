@@ -7,6 +7,7 @@ pub mod cards;
 pub mod clock;
 pub mod cloud;
 pub mod config;
+pub mod conversation;
 pub mod intelligence;
 pub mod ipc;
 pub mod ledger;
@@ -46,6 +47,10 @@ pub use cloud::{
 };
 pub use config::{
     load_account, load_settings, save_account, save_settings, AccountConfig, CueSettings,
+};
+pub use conversation::{
+    assemble_block, bound_summary, build_fold_prompt, context_window_for_model, estimate_tokens,
+    ConvConfig, ConvRole, ConvTurn,
 };
 pub use intelligence::{
     analyze_segment, detect_for_me_question, detect_for_me_question_given, generate_recap,

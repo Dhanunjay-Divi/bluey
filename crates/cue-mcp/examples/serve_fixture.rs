@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use cue_mcp::{FactHitOut, MeetingMemorySource, MeetingSummaryOut, TranscriptSliceOut};
+use cue_mcp::{
+    AgentHistoryHitOut, FactHitOut, MeetingMemorySource, MeetingSummaryOut, TranscriptSliceOut,
+};
 
 struct Fixture;
 
@@ -46,6 +48,15 @@ impl MeetingMemorySource for Fixture {
             text: "[Decision] Shard the database by customer region".to_string(),
             meeting_id: "past-meeting".to_string(),
             relevance: 0.88,
+        }]
+    }
+    async fn search_agent_history(&self, query: &str, _limit: usize) -> Vec<AgentHistoryHitOut> {
+        vec![AgentHistoryHitOut {
+            text: format!("prior reasoning about {query}: we chose advisory locks over table locks"),
+            agent: "Claude Code".to_string(),
+            session_id: "fixture-session".to_string(),
+            when: "1750000000".to_string(),
+            score: 0.81,
         }]
     }
 }

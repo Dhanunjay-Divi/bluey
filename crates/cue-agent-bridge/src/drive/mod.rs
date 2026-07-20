@@ -23,7 +23,10 @@ use crate::{AgentKind, Transcript};
 
 pub mod cli;
 
-pub use cli::{drive, drive_with_mode, drive_with_options, DriveOptions};
+pub use cli::{
+    agent_supports_ephemeral, drive, drive_with_mode, drive_with_mode_ephemeral,
+    drive_with_options, ephemeral_honored, DriveOptions,
+};
 
 /// Per-run CLI overrides the daemon threads into a local-CLI drive. Exact argv
 /// tokens, data-driven off the registry (`model_flag` / `effort_args`) — the

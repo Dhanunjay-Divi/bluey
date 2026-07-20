@@ -612,6 +612,13 @@ export function createTauriClient(): MeetingClient {
       sendEvent({ type: "recording_stop_requested" });
     },
 
+    turnOff() {
+      // `close_requested` is the daemon's existing shutdown path
+      // (`shutdown_daemon` + exit) — the overlay simply never called it. This is
+      // Bluey OFF, not a collapse: the pill goes away and the daemon stops.
+      sendEvent({ type: "close_requested" });
+    },
+
     openPermissionSettings(pane) {
       // The daemon maps `pane` (a fixed enum) to a known System Settings URL and
       // opens it — no plugin/permission needed UI-side, no arbitrary URL.

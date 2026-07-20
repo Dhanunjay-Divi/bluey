@@ -51,7 +51,6 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   // live in the provider (single owner), not here.
   const {
     transcript,
-    history,
     turns,
     detectedQ,
     setDetectedQ,
@@ -61,17 +60,16 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
     patchTurn,
     turnSeq,
   } = useMeetingState();
-  const captionScrollRef = useRef<HTMLDivElement>(null);
-  const captionPinnedRef = useRef(true);
-  // Auto-scroll the transcript panel to the newest line, UNLESS the user has
-  // scrolled up to read earlier history (captionPinnedRef tracks that).
-  useEffect(() => {
-    const el = captionScrollRef.current;
-    if (el && captionPinnedRef.current) el.scrollTop = el.scrollHeight;
-  }, [history]);
+  // (The caption scroll refs went with the ambient-caption block — the bottom
+  // `LiveTranscriptBar` owns transcript scrolling + auto-follow now.)
   const [phase, setPhase] = useState<Phase>("idle");
   const [connectors, setConnectors] = useState<string[]>([]);
   const [listenState, setListenState] = useState<ListeningState>("idle");
+  // Microphone capture (YOUR voice) is an independent source from the system
+  // audio the listen button toggles. Tracked here so the two buttons can be
+  // toggled separately and the current pair is re-sent on every change (the
+  // daemon's start takes both flags at once).
+  const [micInputOn, setMicInputOn] = useState(false);
   // Daemon offer to install a missing agent CLI (push_agent_install). Shown as a
   // card with Install / Not now; the daemon reports the install result as a card.
   const [installOffer, setInstallOffer] = useState<AgentInstallOffer | null>(
@@ -397,39 +395,12 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
         <div ref={feedEndRef} />
       </div>
 
-      {/* AMBIENT CAPTION (master doc §4/§12 — "felt, not read"): a single quiet
-          live line proving Bluey hears you, pinned above the composer. NOT a
-          transcript wall. STAYS VISIBLE through the whole lifecycle — detecting
-          a question AND streaming an answer — because Bluey is still hearing
-          the room the entire time; hiding it during an answer looked like
-          transcription had stopped (the reported bug). It keeps live-updating
-          regardless of `phase` (history is fed by an independent subscription),
-          and its fixed maxHeight means it never squeezes the answer feed. */}
-      {history.length > 0 && (
-        <div
-          ref={captionScrollRef}
-          style={captionScroll}
-          onScroll={(e) => {
-            // Track whether the user is pinned to the bottom. If they scroll up
-            // to read history, we stop auto-scrolling so we don't yank them back.
-            const el = e.currentTarget;
-            captionPinnedRef.current =
-              el.scrollHeight - el.scrollTop - el.clientHeight < 24;
-          }}
-        >
-          {history.map((line, i) => (
-            <div key={i} style={captionWrap}>
-              <span style={captionDot} />
-              <span style={captionWho}>
-                {/* Diarized label ("Speaker 2") when resolved; channel fallback
-                    until then (labels lag lines by up to one diarize tick). */}
-                {line.speaker ?? (line.source === "mic" ? "You" : "They")}
-              </span>
-              <span style={captionText}>{line.text.replace(/^\s+/, "")}</span>
-            </div>
-          ))}
-        </div>
-      )}
+      {/* The ambient caption that used to live here was REMOVED: the panel's
+          bottom row (`LiveTranscriptBar`) now owns live transcription — current
+          line by default, expandable to the scrollable history. Keeping this
+          block rendered the SAME history twice (reported: the transcript
+          appearing both above the composer and in the bottom bar). One surface
+          for transcription, and it is the bottom bar. */}
 
       <Composer
         placeholder="Ask a follow-up while Bluey listens…"
@@ -465,10 +436,25 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
             return;
           }
           if (listenState === "listening") client.stopListening();
-          // v1 captures SYSTEM audio (the other people in the call — the
-          // question trigger), matching the intent of the old "+"-menu Listen
-          // item that this outside mic button replaces.
-          else client.startListening({ microphone: false, system: true });
+          // This button is SYSTEM audio (the other people in the call — the
+          // question trigger). The microphone is the separate button beside it,
+          // whose current state rides along so toggling one never silently
+          // drops the other.
+          else client.startListening({ microphone: micInputOn, system: true });
+        }}
+        micInputOn={micInputOn}
+        onToggleMicInput={() => {
+          const next = !micInputOn;
+          setMicInputOn(next);
+          // Re-issue the start with BOTH flags: the daemon's start call takes
+          // the full source set, so sending only the changed one would drop the
+          // other source. When nothing is listening yet, turning the mic on
+          // starts capture with system audio too (the meeting is the point).
+          if (listenState === "listening" || next) {
+            client.startListening({ microphone: next, system: true });
+          } else {
+            client.stopListening();
+          }
         }}
         listenState={listenState}
       />
@@ -530,51 +516,6 @@ const heroDismiss = {
   cursor: "pointer",
 } as const;
 
-// ---- The ambient caption (a single quiet live line — "felt, not read") ----
-// Scrollable transcript panel: bounded height, scrolls vertically so the full
-// history is readable. Border-top separates it from the feed above; the pinned
-// composer sits below it.
-const captionScroll = {
-  maxHeight: 108,
-  overflowY: "auto",
-  overflowX: "hidden",
-  borderTop: "1px solid var(--line)",
-} as const;
-const captionWrap = {
-  display: "flex",
-  alignItems: "flex-start",
-  gap: 8,
-  padding: "5px 16px",
-  minWidth: 0,
-} as const;
-const captionDot = {
-  width: 6,
-  height: 6,
-  borderRadius: 999,
-  background: "var(--mint)",
-  flex: "none",
-  animation: "blueyPulse 1.8s ease-in-out infinite",
-} as const;
-const captionWho = {
-  fontSize: 10.5,
-  fontWeight: 600,
-  color: "var(--ink-4)",
-  letterSpacing: ".04em",
-  flex: "none",
-} as const;
-const captionText = {
-  fontSize: 12,
-  color: "var(--ink-3)",
-  // Inside the scrollable panel each line shows in FULL — wrap freely (the
-  // panel scrolls), and break any pathological unbroken run so nothing overflows
-  // horizontally.
-  whiteSpace: "pre-wrap",
-  overflowWrap: "anywhere",
-  wordBreak: "break-word",
-  lineHeight: 1.4,
-  flex: 1,
-  minWidth: 0,
-} as const;
 const trig = {
   display: "flex",
   alignItems: "center",

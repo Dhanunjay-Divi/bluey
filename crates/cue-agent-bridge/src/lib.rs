@@ -46,8 +46,8 @@ pub use connectors::read_connectors;
 pub use discover::{discover_agents, discover_in_home, probe_sqlite_store};
 // Local-CLI drive (unchanged surface) — local agents call this directly.
 pub use drive::{
-    drive as drive_cli, is_transient_network_error, AnswerChunk, AnswerStream, DriveOverrides,
-    Question, ToolStatus,
+    agent_supports_ephemeral, drive as drive_cli, ephemeral_honored, is_transient_network_error,
+    AnswerChunk, AnswerStream, DriveOverrides, Question, ToolStatus,
 };
 pub use fix::{fix_apply_prompt, fix_proposal_prompt, parse_fix_proposal, FixProposal};
 pub use sessions::{list_with_health_check, reader_for, ReaderHealth, SessionReader};
@@ -74,7 +74,8 @@ pub async fn drive(agent: AgentKind, question: Question) -> anyhow::Result<Answe
     if should_use_acp(&agent) {
         let cli_question = question.clone();
         let cli_agent = agent.clone();
-        let acp = acp::drive_acp(agent, question).await;
+        // Non-ephemeral entry: today's behavior, unchanged.
+        let acp = acp::drive_acp(agent, question, false).await;
         return Ok(acp_with_cli_fallback(acp, move || {
             drive_cli(cli_agent, cli_question)
         }));
@@ -115,25 +116,77 @@ pub async fn drive_with_overrides(
     question: Question,
     overrides: DriveOverrides,
 ) -> anyhow::Result<AnswerStream> {
-    if should_use_acp(&agent) && overrides.is_empty() {
+    // Non-ephemeral: byte-identical to today. The daemon's existing call site is
+    // unchanged; the ephemeral toggle (Agent D) uses the entry below.
+    drive_with_overrides_ephemeral(agent, question, overrides, false).await
+}
+
+/// Like [`drive_with_overrides`], but also threads the **ephemeral** flag through
+/// the drive so the agent writes NOTHING to its own session store when it
+/// supports it (Claude / Codex). This is the entry the daemon's ephemeral-drive
+/// toggle (`BLUEY_EPHEMERAL_DRIVE`) calls.
+///
+/// Behavior when `ephemeral == true`:
+/// - **CLI path**: appends the agent's ephemeral flag (`--no-session-persistence`
+///   for Claude, `--ephemeral` for Codex) and suppresses `--resume` (fresh turn).
+///   For an unsupported agent it is a no-op — the drive persists as usual and the
+///   daemon learns it was not honored via [`agent_supports_ephemeral`].
+/// - **ACP path**: NOT taken when the agent has a real ephemeral CLI flag — see
+///   the routing rule below. ACP has no don't-persist concept at all (the adapter
+///   writes its own session file regardless), so honoring an ephemeral request
+///   over ACP is impossible.
+///
+/// Routing rule (extends the override rule above): an ephemeral request on an
+/// agent whose CLI *can* honor it (see [`agent_supports_ephemeral`]) FORCES the
+/// CLI route, exactly as a non-empty override does. Rationale is identical — ACP
+/// cannot express the parameter, so staying on ACP would make the request a
+/// silent no-op. LIVE-VERIFIED 2026-07-18: with ACP on by default, an ephemeral
+/// ask still wrote a session file because the flag never reached a CLI. Agents
+/// with no ephemeral flag keep the ACP route (nothing to force it for).
+///
+/// `ephemeral == false` is exactly [`drive_with_overrides`]'s behavior — today's
+/// resume/argv path, untouched. The caller should consult
+/// [`agent_supports_ephemeral`] to decide whether to request ephemeral / how to
+/// log a best-effort fallback; this entry never errors on an unsupported agent
+/// (it just proceeds normally), so an ephemeral request is always fail-soft.
+pub async fn drive_with_overrides_ephemeral(
+    agent: AgentKind,
+    question: Question,
+    overrides: DriveOverrides,
+    ephemeral: bool,
+) -> anyhow::Result<AnswerStream> {
+    // An honorable ephemeral request forces the CLI route (see the routing rule).
+    let force_cli_for_ephemeral = ephemeral && drive::agent_supports_ephemeral(&agent);
+    if should_use_acp(&agent) && overrides.is_empty() && !force_cli_for_ephemeral {
         // Empty overrides: the ACP route is unchanged. Its CLI fallback also needs
-        // no overrides (empty by construction on this branch), so it can build a
-        // default DriveOptions.
+        // no overrides (empty by construction on this branch), so it builds a
+        // DriveOptions carrying only the ephemeral flag (default otherwise).
         let cli_question = question.clone();
         let cli_agent = agent.clone();
-        let acp = acp::drive_acp(agent, question).await;
+        let acp = acp::drive_acp(agent, question, ephemeral).await;
         return Ok(acp_with_cli_fallback(acp, move || {
-            drive::drive_with_options(cli_agent, cli_question, drive::DriveOptions::default())
+            drive::drive_with_options(
+                cli_agent,
+                cli_question,
+                drive::DriveOptions {
+                    ephemeral,
+                    ..Default::default()
+                },
+            )
         }));
     }
     if let Some(tag) = registry::KindTag::from_agent_kind(&agent) {
         if cloud::cloud_entry_for(tag).is_some() {
+            // Cloud agents have no local session store to persist to and no
+            // ephemeral flag — the request is a no-op here (honored=false is
+            // surfaced by `agent_supports_ephemeral`, which is false for cloud).
             return cloud::drive_cloud(agent, question).await;
         }
     }
     let opts = drive::DriveOptions {
         model_override: overrides.model_args,
         effort_override: overrides.effort_args,
+        ephemeral,
         ..Default::default()
     };
     drive::drive_with_options(agent, question, opts).await
@@ -544,6 +597,42 @@ mod acp_gate_tests {
     /// Serializes the env-mutating test below against any other test in this
     /// module that reads/writes `BLUEY_USE_ACP` (the var is process-global).
     static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn an_honorable_ephemeral_request_forces_the_cli_route_off_acp() {
+        // ROUTING RULE (mirrors the non-empty-override rule): ACP has no
+        // don't-persist concept, so an ephemeral request an agent CAN honor must
+        // leave the ACP route or it becomes a silent no-op. LIVE-VERIFIED
+        // 2026-07-18: with ACP on by default the ephemeral ask still wrote a
+        // session file because the flag never reached a CLI.
+        //
+        // This asserts the pure decision `ephemeral && agent_supports_ephemeral`
+        // that gates the branch — no spawning, no env mutation.
+        let forces = |agent: &AgentKind, ephemeral: bool| {
+            ephemeral && drive::agent_supports_ephemeral(agent)
+        };
+
+        // Codex has a real flag → an ephemeral request forces CLI.
+        assert!(
+            forces(&AgentKind::Codex, true),
+            "codex ephemeral must force the CLI route"
+        );
+        // Not requested → never forces (today's ACP behavior preserved).
+        assert!(!forces(&AgentKind::Codex, false));
+        // No real flag (Claude/Cursor/Gemini) → nothing to force it for; these
+        // stay on ACP and the daemon logs the best-effort fallback instead.
+        for k in [
+            AgentKind::ClaudeCode,
+            AgentKind::Cursor,
+            AgentKind::Gemini,
+            AgentKind::Copilot,
+        ] {
+            assert!(
+                !forces(&k, true),
+                "{k:?} has no ephemeral flag; must not be pulled off ACP"
+            );
+        }
+    }
 
     #[test]
     fn should_use_acp_is_on_by_default_for_acp_capable_agents() {

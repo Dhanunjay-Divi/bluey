@@ -2,6 +2,7 @@
 // "this is YOUR agent, resumed, with YOUR connectors." Not a generic chatbot.
 
 import type { AgentSummary } from "../lib/types";
+import { AgentLogo } from "./AgentLogo";
 
 export function AgentBar({
   agent,
@@ -36,11 +37,10 @@ export function AgentBar({
             display: "inline-flex",
             alignItems: "center",
             justifyContent: "center",
-            fontSize: 15,
             boxShadow: "inset 0 0 0 1px rgba(255,255,255,.6)",
           }}
         >
-          ⌘
+          <AgentLogo kind={agent?.kind} size={18} />
         </span>
         <div>
           <div style={{ fontSize: 13, fontWeight: 560 }}>

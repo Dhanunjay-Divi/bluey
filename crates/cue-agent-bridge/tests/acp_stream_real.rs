@@ -8,7 +8,7 @@ use cue_agent_bridge::{AgentKind, AnswerChunk, Question};
 use futures_util::StreamExt;
 
 async fn collect(question: Question) -> (Option<String>, Vec<String>) {
-    let mut stream = cue_agent_bridge::acp::drive_acp(AgentKind::ClaudeCode, question)
+    let mut stream = cue_agent_bridge::acp::drive_acp(AgentKind::ClaudeCode, question, false)
         .await
         .expect("acp drive");
     let mut session = None;

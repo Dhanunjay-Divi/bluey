@@ -11,7 +11,7 @@
 
 mod engine;
 
-pub use engine::{SttEngine, TranscriptChunk};
+pub use engine::{SttEngine, SttEngineHandle, TranscriptChunk};
 
 /// Which audio source a transcript came from. Drives the speaker label without
 /// any diarization model.

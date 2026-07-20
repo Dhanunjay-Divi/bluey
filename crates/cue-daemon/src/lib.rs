@@ -1,6 +1,14 @@
+// Cross-agent session-history retrieval (the "borrow their reasoning"
+// side-channel): builds + owns an in-memory index over other agents' past
+// session prose, exposed via the `search_agent_history` MCP tool. Feature-gated
+// (reuses the local bge-small embedder from `memory`).
+#[cfg(feature = "local-memory")]
+pub mod agent_history;
 pub mod app;
 pub mod audio;
 pub mod cloud;
+// App-owned in-meeting conversation memory: turn log + rolling fold + assembly.
+pub mod conversation;
 pub mod db;
 // Speaker-diarization orchestration (speakrs two-tier). Feature-gated so the
 // default build never links the diarization stack.

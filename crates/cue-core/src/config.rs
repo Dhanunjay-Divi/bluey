@@ -129,6 +129,16 @@ pub struct CueSettings {
     /// product's context spine; turn off to stop all background extraction.
     #[serde(default = "default_live_memory_enabled")]
     pub live_memory_enabled: bool,
+
+    /// Ephemeral drive (PLAN conversation-memory WAVE 3): when `true`, the
+    /// answer drive asks the attached agent to write NOTHING to its own session
+    /// store (persona + Q&A don't accumulate in `~/.claude` etc.) and starts a
+    /// fresh, non-resumed turn every time. The app-owned conversation memory
+    /// carries dialogue continuity instead, so no resume is needed. Best-effort:
+    /// only Claude Code / Codex support it; unsupported agents still persist.
+    /// Default OFF until validated live — env `BLUEY_EPHEMERAL_DRIVE` overrides.
+    #[serde(default)]
+    pub ephemeral_drive: bool,
 }
 
 fn default_live_memory_enabled() -> bool {
@@ -159,6 +169,7 @@ impl Default for CueSettings {
             my_names: Vec::new(),
             auto_trigger_enabled: false,
             live_memory_enabled: true,
+            ephemeral_drive: false,
         }
     }
 }
@@ -263,6 +274,37 @@ mod tests {
         assert_eq!(parsed.attached_agent.as_deref(), Some("claude_code"));
         assert_eq!(parsed.attached_session.as_deref(), Some("sess-42"));
         assert_eq!(parsed.attached_model.as_deref(), Some("gpt-5.1-codex"));
+    }
+
+    #[test]
+    fn ephemeral_drive_defaults_off_and_roundtrips() {
+        // Default is OFF.
+        assert!(!CueSettings::default().ephemeral_drive);
+
+        // A config written before `ephemeral_drive` existed must still load,
+        // defaulting the field to `false` (back-compat via serde default).
+        let legacy = r#"{
+            "default_model": "Bluey Auto",
+            "default_mode": "General",
+            "answer_style": null,
+            "overlay_opacity": 0.9,
+            "audio_system_enabled": true,
+            "audio_microphone_enabled": true,
+            "cloud_sync_enabled": false,
+            "retention_days": 30,
+            "updated_at": "0"
+        }"#;
+        let settings: CueSettings = serde_json::from_str(legacy).expect("legacy config loads");
+        assert!(!settings.ephemeral_drive);
+
+        // Explicit `true` round-trips through JSON.
+        let on = CueSettings {
+            ephemeral_drive: true,
+            ..CueSettings::default()
+        };
+        let json = serde_json::to_string(&on).expect("serialize");
+        let parsed: CueSettings = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.ephemeral_drive);
     }
 
     #[test]

@@ -96,6 +96,39 @@ pub enum KindTag {
 }
 
 impl KindTag {
+    /// The CLI flag that drives this agent **ephemerally** — writing NOTHING to
+    /// its own session store (no rollout/transcript files, so persona + Q&A never
+    /// accumulate on disk) — or `None` when the agent's CLI has no such flag.
+    ///
+    /// **LIVE-VERIFIED against the installed CLIs (2026-07-18) — do NOT add a
+    /// flag from documentation alone.** A wrong flag is not a soft failure: the
+    /// CLI exits non-zero and the answer is LOST.
+    ///
+    /// - [`Codex`](KindTag::Codex): `codex exec --ephemeral` — CONFIRMED present
+    ///   (`codex exec --help`: "Run without persisting session files to disk").
+    /// - [`ClaudeCode`](KindTag::ClaudeCode): **NO ephemeral flag exists.**
+    ///   `--no-session-persistence` was taken from docs but is REJECTED by the
+    ///   installed CLI (v2.0.42): `error: unknown option
+    ///   '--no-session-persistence'` → exit status 1, answer lost. `claude --help`
+    ///   offers only `--resume` / `--fork-session` / `--session-id` — every one of
+    ///   which still writes a transcript. Claude therefore returns `None` until a
+    ///   real flag ships and is verified here the same way.
+    ///
+    /// Claude / Cursor / Gemini / Copilot / Antigravity return `None`: an
+    /// ephemeral drive on those proceeds NORMALLY (still persisting) and the
+    /// caller is told it could not be honored (see [`agent_supports_ephemeral`] /
+    /// [`ephemeral_honored`]).
+    const fn ephemeral_flag(self) -> Option<&'static str> {
+        match self {
+            KindTag::Codex => Some("--ephemeral"),
+            KindTag::ClaudeCode
+            | KindTag::Copilot
+            | KindTag::Cursor
+            | KindTag::Gemini
+            | KindTag::Antigravity => None,
+        }
+    }
+
     /// Map a runtime [`AgentKind`] to a drivable tag, if this agent has a CLI
     /// drive row. Non-drivable kinds (Aider/Windsurf/forks/Other/Unknown)
     /// return `None`.
@@ -268,6 +301,39 @@ fn spec_for(kind: &AgentKind) -> Option<&'static DriveSpec> {
     COMMAND_MAP.iter().find(|s| s.kind_tag == tag)
 }
 
+/// Whether `kind`'s CLI can be driven **ephemerally** — with a flag that makes
+/// the agent write NOTHING to its own session store (persona + Q&A don't
+/// accumulate on disk), while keeping everything else identical.
+///
+/// `true` only for Claude Code (all three surfaces — CLI, Code app, Agent app —
+/// share the one `claude` CLI + its `--no-session-persistence` print-mode flag)
+/// and Codex (`--ephemeral`). `false` for Cursor / Gemini / Copilot /
+/// Antigravity (no known flag) and every non-CLI-drivable kind.
+///
+/// The daemon (the ephemeral-drive toggle) calls this to surface the capability
+/// and decide whether to fall back to a normal (persisting) drive when the
+/// attached agent can't honor ephemeral. Pure + side-effect-free.
+pub fn agent_supports_ephemeral(kind: &AgentKind) -> bool {
+    KindTag::from_agent_kind(kind)
+        .and_then(KindTag::ephemeral_flag)
+        .is_some()
+}
+
+/// Whether an ephemeral request WOULD be honored for `kind`: `true` when
+/// ephemeral was not requested at all (nothing to honor — today's behavior), or
+/// when it was requested AND the agent supports it. `false` only when ephemeral
+/// was requested for an agent that has no ephemeral flag — the drive proceeds
+/// normally (persisting) but the caller (the daemon) is told it could not honor
+/// the request so it can log/fall back.
+///
+/// This is the synchronous "outcome" the daemon reads: honored-ness is fully
+/// determined by the requested flag + the agent's capability, known before the
+/// drive is spawned, so it needs no field threaded back through the answer
+/// stream (whose `Started` chunk is matched in ~60 places).
+pub fn ephemeral_honored(kind: &AgentKind, requested: bool) -> bool {
+    !requested || agent_supports_ephemeral(kind)
+}
+
 /// Tunable limits for a single drive. Defaults are production-safe; callers
 /// (the daemon) may tighten them.
 ///
@@ -303,6 +369,16 @@ pub struct DriveOptions {
     /// `--resume <id>` against `~/.claude/projects/<encoded-cwd>/`). `None` → the
     /// child inherits the daemon's cwd (unchanged for fresh, non-resumed drives).
     pub cwd: Option<String>,
+    /// Drive **ephemerally** when the agent supports it: append the agent's
+    /// ephemeral flag (`--no-session-persistence` for Claude, `--ephemeral` for
+    /// Codex) so it writes NOTHING to its own session store, AND suppress
+    /// `--resume` entirely (ephemeral ⇒ a fresh, non-persisting turn; the caller
+    /// re-supplies any conversation as context). For an agent with no ephemeral
+    /// flag this is a no-op — the drive proceeds normally (persisting); the caller
+    /// learns it was not honored via [`agent_supports_ephemeral`] /
+    /// [`ephemeral_honored`]. `false` (the default) is today's exact behavior,
+    /// byte-identical (resume/argv untouched), so existing callers are unchanged.
+    pub ephemeral: bool,
 }
 
 impl Default for DriveOptions {
@@ -314,6 +390,7 @@ impl Default for DriveOptions {
             model_override: Vec::new(),
             effort_override: Vec::new(),
             cwd: None,
+            ephemeral: false,
         }
     }
 }
@@ -330,15 +407,33 @@ impl Default for DriveOptions {
 /// Cursor). The id is a session UUID the daemon owns — never attacker-controlled
 /// prompt text — so embedding it is safe; the prompt is still kept separate.
 ///
+/// `ephemeral`, when the agent supports it (see [`KindTag::ephemeral_flag`]),
+/// makes the agent write nothing to its own session store: the ephemeral flag is
+/// appended AND resume is suppressed (a fresh, non-persisting turn — the caller
+/// re-supplies conversation as context). For an agent with no ephemeral flag it
+/// is a no-op and the argv is byte-identical to a non-ephemeral drive. `false`
+/// leaves today's behavior untouched.
+///
 /// Returns `(program, args)`.
-fn build_argv(spec: &DriveSpec, q: &Question) -> (String, Vec<String>) {
+fn build_argv(spec: &DriveSpec, q: &Question, ephemeral: bool) -> (String, Vec<String>) {
     let prompt = q.render_prompt();
-    let resuming = q.resume.is_some();
+    // An ephemeral drive is always fresh: resume is dropped so nothing is
+    // continued (and Claude's cwd-scoped `--resume`/Codex's `exec resume`
+    // replacement never fire), and the agent's own persistence is disabled by the
+    // appended ephemeral flag below.
+    let resuming = q.resume.is_some() && !ephemeral;
+    let ephemeral_flag = if ephemeral {
+        spec.kind_tag.ephemeral_flag()
+    } else {
+        None
+    };
 
     // Codex is special: resume *replaces* the `exec --json <prompt>` form
     // entirely with `exec resume <id> <prompt> --json` rather than appending a
     // flag. (VERIFIED LIVE: `codex exec resume <SESSION_ID> "<prompt>"` accepts
     // the id + a follow-up prompt; the old `--last` ignored the pinned id.)
+    // Never taken under `ephemeral` (`resuming` is forced false above), so an
+    // ephemeral Codex drive always uses the fresh `exec … --ephemeral` form.
     if spec.kind_tag == KindTag::Codex && resuming {
         let id = q.resume.as_deref().unwrap_or_default();
         let args = spec
@@ -369,6 +464,12 @@ fn build_argv(spec: &DriveSpec, q: &Question) -> (String, Vec<String>) {
             // form (`{id}`) and the embedded equals form (`--resume={id}`).
             args.push(tok.replace("{id}", id));
         }
+    }
+
+    // Ephemeral flag last (only for supported agents; `None` otherwise). It never
+    // co-occurs with a resume arg — `resuming` is forced false under `ephemeral`.
+    if let Some(flag) = ephemeral_flag {
+        args.push(flag.to_string());
     }
 
     (spec.binary.to_string(), args)
@@ -491,8 +592,9 @@ fn build_argv_with_mode(
     q: &Question,
     mode: DriveMode,
     mcp_allow: &[String],
+    ephemeral: bool,
 ) -> Result<(String, Vec<String>)> {
-    let (program, mut args) = build_argv(spec, q);
+    let (program, mut args) = build_argv(spec, q, ephemeral);
 
     let extra: &[&'static str] = match mode {
         // Answer mode appends only read-safe static args. MCP auto-approval is
@@ -540,11 +642,33 @@ pub async fn drive_with_mode(
     question: Question,
     mode: DriveMode,
 ) -> Result<AnswerStream> {
+    drive_with_mode_ephemeral(agent, question, mode, false).await
+}
+
+/// [`drive_with_mode`] plus the ephemeral switch — the entry the daemon's
+/// BACKGROUND one-shots use (ledger extraction, rolling summary, conversation
+/// fold).
+///
+/// These fire far more often than answers do (~30 drives in a one-hour meeting
+/// vs. a handful of asks), and each one spawns the agent and makes it write a
+/// session file. Wiring ephemeral ONLY into the answer path therefore left the
+/// bulk of the on-disk residue in place — the background passes were the
+/// majority of it. `resume: None` (which these already used) means "don't
+/// CONTINUE a session"; it does NOT mean "don't WRITE one". Only the ephemeral
+/// flag does that, and only where the agent's CLI actually supports it (see
+/// [`KindTag::ephemeral_flag`] — Codex today).
+pub async fn drive_with_mode_ephemeral(
+    agent: AgentKind,
+    question: Question,
+    mode: DriveMode,
+    ephemeral: bool,
+) -> Result<AnswerStream> {
     drive_with_options(
         agent,
         question,
         DriveOptions {
             mode,
+            ephemeral,
             ..DriveOptions::default()
         },
     )
@@ -585,9 +709,17 @@ pub async fn drive_with_options(
     };
 
     // Assemble argv with the requested mode. An unsupported ApplyFix returns
-    // `Err` here — before any subprocess is spawned (the apply gate).
-    let (program, mut args) =
-        build_argv_with_mode(&spec, &agent, &question, opts.mode, &mcp_allow)?;
+    // `Err` here — before any subprocess is spawned (the apply gate). `ephemeral`
+    // (off by default) appends the agent's no-persist flag and drops resume for
+    // supported agents; a no-op for the rest.
+    let (program, mut args) = build_argv_with_mode(
+        &spec,
+        &agent,
+        &question,
+        opts.mode,
+        &mcp_allow,
+        opts.ephemeral,
+    )?;
 
     // Append the per-run model override LAST (e.g. Codex's `-m gpt-5.1-codex`).
     // This is the model-fallback self-resolver ([`crate::model_resolve`])
@@ -614,7 +746,10 @@ pub async fn drive_with_options(
         binary = %program,
         argc = args.len(),
         prompt_len = question.prompt.len(),
-        resuming = question.resume.is_some(),
+        // Under ephemeral, resume is suppressed even if an id was supplied.
+        resuming = question.resume.is_some() && !opts.ephemeral,
+        ephemeral = opts.ephemeral,
+        ephemeral_honored = ephemeral_honored(&agent, opts.ephemeral),
         mode = ?opts.mode,
         "driving agent CLI",
     );
@@ -1225,6 +1360,24 @@ mod tests {
         run_stream(program.to_string_lossy().into_owned(), args, parser, opts)
     }
 
+    // Back-compat test shims: the non-ephemeral (`ephemeral = false`) forms these
+    // tests were written against. They shadow the parent `build_argv` /
+    // `build_argv_with_mode` (which grew an `ephemeral` parameter) so every
+    // existing argv assertion stays byte-identical. The ephemeral-specific tests
+    // below call the real functions via `super::` explicitly.
+    fn build_argv(spec: &DriveSpec, q: &Question) -> (String, Vec<String>) {
+        super::build_argv(spec, q, false)
+    }
+    fn build_argv_with_mode(
+        spec: &DriveSpec,
+        agent: &AgentKind,
+        q: &Question,
+        mode: DriveMode,
+        mcp_allow: &[String],
+    ) -> Result<(String, Vec<String>)> {
+        super::build_argv_with_mode(spec, agent, q, mode, mcp_allow, false)
+    }
+
     // ---- argv construction / no-injection -------------------------------
 
     #[test]
@@ -1480,6 +1633,161 @@ mod tests {
         assert!(!args.iter().any(|a| a.contains("workspace-write")));
         // Must use the resume-compatible `-c` form, never the `--sandbox` flag.
         assert!(!args.iter().any(|a| a == "--sandbox"));
+    }
+
+    // ---- ephemeral drive (W3-A) -----------------------------------------
+
+    #[test]
+    fn test_agent_supports_ephemeral_only_codex_live_verified() {
+        // Codex is the ONLY agent with a real ephemeral flag (`codex exec
+        // --ephemeral`, confirmed in `codex exec --help`).
+        assert!(
+            agent_supports_ephemeral(&AgentKind::Codex),
+            "codex supports ephemeral"
+        );
+        // Claude does NOT: `--no-session-persistence` came from docs but the
+        // installed CLI (v2.0.42) rejects it with `error: unknown option` and
+        // exits 1 — the answer is LOST. Live-verified 2026-07-18. Claiming
+        // support here would ship a broken drive, so all three Claude surfaces
+        // must report false until a real flag exists and is verified.
+        for k in [
+            AgentKind::ClaudeCode,
+            AgentKind::ClaudeCodeApp,
+            AgentKind::ClaudeCodeAgent,
+        ] {
+            assert!(
+                !agent_supports_ephemeral(&k),
+                "{k:?} must NOT claim ephemeral support (no real CLI flag)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agent_supports_ephemeral_false_for_others() {
+        // No known ephemeral flag → unsupported (drive still runs, persisting).
+        for k in [
+            AgentKind::Cursor,
+            AgentKind::Gemini,
+            AgentKind::Copilot,
+            AgentKind::Antigravity,
+            // Non-CLI-drivable kinds (forks / cloud / unknown) are never supported.
+            AgentKind::VsCodeFork,
+            AgentKind::Windsurf,
+            AgentKind::Aider,
+            AgentKind::CodexCloud,
+            AgentKind::Unknown,
+            AgentKind::Other("zed".to_string()),
+        ] {
+            assert!(
+                !agent_supports_ephemeral(&k),
+                "{k:?} should NOT support ephemeral"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ephemeral_honored_semantics() {
+        // Not requested ⇒ always honored (nothing to honor — today's behavior).
+        assert!(ephemeral_honored(&AgentKind::Cursor, false));
+        assert!(ephemeral_honored(&AgentKind::Codex, false));
+        // Requested + supported ⇒ honored. Codex is the only one (live-verified).
+        assert!(ephemeral_honored(&AgentKind::Codex, true));
+        // Requested + unsupported ⇒ NOT honored (caller falls back / logs).
+        // Claude belongs here: no real ephemeral flag on the installed CLI.
+        assert!(!ephemeral_honored(&AgentKind::ClaudeCode, true));
+        assert!(!ephemeral_honored(&AgentKind::Cursor, true));
+        assert!(!ephemeral_honored(&AgentKind::Gemini, true));
+    }
+
+    #[test]
+    fn test_ephemeral_argv_codex_appends_ephemeral_flag_no_resume() {
+        // Codex ephemeral ⇒ fresh `exec … --ephemeral` (never `exec resume`),
+        // and `--ephemeral` present.
+        let s = spec(KindTag::Codex);
+        let mut q = Question::new("what changed?");
+        // Even WITH a resume id set, ephemeral must drop it and go fresh.
+        q.resume = Some("019a4a48-d3b4-7591-9e80-1b84ca5868f8".to_string());
+        let (prog, args) = super::build_argv(s, &q, true);
+        assert_eq!(prog, "codex");
+        assert!(
+            args.iter().any(|a| a == "--ephemeral"),
+            "codex ephemeral must carry --ephemeral, got {args:?}"
+        );
+        // Fresh form: `exec … --json <prompt>`, NOT `exec resume …`.
+        assert!(
+            !args.iter().any(|a| a == "resume"),
+            "no `resume` subcommand"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("019a4a48")),
+            "resume id must not leak into an ephemeral drive"
+        );
+        assert!(args.iter().any(|a| a == "what changed?"));
+    }
+
+    #[test]
+    fn test_ephemeral_argv_claude_never_passes_a_fabricated_flag() {
+        // REGRESSION GUARD (live-verified 2026-07-18): `--no-session-persistence`
+        // does not exist on the installed `claude` CLI (v2.0.42) — passing it
+        // makes the CLI exit 1 with `error: unknown option` and the answer is
+        // LOST. An ephemeral request on Claude must therefore append NO
+        // ephemeral flag at all; it degrades to a normal (persisting) drive.
+        let s = spec(KindTag::ClaudeCode);
+        let mut q = Question::new("follow up");
+        q.resume = Some("sess-123".to_string());
+        let (prog, args) = super::build_argv(s, &q, true);
+        assert_eq!(prog, "claude");
+        assert!(
+            !args.iter().any(|a| a == "--no-session-persistence"),
+            "must NOT pass the non-existent flag, got {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("--ephemeral")),
+            "codex's flag must never leak onto claude, got {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "follow up"));
+    }
+
+    #[test]
+    fn test_ephemeral_argv_unsupported_agent_no_flag_and_not_honored() {
+        // Cursor has no ephemeral flag: an ephemeral drive appends NO ephemeral
+        // flag (argv is byte-identical to the fresh non-ephemeral form) and
+        // honored=false so the caller can fall back.
+        let s = spec(KindTag::Cursor);
+        let q = Question::new("hi");
+        let (_, fresh_plain) = super::build_argv(s, &q, false);
+        let (_, fresh_ephemeral) = super::build_argv(s, &q, true);
+        assert_eq!(
+            fresh_plain, fresh_ephemeral,
+            "unsupported ephemeral must not change the argv"
+        );
+        assert!(!fresh_ephemeral.iter().any(|a| a == "--ephemeral"));
+        assert!(!fresh_ephemeral
+            .iter()
+            .any(|a| a == "--no-session-persistence"));
+        assert!(!ephemeral_honored(&AgentKind::Cursor, true));
+    }
+
+    #[test]
+    fn test_ephemeral_false_is_byte_identical_to_today() {
+        // The DEFAULT path (ephemeral=false) must be byte-identical to the
+        // pre-change behavior — including a real resume argv still forming.
+        let s = spec(KindTag::ClaudeCode);
+        let mut q = Question::new("follow up");
+        q.resume = Some("sess-123".to_string());
+        let (_, args) = super::build_argv(s, &q, false);
+        // The resume argv still forms exactly as before.
+        let i = args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(args[i + 1], "sess-123");
+        // And no ephemeral flag leaks in.
+        assert!(!args.iter().any(|a| a == "--no-session-persistence"));
+
+        // Codex too: the resume-replacement form is intact under ephemeral=false.
+        let sc = spec(KindTag::Codex);
+        let (_, cargs) = super::build_argv(sc, &q, false);
+        assert!(cargs.iter().any(|a| a == "resume"));
+        assert!(cargs.iter().any(|a| a == "sess-123"));
+        assert!(!cargs.iter().any(|a| a == "--ephemeral"));
     }
 
     // ---- drive-mode → Fix-profile arg assembly (slice F1) ---------------

@@ -2,7 +2,7 @@
 // tabs · close) over the active tab. First run shows onboarding; after that the
 // live Ask loop. One window, state-driven views (no router) — lean by design.
 
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { getClient } from "./lib";
 import { useDragHeader } from "./lib/useDragHeader";
 import { useCollapse, useOnboardingWindowSize } from "./lib/useCollapse";
@@ -14,7 +14,9 @@ import {
   SegmentedTabs,
   Waveform,
 } from "./components/primitives";
+import { EyeIcon } from "./components/icons";
 import { Pill } from "./components/Pill";
+import { LiveTranscriptBar } from "./components/LiveTranscriptBar";
 import { AskScreen } from "./screens/AskScreen";
 import { HistoryTab } from "./screens/HistoryTab";
 import { AgentsScreen } from "./screens/AgentsScreen";
@@ -37,7 +39,6 @@ export function App() {
   // Agents + attach/detach come from the shared SWR store (cached across tab
   // switches, kept live by the daemon's set_agents push) — no per-mount refetch.
   const { agents, attached, attach, detach } = useDataStore();
-  const [connectors, setConnectors] = useState<string[]>([]);
   // Drag the frameless panel by its header (no titlebar to grab).
   const headerRef = useRef<HTMLDivElement>(null);
   useDragHeader(headerRef);
@@ -52,25 +53,9 @@ export function App() {
   // rendering full-size in a large empty window).
   useOnboardingWindowSize(onboarding, collapsed);
 
-  // Real connectors for the attached agent — the footer lists the actual ready
-  // ones, never hardcoded brand names.
-  useEffect(() => {
-    let live = true;
-    if (!attached) {
-      setConnectors([]);
-      return;
-    }
-    client
-      .connectors(attached.kind)
-      .then(
-        (cs) =>
-          live && setConnectors(cs.filter((c) => c.ready).map((c) => c.name)),
-      )
-      .catch(() => live && setConnectors([]));
-    return () => {
-      live = false;
-    };
-  }, [client, attached]);
+  // (The connector list that fed the old status footer was dropped with it —
+  // the bottom row is the live transcript now. Connectors remain visible in the
+  // Agents tab, which is where they're actionable.)
 
   return (
     // The panel is ALWAYS mounted — collapse hides it via display:none, it does
@@ -164,14 +149,26 @@ export function App() {
               </span>
             </div>
             <SegmentedTabs tabs={TABS} value={tab} onChange={setTab} />
-            <button
-              aria-label="Collapse to pill"
-              title="Collapse to pill"
-              style={closeBtn}
-              onClick={() => void collapse()}
-            >
-              ×
-            </button>
+            {/* Two distinct exits, side by side: the EYE hides the panel (Bluey
+                keeps running — collapse to the pill), the × turns Bluey OFF. */}
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <button
+                aria-label="Hide panel"
+                title="Hide — Bluey keeps running"
+                style={closeBtn}
+                onClick={() => void collapse()}
+              >
+                <EyeIcon size={15} />
+              </button>
+              <button
+                aria-label="Turn Bluey off"
+                title="Turn Bluey off"
+                style={closeBtn}
+                onClick={() => client.turnOff()}
+              >
+                ×
+              </button>
+            </div>
           </div>
 
           {/* Middle: the active tab flexes to fill between header + footer and
@@ -244,27 +241,11 @@ export function App() {
             )}
           </div>
 
-          {/* footer */}
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              padding: "9px 16px",
-              borderTop: "1px solid var(--line)",
-            }}
-          >
-            <span style={ftr}>
-              {attached?.displayName ?? "Bluey"} ·{" "}
-              <span style={{ color: "var(--tint-ink)" }}>
-                runs on your machine
-              </span>
-            </span>
-            <span style={ftr}>
-              {connectors.length > 0 ? connectors.join(" · ") : "no connectors"}
-            </span>
-            <span style={ftr}>⌘↵ ask · ⌥ hide</span>
-          </div>
+          {/* Bottom row: LIVE TRANSCRIPTION (replaces the old static status
+              footer — that line never changed, so it wasted a permanent row on
+              something read once; the transcript is what's actually live). Shows
+              only the newest spoken line, expandable to a scrollable history. */}
+          <LiveTranscriptBar />
 
           <ResizeGrip />
         </Glass>
@@ -283,4 +264,3 @@ const closeBtn = {
   cursor: "pointer",
   fontSize: 16,
 } as const;
-const ftr = { fontSize: 10.5, color: "var(--ink-4)" } as const;

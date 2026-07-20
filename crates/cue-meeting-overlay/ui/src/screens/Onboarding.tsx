@@ -5,6 +5,7 @@
 
 import { useState } from "react";
 import { Glass, Mark } from "../components/primitives";
+import { AgentLogo } from "../components/AgentLogo";
 import { getClient } from "../lib";
 import type { AgentSummary } from "../lib/types";
 
@@ -82,6 +83,9 @@ export function Onboarding({
               <div style={{ display: "flex", flexDirection: "column", gap: 7, marginTop: 16 }}>
                 {(agents ?? []).slice(0, 4).map((a) => (
                   <button key={a.kind} onClick={() => { onAttach(a.kind); next(); }} style={pickRow}>
+                    <span style={{ display: "inline-flex", alignItems: "center" }}>
+                      <AgentLogo kind={a.kind} size={16} />
+                    </span>
                     <span style={{ fontSize: 13, fontWeight: 540 }}>{a.displayName}</span>
                     <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--ink-3)" }}>{a.sessionCount ?? 0} sessions</span>
                     <span style={{ color: "var(--tint-ink)", fontSize: 13 }}>→</span>

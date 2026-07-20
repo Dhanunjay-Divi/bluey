@@ -47,19 +47,28 @@ pub fn interval_turns() -> usize {
 }
 
 /// Words of new transcript between extraction passes. WORD-based (not
-/// segment-based) so the cadence is insensitive to how the STT chunks speech:
-/// the direct-emit path produces ~2-word fragments, so a segment-count trigger
-/// fired every ~13s (≈130 calls in a 30-min meeting — wasteful). ~350 words is
-/// roughly 2-3 minutes of speech at conversational pace, a predictable cadence
-/// regardless of fragmentation. Override with `BLUEY_LEDGER_INTERVAL_WORDS`.
+/// segment-based) so the cadence is insensitive to how the STT chunks speech.
+///
+/// LIVE-FIRST (2026): the ledger is a LIVE pinned card re-shown on every ask
+/// DURING the meeting — not a post-meeting batch summarizer. Batch summarizers
+/// fire at ~20-32k tokens because latency is irrelevant when nobody's watching;
+/// a live copilot is the opposite case. A decision agreed at minute 3 must show
+/// up in the card by ~minute 5, or "who owns the migration?" at minute 8 gets a
+/// blank card. At ~130 wpm, ~350 words ≈ ~2.7 min of speech — decisions land
+/// within a couple minutes. Cost is NOT paid on the cadence: the extraction
+/// prompt is SELECTIVE (`EXTRACTION_PROMPT`: "If nothing qualifies, output empty
+/// arrays") and every item is quote-verified, so a chitchat window returns empty
+/// and merges nothing — a cheap no-op pass. We fire often to stay fresh, and the
+/// model decides there's nothing worth saving. Override with
+/// `BLUEY_LEDGER_INTERVAL_WORDS`.
 pub const DEFAULT_INTERVAL_WORDS: usize = 350;
 
-/// Words between ledger passes (env `BLUEY_LEDGER_INTERVAL_WORDS`, min 60).
+/// Words between ledger passes (env `BLUEY_LEDGER_INTERVAL_WORDS`, min 100).
 pub fn interval_words() -> usize {
     env::var("BLUEY_LEDGER_INTERVAL_WORDS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .map(|n| n.max(60))
+        .map(|n| n.max(100))
         .unwrap_or(DEFAULT_INTERVAL_WORDS)
 }
 
@@ -122,14 +131,16 @@ mod tests {
 
     #[test]
     fn should_fire_words_respects_interval() {
-        // default 350 words between passes.
+        // Value-agnostic: assert the BEHAVIOR against the live interval, not a
+        // magic number, so tuning the default never breaks this test.
+        let n = interval_words();
         assert!(!should_fire_words(0, 0));
-        assert!(!should_fire_words(349, 0));
-        assert!(should_fire_words(350, 0)); // first boundary crossed
-        assert!(should_fire_words(700, 0)); // well past → still fires
-                                            // After a fire at 350, the next fire is at 350 + 350 = 700.
-        assert!(!should_fire_words(699, 350));
-        assert!(should_fire_words(700, 350));
+        assert!(!should_fire_words(n - 1, 0), "one word short must not fire");
+        assert!(should_fire_words(n, 0), "the first boundary fires");
+        assert!(should_fire_words(n * 2, 0), "well past still fires");
+        // After a fire at `n`, the next boundary is `2n`.
+        assert!(!should_fire_words(2 * n - 1, n));
+        assert!(should_fire_words(2 * n, n));
     }
 
     #[test]

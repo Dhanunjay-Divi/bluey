@@ -6,6 +6,7 @@
 
 import { HistoryScreen } from "./HistoryScreen";
 import { CoverageMeter } from "../components/CoverageMeter";
+import { AgentLogo } from "../components/AgentLogo";
 import type { AgentSummary } from "../lib/types";
 
 const CAP: Record<string, { label: string; bg: string; fg: string }> = {
@@ -108,12 +109,11 @@ export function AgentsScreen({
                 display: "inline-flex",
                 alignItems: "center",
                 justifyContent: "center",
-                fontSize: 14,
                 flex: "none",
                 boxShadow: "inset 0 0 0 1px rgba(255,255,255,.6)",
               }}
             >
-              ⌘
+              <AgentLogo kind={a.kind} size={18} />
             </span>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div

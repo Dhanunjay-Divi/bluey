@@ -165,6 +165,9 @@ export interface MeetingClient {
   startListening(sources?: { microphone?: boolean; system?: boolean }): void;
   /** Stop audio capture. */
   stopListening(): void;
+  /** Turn Bluey OFF — shuts the daemon down and exits (the overlay's × button).
+   *  Distinct from collapsing to the pill, which keeps everything running. */
+  turnOff(): void;
   /** Ask the daemon to open a macOS privacy settings pane (so the user can
    *  grant Screen Recording / Microphone access). */
   openPermissionSettings(pane: "screen_recording" | "microphone"): void;

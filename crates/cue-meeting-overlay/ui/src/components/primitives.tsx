@@ -18,7 +18,15 @@ export function Glass({
   className?: string;
 }) {
   return (
-    <div className={`glass ${className}`} style={{ borderRadius: radius, ...style }}>
+    // `position: relative` is LOAD-BEARING: it makes this the containing block
+    // for the absolutely-positioned `ResizeGrip` (bottom-right). Without it the
+    // grip escaped to the nearest positioned ancestor and landed off-target, so
+    // the corner drag silently did nothing. Callers may override via `style`,
+    // but a positioned Glass is the contract the grip depends on.
+    <div
+      className={`glass ${className}`}
+      style={{ position: "relative", borderRadius: radius, ...style }}
+    >
       <div className="aurora" />
       {children}
     </div>
@@ -263,38 +271,94 @@ export function ThinkingState({ detail }: { detail: string }) {
   );
 }
 
-/** Bottom-right resize grip for the frameless panel — drag to resize the native
- *  window (Tauri `startResizeDragging`). No-op in the browser. */
+/** Bottom-right resize grip for the frameless panel.
+ *
+ *  MANUAL resize via `window.setSize`, NOT the OS `startResizeDragging`. The
+ *  overlay window is a borderless macOS **NSPanel** (converted in the Rust shell
+ *  for screen-share invisibility + float-over behavior). A borderless NSPanel has
+ *  no resizable frame, so `startResizeDragging` — which asks the window server to
+ *  begin an edge-resize — silently no-ops on it (the long-standing "corner drag
+ *  does nothing" bug). `setSize` works on ANY window type (it's how `useCollapse`
+ *  already switches pill↔panel), so we track the pointer ourselves and set the
+ *  new size each move. No-op in the browser (no Tauri). */
+const MIN_W = 320;
+const MIN_H = 240;
+
 export function ResizeGrip() {
-  const onDown = (ev: ReactMouseEvent) => {
+  // Live drag state: the window's logical size + the mouse anchor at press.
+  const drag = useRef<{
+    startX: number;
+    startY: number;
+    startW: number;
+    startH: number;
+    setSize: (w: number, h: number) => void;
+  } | null>(null);
+
+  const onDown = async (ev: ReactMouseEvent) => {
     if (ev.button !== 0) return;
     if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
     ev.preventDefault();
     ev.stopPropagation();
-    console.log("[resize] grip mousedown → startResizeDragging SouthEast");
-    void import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
-      getCurrentWindow()
-        .startResizeDragging("SouthEast" as never)
-        .then(() => console.log("[resize] ok"))
-        .catch((e) => console.log("[resize] FAILED", e));
-    });
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      const { LogicalSize } = await import("@tauri-apps/api/dpi");
+      const win = getCurrentWindow();
+      const inner = await win.innerSize();
+      const factor = await win.scaleFactor();
+      drag.current = {
+        startX: ev.screenX,
+        startY: ev.screenY,
+        startW: Math.round(inner.width / factor),
+        startH: Math.round(inner.height / factor),
+        setSize: (w, h) => void win.setSize(new LogicalSize(w, h)),
+      };
+      // Capture the pointer on the window so the drag keeps working even if the
+      // cursor leaves the tiny grip mid-move.
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp, { once: true });
+    } catch {
+      // Non-Tauri / API unavailable — leave the grip inert.
+    }
   };
+
+  const onMove = (ev: MouseEvent) => {
+    const d = drag.current;
+    if (!d) return;
+    // SouthEast resize: new size = start size + mouse delta (screen coords, so
+    // window movement never confuses the delta). Clamp to a usable minimum.
+    const w = Math.max(MIN_W, d.startW + (ev.screenX - d.startX));
+    const h = Math.max(MIN_H, d.startH + (ev.screenY - d.startY));
+    d.setSize(w, h);
+  };
+
+  const onUp = () => {
+    drag.current = null;
+    window.removeEventListener("mousemove", onMove);
+  };
+
   return (
     <div
       onMouseDown={onDown}
       aria-label="Resize"
       style={{
         position: "absolute",
-        right: 2,
-        bottom: 2,
-        width: 18,
-        height: 18,
+        right: 0,
+        bottom: 0,
+        // A SMALL 16px corner target: the transcript bar's expand chevron lives
+        // in the bottom row's right edge, so a large grip here swallowed the
+        // chevron's clicks (expand did nothing). Keeping the grip to just the
+        // true corner — and the caption row reserving ~26px right-padding —
+        // leaves the chevron (which sits higher/left of this) fully clickable.
+        width: 16,
+        height: 16,
+        padding: "0 2px 2px 0",
+        boxSizing: "border-box",
         cursor: "nwse-resize",
         color: "var(--ink-4)",
         display: "flex",
         alignItems: "flex-end",
         justifyContent: "flex-end",
-        zIndex: 5,
+        zIndex: 50,
       }}
     >
       <svg viewBox="0 0 14 14" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">

@@ -47,9 +47,25 @@ pub(crate) fn has_acp_spec(agent: &AgentKind) -> bool {
 /// satisfying both continuation modes from one call. When `resume` is `None` we
 /// just open a fresh session (folding any context for a plain fork).
 ///
+/// ## Ephemeral drive
+///
+/// When `ephemeral` is `true` the drive is forced **fresh**: any
+/// [`Question::resume`] id is ignored and we always open a new session
+/// (`session/new`), rendering [`Question::context`] as the prompt so the app
+/// re-supplies conversation continuity itself. Nothing is loaded/continued, so
+/// the turn does not chain onto a stored session. (ACP has no per-turn
+/// "don't-persist" flag — the true no-write guarantee is the CLI `-p
+/// --no-session-persistence` / `--ephemeral` path; over ACP, forcing fresh is the
+/// honored mechanism, and the daemon supplies context every turn.) `false` (the
+/// default the non-ephemeral entry passes) is today's exact behavior.
+///
 /// Returns the [`AnswerStream`] eagerly; the ACP subprocess runs on a spawned
 /// task inside the client and is torn down when the stream is dropped.
-pub async fn drive_acp(agent: AgentKind, question: Question) -> anyhow::Result<AnswerStream> {
+pub async fn drive_acp(
+    agent: AgentKind,
+    question: Question,
+    ephemeral: bool,
+) -> anyhow::Result<AnswerStream> {
     let spec = acp_spec_for(&agent)
         .ok_or_else(|| anyhow::anyhow!("agent has no ACP entrypoint: {agent:?}"))?;
 
@@ -63,9 +79,18 @@ pub async fn drive_acp(agent: AgentKind, question: Question) -> anyhow::Result<A
         c
     };
 
-    let Some(session_id) = question.resume.clone() else {
-        // Fresh ask (or a plain fork with no resume id): fold any context into the
-        // prompt — `render_prompt()` returns just the prompt when there's none.
+    // Ephemeral ⇒ always fresh: drop any resume id so we never `session/load`.
+    let resume = if ephemeral {
+        None
+    } else {
+        question.resume.clone()
+    };
+
+    let Some(session_id) = resume else {
+        // Fresh ask (ephemeral, or a plain fork with no resume id): fold any
+        // context into the prompt — `render_prompt()` returns just the prompt when
+        // there's none. Under ephemeral this is what re-supplies conversation
+        // continuity in place of a persisted/loaded session.
         return Ok(make_client().prompt(question.render_prompt()));
     };
 

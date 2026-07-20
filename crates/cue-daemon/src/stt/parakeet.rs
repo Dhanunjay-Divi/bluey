@@ -20,13 +20,41 @@
 //! opt-in and the default build is unaffected. See
 //! docs/DECISION-VOICE-STT-STACK.md.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
 use cue_core::pcm::{AudioChunk, AudioSource};
 use cue_core::stt::{ConnectionState, SttError, SttProvider, TranscriptEvent};
 use tokio::sync::mpsc;
 use tracing::{debug, error};
+
+/// Process-wide shared Nemotron weights (loaded once, backed by an `Arc` inside
+/// `SttEngineHandle`). The first STT source to start pays the ~650 MB load; every
+/// later source spawns a `from_shared` engine reusing these weights, so mic +
+/// system audio cost ONE model in RAM. Keyed by model dir so a different model
+/// path (rare) loads its own handle rather than mis-sharing.
+static SHARED_STT_HANDLE: OnceLock<Mutex<Option<(PathBuf, cue_transcribe::SttEngineHandle)>>> =
+    OnceLock::new();
+
+/// Get a streaming engine for `dir`, sharing weights with any engine already
+/// loaded for the same dir. Loads the handle on first use (per dir). Falls back
+/// to a dedicated `SttEngine::load` only if the handle can't be built (so a
+/// single source is never blocked by the sharing machinery).
+fn shared_engine_for(dir: &Path) -> anyhow::Result<cue_transcribe::SttEngine> {
+    let slot = SHARED_STT_HANDLE.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    // Reuse the handle when the model dir matches; else (re)load for this dir.
+    let handle = match guard.as_ref() {
+        Some((cached_dir, h)) if cached_dir == dir => h.clone(),
+        _ => {
+            let h = cue_transcribe::SttEngineHandle::load(dir)?;
+            *guard = Some((dir.to_path_buf(), h.clone()));
+            h
+        }
+    };
+    Ok(cue_transcribe::SttEngine::from_shared(&handle))
+}
 
 /// Parakeet model file locations the provider resolves at connect time.
 #[derive(Debug, Clone)]
@@ -79,10 +107,14 @@ fn run_worker(
     mut audio_rx: mpsc::UnboundedReceiver<Vec<f32>>,
     event_tx: mpsc::UnboundedSender<Result<TranscriptEvent, SttError>>,
 ) {
-    // Load the streaming ASR engine on this worker thread. `cue-transcribe` owns
-    // the Nemotron-wrapping inference (CPU execution provider by default) and
-    // loads the model fresh, so the engine starts in a clean (reset) state.
-    let mut engine = match cue_transcribe::SttEngine::load(&paths.nemotron_dir) {
+    // Load the streaming ASR engine on this worker thread, SHARING the model
+    // weights across sources. The first source to start loads the ~650 MB
+    // Nemotron weights once into a process-wide handle; every subsequent source
+    // (e.g. the microphone alongside system audio) spawns a `from_shared` engine
+    // with its OWN decoder state but the SAME read-only weights — so two
+    // concurrent sources cost one model in RAM, not two. Each engine still starts
+    // in a clean (reset) state, and the streams never interfere.
+    let mut engine = match shared_engine_for(&paths.nemotron_dir) {
         Ok(e) => e,
         Err(e) => {
             let _ = event_tx.send(Err(SttError::Provider(format!(

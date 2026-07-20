@@ -32,3 +32,12 @@ rust-stemmers = "1.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+# STANDALONE-TEST LINK ONLY. In production the ONNX Runtime native library is
+# provided by the daemon's parakeet-rs stack (ort-defaults) and the whole graph
+# unifies on it; the `local-embed` dep above deliberately does NOT download
+# binaries. But `cargo test -p cue-rag --features local-embed` builds a test
+# EXECUTABLE with no parakeet in the graph, so ort-sys has nothing to link. This
+# dev-only entry lets the test binary download the prebuilt runtime. Dev-deps do
+# not propagate to crates that depend on cue-rag, so the daemon build is
+# unaffected. (agent_history's own tests use a fake embedder and never call ort.)
+ort = { version = "=2.0.0-rc.12", features = ["download-binaries"] }

@@ -116,6 +116,25 @@ export function GlobeIcon({ size }: { size?: number }) {
   );
 }
 
+/** Eye — "hide / minimise to the pill" (the panel stays running, just unseen). */
+export function EyeIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z" />
+      <circle cx="12" cy="12" r="3" />
+    </Icon>
+  );
+}
+
+/** Chevron — expand/collapse affordance (rotate 180° for the open state). */
+export function ChevronIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M6 9l6 6 6-6" />
+    </Icon>
+  );
+}
+
 /** Display — "take a screenshot". */
 export function ScreenIcon({ size }: { size?: number }) {
   return (
