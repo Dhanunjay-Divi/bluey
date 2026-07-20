@@ -8,10 +8,25 @@ export function backgroundAvailabilityDetail(
 ): string {
   if (input.backgroundEnabled) {
     return input.loginItemSupported
-      ? "Closing this window hides it to the tray. It starts quietly at sign-in and runs only while this computer is awake."
-      : "Closing this window hides it to the tray. Start-at-sign-in is not managed on this system.";
+      ? "Starts quietly at sign-in and stays ready in the tray while this computer is awake."
+      : "Stays ready in the tray while this computer is awake. Start it again after signing in.";
   }
   return input.loginItemSupported
-    ? "Closing this window quits Bluey Browser. Turn this on to start quietly at sign-in and keep it available while this computer is awake."
-    : "Closing this window quits Bluey Browser. Turn this on to keep it available while this computer is awake.";
+    ? "Turn on to start quietly at sign-in and stay ready in the tray while this computer is awake."
+    : "Turn on to stay ready in the tray while this computer is awake.";
+}
+
+export function backgroundAvailabilityTitle(
+  input: BackgroundAvailabilityCopyInput,
+): string {
+  if (input.backgroundEnabled) return "Ready in the background";
+  return input.loginItemSupported
+    ? "Start at sign-in"
+    : "Keep ready in the background";
+}
+
+export function backgroundAvailabilityStatus(
+  input: Pick<BackgroundAvailabilityCopyInput, "backgroundEnabled">,
+): string {
+  return input.backgroundEnabled ? "Background ready" : "Window only";
 }

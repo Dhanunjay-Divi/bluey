@@ -88,6 +88,10 @@ export class BrowserShell {
       {
         onShow: () => this.show(),
         onTogglePause: () => this.callbacks.onPauseChange(!this.state.paused),
+        onOpenBrowser: () => this.callbacks.onOpenBrowser(),
+        onBackgroundChange: async (enabled) => {
+          await this.setBackgroundEnabled(enabled);
+        },
         onOpenJobs: () => this.callbacks.onOpenJobs(),
         onQuit: () => this.callbacks.onQuit(),
       },

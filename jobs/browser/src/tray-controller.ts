@@ -1,10 +1,13 @@
 import { Menu, Tray, nativeImage, type NativeImage } from "electron";
 import { join } from "node:path";
 import type { ControllerViewState } from "./controller-contract.js";
+import { statusText, trayMenuView } from "./tray-menu.js";
 
 export interface TrayControllerCallbacks {
   onShow(): void;
   onTogglePause(): void | Promise<void>;
+  onOpenBrowser(): void | Promise<void>;
+  onBackgroundChange(enabled: boolean): void | Promise<void>;
   onOpenJobs(): void | Promise<void>;
   onQuit(): void | Promise<void>;
 }
@@ -30,6 +33,7 @@ export class TrayController {
 
   update(state: ControllerViewState): void {
     this.state = state;
+    this.tray?.setToolTip(`Bluey Browser · ${statusText(state)}`);
     this.rebuildMenu();
   }
 
@@ -51,35 +55,31 @@ export class TrayController {
 
   private rebuildMenu(): void {
     if (!this.tray) return;
-    const statusLabel = `Status: ${statusText(this.state)}`;
-    const backgroundLabel = this.state.backgroundEnabled
-      ? "Background: On (computer awake)"
-      : "Background: Off";
+    const view = trayMenuView(this.state);
     const menu = Menu.buildFromTemplate([
-      { label: "Show Bluey Browser", click: () => this.callbacks.onShow() },
+      { label: view.statusLabel, enabled: false },
+      { type: "separator" },
+      { label: "Show controller", click: () => this.callbacks.onShow() },
       {
-        label: this.state.paused ? "Resume applications" : "Pause applications",
-        enabled: this.state.canPause,
+        label: "Open current application",
+        enabled: view.canOpenBrowser,
+        click: () => void this.callbacks.onOpenBrowser(),
+      },
+      {
+        label: view.pauseLabel,
+        enabled: view.canPause,
         click: () => void this.callbacks.onTogglePause(),
       },
+      {
+        type: "checkbox",
+        label: "Keep ready in background",
+        checked: view.backgroundEnabled,
+        click: (item) => void this.callbacks.onBackgroundChange(item.checked),
+      },
       { label: "Open Bluey Jobs", click: () => void this.callbacks.onOpenJobs() },
-      { type: "separator" },
-      { label: statusLabel, enabled: false },
-      { label: backgroundLabel, enabled: false },
       { type: "separator" },
       { label: "Quit Bluey Browser", click: () => void this.callbacks.onQuit() },
     ]);
     this.tray.setContextMenu(menu);
-  }
-}
-
-function statusText(state: ControllerViewState): string {
-  switch (state.status) {
-    case "needs_you": return "Needs you";
-    case "failed_unknown": return "Needs review";
-    case "running": return state.paused ? "Finishing protected step" : "Running";
-    case "completed": return "Completed";
-    case "paused": return "Paused";
-    default: return state.online ? "Ready" : "Offline";
   }
 }

@@ -14,6 +14,14 @@ describe("sandboxed controller renderer", () => {
     expect(html).not.toMatch(/<script(?![^>]*\bsrc=)/i);
   });
 
+  it("ships an accessible branded header and an explicit background status", async () => {
+    const html = await readFile(join(browserRoot, "src", "renderer", "controller.html"), "utf8");
+    expect(html).toMatch(/<img[^>]+alt="Bluey Browser"/);
+    expect(html).toContain('id="availability-label"');
+    expect(html).toContain('id="background-enabled"');
+    expect(html).toContain('role="switch"');
+  });
+
   it("renders untrusted labels as text and keeps IPC action-only", async () => {
     const [renderer, preload, windowSource, shellSource, tsconfig] = await Promise.all([
       readFile(join(browserRoot, "src", "renderer", "controller.ts"), "utf8"),

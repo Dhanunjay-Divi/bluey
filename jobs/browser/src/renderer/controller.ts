@@ -1,5 +1,9 @@
 import type { ControllerViewState } from "../controller-contract.js";
-import { backgroundAvailabilityDetail } from "./background-copy.js";
+import {
+  backgroundAvailabilityDetail,
+  backgroundAvailabilityStatus,
+  backgroundAvailabilityTitle,
+} from "./background-copy.js";
 
 const elements = {
   statusCard: required<HTMLElement>("status-card"),
@@ -9,6 +13,8 @@ const elements = {
   footnote: required<HTMLElement>("footnote"),
   identity: required<HTMLElement>("identity"),
   mode: required<HTMLElement>("mode"),
+  availability: required<HTMLElement>("availability"),
+  availabilityLabel: required<HTMLElement>("availability-label"),
   offline: required<HTMLElement>("offline"),
   jobContext: required<HTMLElement>("job-context"),
   company: required<HTMLElement>("company"),
@@ -55,7 +61,9 @@ function render(state: ControllerViewState): void {
   elements.title.textContent = state.title;
   elements.detail.textContent = state.detail;
   elements.footnote.textContent = state.footnote;
-  elements.mode.textContent = state.modeLabel;
+  elements.mode.textContent = state.mode === "local" ? "On this computer" : state.modeLabel;
+  elements.availability.dataset.enabled = String(state.backgroundEnabled);
+  elements.availabilityLabel.textContent = backgroundAvailabilityStatus(state);
   elements.identity.textContent = state.identityLabel || "Separate application identity";
   elements.offline.hidden = state.online;
 
@@ -74,16 +82,15 @@ function render(state: ControllerViewState): void {
 
   elements.primary.hidden = state.primaryAction === "none";
   elements.primary.textContent = state.primaryLabel || "Continue";
-  elements.openBrowser.disabled = !state.canOpenBrowser;
-  elements.openBrowser.hidden = !state.canOpenBrowser;
+  const showSecondaryBrowser = state.canOpenBrowser && state.primaryAction !== "open_browser";
+  elements.openBrowser.disabled = !showSecondaryBrowser;
+  elements.openBrowser.hidden = !showSecondaryBrowser;
   elements.pause.disabled = !state.canPause;
   elements.pause.textContent = state.paused ? "Resume" : "Pause";
   elements.stop.disabled = !state.canStop;
   elements.stop.hidden = !state.canStop;
   elements.background.checked = state.backgroundEnabled;
-  elements.backgroundTitle.textContent = state.loginItemSupported
-    ? "Start at sign-in and keep available"
-    : "Keep available in the background";
+  elements.backgroundTitle.textContent = backgroundAvailabilityTitle(state);
   elements.backgroundDetail.textContent = backgroundAvailabilityDetail(state);
 
   const announcement = `${statusLabel(state.status)}. ${state.title}`;

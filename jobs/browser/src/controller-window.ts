@@ -54,10 +54,10 @@ export class ControllerWindow {
     const controllerHtml = join(moduleDirectory, "renderer", "controller.html");
     const icon = join(this.appRoot, "assets", "icon-512.png");
     const window = new BrowserWindow({
-      width: 680,
-      height: 720,
-      minWidth: 480,
-      minHeight: 560,
+      width: 640,
+      height: 680,
+      minWidth: 460,
+      minHeight: 540,
       show: false,
       title: "Bluey Browser",
       backgroundColor: "#06121a",

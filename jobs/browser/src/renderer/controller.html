@@ -14,13 +14,16 @@
     <main class="shell" id="app">
       <header class="app-header">
         <div class="brand-lockup">
-          <img src="../../assets/icon-128.png" width="46" height="46" alt="">
+          <img src="../../assets/icon-128.png" width="48" height="48" alt="Bluey Browser">
           <div>
             <strong>Bluey Browser</strong>
             <span id="identity">Separate application identity</span>
           </div>
         </div>
-        <span class="mode-chip" id="mode">Local</span>
+        <div class="header-status">
+          <span class="availability-chip" id="availability" data-enabled="false"><i></i><span id="availability-label">Window only</span></span>
+          <span class="mode-label" id="mode">On this computer</span>
+        </div>
       </header>
 
       <section class="offline-banner" id="offline" role="status" hidden>
@@ -37,7 +40,7 @@
         </div>
       </section>
 
-      <section class="progress-card" aria-labelledby="progress-title">
+      <section class="progress-panel" aria-labelledby="progress-title">
         <div class="section-heading">
           <h2 id="progress-title">Application progress</h2>
           <span id="run-count">No open application</span>
@@ -62,8 +65,8 @@
       <section class="background-card">
         <label class="toggle-row" for="background-enabled">
           <span>
-            <strong id="background-title">Keep available in the background</strong>
-            <small id="background-detail">Closing this window quits Bluey Browser. Turn this on to keep it available while this computer is awake.</small>
+            <strong id="background-title">Start at sign-in</strong>
+            <small id="background-detail">Turn on to stay ready in the tray while this computer is awake.</small>
           </span>
           <input id="background-enabled" type="checkbox" role="switch">
         </label>
