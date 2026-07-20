@@ -66,11 +66,31 @@ TEMPORAL_TLS=true
 ```
 
 Run the discovery worker as a separate deployment using the workflows image
-with command `node workflows/dist/discovery-worker.js`. It leases only
+with command `node workflows/dist/discovery-worker.js`, or install
+`ops/bluey-jobs-discovery.service.example` for a co-located systemd deployment.
+The co-located unit loads `/etc/bluey-api/bluey-jobs-discovery.env` after the
+shared Jobs environment. Set the private worker values there so signed worker
+routes never cross the public edge:
+
+```env
+BLUEY_JOBS_API_ORIGIN=http://127.0.0.1:8081
+BLUEY_JOBS_DISCOVERY_WORKER_ID=production-discovery-1
+BLUEY_JOBS_DISCOVERY_POLL_MS=5000
+```
+
+Keep this file root-owned and mode `0640`, with group access limited to the
+service account. Do not put the signing key in this override; it remains in the
+shared root-managed Jobs environment.
+The example unit is part of `bluey-jobs-api.service`, so API maintenance also
+restarts the co-located worker after the listener is available. Confirm both
+units are active after deployment; do not leave the worker stopped after an API
+binary swap.
+
+It leases only
 server-configured, host-pinned Greenhouse, Lever, Ashby, SmartRecruiters, and
 Workday sources, sends complete snapshots, and reports bounded failure codes.
-Production `BLUEY_JOBS_API_ORIGIN` must use HTTPS; plaintext origins are
-accepted only for loopback development.
+Networked production workers must use HTTPS. Plaintext is accepted only for a
+co-located worker connecting to a loopback-only Jobs listener.
 
 ### Discovery source lifecycle
 

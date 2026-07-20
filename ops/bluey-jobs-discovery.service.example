@@ -1,0 +1,40 @@
+[Unit]
+Description=Bluey Jobs public ATS discovery worker
+After=network-online.target bluey-jobs-api.service
+Wants=network-online.target
+Requires=bluey-jobs-api.service
+PartOf=bluey-jobs-api.service
+
+[Service]
+Type=simple
+User=bluey
+Group=bluey
+WorkingDirectory=/opt/bluey-jobs-discovery/current/jobs
+EnvironmentFile=/etc/bluey-api/bluey-jobs.env
+EnvironmentFile=/etc/bluey-api/bluey-jobs-discovery.env
+Environment=NODE_ENV=production
+ExecStart=/usr/local/bin/node workflows/dist/discovery-worker.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+UMask=0077
+
+LimitNOFILE=8192
+MemoryMax=512M
+CPUQuota=100%
+
+[Install]
+WantedBy=multi-user.target
