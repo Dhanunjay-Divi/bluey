@@ -85,6 +85,43 @@ describe("Jobhive artifact ingestion", () => {
     expect(await readdir(stagingDirectory)).toEqual([path.basename(verified.path)]);
   });
 
+  it("reuses a content-verified staged artifact when the pinned manifest entry is unchanged", async () => {
+    const content = fixtureCsv();
+    const stagingDirectory = await temporaryDirectory();
+    const fetcher = vi.fn(async () => new Response(content, { status: 200 }));
+    const options = {
+      artifact: artifactFor(content),
+      sourceFamily: "lever",
+      stagingDirectory,
+      fetch: fetcher as typeof fetch,
+    };
+
+    const first = await downloadJobhiveArtifact(options);
+    const second = await downloadJobhiveArtifact(options);
+
+    expect(second).toEqual(first);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("discards a corrupted staged artifact before fetching the pinned artifact again", async () => {
+    const content = fixtureCsv();
+    const stagingDirectory = await temporaryDirectory();
+    const fetcher = vi.fn(async () => new Response(content, { status: 200 }));
+    const options = {
+      artifact: artifactFor(content),
+      sourceFamily: "lever",
+      stagingDirectory,
+      fetch: fetcher as typeof fetch,
+    };
+
+    const first = await downloadJobhiveArtifact(options);
+    await writeFile(first.path, "corrupted");
+    const recovered = await downloadJobhiveArtifact(options);
+
+    expect(await readFile(recovered.path, "utf8")).toBe(content);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("removes partial files after checksum failure and rejects oversized artifacts", async () => {
     const content = fixtureCsv();
     const stagingDirectory = await temporaryDirectory();

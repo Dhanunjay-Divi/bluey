@@ -114,6 +114,8 @@ export async function downloadJobhiveArtifact(
   const suffix = `${artifact.sha256.slice(0, 16)}.${artifact.format}`;
   const finalPath = path.join(stagingDirectory, `${sourceFamily}-${suffix}`);
   const temporaryPath = path.join(stagingDirectory, `.${sourceFamily}-${randomUUID()}.partial`);
+  const cached = await reuseVerifiedArtifact({ artifact, sourceFamily, path: finalPath });
+  if (cached) return cached;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let handle: Awaited<ReturnType<typeof open>> | null = null;
@@ -178,6 +180,51 @@ export async function downloadJobhiveArtifact(
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function reuseVerifiedArtifact(input: {
+  artifact: JobhiveArtifact;
+  sourceFamily: string;
+  path: string;
+}): Promise<VerifiedJobhiveArtifact | null> {
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  let shouldDiscard = false;
+  try {
+    handle = await open(input.path, "r");
+    const metadata = await handle.stat();
+    if (metadata.size !== input.artifact.sizeBytes) {
+      shouldDiscard = true;
+    } else {
+      const hash = createHash("sha256");
+      let bytes = 0;
+      for await (const chunk of handle.createReadStream({ autoClose: false })) {
+        bytes += chunk.byteLength;
+        hash.update(chunk);
+      }
+      const sha256 = hash.digest("hex");
+      if (bytes === input.artifact.sizeBytes && sha256 === input.artifact.sha256) {
+        return {
+          artifact: input.artifact,
+          sourceFamily: input.sourceFamily,
+          path: input.path,
+          bytes,
+          sha256,
+        };
+      }
+      shouldDiscard = true;
+    }
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return null;
+    throw new JobhiveArtifactError("unavailable", "Verified Jobhive artifact cache could not be read");
+  } finally {
+    if (handle) await handle.close().catch(() => undefined);
+  }
+  if (shouldDiscard) await rm(input.path, { force: true }).catch(() => undefined);
+  return null;
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }
 
 /**
