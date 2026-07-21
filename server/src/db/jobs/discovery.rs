@@ -108,6 +108,40 @@ pub fn get_discovery_source(pool: &DbPool, source_id: &str) -> Result<Option<Dis
     })
 }
 
+/// Enroll the bounded, account-level curated source once a candidate has at
+/// least one Career Track. The worker fetches every allowlisted feed once per
+/// account and the server assigns each lead to its best eligible track.
+pub fn ensure_managed_curated_discovery_source(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Option<DiscoverySource>> {
+    if list_tracks(pool, account_id)?.is_empty() {
+        return Ok(None);
+    }
+    if let Some(source) = list_discovery_sources(pool, account_id)?
+        .into_iter()
+        .find(|source| {
+            source.provider == CURATED_DISCOVERY_PROVIDER
+                && source.source_key == CURATED_DISCOVERY_SOURCE_KEY
+                && source.track_id.is_empty()
+        })
+    {
+        return Ok(Some(source));
+    }
+    upsert_discovery_source(
+        pool,
+        account_id,
+        &DiscoverySourceInput {
+            track_id: String::new(),
+            provider: CURATED_DISCOVERY_PROVIDER.to_string(),
+            source_key: CURATED_DISCOVERY_SOURCE_KEY.to_string(),
+            company: CURATED_DISCOVERY_COMPANY.to_string(),
+            run_interval_ms: default_discovery_interval_ms(),
+        },
+    )
+    .map(Some)
+}
+
 pub fn upsert_discovery_source(
     pool: &DbPool,
     account_id: &str,
@@ -120,7 +154,12 @@ pub fn upsert_discovery_source(
     let provider = input.provider.trim().to_ascii_lowercase();
     if !matches!(
         provider.as_str(),
-        "greenhouse" | "lever" | "ashby" | "smartrecruiters" | "workday"
+        "greenhouse"
+            | "lever"
+            | "ashby"
+            | "smartrecruiters"
+            | "workday"
+            | CURATED_DISCOVERY_PROVIDER
     ) {
         anyhow::bail!("unsupported Jobs discovery provider")
     }
@@ -141,6 +180,13 @@ pub fn upsert_discovery_source(
         anyhow::bail!("discovery source company is required")
     }
     let track_id = input.track_id.trim();
+    if provider == CURATED_DISCOVERY_PROVIDER
+        && (!track_id.is_empty()
+            || requested_source_key != CURATED_DISCOVERY_SOURCE_KEY
+            || company != CURATED_DISCOVERY_COMPANY)
+    {
+        anyhow::bail!("managed curated discovery source is invalid")
+    }
     if !track_id.is_empty()
         && !list_tracks(pool, account_id)?
             .iter()
@@ -201,6 +247,14 @@ pub fn upsert_discovery_source(
                 }),
             )
         }
+        CURATED_DISCOVERY_PROVIDER => (
+            requested_source_key.to_string(),
+            json!({
+                "kind": CURATED_DISCOVERY_PROVIDER,
+                "company": CURATED_DISCOVERY_COMPANY,
+                "feedIds": CURATED_DISCOVERY_CATALOG_IDS,
+            }),
+        ),
         _ => unreachable!(),
     };
     let digest = hex::encode(Sha256::digest(format!(
@@ -417,7 +471,12 @@ pub fn validate_discovery_source_input(
     let provider = input.provider.trim().to_ascii_lowercase();
     if !matches!(
         provider.as_str(),
-        "greenhouse" | "lever" | "ashby" | "smartrecruiters" | "workday"
+        "greenhouse"
+            | "lever"
+            | "ashby"
+            | "smartrecruiters"
+            | "workday"
+            | CURATED_DISCOVERY_PROVIDER
     ) {
         anyhow::bail!("unsupported Jobs discovery provider")
     }
@@ -444,6 +503,13 @@ pub fn validate_discovery_source_input(
         anyhow::bail!("discovery source company is required")
     }
     let track_id = input.track_id.trim();
+    if provider == CURATED_DISCOVERY_PROVIDER
+        && (!track_id.is_empty()
+            || source_key != CURATED_DISCOVERY_SOURCE_KEY
+            || company != CURATED_DISCOVERY_COMPANY)
+    {
+        anyhow::bail!("managed curated discovery source is invalid")
+    }
     if !track_id.is_empty()
         && !list_tracks(pool, account_id)?
             .iter()
@@ -511,6 +577,11 @@ fn normalized_discovery_source_values(
                 "site": identifiers[2], "locale": "en-US", "company": company,
             })
         }
+        CURATED_DISCOVERY_PROVIDER => json!({
+            "kind": CURATED_DISCOVERY_PROVIDER,
+            "company": CURATED_DISCOVERY_COMPANY,
+            "feedIds": CURATED_DISCOVERY_CATALOG_IDS,
+        }),
         _ => anyhow::bail!("unsupported Jobs discovery provider"),
     };
     let digest = hex::encode(Sha256::digest(format!(
@@ -566,6 +637,7 @@ fn resolve_verified_import_identity_sqlite(
     source_id: &str,
     external_id: &str,
     canonical_key: &str,
+    canonical_url: &str,
 ) -> Result<Option<JobPosting>> {
     let membership_job_id: Option<String> = tx
         .query_row(
@@ -600,14 +672,28 @@ fn resolve_verified_import_identity_sqlite(
         .optional()?
         .map(|raw| parse_json::<JobPosting>(raw, "job posting"))
         .transpose()?;
-    if membership_posting
-        .as_ref()
-        .zip(canonical_posting.as_ref())
-        .is_some_and(|(membership, canonical)| membership.id != canonical.id)
-    {
-        anyhow::bail!("discovery membership and canonical job disagree")
+    let mut statement = tx.prepare(
+        "SELECT posting_json FROM jobs_postings
+          WHERE account_id = ?1 AND canonical_url = ?2
+          ORDER BY id LIMIT 2",
+    )?;
+    let mut rows = statement.query(params![account_id, canonical_url])?;
+    let mut url_posting: Option<JobPosting> = None;
+    while let Some(row) = rows.next()? {
+        let parsed = parse_json::<JobPosting>(row.get::<_, String>(0)?, "job posting")?;
+        if url_posting
+            .as_ref()
+            .is_some_and(|existing| existing.id != parsed.id)
+        {
+            anyhow::bail!("canonical job URL refers to multiple Jobs matches")
+        }
+        url_posting = Some(parsed);
     }
-    Ok(membership_posting.or(canonical_posting))
+    resolve_consistent_verified_import_identity([
+        membership_posting,
+        canonical_posting,
+        url_posting,
+    ])
 }
 
 fn resolve_verified_import_identity_postgres(
@@ -616,6 +702,7 @@ fn resolve_verified_import_identity_postgres(
     source_id: &str,
     external_id: &str,
     canonical_key: &str,
+    canonical_url: &str,
 ) -> Result<Option<JobPosting>> {
     let membership_job_id = tx
         .query_opt(
@@ -645,14 +732,44 @@ fn resolve_verified_import_identity_postgres(
         )?
         .map(|row| parse_json::<JobPosting>(row.get(0), "job posting"))
         .transpose()?;
-    if membership_posting
-        .as_ref()
-        .zip(canonical_posting.as_ref())
-        .is_some_and(|(membership, canonical)| membership.id != canonical.id)
-    {
-        anyhow::bail!("discovery membership and canonical job disagree")
+    let url_rows = tx.query(
+        "SELECT posting_json FROM jobs_postings
+          WHERE account_id = $1 AND canonical_url = $2
+          ORDER BY id LIMIT 2 FOR UPDATE",
+        &[&account_id, &canonical_url],
+    )?;
+    let mut url_posting: Option<JobPosting> = None;
+    for row in url_rows {
+        let parsed = parse_json::<JobPosting>(row.get(0), "job posting")?;
+        if url_posting
+            .as_ref()
+            .is_some_and(|existing| existing.id != parsed.id)
+        {
+            anyhow::bail!("canonical job URL refers to multiple Jobs matches")
+        }
+        url_posting = Some(parsed);
     }
-    Ok(membership_posting.or(canonical_posting))
+    resolve_consistent_verified_import_identity([
+        membership_posting,
+        canonical_posting,
+        url_posting,
+    ])
+}
+
+fn resolve_consistent_verified_import_identity<const N: usize>(
+    candidates: [Option<JobPosting>; N],
+) -> Result<Option<JobPosting>> {
+    let mut resolved: Option<JobPosting> = None;
+    for candidate in candidates.into_iter().flatten() {
+        if resolved
+            .as_ref()
+            .is_some_and(|existing| existing.id != candidate.id)
+        {
+            anyhow::bail!("discovery membership, canonical job, and job URL disagree")
+        }
+        resolved = Some(candidate);
+    }
+    Ok(resolved)
 }
 
 /// Atomically accept a verified public import and its required board binding.
@@ -727,6 +844,7 @@ pub fn save_verified_import_posting_with_source(
                 &actual_source_id,
                 external_id,
                 &canonical_job_key(posting),
+                &posting.canonical_url,
             )?;
             let saved = prepare_snapshot_posting(
                 posting,
@@ -856,6 +974,7 @@ pub fn save_verified_import_posting_with_source(
                 &actual_source_id,
                 external_id,
                 &canonical_job_key(posting),
+                &posting.canonical_url,
             )?;
             let saved = prepare_snapshot_posting(
                 posting,
@@ -1290,6 +1409,60 @@ fn recover_legacy_stale_discovery_commits(pool: &DbPool, now: i64) -> Result<()>
 }
 
 #[allow(clippy::too_many_arguments)]
+fn prepare_discovery_snapshot_candidate(
+    posting: &JobPosting,
+    existing: Option<JobPosting>,
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+    applications: &[JobApplication],
+    reservations: &[AttemptReservation],
+    tracks: &[CareerTrack],
+    observed_at_ms: i64,
+) -> Result<JobPosting> {
+    // A candidate feed is a lead, not application truth. It may attach source
+    // membership to an existing canonical job, but it must never downgrade a
+    // direct employer record that has already been verified.
+    if is_curated_job_source(&posting.source)
+        && existing
+            .as_ref()
+            .is_some_and(|value| !is_curated_job_source(&value.source))
+    {
+        return existing.ok_or_else(|| anyhow::anyhow!("canonical job disappeared"));
+    }
+
+    let mut candidate = posting.clone();
+    if let Some(value) = existing.as_ref() {
+        candidate.track_id.clone_from(&value.track_id);
+    }
+    let track = tracks
+        .iter()
+        .find(|track| track.id == candidate.track_id);
+    if is_curated_job_source(&candidate.source) && track.is_none() {
+        anyhow::bail!("curated discovery job Career Track was not found")
+    }
+    if !candidate.track_id.is_empty() && track.is_none() {
+        anyhow::bail!("discovery job Career Track was not found")
+    }
+    prepare_snapshot_posting(
+        &candidate,
+        existing,
+        &PostingSnapshotContext {
+            profile,
+            preferences,
+            applications,
+            reservations,
+            track,
+            observed_at_ms,
+        },
+    )
+}
+
+fn is_curated_job_source(source: &str) -> bool {
+    source == CURATED_DISCOVERY_PROVIDER
+        || source.starts_with(&format!("{CURATED_DISCOVERY_PROVIDER}:"))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn publish_discovery_snapshot(
     pool: &DbPool,
     source: &DiscoverySource,
@@ -1302,7 +1475,7 @@ fn publish_discovery_snapshot(
     preferences: &JobPreferences,
     applications: &[JobApplication],
     reservations: &[AttemptReservation],
-    track: Option<&CareerTrack>,
+    tracks: &[CareerTrack],
     observed_at_ms: i64,
 ) -> Result<DiscoveryRunResult> {
     let token_hash = discovery_lease_token_hash(lease_token);
@@ -1440,17 +1613,15 @@ fn publish_discovery_snapshot(
                     anyhow::bail!("discovery membership and canonical job disagree")
                 }
                 let existing = membership_posting.or(canonical_posting);
-                let saved = prepare_snapshot_posting(
+                let saved = prepare_discovery_snapshot_candidate(
                     posting,
                     existing.as_ref().cloned(),
-                    &PostingSnapshotContext {
-                        profile,
-                        preferences,
-                        applications,
-                        reservations,
-                        track,
-                        observed_at_ms,
-                    },
+                    profile,
+                    preferences,
+                    applications,
+                    reservations,
+                    tracks,
+                    observed_at_ms,
                 )?;
                 let payload = to_json(&saved, "job posting")?;
                 if existing.is_some() {
@@ -1493,15 +1664,16 @@ fn publish_discovery_snapshot(
                         source_id, account_id, canonical_key, external_id, job_id,
                         content_hash, first_seen_at_ms, last_seen_at_ms,
                         last_seen_run_id, availability_status
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 'active')
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)
                      ON CONFLICT(source_id, external_id) DO UPDATE SET
                         canonical_key = excluded.canonical_key, job_id = excluded.job_id,
                         content_hash = excluded.content_hash, last_seen_at_ms = excluded.last_seen_at_ms,
-                        last_seen_run_id = excluded.last_seen_run_id, availability_status = 'active',
+                        last_seen_run_id = excluded.last_seen_run_id,
+                        availability_status = excluded.availability_status,
                         missing_count = 0, missing_since_at_ms = NULL",
                     params![
                         source.id, source.account_id, saved.canonical_key, external_id, saved.id,
-                        content_hash, observed_at_ms, run_id,
+                        content_hash, observed_at_ms, run_id, posting.availability_status,
                     ],
                 )?;
                 seen.push(external_id.clone());
@@ -1516,7 +1688,7 @@ fn publish_discovery_snapshot(
                 preferences,
                 applications,
                 reservations,
-                track,
+                tracks,
             )?;
             let source_changed = tx.execute(
                 "UPDATE jobs_discovery_sources
@@ -1682,17 +1854,15 @@ fn publish_discovery_snapshot(
                     anyhow::bail!("discovery membership and canonical job disagree")
                 }
                 let existing = membership_posting.or(canonical_posting);
-                let saved = prepare_snapshot_posting(
+                let saved = prepare_discovery_snapshot_candidate(
                     posting,
                     existing.as_ref().cloned(),
-                    &PostingSnapshotContext {
-                        profile,
-                        preferences,
-                        applications,
-                        reservations,
-                        track,
-                        observed_at_ms,
-                    },
+                    profile,
+                    preferences,
+                    applications,
+                    reservations,
+                    tracks,
+                    observed_at_ms,
                 )?;
                 let payload = to_json(&saved, "job posting")?;
                 if existing.is_some() {
@@ -1744,15 +1914,17 @@ fn publish_discovery_snapshot(
                         source_id, account_id, canonical_key, external_id, job_id,
                         content_hash, first_seen_at_ms, last_seen_at_ms,
                         last_seen_run_id, availability_status
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, 'active')
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9)
                      ON CONFLICT(source_id, external_id) DO UPDATE SET
                         canonical_key = EXCLUDED.canonical_key, job_id = EXCLUDED.job_id,
                         content_hash = EXCLUDED.content_hash, last_seen_at_ms = EXCLUDED.last_seen_at_ms,
-                        last_seen_run_id = EXCLUDED.last_seen_run_id, availability_status = 'active',
+                        last_seen_run_id = EXCLUDED.last_seen_run_id,
+                        availability_status = EXCLUDED.availability_status,
                         missing_count = 0, missing_since_at_ms = NULL",
                     &[
                         &source.id, &source.account_id, &saved.canonical_key, &external_id,
                         &saved.id, &content_hash, &observed_at_ms, &run_id,
+                        &posting.availability_status,
                     ],
                 )?;
                 seen.push(external_id.clone());
@@ -1767,7 +1939,7 @@ fn publish_discovery_snapshot(
                 preferences,
                 applications,
                 reservations,
-                track,
+                tracks,
             )?;
             let source_changed = tx.execute(
                 "UPDATE jobs_discovery_sources
@@ -1832,13 +2004,13 @@ fn close_missing_snapshot_memberships_sqlite(
     preferences: &JobPreferences,
     applications: &[JobApplication],
     reservations: &[AttemptReservation],
-    track: Option<&CareerTrack>,
+    tracks: &[CareerTrack],
 ) -> Result<i64> {
     const MISSING_GRACE_MS: i64 = 30 * 60 * 1_000;
     let mut stmt = tx.prepare(
-        "SELECT external_id, job_id, missing_count, missing_since_at_ms
+        "SELECT external_id, job_id, missing_count, missing_since_at_ms, availability_status
            FROM jobs_discovery_memberships
-          WHERE source_id = ?1 AND availability_status = 'active'",
+          WHERE source_id = ?1 AND availability_status IN ('active', 'unknown')",
     )?;
     let active = stmt
         .query_map(params![source.id], |row| {
@@ -1847,13 +2019,14 @@ fn close_missing_snapshot_memberships_sqlite(
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
     let seen = seen.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut closed = 0;
-    for (external_id, job_id, missing_count, missing_since_at_ms) in active {
+    for (external_id, job_id, missing_count, missing_since_at_ms, prior_availability) in active {
         if seen.contains(external_id.as_str()) {
             continue;
         }
@@ -1861,11 +2034,16 @@ fn close_missing_snapshot_memberships_sqlite(
         let next_missing_count = missing_count + 1;
         let should_close = next_missing_count >= 2
             && observed_at_ms.saturating_sub(missing_since) >= MISSING_GRACE_MS;
-        let availability = if should_close { "expired" } else { "active" };
+        let availability = if should_close {
+            "expired"
+        } else {
+            prior_availability.as_str()
+        };
         let changed = tx.execute(
             "UPDATE jobs_discovery_memberships
                 SET availability_status = ?4, missing_count = ?5, missing_since_at_ms = ?3
-              WHERE source_id = ?1 AND external_id = ?2 AND availability_status = 'active'",
+              WHERE source_id = ?1 AND external_id = ?2
+                AND availability_status IN ('active', 'unknown')",
             params![
                 source.id,
                 external_id,
@@ -1877,15 +2055,19 @@ fn close_missing_snapshot_memberships_sqlite(
         if changed == 0 || !should_close {
             continue;
         }
-        let still_active: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM jobs_discovery_memberships
-              WHERE account_id = ?1 AND job_id = ?2 AND availability_status = 'active')",
+        let (still_active, still_unknown): (bool, bool) = tx.query_row(
+            "SELECT
+                EXISTS(SELECT 1 FROM jobs_discovery_memberships
+                  WHERE account_id = ?1 AND job_id = ?2 AND availability_status = 'active'),
+                EXISTS(SELECT 1 FROM jobs_discovery_memberships
+                  WHERE account_id = ?1 AND job_id = ?2 AND availability_status = 'unknown')",
             params![source.account_id, job_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if still_active {
             continue;
         }
+        let aggregate_availability = if still_unknown { "unknown" } else { "expired" };
         let raw: Option<String> = tx
             .query_row(
                 "SELECT posting_json FROM jobs_postings WHERE account_id = ?1 AND id = ?2",
@@ -1895,9 +2077,16 @@ fn close_missing_snapshot_memberships_sqlite(
             .optional()?;
         if let Some(raw) = raw {
             let mut posting: JobPosting = parse_json(raw, "job posting")?;
-            posting.availability_status = "expired".to_string();
-            posting.last_verified_at_ms = Some(observed_at_ms);
+            posting.availability_status = aggregate_availability.to_string();
+            posting.last_verified_at_ms = if still_unknown {
+                None
+            } else if is_curated_job_source(&posting.source) {
+                posting.last_verified_at_ms
+            } else {
+                Some(observed_at_ms)
+            };
             posting.updated_at_ms = observed_at_ms;
+            let track = tracks.iter().find(|track| track.id == posting.track_id);
             let existing_application_id = applications
                 .iter()
                 .find(|application| application.job_id == posting.id)
@@ -1918,7 +2107,9 @@ fn close_missing_snapshot_memberships_sqlite(
                 params![source.account_id, job_id, payload, observed_at_ms],
             )?;
         }
-        closed += 1;
+        if !still_unknown {
+            closed += 1;
+        }
     }
     Ok(closed)
 }
@@ -1934,14 +2125,14 @@ fn close_missing_snapshot_memberships_postgres(
     preferences: &JobPreferences,
     applications: &[JobApplication],
     reservations: &[AttemptReservation],
-    track: Option<&CareerTrack>,
+    tracks: &[CareerTrack],
 ) -> Result<i64> {
     const MISSING_GRACE_MS: i64 = 30 * 60 * 1_000;
     let active = tx
         .query(
-            "SELECT external_id, job_id, missing_count, missing_since_at_ms
+            "SELECT external_id, job_id, missing_count, missing_since_at_ms, availability_status
                FROM jobs_discovery_memberships
-              WHERE source_id = $1 AND availability_status = 'active' FOR UPDATE",
+              WHERE source_id = $1 AND availability_status IN ('active', 'unknown') FOR UPDATE",
             &[&source.id],
         )?
         .into_iter()
@@ -1951,12 +2142,13 @@ fn close_missing_snapshot_memberships_postgres(
                 row.get::<_, String>(1),
                 row.get::<_, i64>(2),
                 row.get::<_, Option<i64>>(3),
+                row.get::<_, String>(4),
             )
         })
         .collect::<Vec<_>>();
     let seen = seen.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut closed = 0;
-    for (external_id, job_id, missing_count, missing_since_at_ms) in active {
+    for (external_id, job_id, missing_count, missing_since_at_ms, prior_availability) in active {
         if seen.contains(external_id.as_str()) {
             continue;
         }
@@ -1964,11 +2156,16 @@ fn close_missing_snapshot_memberships_postgres(
         let next_missing_count = missing_count + 1;
         let should_close = next_missing_count >= 2
             && observed_at_ms.saturating_sub(missing_since) >= MISSING_GRACE_MS;
-        let availability = if should_close { "expired" } else { "active" };
+        let availability = if should_close {
+            "expired"
+        } else {
+            prior_availability.as_str()
+        };
         let changed = tx.execute(
             "UPDATE jobs_discovery_memberships
                 SET availability_status = $4, missing_count = $5, missing_since_at_ms = $3
-              WHERE source_id = $1 AND external_id = $2 AND availability_status = 'active'",
+              WHERE source_id = $1 AND external_id = $2
+                AND availability_status IN ('active', 'unknown')",
             &[
                 &source.id,
                 &external_id,
@@ -1980,25 +2177,37 @@ fn close_missing_snapshot_memberships_postgres(
         if changed == 0 || !should_close {
             continue;
         }
-        let still_active: bool = tx
+        let row = tx
             .query_one(
-                "SELECT EXISTS(SELECT 1 FROM jobs_discovery_memberships
-              WHERE account_id = $1 AND job_id = $2 AND availability_status = 'active')",
+                "SELECT
+                    EXISTS(SELECT 1 FROM jobs_discovery_memberships
+                      WHERE account_id = $1 AND job_id = $2 AND availability_status = 'active'),
+                    EXISTS(SELECT 1 FROM jobs_discovery_memberships
+                      WHERE account_id = $1 AND job_id = $2 AND availability_status = 'unknown')",
                 &[&source.account_id, &job_id],
-            )?
-            .get(0);
+            )?;
+        let still_active: bool = row.get(0);
+        let still_unknown: bool = row.get(1);
         if still_active {
             continue;
         }
+        let aggregate_availability = if still_unknown { "unknown" } else { "expired" };
         let raw = tx.query_opt(
             "SELECT posting_json FROM jobs_postings WHERE account_id = $1 AND id = $2 FOR UPDATE",
             &[&source.account_id, &job_id],
         )?.map(|row| row.get::<_, String>(0));
         if let Some(raw) = raw {
             let mut posting: JobPosting = parse_json(raw, "job posting")?;
-            posting.availability_status = "expired".to_string();
-            posting.last_verified_at_ms = Some(observed_at_ms);
+            posting.availability_status = aggregate_availability.to_string();
+            posting.last_verified_at_ms = if still_unknown {
+                None
+            } else if is_curated_job_source(&posting.source) {
+                posting.last_verified_at_ms
+            } else {
+                Some(observed_at_ms)
+            };
             posting.updated_at_ms = observed_at_ms;
+            let track = tracks.iter().find(|track| track.id == posting.track_id);
             let existing_application_id = applications
                 .iter()
                 .find(|application| application.job_id == posting.id)
@@ -2019,7 +2228,9 @@ fn close_missing_snapshot_memberships_postgres(
                 &[&source.account_id, &job_id, &payload, &observed_at_ms],
             )?;
         }
-        closed += 1;
+        if !still_unknown {
+            closed += 1;
+        }
     }
     Ok(closed)
 }
@@ -2042,7 +2253,7 @@ pub fn complete_discovery_run(
     let source = get_discovery_source(pool, source_id)?
         .ok_or_else(|| anyhow::anyhow!("discovery source not found"))?;
 
-    let company = source
+    let source_company = source
         .config
         .get("company")
         .and_then(Value::as_str)
@@ -2054,17 +2265,32 @@ pub fn complete_discovery_run(
     let applications = list_applications(pool, &source.account_id)?;
     let reservations = list_attempt_reservations(pool, &source.account_id)?;
     let tracks = list_tracks(pool, &source.account_id)?;
-    let track = tracks.iter().find(|track| track.id == source.track_id);
+    let source_track = tracks.iter().find(|track| track.id == source.track_id);
+    if source.provider == CURATED_DISCOVERY_PROVIDER && tracks.is_empty() {
+        anyhow::bail!("curated discovery requires at least one Career Track")
+    }
     let fetched_at_ms = now_ms();
     let mut normalized = BTreeMap::<String, (JobPosting, String)>::new();
     for input in jobs {
         validate_discovered_job(&source, input)?;
         let canonical_url = canonicalize_discovered_url(&source, &input.canonical_url)?;
+        let company = if source.provider == CURATED_DISCOVERY_PROVIDER {
+            input.company.trim()
+        } else {
+            source_company
+        };
         let content_hash = discovered_job_content_hash(&source, input, company, &canonical_url);
         let mut posting = JobPosting {
             id: String::new(),
             canonical_key: String::new(),
-            source: source.provider.clone(),
+            source: if source.provider == CURATED_DISCOVERY_PROVIDER {
+                format!(
+                    "{CURATED_DISCOVERY_PROVIDER}:{}",
+                    input.source_catalog_id.trim()
+                )
+            } else {
+                source.provider.clone()
+            },
             external_id: input.external_id.trim().to_string(),
             company: company.to_string(),
             title: input.title.trim().to_string(),
@@ -2088,13 +2314,31 @@ pub fn complete_discovery_run(
             posted_at_ms: input
                 .posted_at_ms
                 .filter(|value| *value <= fetched_at_ms + DAY_MS),
-            last_verified_at_ms: Some(fetched_at_ms),
-            availability_status: "active".to_string(),
+            last_verified_at_ms: (source.provider != CURATED_DISCOVERY_PROVIDER)
+                .then_some(fetched_at_ms),
+            availability_status: if source.provider == CURATED_DISCOVERY_PROVIDER {
+                "unknown".to_string()
+            } else {
+                "active".to_string()
+            },
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
             eligibility: None,
         };
+        if source.provider == CURATED_DISCOVERY_PROVIDER {
+            let Some(track) = best_curated_discovery_track(
+                &posting,
+                &profile,
+                &preferences,
+                &tracks,
+            ) else {
+                continue;
+            };
+            posting.track_id = track.id.clone();
+        } else if source_track.is_none() && !source.track_id.is_empty() {
+            anyhow::bail!("discovery source Career Track was not found")
+        }
         posting.canonical_key = canonical_job_key(&posting);
         let external_id = posting.external_id.clone();
         match normalized.get(&external_id) {
@@ -2131,7 +2375,7 @@ pub fn complete_discovery_run(
         &preferences,
         &applications,
         &reservations,
-        track,
+        &tracks,
         fetched_at_ms,
     )
 }
@@ -2393,6 +2637,20 @@ fn validate_discovered_job(source: &DiscoverySource, input: &DiscoveredJobInput)
     {
         anyhow::bail!("discovery job category is invalid")
     }
+    if source.provider == CURATED_DISCOVERY_PROVIDER {
+        if input.company.trim().is_empty()
+            || input.company.chars().count() > 200
+            || !CURATED_DISCOVERY_CATALOG_IDS.contains(&input.source_catalog_id.trim())
+            || !input.requires_original_revalidation
+        {
+            anyhow::bail!("curated discovery lead is invalid")
+        }
+    } else if input.company.chars().count() > 200
+        || !input.source_catalog_id.trim().is_empty()
+        || input.requires_original_revalidation
+    {
+        anyhow::bail!("direct discovery job contains unsupported source metadata")
+    }
     canonicalize_discovered_url(source, &input.canonical_url)?;
     Ok(())
 }
@@ -2417,11 +2675,104 @@ fn is_canonical_discovered_engagement_type(value: &str) -> bool {
 }
 
 fn canonicalize_discovered_url(source: &DiscoverySource, raw: &str) -> Result<String> {
+    if source.provider == CURATED_DISCOVERY_PROVIDER {
+        return canonicalize_curated_lead_url(raw);
+    }
     let (canonical_url, source_key) = canonical_public_discovery_url(&source.provider, raw)?;
     if source_key != source.source_key {
         anyhow::bail!("discovery job URL does not belong to the configured source")
     }
     Ok(canonical_url)
+}
+
+fn canonicalize_curated_lead_url(raw: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(raw.trim()).context("parse curated job URL")?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        anyhow::bail!("curated job URL must be public default-port HTTPS without credentials")
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.parse::<std::net::IpAddr>().is_ok()
+        || matches!(
+            host.as_str(),
+            "github.com" | "raw.githubusercontent.com" | "gist.githubusercontent.com"
+        )
+    {
+        anyhow::bail!("curated job URL must point to a public employer application page")
+    }
+    let mut retained_query = url
+        .query_pairs()
+        .filter(|(key, _)| !is_tracking_query_key(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    retained_query.sort();
+    url.set_query(None);
+    if !retained_query.is_empty() {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in retained_query {
+            query.append_pair(&key, &value);
+        }
+    }
+    url.set_fragment(None);
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn best_curated_discovery_track<'a>(
+    posting: &JobPosting,
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+    tracks: &'a [CareerTrack],
+) -> Option<&'a CareerTrack> {
+    tracks
+        .iter()
+        .filter_map(|track| {
+            let target_family = canonical_role_family(Some(track), posting);
+            let posting_family = posting_role_family(posting);
+            if target_family != ROLE_FAMILY_GENERIC
+                && posting_family != ROLE_FAMILY_GENERIC
+                && target_family != posting_family
+            {
+                return None;
+            }
+            if (target_family == ROLE_FAMILY_GENERIC || posting_family == ROLE_FAMILY_GENERIC)
+                && !meaningful_role_overlap(&track.role, &posting.title)
+            {
+                return None;
+            }
+            let (score, _, _) = score_posting(posting, profile, preferences, Some(track));
+            (score >= 30).then_some((score, track))
+        })
+        .max_by(|(left_score, left), (right_score, right)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| right.id.cmp(&left.id))
+        })
+        .map(|(_, track)| track)
+}
+
+fn meaningful_role_overlap(left: &str, right: &str) -> bool {
+    const GENERIC: [&str; 14] = [
+        "associate", "developer", "engineer", "engineering", "intern", "junior", "lead",
+        "manager", "principal", "senior", "specialist", "staff", "the", "and",
+    ];
+    let tokens = |value: &str| {
+        value
+            .to_ascii_lowercase()
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|token| token.len() >= 3 && !GENERIC.contains(token))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+    };
+    let left = tokens(left);
+    let right = tokens(right);
+    !left.is_disjoint(&right)
 }
 
 /// Derive a scheduled public-ATS source only from a job that the server's

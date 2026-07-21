@@ -8,8 +8,10 @@ import {
   JOB_IMPORT_FALLBACK_LABEL,
   discoverySourceAction,
   discoverySourceState,
+  isCandidateLead,
   isRecentPosting,
   postingAgeLabel,
+  visibleMatches,
 } from "./MatchesView";
 
 function source(status: DiscoverySource["status"], health: DiscoverySourceHealth): DiscoverySource {
@@ -51,6 +53,25 @@ describe("discovery source health", () => {
     expect(html).toContain("Watch companies");
     expect(html).toContain("Add job link");
   });
+
+  it("names the managed aggregate without exposing implementation-oriented source IDs", () => {
+    const managed = {
+      ...source("active", "healthy"),
+      provider: "curated_feed",
+      config: { company: "Curated career feeds" },
+    } as DiscoverySource;
+    const html = renderToStaticMarkup(
+      <DiscoverySourceHealthList
+        sources={[managed]}
+        onAddJob={() => undefined}
+        onWatchCompanies={() => undefined}
+      />,
+    );
+
+    expect(html).toContain("Career feeds");
+    expect(html).toContain("Public, allowlisted feeds");
+    expect(html).not.toContain("Curated_feed");
+  });
 });
 
 describe("job-link import", () => {
@@ -70,5 +91,28 @@ describe("job-link import", () => {
 
     expect(postingAgeLabel(job)).toBe("Posting date not listed");
     expect(isRecentPosting(job, 14)).toBe(true);
+  });
+
+  it("requires original-employer verification for managed-feed leads", () => {
+    expect(isCandidateLead({
+      source: "curated_feed:feed-simplify-new-grad",
+      availability_status: "unknown",
+      last_verified_at_ms: undefined,
+    })).toBe(true);
+    expect(isCandidateLead({
+      source: "lever",
+      availability_status: "active",
+      last_verified_at_ms: Date.now(),
+    })).toBe(false);
+  });
+});
+
+describe("large match sets", () => {
+  it("shows the first 50 results without discarding the remaining matches", () => {
+    const matches = Array.from({ length: 125 }, (_, index) => ({ id: `job-${index + 1}` }));
+
+    expect(visibleMatches(matches, 50)).toHaveLength(50);
+    expect(visibleMatches(matches, 100)).toHaveLength(100);
+    expect(visibleMatches(matches, 150)).toHaveLength(125);
   });
 });

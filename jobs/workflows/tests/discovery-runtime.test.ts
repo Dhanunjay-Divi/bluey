@@ -117,6 +117,36 @@ function greenhousePayload(): unknown {
   };
 }
 
+const CURATED_FEED_IDS = [
+  "feed-simplify-new-grad",
+  "feed-prepai-internships",
+  "feed-prepai-new-grad",
+  "feed-zapply-new-grad",
+];
+
+function curatedSource(): DiscoverySourceRecord {
+  return source({
+    id: "source-curated-account",
+    track_id: "",
+    provider: "curated_feed",
+    source_key: "bluey-curated-v1",
+    config: {
+      kind: "curated_feed",
+      company: "Curated career feeds",
+      feedIds: CURATED_FEED_IDS,
+    },
+    health: "waiting",
+  });
+}
+
+function curatedFeedMarkdown(role = "Software Engineer"): string {
+  return [
+    "| Company | Role | Location | Application | Age |",
+    "| --- | --- | --- | --- | --- |",
+    `| Acme | ${role} | Remote | [Apply](https://boards.greenhouse.io/acme/jobs/123) | 2d |`,
+  ].join("\n");
+}
+
 describe("discovery worker runtime", () => {
   it("handles a no-lease poll without starting provider work", async () => {
     const requests: Array<{ input: string; init?: RequestInit }> = [];
@@ -336,6 +366,116 @@ describe("discovery worker runtime", () => {
     await expect(worker.pollOnce()).resolves.toBe("completed");
     expect(api.completed).toHaveLength(1);
     expect(api.failed).toEqual([]);
+  });
+
+  it("ingests every allowlisted curated feed as one deduplicated candidate snapshot", async () => {
+    const api = new FakeApi([lease(curatedSource())]);
+    const requested: string[] = [];
+    const curatedFetch: typeof fetch = vi.fn(async (input, init) => {
+      requested.push(String(input));
+      expect(init?.redirect).toBe("error");
+      return new Response(curatedFeedMarkdown(), {
+        status: 200,
+        headers: {
+          "content-type": "text/markdown",
+          etag: "\"curated-v1\"",
+        },
+      });
+    });
+    const worker = new DiscoveryWorkerRuntime({
+      api,
+      curatedFetch,
+      loopClock: new ImmediateClock(),
+      logger: new RecordingLogger(),
+    });
+
+    await expect(worker.pollOnce()).resolves.toBe("completed");
+
+    expect(requested).toEqual([
+      "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/README.md",
+      "https://raw.githubusercontent.com/PrepAIJobs/Summer2026-Internships/main/README.md",
+      "https://raw.githubusercontent.com/PrepAIJobs/New-Grad-2026/main/README.md",
+      "https://raw.githubusercontent.com/zapplyjobs/New-Grad-Jobs-2027/main/README.md",
+    ]);
+    expect(api.failed).toEqual([]);
+    expect(api.completed).toHaveLength(1);
+    expect(api.completed[0]).toMatchObject({
+      sourceId: "source-curated-account",
+      input: {
+        complete_snapshot: true,
+        jobs: [{
+          canonical_url: "https://boards.greenhouse.io/acme/jobs/123",
+          company: "Acme",
+          title: "Software Engineer",
+          source_catalog_id: "feed-simplify-new-grad",
+          requires_original_revalidation: true,
+          location: "Remote",
+          workplace: "remote",
+          employment_type: "full_time",
+          posted_at_ms: SCHEDULED_FOR_MS - 2 * 24 * 60 * 60 * 1_000,
+        }],
+      },
+    });
+  });
+
+  it("does not publish a partial curated snapshot when one feed is unavailable", async () => {
+    const api = new FakeApi([lease(curatedSource())]);
+    let requestCount = 0;
+    const curatedFetch: typeof fetch = vi.fn(async () => {
+      requestCount += 1;
+      return requestCount === 3
+        ? new Response("unavailable", { status: 503 })
+        : new Response(curatedFeedMarkdown(), { status: 200 });
+    });
+    const worker = new DiscoveryWorkerRuntime({
+      api,
+      curatedFetch,
+      loopClock: new ImmediateClock(),
+      logger: new RecordingLogger(),
+    });
+
+    await expect(worker.pollOnce()).resolves.toBe("failed");
+
+    expect(requestCount).toBe(3);
+    expect(api.completed).toEqual([]);
+    expect(api.failed[0]?.input.error_code).toBe("unavailable");
+  });
+
+  it("shares one bounded curated snapshot across account leases", async () => {
+    const secondSource = curatedSource();
+    secondSource.id = "source-curated-second-account";
+    const api = new FakeApi([
+      lease(curatedSource()),
+      lease(secondSource, {
+        lease_token: "lease-second",
+        replay_key: "replay-second",
+        scheduled_for_ms: SCHEDULED_FOR_MS + 60_000,
+      }),
+    ]);
+    let requestCount = 0;
+    let now = SCHEDULED_FOR_MS;
+    const worker = new DiscoveryWorkerRuntime({
+      api,
+      curatedFetch: vi.fn(async () => {
+        requestCount += 1;
+        return new Response(curatedFeedMarkdown(), { status: 200 });
+      }),
+      curatedSnapshotTtlMs: 5 * 60_000,
+      curatedNow: () => now,
+      loopClock: new ImmediateClock(),
+      logger: new RecordingLogger(),
+    });
+
+    await expect(worker.pollOnce()).resolves.toBe("completed");
+    now += 60_000;
+    await expect(worker.pollOnce()).resolves.toBe("completed");
+
+    expect(requestCount).toBe(CURATED_FEED_IDS.length);
+    expect(api.completed).toHaveLength(2);
+    expect(api.completed[0]?.input.jobs.map(({ posted_at_ms: _, ...job }) => job))
+      .toEqual(api.completed[1]?.input.jobs.map(({ posted_at_ms: _, ...job }) => job));
+    expect(api.completed[1]?.input.jobs[0]?.posted_at_ms)
+      .toBe((api.completed[0]?.input.jobs[0]?.posted_at_ms ?? 0) + 60_000);
   });
 
   it("reports a provider failure instead of completing an empty snapshot", async () => {

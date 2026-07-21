@@ -302,6 +302,13 @@ pub async fn workspace(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
 ) -> Result<Json<JobsWorkspace>, ApiError> {
+    if let Err(error) = jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id) {
+        tracing::warn!(
+            account_fingerprint = %discovery_log_fingerprint(&account.id),
+            error_category = discovery_enrollment_error_category(&error),
+            "Jobs workspace could not ensure managed curated discovery"
+        );
+    }
     let mut workspace =
         jobs::workspace(&state.pool, &account.id, &account.email).map_err(internal)?;
     if backfill_verified_import_discovery_sources(
@@ -379,6 +386,7 @@ pub async fn complete_onboarding(
 
     jobs::save_preferences(&state.pool, &account.id, &input.preferences).map_err(internal)?;
     jobs::upsert_track(&state.pool, &account.id, &input.track).map_err(internal)?;
+    jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id).map_err(internal)?;
     // Persist completion last. Retrying after any earlier write is idempotent,
     // while a partial request can never make the portal skip onboarding.
     jobs::save_profile(&state.pool, &account.id, &input.profile).map_err(internal)?;
@@ -480,9 +488,9 @@ pub async fn save_track(
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
     let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
     enforce_track_limit(&track, &current, &entitlement)?;
-    jobs::upsert_track(&state.pool, &account.id, &track)
-        .map(Json)
-        .map_err(internal)
+    let saved = jobs::upsert_track(&state.pool, &account.id, &track).map_err(internal)?;
+    jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id).map_err(internal)?;
+    Ok(Json(saved))
 }
 
 pub async fn update_track(
@@ -497,9 +505,9 @@ pub async fn update_track(
     if !current.iter().any(|item| item.id == track.id) {
         return Err((StatusCode::NOT_FOUND, "Career Track not found.".to_string()));
     }
-    jobs::upsert_track(&state.pool, &account.id, &track)
-        .map(Json)
-        .map_err(internal)
+    let saved = jobs::upsert_track(&state.pool, &account.id, &track).map_err(internal)?;
+    jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id).map_err(internal)?;
+    Ok(Json(saved))
 }
 
 pub async fn delete_track(

@@ -237,6 +237,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .job-row:hover, .application-row:hover { background: var(--surface-2); }
 .job-row.passed { opacity: .72; }
 .job-list.compact .job-row { min-height: 58px; padding-top: 7px; padding-bottom: 7px; }
+.job-list-more { min-height: 54px; padding: 9px 16px; display: flex; align-items: center; justify-content: center; gap: 16px; color: var(--muted); font-size: 12px; font-weight: 700; }
+.status-pill.candidate-lead { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); background: color-mix(in srgb, var(--warning) 8%, var(--surface)); }
+.eligibility-panel.candidate-lead { border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); background: color-mix(in srgb, var(--warning) 6%, var(--surface)); }
 .company-mark { width: 36px; height: 36px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-3); color: var(--text-soft); font-size: 10px; font-weight: 900; }
 .job-main, .application-main { min-width: 0; display: grid; gap: 4px; }
 .job-main strong, .application-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
@@ -1086,6 +1089,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .company-mark { width: 32px; height: 32px; }
   .job-row .job-location { display: none; }
   .job-row .status-pill { grid-column: 2 / 4; justify-self: start; }
+  .job-list-more { min-height: 70px; padding: 11px; flex-direction: column; gap: 8px; text-align: center; }
   .application-toolbar { align-items: stretch; flex-direction: column; }
   .tab-control { overflow-x: auto; }
   .tab-control button { min-width: 86px; }

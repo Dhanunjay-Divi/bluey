@@ -29,6 +29,15 @@ pub const ADDITIONAL_INBOX_CENTS: i64 = 400;
 const ENCRYPTED_PAYLOAD_PREFIX: &str = "bluey-jobs:v1:";
 const DISCOVERY_MIN_INTERVAL_MS: i64 = 5 * 60 * 1_000;
 const DISCOVERY_MAX_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
+const CURATED_DISCOVERY_PROVIDER: &str = "curated_feed";
+const CURATED_DISCOVERY_SOURCE_KEY: &str = "bluey-curated-v1";
+const CURATED_DISCOVERY_COMPANY: &str = "Curated career feeds";
+const CURATED_DISCOVERY_CATALOG_IDS: [&str; 4] = [
+    "feed-simplify-new-grad",
+    "feed-prepai-internships",
+    "feed-prepai-new-grad",
+    "feed-zapply-new-grad",
+];
 /// A guardrail against a single account repeatedly enrolling near-identical
 /// public boards. Boards are intentionally one-to-one with a Career Track.
 pub const DISCOVERY_MAX_SOURCES_PER_TRACK: usize = 8;
@@ -482,6 +491,12 @@ pub struct DiscoveredJobInput {
     pub external_id: String,
     pub canonical_url: String,
     pub title: String,
+    #[serde(default)]
+    pub company: String,
+    #[serde(default)]
+    pub source_catalog_id: String,
+    #[serde(default)]
+    pub requires_original_revalidation: bool,
     #[serde(default)]
     pub location: String,
     #[serde(default)]

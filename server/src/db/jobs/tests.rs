@@ -399,7 +399,28 @@ mod tests {
             canonical_url: format!(
                 "https://boards.greenhouse.io/acme/jobs/{external_id}?utm_source=test"
             ),
+            company: String::new(),
+            source_catalog_id: String::new(),
+            requires_original_revalidation: false,
             title: title.to_string(),
+            location: "New York, NY".to_string(),
+            workplace: "hybrid".to_string(),
+            description: "Build reliable products with Rust and TypeScript.".to_string(),
+            compensation: "$170k-$200k".to_string(),
+            employment_type: "full_time".to_string(),
+            engagement_type: "direct_hire".to_string(),
+            posted_at_ms: Some(now_ms() - DAY_MS),
+        }
+    }
+
+    fn curated_discovered_job(external_id: &str, canonical_url: &str) -> DiscoveredJobInput {
+        DiscoveredJobInput {
+            external_id: external_id.to_string(),
+            canonical_url: canonical_url.to_string(),
+            company: "Acme".to_string(),
+            source_catalog_id: "feed-simplify-new-grad".to_string(),
+            requires_original_revalidation: true,
+            title: "Software Engineer".to_string(),
             location: "New York, NY".to_string(),
             workplace: "hybrid".to_string(),
             description: "Build reliable products with Rust and TypeScript.".to_string(),
@@ -740,6 +761,217 @@ mod tests {
                 .health,
             "healthy"
         );
+    }
+
+    #[test]
+    fn managed_curated_discovery_is_one_account_level_source() {
+        let pool = test_pool();
+        let first = ensure_managed_curated_discovery_source(&pool, "acct-jobs")
+            .unwrap()
+            .unwrap();
+        let second = ensure_managed_curated_discovery_source(&pool, "acct-jobs")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.provider, CURATED_DISCOVERY_PROVIDER);
+        assert_eq!(first.source_key, CURATED_DISCOVERY_SOURCE_KEY);
+        assert!(first.track_id.is_empty());
+        assert_eq!(
+            first.config.get("feedIds"),
+            Some(&json!(CURATED_DISCOVERY_CATALOG_IDS))
+        );
+        assert_eq!(
+            list_discovery_sources(&pool, "acct-jobs")
+                .unwrap()
+                .into_iter()
+                .filter(|source| source.provider == CURATED_DISCOVERY_PROVIDER)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn managed_curated_discovery_requires_and_tracks_the_last_career_track() {
+        let pool = test_pool();
+        assert!(ensure_managed_curated_discovery_source(&pool, "acct-jobs")
+            .unwrap()
+            .is_some());
+
+        assert!(delete_track(&pool, "acct-jobs", "track-default").unwrap());
+        assert!(list_tracks(&pool, "acct-jobs").unwrap().is_empty());
+        assert!(list_discovery_sources(&pool, "acct-jobs")
+            .unwrap()
+            .is_empty());
+        assert!(ensure_managed_curated_discovery_source(&pool, "acct-jobs")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn curated_discovery_persists_verify_first_leads_on_the_best_track() {
+        let pool = test_pool();
+        let source = ensure_managed_curated_discovery_source(&pool, "acct-jobs")
+            .unwrap()
+            .unwrap();
+        let lease = lease_due_discovery_source(&pool, "curated-worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.source.id, source.id);
+
+        let result = complete_discovery_run(
+            &pool,
+            &source.id,
+            &lease.lease_token,
+            &lease.replay_key,
+            lease.scheduled_for_ms,
+            &[curated_discovered_job(
+                "lead-1",
+                "https://jobs.lever.co/acme/software-engineer?utm_source=feed",
+            )],
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.discovered_count, 1);
+        assert_eq!(result.upserted_count, 1);
+
+        let postings = list_postings(&pool, "acct-jobs").unwrap();
+        assert_eq!(postings.len(), 1);
+        let posting = &postings[0];
+        assert_eq!(posting.company, "Acme");
+        assert_eq!(posting.track_id, "track-default");
+        assert_eq!(posting.source, "curated_feed:feed-simplify-new-grad");
+        assert_eq!(posting.availability_status, "unknown");
+        assert!(posting.last_verified_at_ms.is_none());
+        assert!(!posting.canonical_url.contains("utm_source"));
+
+        let decision = evaluate_job_eligibility(&pool, "acct-jobs", posting, true, None).unwrap();
+        assert!(!decision.can_prepare);
+        assert!(!decision.can_queue_local);
+        assert!(!decision.can_queue_cloud);
+        assert!(decision
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "availability_unverified"));
+        assert!(decision
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "live_verification_required"));
+    }
+
+    #[test]
+    fn verified_employer_import_upgrades_matching_feed_url_without_duplication() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        let preferences = JobPreferences::default();
+        let direct_url = "https://jobs.lever.co/acme/software-engineer";
+        let source = ensure_managed_curated_discovery_source(&pool, "acct-jobs")
+            .unwrap()
+            .unwrap();
+        let lease = lease_due_discovery_source(&pool, "curated-worker")
+            .unwrap()
+            .unwrap();
+        complete_discovery_run(
+            &pool,
+            &source.id,
+            &lease.lease_token,
+            &lease.replay_key,
+            lease.scheduled_for_ms,
+            &[curated_discovered_job("feed-lead", direct_url)],
+            true,
+        )
+        .unwrap();
+        let feed_lead = list_postings(&pool, "acct-jobs").unwrap().remove(0);
+
+        let mut employer_posting = test_posting(direct_url, now_ms() - DAY_MS, now_ms());
+        employer_posting.source = "lever_import".to_string();
+        employer_posting.external_id = "software-engineer".to_string();
+        employer_posting.company = "Acme Incorporated".to_string();
+        employer_posting.title = "Platform Software Engineer".to_string();
+        employer_posting.location = "United States".to_string();
+        employer_posting.workplace = "remote".to_string();
+        let verified = save_verified_import_posting_with_source(
+            &pool,
+            "acct-jobs",
+            &employer_posting,
+            &DiscoverySourceInput {
+                track_id: "track-default".to_string(),
+                provider: "lever".to_string(),
+                source_key: "acme".to_string(),
+                company: "Acme Incorporated".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+            &profile,
+            &preferences,
+        )
+        .unwrap();
+
+        assert_eq!(verified.id, feed_lead.id);
+        assert_eq!(verified.source, "lever_import");
+        assert_eq!(verified.company, "Acme Incorporated");
+        assert_eq!(verified.title, "Platform Software Engineer");
+        assert_eq!(verified.availability_status, "active");
+        assert!(verified.last_verified_at_ms.is_some());
+        let postings = list_postings(&pool, "acct-jobs").unwrap();
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].id, feed_lead.id);
+        let membership_job_ids = pool
+            .get()
+            .unwrap()
+            .prepare(
+                "SELECT DISTINCT job_id FROM jobs_discovery_memberships
+                  WHERE account_id = ?1 ORDER BY job_id",
+            )
+            .unwrap()
+            .query_map(params!["acct-jobs"], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(membership_job_ids, vec![feed_lead.id]);
+    }
+
+    #[test]
+    fn curated_discovery_never_downgrades_a_verified_employer_record() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        let preferences = JobPreferences::default();
+        let direct_url = "https://jobs.lever.co/acme/software-engineer";
+        let mut direct = test_posting(direct_url, now_ms() - DAY_MS, now_ms());
+        direct.source = "lever".to_string();
+        let direct = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &direct,
+            &profile,
+            &preferences,
+        )
+        .unwrap();
+        assert_eq!(direct.availability_status, "active");
+        assert!(direct.last_verified_at_ms.is_some());
+
+        let source = ensure_managed_curated_discovery_source(&pool, "acct-jobs")
+            .unwrap()
+            .unwrap();
+        let lease = lease_due_discovery_source(&pool, "curated-worker")
+            .unwrap()
+            .unwrap();
+        complete_discovery_run(
+            &pool,
+            &source.id,
+            &lease.lease_token,
+            &lease.replay_key,
+            lease.scheduled_for_ms,
+            &[curated_discovered_job("lead-verified", direct_url)],
+            true,
+        )
+        .unwrap();
+
+        let postings = list_postings(&pool, "acct-jobs").unwrap();
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].id, direct.id);
+        assert_eq!(postings[0].source, "lever");
+        assert_eq!(postings[0].availability_status, "active");
+        assert_eq!(postings[0].last_verified_at_ms, direct.last_verified_at_ms);
     }
 
     #[test]
@@ -2126,6 +2358,9 @@ mod tests {
                 &[DiscoveredJobInput {
                     external_id: external_id.to_string(),
                     canonical_url: snapshot_url.to_string(),
+                    company: String::new(),
+                    source_catalog_id: String::new(),
+                    requires_original_revalidation: false,
                     title: imported.title.clone(),
                     location: imported.location.clone(),
                     workplace: imported.workplace.clone(),

@@ -671,6 +671,23 @@ pub fn delete_track(pool: &DbPool, account_id: &str, track_id: &str) -> Result<b
                     "DELETE FROM jobs_tracks WHERE account_id = ?1 AND id = ?2",
                     params![account_id, track_id],
                 )?;
+                let remaining_tracks: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM jobs_tracks WHERE account_id = ?1",
+                    params![account_id],
+                    |row| row.get(0),
+                )?;
+                if remaining_tracks == 0 {
+                    tx.execute(
+                        "DELETE FROM jobs_discovery_sources
+                          WHERE account_id = ?1 AND provider = ?2
+                            AND source_key = ?3 AND track_id = ''",
+                        params![
+                            account_id,
+                            CURATED_DISCOVERY_PROVIDER,
+                            CURATED_DISCOVERY_SOURCE_KEY,
+                        ],
+                    )?;
+                }
             }
             tx.commit()?;
             Ok(exists)
@@ -707,6 +724,24 @@ pub fn delete_track(pool: &DbPool, account_id: &str, track_id: &str) -> Result<b
                     "DELETE FROM jobs_tracks WHERE account_id = $1 AND id = $2",
                     &[&account_id, &track_id],
                 )?;
+                let remaining_tracks: i64 = tx
+                    .query_one(
+                        "SELECT COUNT(*) FROM jobs_tracks WHERE account_id = $1",
+                        &[&account_id],
+                    )?
+                    .get(0);
+                if remaining_tracks == 0 {
+                    tx.execute(
+                        "DELETE FROM jobs_discovery_sources
+                          WHERE account_id = $1 AND provider = $2
+                            AND source_key = $3 AND track_id = ''",
+                        &[
+                            &account_id,
+                            &CURATED_DISCOVERY_PROVIDER,
+                            &CURATED_DISCOVERY_SOURCE_KEY,
+                        ],
+                    )?;
+                }
             }
             tx.commit()?;
             Ok(exists)

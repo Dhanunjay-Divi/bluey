@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
-import type { JobsFetch } from "@bluey/jobs-automation";
+import {
+  CURATED_JOB_FEEDS,
+  CuratedFeedError,
+  fetchCuratedFeed,
+  type CuratedFeedLead,
+  type JobsFetch,
+} from "@bluey/jobs-automation";
 import {
   type DiscoveredJobInput,
   type DiscoveryCompleteInput,
@@ -31,6 +37,9 @@ export const MAX_DISCOVERY_POLL_INTERVAL_MS = 60_000;
 
 const DEFAULT_SOURCE_CACHE_SIZE = 16;
 const MAX_SOURCE_CACHE_SIZE = 256;
+const DEFAULT_CURATED_SNAPSHOT_TTL_MS = 5 * 60_000;
+const MIN_CURATED_SNAPSHOT_TTL_MS = 1_000;
+const MAX_CURATED_SNAPSHOT_TTL_MS = 60 * 60_000;
 
 export type DiscoveryRuntimeFailureCode =
   | DiscoveryConfigurationErrorCode
@@ -76,6 +85,9 @@ export interface DiscoveryWorkerRuntimeOptions {
   pollIntervalMs?: number;
   logger?: DiscoveryWorkerLogger;
   atsFetch?: JobsFetch;
+  curatedFetch?: typeof fetch;
+  curatedSnapshotTtlMs?: number;
+  curatedNow?: () => number;
   atsTimeoutMs?: number;
   loopClock?: DiscoveryClock;
   sleep?: DiscoveryPollSleep;
@@ -105,6 +117,11 @@ interface SourceCacheEntry {
   report?: CachedReport;
 }
 
+interface CuratedSnapshot {
+  expiresAtMs: number;
+  leads: CuratedFeedLead[];
+}
+
 const consoleLogger: DiscoveryWorkerLogger = {
   log: (event) => console.log(JSON.stringify(event)),
 };
@@ -115,11 +132,15 @@ export class DiscoveryWorkerRuntime {
   private readonly api: DiscoveryWorkerApi;
   private readonly logger: DiscoveryWorkerLogger;
   private readonly atsFetch?: JobsFetch;
+  private readonly curatedFetch?: typeof fetch;
+  private readonly curatedSnapshotTtlMs: number;
+  private readonly curatedNow: () => number;
   private readonly atsTimeoutMs?: number;
   private readonly loopClock?: DiscoveryClock;
   private readonly sleep: DiscoveryPollSleep;
   private readonly sourceCacheSize: number;
   private readonly sourceCache = new Map<string, SourceCacheEntry>();
+  private curatedSnapshot?: CuratedSnapshot;
   private readonly stopController = new AbortController();
   private stopping = false;
 
@@ -130,6 +151,14 @@ export class DiscoveryWorkerRuntime {
     );
     this.logger = options.logger ?? consoleLogger;
     this.atsFetch = options.atsFetch;
+    this.curatedFetch = options.curatedFetch;
+    this.curatedSnapshotTtlMs = boundedInteger(
+      options.curatedSnapshotTtlMs ?? DEFAULT_CURATED_SNAPSHOT_TTL_MS,
+      MIN_CURATED_SNAPSHOT_TTL_MS,
+      MAX_CURATED_SNAPSHOT_TTL_MS,
+      "curated snapshot TTL",
+    );
+    this.curatedNow = options.curatedNow ?? Date.now;
     this.atsTimeoutMs = options.atsTimeoutMs;
     this.loopClock = options.loopClock;
     this.sleep = options.sleep ?? interruptibleSleep;
@@ -187,6 +216,10 @@ export class DiscoveryWorkerRuntime {
     const sourceStateFailure = sourceStateFailureCode(lease.source);
     if (sourceStateFailure) {
       return this.reportDirectFailure(lease, sourceStateFailure, cached?.state);
+    }
+
+    if (lease.source.provider === "curated_feed") {
+      return this.pollCuratedSource(lease, cached?.state);
     }
 
     let prepared: ReturnType<typeof preparePublicAtsDiscovery>;
@@ -253,6 +286,57 @@ export class DiscoveryWorkerRuntime {
     });
     this.logReport(lease.source.id, "complete", false, jobs.length);
     return "completed";
+  }
+
+  private async pollCuratedSource(
+    lease: DiscoverySourceLease,
+    state?: DiscoveryLoopState,
+  ): Promise<"completed" | "failed"> {
+    if (!validCuratedSource(lease.source)) {
+      return this.reportDirectFailure(lease, "invalid_config", state);
+    }
+    try {
+      const leads = await this.curatedLeads();
+      const jobs = curatedJobs(leads, lease.scheduled_for_ms);
+      await this.api.complete(lease.source.id, completionInput(lease, jobs));
+      this.rememberSource(lease.source.id, {
+        state,
+        report: {
+          kind: "complete",
+          replayKey: lease.replay_key,
+          scheduledForMs: lease.scheduled_for_ms,
+          jobs,
+        },
+      });
+      this.logReport(lease.source.id, "complete", false, jobs.length);
+      return "completed";
+    } catch (error) {
+      const errorCode: DiscoveryRuntimeFailureCode = error instanceof CuratedFeedError
+        ? curatedFailureCode(error)
+        : "provider_error";
+      return this.reportDirectFailure(lease, errorCode, state);
+    }
+  }
+
+  private async curatedLeads(): Promise<CuratedFeedLead[]> {
+    const now = this.curatedNow();
+    if (this.curatedSnapshot && now < this.curatedSnapshot.expiresAtMs) {
+      return this.curatedSnapshot.leads;
+    }
+
+    const leads: CuratedFeedLead[] = [];
+    for (const descriptor of CURATED_JOB_FEEDS) {
+      const result = await fetchCuratedFeed(descriptor.id, {
+        ...(this.curatedFetch ? { fetch: this.curatedFetch } : {}),
+        ...(this.atsTimeoutMs ? { timeoutMs: this.atsTimeoutMs } : {}),
+      });
+      leads.push(...result.leads);
+    }
+    this.curatedSnapshot = {
+      expiresAtMs: now + this.curatedSnapshotTtlMs,
+      leads,
+    };
+    return leads;
   }
 
   private async replayCachedReport(lease: DiscoverySourceLease, report: CachedReport): Promise<void> {
@@ -393,6 +477,9 @@ function completedJobs(
       external_id: mutation.job.externalId,
       canonical_url: mutation.job.canonicalUrl,
       title: mutation.job.payload.title,
+      company: "",
+      source_catalog_id: "",
+      requires_original_revalidation: false,
       location: mutation.job.payload.location,
       workplace: mutation.job.payload.workplace,
       description: mutation.job.payload.description,
@@ -402,6 +489,55 @@ function completedJobs(
       posted_at_ms: postedAtMs === null || !Number.isFinite(postedAtMs) ? null : postedAtMs,
     }];
   });
+}
+
+function validCuratedSource(source: DiscoverySourceRecord): boolean {
+  if (source.track_id !== "" || source.source_key !== "bluey-curated-v1") return false;
+  if (!isRecord(source.config)) return false;
+  const feedIds = source.config.feedIds;
+  return source.config.kind === "curated_feed"
+    && Array.isArray(feedIds)
+    && feedIds.length === CURATED_JOB_FEEDS.length
+    && CURATED_JOB_FEEDS.every((feed) => feedIds.includes(feed.sourceCatalogId));
+}
+
+function curatedJobs(leads: CuratedFeedLead[], scheduledForMs: number): DiscoveredJobInput[] {
+  const jobs = new Map<string, DiscoveredJobInput>();
+  for (const lead of leads) {
+    if (jobs.has(lead.originalUrl)) continue;
+    const postedAtMs = lead.ageDays === null
+      ? null
+      : Math.max(0, scheduledForMs - lead.ageDays * 24 * 60 * 60 * 1_000);
+    jobs.set(lead.originalUrl, {
+      external_id: createHash("sha256")
+        .update(`${lead.feedId}\0${lead.originalUrl}`, "utf8")
+        .digest("hex"),
+      canonical_url: lead.originalUrl,
+      title: lead.title,
+      company: lead.company,
+      source_catalog_id: lead.sourceCatalogId,
+      requires_original_revalidation: true,
+      location: lead.location,
+      workplace: /\bremote\b/i.test(lead.location) ? "remote" : "",
+      description: "",
+      compensation: "",
+      employment_type: lead.employmentType,
+      engagement_type: lead.engagementType ?? "",
+      posted_at_ms: postedAtMs,
+    });
+  }
+  return [...jobs.values()].sort((left, right) =>
+    left.canonical_url.localeCompare(right.canonical_url));
+}
+
+function curatedFailureCode(error: CuratedFeedError): DiscoveryRuntimeFailureCode {
+  return error.code === "unavailable" || error.code === "not_modified"
+    ? "unavailable"
+    : "invalid_response";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function reportFailureCode(errorCode: DiscoveryRuntimeFailureCode): DiscoveryReportFailureCode {

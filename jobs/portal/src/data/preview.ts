@@ -637,6 +637,50 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
       interventions: [],
     };
   }
+  if (scenario === "many-matches") {
+    const matches = Array.from({ length: 125 }, (_, index) => {
+      const template = workspace.matches[index % workspace.matches.length];
+      const candidateLead = index % 4 === 0;
+      const eligibility = template.eligibility ?? betaEligibility();
+      return {
+        ...template,
+        id: `volume-job-${index + 1}`,
+        canonical_key: `volume-job-${index + 1}`,
+        external_id: `volume-${index + 1}`,
+        company: `${template.company} ${index + 1}`,
+        title: index % 3 === 0 ? `Senior Product Engineer ${index + 1}` : template.title,
+        source: candidateLead ? "curated_feed:preview-volume" : template.source,
+        canonical_url: `https://example.com/jobs/volume-${index + 1}`,
+        track_id: workspace.tracks[index % workspace.tracks.length].id,
+        match_score: 70 + (index % 26),
+        posted_at_ms: now - (index % 10) * 86_400_000,
+        last_verified_at_ms: candidateLead ? undefined : now - (index % 60) * 60_000,
+        availability_status: candidateLead ? "unknown" as const : "active" as const,
+        eligibility: candidateLead ? {
+          ...eligibility,
+          can_prepare: false,
+          can_auto_submit: false,
+          can_queue_local: false,
+          can_queue_cloud: false,
+        } : eligibility,
+      };
+    });
+    return {
+      ...workspace,
+      matches,
+      discovery_sources: [
+        ...workspace.discovery_sources,
+        {
+          id: "source-curated-preview",
+          provider: "curated_feed",
+          config: { company: "Curated career feeds" },
+          status: "active",
+          health: "healthy",
+          last_success_at_ms: now - 90_000,
+        },
+      ],
+    };
+  }
   if (scenario !== "final-review") return workspace;
 
   const title = "Review the Greenhouse application";

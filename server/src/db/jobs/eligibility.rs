@@ -537,7 +537,8 @@ fn build_job_eligibility(
     let can_prepare = capability != "blocked"
         && hard_failures
             .iter()
-            .all(|reason| reason.code == "daily_limit_reached");
+            .all(|reason| reason.code == "daily_limit_reached")
+        && (!require_live_verification || !live_verification_missing);
     let queue_capable = matches!(capability.as_str(), "certified" | "beta_review");
     let can_queue =
         can_prepare && hard_failures.is_empty() && queue_capable && !live_verification_missing;

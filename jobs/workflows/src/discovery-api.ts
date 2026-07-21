@@ -38,6 +38,9 @@ export interface DiscoveredJobInput {
   external_id: string;
   canonical_url: string;
   title: string;
+  company: string;
+  source_catalog_id: string;
+  requires_original_revalidation: boolean;
   location: string;
   workplace: string;
   description: string;
