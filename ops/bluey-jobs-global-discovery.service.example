@@ -14,6 +14,8 @@ EnvironmentFile=/etc/bluey-api/bluey-jobs.env
 EnvironmentFile=/etc/bluey-api/bluey-jobs-global-discovery.env
 Environment=NODE_ENV=production
 Environment=BLUEY_JOBS_GLOBAL_DISCOVERY_STAGING_DIR=/var/lib/bluey-jobs-global-discovery
+# Set BLUEY_JOBS_GLOBAL_DISCOVERY_SOURCE_FAMILIES in the root-managed override
+# before first start; begin with bounded canaries instead of every manifest family.
 ExecStart=/usr/local/bin/node workflows/dist/global-discovery-worker.js
 Restart=on-failure
 RestartSec=5s

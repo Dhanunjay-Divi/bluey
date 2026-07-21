@@ -10,6 +10,7 @@ import {
   DEFAULT_GLOBAL_DISCOVERY_POLL_INTERVAL_MS,
   DEFAULT_GLOBAL_DISCOVERY_RUN_INTERVAL_MS,
   GlobalDiscoveryWorkerRuntime,
+  parseGlobalDiscoverySourceFamilies,
 } from "./global-discovery-runtime.js";
 
 export function globalDiscoveryWorkerFromEnvironment(): GlobalDiscoveryWorkerRuntime {
@@ -23,6 +24,9 @@ export function globalDiscoveryWorkerFromEnvironment(): GlobalDiscoveryWorkerRun
   return new GlobalDiscoveryWorkerRuntime({
     api: new GlobalDiscoveryApiClient({ origin, signingKey, workerId }),
     stagingDirectory,
+    sourceFamilies: parseGlobalDiscoverySourceFamilies(
+      process.env.BLUEY_JOBS_GLOBAL_DISCOVERY_SOURCE_FAMILIES,
+    ),
     pollIntervalMs: environmentInteger(
       "BLUEY_JOBS_GLOBAL_DISCOVERY_POLL_MS",
       process.env.BLUEY_JOBS_GLOBAL_DISCOVERY_POLL_MS,

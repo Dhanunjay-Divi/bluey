@@ -22,6 +22,7 @@ import {
   DEFAULT_GLOBAL_DISCOVERY_ARTIFACT_TIMEOUT_MS,
   DEFAULT_GLOBAL_DISCOVERY_MAX_ARTIFACT_BYTES,
   GlobalDiscoveryWorkerRuntime,
+  parseGlobalDiscoverySourceFamilies,
   type GlobalDiscoveryWorkerLogEvent,
   type GlobalDiscoveryWorkerLogger,
 } from "../src/global-discovery-runtime.js";
@@ -93,6 +94,51 @@ describe("global discovery worker runtime", () => {
   it("keeps current multi-gigabyte ATS snapshots inside explicit bounded defaults", () => {
     expect(DEFAULT_GLOBAL_DISCOVERY_ARTIFACT_TIMEOUT_MS).toBe(30 * 60_000);
     expect(DEFAULT_GLOBAL_DISCOVERY_MAX_ARTIFACT_BYTES).toBe(4 * 1024 * 1024 * 1024);
+  });
+
+  it("normalizes a source-family canary allowlist and rejects malformed families", () => {
+    expect(parseGlobalDiscoverySourceFamilies(undefined)).toBeUndefined();
+    expect(parseGlobalDiscoverySourceFamilies("  Lever,greenhouse,LEVER ")).toEqual(["lever", "greenhouse"]);
+    expect(() => parseGlobalDiscoverySourceFamilies("lever,not/a/source")).toThrow(/invalid source family/);
+  });
+
+  it("registers and leases only configured source-family canaries", async () => {
+    const csv = candidateCsv();
+    const sha256 = createHash("sha256").update(csv).digest("hex");
+    const api = new FakeApi(lease(sha256));
+    const runtime = new GlobalDiscoveryWorkerRuntime({
+      api,
+      stagingDirectory: await temporaryDirectory(),
+      sourceFamilies: ["Lever", "lever"],
+      manifestFetch: (async () => jsonResponse(manifestFixtureWithGreenhouse(csv, sha256))) as typeof fetch,
+      artifactFetch: (async () => new Response(csv, {
+        status: 200,
+        headers: { "content-length": String(Buffer.byteLength(csv)) },
+      })) as typeof fetch,
+      now: () => SNAPSHOT_AT_MS,
+    });
+
+    await expect(runtime.pollOnce()).resolves.toBe("completed");
+
+    expect(api.synced).toHaveLength(1);
+    expect(api.synced[0]).toHaveLength(1);
+    expect(api.synced[0]?.[0]?.source_family).toBe("lever");
+  });
+
+  it("fails closed when no manifest source matches the configured canary allowlist", async () => {
+    const csv = candidateCsv();
+    const sha256 = createHash("sha256").update(csv).digest("hex");
+    const api = new FakeApi(null);
+    const runtime = new GlobalDiscoveryWorkerRuntime({
+      api,
+      stagingDirectory: await temporaryDirectory(),
+      sourceFamilies: ["greenhouse"],
+      manifestFetch: (async () => jsonResponse(manifestFixture(csv, sha256))) as typeof fetch,
+      now: () => SNAPSHOT_AT_MS,
+    });
+
+    await expect(runtime.pollOnce()).rejects.toThrow(/allowlist/);
+    expect(api.synced).toEqual([]);
   });
 
   it("verifies, streams, normalizes, and commits a complete shared-feed snapshot", async () => {
@@ -380,6 +426,25 @@ function manifestFixture(csv: string, csvSha256: string): unknown {
       },
     },
   };
+}
+
+function manifestFixtureWithGreenhouse(csv: string, csvSha256: string): unknown {
+  const manifest = manifestFixture(csv, csvSha256) as Record<string, unknown>;
+  const byAts = manifest.by_ats as Record<string, unknown>;
+  const stats = manifest.stats as Record<string, unknown>;
+  stats.ats_count = 2;
+  stats.total_jobs = 2;
+  stats.total_jobs_raw = 2;
+  byAts.greenhouse = {
+    csv: "https://storage.stapply.ai/jobhive/v1/greenhouse/jobs.csv",
+    parquet: "https://storage.stapply.ai/jobhive/v1/greenhouse/jobs.parquet",
+    sha256: "d".repeat(64),
+    size_bytes: 1,
+    parquet_sha256: "e".repeat(64),
+    parquet_size_bytes: 1,
+    rows: 1,
+  };
+  return manifest;
 }
 
 function jsonResponse(payload: unknown): Response {

@@ -52,6 +52,7 @@ export type GlobalDiscoveryPollSleep = (milliseconds: number, signal: AbortSigna
 export interface GlobalDiscoveryWorkerRuntimeOptions {
   api: GlobalDiscoveryWorkerApi;
   stagingDirectory: string;
+  sourceFamilies?: readonly string[];
   pollIntervalMs?: number;
   runIntervalMs?: number;
   manifestRefreshMs?: number;
@@ -89,6 +90,7 @@ export class GlobalDiscoveryWorkerRuntime {
 
   private readonly api: GlobalDiscoveryWorkerApi;
   private readonly stagingDirectory: string;
+  private readonly sourceFamilies?: ReadonlySet<string>;
   private readonly runIntervalMs: number;
   private readonly manifestRefreshMs: number;
   private readonly artifactTimeoutMs: number;
@@ -108,6 +110,8 @@ export class GlobalDiscoveryWorkerRuntime {
     this.api = options.api;
     this.stagingDirectory = options.stagingDirectory;
     if (this.stagingDirectory.trim() === "") throw new Error("Global discovery staging directory is required");
+    const sourceFamilies = normalizeSourceFamilies(options.sourceFamilies);
+    this.sourceFamilies = sourceFamilies ? new Set(sourceFamilies) : undefined;
     this.pollIntervalMs = boundedInteger(
       options.pollIntervalMs ?? DEFAULT_GLOBAL_DISCOVERY_POLL_INTERVAL_MS,
       MIN_POLL_INTERVAL_MS,
@@ -272,8 +276,10 @@ export class GlobalDiscoveryWorkerRuntime {
     }
     const { manifest } = await fetchJobhiveManifest({ fetch: this.manifestFetch });
     const snapshotAtMs = Date.parse(manifest.updatedAt);
-    const sources = manifest.sources
-      .filter((source) => source.rows > 0)
+    const selectedSnapshots = manifest.sources.filter((source) => (
+      source.rows > 0 && (!this.sourceFamilies || this.sourceFamilies.has(source.sourceFamily))
+    ));
+    const sources = selectedSnapshots
       .map((source) => ({
         provider: "jobhive" as const,
         source_key: `jobhive:${source.sourceFamily}`,
@@ -284,15 +290,25 @@ export class GlobalDiscoveryWorkerRuntime {
         snapshot_at_ms: snapshotAtMs,
         run_interval_ms: this.runIntervalMs,
       }));
-    if (sources.length === 0) throw new JobhiveManifestError("invalid_manifest", "Jobhive manifest has no nonempty sources");
+    if (sources.length === 0) {
+      throw new JobhiveManifestError(
+        "invalid_manifest",
+        this.sourceFamilies
+          ? "Jobhive manifest has no nonempty sources matching the configured source-family allowlist"
+          : "Jobhive manifest has no nonempty sources",
+      );
+    }
     await this.api.syncSources(sources);
-    this.manifestSnapshot = { manifest, syncedAtMs: now };
+    const selectedManifest = this.sourceFamilies
+      ? { ...manifest, sources: selectedSnapshots, sourceCount: selectedSnapshots.length }
+      : manifest;
+    this.manifestSnapshot = { manifest: selectedManifest, syncedAtMs: now };
     this.logger.log({
       event: "global_discovery_manifest_synced",
       source_count: sources.length,
       row_count: sources.reduce((sum, source) => sum + source.expected_rows, 0),
     });
-    return manifest;
+    return selectedManifest;
   }
 
   private async reportFailure(
@@ -315,6 +331,23 @@ export class GlobalDiscoveryWorkerRuntime {
     });
     return "failed";
   }
+}
+
+export function parseGlobalDiscoverySourceFamilies(value: string | undefined): string[] | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  return normalizeSourceFamilies(value.split(","));
+}
+
+function normalizeSourceFamilies(values: readonly string[] | undefined): string[] | undefined {
+  if (values === undefined) return undefined;
+  const normalized = [...new Set(values.map((value) => value.trim().toLowerCase()).filter(Boolean))];
+  if (normalized.length === 0) throw new Error("Global discovery source-family allowlist cannot be empty");
+  for (const sourceFamily of normalized) {
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(sourceFamily)) {
+      throw new Error("Global discovery source-family allowlist contains an invalid source family");
+    }
+  }
+  return normalized;
 }
 
 function parseSourceConfig(value: unknown): GlobalSourceConfig {

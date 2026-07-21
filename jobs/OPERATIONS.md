@@ -104,8 +104,13 @@ Run the shared candidate-feed worker separately with
 `node workflows/dist/global-discovery-worker.js`, or install
 `ops/bluey-jobs-global-discovery.service.example`. Its root-owned override file
 at `/etc/bluey-api/bluey-jobs-global-discovery.env` should contain only the
-loopback API origin, stable worker ID, and bounded timing overrides. The shared
-Jobs environment supplies the signing key. The worker reads a pinned HTTPS
+loopback API origin, stable worker ID, an explicit comma-separated
+`BLUEY_JOBS_GLOBAL_DISCOVERY_SOURCE_FAMILIES` canary allowlist, and bounded
+timing overrides. The shared Jobs environment supplies the signing key. An
+unset source-family allowlist means every nonempty manifest family, so do not
+leave it unset during the initial production rollout. Expand the allowlist only
+after each family's source completion, disk headroom, row counts, and original-
+source revalidation metrics pass. The worker reads a pinned HTTPS
 manifest, downloads each immutable CSV to private `0700` staging, verifies its
 exact byte length and SHA-256, streams bounded batches to the shared candidate
 index, and removes the staged artifact after the run. A completed snapshot is
