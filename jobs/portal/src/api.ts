@@ -24,7 +24,9 @@ import type {
   PacketCommitResult,
   QueueApplicationRunResponse,
   PrepareApplicationResponse,
+  ResumeSourceMetadata,
   ResumeVersion,
+  UploadResumeSourceResponse,
 } from "./types";
 
 const ACCESS_TOKEN_KEY = "bluey_access_token";
@@ -149,6 +151,47 @@ async function request<T>(path: string, init: RequestInit = {}, retried = false)
   return body as T;
 }
 
+async function requestDownload(
+  path: string,
+  fallbackName: string,
+  retried = false,
+): Promise<{ blob: Blob; fileName: string }> {
+  const headers = new Headers();
+  const token = accessToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(path, { headers });
+  if (response.status === 401 && !retried) {
+    const refreshed = await refreshAccessToken();
+    if (refreshed) return requestDownload(path, fallbackName, true);
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    throw new ApiError(response.status, text || "Bluey could not download that resume.");
+  }
+  const disposition = response.headers.get("content-disposition") || "";
+  const match = disposition.match(/filename="([^"]+)"/i);
+  return { blob: await response.blob(), fileName: match?.[1] || fallbackName };
+}
+
+function resumeMediaType(file: File): string {
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  if (extension === "docx") {
+    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  }
+  if (extension === "pdf") return "application/pdf";
+  if (extension === "txt") return "text/plain";
+  return file.type || "application/octet-stream";
+}
+
+async function fileBase64(file: File): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const chunks: string[] = [];
+  for (let offset = 0; offset < bytes.length; offset += 32_768) {
+    chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 32_768)));
+  }
+  return btoa(chunks.join(""));
+}
+
 export const jobsApi = {
   workspace: () => request<JobsWorkspace>("/api/jobs/workspace"),
   account: () => request<AccountSummary>("/account/me"),
@@ -164,6 +207,23 @@ export const jobsApi = {
     }),
   saveProfile: (profile: CareerProfile) =>
     request<CareerProfile>("/api/jobs/profile", { method: "PUT", body: JSON.stringify(profile) }),
+  resumeSource: () => request<ResumeSourceMetadata | null>("/api/jobs/resume-source"),
+  uploadResumeSource: async (file: File, profile: CareerProfile, pageCount?: number) =>
+    request<UploadResumeSourceResponse>("/api/jobs/resume-source", {
+      method: "POST",
+      body: JSON.stringify({
+        file_name: file.name,
+        media_type: resumeMediaType(file),
+        bytes_base64: await fileBase64(file),
+        page_count: pageCount,
+        profile,
+      }),
+    }),
+  downloadTemplateResume: (resumeVersionId: string) =>
+    requestDownload(
+      `/api/jobs/resume-versions/${encodeURIComponent(resumeVersionId)}/template-docx`,
+      "Bluey-tailored-resume.docx",
+    ),
   savePreferences: (preferences: JobPreferences) =>
     request<JobPreferences>("/api/jobs/preferences", {
       method: "PUT",

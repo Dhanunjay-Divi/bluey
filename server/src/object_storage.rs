@@ -79,6 +79,24 @@ impl ObjectStorage {
         )
     }
 
+    pub fn resume_source_key(
+        &self,
+        account_id: &str,
+        asset_id: &str,
+        sha256: &str,
+        extension: &str,
+    ) -> String {
+        let extension = extension
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        self.account_key(
+            &format!("jobs/resumes/{asset_id}/sha256/{sha256}.{extension}"),
+            account_id,
+        )
+    }
+
     pub fn key_belongs_to_account(&self, key: &str, account_id: &str) -> bool {
         let prefix = self.config.key_prefix.trim_matches('/');
         let expected = if prefix.is_empty() {

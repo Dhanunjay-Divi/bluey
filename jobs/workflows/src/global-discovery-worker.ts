@@ -20,13 +20,19 @@ export function globalDiscoveryWorkerFromEnvironment(): GlobalDiscoveryWorkerRun
     || `global-discovery-${hostname()}-${process.pid}`;
   const stagingDirectory = process.env.BLUEY_JOBS_GLOBAL_DISCOVERY_STAGING_DIR
     || path.join(tmpdir(), "bluey-jobs-global-discovery");
+  const sourceFamilies = parseGlobalDiscoverySourceFamilies(
+    process.env.BLUEY_JOBS_GLOBAL_DISCOVERY_SOURCE_FAMILIES,
+  );
+  if (!sourceFamilies || sourceFamilies.length === 0) {
+    throw new Error(
+      "BLUEY_JOBS_GLOBAL_DISCOVERY_SOURCE_FAMILIES is required; apply an approved rollout wave",
+    );
+  }
 
   return new GlobalDiscoveryWorkerRuntime({
     api: new GlobalDiscoveryApiClient({ origin, signingKey, workerId }),
     stagingDirectory,
-    sourceFamilies: parseGlobalDiscoverySourceFamilies(
-      process.env.BLUEY_JOBS_GLOBAL_DISCOVERY_SOURCE_FAMILIES,
-    ),
+    sourceFamilies,
     pollIntervalMs: environmentInteger(
       "BLUEY_JOBS_GLOBAL_DISCOVERY_POLL_MS",
       process.env.BLUEY_JOBS_GLOBAL_DISCOVERY_POLL_MS,

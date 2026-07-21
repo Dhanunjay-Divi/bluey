@@ -64,6 +64,10 @@ export interface CareerProfile {
   reusable_answers: Record<string, string>;
   source_resume_name: string;
   source_resume_text: string;
+  source_resume_asset_id: string;
+  source_resume_sha256: string;
+  source_resume_media_type: string;
+  source_resume_template_status: string;
   resume_mode: ResumeMode;
   review_new_claims: boolean;
   default_submission_mode: SubmissionMode;
@@ -72,6 +76,24 @@ export interface CareerProfile {
   onboarding_step: number;
   onboarding_complete: boolean;
   updated_at_ms: number;
+}
+
+export interface ResumeSourceMetadata {
+  id: string;
+  file_name: string;
+  media_type: string;
+  file_type: string;
+  sha256: string;
+  size_bytes: number;
+  page_count?: number;
+  template_status: string;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface UploadResumeSourceResponse {
+  asset: ResumeSourceMetadata;
+  profile: CareerProfile;
 }
 
 export interface CareerFact {

@@ -136,6 +136,21 @@ pub struct ProjectEntry {
     pub url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResumeSourceAsset {
+    pub id: String,
+    pub file_name: String,
+    pub media_type: String,
+    pub file_type: String,
+    pub storage_key: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub page_count: Option<i64>,
+    pub template_status: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CareerProfile {
     #[serde(default)]
@@ -180,6 +195,14 @@ pub struct CareerProfile {
     pub source_resume_name: String,
     #[serde(default)]
     pub source_resume_text: String,
+    #[serde(default)]
+    pub source_resume_asset_id: String,
+    #[serde(default)]
+    pub source_resume_sha256: String,
+    #[serde(default)]
+    pub source_resume_media_type: String,
+    #[serde(default)]
+    pub source_resume_template_status: String,
     #[serde(default = "default_resume_mode")]
     pub resume_mode: String,
     #[serde(default)]
@@ -222,6 +245,10 @@ impl Default for CareerProfile {
             reusable_answers: json!({}),
             source_resume_name: String::new(),
             source_resume_text: String::new(),
+            source_resume_asset_id: String::new(),
+            source_resume_sha256: String::new(),
+            source_resume_media_type: String::new(),
+            source_resume_template_status: String::new(),
             resume_mode: default_resume_mode(),
             review_new_claims: false,
             default_submission_mode: default_submission_mode(),
@@ -1432,6 +1459,7 @@ include!("jobs/discovery.rs");
 include!("jobs/global_discovery.rs");
 include!("jobs/global_discovery_completion.rs");
 include!("jobs/global_materialization.rs");
+include!("jobs/resume_assets.rs");
 include!("jobs/eligibility.rs");
 include!("jobs/applications.rs");
 include!("jobs/customer_data.rs");

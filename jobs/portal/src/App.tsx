@@ -157,6 +157,40 @@ export default function App() {
     setToast("Career Profile saved.");
   }, []);
 
+  const importResumeSource = useCallback(
+    async (file: File, profile: CareerProfile, pageCount?: number): Promise<CareerProfile> => {
+      setError("");
+      try {
+        let saved: CareerProfile;
+        if (isPreview) {
+          const extension = file.name.split(".").pop()?.toLowerCase() || "";
+          saved = {
+            ...profile,
+            source_resume_name: file.name,
+            source_resume_asset_id: `preview-resume-${Date.now()}`,
+            source_resume_sha256: "preview",
+            source_resume_media_type: extension === "docx"
+              ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              : extension === "pdf" ? "application/pdf" : "text/plain",
+            source_resume_template_status: extension === "docx" ? "exact_docx" : "ats_layout",
+          };
+        } else {
+          const result = await jobsApi.uploadResumeSource(file, profile, pageCount);
+          saved = result.profile;
+        }
+        setWorkspace((current) => (current ? { ...current, profile: saved } : current));
+        setToast(saved.source_resume_template_status === "exact_docx"
+          ? "Resume imported. Bluey will preserve its Word layout for tailored downloads."
+          : "Resume imported. Bluey will use a clean ATS layout for tailored downloads.");
+        return saved;
+      } catch (requestError) {
+        setError(requestError instanceof Error ? requestError.message : "Could not save that resume.");
+        throw requestError;
+      }
+    },
+    [],
+  );
+
   const savePreferences = useCallback(async (preferences: JobPreferences) => {
     const localized = {
       ...preferences,
@@ -649,6 +683,7 @@ export default function App() {
       <Onboarding
         workspace={workspace}
         error={error}
+        onImportResume={importResumeSource}
         onProgress={saveOnboardingProgress}
         onComplete={saveOnboarding}
       />
@@ -701,6 +736,7 @@ export default function App() {
               workspace={workspace}
               resumeVersions={resumeVersions}
               onSave={saveProfile}
+              onImportResume={importResumeSource}
               onCommit={commitApplication}
               onLoadResume={loadResumeVersion}
             />

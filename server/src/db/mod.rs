@@ -271,6 +271,8 @@ pub fn open_postgres_pool(database_url: &str) -> Result<DbPool> {
 /// EXISTS, etc.) so safe to re-run on every startup.
 const SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX: &str =
     include_str!("../../../infra/sqlite/server-runtime/035_jobs_global_candidate_index.sql");
+const SQLITE_JOBS_RESUME_SOURCE_ASSETS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/036_jobs_resume_source_assets.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1508,6 +1510,8 @@ const MIGRATIONS: &[&str] = &[
     // 0035 - shared candidate-feed staging. Large third-party/public candidate
     // datasets are ingested once and materialized into bounded account views.
     SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
+    // 0036 - source resume bytes and exact-template capability metadata.
+    SQLITE_JOBS_RESUME_SOURCE_ASSETS,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1860,6 +1864,8 @@ const POSTGRES_JOBS_CANDIDATE_EVIDENCE: &str =
     include_str!("../../../infra/postgres/server-runtime/011_jobs_candidate_evidence.sql");
 const POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX: &str =
     include_str!("../../../infra/postgres/server-runtime/012_jobs_global_candidate_index.sql");
+const POSTGRES_JOBS_RESUME_SOURCE_ASSETS: &str =
+    include_str!("../../../infra/postgres/server-runtime/013_jobs_resume_source_assets.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -1899,6 +1905,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "012_jobs_global_candidate_index.sql",
         POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
+    ),
+    (
+        "013_jobs_resume_source_assets.sql",
+        POSTGRES_JOBS_RESUME_SOURCE_ASSETS,
     ),
 ];
 

@@ -137,6 +137,10 @@ function resumeImportBase(profile: CareerProfile): CareerProfile {
     reusable_answers: {},
     source_resume_name: "",
     source_resume_text: "",
+    source_resume_asset_id: "",
+    source_resume_sha256: "",
+    source_resume_media_type: "",
+    source_resume_template_status: "",
   };
 }
 
@@ -159,6 +163,10 @@ function mergeCareerProfiles(current: CareerProfile, parsed: CareerProfile): Car
     projects: mergeProjects(current.projects, parsed.projects),
     source_resume_name: parsed.source_resume_name,
     source_resume_text: parsed.source_resume_text,
+    source_resume_asset_id: parsed.source_resume_asset_id,
+    source_resume_sha256: parsed.source_resume_sha256,
+    source_resume_media_type: parsed.source_resume_media_type,
+    source_resume_template_status: parsed.source_resume_template_status,
   };
 }
 

@@ -44,21 +44,24 @@ import { useLocationSuggestions } from "../data/use-location-suggestions";
 import { relativeTime } from "../lib/format";
 import { validateCareerProfile } from "../lib/profile-validation";
 import { formatResumeDiffValue, resumeDiffHasValue, resumeDiffLabel } from "../lib/resume-diff";
+import { jobsApi } from "../api";
 
 interface Props {
   workspace: JobsWorkspace;
   resumeVersions: Record<string, ResumeVersion>;
   onSave(profile: CareerProfile): Promise<void>;
+  onImportResume(file: File, profile: CareerProfile, pageCount?: number): Promise<CareerProfile>;
   onCommit(application: JobsWorkspace["applications"][number]): Promise<void>;
   onLoadResume(id: string): Promise<ResumeVersion | undefined>;
 }
 
-export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoadResume }: Props) {
+export function ResumeView({ workspace, resumeVersions, onSave, onImportResume, onCommit, onLoadResume }: Props) {
   const [profile, setProfile] = useState(workspace.profile);
   const [editOpen, setEditOpen] = useState(false);
   const [selectedResume, setSelectedResume] = useState<ResumeVersion | undefined>();
   const [saving, setSaving] = useState(false);
   const [importPreview, setImportPreview] = useState<ResumeImportPreview>();
+  const [pendingResume, setPendingResume] = useState<{ file: File; pageCount?: number }>();
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
@@ -117,17 +120,35 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
     try {
       const imported = await importResume(file);
       setImportPreview(prepareResumeImport(profile, imported));
+      setPendingResume({ file, pageCount: imported.page_count });
     } catch (requestError) {
       setError(resumeErrorMessage(requestError, "Resume import failed."));
     }
   };
 
-  const applyImport = (mode: ResumeImportMode) => {
-    if (!importPreview) return;
-    setProfile(applyResumeImport(importPreview, mode));
-    setImportPreview(undefined);
-    setEditOpen(true);
-    setMessage("Import staged. Review the extracted Career Profile, then save or cancel.");
+  const applyImport = async (mode: ResumeImportMode) => {
+    if (!importPreview || !pendingResume) return;
+    setSaving(true);
+    setError("");
+    try {
+      const importedProfile = applyResumeImport(importPreview, mode);
+      const savedProfile = await onImportResume(
+        pendingResume.file,
+        importedProfile,
+        pendingResume.pageCount,
+      );
+      setProfile(savedProfile);
+      setImportPreview(undefined);
+      setPendingResume(undefined);
+      setEditOpen(true);
+      setMessage(savedProfile.source_resume_template_status === "exact_docx"
+        ? "Resume imported. The original Word layout is preserved for tailored downloads."
+        : "Resume imported. Tailored downloads use Bluey's clean ATS layout.");
+    } catch (requestError) {
+      setError(resumeErrorMessage(requestError, "Resume import could not be saved."));
+    } finally {
+      setSaving(false);
+    }
   };
 
   const cancelEdit = () => {
@@ -173,7 +194,12 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
     try {
       await onCommit(selectedApplication);
       if (format === "pdf") await exportResumePdf(selectedResume.content, "bluey-tailored-resume");
-      else await exportResumeDocx(selectedResume.content, "bluey-tailored-resume");
+      else if (profile.source_resume_template_status === "exact_docx" && profile.source_resume_asset_id) {
+        const downloaded = await jobsApi.downloadTemplateResume(selectedResume.id);
+        saveDownloadedBlob(downloaded.blob, downloaded.fileName);
+      } else {
+        await exportResumeDocx(selectedResume.content, "bluey-tailored-resume");
+      }
     } catch (requestError) {
       setError(resumeErrorMessage(requestError, "Resume export could not be completed."));
     }
@@ -220,6 +246,7 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
       <div className="resume-layout">
         <section className="resume-sheet">
           <div className="section-heading compact"><div><p>BASE PROFILE</p><h2>{profile.source_resume_name || "Bluey Career Profile"}</h2></div><div><button className="icon-button" title="Download PDF" onClick={() => void exportBaseResume()}><Download size={16} /></button></div></div>
+          {profile.source_resume_asset_id && <p className="muted-copy source-template-note">{profile.source_resume_template_status === "exact_docx" ? "Original Word layout preserved for tailored DOCX downloads." : "Imported facts use Bluey's clean ATS export layout."}</p>}
           <BaseResume content={baseContent} />
         </section>
 
@@ -244,7 +271,7 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
         </aside>
       </div>
 
-      <ResumeImportReview preview={importPreview} onApply={applyImport} onClose={() => setImportPreview(undefined)} />
+      <ResumeImportReview preview={importPreview} busy={saving} onApply={applyImport} onClose={() => { setImportPreview(undefined); setPendingResume(undefined); }} />
 
       <Dialog open={editOpen} title="Edit Career Profile" description="These facts become reusable source material for job-specific resumes." onClose={cancelEdit} size="large">
         <div className="dialog-form profile-edit-form full-profile-editor">
@@ -326,7 +353,7 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
       </Dialog>
 
       <Dialog open={Boolean(selectedResume)} title={selectedResume?.content.target ? `${selectedResume.content.target.title} at ${selectedResume.content.target.company}` : "Tailored resume"} description={`Version ${selectedResume?.version_no || 1} · ${selectedResume?.mode || "factual"}`} onClose={() => setSelectedResume(undefined)} size="large">
-        {selectedResume && <div className="resume-version-dialog"><section className="resume-sheet compact-sheet"><BaseResume content={selectedResume.content} /></section><aside><div className="section-heading compact"><div><p>VISIBLE DIFF</p><h2>Why this version changed</h2></div><FileDiff /></div>{Object.entries(selectedResume.diff).filter(([, value]) => resumeDiffHasValue(value)).map(([key, value]) => <div className="diff-item" key={key}><b>{resumeDiffLabel(key)}</b><p>{formatResumeDiffValue(value)}</p></div>)}<div className="download-row"><button disabled={!selectedApplication} onClick={() => void exportSelected("pdf")}><Download size={15} />PDF</button><button disabled={!selectedApplication} onClick={() => void exportSelected("docx")}><Download size={15} />DOCX</button></div></aside></div>}
+        {selectedResume && <div className="resume-version-dialog"><section className="resume-sheet compact-sheet"><BaseResume content={selectedResume.content} /></section><aside><div className="section-heading compact"><div><p>VISIBLE DIFF</p><h2>Why this version changed</h2></div><FileDiff /></div>{Object.entries(selectedResume.diff).filter(([, value]) => resumeDiffHasValue(value)).map(([key, value]) => <div className="diff-item" key={key}><b>{resumeDiffLabel(key)}</b><p>{formatResumeDiffValue(value)}</p></div>)}<div className="download-row"><button disabled={!selectedApplication} onClick={() => void exportSelected("pdf")}><Download size={15} />ATS PDF</button><button disabled={!selectedApplication} onClick={() => void exportSelected("docx")}><Download size={15} />{profile.source_resume_template_status === "exact_docx" ? "Original template DOCX" : "ATS DOCX"}</button></div></aside></div>}
       </Dialog>
     </div>
   );
@@ -334,6 +361,17 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
 
 function resumeErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message.trim() ? error.message : fallback;
+}
+
+function saveDownloadedBlob(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 function BaseResume({ content }: { content: ResumeContent }) {

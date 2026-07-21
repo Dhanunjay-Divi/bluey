@@ -28,7 +28,7 @@ use crate::{
     pricing, routing,
 };
 
-const GENERATION_SCHEMA_VERSION: i64 = 4;
+const GENERATION_SCHEMA_VERSION: i64 = 5;
 const MAX_RESUME_SKILLS: usize = 16;
 const MAX_HEADLINE_CHARS: usize = 180;
 const MAX_SUMMARY_CHARS: usize = 700;
@@ -786,6 +786,7 @@ async fn try_model_generation(
             let deadline_rejected = generation_started.elapsed() >= MODEL_GENERATION_DEADLINE;
             let plan = parse_plan(&completion.text)
                 .map(|plan| normalize_plan(profile, catalog, plan))
+                .map(|plan| lock_plan_to_source_layout(profile, plan))
                 .and_then(|plan| validate_plan(profile, catalog, plan));
             let outcome = if provider_boundary_rejected {
                 AttemptOutcome::RejectedProviderBoundary
@@ -1140,7 +1141,9 @@ The output schema is:
   "project_order": [0]
 }
 
-Select zero or one headline evidence ID and any non-duplicated summary evidence IDs whose exact text fits the resume. Bluey composes those exact records deterministically; do not return headline or summary text. An empty headline or summary selection preserves Bluey's deterministic baseline instead of deleting it. Include every employment and project index exactly once. Include every highlight index exactly once for every employment entry. Choose at most 16 exact skills. Each rewrite target may appear at most once. Its own original highlight ID must be the first source_evidence_ids item; additional items may cite only other highlights from the same employment entry. Prefer the evidence that best answers the job description."#
+Select zero or one headline evidence ID and any non-duplicated summary evidence IDs whose exact text fits the resume. Bluey composes those exact records deterministically; do not return headline or summary text. An empty headline or summary selection preserves Bluey's deterministic baseline instead of deleting it. Include every employment and project index exactly once. Include every highlight index exactly once for every employment entry. Choose at most 16 exact skills. Each rewrite target may appear at most once. Its own original highlight ID must be the first source_evidence_ids item; additional items may cite only other highlights from the same employment entry. Prefer the evidence that best answers the job description.
+
+The user input includes layout_policy. When it is preserve_source_docx, the original Word document is the layout authority: preserve its headline, summary, complete skill list, section order, employer order, title order, dates, education, project order, and bullet order. In that mode, propose only evidence-grounded same-role employment_highlight_rewrites; Bluey will ignore every requested reorder or selection change server-side."#
 }
 
 fn user_prompt(
@@ -1167,6 +1170,11 @@ fn user_prompt(
         "job": job,
         "candidate": candidate,
         "evidence_catalog": catalog.values,
+        "layout_policy": if preserves_source_layout(profile) {
+            "preserve_source_docx"
+        } else {
+            "rank_verified_evidence"
+        },
     });
     let prompt = serde_json::to_string(&input).context("encode resume generation prompt")?;
     if prompt.len() > MAX_USER_PROMPT_BYTES {
@@ -1238,7 +1246,7 @@ fn validate_plan(
         profile.employment.len(),
         "employment highlight entry",
     )?;
-    if plan.skill_order.len() > MAX_RESUME_SKILLS {
+    if !preserves_source_layout(profile) && plan.skill_order.len() > MAX_RESUME_SKILLS {
         return Err(anyhow!("too many selected skills"));
     }
     let mut seen_skills = Vec::new();
@@ -1384,6 +1392,32 @@ fn normalize_plan(
     plan
 }
 
+fn preserves_source_layout(profile: &CareerProfile) -> bool {
+    profile.source_resume_template_status == "exact_docx"
+}
+
+fn lock_plan_to_source_layout(profile: &CareerProfile, mut plan: ResumePlan) -> ResumePlan {
+    if !preserves_source_layout(profile) {
+        return plan;
+    }
+
+    plan.headline_evidence_ids.clear();
+    plan.summary_evidence_ids.clear();
+    plan.skill_order = profile.skills.clone();
+    plan.employment_order = (0..profile.employment.len()).collect();
+    plan.employment_highlight_order = profile
+        .employment
+        .iter()
+        .enumerate()
+        .map(|(entry_index, entry)| HighlightOrder {
+            entry_index,
+            highlight_indices: (0..entry.highlights.len()).collect(),
+        })
+        .collect();
+    plan.project_order = (0..profile.projects.len()).collect();
+    plan
+}
+
 fn normalize_evidence_ids(catalog: &EvidenceCatalog, ids: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for id in ids {
@@ -1475,9 +1509,11 @@ fn materialize(
     kind: &str,
 ) -> Result<GeneratedResume> {
     let catalog = EvidenceCatalog::from_profile(profile);
+    let effective_plan = lock_plan_to_source_layout(profile, plan.clone());
     if kind == "model" {
-        validate_plan(profile, &catalog, plan.clone())?;
+        validate_plan(profile, &catalog, effective_plan.clone())?;
     }
+    let plan = &effective_plan;
     let headline = if plan.headline_evidence_ids.is_empty() {
         baseline
             .content
@@ -1552,6 +1588,7 @@ fn materialize(
     let public_provenance = json!({
         "kind": kind,
         "schema_version": GENERATION_SCHEMA_VERSION,
+        "layout_policy": if preserves_source_layout(profile) { "preserve_source_docx" } else { "rank_verified_evidence" },
         "truth_guard": if kind == "model" { "passed" } else { "deterministic" },
         "claims_added": 0,
         "claims_rewritten": rewrite_sources.len(),
@@ -1602,23 +1639,27 @@ fn build_diff(
             json!({"before": profile.skills, "after": plan.skill_order}),
         );
     }
-    let experience_changes = profile
-        .employment
-        .iter()
-        .filter_map(|before| {
-            employment
-                .iter()
-                .find(|after| after.id == before.id)
-                .filter(|after| after.highlights.first() != before.highlights.first())
-                .map(|after| {
-                    json!({
-                        "role": if after.company.trim().is_empty() { after.title.clone() } else { format!("{} at {}", after.title, after.company) },
-                        "previously_first": before.highlights.first(),
-                        "moved_to_top": after.highlights.first(),
+    let experience_changes = if preserves_source_layout(profile) {
+        Vec::new()
+    } else {
+        profile
+            .employment
+            .iter()
+            .filter_map(|before| {
+                employment
+                    .iter()
+                    .find(|after| after.id == before.id)
+                    .filter(|after| after.highlights.first() != before.highlights.first())
+                    .map(|after| {
+                        json!({
+                            "role": if after.company.trim().is_empty() { after.title.clone() } else { format!("{} at {}", after.title, after.company) },
+                            "previously_first": before.highlights.first(),
+                            "moved_to_top": after.highlights.first(),
+                        })
                     })
-                })
-        })
-        .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>()
+    };
     if !experience_changes.is_empty() {
         diff.insert("experience_emphasis".to_string(), json!(experience_changes));
     }
@@ -1654,6 +1695,12 @@ fn build_diff(
         diff.insert(
             "project_emphasis".to_string(),
             json!({"before": before_projects, "after": after_projects}),
+        );
+    }
+    if preserves_source_layout(profile) {
+        diff.insert(
+            "layout_policy".to_string(),
+            json!("Original Word layout, section order, employers, titles, dates, education, projects, skills, and certifications were preserved. Only evidence-backed experience bullets may change."),
         );
     }
     diff.insert(

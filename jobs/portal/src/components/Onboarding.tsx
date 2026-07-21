@@ -72,6 +72,7 @@ import blueyWordmark from "../../../../web/assets/bluey-wordmark.svg";
 interface Props {
   workspace: JobsWorkspace;
   error: string;
+  onImportResume(file: File, profile: CareerProfile, pageCount?: number): Promise<CareerProfile>;
   onProgress(profile: CareerProfile, preferences: JobPreferences): Promise<void>;
   onComplete(profile: CareerProfile, preferences: JobPreferences, track: CareerTrack): Promise<void>;
 }
@@ -85,7 +86,7 @@ const steps = [
   { label: "Ready", icon: Check },
 ];
 
-export function Onboarding({ workspace, error, onProgress, onComplete }: Props) {
+export function Onboarding({ workspace, error, onImportResume, onProgress, onComplete }: Props) {
   const [step, setStep] = useState(Math.min(workspace.profile.onboarding_step || 0, steps.length - 1));
   const [profile, setProfile] = useState<CareerProfile>(workspace.profile);
   const [preferences, setPreferences] = useState<JobPreferences>({
@@ -101,6 +102,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
     workspace.profile.source_resume_name ? summarizeResumeImport(workspace.profile) : null,
   );
   const [importPreview, setImportPreview] = useState<ResumeImportPreview>();
+  const [pendingResume, setPendingResume] = useState<{ file: File; pageCount?: number }>();
   const [resumeStart, setResumeStart] = useState<"import" | "build">("import");
   const fileRef = useRef<HTMLInputElement>(null);
   const trackId = useRef(workspace.tracks[0]?.id || "onboarding-primary-track");
@@ -171,6 +173,7 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
     try {
       const imported = await importResume(file);
       setImportPreview(prepareResumeImport(profile, imported));
+      setPendingResume({ file, pageCount: imported.page_count });
     } catch (fileError) {
       setValidation(fileError instanceof Error ? fileError.message : "That resume could not be read.");
     } finally {
@@ -178,13 +181,26 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
     }
   };
 
-  const applyImport = (mode: ResumeImportMode) => {
-    if (!importPreview) return;
-    const next = applyResumeImport(importPreview, mode);
-    setProfile(next);
-    setImportSummary(summarizeResumeImport(next));
-    setImportPreview(undefined);
+  const applyImport = async (mode: ResumeImportMode) => {
+    if (!importPreview || !pendingResume) return;
+    setSaving(true);
     setValidation("");
+    try {
+      const importedProfile = applyResumeImport(importPreview, mode);
+      const savedProfile = await onImportResume(
+        pendingResume.file,
+        importedProfile,
+        pendingResume.pageCount,
+      );
+      setProfile(savedProfile);
+      setImportSummary(summarizeResumeImport(savedProfile));
+      setImportPreview(undefined);
+      setPendingResume(undefined);
+    } catch (requestError) {
+      setValidation(requestError instanceof Error ? requestError.message : "Bluey could not save that resume.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const moveToStep = async (nextStep: number) => {
@@ -490,8 +506,9 @@ export function Onboarding({ workspace, error, onProgress, onComplete }: Props) 
       </div>
       <ResumeImportReview
         preview={importPreview}
+        busy={saving}
         onApply={applyImport}
-        onClose={() => setImportPreview(undefined)}
+        onClose={() => { setImportPreview(undefined); setPendingResume(undefined); }}
       />
     </main>
   );

@@ -189,6 +189,20 @@ pub fn artifact_object_refs(pool: &DbPool, account_id: &str) -> Result<Vec<Artif
             });
         }
     }
+    if let Some(asset) = jobs::get_resume_source_asset(pool, account_id)? {
+        let key = asset.storage_key.trim();
+        if !key.is_empty() && seen.insert(key.to_string()) {
+            refs.push(ArtifactObjectRef {
+                artifact_id: asset.id,
+                title: asset.file_name,
+                object_key: key.to_string(),
+                content_type: Some(asset.media_type),
+                size_bytes: Some(asset.size_bytes),
+                sha256: Some(asset.sha256),
+                expires_at_ms: None,
+            });
+        }
+    }
     Ok(refs)
 }
 

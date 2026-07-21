@@ -305,22 +305,13 @@ mod tests {
             generated.content["employment"][0]["location"],
             "Indianapolis, IN"
         );
-        assert_eq!(
-            generated.content["employment"][0]["start_date"],
-            "2021-01"
-        );
-        assert_eq!(
-            generated.content["employment"][0]["end_date"],
-            "2023-06"
-        );
+        assert_eq!(generated.content["employment"][0]["start_date"], "2021-01");
+        assert_eq!(generated.content["employment"][0]["end_date"], "2023-06");
         assert_eq!(
             generated.content["employment"][0]["highlights"][1],
             "Engineered reliable distributed systems."
         );
-        assert_eq!(
-            generated.content["contact"],
-            baseline.content["contact"]
-        );
+        assert_eq!(generated.content["contact"], baseline.content["contact"]);
         assert_eq!(
             generated.content["education"],
             baseline.content["education"]
@@ -329,10 +320,7 @@ mod tests {
             generated.content["certifications"],
             baseline.content["certifications"]
         );
-        assert_eq!(
-            generated.content["template"],
-            baseline.content["template"]
-        );
+        assert_eq!(generated.content["template"], baseline.content["template"]);
         assert_eq!(
             generated.content["provenance"]["resume_generation"]["rewrite_sources"]
                 ["/employment/0/highlights/1"],
@@ -444,6 +432,167 @@ mod tests {
         assert!(prompt.contains("Do not force a metric into a bullet that has none"));
         assert!(prompt.contains("Keep every employer, title, location, date"));
         assert!(prompt.contains("when the change would be cosmetic only"));
+    }
+
+    #[test]
+    fn exact_docx_prompt_and_plan_lock_preserve_the_complete_source_layout() {
+        let mut profile = profile();
+        profile.source_resume_template_status = "exact_docx".into();
+        profile.skills = (0..17).map(|index| format!("Skill {index}")).collect();
+        profile.employment.push(EmploymentEntry {
+            id: "work-2".into(),
+            company: "Earlier Company".into(),
+            title: "Platform Engineer".into(),
+            highlights: vec!["Maintained a service platform.".into()],
+            ..Default::default()
+        });
+        profile.projects.push(ProjectEntry {
+            id: "project-2".into(),
+            name: "Earlier Project".into(),
+            summary: "Created an internal service.".into(),
+            ..Default::default()
+        });
+        let catalog = EvidenceCatalog::from_profile(&profile);
+        let prompt = user_prompt(&profile, &posting(), &catalog).unwrap();
+        assert!(prompt.contains("\"layout_policy\":\"preserve_source_docx\""));
+
+        let requested = ResumePlan {
+            headline_evidence_ids: vec!["profile:headline".into()],
+            summary_evidence_ids: vec!["profile:summary".into()],
+            skill_order: vec!["Skill 16".into(), "Skill 0".into()],
+            employment_order: vec![1, 0],
+            employment_highlight_order: vec![
+                HighlightOrder {
+                    entry_index: 0,
+                    highlight_indices: vec![1, 0],
+                },
+                HighlightOrder {
+                    entry_index: 1,
+                    highlight_indices: vec![0],
+                },
+            ],
+            employment_highlight_rewrites: vec![HighlightRewrite {
+                entry_index: 0,
+                highlight_index: 0,
+                source_evidence_ids: vec!["employment:0:highlight:0".into()],
+                text: "Engineered reliable distributed systems.".into(),
+            }],
+            project_order: vec![1, 0],
+        };
+        let locked =
+            lock_plan_to_source_layout(&profile, normalize_plan(&profile, &catalog, requested));
+
+        assert!(locked.headline_evidence_ids.is_empty());
+        assert!(locked.summary_evidence_ids.is_empty());
+        assert_eq!(locked.skill_order, profile.skills);
+        assert_eq!(locked.employment_order, vec![0, 1]);
+        assert_eq!(
+            locked.employment_highlight_order[0].highlight_indices,
+            vec![0, 1]
+        );
+        assert_eq!(locked.project_order, vec![0, 1]);
+        assert_eq!(locked.employment_highlight_rewrites.len(), 1);
+        validate_plan(&profile, &catalog, locked).unwrap();
+    }
+
+    #[test]
+    fn exact_docx_materialization_changes_only_a_truth_guarded_same_role_bullet() {
+        let mut profile = profile();
+        profile.source_resume_template_status = "exact_docx".into();
+        profile.skills = (0..17).map(|index| format!("Skill {index}")).collect();
+        profile.employment.push(EmploymentEntry {
+            id: "work-2".into(),
+            company: "Earlier Company".into(),
+            title: "Platform Engineer".into(),
+            highlights: vec!["Maintained a service platform.".into()],
+            ..Default::default()
+        });
+        profile.projects.push(ProjectEntry {
+            id: "project-2".into(),
+            name: "Earlier Project".into(),
+            summary: "Created an internal service.".into(),
+            ..Default::default()
+        });
+        let baseline = ResumeVersion {
+            id: "resume-source".into(),
+            job_id: "job-source".into(),
+            version_no: 1,
+            mode: "factual".into(),
+            content: json!({
+                "headline": "Original Word headline",
+                "summary": "Original Word summary",
+                "provenance": {},
+            }),
+            diff: json!({}),
+            claim_ids: Vec::new(),
+            checksum: "source-checksum".into(),
+            created_at_ms: 1,
+        };
+        let requested = ResumePlan {
+            headline_evidence_ids: vec!["profile:headline".into()],
+            summary_evidence_ids: vec!["profile:summary".into()],
+            skill_order: vec!["Skill 16".into()],
+            employment_order: vec![1, 0],
+            employment_highlight_order: vec![
+                HighlightOrder {
+                    entry_index: 0,
+                    highlight_indices: vec![1, 0],
+                },
+                HighlightOrder {
+                    entry_index: 1,
+                    highlight_indices: vec![0],
+                },
+            ],
+            employment_highlight_rewrites: vec![HighlightRewrite {
+                entry_index: 0,
+                highlight_index: 0,
+                source_evidence_ids: vec!["employment:0:highlight:0".into()],
+                text: "Engineered reliable distributed systems.".into(),
+            }],
+            project_order: vec![1, 0],
+        };
+
+        let generated = materialize(&profile, &baseline, &requested, "model").unwrap();
+
+        assert_eq!(generated.content["headline"], "Original Word headline");
+        assert_eq!(generated.content["summary"], "Original Word summary");
+        assert_eq!(generated.content["skills"], json!(profile.skills));
+        assert_eq!(
+            generated.content["employment"][0]["company"],
+            "Example Health"
+        );
+        assert_eq!(
+            generated.content["employment"][1]["company"],
+            "Earlier Company"
+        );
+        assert_eq!(
+            generated.content["employment"][0]["highlights"][0],
+            "Engineered reliable distributed systems."
+        );
+        assert_eq!(
+            generated.content["employment"][0]["highlights"][1],
+            "Reduced deployment time by 30 percent."
+        );
+        assert_eq!(generated.content["projects"][0]["name"], "Care Platform");
+        assert_eq!(generated.content["projects"][1]["name"], "Earlier Project");
+        assert_eq!(
+            generated.public_provenance["layout_policy"],
+            "preserve_source_docx"
+        );
+        assert!(generated.diff.get("skill_emphasis").is_none());
+        assert!(generated.diff.get("experience_emphasis").is_none());
+        assert!(generated.diff.get("project_emphasis").is_none());
+        assert!(generated.diff["layout_policy"]
+            .as_str()
+            .unwrap()
+            .contains("Original Word layout"));
+        assert_eq!(
+            generated.diff["experience_rewrites"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

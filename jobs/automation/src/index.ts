@@ -7,6 +7,7 @@ export * from "./form-intelligence.js";
 export * from "./interview-prep.js";
 export * from "./jobhive-manifest.js";
 export * from "./jobhive-artifact.js";
+export * from "./jobhive-rollout.js";
 export * from "./packet-guards.js";
 export * from "./policy.js";
 export * from "./providers/index.js";

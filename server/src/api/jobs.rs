@@ -50,6 +50,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/jobs/workspace", get(workspace))
         .route("/api/jobs/onboarding/complete", post(complete_onboarding))
         .route("/api/jobs/profile", get(profile).put(save_profile))
+        .route(
+            "/api/jobs/resume-source",
+            get(super::jobs_resume_assets::resume_source)
+                .post(super::jobs_resume_assets::upload_resume_source)
+                .route_layer(DefaultBodyLimit::max(15 * 1024 * 1024)),
+        )
         .route("/api/jobs/facts", get(facts).post(save_fact))
         .route("/api/jobs/facts/:fact_id", delete(delete_fact))
         .route(
@@ -102,6 +108,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/jobs/resume-versions/:resume_version_id",
             get(resume_version),
+        )
+        .route(
+            "/api/jobs/resume-versions/:resume_version_id/template-docx",
+            get(super::jobs_resume_assets::download_template_docx),
         )
         .route(
             "/api/jobs/browser-sessions",
@@ -4639,7 +4649,7 @@ fn update_worker_browser_session(
     Ok(())
 }
 
-fn validate_profile(profile: &CareerProfile) -> Result<(), ApiError> {
+pub(crate) fn validate_profile(profile: &CareerProfile) -> Result<(), ApiError> {
     if profile.onboarding_complete {
         if profile.full_name.trim().is_empty() {
             return bad_request("Add your full name before finishing setup.");

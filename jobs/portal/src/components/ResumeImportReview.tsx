@@ -4,18 +4,21 @@ import { Dialog } from "./Dialog";
 
 interface Props {
   preview?: ResumeImportPreview;
-  onApply(mode: ResumeImportMode): void;
+  busy?: boolean;
+  onApply(mode: ResumeImportMode): void | Promise<void>;
   onClose(): void;
 }
 
-export function ResumeImportReview({ preview, onApply, onClose }: Props) {
+export function ResumeImportReview({ preview, busy = false, onApply, onClose }: Props) {
   const profile = preview?.replacement;
   return (
     <Dialog
       open={Boolean(preview)}
       title="Review imported resume"
       description="Bluey has not changed your Career Profile yet. Check the extracted person and history first."
-      onClose={onClose}
+      onClose={() => {
+        if (!busy) onClose();
+      }}
       size="large"
     >
       {preview && profile && (
@@ -91,9 +94,9 @@ export function ResumeImportReview({ preview, onApply, onClose }: Props) {
           <div className="dialog-actions spread import-review-actions">
             <p>{preview.likely_different_person ? "Confirm this is the correct candidate before replacing the current profile." : "Choose Replace for a corrected resume. Use Fill blanks to retain confirmed fields while adding new history."}</p>
             <div>
-              <button type="button" className="button secondary" onClick={onClose}>Cancel</button>
-              {!preview.likely_different_person && <button type="button" className="button secondary" onClick={() => onApply("merge")}>Fill blanks only</button>}
-              <button type="button" className="button primary" onClick={() => onApply("replace")}>Replace resume facts</button>
+              <button type="button" className="button secondary" disabled={busy} onClick={onClose}>Cancel</button>
+              {!preview.likely_different_person && <button type="button" className="button secondary" disabled={busy} onClick={() => void onApply("merge")}>Fill blanks only</button>}
+              <button type="button" className="button primary" disabled={busy} onClick={() => void onApply("replace")}>{busy ? "Saving resume..." : "Replace resume facts"}</button>
             </div>
           </div>
         </>
