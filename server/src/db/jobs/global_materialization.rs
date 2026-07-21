@@ -300,7 +300,18 @@ fn global_candidate_index_revision(pool: &DbPool) -> Result<i64> {
         DbPool::Sqlite(_) => pool
             .get()?
             .query_row(
-                "SELECT COALESCE(MAX(updated_at_ms), 0) FROM jobs_global_candidates",
+                "SELECT COALESCE(MAX(candidate.updated_at_ms), 0)
+                   FROM jobs_global_candidates candidate
+                  WHERE EXISTS (
+                        SELECT 1
+                          FROM jobs_global_candidate_memberships membership
+                          JOIN jobs_global_ingestion_runs run
+                            ON run.id = membership.last_seen_run_id
+                           AND run.source_id = membership.source_id
+                         WHERE membership.candidate_id = candidate.id
+                           AND membership.availability_status = 'active'
+                           AND run.status = 'completed'
+                  )",
                 [],
                 |row| row.get(0),
             )
@@ -308,7 +319,18 @@ fn global_candidate_index_revision(pool: &DbPool) -> Result<i64> {
         DbPool::Postgres(_) => pool
             .get_pg()?
             .query_one(
-                "SELECT COALESCE(MAX(updated_at_ms), 0)::BIGINT FROM jobs_global_candidates",
+                "SELECT COALESCE(MAX(candidate.updated_at_ms), 0)::BIGINT
+                   FROM jobs_global_candidates candidate
+                  WHERE EXISTS (
+                        SELECT 1
+                          FROM jobs_global_candidate_memberships membership
+                          JOIN jobs_global_ingestion_runs run
+                            ON run.id = membership.last_seen_run_id
+                           AND run.source_id = membership.source_id
+                         WHERE membership.candidate_id = candidate.id
+                           AND membership.availability_status = 'active'
+                           AND run.status = 'completed'
+                  )",
                 &[],
             )
             .map(|row| row.get(0))
@@ -357,10 +379,22 @@ fn load_recent_global_candidates(
             let conn = pool.get()?;
             let mut stmt = conn.prepare(
                 "SELECT id, candidate_json, updated_at_ms
-                   FROM jobs_global_candidates
-                  WHERE availability_status <> 'expired'
-                    AND (posted_at_ms >= ?1 OR (posted_at_ms IS NULL AND updated_at_ms >= ?1))
-                  ORDER BY posted_at_ms DESC, updated_at_ms DESC, id LIMIT ?2",
+                   FROM jobs_global_candidates candidate
+                  WHERE candidate.availability_status <> 'expired'
+                    AND (candidate.posted_at_ms >= ?1 OR
+                         (candidate.posted_at_ms IS NULL AND candidate.updated_at_ms >= ?1))
+                    AND EXISTS (
+                        SELECT 1
+                          FROM jobs_global_candidate_memberships membership
+                          JOIN jobs_global_ingestion_runs run
+                            ON run.id = membership.last_seen_run_id
+                           AND run.source_id = membership.source_id
+                         WHERE membership.candidate_id = candidate.id
+                           AND membership.availability_status = 'active'
+                           AND run.status = 'completed'
+                    )
+                  ORDER BY candidate.posted_at_ms DESC, candidate.updated_at_ms DESC,
+                           candidate.id LIMIT ?2",
             )?;
             let values = stmt.query_map(params![cutoff_at_ms, limit], |row| {
                 Ok(GlobalCandidateMaterializationRow {
@@ -377,10 +411,22 @@ fn load_recent_global_candidates(
             .get_pg()?
             .query(
                 "SELECT id, candidate_json, updated_at_ms
-                   FROM jobs_global_candidates
-                  WHERE availability_status <> 'expired'
-                    AND (posted_at_ms >= $1 OR (posted_at_ms IS NULL AND updated_at_ms >= $1))
-                  ORDER BY posted_at_ms DESC NULLS LAST, updated_at_ms DESC, id LIMIT $2",
+                   FROM jobs_global_candidates candidate
+                  WHERE candidate.availability_status <> 'expired'
+                    AND (candidate.posted_at_ms >= $1 OR
+                         (candidate.posted_at_ms IS NULL AND candidate.updated_at_ms >= $1))
+                    AND EXISTS (
+                        SELECT 1
+                          FROM jobs_global_candidate_memberships membership
+                          JOIN jobs_global_ingestion_runs run
+                            ON run.id = membership.last_seen_run_id
+                           AND run.source_id = membership.source_id
+                         WHERE membership.candidate_id = candidate.id
+                           AND membership.availability_status = 'active'
+                           AND run.status = 'completed'
+                    )
+                  ORDER BY candidate.posted_at_ms DESC NULLS LAST,
+                           candidate.updated_at_ms DESC, candidate.id LIMIT $2",
                 &[&cutoff_at_ms, &limit],
             )?
             .into_iter()

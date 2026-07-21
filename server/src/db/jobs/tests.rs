@@ -438,6 +438,24 @@ mod tests {
         canonical_url: &str,
         updated_at_ms: i64,
     ) -> DiscoveredJobInput {
+        insert_global_candidate_with_run_status(
+            pool,
+            id,
+            external_id,
+            canonical_url,
+            updated_at_ms,
+            "completed",
+        )
+    }
+
+    fn insert_global_candidate_with_run_status(
+        pool: &DbPool,
+        id: &str,
+        external_id: &str,
+        canonical_url: &str,
+        updated_at_ms: i64,
+        run_status: &str,
+    ) -> DiscoveredJobInput {
         let input = DiscoveredJobInput {
             external_id: external_id.to_string(),
             canonical_url: canonical_url.to_string(),
@@ -455,9 +473,36 @@ mod tests {
         };
         let mut posting = global_candidate_posting(&input);
         posting.canonical_key = canonical_job_key(&posting);
-        pool.get()
-            .unwrap()
-            .execute(
+        let source_id = format!("source-{id}");
+        let run_id = format!("run-{id}");
+        let completed_at_ms = (run_status == "completed").then_some(updated_at_ms);
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO jobs_global_discovery_sources (
+                id, provider, source_key, source_json, status, health,
+                run_interval_ms, next_run_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (?1, 'jobhive', ?2, '{}', 'active', 'waiting',
+                       14400000, ?3, ?3, ?3)",
+            params![source_id, format!("fixture-{id}"), updated_at_ms],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_global_ingestion_runs (
+                id, source_id, replay_key, status, expected_rows, received_rows,
+                received_batches, artifact_sha256, started_at_ms, completed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, 1, 1, 1, ?5, ?6, ?7)",
+            params![
+                run_id,
+                source_id,
+                format!("replay-{id}"),
+                run_status,
+                "a".repeat(64),
+                updated_at_ms,
+                completed_at_ms,
+            ],
+        )
+        .unwrap();
+        conn.execute(
                 "INSERT INTO jobs_global_candidates (
                     id, canonical_key, candidate_json, company, title, location, workplace,
                     canonical_url, role_family, posted_at_ms, availability_status,
@@ -478,6 +523,21 @@ mod tests {
                 ],
             )
             .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_global_candidate_memberships (
+                source_id, external_id, candidate_id, content_hash, first_seen_at_ms,
+                last_seen_at_ms, last_seen_run_id, availability_status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, 'active')",
+            params![
+                source_id,
+                external_id,
+                id,
+                format!("content-{id}"),
+                updated_at_ms,
+                run_id,
+            ],
+        )
+        .unwrap();
         input
     }
 
@@ -916,6 +976,169 @@ mod tests {
         .unwrap();
         assert_eq!(second, empty_global_materialization_result());
         assert_eq!(list_postings(&pool, "acct-jobs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn global_candidates_wait_for_their_ingestion_run_to_complete() {
+        let pool = test_pool();
+        save_profile(
+            &pool,
+            "acct-jobs",
+            &default_profile("jobs@example.com"),
+        )
+        .unwrap();
+        insert_global_candidate_with_run_status(
+            &pool,
+            "candidate-global-running",
+            "lead-running",
+            "https://jobs.lever.co/acme/running-ingestion",
+            now_ms(),
+            "running",
+        );
+
+        let hidden = materialize_global_candidates_for_account(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+        )
+        .unwrap();
+        assert_eq!(hidden, empty_global_materialization_result());
+        assert!(list_postings(&pool, "acct-jobs").unwrap().is_empty());
+
+        let completed_at_ms = now_ms();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_global_ingestion_runs
+                    SET status = 'completed', completed_at_ms = ?2
+                  WHERE id = ?1",
+                params!["run-candidate-global-running", completed_at_ms],
+            )
+            .unwrap();
+
+        let visible = materialize_global_candidates_for_account(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+        )
+        .unwrap();
+        assert_eq!(visible.materialized_count, 1);
+        assert_eq!(list_postings(&pool, "acct-jobs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn global_ingestion_recovers_after_completion_response_is_lost() {
+        let pool = test_pool();
+        let artifact_sha256 = "a".repeat(64);
+        let sources = sync_global_discovery_sources(
+            &pool,
+            &[GlobalDiscoverySourceInput {
+                provider: "jobhive".to_string(),
+                source_key: "lever-recovery".to_string(),
+                source_family: "lever".to_string(),
+                artifact_url: "https://storage.stapply.ai/lever.csv".to_string(),
+                artifact_sha256: artifact_sha256.clone(),
+                expected_rows: 1,
+                snapshot_at_ms: now_ms(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            }],
+        )
+        .unwrap();
+        let source_id = sources[0].id.clone();
+        let first = lease_due_global_discovery_source(&pool, "first-worker")
+            .unwrap()
+            .unwrap();
+        let batch = GlobalIngestionBatchInput {
+            lease_token: first.lease_token.clone(),
+            replay_key: first.replay_key.clone(),
+            scheduled_for_ms: first.scheduled_for_ms,
+            batch_index: 0,
+            artifact_sha256: artifact_sha256.clone(),
+            jobs: vec![curated_discovered_job(
+                "lever-recovery-job",
+                "https://jobs.lever.co/acme/lever-recovery-job",
+            )],
+        };
+        let uploaded = ingest_global_discovery_batch(&pool, &source_id, &batch).unwrap();
+        assert!(!uploaded.replayed);
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_global_discovery_sources
+                    SET lease_expires_at_ms = ?2 WHERE id = ?1",
+                params![source_id, now_ms() - 1],
+            )
+            .unwrap();
+        let second = lease_due_global_discovery_source(&pool, "recovery-worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.replay_key, first.replay_key);
+        assert_eq!(second.scheduled_for_ms, first.scheduled_for_ms);
+
+        let replayed = ingest_global_discovery_batch(
+            &pool,
+            &source_id,
+            &GlobalIngestionBatchInput {
+                lease_token: second.lease_token.clone(),
+                ..batch
+            },
+        )
+        .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.received_rows, 1);
+        assert_eq!(replayed.received_batches, 1);
+
+        let completed = complete_global_discovery_ingestion(
+            &pool,
+            &source_id,
+            &GlobalIngestionCompleteInput {
+                lease_token: second.lease_token.clone(),
+                replay_key: second.replay_key.clone(),
+                scheduled_for_ms: second.scheduled_for_ms,
+                artifact_sha256: artifact_sha256.clone(),
+                expected_rows: 1,
+                expected_batches: 1,
+                complete_snapshot: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(completed.status, "completed");
+        assert!(!completed.replayed);
+
+        let completion_replay = complete_global_discovery_ingestion(
+            &pool,
+            &source_id,
+            &GlobalIngestionCompleteInput {
+                lease_token: second.lease_token,
+                replay_key: second.replay_key,
+                scheduled_for_ms: second.scheduled_for_ms,
+                artifact_sha256,
+                expected_rows: 1,
+                expected_batches: 1,
+                complete_snapshot: true,
+            },
+        )
+        .unwrap();
+        assert!(completion_replay.replayed);
+
+        let conn = pool.get().unwrap();
+        let candidates: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_global_candidates",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let memberships: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_global_candidate_memberships",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(candidates, 1);
+        assert_eq!(memberships, 1);
     }
 
     #[test]

@@ -537,7 +537,7 @@ fn validate_global_run_batches_postgres(
     )?;
     let batches = tx.query_one(
         "SELECT COUNT(*), COALESCE(MIN(batch_index), 0),
-                COALESCE(MAX(batch_index), -1), COALESCE(SUM(row_count), 0)
+                COALESCE(MAX(batch_index), -1), COALESCE(SUM(row_count), 0)::BIGINT
            FROM jobs_global_ingestion_batches WHERE run_id = $1",
         &[&run_id],
     )?;

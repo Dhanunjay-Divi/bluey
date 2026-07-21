@@ -263,13 +263,22 @@ mod tests {
 
     #[test]
     fn rewrites_a_bullet_with_same_role_source_evidence_and_real_diff() {
-        let profile = profile();
+        let mut profile = profile();
+        profile.employment[0].location = "Indianapolis, IN".into();
+        profile.employment[0].start_date = "2021-01".into();
+        profile.employment[0].end_date = "2023-06".into();
         let baseline = ResumeVersion {
             id: "resume-1".into(),
             job_id: "job-1".into(),
             version_no: 1,
             mode: "factual".into(),
-            content: json!({"provenance": {}}),
+            content: json!({
+                "contact": {"name": "Candidate Name", "email": "candidate@example.com"},
+                "education": [{"school": "Indiana University", "degree": "MS"}],
+                "certifications": ["AWS Certified Solutions Architect"],
+                "template": {"id": "compact-ats", "accent": "blue"},
+                "provenance": {},
+            }),
             diff: json!({}),
             claim_ids: Vec::new(),
             checksum: "checksum".into(),
@@ -293,8 +302,36 @@ mod tests {
             "Software Engineer"
         );
         assert_eq!(
+            generated.content["employment"][0]["location"],
+            "Indianapolis, IN"
+        );
+        assert_eq!(
+            generated.content["employment"][0]["start_date"],
+            "2021-01"
+        );
+        assert_eq!(
+            generated.content["employment"][0]["end_date"],
+            "2023-06"
+        );
+        assert_eq!(
             generated.content["employment"][0]["highlights"][1],
             "Engineered reliable distributed systems."
+        );
+        assert_eq!(
+            generated.content["contact"],
+            baseline.content["contact"]
+        );
+        assert_eq!(
+            generated.content["education"],
+            baseline.content["education"]
+        );
+        assert_eq!(
+            generated.content["certifications"],
+            baseline.content["certifications"]
+        );
+        assert_eq!(
+            generated.content["template"],
+            baseline.content["template"]
         );
         assert_eq!(
             generated.content["provenance"]["resume_generation"]["rewrite_sources"]

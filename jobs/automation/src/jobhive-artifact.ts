@@ -299,7 +299,9 @@ function validateCandidateUrl(raw: string, label: string): void {
 }
 
 function boundedText(value: string | undefined, label: string, maximumLength: number): string {
-  const text = typeof value === "string" ? value.trim() : "";
+  const text = typeof value === "string"
+    ? value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ").trim()
+    : "";
   if (text.length > maximumLength) {
     throw new JobhiveArtifactError("invalid_artifact", `Jobhive ${label} exceeds its field limit`);
   }

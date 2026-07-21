@@ -132,6 +132,35 @@ describe("Jobhive artifact ingestion", () => {
     expect(batches[1]?.[0]).toMatchObject({ description: "Line one\nLine two", commitment: "C2C" });
   });
 
+  it("removes database-forbidden control bytes without changing readable feed content", async () => {
+    const values = [
+      "https://jobs.ashbyhq.com/acme/1", "Software Engineer", "Acme", "ashby", "1", "Austin, TX", "false",
+      "", "", "", "", "", "full_time", "Engineering", "Platform",
+      "Build\u0000 reliable\u0007 systems\nwith candidates", "2026-07-20T00:00:00Z", "REQ-1",
+      "https://jobs.ashbyhq.com/acme/1", "Full-time", "{\"source\":\"ashby\"}", "US",
+    ];
+    const content = `${csvRow(headers)}\n${csvRow(values)}\n`;
+    const stagingDirectory = await temporaryDirectory();
+    const filePath = path.join(stagingDirectory, "ashby.csv");
+    await writeFile(filePath, content);
+    const verified: VerifiedJobhiveArtifact = {
+      artifact: artifactFor(content, {
+        rows: 1,
+        url: "https://storage.stapply.ai/jobhive/v1/ashby/jobs.csv",
+      }),
+      sourceFamily: "ashby",
+      path: filePath,
+      bytes: Buffer.byteLength(content),
+      sha256: createHash("sha256").update(content).digest("hex"),
+    };
+    const rows: unknown[] = [];
+
+    await streamVerifiedJobhiveCsv({ verified, onBatch: (batch) => rows.push(...batch) });
+
+    expect(rows[0]).toMatchObject({ description: "Build  reliable  systems\nwith candidates" });
+    expect(JSON.stringify(rows[0])).not.toContain("\\u0000");
+  });
+
   it("rejects missing columns and row-count drift", async () => {
     const stagingDirectory = await temporaryDirectory();
     const missingHeader = headers.filter((header) => header !== "apply_url");

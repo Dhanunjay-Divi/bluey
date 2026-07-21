@@ -9,7 +9,7 @@ PartOf=bluey-jobs-api.service
 Type=simple
 User=bluey
 Group=bluey
-WorkingDirectory=/opt/bluey-jobs-discovery/current/jobs
+WorkingDirectory=/opt/bluey-jobs-global-discovery/current/jobs
 EnvironmentFile=/etc/bluey-api/bluey-jobs.env
 EnvironmentFile=/etc/bluey-api/bluey-jobs-global-discovery.env
 Environment=NODE_ENV=production
