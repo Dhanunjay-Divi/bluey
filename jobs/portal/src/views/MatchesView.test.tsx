@@ -9,6 +9,7 @@ import {
   discoverySourceAction,
   discoverySourceState,
   isCandidateLead,
+  isMatchVisibleByState,
   isRecentPosting,
   postingAgeLabel,
   visibleMatches,
@@ -114,5 +115,24 @@ describe("large match sets", () => {
     expect(visibleMatches(matches, 50)).toHaveLength(50);
     expect(visibleMatches(matches, 100)).toHaveLength(100);
     expect(visibleMatches(matches, 150)).toHaveLength(125);
+  });
+
+  it("does not let historical or passed rows inflate active tab counts", () => {
+    const now = Date.now();
+    const active = {
+      status: "matched",
+      availability_status: "active",
+      posted_at_ms: now - 2 * 86_400_000,
+    } as JobPosting;
+    const stale = { ...active, posted_at_ms: now - 30 * 86_400_000 } as JobPosting;
+    const expired = { ...active, availability_status: "expired" } as JobPosting;
+    const skipped = { ...active, status: "skipped" } as JobPosting;
+
+    expect(isMatchVisibleByState(active, 14, false, false)).toBe(true);
+    expect(isMatchVisibleByState(stale, 14, false, false)).toBe(false);
+    expect(isMatchVisibleByState(expired, 14, false, false)).toBe(false);
+    expect(isMatchVisibleByState(skipped, 14, false, false)).toBe(false);
+    expect(isMatchVisibleByState(active, 14, true, false)).toBe(false);
+    expect(isMatchVisibleByState(active, 14, true, true)).toBe(true);
   });
 });

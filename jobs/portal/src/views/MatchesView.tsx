@@ -91,20 +91,27 @@ export function MatchesView({
     [workspace.matches, workspace.candidate_events],
   );
 
+  const activeMatches = useMemo(
+    () => workspace.matches.filter((job) => isMatchVisibleByState(
+      job,
+      workspace.preferences.max_posting_age_days,
+      passedJobIds.has(job.id),
+      showPassed,
+    )),
+    [workspace.matches, workspace.preferences.max_posting_age_days, passedJobIds, showPassed],
+  );
+
   const filtered = useMemo(() => {
     const needle = query.toLowerCase();
-    return workspace.matches.filter((job) => {
+    return activeMatches.filter((job) => {
       const matchesTrack = activeTrack === "all" || job.track_id === activeTrack;
       const matchesQuery = !needle || `${job.company} ${job.title} ${job.location}`.toLowerCase().includes(needle);
       const matchesScore = job.match_score >= minimumScore;
       const matchesWorkplace = workplace === "all" || job.workplace.toLowerCase().includes(workplace);
       const matchesPacket = !onlyUnprepared || !preparedJobIds.has(job.id);
-      const isRecent = isRecentPosting(job, workspace.preferences.max_posting_age_days);
-      const matchesPassed = showPassed ? passedJobIds.has(job.id) : !passedJobIds.has(job.id);
-      return matchesTrack && matchesQuery && matchesScore && matchesWorkplace && matchesPacket
-        && matchesPassed && job.status !== "skipped" && job.availability_status !== "expired" && isRecent;
+      return matchesTrack && matchesQuery && matchesScore && matchesWorkplace && matchesPacket;
     });
-  }, [workspace.matches, workspace.preferences.max_posting_age_days, activeTrack, query, minimumScore, workplace, onlyUnprepared, preparedJobIds, showPassed, passedJobIds]);
+  }, [activeMatches, activeTrack, query, minimumScore, workplace, onlyUnprepared, preparedJobIds]);
   const visibleJobs = visibleMatches(filtered, visibleCount);
 
   useEffect(() => {
@@ -234,8 +241,8 @@ export function MatchesView({
       />
 
       <section className="track-strip" aria-label="Career Tracks">
-        <button className={activeTrack === "all" ? "active" : ""} onClick={() => setActiveTrack("all")}><span>All matches</span><b>{workspace.matches.length}</b></button>
-        {workspace.tracks.map((track) => <button key={track.id} className={activeTrack === track.id ? "active" : ""} onClick={() => setActiveTrack(track.id)}><span>{track.name}</span><b>{workspace.matches.filter((job) => job.track_id === track.id).length || track.match_count}</b></button>)}
+        <button className={activeTrack === "all" ? "active" : ""} onClick={() => setActiveTrack("all")}><span>All matches</span><b>{activeMatches.length}</b></button>
+        {workspace.tracks.map((track) => <button key={track.id} className={activeTrack === track.id ? "active" : ""} onClick={() => setActiveTrack(track.id)}><span>{track.name}</span><b>{activeMatches.filter((job) => job.track_id === track.id).length}</b></button>)}
         <Link className="add-track" title="Add Career Track" to={`../settings${window.location.search}#tracks`}><Plus size={15} /></Link>
       </section>
 
@@ -258,7 +265,7 @@ export function MatchesView({
             <ChevronRight size={18} />
           </button>
         ))}
-        {visibleJobs.length < filtered.length && <div className="job-list-more"><span>Showing {visibleJobs.length} of {filtered.length} relevant jobs</span><button className="button secondary compact" onClick={() => setVisibleCount((current) => current + MATCH_PAGE_SIZE)}>Show 50 more</button></div>}
+        {visibleJobs.length < filtered.length && <div className="job-list-more"><span>Showing {visibleJobs.length} of {filtered.length} relevant jobs</span><button className="button secondary compact" onClick={() => setVisibleCount((current) => current + MATCH_PAGE_SIZE)}>Show {Math.min(MATCH_PAGE_SIZE, filtered.length - visibleJobs.length)} more</button></div>}
         {filtered.length === 0 && <div className="empty-state match-empty-state"><Search /><h3>{selectedTrack ? "Start with a job link" : "Create a Career Track first"}</h3><p>{selectedTrack ? "Paste a recent opening. Bluey verifies it, checks your hard filters, ranks the fit, and builds the application kit for review." : "A Career Track keeps each role, location, resume, and application stream separate."}</p><div className="empty-actions">{selectedTrack && <button className="button primary" onClick={() => setAddOpen(true)}><Link2 size={16} />Add job link</button>}<Link className="button secondary" to={`../settings${window.location.search}#tracks`}>{selectedTrack ? "Adjust Career Track" : "Create Career Track"}</Link></div><ol className="match-activation-flow"><li><b>1</b><span>Verify posting</span></li><li><b>2</b><span>Check hard filters</span></li><li><b>3</b><span>Rank the fit</span></li><li><b>4</b><span>Review application kit</span></li></ol></div>}
       </section>
 
@@ -440,10 +447,26 @@ function capabilityDescription(capability: ReturnType<typeof jobEligibility>["ca
 
 const DAY_MS = 86_400_000;
 
-export function isRecentPosting(job: JobPosting, maximumAgeDays: number): boolean {
+export function isRecentPosting(
+  job: Pick<JobPosting, "availability_status" | "posted_at_ms">,
+  maximumAgeDays: number,
+): boolean {
   const timestamp = job.posted_at_ms;
   if (!timestamp) return job.availability_status !== "expired";
   return Date.now() - timestamp <= Math.max(1, maximumAgeDays) * DAY_MS;
+}
+
+export function isMatchVisibleByState(
+  job: Pick<JobPosting, "status" | "availability_status" | "posted_at_ms">,
+  maximumAgeDays: number,
+  passed: boolean,
+  showPassed: boolean,
+): boolean {
+  const matchesPassedState = showPassed ? passed : !passed;
+  return matchesPassedState
+    && job.status !== "skipped"
+    && job.availability_status !== "expired"
+    && isRecentPosting(job, maximumAgeDays);
 }
 
 export function postingAgeLabel(job: JobPosting): string {
