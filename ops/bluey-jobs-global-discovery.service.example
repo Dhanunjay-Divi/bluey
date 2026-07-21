@@ -1,0 +1,44 @@
+[Unit]
+Description=Bluey Jobs shared candidate-feed ingestion worker
+After=network-online.target bluey-jobs-api.service
+Wants=network-online.target
+Requires=bluey-jobs-api.service
+PartOf=bluey-jobs-api.service
+
+[Service]
+Type=simple
+User=bluey
+Group=bluey
+WorkingDirectory=/opt/bluey-jobs-discovery/current/jobs
+EnvironmentFile=/etc/bluey-api/bluey-jobs.env
+EnvironmentFile=/etc/bluey-api/bluey-jobs-global-discovery.env
+Environment=NODE_ENV=production
+Environment=BLUEY_JOBS_GLOBAL_DISCOVERY_STAGING_DIR=/var/lib/bluey-jobs-global-discovery
+ExecStart=/usr/local/bin/node workflows/dist/global-discovery-worker.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+StateDirectory=bluey-jobs-global-discovery
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/bluey-jobs-global-discovery
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+UMask=0077
+
+LimitNOFILE=8192
+MemoryMax=1536M
+CPUQuota=150%
+
+[Install]
+WantedBy=multi-user.target

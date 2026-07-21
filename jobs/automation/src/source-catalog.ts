@@ -3,11 +3,14 @@ import type { SubmissionCapability } from "./policy.js";
 export type JobSourceKind =
   | "public_ats"
   | "public_curated_feed"
+  | "global_candidate_feed"
   | "staffing_company"
   | "portal_handoff";
 
 export type DiscoveryCapability =
   | "scheduled_public_feed"
+  | "shared_ingestion"
+  | "planned_shared_ingestion"
   | "candidate_lead"
   | "pasted_link_only";
 
@@ -76,6 +79,14 @@ export const JOB_SOURCE_CATALOG: readonly JobSourceCatalogEntry[] = [
   source("portal-ziprecruiter", "ZipRecruiter", "portal_handoff", "pasted_link_only", "unknown_review", ["ziprecruiter.com"]),
   source("portal-dice", "Dice", "portal_handoff", "pasted_link_only", "unknown_review", ["dice.com"]),
   source("portal-careerbuilder", "CareerBuilder", "portal_handoff", "pasted_link_only", "unknown_review", ["careerbuilder.com"]),
+  source("portal-glassdoor", "Glassdoor", "portal_handoff", "pasted_link_only", "handoff", ["glassdoor.com"]),
+  source("portal-wellfound", "Wellfound", "portal_handoff", "pasted_link_only", "handoff", ["wellfound.com"]),
+
+  source("feed-jobhive-index", "Jobhive source index", "global_candidate_feed", "shared_ingestion", "unknown_review", ["storage.stapply.ai"], ["kalil0321/ats-scrapers"], "Shared candidate index only. Revalidate every row against its original employer or ATS before ranking or preparation."),
+  source("feed-remoteok", "Remote OK", "global_candidate_feed", "planned_shared_ingestion", "unknown_review", ["remoteok.com"], [], "Connector metadata only. No production reader is enabled; candidate leads require original-page revalidation."),
+  source("feed-we-work-remotely", "We Work Remotely", "global_candidate_feed", "planned_shared_ingestion", "unknown_review", ["weworkremotely.com"], [], "Connector metadata only. No production reader is enabled; candidate leads require original-page revalidation."),
+  source("feed-yc-work-at-a-startup", "YC Work at a Startup", "global_candidate_feed", "planned_shared_ingestion", "unknown_review", ["workatastartup.com"], ["Y Combinator jobs"], "Connector metadata only. No production reader is enabled; candidate leads require original-page revalidation."),
+  source("feed-built-in", "Built In", "global_candidate_feed", "planned_shared_ingestion", "unknown_review", ["builtin.com"], [], "Connector metadata only. No production reader is enabled; candidate leads require original-page revalidation."),
 
   source("feed-simplify-new-grad", "Simplify New Grad Positions", "public_curated_feed", "candidate_lead", "unknown_review", ["github.com"], ["SimplifyJobs/New-Grad-Positions"], "Revalidate every row against its original employer application URL."),
   source("feed-prepai-internships", "PrepAIJobs Summer Internships", "public_curated_feed", "candidate_lead", "unknown_review", ["github.com"], ["PrepAIJobs/Summer2026-Internships"], "Revalidate every row against its original employer application URL."),
@@ -96,12 +107,12 @@ export const JOB_SOURCE_CATALOG: readonly JobSourceCatalogEntry[] = [
   staffing("staffing-computer-futures", "Computer Futures"),
   staffing("staffing-consol-partners", "ConSol Partners"),
   staffing("staffing-consultsbc", "ConsultSBC", [], ["consultsbc"]),
-  staffing("staffing-corporate-biz", "Corporate Biz Solutions"),
+  staffing("staffing-corporate-biz", "Corporate Biz Solutions", [], ["Corporate Biz Solutions Inc."]),
   staffing("staffing-cross-creek", "Cross Creek Systems"),
   staffing("staffing-css-tech", "CSS Tech", [], ["css-tech"]),
   staffing("staffing-dewinter", "DeWinter Technology"),
-  staffing("staffing-eclaro", "Eclaro International"),
-  staffing("staffing-ekodus", "Ekodus"),
+  staffing("staffing-eclaro", "Eclaro International", [], ["Eclaro International, Inc."]),
+  staffing("staffing-ekodus", "Ekodus", [], ["Ekodus Inc"]),
   staffing("staffing-empiric", "Empiric Solutions"),
   staffing("staffing-expedite", "Expedite Technology"),
   staffing("staffing-experis", "Experis", [], ["Experies"]),
@@ -112,13 +123,18 @@ export const JOB_SOURCE_CATALOG: readonly JobSourceCatalogEntry[] = [
   staffing("staffing-horizontal", "Horizontal Integration"),
   staffing("staffing-host-ventures", "Host Ventures", ["hostventures.com"]),
   staffing("staffing-iconma", "ICONMA", ["iconma.com"]),
-  staffing("staffing-indotronix", "Indotronix International"),
+  staffing(
+    "staffing-indotronix",
+    "Indotronix International",
+    [],
+    ["Indotronix International Corporation"],
+  ),
   staffing("staffing-insight-global", "Insight Global"),
   staffing("staffing-jsg", "Johnson Service Group", [], ["JSG"]),
   staffing("staffing-kds", "KDS Strategic"),
   staffing("staffing-kelly-it", "Kelly IT Resources"),
-  staffing("staffing-kforce", "Kforce"),
-  staffing("staffing-lawrence-harvey", "Lawrence Harvey"),
+  staffing("staffing-kforce", "Kforce", [], ["Kforce, Inc"]),
+  staffing("staffing-lawrence-harvey", "Lawrence Harvey", [], ["Lawrenceharvey"]),
   staffing("staffing-leadstack", "LeadStack", [], ["leadstackinc"]),
   staffing("staffing-matchpoint", "MatchPoint Solutions"),
   staffing("staffing-maxonic", "Maxonic"),
@@ -130,19 +146,19 @@ export const JOB_SOURCE_CATALOG: readonly JobSourceCatalogEntry[] = [
   staffing("staffing-quantum-leap", "Quantum Leap"),
   staffing("staffing-randstad", "Randstad Technologies", ["randstadusa.com"], ["Randstad USA"]),
   staffing("staffing-robert-half", "Robert Half Technology", ["roberthalf.com"], ["Robert Half"]),
-  staffing("staffing-sd-engineering", "S&D Engineering Solutions"),
+  staffing("staffing-sd-engineering", "S&D Engineering Solutions", [], ["S&D Engineering Solutions, LLC"]),
   staffing("staffing-sabre", "Sabre Corporation"),
   staffing("staffing-signature", "Signature Consultants"),
-  staffing("staffing-softcom", "Softcom Systems"),
+  staffing("staffing-softcom", "Softcom Systems", [], ["Softcom Systems, Inc."]),
   staffing("staffing-sogeti", "Sogeti USA"),
   staffing("staffing-splunk", "Splunk"),
   staffing("staffing-sprucetech", "Spruce Technology", [], ["Sprucetech"]),
   staffing("staffing-staff-perm", "Staff Perm"),
   staffing("staffing-starpoint", "Starpoint Solutions", [], ["starpoint"]),
   staffing("staffing-synechron", "Synechron", ["synechron.com"]),
-  staffing("staffing-systems-pros", "Systems Pros"),
+  staffing("staffing-systems-pros", "Systems Pros", [], ["Systems Pros Inc"]),
   staffing("staffing-talentric", "Talentric"),
-  staffing("staffing-tech-providers", "Tech Providers"),
+  staffing("staffing-tech-providers", "Tech Providers", [], ["Tech Providers, Inc"]),
   staffing("staffing-tekni-force", "Tekni Force"),
   staffing("staffing-teksystems", "TEKsystems", ["teksystems.com"], ["Tek Systems"]),
   staffing("staffing-judge-group", "The Judge Group"),
@@ -150,8 +166,8 @@ export const JOB_SOURCE_CATALOG: readonly JobSourceCatalogEntry[] = [
   staffing("staffing-three-bridge", "ThreeBridge", [], ["Three Bridge"]),
   staffing("staffing-twentypine", "TwentyPine"),
   staffing("staffing-ventas", "Ventas Consulting"),
-  staffing("staffing-weinberg", "Weinberg & Associates"),
-  staffing("staffing-xchange", "Xchange Software"),
+  staffing("staffing-weinberg", "Weinberg & Associates", [], ["Weinberg & Associates, Inc."]),
+  staffing("staffing-xchange", "Xchange Software", [], ["Xchange Software Inc"]),
 ];
 
 export function findJobSourceByUrl(rawUrl: string): JobSourceCatalogEntry | undefined {
@@ -165,13 +181,17 @@ export function findJobSourceByUrl(rawUrl: string): JobSourceCatalogEntry | unde
   const path = url.pathname.toLowerCase().replace(/^\/+|\/+$/g, "");
   const pathSpecific = JOB_SOURCE_CATALOG.find((entry) => (
     entry.domains.some((domain) => host === domain || host.endsWith(`.${domain}`))
-    && entry.kind === "public_curated_feed"
-    && entry.aliases.some((alias) => path === alias.toLowerCase() || path.startsWith(`${alias.toLowerCase()}/`))
+    && (entry.kind === "public_curated_feed" || entry.kind === "global_candidate_feed")
+    && (
+      (entry.kind === "global_candidate_feed" && !entry.domains.includes("github.com"))
+      || entry.aliases.some((alias) => path === alias.toLowerCase() || path.startsWith(`${alias.toLowerCase()}/`))
+    )
   ));
   if (pathSpecific) return pathSpecific;
   return JOB_SOURCE_CATALOG.find((entry) => entry.domains.some((domain) => (
     (host === domain || host.endsWith(`.${domain}`))
     && entry.kind !== "public_curated_feed"
+    && entry.kind !== "global_candidate_feed"
   )));
 }
 

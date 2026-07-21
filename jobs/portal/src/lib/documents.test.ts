@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyResumeImport,
+  buildResumeExportSections,
   inferProfileFromResume,
   pdfTextItemsToText,
   prepareResumeImport,
@@ -11,7 +12,7 @@ import {
   validateExtractedResumeText,
   validateResumeFileBytes,
 } from "./documents";
-import type { CareerProfile } from "../types";
+import type { CareerProfile, ResumeContent } from "../types";
 
 function emptyProfile(): CareerProfile {
   return {
@@ -47,7 +48,84 @@ function emptyProfile(): CareerProfile {
   };
 }
 
+describe("resume export structure", () => {
+  it("preserves every parsed ATS section in generated documents", () => {
+    const content: ResumeContent = {
+      employment: [{
+        id: "employment-1",
+        company: "Northstar Labs",
+        title: "Software Engineer",
+        location: "Austin, TX",
+        start_date: "2022-01",
+        end_date: "",
+        current: true,
+        highlights: ["Built reliable services."],
+      }],
+      projects: [{
+        id: "project-1",
+        name: "Release Guard",
+        role: "Creator",
+        summary: "Built a deployment safety toolkit.",
+        technologies: ["Rust", "React"],
+        url: "https://example.com/release-guard",
+      }],
+      education: [{
+        id: "education-1",
+        school: "State University",
+        degree: "Master of Science",
+        field: "Computer Science",
+        start_date: "2020",
+        end_date: "2022",
+        location: "Austin, TX",
+      }],
+      certifications: ["AWS Certified Developer"],
+    };
+
+    const sections = buildResumeExportSections(content);
+
+    expect(sections.map((section) => section.title)).toEqual([
+      "EXPERIENCE",
+      "PROJECTS",
+      "EDUCATION",
+      "CERTIFICATIONS",
+    ]);
+    expect(sections[0]?.blocks[0]).toEqual(expect.objectContaining({
+      heading: "Software Engineer - Northstar Labs",
+      metadata: "Austin, TX | 2022-01 - Present",
+      bullets: ["Built reliable services."],
+    }));
+    expect(sections[1]?.blocks[0]?.body).toEqual([
+      "Built a deployment safety toolkit.",
+      "Technologies: Rust, React",
+    ]);
+    expect(sections[2]?.blocks[0]).toEqual(expect.objectContaining({
+      heading: "Master of Science, Computer Science",
+      metadata: "State University | Austin, TX | 2020 - 2022",
+    }));
+    expect(sections[3]?.blocks[0]?.body).toEqual(["AWS Certified Developer"]);
+  });
+});
+
 describe("resume import inference", () => {
+  it("accepts a legitimate all-caps mononym without treating headings as names", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "candidate.docx",
+      text: `RESUME
+ARUN
+Data Engineer
+Irving, TX
+
+EXPERIENCE
+Data Engineer
+Example Systems
+Jan 2022 - Present
+• Built reliable data pipelines.`,
+    });
+
+    expect(result.full_name).toBe("ARUN");
+    expect(result.headline).toBe("Data Engineer");
+  });
+
   it("fills missing contact fields without overwriting confirmed profile data", () => {
     const profile: CareerProfile = {
       ...emptyProfile(),

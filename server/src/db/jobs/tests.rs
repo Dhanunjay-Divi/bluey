@@ -431,6 +431,56 @@ mod tests {
         }
     }
 
+    fn insert_global_candidate(
+        pool: &DbPool,
+        id: &str,
+        external_id: &str,
+        canonical_url: &str,
+        updated_at_ms: i64,
+    ) -> DiscoveredJobInput {
+        let input = DiscoveredJobInput {
+            external_id: external_id.to_string(),
+            canonical_url: canonical_url.to_string(),
+            company: "Acme".to_string(),
+            source_catalog_id: "jobhive:lever".to_string(),
+            requires_original_revalidation: true,
+            title: "Software Engineer".to_string(),
+            location: "New York, NY".to_string(),
+            workplace: "hybrid".to_string(),
+            description: "Build reliable products with Rust and TypeScript.".to_string(),
+            compensation: "$170k-$200k".to_string(),
+            employment_type: "full_time".to_string(),
+            engagement_type: "direct_hire".to_string(),
+            posted_at_ms: Some(updated_at_ms - DAY_MS),
+        };
+        let mut posting = global_candidate_posting(&input);
+        posting.canonical_key = canonical_job_key(&posting);
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_global_candidates (
+                    id, canonical_key, candidate_json, company, title, location, workplace,
+                    canonical_url, role_family, posted_at_ms, availability_status,
+                    first_seen_at_ms, last_seen_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'software_engineering',
+                           ?9, 'active', ?10, ?10, ?10)",
+                params![
+                    id,
+                    posting.canonical_key,
+                    to_json(&input, "global candidate input").unwrap(),
+                    input.company,
+                    input.title,
+                    input.location,
+                    input.workplace,
+                    input.canonical_url,
+                    input.posted_at_ms,
+                    updated_at_ms,
+                ],
+            )
+            .unwrap();
+        input
+    }
+
     #[test]
     fn resume_import_facts_must_be_confirmed_before_entering_resume_claims() {
         let pool = test_pool();
@@ -806,6 +856,159 @@ mod tests {
         assert!(ensure_managed_curated_discovery_source(&pool, "acct-jobs")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn global_candidates_materialize_once_as_track_scoped_review_leads() {
+        let pool = test_pool();
+        let mut profile = default_profile("jobs@example.com");
+        profile.skills = vec!["Rust".to_string(), "TypeScript".to_string()];
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        save_preferences(
+            &pool,
+            "acct-jobs",
+            &JobPreferences {
+                sponsorship: "not_required".to_string(),
+                ..JobPreferences::default()
+            },
+        )
+        .unwrap();
+        insert_global_candidate(
+            &pool,
+            "candidate-global-1",
+            "lead-1",
+            "https://jobs.lever.co/acme/software-engineer",
+            now_ms(),
+        );
+
+        let first = materialize_global_candidates_for_account(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+        )
+        .unwrap();
+        assert_eq!(first.materialized_count, 1);
+        assert_eq!(first.refreshed_count, 0);
+
+        let postings = list_postings(&pool, "acct-jobs").unwrap();
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].track_id, "track-default");
+        assert_eq!(postings[0].source, "curated_feed:jobhive:lever");
+        assert_eq!(postings[0].availability_status, "unknown");
+        assert!(postings[0].last_verified_at_ms.is_none());
+        let decision = evaluate_job_eligibility(
+            &pool,
+            "acct-jobs",
+            &postings[0],
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(!decision.can_prepare);
+        assert!(!decision.can_queue_local);
+        assert!(!decision.can_queue_cloud);
+
+        let second = materialize_global_candidates_for_account(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+        )
+        .unwrap();
+        assert_eq!(second, empty_global_materialization_result());
+        assert_eq!(list_postings(&pool, "acct-jobs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn global_candidates_never_replace_direct_employer_records() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        let preferences = JobPreferences::default();
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let url = "https://jobs.lever.co/acme/software-engineer";
+        let direct = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(url, now_ms() - DAY_MS, now_ms()),
+            &profile,
+            &preferences,
+        )
+        .unwrap();
+        insert_global_candidate(
+            &pool,
+            "candidate-global-direct",
+            "lead-direct",
+            url,
+            now_ms(),
+        );
+
+        let result = materialize_global_candidates_for_account(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+        )
+        .unwrap();
+        assert_eq!(result.materialized_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        let postings = list_postings(&pool, "acct-jobs").unwrap();
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].id, direct.id);
+        assert_eq!(postings[0].source, "greenhouse");
+        assert_eq!(postings[0].availability_status, "active");
+    }
+
+    #[test]
+    fn expired_global_candidates_leave_the_account_review_queue() {
+        let pool = test_pool();
+        save_profile(
+            &pool,
+            "acct-jobs",
+            &default_profile("jobs@example.com"),
+        )
+        .unwrap();
+        insert_global_candidate(
+            &pool,
+            "candidate-global-expired",
+            "lead-expired",
+            "https://jobs.lever.co/acme/software-engineer",
+            now_ms(),
+        );
+        materialize_global_candidates_for_account(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+        )
+        .unwrap();
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_global_candidates
+                    SET availability_status = 'expired', updated_at_ms = ?2
+                  WHERE id = ?1",
+                params!["candidate-global-expired", now_ms() + 1_000],
+            )
+            .unwrap();
+        materialize_global_candidates_for_account(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+        )
+        .unwrap();
+
+        let postings = list_postings(&pool, "acct-jobs").unwrap();
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].availability_status, "expired");
+        let materialization_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_global_candidate_materializations
+                  WHERE account_id = ?1",
+                params!["acct-jobs"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(materialization_count, 0);
     }
 
     #[test]

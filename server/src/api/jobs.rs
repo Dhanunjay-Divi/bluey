@@ -192,6 +192,27 @@ pub fn worker_router() -> Router<AppState> {
             post(worker_discovery_fail),
         )
         .route(
+            "/api/jobs/internal/global-discovery/sources/sync",
+            post(worker_global_discovery_source_sync),
+        )
+        .route(
+            "/api/jobs/internal/global-discovery/lease",
+            post(worker_global_discovery_lease),
+        )
+        .route(
+            "/api/jobs/internal/global-discovery/:source_id/batches",
+            post(worker_global_discovery_batch)
+                .route_layer(DefaultBodyLimit::max(DISCOVERY_SNAPSHOT_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/jobs/internal/global-discovery/:source_id/complete",
+            post(worker_global_discovery_complete),
+        )
+        .route(
+            "/api/jobs/internal/global-discovery/:source_id/fail",
+            post(worker_global_discovery_fail),
+        )
+        .route(
             "/api/jobs/internal/runs/:run_id/events",
             post(worker_run_event),
         )
@@ -309,6 +330,26 @@ pub async fn workspace(
             "Jobs workspace could not ensure managed curated discovery"
         );
     }
+    match jobs::materialize_global_candidates_for_account(&state.pool, &account.id, &account.email)
+    {
+        Ok(result) if result.materialized_count > 0 || result.refreshed_count > 0 => {
+            tracing::info!(
+                account_fingerprint = %discovery_log_fingerprint(&account.id),
+                considered_count = result.considered_count,
+                materialized_count = result.materialized_count,
+                refreshed_count = result.refreshed_count,
+                skipped_count = result.skipped_count,
+                "Jobs workspace projected shared discovery candidates"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            account_fingerprint = %discovery_log_fingerprint(&account.id),
+            error_category = "global_materialization_failed",
+            error = %error,
+            "Jobs workspace continued without shared discovery projection"
+        ),
+    }
     let mut workspace =
         jobs::workspace(&state.pool, &account.id, &account.email).map_err(internal)?;
     if backfill_verified_import_discovery_sources(
@@ -390,6 +431,16 @@ pub async fn complete_onboarding(
     // Persist completion last. Retrying after any earlier write is idempotent,
     // while a partial request can never make the portal skip onboarding.
     jobs::save_profile(&state.pool, &account.id, &input.profile).map_err(internal)?;
+    if let Err(error) =
+        jobs::materialize_global_candidates_for_account(&state.pool, &account.id, &account.email)
+    {
+        tracing::warn!(
+            account_fingerprint = %discovery_log_fingerprint(&account.id),
+            error_category = "global_materialization_failed",
+            error = %error,
+            "Jobs onboarding completed without shared discovery projection"
+        );
+    }
     jobs::workspace(&state.pool, &account.id, &account.email)
         .map(Json)
         .map_err(internal)
@@ -3381,6 +3432,66 @@ async fn worker_discovery_fail(
     )
     .map(Json)
     .map_err(discovery_domain_error)
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerGlobalDiscoverySourceSyncRequest {
+    sources: Vec<jobs::GlobalDiscoverySourceInput>,
+}
+
+async fn worker_global_discovery_source_sync(
+    State(state): State<AppState>,
+    Json(req): Json<WorkerGlobalDiscoverySourceSyncRequest>,
+) -> Result<Json<Vec<jobs::GlobalDiscoverySource>>, ApiError> {
+    jobs::sync_global_discovery_sources(&state.pool, &req.sources)
+        .map(Json)
+        .map_err(discovery_domain_error)
+}
+
+async fn worker_global_discovery_lease(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let worker_id = headers
+        .get("x-bluey-jobs-worker-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("jobs-global-discovery-worker");
+    match jobs::lease_due_global_discovery_source(&state.pool, worker_id)
+        .map_err(discovery_domain_error)?
+    {
+        Some(lease) => Ok(Json(lease).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+async fn worker_global_discovery_batch(
+    State(state): State<AppState>,
+    Path(source_id): Path<String>,
+    Json(req): Json<jobs::GlobalIngestionBatchInput>,
+) -> Result<Json<jobs::GlobalIngestionBatchResult>, ApiError> {
+    jobs::ingest_global_discovery_batch(&state.pool, &source_id, &req)
+        .map(Json)
+        .map_err(discovery_domain_error)
+}
+
+async fn worker_global_discovery_complete(
+    State(state): State<AppState>,
+    Path(source_id): Path<String>,
+    Json(req): Json<jobs::GlobalIngestionCompleteInput>,
+) -> Result<Json<jobs::GlobalIngestionRunResult>, ApiError> {
+    jobs::complete_global_discovery_ingestion(&state.pool, &source_id, &req)
+        .map(Json)
+        .map_err(discovery_domain_error)
+}
+
+async fn worker_global_discovery_fail(
+    State(state): State<AppState>,
+    Path(source_id): Path<String>,
+    Json(req): Json<jobs::GlobalIngestionFailureInput>,
+) -> Result<Json<jobs::GlobalIngestionRunResult>, ApiError> {
+    jobs::fail_global_discovery_ingestion(&state.pool, &source_id, &req)
+        .map(Json)
+        .map_err(discovery_domain_error)
 }
 
 #[derive(Debug, Deserialize)]

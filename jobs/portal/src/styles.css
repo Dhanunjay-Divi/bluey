@@ -120,7 +120,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .heading-stat { display: grid; justify-items: end; }
 .heading-stat b { font-size: 24px; }
 .heading-stat span { color: var(--muted); font-size: 11px; }
-.heading-actions { display: flex; gap: 8px; }
+.heading-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .button { min-height: 38px; padding: 0 15px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 1px solid transparent; border-radius: 7px; font-size: 13px; font-weight: 760; white-space: nowrap; }
 .button.primary { background: var(--accent); color: #051219; border-color: color-mix(in srgb, var(--accent) 80%, white); }
 .button.primary:hover { background: color-mix(in srgb, var(--accent) 82%, white); }
@@ -493,11 +493,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .prep-privacy svg { color: var(--green); }
 
 .profile-band { min-height: 104px; padding: 16px 18px; display: grid; grid-template-columns: minmax(280px, 1.2fr) auto minmax(240px, .7fr); align-items: center; gap: 24px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
-.profile-identity { display: flex; align-items: center; gap: 12px; }
-.profile-identity > div { width: 46px; height: 46px; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border)); border-radius: 8px; background: var(--accent-soft); color: var(--accent); font-size: 13px; font-weight: 900; }
+.profile-identity { min-width: 0; display: flex; align-items: center; gap: 12px; }
+.profile-identity > div { width: 46px; height: 46px; flex: 0 0 46px; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border)); border-radius: 8px; background: var(--accent-soft); color: var(--accent); font-size: 13px; font-weight: 900; }
 .profile-identity > span { min-width: 0; display: grid; gap: 3px; }
 .profile-identity h2 { font-size: 16px; }
-.profile-identity p { color: var(--text-soft); font-size: 11px; }
+.profile-identity p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-soft); font-size: 11px; }
 .profile-identity small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
 .profile-health { display: flex; align-items: center; gap: 0; }
 .profile-health span { min-width: 82px; padding: 0 18px; display: grid; border-left: 1px solid var(--border); }
@@ -506,13 +506,16 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .mode-control { justify-self: end; min-width: 245px; }
 .mode-control label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 9px; font-weight: 850; }
 .resume-layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(300px, .65fr); gap: 18px; align-items: start; }
+.resume-layout > *, .resume-sheet .section-heading > div:first-child { min-width: 0; }
 .resume-sheet, .resume-sidebar > section { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.resume-sheet { overflow: hidden; }
 .resume-sheet > .section-heading { min-height: 68px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+.resume-sheet .section-heading h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .section-heading.compact { align-items: center; }
-.resume-paper { width: min(760px, 100%); min-height: 790px; margin: 0 auto; padding: 44px 52px; background: #fff; color: #15191c; font-family: Arial, sans-serif; }
+.resume-paper { width: min(760px, 100%); max-width: 100%; min-width: 0; min-height: 790px; margin: 0 auto; padding: 44px 52px; overflow-wrap: anywhere; background: #fff; color: #15191c; font-family: Arial, sans-serif; }
 .resume-paper header { padding-bottom: 12px; border-bottom: 2px solid #1d2327; text-align: center; }
-.resume-paper header h2 { font-size: 24px; text-transform: uppercase; }
-.resume-paper header p { margin-top: 6px; color: #444; font-size: 9px; }
+.resume-paper header h2 { max-width: 100%; font-size: 24px; overflow-wrap: anywhere; text-transform: uppercase; }
+.resume-paper header p { max-width: 100%; margin-top: 6px; color: #444; font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
 .resume-paper > h3 { margin: 22px 0 5px; font-size: 14px; }
 .resume-paper > p { font-size: 10px; line-height: 1.5; }
 .resume-paper h4 { margin: 18px 0 7px; padding-bottom: 4px; border-bottom: 1px solid #777; font-size: 9px; }
@@ -1066,7 +1069,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .app-main { width: calc(100% - 16px); padding-top: 18px; }
   .view-shell { gap: 14px; }
   .view-heading { min-height: 68px; flex-direction: column; align-items: stretch; }
-  .view-heading .button { align-self: flex-start; }
+  .view-heading .button { align-self: stretch; }
+  .resume-view .heading-actions { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .resume-view .heading-actions .button { min-width: 0; padding-right: 10px; padding-left: 10px; }
   .metric-band { grid-template-columns: 1fr 1fr; }
   .metric-band > div { padding: 12px; }
   .metric-band svg { display: none; }
@@ -1120,8 +1125,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .prep-section-heading { grid-template-columns: 1fr; }
   .prep-section-heading p { grid-column: auto; }
   .form-grid.two { grid-template-columns: 1fr; }
-  .profile-band { padding: 13px; }
-  .resume-paper { min-height: 650px; padding: 28px 24px; }
+  .profile-band { padding: 13px; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .profile-identity, .mode-control { grid-column: 1; }
+  .resume-sheet > .section-heading { min-height: 62px; padding: 12px 13px; }
+  .resume-paper { min-height: 650px; padding: 28px 20px; }
+  .resume-paper header h2 { font-size: 20px; }
   .resume-role { padding-right: 0; }
   .resume-role > small { position: static; display: block; margin-top: 2px; }
   .runner-option { padding: 14px; }

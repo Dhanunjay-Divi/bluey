@@ -507,6 +507,13 @@ pub fn finalize_prepared_application(
     {
         anyhow::bail!("generated resume does not match its candidate evidence revision")
     }
+    validate_prepared_resume_content(
+        &content,
+        &baseline.content,
+        &prepared.profile,
+        &prepared.identity,
+        &posting,
+    )?;
 
     let checksum_source = format!("{}|{}|{}", account_id, posting.id, content);
     let checksum = hex::encode(Sha256::digest(checksum_source.as_bytes()));

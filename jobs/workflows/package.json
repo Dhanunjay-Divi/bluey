@@ -11,6 +11,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/worker.js",
     "start:discovery": "node dist/discovery-worker.js",
+    "start:global-discovery": "node dist/global-discovery-worker.js",
     "start:gateway": "node dist/gateway.js"
   },
   "dependencies": {

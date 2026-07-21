@@ -94,6 +94,8 @@ export function ResumeView({ workspace, resumeVersions, onSave, onCommit, onLoad
       email: profile.email,
       phone: profile.phone,
       location: profile.current_location,
+      linkedin_url: profile.linkedin_url,
+      portfolio_url: profile.portfolio_url,
     },
     headline: profile.headline,
     summary: profile.summary,
@@ -335,5 +337,34 @@ function resumeErrorMessage(error: unknown, fallback: string): string {
 }
 
 function BaseResume({ content }: { content: ResumeContent }) {
-  return <div className="resume-paper"><header><h2>{content.contact?.name}</h2><p>{[content.contact?.email, content.contact?.phone, content.contact?.location].filter(Boolean).join(" · ")}</p></header><h3>{content.headline}</h3><p>{content.summary}</p><h4>SKILLS</h4><p className="skill-line">{content.skills?.join(" · ")}</p><h4>EXPERIENCE</h4>{content.employment?.map((role) => <div className="resume-role" key={role.id}><div><b>{role.title}</b><span>{role.company}</span></div><small>{role.start_date} - {role.current ? "Present" : role.end_date}</small>{role.highlights.map((highlight) => <p key={highlight}>• {highlight}</p>)}</div>)}{content.education && content.education.length > 0 && <><h4>EDUCATION</h4>{content.education.map((entry) => <div className="resume-role" key={entry.id}><div><b>{entry.degree} {entry.field}</b><span>{entry.school}</span></div><small>{entry.end_date}</small></div>)}</>}</div>;
+  const contact = [content.contact?.email, content.contact?.phone, content.contact?.location].filter(Boolean).join(" · ");
+  const links = [content.contact?.linkedin_url, content.contact?.portfolio_url].filter(Boolean).join(" · ");
+  return <div className="resume-paper">
+    <header><h2>{content.contact?.name}</h2><p>{contact}</p>{links && <p>{links}</p>}</header>
+    {content.headline && <h3>{content.headline}</h3>}
+    {content.summary && <><h4>PROFESSIONAL SUMMARY</h4><p>{content.summary}</p></>}
+    {content.skills && content.skills.length > 0 && <><h4>SKILLS</h4><p className="skill-line">{content.skills.join(" · ")}</p></>}
+    {content.employment && content.employment.length > 0 && <><h4>EXPERIENCE</h4>{content.employment.map((role) => <div className="resume-role" key={role.id}>
+      <div><b>{role.title}</b><span>{role.company}</span></div>
+      <small>{[role.location, `${role.start_date} - ${role.current ? "Present" : role.end_date}`].filter(Boolean).join(" · ")}</small>
+      {role.highlights.map((highlight) => <p key={highlight}>• {highlight}</p>)}
+    </div>)}</>}
+    {content.projects && content.projects.length > 0 && <><h4>PROJECTS</h4>{content.projects.map((project) => <div className="resume-role" key={project.id}>
+      <div><b>{project.name}</b>{project.role && <span>{project.role}</span>}</div>
+      {project.url && <small>{project.url}</small>}
+      {project.summary && <p>{project.summary}</p>}
+      {project.technologies.length > 0 && <p><b>Technologies:</b> {project.technologies.join(", ")}</p>}
+    </div>)}</>}
+    {content.education && content.education.length > 0 && <><h4>EDUCATION</h4>{content.education.map((entry) => <div className="resume-role" key={entry.id}>
+      <div><b>{educationLabel(entry.degree, entry.field)}</b><span>{entry.school}</span></div>
+      <small>{[entry.location, [entry.start_date, entry.end_date].filter(Boolean).join(" - ")].filter(Boolean).join(" · ")}</small>
+    </div>)}</>}
+    {content.certifications && content.certifications.length > 0 && <><h4>CERTIFICATIONS</h4><p className="skill-line">{content.certifications.join(" · ")}</p></>}
+  </div>;
+}
+
+function educationLabel(degree: string, field: string): string {
+  if (!degree) return field;
+  if (!field || degree.toLowerCase().includes(field.toLowerCase())) return degree;
+  return `${degree}, ${field}`;
 }

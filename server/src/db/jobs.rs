@@ -43,6 +43,9 @@ const CURATED_DISCOVERY_CATALOG_IDS: [&str; 4] = [
 pub const DISCOVERY_MAX_SOURCES_PER_TRACK: usize = 8;
 pub const DISCOVERY_MAX_SOURCES_PER_ACCOUNT: usize = 24;
 const DISCOVERY_LEASE_MS: i64 = 2 * 60 * 1_000;
+const GLOBAL_DISCOVERY_LEASE_MS: i64 = 10 * 60 * 1_000;
+const GLOBAL_DISCOVERY_MAX_BATCH_ROWS: usize = 1_000;
+const GLOBAL_DISCOVERY_MAX_MATERIALIZED_PER_ACCOUNT: usize = 500;
 const EXECUTION_LEASE_TTL_MS: i64 = 60 * 1_000;
 const LOCAL_RESUME_ACTION_TTL_MS: i64 = 15 * 60 * 1_000;
 type HmacSha256 = Hmac<Sha256>;
@@ -522,6 +525,106 @@ pub struct DiscoveryRunResult {
     pub upserted_count: i64,
     pub closed_count: i64,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalDiscoverySourceInput {
+    pub provider: String,
+    pub source_key: String,
+    pub source_family: String,
+    pub artifact_url: String,
+    pub artifact_sha256: String,
+    pub expected_rows: i64,
+    pub snapshot_at_ms: i64,
+    #[serde(default = "default_discovery_interval_ms")]
+    pub run_interval_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalDiscoverySource {
+    pub id: String,
+    pub provider: String,
+    pub source_key: String,
+    pub config: Value,
+    pub status: String,
+    pub health: String,
+    pub consecutive_failures: i64,
+    pub run_interval_ms: i64,
+    pub next_run_at_ms: i64,
+    pub last_success_at_ms: Option<i64>,
+    pub last_failure_at_ms: Option<i64>,
+    pub last_error_code: Option<String>,
+    pub lease_expires_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalDiscoverySourceLease {
+    pub source: GlobalDiscoverySource,
+    pub lease_token: String,
+    pub replay_key: String,
+    pub scheduled_for_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalIngestionBatchInput {
+    pub lease_token: String,
+    pub replay_key: String,
+    pub scheduled_for_ms: i64,
+    pub batch_index: i64,
+    pub artifact_sha256: String,
+    pub jobs: Vec<DiscoveredJobInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GlobalIngestionBatchResult {
+    pub run_id: String,
+    pub batch_index: i64,
+    pub row_count: i64,
+    pub received_rows: i64,
+    pub received_batches: i64,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalIngestionCompleteInput {
+    pub lease_token: String,
+    pub replay_key: String,
+    pub scheduled_for_ms: i64,
+    pub artifact_sha256: String,
+    pub expected_rows: i64,
+    pub expected_batches: i64,
+    #[serde(default)]
+    pub complete_snapshot: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalIngestionFailureInput {
+    pub lease_token: String,
+    pub replay_key: String,
+    pub scheduled_for_ms: i64,
+    pub artifact_sha256: String,
+    pub error_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GlobalIngestionRunResult {
+    pub run_id: String,
+    pub replay_key: String,
+    pub status: String,
+    pub received_rows: i64,
+    pub received_batches: i64,
+    pub expired_count: i64,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GlobalMaterializationResult {
+    pub considered_count: i64,
+    pub materialized_count: i64,
+    pub refreshed_count: i64,
+    pub skipped_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1322,9 +1425,13 @@ fn parse_json_lossy<T: DeserializeOwned>(raw: &str) -> Option<T> {
 }
 
 include!("jobs/candidate_policy.rs");
+include!("jobs/resume_truth.rs");
 include!("jobs/evidence.rs");
 include!("jobs/profile_postings.rs");
 include!("jobs/discovery.rs");
+include!("jobs/global_discovery.rs");
+include!("jobs/global_discovery_completion.rs");
+include!("jobs/global_materialization.rs");
 include!("jobs/eligibility.rs");
 include!("jobs/applications.rs");
 include!("jobs/customer_data.rs");

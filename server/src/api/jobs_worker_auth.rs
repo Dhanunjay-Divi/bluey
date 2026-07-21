@@ -198,7 +198,7 @@ fn worker_scope(method: &str, path: &str) -> Option<&'static str> {
     }
     if path.contains("/execution-leases/") {
         Some("execution")
-    } else if path.contains("/discovery/") {
+    } else if path.contains("/discovery/") || path.contains("/global-discovery/") {
         Some("discovery")
     } else if path.ends_with("/receipt") {
         Some("receipt")
@@ -216,7 +216,9 @@ fn worker_scope(method: &str, path: &str) -> Option<&'static str> {
 fn signed_body_limit(path: &str) -> usize {
     if path.ends_with("/receipt") {
         RECEIPT_SIGNED_BODY_BYTES
-    } else if path.contains("/discovery/") && path.ends_with("/complete") {
+    } else if (path.contains("/discovery/") || path.contains("/global-discovery/"))
+        && (path.ends_with("/complete") || path.ends_with("/batches"))
+    {
         DISCOVERY_SIGNED_BODY_BYTES
     } else {
         DEFAULT_SIGNED_BODY_BYTES
@@ -305,6 +307,10 @@ mod tests {
             Some("discovery")
         );
         assert_eq!(
+            worker_scope("POST", "/api/jobs/internal/global-discovery/lease"),
+            Some("discovery")
+        );
+        assert_eq!(
             worker_scope("POST", "/api/jobs/internal/execution-leases/run/heartbeat"),
             Some("execution")
         );
@@ -318,6 +324,10 @@ mod tests {
         );
         assert_eq!(
             signed_body_limit("/api/jobs/internal/discovery/source/complete"),
+            DISCOVERY_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit("/api/jobs/internal/global-discovery/source/batches"),
             DISCOVERY_SIGNED_BODY_BYTES
         );
         assert_eq!(

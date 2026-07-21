@@ -269,6 +269,9 @@ pub fn open_postgres_pool(database_url: &str) -> Result<DbPool> {
 
 /// Migrations, run in order. Each one is idempotent (CREATE TABLE IF NOT
 /// EXISTS, etc.) so safe to re-run on every startup.
+const SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX: &str =
+    include_str!("../../../infra/sqlite/server-runtime/035_jobs_global_candidate_index.sql");
+
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
     r#"
@@ -1502,6 +1505,9 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_claim_evidence_revision
         ON jobs_resume_claim_evidence(account_id, evidence_revision_id, created_at_ms DESC);
     "#,
+    // 0035 - shared candidate-feed staging. Large third-party/public candidate
+    // datasets are ingested once and materialized into bounded account views.
+    SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1852,6 +1858,8 @@ const POSTGRES_PROVIDER_USAGE_PROVENANCE: &str =
     include_str!("../../../infra/postgres/server-runtime/010_provider_usage_provenance.sql");
 const POSTGRES_JOBS_CANDIDATE_EVIDENCE: &str =
     include_str!("../../../infra/postgres/server-runtime/011_jobs_candidate_evidence.sql");
+const POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX: &str =
+    include_str!("../../../infra/postgres/server-runtime/012_jobs_global_candidate_index.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -1887,6 +1895,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "011_jobs_candidate_evidence.sql",
         POSTGRES_JOBS_CANDIDATE_EVIDENCE,
+    ),
+    (
+        "012_jobs_global_candidate_index.sql",
+        POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
     ),
 ];
 
@@ -2271,7 +2283,7 @@ mod sqlite_migration_replay_tests {
 mod postgres_migration_tests {
     use super::{
         POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_SCHEMA, POSTGRES_MIGRATIONS,
-        POSTGRES_POST_JOBS_MIGRATIONS,
+        POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
     };
 
     #[test]
@@ -2380,5 +2392,31 @@ mod postgres_migration_tests {
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS jobs_resume_claim_evidence"));
         assert!(sql.contains("UNIQUE(account_id, resume_version_id, claim_id)"));
         assert!(sql.contains("evidence_revision_id TEXT NOT NULL REFERENCES jobs_profile_evidence_revisions(id) ON DELETE RESTRICT"));
+    }
+
+    #[test]
+    fn global_candidate_index_is_a_shared_replay_safe_migration() {
+        let (_, sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == "012_jobs_global_candidate_index.sql")
+            .expect("global candidate index must exist before its worker starts");
+
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_global_discovery_sources",
+            "CREATE TABLE IF NOT EXISTS jobs_global_ingestion_runs",
+            "CREATE TABLE IF NOT EXISTS jobs_global_candidates",
+            "CREATE TABLE IF NOT EXISTS jobs_global_candidate_memberships",
+            "CREATE TABLE IF NOT EXISTS jobs_global_ingestion_batches",
+            "CREATE TABLE IF NOT EXISTS jobs_global_candidate_materializations",
+            "CREATE TABLE IF NOT EXISTS jobs_global_materialization_state",
+            "UNIQUE(source_id, replay_key)",
+            "PRIMARY KEY(run_id, batch_index)",
+        ] {
+            assert!(sql.contains(required), "missing {required}");
+            assert!(
+                SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX.contains(required),
+                "SQLite migration missing {required}"
+            );
+        }
     }
 }

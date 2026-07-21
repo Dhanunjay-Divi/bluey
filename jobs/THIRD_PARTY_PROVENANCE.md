@@ -86,19 +86,22 @@ reviewed as read-only research material. They are not shipped with Bluey.
 
 ## External company-directory feed
 
-Bluey may use the public company directory published by
+Bluey may use the public company directory and manifest metadata published by
 [`kalil0321/ats-scrapers`](https://github.com/kalil0321/ats-scrapers), now
 published as Jobhive, to suggest employer career pages a user can explicitly
-connect to a Career Track. The repository was reviewed at commit
+connect to a Career Track and to plan bounded shared candidate-feed ingestion.
+The repository was reviewed at commit
 `d825caefc8e97c3533efe1707b4daddfeed58706` and exposes an MIT code license
 (copyright Kalil Bouzigues, 2026).
 
-No Jobhive source code, scraper, proxy, anti-bot, or browser-evasion component
-is shipped by Bluey. Bluey reads only the bounded `name,slug,url` company CSVs
-declared by the pinned v1 manifest. Every selected company is converted into a
-Bluey public-ATS source and all job records are fetched from, revalidated
-against, and attributed to the original employer ATS before ranking or use.
-The external directory is therefore a discovery lead, never application truth.
+No Jobhive scraper, proxy, anti-bot, or browser-evasion component is shipped by
+Bluey. Bluey reads the bounded manifest, validates pinned artifact URLs,
+declared checksums, row counts, byte sizes, and schema, and builds bounded work
+for one shared ingestion service. It must not download the multi-gigabyte
+snapshot once per account. Every selected row is still revalidated against and
+attributed to the original employer or ATS before ranking, preparation, or use.
+The external dataset is therefore a candidate lead, never application truth or
+permission to automate a submission.
 
 Manifest reviewed on July 20, 2026:
 `https://storage.stapply.ai/jobhive/v1/manifest.json`.
@@ -112,10 +115,10 @@ Manifest reviewed on July 20, 2026:
 | Workday | 2,604 | `034811ae293215fb60c21145e32d3e5a9ab49caba6080cb6639c02f60731b0b8` |
 
 The MIT software license does not itself establish rights in every directory
-record or upstream job posting. Production use remains subject to source-owner
-review, source attribution, removal handling, and the terms of each original
-ATS. Bluey retains no Jobhive full-job snapshot and never uses this directory
-to bypass access controls.
+record or upstream job posting. Production use remains subject to independent
+dataset-rights review, source attribution, removal handling, and the terms of
+each original source. The manifest reader does not activate production
+ingestion by itself. Bluey never uses the dataset to bypass access controls.
 
 ## Bundled document fonts
 

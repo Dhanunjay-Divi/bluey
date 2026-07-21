@@ -133,11 +133,17 @@ function inferName(lines: string[]): string {
   return (
     lines.find((line) => {
       const value = stripContactParts(line);
+      const words = value.split(/\s+/).filter(Boolean);
+      const isSupportedMononym =
+        words.length === 1 &&
+        /^[A-Z][A-Z'-]{2,39}$/.test(value) &&
+        titleScore(value) === 0 &&
+        !/^(?:contact|curriculum|details|profile|resume|vitae)$/i.test(value);
       return (
-        value.length >= 4 &&
+        value.length >= 3 &&
         value.length <= 60 &&
         /^[A-Za-z][A-Za-z .'-]+$/.test(value) &&
-        value.split(/\s+/).length >= 2 &&
+        (words.length >= 2 || isSupportedMononym) &&
         !looksLikeLocation(value) &&
         !detectSection(value)
       );

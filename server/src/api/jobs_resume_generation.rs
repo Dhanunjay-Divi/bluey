@@ -1,17 +1,20 @@
 //! Evidence-grounded model planning for one job-specific resume version.
 //!
-//! The model may rank verified profile evidence, but it never authors resume
-//! prose. Headline and summary text are composed deterministically from exact
-//! evidence records selected by ID, so short credentials and metrics cannot be
-//! invented or reassigned across facts. Provider provenance and Bluey's
+//! The model may rank verified profile evidence and rewrite employment bullets
+//! that cite exact source bullets from the same role. Immutable profile facts
+//! remain server-owned, and every rewrite passes deterministic claim guards
+//! before it can enter a resume version. Provider provenance and Bluey's
 //! upstream cost stay in the server-side generation ledger; the public packet
-//! receives only the truth policy and generation kind.
+//! receives only the truth policy, generation kind, and claim-source map.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use super::AppState;
 use crate::{
@@ -25,10 +28,12 @@ use crate::{
     pricing, routing,
 };
 
-const GENERATION_SCHEMA_VERSION: i64 = 3;
+const GENERATION_SCHEMA_VERSION: i64 = 4;
 const MAX_RESUME_SKILLS: usize = 16;
 const MAX_HEADLINE_CHARS: usize = 180;
 const MAX_SUMMARY_CHARS: usize = 700;
+const MAX_REWRITE_CHARS: usize = 420;
+const MAX_REWRITE_SOURCES: usize = 4;
 const MAX_MODEL_OUTPUT_TOKENS: u32 = 1_200;
 const MAX_CANDIDATE_PROMPT_BYTES: usize = 48 * 1024;
 const MAX_JOB_PROMPT_BYTES: usize = 32 * 1024;
@@ -65,6 +70,8 @@ struct ResumePlan {
     #[serde(default)]
     employment_highlight_order: Vec<HighlightOrder>,
     #[serde(default)]
+    employment_highlight_rewrites: Vec<HighlightRewrite>,
+    #[serde(default)]
     project_order: Vec<usize>,
 }
 
@@ -73,6 +80,15 @@ struct ResumePlan {
 struct HighlightOrder {
     entry_index: usize,
     highlight_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HighlightRewrite {
+    entry_index: usize,
+    highlight_index: usize,
+    source_evidence_ids: Vec<String>,
+    text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1100,8 +1116,18 @@ fn generation_key(
 }
 
 fn system_prompt() -> &'static str {
-    r#"You rank verified candidate evidence for one job-specific resume.
-Return JSON only. Do not write or rewrite the headline, summary, skills, employers, titles, degrees, dates, metrics, certifications, authorization facts, or locations. Select only exact skill strings, exact evidence IDs, and existing array indexes from the input. Never copy candidate requirements from the job description into candidate evidence.
+    r#"You create an evidence-grounded plan for one job-specific resume.
+Return JSON only. You may rank verified evidence and rewrite employment bullets, but each rewritten bullet must cite one or more exact source highlight evidence IDs from the same employment entry. Preserve the source meaning and strength. Never add or alter employers, titles, clients, degrees, dates, locations, metrics, certifications, tools, skills, authorization facts, scope, ownership, seniority, or outcomes. Never move a fact or metric from one role to another. The job description is relevance context, not candidate evidence.
+
+Do not write or rewrite the headline, summary, skill names, employment metadata, education, project facts, or certifications. Select those only by exact string, evidence ID, or existing array index. Keep every employer, title, location, date, project, degree, and certification in the output; improve relevance through ordering and evidence-grounded bullet wording, never by replacing history.
+
+Optimize the packet for the actual job, in this order:
+1. Prioritize source evidence that directly supports required responsibilities and qualifications in the job description.
+2. Then prioritize preferred qualifications and adjacent responsibilities that are already supported by candidate evidence.
+3. Within each role, put the strongest job-relevant bullets first while retaining every source bullet exactly once.
+4. Order exact candidate skills by job relevance without adding aliases, inferred skills, or requirement keywords that are absent from the candidate profile.
+
+A bullet rewrite should be concise, ATS-readable, and use only facts present in its cited source bullets. Prefer a concrete action followed by supported scope and a supported result. Preserve every number, percentage, duration, team size, scale, client, tool, and outcome exactly as stated in the cited evidence; never estimate, round, combine, or improve a metric. Use active voice, remove filler and repetition, avoid first-person language, and avoid vague claims such as "results-driven", "proven", "expert", or "best-in-class" unless those exact words are candidate evidence. Do not force a metric into a bullet that has none. Use terminology from the job description only when the same skill, tool, responsibility, or outcome is already stated in the cited candidate evidence. Never keyword-stuff, copy requirements into the resume, or imply that packet coverage changes the candidate's underlying profile fit. Omit a rewrite when the existing bullet is already strong, when the change would be cosmetic only, or when the cited evidence cannot safely support a stronger job-aligned sentence.
 
 The output schema is:
 {
@@ -1110,10 +1136,11 @@ The output schema is:
   "skill_order": ["exact candidate skill"],
   "employment_order": [0],
   "employment_highlight_order": [{"entry_index":0,"highlight_indices":[0]}],
+  "employment_highlight_rewrites": [{"entry_index":0,"highlight_index":0,"source_evidence_ids":["employment:0:highlight:0"],"text":"Evidence-grounded rewritten bullet."}],
   "project_order": [0]
 }
 
-Select zero or one headline evidence ID and any non-duplicated summary evidence IDs whose exact text fits the resume. Bluey composes those exact records deterministically; do not return headline or summary text. An empty headline or summary selection preserves Bluey's deterministic baseline instead of deleting it. Include every employment and project index exactly once. Include every highlight index exactly once for every employment entry. Choose at most 16 skills. Prefer the evidence that best answers the job description."#
+Select zero or one headline evidence ID and any non-duplicated summary evidence IDs whose exact text fits the resume. Bluey composes those exact records deterministically; do not return headline or summary text. An empty headline or summary selection preserves Bluey's deterministic baseline instead of deleting it. Include every employment and project index exactly once. Include every highlight index exactly once for every employment entry. Choose at most 16 exact skills. Each rewrite target may appear at most once. Its own original highlight ID must be the first source_evidence_ids item; additional items may cite only other highlights from the same employment entry. Prefer the evidence that best answers the job description."#
 }
 
 fn user_prompt(
@@ -1224,7 +1251,105 @@ fn validate_plan(
         }
         seen_skills.push(skill);
     }
+    let mut rewrite_targets = BTreeSet::new();
+    for rewrite in &plan.employment_highlight_rewrites {
+        let target = (rewrite.entry_index, rewrite.highlight_index);
+        if !rewrite_targets.insert(target) {
+            return Err(anyhow!(
+                "duplicate employment highlight rewrite target: {}:{}",
+                rewrite.entry_index,
+                rewrite.highlight_index
+            ));
+        }
+        validate_highlight_rewrite(profile, catalog, rewrite)?;
+    }
     Ok(plan)
+}
+
+fn validate_highlight_rewrite(
+    profile: &CareerProfile,
+    catalog: &EvidenceCatalog,
+    rewrite: &HighlightRewrite,
+) -> Result<()> {
+    let entry = profile
+        .employment
+        .get(rewrite.entry_index)
+        .ok_or_else(|| anyhow!("employment rewrite entry is out of range"))?;
+    entry
+        .highlights
+        .get(rewrite.highlight_index)
+        .ok_or_else(|| anyhow!("employment rewrite highlight is out of range"))?;
+    let rewritten = rewrite.text.trim();
+    if rewritten.is_empty() {
+        return Err(anyhow!("employment rewrite text is empty"));
+    }
+    if rewritten.chars().count() > MAX_REWRITE_CHARS {
+        return Err(anyhow!("employment rewrite text is too long"));
+    }
+    if rewrite.source_evidence_ids.is_empty()
+        || rewrite.source_evidence_ids.len() > MAX_REWRITE_SOURCES
+    {
+        return Err(anyhow!(
+            "employment rewrite must cite between 1 and {MAX_REWRITE_SOURCES} source bullets"
+        ));
+    }
+
+    let target_id = format!(
+        "employment:{}:highlight:{}",
+        rewrite.entry_index, rewrite.highlight_index
+    );
+    if rewrite.source_evidence_ids.first() != Some(&target_id) {
+        return Err(anyhow!(
+            "employment rewrite must cite its original highlight first"
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut source_text = Vec::new();
+    for source_id in &rewrite.source_evidence_ids {
+        if !seen.insert(source_id) {
+            return Err(anyhow!("duplicate rewrite evidence id: {source_id}"));
+        }
+        let Some((entry_index, highlight_index)) = parse_highlight_evidence_id(source_id) else {
+            return Err(anyhow!(
+                "rewrite evidence must reference an employment highlight: {source_id}"
+            ));
+        };
+        if entry_index != rewrite.entry_index {
+            return Err(anyhow!(
+                "employment rewrite cannot source evidence from another role"
+            ));
+        }
+        if profile
+            .employment
+            .get(entry_index)
+            .and_then(|employment| employment.highlights.get(highlight_index))
+            .is_none()
+        {
+            return Err(anyhow!("rewrite evidence is out of range: {source_id}"));
+        }
+        source_text.push(
+            catalog
+                .values
+                .get(source_id)
+                .ok_or_else(|| anyhow!("unknown rewrite evidence id: {source_id}"))?
+                .as_str(),
+        );
+    }
+    jobs::validate_resume_rewrite_claims(
+        profile,
+        rewrite.entry_index,
+        &source_text.join(" "),
+        rewritten,
+    )
+}
+
+fn parse_highlight_evidence_id(id: &str) -> Option<(usize, usize)> {
+    let parts = id.split(':').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "employment" || parts[2] != "highlight" {
+        return None;
+    }
+    Some((parts[1].parse().ok()?, parts[3].parse().ok()?))
 }
 
 fn normalize_plan(
@@ -1321,6 +1446,8 @@ fn deterministic_fallback(baseline: &ResumeVersion) -> Result<GeneratedResume> {
         "schema_version": GENERATION_SCHEMA_VERSION,
         "truth_guard": "deterministic",
         "claims_added": 0,
+        "claims_rewritten": 0,
+        "rewrite_sources": {},
     });
     content["provenance"]["resume_generation"] = public_provenance.clone();
 
@@ -1381,17 +1508,37 @@ fn materialize(
         .iter()
         .map(|order| (order.entry_index, order))
         .collect();
+    let highlight_rewrites: BTreeMap<(usize, usize), &HighlightRewrite> = plan
+        .employment_highlight_rewrites
+        .iter()
+        .map(|rewrite| ((rewrite.entry_index, rewrite.highlight_index), rewrite))
+        .collect();
+    let mut rewrite_sources = serde_json::Map::new();
     let mut employment = Vec::with_capacity(profile.employment.len());
-    for entry_index in &plan.employment_order {
+    for (output_entry_index, entry_index) in plan.employment_order.iter().enumerate() {
         let mut entry = profile.employment[*entry_index].clone();
+        let original_highlights = entry.highlights.clone();
         let order = highlight_orders
             .get(entry_index)
             .ok_or_else(|| anyhow!("missing employment highlight order"))?;
         entry.highlights = order
             .highlight_indices
             .iter()
-            .map(|index| entry.highlights[*index].clone())
-            .collect();
+            .enumerate()
+            .map(|(output_highlight_index, highlight_index)| {
+                if let Some(rewrite) = highlight_rewrites.get(&(*entry_index, *highlight_index)) {
+                    rewrite_sources.insert(
+                        format!(
+                            "/employment/{output_entry_index}/highlights/{output_highlight_index}"
+                        ),
+                        json!(rewrite.source_evidence_ids),
+                    );
+                    rewrite.text.trim().to_string()
+                } else {
+                    original_highlights[*highlight_index].clone()
+                }
+            })
+            .collect::<Vec<_>>();
         employment.push(entry);
     }
     content["employment"] = serde_json::to_value(&employment)?;
@@ -1407,6 +1554,8 @@ fn materialize(
         "schema_version": GENERATION_SCHEMA_VERSION,
         "truth_guard": if kind == "model" { "passed" } else { "deterministic" },
         "claims_added": 0,
+        "claims_rewritten": rewrite_sources.len(),
+        "rewrite_sources": rewrite_sources,
     });
     content["provenance"]["resume_generation"] = public_provenance.clone();
     let diff = build_diff(
@@ -1473,6 +1622,25 @@ fn build_diff(
     if !experience_changes.is_empty() {
         diff.insert("experience_emphasis".to_string(), json!(experience_changes));
     }
+    let experience_rewrites = plan
+        .employment_highlight_rewrites
+        .iter()
+        .map(|rewrite| {
+            let entry = &profile.employment[rewrite.entry_index];
+            json!({
+                "role": if entry.company.trim().is_empty() { entry.title.clone() } else { format!("{} at {}", entry.title, entry.company) },
+                "before": entry.highlights[rewrite.highlight_index],
+                "after": rewrite.text.trim(),
+                "source_evidence_ids": rewrite.source_evidence_ids,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !experience_rewrites.is_empty() {
+        diff.insert(
+            "experience_rewrites".to_string(),
+            json!(experience_rewrites),
+        );
+    }
     let before_projects = profile
         .projects
         .iter()
@@ -1491,7 +1659,7 @@ fn build_diff(
     diff.insert(
         "evidence_policy".to_string(),
         json!(if kind == "model" {
-            "A managed model ranked verified profile evidence. Bluey composed exact evidence records without model-authored facts."
+            "A managed model ranked verified profile evidence and rewrote selected bullets. Every rewritten bullet cites same-role source evidence and passed Bluey's claim guards."
         } else {
             "Verified profile facts only; Bluey used deterministic relevance ranking because model generation was unavailable."
         }),

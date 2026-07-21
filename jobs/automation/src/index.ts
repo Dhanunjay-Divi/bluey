@@ -5,6 +5,8 @@ export * from "./contracts.js";
 export * from "./curated-feeds.js";
 export * from "./form-intelligence.js";
 export * from "./interview-prep.js";
+export * from "./jobhive-manifest.js";
+export * from "./jobhive-artifact.js";
 export * from "./packet-guards.js";
 export * from "./policy.js";
 export * from "./providers/index.js";

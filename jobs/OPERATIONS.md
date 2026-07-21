@@ -7,9 +7,10 @@ Run these as separate deployable services:
 1. `bluey-jobs-api` on the Jobs API origin.
 2. `@bluey/jobs-workflows` worker on the `bluey-jobs-applications` Temporal task queue.
 3. `@bluey/jobs-workflows` discovery worker via `npm run start:discovery --workspace @bluey/jobs-workflows`.
-4. `@bluey/jobs-workflows` gateway for authenticated workflow start and resume requests.
-5. `@bluey/jobs-runner` in a Chromium-capable container pool.
-6. The static Jobs portal under `/jobs`.
+4. `@bluey/jobs-workflows` global candidate-feed worker via `npm run start:global-discovery --workspace @bluey/jobs-workflows`.
+5. `@bluey/jobs-workflows` gateway for authenticated workflow start and resume requests.
+6. `@bluey/jobs-runner` in a Chromium-capable container pool.
+7. The static Jobs portal under `/jobs`.
 
 On a Bluey production host, install `ops/bluey-jobs.env.example` as
 `/etc/bluey-api/bluey-jobs.env`, replace every placeholder with an independent
@@ -52,6 +53,13 @@ BLUEY_JOBS_WORKFLOW_TOKEN=<random secret>
 BLUEY_JOBS_WORKER_TOKEN=<random secret>
 BLUEY_JOBS_DISCOVERY_WORKER_ID=<stable deployment replica ID>
 BLUEY_JOBS_DISCOVERY_POLL_MS=5000
+BLUEY_JOBS_GLOBAL_DISCOVERY_WORKER_ID=<stable global-ingestion replica ID>
+BLUEY_JOBS_GLOBAL_DISCOVERY_POLL_MS=5000
+BLUEY_JOBS_GLOBAL_DISCOVERY_RUN_INTERVAL_MS=21600000
+BLUEY_JOBS_GLOBAL_DISCOVERY_MANIFEST_REFRESH_MS=900000
+BLUEY_JOBS_GLOBAL_DISCOVERY_ARTIFACT_TIMEOUT_MS=1800000
+BLUEY_JOBS_GLOBAL_DISCOVERY_MAX_ARTIFACT_BYTES=4294967296
+BLUEY_JOBS_GLOBAL_DISCOVERY_STAGING_DIR=/var/lib/bluey-jobs-global-discovery
 BLUEY_JOBS_RUNNER_ORIGIN=https://jobs-runner.internal
 BLUEY_JOBS_RUNNER_TOKEN=<random secret>
 BLUEY_JOBS_RUNNER_ID=<stable browser-pool replica ID>
@@ -91,6 +99,37 @@ server-configured, host-pinned Greenhouse, Lever, Ashby, SmartRecruiters, and
 Workday sources, sends complete snapshots, and reports bounded failure codes.
 Networked production workers must use HTTPS. Plaintext is accepted only for a
 co-located worker connecting to a loopback-only Jobs listener.
+
+Run the shared candidate-feed worker separately with
+`node workflows/dist/global-discovery-worker.js`, or install
+`ops/bluey-jobs-global-discovery.service.example`. Its root-owned override file
+at `/etc/bluey-api/bluey-jobs-global-discovery.env` should contain only the
+loopback API origin, stable worker ID, and bounded timing overrides. The shared
+Jobs environment supplies the signing key. The worker reads a pinned HTTPS
+manifest, downloads each immutable CSV to private `0700` staging, verifies its
+exact byte length and SHA-256, streams bounded batches to the shared candidate
+index, and removes the staged artifact after the run. A completed snapshot is
+accepted only when the server observes the exact manifest row and batch counts.
+
+The artifact ceiling is 4 GiB because current Workday, EURES,
+Bundesagentur, and SuccessFactors snapshots exceed the former 1 GiB ceiling.
+Artifacts are streamed to disk and then parsed as bounded batches; they are
+never loaded into memory as one buffer. Provision at least 8 GiB of free space
+in the private staging filesystem so the largest current snapshot, its partial
+download, and normal filesystem overhead fit safely. Alert below that headroom,
+and keep the service stopped rather than silently omitting a source family.
+The 30-minute download timeout and 4 GiB byte ceiling are explicit environment
+controls, not permission to follow redirects to an unpinned host or accept an
+artifact whose declared size, digest, schema, or row count differs from the
+signed manifest.
+
+These shared-feed records are candidate leads, not employer application truth.
+Every account projection remains Review first, and the original employer URL
+must pass a fresh availability and ATS-capability check before packet creation,
+queueing, or submission. Unknown portals, public lists, LinkedIn, Indeed,
+ZipRecruiter, Dice, and similar aggregators never gain submission authority from
+feed inclusion. Disable the systemd unit to stop shared-feed refresh without
+affecting direct account imports or the account-specific ATS discovery worker.
 
 ### Discovery source lifecycle
 

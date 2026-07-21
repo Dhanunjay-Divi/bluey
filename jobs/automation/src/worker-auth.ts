@@ -68,7 +68,7 @@ export function createJobsWorkerAuthHeaders(input: JobsWorkerAuthInput): Record<
 export function jobsWorkerScope(method: string, path: string): JobsWorkerScope | undefined {
   if (method.toUpperCase() !== "POST" || !path.startsWith("/api/jobs/internal/")) return undefined;
   if (path.includes("/execution-leases/")) return "execution";
-  if (path.includes("/discovery/")) return "discovery";
+  if (path.includes("/discovery/") || path.includes("/global-discovery/")) return "discovery";
   if (path.endsWith("/receipt")) return "receipt";
   if (path.endsWith("/interventions")) return "intervention";
   if (path.endsWith("/state")) return "application-state";

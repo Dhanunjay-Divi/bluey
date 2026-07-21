@@ -41,6 +41,7 @@ mod tests {
                 entry_index: 0,
                 highlight_indices: vec![1, 0],
             }],
+            employment_highlight_rewrites: Vec::new(),
             project_order: vec![0],
         }
     }
@@ -261,6 +262,123 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_a_bullet_with_same_role_source_evidence_and_real_diff() {
+        let profile = profile();
+        let baseline = ResumeVersion {
+            id: "resume-1".into(),
+            job_id: "job-1".into(),
+            version_no: 1,
+            mode: "factual".into(),
+            content: json!({"provenance": {}}),
+            diff: json!({}),
+            claim_ids: Vec::new(),
+            checksum: "checksum".into(),
+            created_at_ms: 1,
+        };
+        let mut plan = valid_plan();
+        plan.employment_highlight_rewrites = vec![HighlightRewrite {
+            entry_index: 0,
+            highlight_index: 0,
+            source_evidence_ids: vec!["employment:0:highlight:0".into()],
+            text: "Engineered reliable distributed systems.".into(),
+        }];
+
+        let generated = materialize(&profile, &baseline, &plan, "model").unwrap();
+        assert_eq!(
+            generated.content["employment"][0]["company"],
+            "Example Health"
+        );
+        assert_eq!(
+            generated.content["employment"][0]["title"],
+            "Software Engineer"
+        );
+        assert_eq!(
+            generated.content["employment"][0]["highlights"][1],
+            "Engineered reliable distributed systems."
+        );
+        assert_eq!(
+            generated.content["provenance"]["resume_generation"]["rewrite_sources"]
+                ["/employment/0/highlights/1"],
+            json!(["employment:0:highlight:0"])
+        );
+        assert_eq!(
+            generated.diff["experience_rewrites"][0]["before"],
+            "Built reliable distributed systems."
+        );
+        assert_eq!(
+            generated.diff["experience_rewrites"][0]["after"],
+            "Engineered reliable distributed systems."
+        );
+    }
+
+    #[test]
+    fn rejects_rewrite_with_new_metric_or_unrelated_skill() {
+        let profile = profile();
+        let catalog = EvidenceCatalog::from_profile(&profile);
+        let mut new_metric = valid_plan();
+        new_metric.employment_highlight_rewrites = vec![HighlightRewrite {
+            entry_index: 0,
+            highlight_index: 0,
+            source_evidence_ids: vec!["employment:0:highlight:0".into()],
+            text: "Engineered reliable distributed systems with 99 percent uptime.".into(),
+        }];
+        assert!(validate_plan(&profile, &catalog, new_metric)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported protected claims"));
+
+        let mut unrelated_skill = valid_plan();
+        unrelated_skill.employment_highlight_rewrites = vec![HighlightRewrite {
+            entry_index: 0,
+            highlight_index: 0,
+            source_evidence_ids: vec!["employment:0:highlight:0".into()],
+            text: "Engineered reliable React distributed systems.".into(),
+        }];
+        assert!(validate_plan(&profile, &catalog, unrelated_skill).is_err());
+    }
+
+    #[test]
+    fn rejects_cross_role_sources_and_unsupported_claim_strength() {
+        let mut profile = profile();
+        profile.employment[0].highlights[0] =
+            "Supported reliable distributed systems delivery.".into();
+        profile.employment.push(EmploymentEntry {
+            id: "work-2".into(),
+            company: "Other Company".into(),
+            title: "Platform Engineer".into(),
+            highlights: vec!["Led a PostgreSQL migration.".into()],
+            ..Default::default()
+        });
+        let catalog = EvidenceCatalog::from_profile(&profile);
+        let mut plan = valid_plan();
+        plan.employment_order = vec![0, 1];
+        plan.employment_highlight_order.push(HighlightOrder {
+            entry_index: 1,
+            highlight_indices: vec![0],
+        });
+        plan.employment_highlight_rewrites = vec![HighlightRewrite {
+            entry_index: 0,
+            highlight_index: 0,
+            source_evidence_ids: vec![
+                "employment:0:highlight:0".into(),
+                "employment:1:highlight:0".into(),
+            ],
+            text: "Led reliable distributed systems delivery.".into(),
+        }];
+        assert!(validate_plan(&profile, &catalog, plan.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("another role"));
+
+        plan.employment_highlight_rewrites[0].source_evidence_ids =
+            vec!["employment:0:highlight:0".into()];
+        assert!(validate_plan(&profile, &catalog, plan)
+            .unwrap_err()
+            .to_string()
+            .contains("strengthened"));
+    }
+
+    #[test]
     fn prompt_caps_reject_oversized_profile_and_job_text() {
         let mut oversized_profile = profile();
         oversized_profile.employment[0].highlights = vec!["x".repeat(MAX_CANDIDATE_PROMPT_BYTES)];
@@ -273,6 +391,22 @@ mod tests {
         oversized_posting.description = "x".repeat(MAX_JOB_PROMPT_BYTES);
         let catalog = EvidenceCatalog::from_profile(&profile);
         assert!(user_prompt(&profile, &oversized_posting, &catalog).is_err());
+    }
+
+    #[test]
+    fn prompt_optimizes_supported_packet_coverage_without_inflating_profile_fit() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("same skill, tool, responsibility, or outcome"));
+        assert!(prompt.contains("Never keyword-stuff"));
+        assert!(prompt.contains("underlying profile fit"));
+        assert!(prompt.contains("cited candidate evidence"));
+        assert!(prompt.contains("required responsibilities and qualifications"));
+        assert!(prompt.contains("preferred qualifications"));
+        assert!(prompt.contains("retaining every source bullet exactly once"));
+        assert!(prompt.contains("Preserve every number, percentage, duration"));
+        assert!(prompt.contains("Do not force a metric into a bullet that has none"));
+        assert!(prompt.contains("Keep every employer, title, location, date"));
+        assert!(prompt.contains("when the change would be cosmetic only"));
     }
 
     #[test]
