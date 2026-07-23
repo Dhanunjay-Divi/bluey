@@ -6,9 +6,11 @@ import {
   JOB_IMPORT_ACTION_LABEL,
   JOB_IMPORT_DESCRIPTION,
   JOB_IMPORT_FALLBACK_LABEL,
+  autoSubmitUnavailableReason,
   discoverySourceAction,
   discoverySourceState,
   isCandidateLead,
+  isMatchEligibleForDefaultView,
   isMatchVisibleByState,
   isRecentPosting,
   postingAgeLabel,
@@ -23,6 +25,42 @@ function source(status: DiscoverySource["status"], health: DiscoverySourceHealth
     status,
     health,
     last_success_at_ms: null,
+  };
+}
+
+function match(canPrepare: boolean, capability: NonNullable<JobPosting["eligibility"]>["capability"] = "beta_review"): JobPosting {
+  return {
+    id: "job-1",
+    canonical_key: "job-1",
+    source: "greenhouse",
+    external_id: "1",
+    company: "Acme",
+    title: "Software Engineer",
+    location: "Austin, TX",
+    workplace: "On-site",
+    canonical_url: "https://boards.greenhouse.io/acme/jobs/1",
+    description: "",
+    compensation: "",
+    track_id: "track-1",
+    match_score: 88,
+    matched_reasons: [],
+    missing_requirements: [],
+    last_verified_at_ms: Date.now(),
+    availability_status: "active",
+    status: "matched",
+    created_at_ms: 1,
+    updated_at_ms: 1,
+    eligibility: {
+      capability,
+      can_prepare: canPrepare,
+      can_auto_submit: false,
+      can_queue_local: false,
+      can_queue_cloud: false,
+      hard_failures: canPrepare ? [] : [{ code: "location", message: "Austin is outside your selected locations." }],
+      review_reasons: canPrepare ? [{ code: "beta", message: "Review first is required." }] : [],
+      passed_checks: [],
+      evaluated_at_ms: 1,
+    },
   };
 }
 
@@ -134,5 +172,29 @@ describe("large match sets", () => {
     expect(isMatchVisibleByState(skipped, 14, false, false)).toBe(false);
     expect(isMatchVisibleByState(active, 14, true, false)).toBe(false);
     expect(isMatchVisibleByState(active, 14, true, true)).toBe(true);
+  });
+});
+
+describe("Career Track filtering and submission truth", () => {
+  it("shows eligible jobs and hides hard-filter failures from the default match view", () => {
+    expect(isMatchEligibleForDefaultView(match(true))).toBe(true);
+    expect(isMatchEligibleForDefaultView(match(false))).toBe(false);
+  });
+
+  it("keeps managed-feed leads visible until original-source verification runs", () => {
+    const lead = {
+      ...match(false),
+      source: "curated_feed:feed-simplify-new-grad",
+      availability_status: "unknown",
+      last_verified_at_ms: undefined,
+    };
+
+    expect(isMatchEligibleForDefaultView(lead)).toBe(true);
+  });
+
+  it("explains why beta, handoff, and hard-filtered jobs cannot Auto-submit", () => {
+    expect(autoSubmitUnavailableReason(match(true, "beta_review"))).toContain("beta");
+    expect(autoSubmitUnavailableReason(match(true, "handoff"))).toContain("user-controlled handoff");
+    expect(autoSubmitUnavailableReason(match(false))).toContain("Career Track rules");
   });
 });

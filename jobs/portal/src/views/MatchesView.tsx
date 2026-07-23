@@ -72,6 +72,7 @@ export function MatchesView({
   const [minimumScore, setMinimumScore] = useState(0);
   const [workplace, setWorkplace] = useState("all");
   const [onlyUnprepared, setOnlyUnprepared] = useState(false);
+  const [showOutsideTrack, setShowOutsideTrack] = useState(false);
   const [density, setDensity] = useState<"comfortable" | "compact">("comfortable");
   const [showPassed, setShowPassed] = useState(false);
   const [passTarget, setPassTarget] = useState<JobPosting | null>(null);
@@ -91,7 +92,7 @@ export function MatchesView({
     [workspace.matches, workspace.candidate_events],
   );
 
-  const activeMatches = useMemo(
+  const stateMatches = useMemo(
     () => workspace.matches.filter((job) => isMatchVisibleByState(
       job,
       workspace.preferences.max_posting_age_days,
@@ -99,6 +100,17 @@ export function MatchesView({
       showPassed,
     )),
     [workspace.matches, workspace.preferences.max_posting_age_days, passedJobIds, showPassed],
+  );
+  const outsideCurrentTrackCount = useMemo(
+    () => stateMatches.filter((job) => (
+      (activeTrack === "all" || job.track_id === activeTrack)
+      && !isMatchEligibleForDefaultView(job)
+    )).length,
+    [activeTrack, stateMatches],
+  );
+  const activeMatches = useMemo(
+    () => showOutsideTrack ? stateMatches : stateMatches.filter(isMatchEligibleForDefaultView),
+    [showOutsideTrack, stateMatches],
   );
 
   const filtered = useMemo(() => {
@@ -113,13 +125,23 @@ export function MatchesView({
     });
   }, [activeMatches, activeTrack, query, minimumScore, workplace, onlyUnprepared, preparedJobIds]);
   const visibleJobs = visibleMatches(filtered, visibleCount);
+  const hasOnlyExcludedMatches = !showOutsideTrack
+    && outsideCurrentTrackCount > 0
+    && filtered.length === 0
+    && !query
+    && minimumScore === 0
+    && workplace === "all"
+    && !onlyUnprepared;
 
   useEffect(() => {
     setVisibleCount(MATCH_PAGE_SIZE);
-  }, [activeTrack, query, minimumScore, workplace, onlyUnprepared, showPassed]);
+  }, [activeTrack, query, minimumScore, workplace, onlyUnprepared, showOutsideTrack, showPassed]);
 
   const averageScore = filtered.length ? Math.round(filtered.reduce((sum, item) => sum + item.match_score, 0) / filtered.length) : 0;
-  const activeFilterCount = Number(minimumScore > 0) + Number(workplace !== "all") + Number(onlyUnprepared);
+  const activeFilterCount = Number(minimumScore > 0)
+    + Number(workplace !== "all")
+    + Number(onlyUnprepared)
+    + Number(showOutsideTrack);
   const activeTracks = workspace.tracks.filter((track) => track.active);
   const selectedTrack = activeTrack === "all"
     ? activeTracks[0]
@@ -261,12 +283,24 @@ export function MatchesView({
             <div className="job-main"><strong>{job.title}</strong><span>{job.company} · {postingAgeLabel(job)}</span></div>
             <div className={`score score-${Math.floor(job.match_score / 10)}`}><b>{job.match_score}</b><span>%</span></div>
             <div className="job-location"><MapPin size={14} /><span>{job.location}<small>{job.workplace}</small></span></div>
-            <div className={`status-pill ${isCandidateLead(job) ? "candidate-lead" : `capability-${jobEligibility(job).capability}`}`}>{matchStatusLabel(job)}</div>
+            <div className={`status-pill ${matchStatusClass(job)}`}>{matchStatusLabel(job)}</div>
             <ChevronRight size={18} />
           </button>
         ))}
         {visibleJobs.length < filtered.length && <div className="job-list-more"><span>Showing {visibleJobs.length} of {filtered.length} relevant jobs</span><button className="button secondary compact" onClick={() => setVisibleCount((current) => current + MATCH_PAGE_SIZE)}>Show {Math.min(MATCH_PAGE_SIZE, filtered.length - visibleJobs.length)} more</button></div>}
-        {filtered.length === 0 && <div className="empty-state match-empty-state"><Search /><h3>{selectedTrack ? "Start with a job link" : "Create a Career Track first"}</h3><p>{selectedTrack ? "Paste a recent opening. Bluey verifies it, checks your hard filters, ranks the fit, and builds the application kit for review." : "A Career Track keeps each role, location, resume, and application stream separate."}</p><div className="empty-actions">{selectedTrack && <button className="button primary" onClick={() => setAddOpen(true)}><Link2 size={16} />Add job link</button>}<Link className="button secondary" to={`../settings${window.location.search}#tracks`}>{selectedTrack ? "Adjust Career Track" : "Create Career Track"}</Link></div><ol className="match-activation-flow"><li><b>1</b><span>Verify posting</span></li><li><b>2</b><span>Check hard filters</span></li><li><b>3</b><span>Rank the fit</span></li><li><b>4</b><span>Review application kit</span></li></ol></div>}
+        {filtered.length === 0 && (hasOnlyExcludedMatches ? (
+          <div className="empty-state match-empty-state">
+            <Filter />
+            <h3>{outsideCurrentTrackCount} job{outsideCurrentTrackCount === 1 ? "" : "s"} outside this Career Track</h3>
+            <p>Bluey excluded these jobs using your location, job type, experience, authorization, and other saved rules.</p>
+            <div className="empty-actions">
+              <button className="button primary" onClick={() => setShowOutsideTrack(true)}>Review excluded jobs</button>
+              <Link className="button secondary" to={`../settings${window.location.search}#tracks`}>Adjust Career Track</Link>
+            </div>
+          </div>
+        ) : (
+          <div className="empty-state match-empty-state"><Search /><h3>{selectedTrack ? "Start with a job link" : "Create a Career Track first"}</h3><p>{selectedTrack ? "Paste a recent opening. Bluey verifies it, checks your hard filters, ranks the fit, and builds the application kit for review." : "A Career Track keeps each role, location, resume, and application stream separate."}</p><div className="empty-actions">{selectedTrack && <button className="button primary" onClick={() => setAddOpen(true)}><Link2 size={16} />Add job link</button>}<Link className="button secondary" to={`../settings${window.location.search}#tracks`}>{selectedTrack ? "Adjust Career Track" : "Create Career Track"}</Link></div><ol className="match-activation-flow"><li><b>1</b><span>Verify posting</span></li><li><b>2</b><span>Check hard filters</span></li><li><b>3</b><span>Rank the fit</span></li><li><b>4</b><span>Review application kit</span></li></ol></div>
+        ))}
       </section>
 
       <Dialog open={Boolean(selected)} title={selected ? `${selected.title} at ${selected.company}` : "Job match"} description={selected?.location} onClose={() => { setSelected(null); setActionError(""); }} size="large">
@@ -283,7 +317,16 @@ export function MatchesView({
             </section>
             <div className="detail-columns">
               <section><h3>Why it matched</h3><ul className="check-list">{selected.matched_reasons.map((reason) => <li key={reason}><Check size={15} />{reason}</li>)}</ul>{selected.missing_requirements.length > 0 && <><h3>Check before applying</h3><ul className="watch-list">{selected.missing_requirements.map((reason) => <li key={reason}>{reason}</li>)}</ul></>}</section>
-              <section><h3>Tailored application</h3><p>Bluey creates a new resume version for this job. It will never reuse this version for another role.</p><label>Resume mode</label><div className="segmented"><button className={mode === "factual" ? "active" : ""} onClick={() => setMode("factual")}>Factual</button><button className={mode === "enhance" ? "active" : ""} onClick={() => setMode("enhance")}>Enhance</button></div><label>After preparation</label><div className="segmented"><button className={submissionMode === "review_first" || !jobEligibility(selected).can_auto_submit ? "active" : ""} onClick={() => setSubmissionMode("review_first")}>Review first</button><button disabled={!jobEligibility(selected).can_auto_submit} title={!jobEligibility(selected).can_auto_submit ? "Auto-submit becomes available only after every server rule and site capability passes." : undefined} className={submissionMode === "auto_submit" && jobEligibility(selected).can_auto_submit ? "active" : ""} onClick={() => setSubmissionMode("auto_submit")}>Auto-submit</button></div></section>
+              <section>
+                <h3>Tailored application</h3>
+                <p>Prepare automatically builds a new resume for this job from your verified experience, then shows every change before anything is submitted.</p>
+                <label>Resume mode</label>
+                <div className="segmented"><button className={mode === "factual" ? "active" : ""} onClick={() => setMode("factual")}>Factual</button><button className={mode === "enhance" ? "active" : ""} onClick={() => setMode("enhance")}>Enhance</button></div>
+                <p className="selection-help">{mode === "enhance" ? "Enhance strengthens wording and emphasizes JD-relevant skills already supported by your profile. It never invents employers, dates, credentials, or experience." : "Factual keeps your verified wording and moves the strongest relevant evidence first."}</p>
+                <label>After preparation</label>
+                <div className="segmented"><button className={submissionMode === "review_first" || !jobEligibility(selected).can_auto_submit ? "active" : ""} onClick={() => setSubmissionMode("review_first")}>Review first</button><button disabled={!jobEligibility(selected).can_auto_submit} title={autoSubmitUnavailableReason(selected)} className={submissionMode === "auto_submit" && jobEligibility(selected).can_auto_submit ? "active" : ""} onClick={() => setSubmissionMode("auto_submit")}>Auto-submit</button></div>
+                {!jobEligibility(selected).can_auto_submit && <p className="selection-help warning-copy">{autoSubmitUnavailableReason(selected)}</p>}
+              </section>
             </div>
             {actionError && <div className="inline-error" role="alert">{actionError}</div>}
             <div className="dialog-actions spread"><p>{isCandidateLead(selected) ? "Verification does not use an application allowance." : jobEligibility(selected).capability === "handoff" || jobEligibility(selected).capability === "unknown_review" ? "Bluey prepares the application kit for your review; this site stays user-controlled." : "This application uses one monthly allowance when approved, downloaded, or queued."}</p><div>{passedJobIds.has(selected.id) ? <button className="button secondary" disabled={feedbackBusy} onClick={() => void restoreMatch(selected)}><Undo2 size={16} />Restore</button> : <button className="button secondary" onClick={() => { setPassTarget(selected); setSelected(null); setActionError(""); }}>Pass</button>}<button className="button primary" disabled={busy || (!isCandidateLead(selected) && !jobEligibility(selected).can_prepare) || passedJobIds.has(selected.id)} onClick={() => void prepare()}>{busy ? "Checking..." : isCandidateLead(selected) ? "Verify and prepare" : jobEligibility(selected).can_prepare ? "Prepare application" : "Blocked by your rules"}<ArrowRight size={17} /></button></div></div>
@@ -312,8 +355,8 @@ export function MatchesView({
         onConnect={onConnectDiscoverySource}
       />
       <Dialog open={filterOpen} title="Filter matches" description="Narrow this view without changing your Career Track." onClose={() => setFilterOpen(false)}>
-        <div className="dialog-form"><label><span>Minimum match score</span><div className="range-field"><input type="range" min="0" max="95" step="5" value={minimumScore} onChange={(event) => setMinimumScore(Number(event.target.value))} /><b>{minimumScore || "Any"}{minimumScore ? "%" : ""}</b></div></label><label><span>Workplace</span><select value={workplace} onChange={(event) => setWorkplace(event.target.value)}><option value="all">Any workplace</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on-site">On-site</option></select></label><label className="setting-line simple"><div><b>Only jobs not prepared</b><span>Hide applications you already prepared.</span></div><button type="button" className={`toggle ${onlyUnprepared ? "on" : ""}`} role="switch" aria-checked={onlyUnprepared} onClick={() => setOnlyUnprepared((current) => !current)}><span /></button></label></div>
-        <div className="dialog-actions"><button className="button secondary" onClick={() => { setMinimumScore(0); setWorkplace("all"); setOnlyUnprepared(false); }}>Reset</button><button className="button primary" onClick={() => setFilterOpen(false)}>Show {filtered.length} match{filtered.length === 1 ? "" : "es"}</button></div>
+        <div className="dialog-form"><label><span>Minimum match score</span><div className="range-field"><input type="range" min="0" max="95" step="5" value={minimumScore} onChange={(event) => setMinimumScore(Number(event.target.value))} /><b>{minimumScore || "Any"}{minimumScore ? "%" : ""}</b></div></label><label><span>Workplace</span><select value={workplace} onChange={(event) => setWorkplace(event.target.value)}><option value="all">Any workplace</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on-site">On-site</option></select></label><label className="setting-line simple"><div><b>Only jobs not prepared</b><span>Hide applications you already prepared.</span></div><button type="button" className={`toggle ${onlyUnprepared ? "on" : ""}`} role="switch" aria-checked={onlyUnprepared} onClick={() => setOnlyUnprepared((current) => !current)}><span /></button></label><label className="setting-line simple"><div><b>Show jobs outside my rules</b><span>{outsideCurrentTrackCount ? `Review ${outsideCurrentTrackCount} job${outsideCurrentTrackCount === 1 ? "" : "s"} excluded by location, job type, experience, authorization, or other Career Track rules.` : "No jobs are currently excluded by your Career Track rules."}</span></div><button type="button" className={`toggle ${showOutsideTrack ? "on" : ""}`} role="switch" aria-checked={showOutsideTrack} onClick={() => setShowOutsideTrack((current) => !current)}><span /></button></label></div>
+        <div className="dialog-actions"><button className="button secondary" onClick={() => { setMinimumScore(0); setWorkplace("all"); setOnlyUnprepared(false); setShowOutsideTrack(false); }}>Reset</button><button className="button primary" onClick={() => setFilterOpen(false)}>Show {filtered.length} match{filtered.length === 1 ? "" : "es"}</button></div>
       </Dialog>
     </div>
   );
@@ -420,13 +463,26 @@ function jobEligibility(job: JobPosting) {
   };
 }
 
+export function isMatchEligibleForDefaultView(job: JobPosting): boolean {
+  if (isCandidateLead(job)) return true;
+  return job.eligibility ? job.eligibility.can_prepare : true;
+}
+
 export function isCandidateLead(job: Pick<JobPosting, "source" | "availability_status" | "last_verified_at_ms">): boolean {
   return job.source.startsWith("curated_feed:")
     || (job.availability_status === "unknown" && !job.last_verified_at_ms);
 }
 
 function matchStatusLabel(job: JobPosting): string {
-  return isCandidateLead(job) ? "Lead · Verify first" : capabilityLabel(jobEligibility(job).capability);
+  if (isCandidateLead(job)) return "Lead · Verify first";
+  if (!jobEligibility(job).can_prepare) return "Outside your rules";
+  return capabilityLabel(jobEligibility(job).capability);
+}
+
+function matchStatusClass(job: JobPosting): string {
+  if (isCandidateLead(job)) return "candidate-lead";
+  if (!jobEligibility(job).can_prepare) return "capability-blocked";
+  return `capability-${jobEligibility(job).capability}`;
 }
 
 function capabilityLabel(capability: ReturnType<typeof jobEligibility>["capability"]): string {
@@ -443,6 +499,17 @@ function capabilityDescription(capability: ReturnType<typeof jobEligibility>["ca
   if (capability === "handoff") return "Bluey prepares the exact resume and answers, then you finish on the job site.";
   if (capability === "blocked") return "Bluey will not prepare or open this listing.";
   return "Bluey can prepare a kit, but this application system is not certified for runner submission.";
+}
+
+export function autoSubmitUnavailableReason(job: JobPosting): string | undefined {
+  const eligibility = jobEligibility(job);
+  if (eligibility.can_auto_submit) return undefined;
+  if (eligibility.hard_failures.length > 0) return "Resolve the Career Track rules above before Auto-submit can be considered.";
+  if (eligibility.capability === "beta_review") return "Review first is required while this application system is in beta.";
+  if (eligibility.capability === "handoff") return "This site uses a user-controlled handoff after Bluey prepares the application kit.";
+  if (eligibility.capability === "unknown_review") return "Review first is required because this application system is not certified.";
+  if (eligibility.capability === "blocked") return "This listing cannot use a Bluey runner.";
+  return "Auto-submit is available only after every server rule and application-system check passes.";
 }
 
 const DAY_MS = 86_400_000;
