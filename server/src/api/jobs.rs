@@ -329,6 +329,38 @@ fn apply_jobs_distribution_gates(
     entitlement.cloud_browser &= cloud_browser;
 }
 
+fn schedule_global_candidate_materialization(
+    pool: crate::db::DbPool,
+    account_id: String,
+    email: String,
+    reason: &'static str,
+) {
+    let account_fingerprint = discovery_log_fingerprint(&account_id);
+    std::mem::drop(tokio::task::spawn_blocking(move || {
+        match jobs::materialize_global_candidates_for_account(&pool, &account_id, &email) {
+            Ok(result) if result.materialized_count > 0 || result.refreshed_count > 0 => {
+                tracing::info!(
+                    account_fingerprint = %account_fingerprint,
+                    reason,
+                    considered_count = result.considered_count,
+                    materialized_count = result.materialized_count,
+                    refreshed_count = result.refreshed_count,
+                    skipped_count = result.skipped_count,
+                    "Jobs projected shared discovery candidates"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                account_fingerprint = %account_fingerprint,
+                reason,
+                error_category = "global_materialization_failed",
+                error = %error,
+                "Jobs continued without shared discovery projection"
+            ),
+        }
+    }));
+}
+
 pub async fn workspace(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -340,26 +372,12 @@ pub async fn workspace(
             "Jobs workspace could not ensure managed curated discovery"
         );
     }
-    match jobs::materialize_global_candidates_for_account(&state.pool, &account.id, &account.email)
-    {
-        Ok(result) if result.materialized_count > 0 || result.refreshed_count > 0 => {
-            tracing::info!(
-                account_fingerprint = %discovery_log_fingerprint(&account.id),
-                considered_count = result.considered_count,
-                materialized_count = result.materialized_count,
-                refreshed_count = result.refreshed_count,
-                skipped_count = result.skipped_count,
-                "Jobs workspace projected shared discovery candidates"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => tracing::warn!(
-            account_fingerprint = %discovery_log_fingerprint(&account.id),
-            error_category = "global_materialization_failed",
-            error = %error,
-            "Jobs workspace continued without shared discovery projection"
-        ),
-    }
+    schedule_global_candidate_materialization(
+        state.pool.clone(),
+        account.id.clone(),
+        account.email.clone(),
+        "workspace_load",
+    );
     let mut workspace =
         jobs::workspace(&state.pool, &account.id, &account.email).map_err(internal)?;
     if backfill_verified_import_discovery_sources(
@@ -441,16 +459,12 @@ pub async fn complete_onboarding(
     // Persist completion last. Retrying after any earlier write is idempotent,
     // while a partial request can never make the portal skip onboarding.
     jobs::save_profile(&state.pool, &account.id, &input.profile).map_err(internal)?;
-    if let Err(error) =
-        jobs::materialize_global_candidates_for_account(&state.pool, &account.id, &account.email)
-    {
-        tracing::warn!(
-            account_fingerprint = %discovery_log_fingerprint(&account.id),
-            error_category = "global_materialization_failed",
-            error = %error,
-            "Jobs onboarding completed without shared discovery projection"
-        );
-    }
+    schedule_global_candidate_materialization(
+        state.pool.clone(),
+        account.id.clone(),
+        account.email.clone(),
+        "onboarding_complete",
+    );
     jobs::workspace(&state.pool, &account.id, &account.email)
         .map(Json)
         .map_err(internal)

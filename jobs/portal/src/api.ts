@@ -32,6 +32,9 @@ import type {
 const ACCESS_TOKEN_KEY = "bluey_access_token";
 const REFRESH_TOKEN_KEY = "bluey_refresh_token";
 const AUTH_PERSISTENCE_KEY = "bluey_auth_persistence";
+const READ_TIMEOUT_MS = 20_000;
+const WRITE_TIMEOUT_MS = 90_000;
+const AUTH_TIMEOUT_MS = 15_000;
 let refreshAccessTokenPromise: Promise<string> | null = null;
 
 export class ApiError extends Error {
@@ -97,16 +100,48 @@ function persistTokens(payload: { access_token: string; refresh_token?: string }
   if (payload.refresh_token) store.setItem(REFRESH_TOKEN_KEY, payload.refresh_token);
 }
 
+function timeoutFor(init: RequestInit): number {
+  const method = String(init.method || "GET").toUpperCase();
+  return method === "GET" || method === "HEAD" ? READ_TIMEOUT_MS : WRITE_TIMEOUT_MS;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  timeoutMs = timeoutFor(init),
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  const onAbort = () => controller.abort();
+  init.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    globalThis.clearTimeout(timer);
+    init.signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 async function refreshAccessToken(): Promise<string> {
   if (refreshAccessTokenPromise) return refreshAccessTokenPromise;
   refreshAccessTokenPromise = (async () => {
     const token = refreshToken();
     if (!token) return "";
-    const response = await fetch("/auth/refresh", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_token: token }),
-    });
+    let response: Response;
+    try {
+      response = await fetchWithTimeout("/auth/refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: token }),
+      }, AUTH_TIMEOUT_MS);
+    } catch (error) {
+      if (isAbortError(error)) return "";
+      throw error;
+    }
     if (!response.ok) return "";
     const payload = (await response.json()) as { access_token?: string; refresh_token?: string };
     if (!payload.access_token) return "";
@@ -125,7 +160,15 @@ async function request<T>(path: string, init: RequestInit = {}, retried = false)
   if (!(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
   const token = accessToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
-  const response = await fetch(path, { ...init, headers });
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(path, { ...init, headers });
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw new ApiError(0, "Bluey Jobs is taking longer than expected. Please try again.");
+    }
+    throw error;
+  }
   if (response.status === 401 && !retried) {
     const refreshed = await refreshAccessToken();
     if (refreshed) return request<T>(path, init, true);
@@ -159,7 +202,15 @@ async function requestDownload(
   const headers = new Headers();
   const token = accessToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
-  const response = await fetch(path, { headers });
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(path, { headers }, WRITE_TIMEOUT_MS);
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw new ApiError(0, "Bluey could not finish the download in time. Please try again.");
+    }
+    throw error;
+  }
   if (response.status === 401 && !retried) {
     const refreshed = await refreshAccessToken();
     if (refreshed) return requestDownload(path, fallbackName, true);
