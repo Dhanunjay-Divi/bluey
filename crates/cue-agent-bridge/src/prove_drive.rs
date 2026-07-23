@@ -1482,6 +1482,8 @@ mod tests {
             id: "tc_1".to_string(),
             title: "mcp__perplexity__perplexity_ask".to_string(),
             status: ToolStatus::InProgress,
+            kind: None,
+            detail: None,
         };
         let title = match &fired {
             AnswerChunk::ToolCall { title, .. } => Some(title.clone()),

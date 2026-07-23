@@ -508,6 +508,11 @@ fn session_update_to_chunk(update: SessionUpdate) -> Option<AnswerChunk> {
             id: tool_call.tool_call_id.0.to_string(),
             title: tool_call.title.clone(),
             status: tool_status_of(tool_call.status),
+            // The KIND and the concrete TARGET — the minable signal the plain
+            // title drops. Location wins over raw_input (a clean file path beats
+            // a JSON arg blob); fall back to raw_input when no location is given.
+            kind: tool_call_kind_str(&tool_call.kind),
+            detail: tool_call_detail(&tool_call.locations, tool_call.raw_input.as_ref()),
         }),
         // A tool call PROGRESS update — same tool-call id, new status (and
         // sometimes a refined title). Collapses onto the existing status row.
@@ -521,6 +526,15 @@ fn session_update_to_chunk(update: SessionUpdate) -> Option<AnswerChunk> {
                 .status
                 .map(tool_status_of)
                 .unwrap_or(ToolStatus::InProgress),
+            // Updates carry refined fields; capture them when present. The
+            // downstream capture only records the FIRST sighting of a tool id,
+            // so a later update won't duplicate — but a start event that lacked
+            // a location and an update that has one still improves the live row.
+            kind: update.fields.kind.as_ref().and_then(tool_call_kind_str),
+            detail: tool_call_detail(
+                update.fields.locations.as_deref().unwrap_or(&[]),
+                update.fields.raw_input.as_ref(),
+            ),
         }),
         // Everything else (user echo, plans, mode/usage/info updates, and any
         // future variants) is not part of the answer or status, so it is
@@ -540,6 +554,54 @@ fn tool_status_of(status: agent_client_protocol::schema::ToolCallStatus) -> Tool
         // `ToolCallStatus` is #[non_exhaustive]; treat unknowns as in-progress.
         _ => ToolStatus::InProgress,
     }
+}
+
+/// The ACP tool KIND as a lowercase string ("read"/"edit"/"search"/…), or
+/// `None`. Serialized via serde (the schema is macro-generated, so we go through
+/// the stable JSON form rather than matching Rust variant names) — the ACP wire
+/// value is exactly the kebab/lower string we want to store.
+fn tool_call_kind_str(kind: &agent_client_protocol::schema::ToolKind) -> Option<String> {
+    match serde_json::to_value(kind) {
+        Ok(serde_json::Value::String(s)) if !s.is_empty() => Some(s),
+        _ => None,
+    }
+}
+
+/// The concrete TARGET a tool acted on: the first `locations` file path if any,
+/// else a compact rendering of `raw_input`. This is the "which file / which
+/// query" the human title drops — the actual input to a who-touched-what graph.
+/// Returns `None` when the agent surfaced neither (some agents send empty tool
+/// events — see the ACP MCP-identity gap).
+fn tool_call_detail(
+    locations: &[agent_client_protocol::schema::ToolCallLocation],
+    raw_input: Option<&serde_json::Value>,
+) -> Option<String> {
+    // Prefer a real file path from `locations`. Go through JSON so we don't
+    // depend on the macro-generated field names; the ACP location object is
+    // `{ "path": "...", "line": N? }`.
+    if let Some(first) = locations.first() {
+        if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(first) {
+            if let Some(serde_json::Value::String(path)) = map.get("path") {
+                if !path.is_empty() {
+                    return Some(path.clone());
+                }
+            }
+        }
+    }
+    // Fall back to the raw tool input, compacted and length-bounded so a large
+    // arg blob can't bloat the row. Metadata-grade, not full content.
+    if let Some(v) = raw_input {
+        let s = match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let s = s.trim();
+        if !s.is_empty() {
+            let bounded: String = s.chars().take(200).collect();
+            return Some(bounded);
+        }
+    }
+    None
 }
 
 /// Extract plain text from a [`ContentBlock`], if it is textual.
@@ -639,6 +701,8 @@ mod tests {
                 id: "tool-1".to_string(),
                 title: "Read file".to_string(),
                 status: ToolStatus::Pending,
+                kind: Some("other".to_string()),
+                detail: None,
             })
         );
     }

@@ -283,6 +283,17 @@ pub enum AnswerChunk {
         id: String,
         title: String,
         status: ToolStatus,
+        /// The ACP tool KIND ("read" / "edit" / "search" / "execute" / "fetch" /
+        /// …), when the agent reported one. This is the stable, minable signal —
+        /// far better than the human `title` for "what KIND of work happened".
+        /// `None` when the agent omits it (some agents leave it empty).
+        kind: Option<String>,
+        /// The concrete TARGET the tool acted on — the file path from the ACP
+        /// `locations`, or the tool's raw input when no location was given. This
+        /// is the "which file / which query" the plain `title` ("Read File")
+        /// throws away, and the actual input to a who-touched-what graph. `None`
+        /// when the agent surfaced neither.
+        detail: Option<String>,
     },
     /// The run finished cleanly; carries the reported cost when available.
     Done { cost_usd: Option<f64> },

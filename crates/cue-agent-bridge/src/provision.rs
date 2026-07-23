@@ -205,23 +205,17 @@ pub fn plan_install(agent: &AgentKind) -> Option<InstallPlan> {
 /// Whether a command is available on `PATH`. Read-only; never executes the
 /// target — uses a `--version`-free `command -v`-style probe via `which`.
 fn binary_on_path(binary: &str) -> bool {
-    // `which` is on every supported platform's PATH; if even it is missing we
-    // conservatively report false rather than risk a false positive.
+    if crate::hermetic_runtime::agent_bin_dir().join(binary).is_file() {
+        return true;
+    }
     Command::new("which")
         .arg(binary)
+        .env("PATH", crate::hermetic_runtime::augmented_path())
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-/// Whether a binary on `PATH` actually **runs** — `Ok(())` if a `--version`
-/// probe exits 0, `Err(launch-error-text)` if it spawns but fails (e.g. a
-/// runtime-version mismatch like Copilot's "requires Node v24"). This is the
-/// difference between "installed" and "usable": a binary can be on `PATH` yet
-/// non-functional. We probe `--version` (cheap, side-effect-free for every CLI
-/// in the registry) and, on a non-zero exit, return the combined stderr+stdout
-/// tail so the caller sees the real reason. A binary that isn't even on PATH
-/// returns `Err` too (caller should check `binary_on_path` first for clarity).
 fn binary_runnable(binary: &str) -> Result<(), String> {
     match Command::new(binary).arg("--version").output() {
         Ok(o) if o.status.success() => Ok(()),
