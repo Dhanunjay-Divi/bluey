@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::agent_ui::{AgentConnectorInfo, AgentSessionSummary, AgentSummary};
+use crate::agent_ui::{AgentConnectorInfo, AgentSessionSummary, AgentSummary, SetupStatus};
 use crate::{overlay_ipc::ListeningState, CueCard, CueCardArtifact};
 
 /// serde default for opt-in-by-default booleans (e.g. capture both audio sources
@@ -299,6 +299,16 @@ pub enum OverlayCommand {
     SetAgents {
         agents: Vec<AgentSummary>,
     },
+    /// Push the first-run setup status so ONBOARDING can show, and gate on, the
+    /// real state of every prerequisite — instead of the user discovering
+    /// mid-meeting that a model never downloaded or the agent is signed out.
+    ///
+    /// Pushed on request ([`OverlayEvent::SetupStatusRequested`]) and again
+    /// whenever a step's state changes (model download progress, an install or
+    /// login finishing), so the onboarding screen is live rather than a snapshot.
+    SetSetupStatus {
+        status: SetupStatus,
+    },
     /// Push one agent's prior sessions to the UI (gated on consent upstream).
     SetAgentSessions {
         kind: String,
@@ -583,6 +593,30 @@ pub enum OverlayEvent {
         kind: String,
         approved: bool,
     },
+    /// The user asked Bluey to install a coding agent from the UI (onboarding's
+    /// "no agent found" state). The daemon picks the best installable agent —
+    /// or the named `kind` when given — and replies with the SAME
+    /// [`OverlayCommand::PushAgentInstall`] offer the drive path uses, so the
+    /// consent card and vetted-recipe execution stay one code path.
+    ///
+    /// Exists because onboarding previously showed an EMPTY agent list with no
+    /// way forward: Bluey cannot answer without an agent, so "install one" has
+    /// to be reachable in-product, not only from a terminal.
+    AgentInstallRequested {
+        /// `None` → daemon chooses the best installable candidate.
+        #[serde(default)]
+        kind: Option<String>,
+    },
+    /// The user asked to sign in to an agent whose CLI is installed but signed
+    /// out (`capability == "needs_reauth"`). The daemon LAUNCHES that agent's
+    /// own login flow (e.g. `cursor-agent login`) so the user completes it in
+    /// their browser/device-code flow. Bluey never handles the credentials.
+    AgentLoginRequested {
+        kind: String,
+    },
+    /// Onboarding asks for the current [`SetupStatus`]. The daemon replies with
+    /// [`OverlayCommand::SetSetupStatus`] and keeps pushing it as steps change.
+    SetupStatusRequested,
     InstructionsRequested,
     InstructionsUpdated {
         text: String,

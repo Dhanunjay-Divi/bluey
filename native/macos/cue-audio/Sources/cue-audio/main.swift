@@ -218,10 +218,61 @@ private final class SystemAudioCapture {
 
     // MARK: - Tap setup
 
+    /// Our own process as a Core Audio object id, for the tap's exclude list.
+    ///
+    /// `CATapDescription(stereoGlobalTapButExcludeProcesses:)` takes audio
+    /// OBJECT ids, not pids — passing a pid would silently exclude an unrelated
+    /// process (or nothing). Core Audio exposes the mapping via
+    /// `kAudioHardwarePropertyTranslatePIDToProcessObject`.
+    ///
+    /// Returns nil when the translation fails, which is normal: a process that
+    /// has never produced audio has no process object yet. The caller then taps
+    /// globally, which is the pre-existing behavior.
+    private static func ownAudioProcessObjectID() -> AudioObjectID? {
+        var pid = ProcessInfo.processInfo.processIdentifier
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var objectID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            UInt32(MemoryLayout<pid_t>.size),
+            &pid,
+            &size,
+            &objectID
+        )
+        guard status == noErr, objectID != AudioObjectID(kAudioObjectUnknown) else {
+            return nil
+        }
+        return objectID
+    }
+
     @available(macOS 14.2, *)
     private func setUpTap() throws {
-        // 1. Tap description: a private, unmuted, global stereo tap.
-        let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        // 1. Tap description: a private, unmuted, global stereo tap that
+        //    EXCLUDES our own audio.
+        //
+        // The exclude list was previously empty, so the tap captured output
+        // from every process INCLUDING this one. Anything Bluey itself plays is
+        // then re-captured and re-transcribed, which is the same echo-loop the
+        // ScreenCaptureKit path avoids with `excludesCurrentProcessAudio` (see
+        // the picker path below). Excluding our own PID is the Core Audio
+        // equivalent.
+        //
+        // Note this is the OUTPUT side only: it stops Bluey's own playback from
+        // looping back. Speaker-to-microphone bleed is a separate acoustic path
+        // and is handled by the VoiceProcessingIO AEC on the mic input.
+        // The API takes audio-object IDs, NOT pids, so translate ours first
+        // (`kAudioHardwarePropertyTranslatePIDToProcessObject`). If the
+        // translation fails — which it does when this process has never played
+        // audio and so has no process object — fall back to an empty exclude
+        // list: a global tap is still far better than no capture at all.
+        let excluded = Self.ownAudioProcessObjectID().map { [$0] } ?? []
+        let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
         tapDescription.uuid = UUID()
         tapDescription.muteBehavior = .unmuted
         tapDescription.isPrivate = true
@@ -479,8 +530,65 @@ private final class MicrophoneCapture {
         self.continuous = continuous
     }
 
+    /// Enables Apple's VoiceProcessingIO acoustic echo cancellation on the input
+    /// node, so the far side's voice — played through the speakers and leaking
+    /// back into the mic — is removed BEFORE it reaches STT. Without this the
+    /// same speech is transcribed twice: once from the system-audio tap and
+    /// again from the mic. Text-level dedup cannot fix that reliably; hardware
+    /// AEC is what production conferencing apps use.
+    ///
+    /// Returns true if AEC is active. Fail-soft by design: a mic with echo is
+    /// far better than no mic, so every failure path logs and returns false.
+    private func enableEchoCancellation(on input: AVAudioInputNode) -> Bool {
+        // Escape hatch: voice processing also applies AGC + noise suppression,
+        // which alters voice timbre. A user on a headset has no echo path to
+        // cancel and may prefer the untouched signal.
+        if ProcessInfo.processInfo.environment["BLUEY_AEC"] == "0" {
+            fputs("microphone: echo cancellation disabled by BLUEY_AEC=0\n", stderr)
+            return false
+        }
+        do {
+            // Must run before the engine starts and before the tap is installed:
+            // switching to the VoiceProcessingIO unit reconfigures the input
+            // hardware, which is only legal on a stopped engine.
+            try input.setVoiceProcessingEnabled(true)
+
+            // CRITICAL: turn OFF the ducking VoiceProcessingIO applies by
+            // default. The unit assumes it is powering a voice call, so it
+            // aggressively attenuates all OTHER audio on the machine while the
+            // mic is live. Bluey's whole second capture path IS that other
+            // audio (the system tap recording the far side), so leaving the
+            // default on trades duplicate transcripts for a near-silent system
+            // stream — one independent report measured -51 dB, effectively
+            // inaudible. `.min` keeps the smallest attenuation the API allows,
+            // and advanced (voice-activity-driven) ducking stays off so levels
+            // do not pump while people talk.
+            if #available(macOS 14.0, *) {
+                input.voiceProcessingOtherAudioDuckingConfiguration =
+                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                        enableAdvancedDucking: false,
+                        duckingLevel: .min
+                    )
+            }
+
+            fputs("microphone: echo cancellation ENABLED (ducking minimized)\n", stderr)
+            return true
+        } catch {
+            fputs(
+                "microphone: echo cancellation unavailable (\(error.localizedDescription)) — continuing without\n",
+                stderr
+            )
+            return false
+        }
+    }
+
     func run() throws {
         let input = engine.inputNode
+        // Enable AEC BEFORE reading the input format: the VoiceProcessingIO unit
+        // imposes its own sample rate and channel count, so a format captured
+        // beforehand would no longer describe the buffers the tap receives and
+        // the converter would emit garbled audio.
+        _ = enableEchoCancellation(on: input)
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.channelCount > 0 else {
             throw NSError(domain: "BlueyAudio", code: 2, userInfo: [NSLocalizedDescriptionKey: "no microphone input format available"])

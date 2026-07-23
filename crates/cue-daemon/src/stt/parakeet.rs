@@ -43,16 +43,47 @@ static SHARED_STT_HANDLE: OnceLock<Mutex<Option<(PathBuf, cue_transcribe::SttEng
 /// single source is never blocked by the sharing machinery).
 fn shared_engine_for(dir: &Path) -> anyhow::Result<cue_transcribe::SttEngine> {
     let slot = SHARED_STT_HANDLE.get_or_init(|| Mutex::new(None));
-    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
-    // Reuse the handle when the model dir matches; else (re)load for this dir.
-    let handle = match guard.as_ref() {
-        Some((cached_dir, h)) if cached_dir == dir => h.clone(),
-        _ => {
-            let h = cue_transcribe::SttEngineHandle::load(dir)?;
-            *guard = Some((dir.to_path_buf(), h.clone()));
-            h
+
+    // FAST PATH: take the lock, check the cache, RELEASE it. Never hold the lock
+    // across the load.
+    {
+        let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((cached_dir, h)) = guard.as_ref() {
+            if cached_dir == dir {
+                return Ok(cue_transcribe::SttEngine::from_shared(h));
+            }
         }
-    };
+    }
+
+    // SLOW PATH: load OUTSIDE the lock.
+    //
+    // DEADLOCK FIX (2026-07-20, found live on an Intel Mac): this previously
+    // held the mutex across `SttEngineHandle::load` — a ~650 MB, multi-second
+    // blocking load. Mic and system audio start at the SAME instant, so source
+    // A took the lock and began loading while source B blocked on it. Both
+    // threads sat in `__psynch_mutexwait` and NEITHER ever reached the code that
+    // logs success or failure: the daemon log dead-ended at "parakeet model
+    // already present", RSS stayed at 31 MB (model never resident), and
+    // transcription silently never started. Loading off-lock means a concurrent
+    // start can never block on a load.
+    //
+    // Cost of the race: if both sources miss the cache simultaneously they may
+    // each load once, and the last writer wins. That is a bounded, one-time
+    // duplicate load — strictly better than a hang, and the steady state is
+    // still one shared handle.
+    let handle = cue_transcribe::SttEngineHandle::load(dir)?;
+
+    {
+        let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_ref() {
+            // Someone else finished first — prefer THEIR handle so both sources
+            // converge on one set of weights.
+            Some((cached_dir, existing)) if cached_dir == dir => {
+                return Ok(cue_transcribe::SttEngine::from_shared(existing));
+            }
+            _ => *guard = Some((dir.to_path_buf(), handle.clone())),
+        }
+    }
     Ok(cue_transcribe::SttEngine::from_shared(&handle))
 }
 
@@ -115,8 +146,26 @@ fn run_worker(
     // concurrent sources cost one model in RAM, not two. Each engine still starts
     // in a clean (reset) state, and the streams never interfere.
     let mut engine = match shared_engine_for(&paths.nemotron_dir) {
-        Ok(e) => e,
+        Ok(e) => {
+            tracing::info!(
+                source = ?source,
+                dir = %paths.nemotron_dir.display(),
+                "STT engine ready"
+            );
+            e
+        }
         Err(e) => {
+            // LOG it, don't only send it. This error previously went ONLY into
+            // the event channel, so a failed engine load was completely silent
+            // in the daemon log: capture said "started", nothing transcribed,
+            // and there was no error anywhere to explain why. Cost hours of
+            // blind debugging on a real Intel Mac (2026-07-20).
+            tracing::error!(
+                source = ?source,
+                dir = %paths.nemotron_dir.display(),
+                error = %e,
+                "failed to load Parakeet STT engine — transcription will not work"
+            );
             let _ = event_tx.send(Err(SttError::Provider(format!(
                 "failed to load Parakeet model from {}: {e}",
                 paths.nemotron_dir.display()

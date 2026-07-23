@@ -3,17 +3,22 @@
 // privacy stated upfront, each step a single clear action. Progressive, not a
 // scary wall of permissions.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Glass, Mark } from "../components/primitives";
 import { AgentLogo } from "../components/AgentLogo";
+import {
+  AgentInstallCard,
+  type AgentInstallOffer,
+} from "../components/AgentInstallCard";
 import { getClient } from "../lib";
-import type { AgentSummary } from "../lib/types";
+import type { AgentSummary, SetupStatus } from "../lib/types";
 
-type Step = "welcome" | "mic" | "attach" | "calendar" | "consent" | "ready";
+type Step = "welcome" | "mic" | "attach" | "setup" | "calendar" | "consent" | "ready";
 const ORDER: Step[] = [
   "welcome",
   "mic",
   "attach",
+  "setup",
   "calendar",
   "consent",
   "ready",
@@ -29,9 +34,23 @@ export function Onboarding({
   onDone: () => void;
 }) {
   const [step, setStep] = useState<Step>("welcome");
+  // The daemon answers requestAgentInstall with a push_agent_install offer;
+  // render the SAME consent card AskScreen uses so nothing installs unasked.
+  const [installOffer, setInstallOffer] = useState<AgentInstallOffer | null>(null);
+  const [setup, setSetup] = useState<SetupStatus | null>(null);
   const idx = ORDER.indexOf(step);
   const next = () => setStep(ORDER[Math.min(idx + 1, ORDER.length - 1)]);
   const client = getClient();
+
+  // Subscribe to daemon install offers (the reply to requestAgentInstall).
+  useEffect(() => client.onAgentInstall((o) => setInstallOffer(o)), [client]);
+  // Live setup status: the daemon pushes on request and on every change (model
+  // download progress, an install/login finishing), so this screen reflects the
+  // REAL state instead of assuming setup worked.
+  useEffect(() => client.onSetupStatus((s) => setSetup(s)), [client]);
+  useEffect(() => {
+    if (step === "setup") client.requestSetupStatus();
+  }, [step, client]);
 
   return (
     // Fill the window and center the card — the panel IS the window (no empty
@@ -64,11 +83,14 @@ export function Onboarding({
               cta="Allow microphone"
               secondary="Skip for now"
               onCta={() => {
-                // Actually start capture — this triggers the OS permission
-                // prompt and begins listening, mirroring the composer mic
-                // button (v1 captures SYSTEM audio: the other people on the
-                // call). Without this the step was cosmetic (next() only).
-                client.startListening({ microphone: false, system: true });
+                // Request BOTH sources so macOS actually prompts for each.
+                // This step is titled "Let Bluey hear the call" and claims to
+                // allow the microphone, but it previously passed
+                // `microphone: false` — so the mic prompt was NEVER triggered,
+                // TCC recorded "not requested yet", and macOS then fed silent
+                // audio to a capture that looked successful in the logs. The
+                // symptom was "transcription doesn't work even with mic".
+                client.startListening({ microphone: true, system: true });
                 next();
               }}
               onSecondary={next}
@@ -81,18 +103,120 @@ export function Onboarding({
               <h2 style={h2}>Attach your agent</h2>
               <p style={p}>Pick the coding agent you already use. Bluey drives your own session, so it knows your projects.</p>
               <div style={{ display: "flex", flexDirection: "column", gap: 7, marginTop: 16 }}>
-                {(agents ?? []).slice(0, 4).map((a) => (
-                  <button key={a.kind} onClick={() => { onAttach(a.kind); next(); }} style={pickRow}>
-                    <span style={{ display: "inline-flex", alignItems: "center" }}>
-                      <AgentLogo kind={a.kind} size={16} />
-                    </span>
-                    <span style={{ fontSize: 13, fontWeight: 540 }}>{a.displayName}</span>
-                    <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--ink-3)" }}>{a.sessionCount ?? 0} sessions</span>
-                    <span style={{ color: "var(--tint-ink)", fontSize: 13 }}>→</span>
-                  </button>
-                ))}
+                {(agents ?? []).slice(0, 4).map((a) => {
+                  // `needs_reauth` = the CLI is installed but signed out. Attaching
+                  // it "works" and then every ask fails, so say so HERE and let the
+                  // user fix it in-product (the daemon launches the agent's own
+                  // login flow) instead of sending them to a terminal.
+                  const needsLogin = a.capability === "needs_reauth";
+                  return (
+                    <button
+                      key={a.kind}
+                      onClick={() => {
+                        // Signed out: launch the agent's own login flow instead
+                        // of attaching something that fails on every ask. Stay
+                        // on this step so the user can pick again once signed in.
+                        if (needsLogin) {
+                          client.requestAgentLogin(a.kind);
+                          return;
+                        }
+                        onAttach(a.kind);
+                        next();
+                      }}
+                      style={pickRow}
+                    >
+                      <span style={{ display: "inline-flex", alignItems: "center" }}>
+                        <AgentLogo kind={a.kind} size={16} />
+                      </span>
+                      <span style={{ fontSize: 13, fontWeight: 540 }}>{a.displayName}</span>
+                      <span style={{ marginLeft: "auto", fontSize: 11, color: needsLogin ? "var(--warn-ink, #d08700)" : "var(--ink-3)" }}>
+                        {needsLogin ? "Sign in" : `${a.sessionCount ?? 0} sessions`}
+                      </span>
+                      <span style={{ color: "var(--tint-ink)", fontSize: 13 }}>→</span>
+                    </button>
+                  );
+                })}
                 {agents === null && <p style={p}>Discovering your agents…</p>}
+                {/* The empty case used to render NOTHING — a blank list with no
+                    explanation and no way forward, which is what a brand-new Mac
+                    sees. Bluey cannot answer without an agent, so this is the
+                    single most important state in onboarding. */}
+                {agents !== null && agents.length === 0 && (
+                  <div>
+                    <p style={p}>
+                      No coding agent found on this Mac. Bluey answers <em>through</em> your
+                      own agent, so you'll need one installed.
+                    </p>
+                    <button style={pickRow} onClick={() => client.requestAgentInstall()}>
+                      <span style={{ fontSize: 13, fontWeight: 540 }}>Install one for me</span>
+                      <span style={{ marginLeft: "auto", color: "var(--tint-ink)", fontSize: 13 }}>→</span>
+                    </button>
+                    <button style={{ ...pickRow, marginTop: 7 }} onClick={next}>
+                      <span style={{ fontSize: 13, color: "var(--ink-3)" }}>I'll do it later</span>
+                      <span style={{ marginLeft: "auto", color: "var(--ink-3)", fontSize: 13 }}>→</span>
+                    </button>
+                  </div>
+                )}
               </div>
+            </div>
+          )}
+
+          {installOffer && (
+            <AgentInstallCard
+              offer={installOffer}
+              onInstall={() => {
+                client.respondAgentInstall(installOffer.kind, true);
+                setInstallOffer(null);
+              }}
+              onCancel={() => {
+                client.respondAgentInstall(installOffer.kind, false);
+                setInstallOffer(null);
+              }}
+            />
+          )}
+
+          {step === "setup" && (
+            <div>
+              <Glyph>⚙</Glyph>
+              <h2 style={h2}>Getting everything ready</h2>
+              <p style={p}>
+                Bluey transcribes on this Mac and answers through your agent.
+                Both need to be ready before a meeting.
+              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: 7, marginTop: 16 }}>
+                {setup === null && <p style={p}>Checking…</p>}
+                {setup && (
+                  <>
+                    <SetupRow item={setup.model} />
+                    <SetupRow
+                      item={setup.agent}
+                      onFix={
+                        setup.agent.state === "missing"
+                          ? () => client.requestAgentInstall(setup.agent.kind ?? undefined)
+                          : setup.agent.state === "needs_login" && setup.agent.kind
+                            ? () => client.requestAgentLogin(setup.agent.kind as string)
+                            : undefined
+                      }
+                      fixLabel={
+                        setup.agent.state === "missing"
+                          ? "Install"
+                          : setup.agent.state === "needs_login"
+                            ? "Sign in"
+                            : undefined
+                      }
+                    />
+                  </>
+                )}
+              </div>
+              <button
+                style={{ ...pickRow, marginTop: 14, opacity: setup?.allReady ? 1 : 0.55 }}
+                onClick={next}
+              >
+                <span style={{ fontSize: 13, fontWeight: 540 }}>
+                  {setup?.allReady ? "Continue" : "Continue anyway"}
+                </span>
+                <span style={{ marginLeft: "auto", color: "var(--tint-ink)", fontSize: 13 }}>→</span>
+              </button>
             </div>
           )}
 
@@ -339,3 +463,47 @@ const pickRow = {
   padding: "11px 13px",
   cursor: "pointer",
 } as const;
+
+/** One setup prerequisite row: status dot, detail, live progress, and (when the
+ *  item is actionable) an in-product fix button — so the user never has to open
+ *  a terminal to finish setup. */
+function SetupRow({
+  item,
+  onFix,
+  fixLabel,
+}: {
+  item: { state: string; detail: string; percent: number | null };
+  onFix?: () => void;
+  fixLabel?: string;
+}) {
+  const color =
+    item.state === "ready"
+      ? "var(--ok-ink, #2e9e5b)"
+      : item.state === "working"
+        ? "var(--tint-ink)"
+        : "var(--warn-ink, #d08700)";
+  return (
+    <div style={{ ...pickRow, cursor: "default", alignItems: "flex-start", flexDirection: "column", gap: 6 }}>
+      <div style={{ display: "flex", alignItems: "center", width: "100%", gap: 8 }}>
+        <span style={{ width: 7, height: 7, borderRadius: 4, background: color, flexShrink: 0 }} />
+        <span style={{ fontSize: 12.5 }}>{item.detail}</span>
+        {onFix && fixLabel && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onFix(); }}
+            style={{
+              marginLeft: "auto", fontSize: 11.5, fontWeight: 560,
+              color: "var(--tint-ink)", background: "none", border: "none", cursor: "pointer",
+            }}
+          >
+            {fixLabel}
+          </button>
+        )}
+      </div>
+      {item.percent !== null && (
+        <div style={{ width: "100%", height: 3, borderRadius: 2, background: "var(--line-2)" }}>
+          <div style={{ width: `${item.percent}%`, height: "100%", borderRadius: 2, background: "var(--tint)", transition: ".3s" }} />
+        </div>
+      )}
+    </div>
+  );
+}

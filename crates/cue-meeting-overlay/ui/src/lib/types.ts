@@ -244,3 +244,22 @@ export interface AnswerSource {
   /** optional status note, e.g. "resolved 3d ago". */
   note?: string;
 }
+
+/** One first-run setup prerequisite (see daemon `setup_status`). */
+export interface SetupItem {
+  /** "ready" | "working" | "missing" | "needs_login" | "failed" */
+  state: string;
+  detail: string;
+  /** 0-100 while state === "working". */
+  percent: number | null;
+  /** Agent kind when agent-specific, for install/login actions. */
+  kind: string | null;
+}
+
+/** First-run setup status: the REAL state of every prerequisite. */
+export interface SetupStatus {
+  model: SetupItem;
+  agent: SetupItem;
+  /** True only when every required item is ready — onboarding gates on this. */
+  allReady: boolean;
+}

@@ -31,6 +31,7 @@ pub mod stt;
 // Calendar trigger: fires the warm meeting-backend drive ahead of meetings.
 pub mod calendar;
 // Rolling-summary orchestration: throwaway agent one-shot every N segments.
+pub mod setup_status;
 pub mod summary;
 pub mod util;
 

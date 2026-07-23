@@ -112,9 +112,36 @@ impl MicrophoneCapture {
             let mut framer = Framer::new(opts.source, sample_rate, opts.chunk_ms);
             let stream_cfg: StreamConfig = config.into();
 
+            // PERMISSION CANARY. On macOS, opening a mic stream SUCCEEDS even
+            // when microphone access was never granted — the OS just delivers
+            // digital silence. Capture then logs "started" and STT runs on
+            // nothing, so the user sees "transcription doesn't work" with no
+            // error anywhere. Watch the first few seconds of audio: if every
+            // sample is pure zero, that is not a quiet room (a live mic always
+            // carries some noise floor), it is a blocked mic — say so once.
+            let mut silent_chunks: u32 = 0;
+            let mut canary_done = false;
+
             let emit = {
                 let tx = tx.clone();
                 move |samples: Vec<i16>| {
+                    if !canary_done {
+                        if samples.iter().all(|s| *s == 0) {
+                            silent_chunks += 1;
+                            // ~3s at the default chunk size.
+                            if silent_chunks >= 30 {
+                                canary_done = true;
+                                tracing::warn!(
+                                    "microphone is delivering pure silence — macOS \
+                                     microphone permission is almost certainly not \
+                                     granted. Grant it in System Settings > Privacy \
+                                     & Security > Microphone, then start again."
+                                );
+                            }
+                        } else {
+                            canary_done = true; // real audio — stop checking
+                        }
+                    }
                     let captured_at_ms = epoch_ms();
                     for chunk in framer.push(&samples, captured_at_ms) {
                         if tx.send(chunk).is_err() {

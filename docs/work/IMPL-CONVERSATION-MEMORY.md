@@ -109,31 +109,95 @@ cue-daemon 6 (5 db round-trip/prune/delete/clear + envelope placement).
 | Migration numbered 012 (not 011) | 011 (keybinds) is an inline `ensure_keybinds_table`, not in `run_migrations`; 012 avoids collision. |
 | `ConvRole::as_str`/`from_str_lossy` added to cue-core | The type owner is the right home for its DB string form; keeps the daemon accessor clean. |
 
-## Known Follow-ups
+## Waves 2 & 3 — SHIPPED (were follow-ups, now landed)
 
-- **Wave 2**: session-history retrieval index + `search_agent_history` MCP tool
-  (consumes `cue-rag::hash_dedup` + `is_self_prompt`; the harness proved the
-  engine at 78% recall@1 / 12ms). Note Agent 1's flag: the fold prompt opens
-  with "You maintain the running summary of the conversation…", distinct from
-  the meeting summarizer — add that marker to `is_self_prompt` before indexing
-  if fold one-shots can leak into agent session files.
-- **Wave 3**: ephemeral drive (`--ephemeral` / `--no-session-persistence`, drop
-  `--resume`) behind a default-OFF flag, only after live validation below.
-- **Persistence**: promote `conv_summary` to disk if restart-mid-meeting summary
-  loss proves noticeable (turns already survive; only the fold is lost).
+- **Wave 2 — agent-history retrieval — DONE.** `search_agent_history` MCP tool
+  over indexed agent sessions (`cue-daemon/src/agent_history.rs`,
+  `cue-rag/src/agent_history.rs`). Scoped to the ATTACHED agent family by
+  default (`HistoryScope::Attached`); `BLUEY_AGENT_HISTORY_SCOPE=all` widens it.
+  `same_agent_family()` groups the three Claude surfaces so an attached Claude
+  session also sees Claude Code CLI/app history. Agent 1's flag was actioned:
+  the fold-prompt marker (and several other live-measured self-prompt markers)
+  are now in `cue-rag/src/filter.rs::is_self_prompt`, so Bluey's own one-shots
+  cannot be re-indexed as if they were the user's reasoning.
+- **Wave 3 — ephemeral drive — DONE, with a correction.** `codex exec
+  --ephemeral` is REAL and is the only working ephemeral flag.
+  **`--no-session-persistence` DOES NOT EXIST** — it was taken from docs, and
+  the installed Claude CLI rejects it (`error: unknown option`, exit 1, answer
+  lost). `KindTag::ephemeral_flag()` is therefore Codex-only; every other agent
+  degrades gracefully to a normal drive. Requesting ephemeral FORCES the CLI
+  route (`drive_with_overrides_ephemeral`), because ACP cannot honor it.
+  Note: `resume: None` alone does NOT prevent a session being written — only
+  the real ephemeral flag does.
+- **Persistence** (still open): promote `conv_summary` to disk if
+  restart-mid-meeting summary loss proves noticeable (turns already survive;
+  only the fold is lost).
+
+## Cadence tuning — LIVE-FIRST (supersedes the original numbers)
+
+The ledger/summary intervals were re-derived for a LIVE pinned card, not a
+post-meeting batch summarizer. Batch summarizers fire at ~20-32k tokens because
+latency is irrelevant when the artifact is read once at the end; a live copilot
+is the opposite case — a decision made at minute 3 must appear in the card by
+~minute 5.
+
+| Knob | Value | ≈ wall-clock @130 wpm |
+|---|---|---|
+| `ledger::DEFAULT_INTERVAL_WORDS` | 350 | ~2.7 min |
+| `summary::DEFAULT_INTERVAL_WORDS` | 800 | ~6 min |
+| `ConvConfig::DEFAULT_TAIL_TOKENS` | 10_000 | (capacity, not cadence) |
+
+Cost is bounded by SELECTIVITY, not by firing less often: the ledger prompt
+already says "If nothing qualifies, output empty arrays" and every item is
+quote-verified, and the summary prompt now permits returning the current
+summary UNCHANGED. So a chitchat window is a cheap no-op pass.
+
+Scaling property: per-pass input is CONSTANT at every meeting length (both the
+transcript window and the stored summary are hard-capped), so cost is LINEAR in
+meeting length — an 8-hour meeting costs 8x a 1-hour one, with no blow-up.
+
+## Verification status — READ THIS FIRST
+
+`cargo test` passing does NOT mean these paths were exercised live. Current
+state as of this branch (1,368 lib tests pass, clippy `-D warnings` clean,
+`cargo fmt` clean, release binaries build):
+
+| Area | Status |
+|---|---|
+| Conversation memory recall (follow-up across turns) | ✅ **live-verified** (the "9432" port-recall test) |
+| `search_agent_history` retrieval | ✅ **live-verified** — real ranked hits returned |
+| Ledger / summary firing | ⚠️ **NOT verified live.** In an e2e run they fired **0 times** — 513 words spoken, decisions=0. Root cause: `attached: None`. **Both REQUIRE an attached agent to drive extraction**; with no agent attached they silently do nothing. |
+| Mic capture end-to-end | ❌ **compiles, never driven live.** The `let _ = enable_microphone;` discard is fixed, but real mic→STT was not exercised. |
+| Window resize (NSPanel `setSize`) | ❌ **not verified** — borderless NSPanels don't support `startResizeDragging`; the manual fix needs the real app, not a browser. |
+| New 350/800 cadence | ❌ **never observed firing in a live meeting.** |
+
+**The trap:** if the ledger/summary appear "broken", check whether an agent is
+attached before debugging anything else.
 
 ## Needs LIVE validation (the last proof)
 
-Wave 1 is unit-proven; the end-to-end behavior needs one real meeting:
-
 1. Ask two related questions in a meeting; the second ("follow up on that")
    must show the agent recalling its OWN prior answer — proving the block is
-   supplied and used.
-2. After ~15+ asks (tail overflows ~2000 tokens), confirm a fold fires: a
-   `conversation fold` debug line, the rolling summary populates, and the oldest
-   turns are deleted from `conversation_turns`.
-3. Confirm the ordering in a captured envelope: summary → conversation →
-   transcript.
+   supplied and used. *(This one has been done.)*
+2. Confirm a fold fires once the tail overflows `DEFAULT_TAIL_TOKENS`
+   (**10_000**, not the original 2_000): a `conversation fold` debug line, the
+   rolling summary populates, and the oldest turns are deleted from
+   `conversation_turns`. Note the far larger tail means folds are now RARE —
+   force one with `BLUEY_CONV_TAIL_TOKENS=500` rather than asking 15+ times.
+3. Confirm the ordering in a captured envelope: ledger → summary →
+   conversation → transcript.
+4. **With an agent attached**, confirm ledger and summary passes actually fire.
+
+## How to test WITHOUT sitting through a long meeting
+
+Cadence is provably clock-free (`should_fire_words` is a pure function of word
+counts; nothing in the fire path reads `Instant::now`/`SystemTime::now`). A
+replayed transcript therefore produces the BYTE-IDENTICAL firing pattern to a
+real meeting of the same length, in seconds. Use `BLUEY_AUDIO_WAV_FILE` +
+`bluey audio start` to drive the full pipeline from a 16kHz mono WAV.
+
+No eval harness exists yet — retrieval/summarization accuracy is currently
+UNMEASURED. See `docs/work/FUTURE-UPGRADES.md`.
 
 ## Review Checklist (for reviewer)
 

@@ -760,3 +760,39 @@ the earlier native transcript overlay and the Pinky/Natively/Pluely references:
   useful session context instead of doing nothing.
 - Added a parent-process watchdog so future orphaned macOS overlay helpers exit
   if the daemon disappears unexpectedly.
+
+## Round 63: Conversation Memory, Agent-History Retrieval, And Live-First Cadence
+
+Made in-meeting follow-ups work without depending on the agent's resumable
+session, and re-derived the memory cadence for a live card rather than a
+post-meeting summary:
+
+- Added app-owned conversation memory: every in-meeting Q&A turn is stored in
+  Bluey's own `conversation_turns` table (migration 012) and re-supplied each
+  turn as a token-bounded block (rolling summary + verbatim tail). "Follow up on
+  that" no longer depends on the agent's session surviving.
+- Added `search_agent_history`, an MCP tool over indexed agent sessions, scoped
+  to the ATTACHED agent family by default (`BLUEY_AGENT_HISTORY_SCOPE=all`
+  widens it). Bluey's own one-shot prompts are filtered out of the index.
+- Added the ephemeral drive. `codex exec --ephemeral` is the only real ephemeral
+  flag; `--no-session-persistence` was fabricated from docs and is rejected by
+  the installed Claude CLI, so it was removed. Requesting ephemeral forces the
+  CLI route because ACP cannot honor it.
+- Re-tuned ledger/summary cadence live-first: ledger every ~350 words (~2.7 min)
+  and summary every ~800 words (~6 min). An earlier pass had set these from
+  batch-summarizer research (1,500/3,000), which would have left a decision
+  invisible for ~12 minutes on a card that is re-shown every ask. Cost is
+  bounded by selectivity — a window that adds nothing records nothing — and
+  per-pass input is constant, so cost stays linear in meeting length.
+- Raised the conversation tail to 10,000 tokens (was 2,000) to match modern
+  context windows.
+- Shared one loaded Parakeet weight set across per-source STT engines instead of
+  a full ~650MB copy each, keeping independent decoder state per source.
+- Replaced the generic agent glyph with real official brand marks and mapped
+  "Code - Insiders" to the VS Code family.
+- Removed a `console.log` that fired on every streaming answer token.
+
+Known-unverified after this round: ledger/summary require an attached agent and
+silently do nothing without one; mic capture, window resize, and the new cadence
+compile and pass tests but were not driven in a live meeting. See
+`docs/work/REVIEW-CONVERSATION-MEMORY.md`.

@@ -171,3 +171,35 @@ mod tests {
         assert_eq!(legacy.project, None);
     }
 }
+
+/// First-run setup status for the onboarding screen.
+///
+/// Onboarding previously advanced on clicks alone: it could reach "You're
+/// ready" while the speech model had never downloaded and the agent CLI was
+/// missing or signed out, so the failure surfaced mid-meeting as "couldn't
+/// answer". This DTO carries the REAL state of every prerequisite so the UI can
+/// show live progress, offer the fix in-product (install / sign in), and gate
+/// "ready" on setup actually being done.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetupStatus {
+    /// On-device speech model.
+    pub model: SetupItem,
+    /// The coding agent Bluey drives (Bluey never answers on its own).
+    pub agent: SetupItem,
+    /// True once every REQUIRED item is `Ready` — what onboarding gates on.
+    pub all_ready: bool,
+}
+
+/// One setup prerequisite: its state, a human line, and optional progress.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetupItem {
+    /// `snake_case`: `ready` / `working` / `missing` / `needs_login` / `failed`.
+    pub state: String,
+    /// One human-readable line, e.g. "Downloading… 47%" or "Cursor — signed out".
+    pub detail: String,
+    /// 0-100 while `state == "working"`, else `None`. Drives a progress bar.
+    pub percent: Option<u8>,
+    /// The agent kind this item refers to, when it is agent-specific — so the
+    /// UI can send `AgentInstallRequested` / `AgentLoginRequested` for it.
+    pub kind: Option<String>,
+}

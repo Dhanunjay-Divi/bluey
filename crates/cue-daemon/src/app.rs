@@ -915,6 +915,14 @@ struct Args {
     /// Explicit path to native overlay sidecar.
     #[arg(long)]
     overlay_bin: Option<PathBuf>,
+    /// Download the on-device models, then exit WITHOUT starting the daemon.
+    ///
+    /// Used by the installer so the one-time ~600MB STT fetch happens during
+    /// setup — when the user expects to wait — instead of silently stalling
+    /// their first real meeting. Idempotent: a model already on disk is a
+    /// no-op, so re-running setup is cheap.
+    #[arg(long)]
+    preload_models: bool,
 }
 
 /// Payload emitted on the live transcript broadcast channel whenever a new
@@ -1345,6 +1353,30 @@ pub async fn run() -> Result<()> {
     let args = Args::parse();
     let paths = AppPaths::discover()?;
     paths.ensure()?;
+
+    // `--preload-models`: fetch the on-device models, then exit. The installer
+    // calls this so the one-time ~600MB download happens during setup, while
+    // the user expects to wait — not as a silent stall in their first meeting.
+    // Idempotent (a present model short-circuits), and fail-soft: a download
+    // problem here must not make setup look broken, since the normal lazy
+    // fetch on first use still applies.
+    if args.preload_models {
+        #[cfg(feature = "parakeet-stt")]
+        {
+            println!("Downloading speech-to-text model (one time, ~600MB)...");
+            match crate::stt::model_setup::ensure_parakeet_model(&paths).await {
+                Ok(_) => println!("Speech-to-text model ready."),
+                Err(e) => {
+                    eprintln!("Could not pre-download the model: {e:#}");
+                    eprintln!("Bluey will download it on first use instead.");
+                }
+            }
+        }
+        #[cfg(not(feature = "parakeet-stt"))]
+        println!("This build has no on-device STT; nothing to pre-download.");
+        return Ok(());
+    }
+
     let store = MeetingStore::new(&paths)?;
     // Do NOT silently resume a leftover "active" meeting on boot. A stray screen
     // capture or transcript segment auto-creates an ad-hoc meeting and persists it
@@ -3228,6 +3260,15 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::AgentInstallResponded { kind, approved } => {
             handle_agent_install_response(daemon, &kind, approved).await;
+        }
+        OverlayEvent::AgentInstallRequested { kind } => {
+            handle_agent_install_requested(daemon, kind).await;
+        }
+        OverlayEvent::AgentLoginRequested { kind } => {
+            handle_agent_login_requested(daemon, &kind).await;
+        }
+        OverlayEvent::SetupStatusRequested => {
+            push_setup_status(daemon).await;
         }
         OverlayEvent::InstructionsRequested => {
             // Drive Idle -> InstructionsOpen while the daemon-owned prompt is
@@ -10629,6 +10670,23 @@ async fn answer_with_agent(
 /// Push a guidance WARNING card and resolve the answer card to the same text.
 /// Used whenever the attached agent cannot answer live — never a silent
 /// fallback to Bluey's own AI.
+/// The exact sign-in command for an agent, resolved from the AGENT REGISTRY —
+/// the single source of truth (`AgentEntry::login_command`). Deliberately not a
+/// second hand-maintained table: a duplicate would drift the moment a new agent
+/// is added, and telling a user to run a command that does not exist is worse
+/// than saying nothing. Returns `None` when that agent has no CLI sign-in flow
+/// (it authenticates in-session or via the IDE).
+fn agent_login_hint(label: &str) -> Option<String> {
+    let l = label.to_ascii_lowercase();
+    cue_agent_bridge::registry::all_binary_candidates()
+        .find(|(entry, _)| {
+            let name = entry.display_name.to_ascii_lowercase();
+            l.contains(&name) || name.contains(&l)
+        })
+        .and_then(|(entry, _)| entry.login_command)
+        .map(|cmd| cmd.join(" "))
+}
+
 async fn agent_not_ready(
     provider: &ProviderSelector,
     stream: &mut Option<&mut OverlayAnswerStream>,
@@ -10636,10 +10694,71 @@ async fn agent_not_ready(
     label: &str,
     reason: &str,
 ) -> AgentRouteOutcome {
-    let body = format!(
-        "Your {label} CLI {reason}. Install it and sign in, then ask again — \
+    // An AUTH failure is not the same as a MISSING binary, and the generic
+    // "Install it and sign in" wastes the user's time when we know the exact
+    // command. The raw CLI error is also truncated to 80 chars, which cut
+    // "Please run 'agent login'" mid-word — so give the real command instead.
+    let lower = reason.to_ascii_lowercase();
+
+    // A LOCKED KEYCHAIN is not a sign-out, and telling the user to log in again
+    // sends them in circles: the agent IS signed in, macOS just won't hand over
+    // the stored token. Seen live on a real Mac (2026-07-20) — every agent that
+    // keeps its token in the login keychain hits this. Check it BEFORE the auth
+    // heuristic, because the CLI's own message often mentions both.
+    let is_keychain_locked = lower.contains("keychain is locked")
+        || lower.contains("keychain") && lower.contains("lock");
+    if is_keychain_locked {
+        let body = format!(
+            "Your {label} CLI is signed in, but macOS has locked the login keychain \
+so it can't read its saved credentials. Unlock it, then ask again:\n\n    \
+security unlock-keychain ~/Library/Keychains/login.keychain-db\n\n\
+(This usually happens over SSH or remote login, not at the desk.)"
+        );
+        if let Some(stream) = stream.as_mut() {
+            let _ = push_system_card(
+                &stream.daemon,
+                CardKind::Warning,
+                "Keychain locked",
+                body.clone(),
+            )
+            .await;
+            let _ = stream.finish_error(&body).await;
+        }
+        return AgentRouteOutcome {
+            answer: body,
+            safety: SafetyOutcome::pass().with_notice(format!(
+                "attached agent ({label}) blocked by locked keychain"
+            )),
+            attempts: vec![
+                RouteAttemptMetadata::started(provider.clone(), fallback_depth)
+                    .failed(format!("keychain locked: {label}")),
+            ],
+        };
+    }
+
+    let is_auth = {
+        let r = &lower;
+        r.contains("authentication required")
+            || r.contains("not authenticated")
+            || r.contains("please run")
+            || r.contains("sign in")
+            || r.contains("unauthorized")
+    };
+    let login_hint = agent_login_hint(label);
+    let body = match (is_auth, login_hint) {
+        (true, Some(cmd)) => format!(
+            "Your {label} CLI is signed out. Run this in a terminal, then ask again:\n\n    {cmd}\n\n\
 Bluey answers live through your agent and never on your behalf."
-    );
+        ),
+        (true, None) => format!(
+            "Your {label} CLI is signed out. Sign in to {label}, then ask again — \
+Bluey answers live through your agent and never on your behalf."
+        ),
+        _ => format!(
+            "Your {label} CLI {reason}. Install it and sign in, then ask again — \
+Bluey answers live through your agent and never on your behalf."
+        ),
+    };
     if let Some(stream) = stream.as_mut() {
         let _ = push_system_card(
             &stream.daemon,
@@ -10648,7 +10767,13 @@ Bluey answers live through your agent and never on your behalf."
             body.clone(),
         )
         .await;
-        let _ = stream.finish(&body).await;
+        // Resolve as an ERROR, not as an answer. This is a failure notice —
+        // the agent is missing or signed out — so the overlay must render the
+        // retryable error state. Using `finish` here marked it `done && !error`,
+        // which showed a useless "Fix this" button (it re-drove the same
+        // unauthenticated agent and did nothing) and HID the "Retry" button
+        // the user actually needs after signing in.
+        let _ = stream.finish_error(&body).await;
     }
     let safety = SafetyOutcome::pass().with_notice(format!(
         "attached agent ({label}) not ready; guidance shown"
@@ -10678,6 +10803,15 @@ async fn maybe_offer_agent_install(
     if !reason.contains("not found on PATH") {
         return;
     }
+    push_agent_install_offer(daemon, kind).await;
+}
+
+/// Push the install-consent offer for `kind` to the overlay. Shared by the
+/// drive path (`maybe_offer_agent_install`, gated on a missing binary) and the
+/// UI-initiated path (`handle_agent_install_requested`), so both routes show
+/// the same card and run the same vetted recipe. No-op when the agent has no
+/// installer (VS Code, Windsurf, unknown).
+async fn push_agent_install_offer(daemon: &Arc<Daemon>, kind: &cue_agent_bridge::AgentKind) {
     let Some(plan) = cue_agent_bridge::provision::plan_install(kind) else {
         return; // no installer for this agent (VS Code, Windsurf, unknown)
     };
@@ -10701,6 +10835,118 @@ async fn maybe_offer_agent_install(
         },
     )
     .await;
+}
+
+/// Build and push the first-run [`SetupStatus`] to the overlay so onboarding can
+/// show live prerequisite state and gate "ready" on setup actually being done.
+///
+/// Model presence is read from DISK (not from this process's download progress),
+/// so a model provisioned by the installer, a prior run, or an offline bundle
+/// counts as ready. The agent is the attached one when there is one, else the
+/// best discovered candidate — so a signed-out CLI reports `needs_login` here
+/// rather than failing later on the first ask.
+pub(crate) async fn push_setup_status(daemon: &Arc<Daemon>) {
+    #[cfg(feature = "parakeet-stt")]
+    let models_present = {
+        let dir = crate::stt::model_setup::resolve_model_dir(&daemon.paths);
+        crate::stt::model_setup::model_present(&dir)
+    };
+    #[cfg(not(feature = "parakeet-stt"))]
+    let models_present = true; // no on-device STT in this build; nothing to fetch
+
+    let agents = discover_agent_summaries(daemon).await;
+    let best = agents
+        .iter()
+        .find(|a| a.attached)
+        .or_else(|| agents.iter().find(|a| a.capability == "drive"))
+        .or_else(|| agents.first());
+    let agent = best.map(|a| {
+        (
+            a.kind.as_str(),
+            a.display_name.as_str(),
+            a.capability.as_str(),
+        )
+    });
+
+    let status = crate::setup_status::build(models_present, agent);
+    let _ = send_overlay(daemon, OverlayCommand::SetSetupStatus { status }).await;
+}
+
+/// UI-INITIATED install: the user clicked "Install an agent" in onboarding.
+/// Picks `kind` when named, else the first registry agent that has a vetted
+/// install recipe, and pushes the SAME consent offer the drive path uses — one
+/// code path, one consent card, one vetted recipe. Nothing is installed until
+/// the user approves the pushed offer.
+async fn handle_agent_install_requested(daemon: &Arc<Daemon>, kind: Option<String>) {
+    use cue_agent_bridge::provision::plan_install;
+
+    // Named agent → offer exactly that one.
+    if let Some(k) = kind.as_deref() {
+        if let Some(agent) = parse_attached_agent(Some(k)) {
+            push_agent_install_offer(daemon, &agent).await;
+            return;
+        }
+    }
+    // Otherwise pick the first agent with a real installer whose CLI is absent.
+    for (entry, _bin) in cue_agent_bridge::registry::all_binary_candidates() {
+        let agent = entry.kind_tag.to_agent_kind();
+        if plan_install(&agent).is_some() {
+            push_agent_install_offer(daemon, &agent).await;
+            return;
+        }
+    }
+    let _ = push_system_card(
+        daemon,
+        CardKind::Warning,
+        "No installable agent",
+        "Bluey couldn't find a coding agent it can install automatically. \
+Install Claude Code, Codex, or Cursor, then reopen Bluey."
+            .to_string(),
+    )
+    .await;
+}
+
+/// UI-INITIATED login: the user clicked "Sign in" on an agent whose CLI is
+/// installed but signed out. Launches THAT agent's own login flow — Bluey never
+/// handles credentials, it only starts the vendor's flow.
+async fn handle_agent_login_requested(daemon: &Arc<Daemon>, kind: &str) {
+    let Some(agent) = parse_attached_agent(Some(kind)) else {
+        return;
+    };
+    let label = agent_display_name(&agent);
+    match cue_agent_bridge::auth_resolve::login_command_for(&agent) {
+        Some(cmd) => {
+            let shown = cmd.join(" ");
+            // Launch it in Terminal so the user completes the browser/device-code
+            // flow themselves. Detached: the login flow outlives this handler.
+            let script = format!(
+                "tell application \"Terminal\" to do script \"{}\"",
+                shown.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+            let launched = tokio::process::Command::new("osascript")
+                .arg("-e")
+                .arg(&script)
+                .spawn()
+                .is_ok();
+            let body = if launched {
+                format!("Opened Terminal to sign in to {label}:\n\n    {shown}\n\nFinish there, then ask again.")
+            } else {
+                format!("To sign in to {label}, run:\n\n    {shown}")
+            };
+            let _ = push_system_card(daemon, CardKind::System, "Sign in", body).await;
+        }
+        None => {
+            let _ = push_system_card(
+                daemon,
+                CardKind::Warning,
+                "Sign in",
+                format!(
+                    "{label} has no CLI sign-in command — sign in from the {label} app itself."
+                ),
+            )
+            .await;
+        }
+    }
 }
 
 /// Handle the user's response to a [`OverlayCommand::PushAgentInstall`] offer.
@@ -12859,27 +13105,39 @@ fn spawn_model_progress_forwarder(daemon: Arc<Daemon>) {
                 None => {
                     let id = uuid::Uuid::new_v4();
                     card_ids.insert(update.label.clone(), id);
+                    // Status only — deliberately NOT the model name/vendor. The
+                    // user cares that setup is progressing, not which weights
+                    // are being fetched.
                     let mut card = CueCard::new(
                         CardKind::System,
-                        format!("Setting up {}", update.label),
-                        "Downloading…".to_string(),
+                        "Setting up Bluey".to_string(),
+                        "Getting things ready…".to_string(),
                     )
-                    .with_source("model setup");
+                    .with_source("setup");
                     card.id = id;
                     let _ = send_overlay(&daemon, OverlayCommand::PushCard { card }).await;
                     (id, true)
                 }
             };
 
+            // Mirror progress into the setup-status snapshot so onboarding's
+            // live view matches the card, then push the refreshed status.
+            crate::setup_status::set_model_progress(if update.done {
+                None
+            } else {
+                update
+                    .total
+                    .filter(|t| *t > 0)
+                    .map(|t| ((update.downloaded.min(t) as f64 / t as f64) * 100.0).round() as u8)
+            });
+            push_setup_status(&daemon).await;
+
             if update.done {
                 let _ = send_overlay(
                     &daemon,
                     OverlayCommand::UpdateCard {
                         id,
-                        body: format!(
-                            "{} ready — on-device, nothing leaves this machine.",
-                            capitalize_first(&update.label)
-                        ),
+                        body: "Ready — runs on-device, nothing leaves this machine.".to_string(),
                         done: true,
                         cost_label: None,
                         artifact: None,
@@ -12894,16 +13152,23 @@ fn spawn_model_progress_forwarder(daemon: Arc<Daemon>) {
                 Some(total) if total > 0 => {
                     let pct = ((update.downloaded.min(total) as f64 / total as f64) * 100.0).round()
                         as u8;
+                    // Percent + size = a real progress signal (the user can tell
+                    // it's moving and roughly how long is left) without naming
+                    // the model. One-time setup is called out so a multi-minute
+                    // wait doesn't read as the app being stuck.
                     (
                         Some(pct),
                         format!(
-                            "Downloading… {pct}% ({} / {})",
+                            "Setting up… {pct}%  ({} of {}) — one-time setup",
                             fmt_mb(update.downloaded),
                             fmt_mb(total)
                         ),
                     )
                 }
-                _ => (None, format!("Downloading… {}", fmt_mb(update.downloaded))),
+                _ => (
+                    None,
+                    format!("Setting up… {} — one-time setup", fmt_mb(update.downloaded)),
+                ),
             };
 
             // Throttle to whole-percent changes (skip if same pct), but always send
@@ -12939,15 +13204,6 @@ fn fmt_mb(bytes: u64) -> String {
         format!("{:.1} GB", mb / 1024.0)
     } else {
         format!("{:.0} MB", mb)
-    }
-}
-
-#[cfg(feature = "parakeet-stt")]
-fn capitalize_first(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
-        None => String::new(),
     }
 }
 

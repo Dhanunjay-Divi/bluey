@@ -68,6 +68,14 @@ interface WireAgentSessionSummary {
   project: string | null;
 }
 
+// One first-run setup prerequisite (daemon `SetupItem`).
+interface WireSetupItem {
+  state: string;
+  detail: string;
+  percent?: number | null;
+  kind?: string | null;
+}
+
 interface WireAgentConnectorInfo {
   name: string;
   auth_tier: string;
@@ -165,6 +173,14 @@ type OverlayCommand =
       id: string;
       steps: WireAnswerStatusStep[];
       done?: boolean;
+    }
+  | {
+      type: "set_setup_status";
+      status: {
+        model: WireSetupItem;
+        agent: WireSetupItem;
+        all_ready: boolean;
+      };
     }
   | {
       type: "push_agent_install";
@@ -751,6 +767,48 @@ export function createTauriClient(): MeetingClient {
 
     respondAgentInstall(kind, approved) {
       sendEvent({ type: "agent_install_responded", kind, approved });
+    },
+
+    requestAgentInstall(kind) {
+      // UI-initiated (onboarding "no agent found"). The daemon replies with the
+      // SAME push_agent_install offer the drive path uses, so onAgentInstall
+      // renders the consent card and nothing installs without approval.
+      sendEvent({ type: "agent_install_requested", kind: kind ?? null });
+    },
+
+    requestAgentLogin(kind) {
+      // Launches the agent's OWN login flow (e.g. `cursor-agent login`).
+      // Bluey never handles credentials.
+      sendEvent({ type: "agent_login_requested", kind });
+    },
+
+    onSetupStatus(cb) {
+      const handler = (cmd: OverlayCommand) => {
+        if (cmd.type !== "set_setup_status") return;
+        const c = cmd as Extract<OverlayCommand, { type: "set_setup_status" }>;
+        const s = c.status;
+        cb({
+          model: {
+            state: s.model.state,
+            detail: s.model.detail,
+            percent: s.model.percent ?? null,
+            kind: s.model.kind ?? null,
+          },
+          agent: {
+            state: s.agent.state,
+            detail: s.agent.detail,
+            percent: s.agent.percent ?? null,
+            kind: s.agent.kind ?? null,
+          },
+          allReady: s.all_ready,
+        });
+      };
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+
+    requestSetupStatus() {
+      sendEvent({ type: "setup_status_requested" });
     },
 
     requestFix(question, cardId) {

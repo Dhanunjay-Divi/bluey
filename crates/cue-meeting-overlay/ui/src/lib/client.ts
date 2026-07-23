@@ -21,6 +21,7 @@ import type {
   MeetingState,
   MeetingSummary,
   MeetingViewState,
+  SetupStatus,
   TranscriptLine,
 } from "./types";
 
@@ -128,6 +129,24 @@ export interface MeetingClient {
   /** Answer an install offer. `approved` runs the vetted recipe on the daemon
    *  (which reports the outcome as a card); Bluey never signs the user in. */
   respondAgentInstall(kind: string, approved: boolean): void;
+
+  /** Ask the daemon to offer an agent install (onboarding's "no agent found"
+   *  state). `kind` omitted → the daemon picks the best installable agent. The
+   *  daemon replies with the same push_agent_install offer {@link onAgentInstall}
+   *  renders, so nothing installs without explicit consent. */
+  requestAgentInstall(kind?: string): void;
+
+  /** Launch an agent's OWN login flow for a CLI that is installed but signed
+   *  out (`capability === "needs_reauth"`). Bluey never handles credentials. */
+  requestAgentLogin(kind: string): void;
+
+  /** Subscribe to first-run setup status (models + agent). The daemon pushes on
+   *  request and again whenever a step changes, so onboarding stays live.
+   *  Returns an unsubscribe fn. */
+  onSetupStatus(cb: (status: SetupStatus) => void): () => void;
+
+  /** Ask the daemon for the current setup status. */
+  requestSetupStatus(): void;
   /** Ask the daemon to propose a fix for an agent answer (Fix-button slice F3).
    *  The daemon drives the ATTACHED agent in PROPOSE-ONLY mode and replies by
    *  PUSHING an {@link onFixProposal} — nothing is applied at this step.

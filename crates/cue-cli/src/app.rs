@@ -2057,10 +2057,27 @@ async fn start(args: StartArgs) -> Result<()> {
         return Ok(());
     }
 
-    let mut command = Command::new(resolve_daemon_bin()?);
-    command.args(daemon_launch_args(&args));
+    let daemon_bin = resolve_daemon_bin()?;
+    let launch_args = daemon_launch_args(&args);
+    let trace_id = command_trace_id();
+
+    // macOS: spawn DISCLAIMED so the daemon owns its own TCC identity and can
+    // actually prompt for microphone / screen recording. A plain detached spawn
+    // is reparented to launchd, which silently disables every permission
+    // prompt. Falls back to the portable path if the private API is missing.
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = spawn_daemon_disclaimed(&daemon_bin, &launch_args, &trace_id) {
+        wait_for_daemon_ready(Duration::from_secs(5)).await?;
+        if !args.quiet {
+            println!("Bluey daemon started with pid {pid}.");
+        }
+        return Ok(());
+    }
+
+    let mut command = Command::new(&daemon_bin);
+    command.args(&launch_args);
     command
-        .env(BLUEY_TRACE_ID_ENV, command_trace_id())
+        .env(BLUEY_TRACE_ID_ENV, &trace_id)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -2219,6 +2236,116 @@ fn configure_detached_daemon(command: &mut Command) {
                 Ok(())
             }
         });
+    }
+}
+
+/// macOS ONLY: spawn the daemon as its own TCC-**responsible** process.
+///
+/// THE BUG THIS FIXES. `setsid()` puts the daemon in a new session, so it is
+/// reparented to `launchd` (PPID 1). macOS then cannot build a "responsible
+/// app" attribution chain for it — with no foreground app anywhere in the
+/// parent chain, TCC is never consulted and every protected resource silently
+/// defaults to DENY. Concretely: opening the microphone SUCCEEDS but delivers
+/// pure silence, no permission dialog is ever shown, and `tccutil` shows the
+/// mic as "not requested yet". The user sees "transcription doesn't work" with
+/// no error anywhere. Verified live on a real Intel Mac (2026-07-20).
+///
+/// THE FIX. `responsibility_spawnattrs_setdisclaim` (the same private API LLDB,
+/// Chromium and Qt Creator use) tells the kernel the child DISCLAIMS its
+/// parent's responsibility and becomes responsible for ITSELF. It then has its
+/// own TCC identity, prompts under its own name, and still stays detached.
+/// It must be set on the `posix_spawnattr_t` BEFORE `posix_spawn` — it cannot
+/// be done from `pre_exec`, because fork/exec never touches spawn attributes.
+/// That is why this path exists instead of `Command::spawn`.
+///
+/// Resolved with `dlsym(RTLD_DEFAULT, …)` because the symbol is not in any
+/// public header. If it is missing (older macOS), we fall back to the normal
+/// spawn — degraded (no prompt) but never broken.
+///
+/// NOTE: TCC keys the grant on code-signing identity. An ad-hoc signature mints
+/// a NEW identity on every re-sign, so grants will not persist across updates
+/// until the binaries are signed with a stable Developer ID.
+#[cfg(target_os = "macos")]
+fn spawn_daemon_disclaimed(program: &Path, args: &[String], trace_id: &str) -> Option<u32> {
+    use std::ffi::CString;
+
+    type SetDisclaimFn =
+        unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;
+
+    unsafe {
+        let symbol = c"responsibility_spawnattrs_setdisclaim";
+        let ptr = libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr());
+        if ptr.is_null() {
+            return None; // not available — caller falls back to Command::spawn
+        }
+        let set_disclaim: SetDisclaimFn = std::mem::transmute(ptr);
+
+        let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+        if libc::posix_spawnattr_init(&mut attr) != 0 {
+            return None;
+        }
+        // Detach exactly like `setsid()` did, but WITHOUT losing responsibility:
+        // posix_spawn creates the new session itself. Not exposed by the `libc`
+        // crate; value read from the macOS SDK (`sys/spawn.h:61`).
+        const POSIX_SPAWN_SETSID: libc::c_short = 0x0400;
+        libc::posix_spawnattr_setflags(&mut attr, POSIX_SPAWN_SETSID);
+        // The whole point: child becomes its OWN responsible process.
+        set_disclaim(&mut attr, 1);
+
+        // /dev/null for all three stdio, matching the detached-daemon contract.
+        let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+        if libc::posix_spawn_file_actions_init(&mut actions) != 0 {
+            libc::posix_spawnattr_destroy(&mut attr);
+            return None;
+        }
+        let devnull = CString::new("/dev/null").ok()?;
+        for fd in 0..3 {
+            libc::posix_spawn_file_actions_addopen(
+                &mut actions,
+                fd,
+                devnull.as_ptr(),
+                libc::O_RDWR,
+                0,
+            );
+        }
+
+        let prog = CString::new(program.as_os_str().as_encoded_bytes()).ok()?;
+        let mut argv_owned = vec![prog.clone()];
+        for a in args {
+            argv_owned.push(CString::new(a.as_str()).ok()?);
+        }
+        let mut argv: Vec<*mut libc::c_char> =
+            argv_owned.iter().map(|c| c.as_ptr() as *mut _).collect();
+        argv.push(std::ptr::null_mut());
+
+        // Inherit the parent environment plus the trace id.
+        let mut env_owned: Vec<CString> = std::env::vars()
+            .filter(|(k, _)| k != BLUEY_TRACE_ID_ENV)
+            .filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok())
+            .collect();
+        env_owned.push(CString::new(format!("{BLUEY_TRACE_ID_ENV}={trace_id}")).ok()?);
+        let mut envp: Vec<*mut libc::c_char> =
+            env_owned.iter().map(|c| c.as_ptr() as *mut _).collect();
+        envp.push(std::ptr::null_mut());
+
+        let mut pid: libc::pid_t = 0;
+        let rc = libc::posix_spawn(
+            &mut pid,
+            prog.as_ptr(),
+            &actions,
+            &attr,
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
+
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        libc::posix_spawnattr_destroy(&mut attr);
+
+        if rc == 0 && pid > 0 {
+            Some(pid as u32)
+        } else {
+            None
+        }
     }
 }
 

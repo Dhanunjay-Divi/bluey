@@ -100,7 +100,7 @@ pub fn resolve_model_dir(paths: &AppPaths) -> PathBuf {
 }
 
 /// True when every required model file is already present in `dir`.
-fn model_present(dir: &Path) -> bool {
+pub fn model_present(dir: &Path) -> bool {
     NEMOTRON_FILES.iter().all(|f| dir.join(f).is_file())
 }
 

@@ -32,6 +32,14 @@ const TABS: readonly Tab[] = ["Ask", "History", "Agents"];
 
 export function App() {
   const client = getClient();
+  // KNOWN LIMITATION: first-run state lives ONLY in the WebView's localStorage
+  // (~/Library/WebKit/cue-meeting-overlay), not in daemon settings. So it is
+  // out of sync with the rest of the install in both directions: deleting
+  // ~/.bluey + Application Support does NOT reset onboarding (the flag
+  // survives, and the next launch skips straight to the main app), and clearing
+  // the WebView store re-triggers onboarding for an already-set-up user.
+  // `install.sh --reset` clears the WebView store too; the real fix is to move
+  // this flag into daemon settings so there is one source of truth.
   const [onboarding, setOnboarding] = useState(
     () => !localStorage.getItem("bluey.onboarded"),
   );
