@@ -145,3 +145,32 @@ export function ScreenIcon({ size }: { size?: number }) {
     </Icon>
   );
 }
+
+/** User — speaker identification and assignment glyph. */
+export function UserIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" />
+      <circle cx="12" cy="7" r="4" />
+    </Icon>
+  );
+}
+
+/** Merge — combine two speaker profiles. */
+export function MergeIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M18 18L12 12L6 18" />
+      <path d="M6 6L12 12L18 6" />
+    </Icon>
+  );
+}
+
+/** Check mark — selected state glyph. */
+export function CheckIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M20 6L9 17l-5-5" />
+    </Icon>
+  );
+}

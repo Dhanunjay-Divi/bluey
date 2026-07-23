@@ -44,8 +44,12 @@ enum Commands {
     Run(RunArgs),
     /// Turn Bluey on with the overlay-first product flow.
     On(OnArgs),
-    /// Turn Bluey off.
+    /// Close the Bluey overlay. The daemon keeps running in the background
+    /// (calendar polling + pre-context warmup continue).
     Off,
+    /// Fully stop Bluey including the background daemon. Use this only when
+    /// you want calendar polling and pre-context to stop completely.
+    Quit,
     /// Sign in or link Bluey to a cloud account.
     #[command(hide = true)]
     Login(LoginArgs),
@@ -120,6 +124,14 @@ enum Commands {
     /// Stop the Bluey daemon.
     #[command(hide = true)]
     Stop,
+    /// Install Bluey as a macOS login item so the daemon starts automatically
+    /// on login and runs in the background (calendar polling + pre-context).
+    /// Run once after initial setup.
+    Install {
+        /// Uninstall the login item instead of installing it.
+        #[arg(long)]
+        uninstall: bool,
+    },
     /// Show daemon status.
     #[command(hide = true)]
     Status,
@@ -187,6 +199,11 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
+    },
+    /// Manage cloud calendar OAuth connections (Google / Microsoft).
+    Calendar {
+        #[command(subcommand)]
+        command: CalendarCommands,
     },
     /// Show configured AI provider environment.
     #[command(hide = true)]
@@ -425,6 +442,16 @@ struct AudioStartArgs {
 #[derive(Debug, Subcommand)]
 enum AiCommands {
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum CalendarCommands {
+    /// Show calendar connection status.
+    Status,
+    /// Connect a cloud calendar provider (google / microsoft).
+    Connect { provider: String },
+    /// Disconnect a cloud calendar provider (google / microsoft).
+    Disconnect { provider: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -690,6 +717,7 @@ pub async fn cli_main() -> Result<()> {
         Commands::Run(args) => run(args).await,
         Commands::On(args) => cue_on(args).await,
         Commands::Off => cue_off().await,
+        Commands::Quit => cue_quit().await,
         Commands::Login(args) => cue_login(args).await,
         Commands::Account => print_account().await,
         Commands::Sessions(args) => print_sessions(args),
@@ -741,6 +769,13 @@ pub async fn cli_main() -> Result<()> {
         Commands::Stop => {
             let response = request(DaemonRequest::Shutdown).await?;
             print_response(response)
+        }
+        Commands::Install { uninstall } => {
+            if uninstall {
+                bluey_uninstall_login_item()
+            } else {
+                bluey_install_login_item()
+            }
         }
         Commands::Status => match request(DaemonRequest::Status).await {
             Ok(response) => print_response(response),
@@ -892,6 +927,15 @@ pub async fn cli_main() -> Result<()> {
         Commands::Ai { command } => {
             let request_msg = match command {
                 AiCommands::Status => DaemonRequest::AiStatus,
+            };
+            let response = request(request_msg).await?;
+            print_response(response)
+        }
+        Commands::Calendar { command } => {
+            let request_msg = match command {
+                CalendarCommands::Status => DaemonRequest::CalendarConnectStatus,
+                CalendarCommands::Connect { provider } => DaemonRequest::CalendarConnectStart { provider },
+                CalendarCommands::Disconnect { provider } => DaemonRequest::CalendarDisconnect { provider },
             };
             let response = request(request_msg).await?;
             print_response(response)
@@ -1059,9 +1103,32 @@ fn bluey_on_boot_title(auth_state: &BlueyOnAuthState) -> &'static str {
 }
 
 async fn cue_off() -> Result<()> {
+    // Close the overlay UI only — the daemon keeps running in the background
+    // so calendar polling and pre-context warmup continue uninterrupted.
+    match request(DaemonRequest::CloseOverlay).await {
+        Ok(DaemonResponse::Ok) => {
+            println!("Bluey overlay closed. Daemon is still running in the background.");
+            println!("Use 'bluey on' to reopen, or 'bluey quit' to stop everything.");
+            Ok(())
+        }
+        Ok(response) => print_response(response),
+        Err(error) => {
+            // Daemon not reachable — clean up stale state.
+            let paths = AppPaths::discover()?;
+            cleanup_stale_daemon(&paths, true)
+                .await
+                .with_context(|| format!("Bluey daemon was not reachable ({error:#})"))?;
+            println!("Bluey is off.");
+            Ok(())
+        }
+    }
+}
+
+async fn cue_quit() -> Result<()> {
+    // Full shutdown — stops daemon, overlay, calendar polling, everything.
     match request(DaemonRequest::Shutdown).await {
         Ok(DaemonResponse::Ok) => {
-            println!("Bluey is off.");
+            println!("Bluey stopped.");
             Ok(())
         }
         Ok(response) => print_response(response),
@@ -1070,7 +1137,7 @@ async fn cue_off() -> Result<()> {
             cleanup_stale_daemon(&paths, true)
                 .await
                 .with_context(|| format!("Bluey daemon was not reachable ({error:#})"))?;
-            println!("Bluey is off.");
+            println!("Bluey stopped.");
             Ok(())
         }
     }
@@ -4144,4 +4211,170 @@ mod tests {
 
         let _ = fs::remove_dir_all(base);
     }
+}
+
+// ---------------------------------------------------------------------------
+// LaunchAgent installer — `bluey install` / `bluey install --uninstall`
+// ---------------------------------------------------------------------------
+
+const LAUNCH_AGENT_LABEL: &str = "com.bluey.daemon";
+
+fn launch_agent_plist_path() -> Result<std::path::PathBuf> {
+    let home = std::env::var("HOME").context("HOME env var not set")?;
+    let dir = std::path::Path::new(&home).join("Library").join("LaunchAgents");
+    std::fs::create_dir_all(&dir).context("create ~/Library/LaunchAgents")?;
+    Ok(dir.join(format!("{LAUNCH_AGENT_LABEL}.plist")))
+}
+
+/// Resolve the path to the installed bluey-daemon binary, preferring the
+/// same directory as the current `bluey` CLI binary.
+fn resolve_daemon_bin_for_install() -> Result<std::path::PathBuf> {
+    // Walk: same dir as current exe → ~/.local/bin → PATH
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe.with_file_name("bluey-daemon");
+        if sibling.exists() {
+            return Ok(sibling);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let local = std::path::Path::new(&home)
+        .join(".local")
+        .join("bin")
+        .join("bluey-daemon");
+    if local.exists() {
+        return Ok(local);
+    }
+    // Fall back to PATH resolution using stdlib
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            let candidate = std::path::Path::new(dir).join("bluey-daemon");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+    anyhow::bail!(
+        "bluey-daemon not found; run `bash run-local.sh` first to build + install it"
+    )
+}
+
+/// Install a macOS LaunchAgent that auto-starts `bluey-daemon --no-overlay`
+/// on login. The daemon runs silently in the background — Google Calendar is
+/// polled every 30s, and the overlay is spawned automatically when a meeting
+/// is detected within the 10-minute look-ahead window.
+fn bluey_install_login_item() -> Result<()> {
+    let daemon_bin = resolve_daemon_bin_for_install()?;
+    let plist_path = launch_agent_plist_path()?;
+    let log_dir = {
+        let home = std::env::var("HOME").unwrap_or_default();
+        std::path::Path::new(&home)
+            .join("Library")
+            .join("Logs")
+            .join("Bluey")
+    };
+    std::fs::create_dir_all(&log_dir).context("create Bluey log dir")?;
+    let stdout_log = log_dir.join("daemon-stdout.log");
+    let stderr_log = log_dir.join("daemon-stderr.log");
+
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{daemon}</string>
+        <string>--no-overlay</string>
+    </array>
+
+    <!-- Start immediately on login and after every crash/exit -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Give the daemon 10s to clean up on logout before SIGKILL -->
+    <key>ExitTimeOut</key>
+    <integer>10</integer>
+
+    <!-- Log stdout/stderr to ~/Library/Logs/Bluey/ -->
+    <key>StandardOutPath</key>
+    <string>{stdout}</string>
+    <key>StandardErrorPath</key>
+    <string>{stderr}</string>
+
+    <!-- Throttle rapid restart loops (wait 5s between crashes) -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+</dict>
+</plist>
+"#,
+        label = LAUNCH_AGENT_LABEL,
+        daemon = daemon_bin.display(),
+        stdout = stdout_log.display(),
+        stderr = stderr_log.display(),
+    );
+
+    std::fs::write(&plist_path, plist.as_bytes())
+        .with_context(|| format!("write plist to {}", plist_path.display()))?;
+
+    // Load immediately without needing a logout/login cycle.
+    let status = std::process::Command::new("launchctl")
+        .args(["load", "-w", &plist_path.to_string_lossy()])
+        .status()
+        .context("run launchctl load")?;
+
+    if status.success() {
+        println!("✅  Bluey login item installed.");
+        println!("    Daemon binary : {}", daemon_bin.display());
+        println!("    LaunchAgent   : {}", plist_path.display());
+        println!("    Logs          : {}", log_dir.display());
+        println!();
+        println!("The daemon is now starting in the background.");
+        println!("Google Calendar will be polled every 30s.");
+        println!("Pre-context warmup fires automatically 10 min before each meeting.");
+        println!();
+        println!("Commands:");
+        println!("  bluey on        — open the overlay");
+        println!("  bluey off       — close the overlay (daemon keeps running)");
+        println!("  bluey quit      — stop everything");
+        println!("  bluey install --uninstall  — remove the login item");
+    } else {
+        // launchctl may fail if the agent is already loaded; that's fine.
+        println!("⚠️  launchctl load returned non-zero (agent may already be loaded).");
+        println!("   Plist written to: {}", plist_path.display());
+        println!("   If problems persist, run: launchctl unload -w {} && launchctl load -w {}",
+            plist_path.display(), plist_path.display());
+    }
+
+    Ok(())
+}
+
+/// Remove the Bluey LaunchAgent and stop the currently running background
+/// daemon (if any). Does NOT delete logs or user data.
+fn bluey_uninstall_login_item() -> Result<()> {
+    let plist_path = launch_agent_plist_path()?;
+    if !plist_path.exists() {
+        println!("No Bluey login item found (nothing to uninstall).");
+        return Ok(());
+    }
+
+    // Unload first so launchd stops the daemon.
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", "-w", &plist_path.to_string_lossy()])
+        .status();
+
+    std::fs::remove_file(&plist_path)
+        .with_context(|| format!("remove plist {}", plist_path.display()))?;
+
+    println!("✅  Bluey login item removed.");
+    println!("    The background daemon has been stopped.");
+    println!("    User data and logs are preserved.");
+    println!("    Run 'bluey install' to re-enable auto-start.");
+
+    Ok(())
 }

@@ -53,7 +53,7 @@ build-helpers-release:
 # arm64 is the MVP target for on-device STT. parakeet-stt uses the native
 # prebuilt ONNX Runtime (ort-defaults) on Apple Silicon; nothing extra to ship.
 build-darwin-arm64:
-	cargo build --release --target aarch64-apple-darwin -p cue-daemon -p cue-cli --features cue-daemon/parakeet-stt
+	cargo build --release --target aarch64-apple-darwin -p cue-daemon -p cue-cli --features cue-daemon/parakeet-stt,cue-daemon/cloud-calendar
 
 # NOTE (Intel mac): on x86_64 macOS, parakeet-rs links via `load-dynamic`
 # (see crates/cue-daemon/Cargo.toml), so the packaged binary expects an ONNX
@@ -62,7 +62,7 @@ build-darwin-arm64:
 # dylib-staging step before it is fully usable. Feature is enabled so the code
 # path compiles in for parity.
 build-darwin-x86_64:
-	cargo build --release --target x86_64-apple-darwin -p cue-daemon -p cue-cli --features cue-daemon/parakeet-stt
+	cargo build --release --target x86_64-apple-darwin -p cue-daemon -p cue-cli --features cue-daemon/parakeet-stt,cue-daemon/cloud-calendar
 
 build-windows-x86_64:
 	cargo build --release --target x86_64-pc-windows-msvc -p cue-daemon -p cue-cli
@@ -95,6 +95,8 @@ package-darwin-arm64: build-darwin-arm64 build-helpers-release build-meeting-ove
 	cp native/macos/cue-picker/.build/bluey-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-picker/.build/cue-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
 	cp -R native/macos/cue-picker/.build/BlueyFilePicker.app staging-arm64/bin/ 2>/dev/null || true
+	cp scripts/install.sh staging-arm64/install.sh 2>/dev/null || cp dist/bluey-0.1.10-darwin-arm64/install.sh staging-arm64/install.sh 2>/dev/null || true
+	cp dist/bluey-0.1.10-darwin-arm64/README.txt staging-arm64/README.txt 2>/dev/null || true
 	tar -czf dist/bluey-$(VERSION)-darwin-arm64.tar.gz -C staging-arm64 .
 	shasum -a 256 dist/bluey-$(VERSION)-darwin-arm64.tar.gz \
 	  > dist/bluey-$(VERSION)-darwin-arm64.tar.gz.sha256

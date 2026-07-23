@@ -159,6 +159,13 @@ pub enum DaemonRequest {
     CalendarDisconnect {
         provider: String,
     },
+    /// Close the overlay UI without stopping the daemon. The daemon keeps
+    /// running in the background — calendar polling, pre-context warmup, and
+    /// all background tasks continue. Use `Shutdown` to stop everything.
+    CloseOverlay,
+    /// Full daemon shutdown including all background tasks. Equivalent to
+    /// the old `bluey off` behaviour. Prefer `CloseOverlay` for normal use.
+    QuitDaemon,
 }
 
 impl DaemonRequest {
@@ -186,7 +193,7 @@ impl DaemonRequest {
 
     pub fn is_shutdown(&self) -> bool {
         match self {
-            Self::Shutdown => true,
+            Self::Shutdown | Self::QuitDaemon => true,
             Self::WithTrace { request, .. } => request.is_shutdown(),
             _ => false,
         }
